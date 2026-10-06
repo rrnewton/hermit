@@ -285,6 +285,45 @@ fn copy_procfs_output<M: MemoryAccess>(
     }
 }
 
+/// Check the caller's whole requested range as `vfs_read`'s `access_ok` does
+/// before the file is read, so an address range beyond the user address limit
+/// is `EFAULT` even at EOF, when nothing would be copied. A procfs snapshot read
+/// never hands that range to the kernel.
+fn validate_procfs_destination(
+    policy: crate::iovecs::UserAddressPolicy,
+    destination: Option<AddrMut<'_, u8>>,
+    len: usize,
+) -> Result<(), Error> {
+    // No count past isize::MAX fits below a user address limit. The native
+    // check would refuse it as an invalid iovec rather than a bad range.
+    if isize::try_from(len).is_err() {
+        return Err(Errno::EFAULT.into());
+    }
+    // Two descriptors keep the range uncapped, as `access_ok` sees it; a
+    // single one is capped at MAX_RW_COUNT first (`import_ubuf`).
+    policy.validate(&[
+        crate::iovecs::ImportedIovec {
+            base: destination.map_or(0, |address| address.as_raw()),
+            len,
+        },
+        crate::iovecs::ImportedIovec { base: 0, len: 0 },
+    ])
+}
+
+/// Save the bytes at `scratch` into `original` if the guest's own protections
+/// let the capture read land there: the range is readable, and writing the
+/// same bytes back through the guest's protections copies all of them.
+fn save_procfs_scratch<M: MemoryAccess>(
+    memory: &mut M,
+    scratch: AddrMut<'_, u8>,
+    original: &mut [u8],
+) -> bool {
+    memory.read_exact(scratch, original).is_ok()
+        && memory
+            .write_with_user_access(scratch, original)
+            .is_ok_and(|written| written == original.len())
+}
+
 /// Capacity used for pipes that Detcore makes physically nonblocking.
 ///
 /// Linux normally creates 64-KiB pipes on this platform, but silently falls back to two pages
@@ -1862,6 +1901,15 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// neighbouring row, and then be unmapped before the guest sees it. The
     /// stack scratch changes no mapping; its original bytes are put back, so
     /// no host byte stays below the stack pointer either.
+    ///
+    /// The scratch below the red zone is not always there: a thread, fiber or
+    /// alternate signal stack may put the stack pointer just above a guard page
+    /// or the end of its mapping (compare [`Self::inject_fstat`]). The read
+    /// needs no stack, so that must not fail it. The capture then goes through
+    /// the caller's buffer, which this read writes anyway, with the same save
+    /// and restore before the output is copied. If not even its first byte can
+    /// be read and written, Linux copies nothing and the read fails `EFAULT`;
+    /// it does so here without taking the snapshot.
     async fn capture_procfs_on_stack<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1869,17 +1917,33 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<Vec<u8>, Error> {
         const CAPTURE_CHUNK_BYTES: usize = 512;
 
-        let mut stack = guest.stack().await;
-        let scratch = stack.reserve::<[u8; CAPTURE_CHUNK_BYTES]>().cast::<u8>();
         let mut original = [0_u8; CAPTURE_CHUNK_BYTES];
-        guest.memory().read_exact(scratch, &mut original)?;
-        let guard = stack.commit()?;
-        let result = self
-            .drain_procfs(guest, call, scratch, CAPTURE_CHUNK_BYTES)
-            .await;
-        guest.memory().write_exact(scratch, &original)?;
-        drop(guard);
-        result
+        {
+            let mut stack = guest.stack().await;
+            let scratch = stack.reserve::<[u8; CAPTURE_CHUNK_BYTES]>().cast::<u8>();
+            // `commit` writes the reserved bytes, so save them before it.
+            if save_procfs_scratch(&mut guest.memory(), scratch, &mut original)
+                && let Ok(guard) = stack.commit()
+            {
+                let result = self
+                    .drain_procfs(guest, call, scratch, CAPTURE_CHUNK_BYTES)
+                    .await;
+                guest.memory().write_exact(scratch, &original)?;
+                drop(guard);
+                return result;
+            }
+        }
+
+        let buffer = call.buf().ok_or(Errno::EFAULT)?;
+        for chunk in [call.len().min(CAPTURE_CHUNK_BYTES), 1] {
+            let original = &mut original[..chunk];
+            if save_procfs_scratch(&mut guest.memory(), buffer, original) {
+                let result = self.drain_procfs(guest, call, buffer, chunk).await;
+                guest.memory().write_exact(buffer, original)?;
+                return result;
+            }
+        }
+        Err(Errno::EFAULT.into())
     }
 
     /// Read the host file to EOF through `scratch`, `chunk` bytes at a time.
@@ -2273,9 +2337,22 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await;
         }
 
-        let needs_procfs_snapshot = guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_needs_snapshot())?;
+        let (needs_procfs_snapshot, serves_procfs_snapshot) =
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                (
+                    detfd.procfs_needs_snapshot(),
+                    detfd.procfs_serves_snapshot(),
+                )
+            })?;
+        if serves_procfs_snapshot {
+            validate_procfs_destination(
+                crate::iovecs::UserAddressPolicy::for_backend(
+                    guest.config().backend.user_address_limit,
+                ),
+                call.buf(),
+                call.len(),
+            )?;
+        }
         if needs_procfs_snapshot {
             self.initialize_procfs_snapshot(guest, call).await?;
         }
@@ -2386,9 +2463,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let offset = usize::try_from(call.offset()).map_err(|_| Errno::EINVAL)?;
-        let needs_procfs_snapshot = guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_needs_snapshot())?;
+        let (needs_procfs_snapshot, serves_procfs_snapshot) =
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                (
+                    detfd.procfs_needs_snapshot(),
+                    detfd.procfs_serves_snapshot(),
+                )
+            })?;
+        if serves_procfs_snapshot {
+            validate_procfs_destination(
+                crate::iovecs::UserAddressPolicy::for_backend(
+                    guest.config().backend.user_address_limit,
+                ),
+                call.buf(),
+                call.len(),
+            )?;
+        }
         if needs_procfs_snapshot {
             let read = syscalls::Read::new()
                 .with_fd(call.fd())

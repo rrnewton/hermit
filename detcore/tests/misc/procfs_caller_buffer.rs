@@ -25,6 +25,11 @@
 //!   the bytes it copied, so a read that faults leaves the data unread.
 //! - Capturing `/proc/self/maps` does not list a mapping that is gone by the
 //!   time the read returns.
+//! - That capture does not need stack below the stack pointer: a stack pointer
+//!   just above a guard page or unmapped memory still gets the listing, and
+//!   neither the stack nor the caller's buffer beyond the output is changed.
+//! - As in Linux, a requested range beyond the user address limit gets
+//!   `EFAULT` even at end of file, where any other range gets 0.
 
 use std::fs::File;
 use std::os::fd::AsRawFd;
@@ -320,10 +325,38 @@ fn procfs_failed_first_read_leaves_the_content_unread() {
     });
 }
 
+/// Whether every page of `[start, end)` is mapped. `msync(MS_ASYNC)` fails
+/// with `ENOMEM` at the first unmapped page and, unlike `mincore`, needs no
+/// buffer sized to the range: one maps row can reserve terabytes.
+fn range_is_mapped(start: usize, end: usize) -> Result<(), i32> {
+    let rc = unsafe { libc::msync(start as *mut libc::c_void, end - start, libc::MS_ASYNC) };
+    if rc == 0 { Ok(()) } else { Err(errno()) }
+}
+
+/// Require every row of `/proc/self/maps` text other than `[vsyscall]` to be
+/// mapped now, and return each row's range with its line.
+fn assert_rows_mapped(text: &str) -> Vec<(usize, usize, String)> {
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        if line.ends_with("[vsyscall]") {
+            continue;
+        }
+        let range = line.split_whitespace().next().unwrap();
+        let (start, end) = range.split_once('-').unwrap();
+        let start = usize::from_str_radix(start, 16).unwrap();
+        let end = usize::from_str_radix(end, 16).unwrap();
+        if let Err(errno) = range_is_mapped(start, end) {
+            panic!("row {line:?} is not mapped: errno {errno}");
+        }
+        rows.push((start, end, line.to_owned()));
+    }
+    rows
+}
+
 /// Every row of a freshly read `/proc/self/maps` is still mapped when the read
 /// returns. A capture mapping created and removed inside the read would show
 /// either as its own row or merged into a neighbouring row, and in both cases
-/// part of that row's range is gone, so `mincore` fails with `ENOMEM`. A
+/// part of that row's range is gone, so `msync` fails with `ENOMEM`. A
 /// guarded read/write page must also keep a row of exactly its own extent.
 #[test]
 fn procfs_self_maps_lists_no_capture_mapping() {
@@ -351,34 +384,231 @@ fn procfs_self_maps_lists_no_capture_mapping() {
         }
 
         let text = String::from_utf8(contents).unwrap();
-        let mut neighbour_row = None;
-        for line in text.lines() {
-            if line.ends_with("[vsyscall]") {
-                continue;
-            }
-            let range = line.split_whitespace().next().unwrap();
-            let (start, end) = range.split_once('-').unwrap();
-            let start = usize::from_str_radix(start, 16).unwrap();
-            let end = usize::from_str_radix(end, 16).unwrap();
-            let mut residency = vec![0_u8; (end - start).div_ceil(page)];
-            let rc = unsafe {
-                libc::mincore(
-                    start as *mut libc::c_void,
-                    end - start,
-                    residency.as_mut_ptr(),
-                )
-            };
-            assert_eq!(rc, 0, "row {line:?} is not mapped: errno {}", errno());
-            if (start..end).contains(&(neighbour as usize)) {
-                neighbour_row = Some((start, end, line.to_owned()));
-            }
-        }
-        let (start, end, line) = neighbour_row.expect("the guarded page has no row");
+        let (start, end, line) = assert_rows_mapped(&text)
+            .into_iter()
+            .find(|(start, end, _)| (*start..*end).contains(&(neighbour as usize)))
+            .expect("the guarded page has no row");
         assert_eq!(
             (start, end),
             (neighbour as usize, neighbour as usize + page),
             "the guarded page's row is {line:?}"
         );
+        // The probe sees a hole: with the middle page gone, the three-page
+        // range is no longer mapped.
+        let guarded_start = guarded as usize;
+        assert_eq!(
+            range_is_mapped(guarded_start, guarded_start + 3 * page),
+            Ok(())
+        );
+        assert_eq!(unsafe { libc::munmap(neighbour.cast(), page) }, 0);
+        assert_eq!(
+            range_is_mapped(guarded_start, guarded_start + 3 * page),
+            Err(libc::ENOMEM)
+        );
         assert_eq!(unsafe { libc::munmap(guarded.cast(), 3 * page) }, 0);
+    });
+}
+
+/// Issue `read(fd, buf, count)`, or `pread64(fd, buf, count, 0)` when
+/// `positioned`, with `rsp` switched to `stack` for the `syscall` instruction.
+///
+/// # Safety
+///
+/// As for the tight-stack `openat`: nothing is pushed to `stack`.
+unsafe fn raw_read_on_stack(
+    stack: *mut u8,
+    fd: libc::c_int,
+    buf: *mut u8,
+    count: usize,
+    positioned: bool,
+) -> i64 {
+    let number = if positioned {
+        libc::SYS_pread64
+    } else {
+        libc::SYS_read
+    };
+    let result: i64;
+    // SAFETY: rsp is swapped with r12 and swapped back before the block ends;
+    // `syscall` itself does not touch the user stack. rcx and r11 are the
+    // registers `syscall` clobbers.
+    unsafe {
+        std::arch::asm!(
+            "xchg rsp, r12",
+            "syscall",
+            "xchg rsp, r12",
+            inout("r12") stack => _,
+            inlateout("rax") number => result,
+            in("rdi") i64::from(fd),
+            in("rsi") buf,
+            in("rdx") count,
+            in("r10") 0_i64,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    result
+}
+
+/// The first read of `/proc/self/maps` needs no stack, so a stack pointer just
+/// above a guard page or unmapped memory must not fail it. The stack page and
+/// the caller's buffer beyond the output keep their bytes, and the listing
+/// still has no capture mapping.
+#[test]
+fn procfs_self_maps_first_read_succeeds_without_writable_stack_below_rsp() {
+    use super::tight_stack_openat::BelowStack;
+    super::det_test_fn_sequential_without_pmu(|| {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        // 1024 bytes leave room below the red zone for the whole scratch and
+        // are the control; 512, 192 and 0 do not.
+        for (below, writable_bytes) in [
+            (BelowStack::GuardPage, 1024),
+            (BelowStack::GuardPage, 512),
+            (BelowStack::GuardPage, 192),
+            (BelowStack::GuardPage, 0),
+            (BelowStack::Unmapped, 192),
+            (BelowStack::Unmapped, 0),
+        ] {
+            for positioned in [false, true] {
+                let (stack, mapping, mapping_len) =
+                    super::tight_stack_openat::tight_stack(below, writable_bytes);
+                let stack_page = unsafe { stack.sub(writable_bytes) };
+                unsafe { std::ptr::write_bytes(stack_page, SENTINEL, page) };
+                let file = File::open("/proc/self/maps").unwrap();
+                let mut contents = vec![SENTINEL; 1 << 20];
+                let n = unsafe {
+                    raw_read_on_stack(
+                        stack,
+                        file.as_raw_fd(),
+                        contents.as_mut_ptr(),
+                        contents.len(),
+                        positioned,
+                    )
+                };
+                let case = format!(
+                    "{} with {writable_bytes} writable bytes above a {below:?} region",
+                    if positioned { "pread" } else { "read" }
+                );
+                assert!(n > 0, "{case} returned {n}");
+                assert!(
+                    (n as usize) < contents.len(),
+                    "/proc/self/maps outgrew the buffer"
+                );
+                let stack_bytes = unsafe { std::slice::from_raw_parts(stack_page, page) };
+                assert!(
+                    stack_bytes.iter().all(|&byte| byte == SENTINEL),
+                    "{case} changed the stack page"
+                );
+                assert!(
+                    contents[n as usize..].iter().all(|&byte| byte == SENTINEL),
+                    "{case} left bytes beyond the output in the caller's buffer"
+                );
+                let text = std::str::from_utf8(&contents[..n as usize]).unwrap();
+                assert_rows_mapped(text);
+                assert_eq!(unsafe { libc::munmap(mapping, mapping_len) }, 0);
+            }
+        }
+    });
+}
+
+/// With no stack scratch, the caller's destination is checked the way Linux
+/// checks it: a destination that faults part way gets the bytes before the
+/// fault, and a read-only one gets `EFAULT` and is not written.
+#[test]
+fn procfs_self_maps_first_read_on_a_tight_stack_checks_the_destination() {
+    use super::tight_stack_openat::BelowStack;
+    super::det_test_fn_sequential_without_pmu(|| {
+        for positioned in [false, true] {
+            let (stack, stack_mapping, stack_len) =
+                super::tight_stack_openat::tight_stack(BelowStack::GuardPage, 0);
+            let (mapping, page) = sentinel_pages(2);
+            let second_page = unsafe { mapping.add(page) };
+            protect(second_page, page, libc::PROT_NONE);
+            let file = File::open("/proc/self/maps").unwrap();
+            let n = unsafe {
+                raw_read_on_stack(stack, file.as_raw_fd(), second_page.sub(4), 512, positioned)
+            };
+            assert_eq!(n, 4, "positioned: {positioned}");
+            let offset = unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_CUR) };
+            assert_eq!(offset, if positioned { 0 } else { 4 });
+            protect(second_page, page, libc::PROT_READ | libc::PROT_WRITE);
+            let tail = unsafe { std::slice::from_raw_parts(second_page, page) };
+            assert!(tail.iter().all(|&byte| byte == SENTINEL));
+
+            // The prefix above went to the end of this page.
+            unsafe { std::ptr::write_bytes(mapping, SENTINEL, page) };
+            protect(mapping, page, libc::PROT_READ);
+            let file = File::open("/proc/self/maps").unwrap();
+            let n = unsafe { raw_read_on_stack(stack, file.as_raw_fd(), mapping, 512, positioned) };
+            assert_eq!(n, -i64::from(libc::EFAULT), "positioned: {positioned}");
+            assert_eq!(
+                unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_CUR) },
+                0
+            );
+            let head = unsafe { std::slice::from_raw_parts(mapping, page) };
+            assert!(head.iter().all(|&byte| byte == SENTINEL));
+            assert_eq!(unsafe { libc::munmap(mapping.cast(), 2 * page) }, 0);
+            assert_eq!(unsafe { libc::munmap(stack_mapping, stack_len) }, 0);
+        }
+    });
+}
+
+/// Linux checks the whole requested range against the user address limit
+/// before reading, so a range beyond it is `EFAULT` even at EOF. A range
+/// within the limit gets 0 at EOF whether or not its pages are mapped.
+fn read_at_eof(fd: libc::c_int, positioned: bool, buf: usize, count: usize) -> (isize, i32) {
+    let n = unsafe {
+        if positioned {
+            libc::pread(fd, buf as *mut libc::c_void, count, 0)
+        } else {
+            libc::read(fd, buf as *mut libc::c_void, count)
+        }
+    };
+    (n, if n < 0 { errno() } else { 0 })
+}
+
+fn assert_eof_ranges(fd: libc::c_int, positioned: bool, offset: i64) {
+    let call = if positioned { "pread" } else { "read" };
+    // Within the limit: no page is mapped at 4 KiB, and NULL has no bytes to take.
+    assert_eq!(
+        read_at_eof(fd, positioned, 0x1000, 1 << 20),
+        (0, 0),
+        "{call}"
+    );
+    assert_eq!(read_at_eof(fd, positioned, 0, 8), (0, 0), "{call}");
+    // Beyond it: the start, the end, or an end that wraps around.
+    for (buf, count) in [
+        (usize::MAX - 0xfff, 1),
+        (0x1000, 1 << 62),
+        (0x1000, usize::MAX - 0xfff),
+    ] {
+        assert_eq!(
+            read_at_eof(fd, positioned, buf, count),
+            (-1, libc::EFAULT),
+            "{call} of {count:#x} bytes at {buf:#x} at EOF"
+        );
+    }
+    assert_eq!(unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) }, offset);
+}
+
+#[test]
+fn procfs_read_beyond_the_user_address_limit_fails_efault_at_eof() {
+    super::det_test_fn_without_pmu(|| {
+        // Sanitized /proc/modules is empty, so its first read is at EOF.
+        for positioned in [false, true] {
+            let file = File::open("/proc/modules").unwrap();
+            assert_eof_ranges(file.as_raw_fd(), positioned, 0);
+        }
+        // /proc/uptime after reading all of it.
+        let file = File::open("/proc/uptime").unwrap();
+        let fd = file.as_raw_fd();
+        let mut whole = [0_u8; 256];
+        let len = unsafe { libc::read(fd, whole.as_mut_ptr().cast(), whole.len()) };
+        assert!(len > 0);
+        assert_eq!(
+            unsafe { libc::read(fd, whole.as_mut_ptr().cast(), whole.len()) },
+            0
+        );
+        assert_eof_ranges(fd, false, len as i64);
     });
 }

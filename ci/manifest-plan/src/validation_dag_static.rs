@@ -1171,7 +1171,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Seven more procfs_caller_buffer tests (destination protection, partial
     // copies, the failed-read offset and the self-maps capture) retain all 65
     // (measured 72).
-    ("test.detcore_misc", 72),
+    // Three more (a first self-maps read on a tight stack, its destination
+    // checks, and the user-address-limit check at end of file) retain all 72
+    // (measured 75).
+    ("test.detcore_misc", 75),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -1501,8 +1504,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.app_strict_verify_on_host", 8),
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
-    // The host node carries the identical 72-test tests_misc selection.
-    ("test.detcore_misc_on_host", 72),
+    // The host node carries the identical 75-test tests_misc selection.
+    ("test.detcore_misc_on_host", 75),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).

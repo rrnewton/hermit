@@ -483,6 +483,15 @@ impl DetFd {
             .is_some_and(ProcfsFile::needs_snapshot)
     }
 
+    /// Whether reads of this open file description are served from a procfs
+    /// snapshot, already taken or still to be taken.
+    pub(crate) fn procfs_serves_snapshot(&self) -> bool {
+        self.description()
+            .procfs
+            .as_ref()
+            .is_some_and(|procfs| procfs.needs_snapshot() || procfs.position().1.is_some())
+    }
+
     /// Whether this procfs snapshot consumes deterministic random bytes.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-955): Review deterministic kernel UUID generation.
