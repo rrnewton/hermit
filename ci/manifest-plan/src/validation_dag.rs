@@ -1342,6 +1342,20 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
     hosted_workspace.cmd = hosted_workspace
         .cmd
         .replace(&local_prebuild, &hosted_prebuild);
+    // The hosted runner builds at three Cargo workers on varying hardware, so
+    // the hosted twin alone carries a longer wall; its CPU bound and memory
+    // hints stay the local node's. See HOSTED_WORKSPACE_WALL_DESCRIPTION.
+    if hosted_workspace.timeout != crate::validation_dag_static::WORKSPACE_WALL_SECONDS {
+        return Err(format!(
+            "hosted workspace producer inherited a {}s wall, not build.workspace's {}s",
+            hosted_workspace.timeout,
+            crate::validation_dag_static::WORKSPACE_WALL_SECONDS
+        ));
+    }
+    hosted_workspace.timeout = crate::validation_dag_static::HOSTED_WORKSPACE_WALL_SECONDS;
+    hosted_workspace
+        .description
+        .push_str(crate::validation_dag_static::HOSTED_WORKSPACE_WALL_DESCRIPTION);
     // The publisher verifies the binary it publishes against the preparation
     // record of the profile its workspace producer prepared.
     let hosted_publisher = cfg
@@ -2927,10 +2941,23 @@ fn assert_pinned_workspace_split(cfg: &DagConfig) -> Result<(), String> {
         ));
     }
     // The Cargo half carries the unsplit producer's heavy budget, which the
-    // hosted producer still runs whole.
+    // hosted producer still runs whole. The walls are compared with their
+    // authored values: the Cargo half keeps build.workspace's, and only the
+    // hosted twin carries the longer hosted wall.
+    if compile.timeout != crate::validation_dag_static::WORKSPACE_WALL_SECONDS {
+        return Err(format!(
+            "{PINNED_WORKSPACE_COMPILE_TAG} lost the workspace build's budget"
+        ));
+    }
     if let Some(hosted) = by_tag.get("build.workspace_on_host") {
-        if compile.timeout != hosted.timeout
-            || compile.cpu_timeout != hosted.cpu_timeout
+        if hosted.timeout != crate::validation_dag_static::HOSTED_WORKSPACE_WALL_SECONDS {
+            return Err(format!(
+                "build.workspace_on_host has a {}s wall, not the hosted {}s",
+                hosted.timeout,
+                crate::validation_dag_static::HOSTED_WORKSPACE_WALL_SECONDS
+            ));
+        }
+        if compile.cpu_timeout != hosted.cpu_timeout
             || compile.hint.rss_baseline_bytes != hosted.hint.rss_baseline_bytes
             || compile.hint.hard_mem_max_bytes != hosted.hint.hard_mem_max_bytes
             || compile.hint.classification != hosted.hint.classification
@@ -6538,6 +6565,28 @@ sys.exit(37)
             step.labels.pop();
         });
         assert!(relabeled.contains("labels"), "{relabeled}");
+        // The Cargo half keeps build.workspace's authored wall and the hosted
+        // twin keeps the hosted wall; neither may take the other's, and the
+        // hosted twin's CPU bound stays the Cargo half's.
+        let compile_wall = mutated(PINNED_WORKSPACE_COMPILE_TAG, &|step| {
+            step.timeout = crate::validation_dag_static::HOSTED_WORKSPACE_WALL_SECONDS
+        });
+        assert!(
+            compile_wall.contains("lost the workspace build's budget"),
+            "{compile_wall}"
+        );
+        let hosted_wall = mutated("build.workspace_on_host", &|step| {
+            step.timeout = crate::validation_dag_static::WORKSPACE_WALL_SECONDS
+        });
+        assert!(
+            hosted_wall.contains("not the hosted 2100s"),
+            "{hosted_wall}"
+        );
+        let hosted_cpu = mutated("build.workspace_on_host", &|step| step.cpu_timeout += 1);
+        assert!(
+            hosted_cpu.contains("lost the workspace build's budget"),
+            "{hosted_cpu}"
+        );
         // The assertion is wired into the generator's invariant set.
         let mut changed = committed.clone();
         changed
