@@ -1058,9 +1058,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retain all 954 prior identities: 954 + 3 = 957.
     // syscalls::files::rebound_path_tests::an_operand_that_cannot_be_established_is_reported_as_the_root
     // retains all 957 (958, measured with cargo nextest list).
+    // Four tool_global::tests mount-ID tests and two procfs::tests mountinfo
+    // tests (mount IDs numbered by first observation, hermit 565ec411cd21)
+    // retain all 958: 958 + 6 = 964, the count a full validate run measured
+    // at a25b3fcd3805 ("Starting 964 tests across 2 binaries").
     // syscalls::network_trace::tests::select_sets_report_each_set_s_events_as_fs_select_c_does
-    // retains all 958 (959).
-    ("test.detcore_unit", 959),
+    // retains all 964 (965).
+    ("test.detcore_unit", 965),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1397,8 +1401,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // host-input observation test (952).
     // The same two forwarded-record tests retain all 952: 952 + 2 = 954.
     // The same three DETLOG forwarding-policy tests retain all 954: 957.
-    // And the rebound-path test (958), and the select-set test (959).
-    ("test.detcore_unit_on_host", 959),
+    // And the rebound-path test (958), the six mount-ID tests (964), and the
+    // select-set test (965).
+    ("test.detcore_unit_on_host", 965),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
