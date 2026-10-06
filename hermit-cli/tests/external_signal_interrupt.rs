@@ -2021,6 +2021,352 @@ fn ptrace_terminal_hangup_after_tiocsctty_keeps_a_poll_to_its_deadline() {
     assert_parent_death_signal_keeps_a_poll_to_its_deadline("ptrace", "hupctty");
 }
 
+/// The guest's `poll hupinherit` RESULT line when the poll keeps its deadline
+/// and the handler runs once afterwards: this prefix, the guest's `elapsed`
+/// milliseconds, then this suffix.
+const HUPINHERIT_KEPT_PREFIX: &str = "RESULT call=poll role=hupinherit ret=0 errno=none elapsed=";
+const HUPINHERIT_KEPT_SUFFIX: &str = " handled=1 ok=1";
+
+/// One run of the guest's `poll hupinherit` mode under a session leader that
+/// owns a pseudoterminal.
+struct InheritedTerminalRun {
+    /// How the session leader that started Hermit ended, which is how Hermit
+    /// ended: the leader exits with Hermit's status.
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
+    /// Host wall time from the guest's READY line to its RESULT line.
+    ready_to_result: Option<Duration>,
+}
+
+impl InheritedTerminalRun {
+    fn line(&self, prefix: &str) -> Option<&str> {
+        self.stdout.lines().find(|line| line.starts_with(prefix))
+    }
+
+    fn has_line(&self, want: &str) -> bool {
+        self.stdout.lines().any(|line| line == want)
+    }
+
+    fn kept_its_deadline(&self) -> bool {
+        self.line("RESULT ").is_some_and(|line| {
+            line.starts_with(HUPINHERIT_KEPT_PREFIX) && line.ends_with(HUPINHERIT_KEPT_SUFFIX)
+        })
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "status={:?} ready_to_result={:?}\nguest stdout:\n{}\nhermit stderr:\n{}",
+            self.status, self.ready_to_result, self.stdout, self.stderr
+        )
+    }
+}
+
+/// Run the guest's `poll hupinherit` mode under Hermit, started by a shell
+/// that leads a new session whose controlling terminal is a pseudoterminal's
+/// slave, so that Hermit and the guest inherit that terminal and none of the
+/// three standard descriptors is a terminal. `EXTERNAL_SIGNAL_DELAY` after the
+/// guest's READY line this process sends the guest SIGHUP, from outside the
+/// container. This process keeps the master open until the run ends, so the
+/// terminal never hangs up.
+fn run_inherited_terminal_cell(namespace: bool) -> InheritedTerminalRun {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let describe = format!("ptrace poll hupinherit namespace={namespace}");
+    // Compiling the guest also creates the directory that holds every trial.
+    let guest = guest();
+    let trial = tempfile::Builder::new()
+        .prefix("trial-")
+        .tempdir_in(build_root())
+        .expect("failed to create trial directory");
+    let program = trial.path().join("esi");
+    std::os::unix::fs::symlink(guest, &program).expect("failed to link the guest");
+    let stdout_path = trial.path().join("stdout");
+    let stdout_writer = fs::File::create(&stdout_path).expect("failed to create guest stdout");
+
+    let master = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open("/dev/ptmx")
+        .expect("failed to open /dev/ptmx");
+    let mut name = [0 as libc::c_char; 128];
+    // SAFETY: plain calls on a descriptor this process owns; `name` has room
+    // for any pseudoterminal path, and ptsname_r terminates it.
+    let slave_path = unsafe {
+        assert_eq!(libc::grantpt(master.as_raw_fd()), 0, "grantpt failed");
+        assert_eq!(libc::unlockpt(master.as_raw_fd()), 0, "unlockpt failed");
+        assert_eq!(
+            libc::ptsname_r(master.as_raw_fd(), name.as_mut_ptr(), name.len()),
+            0,
+            "ptsname_r failed"
+        );
+        std::ffi::CStr::from_ptr(name.as_ptr())
+            .to_str()
+            .expect("the pseudoterminal path should be UTF-8")
+            .to_owned()
+    };
+    let slave = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(&slave_path)
+        .unwrap_or_else(|error| panic!("failed to open {slave_path}: {error}"));
+    let slave_fd = slave.as_raw_fd();
+
+    // The shell stays the session leader, as a login shell would, and exits
+    // with Hermit's status.
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg(r#""$@"; exit "$?""#)
+        .arg("sh")
+        .arg(hermit_binary::hermit_binary())
+        .args(["--backend", "ptrace", "run"]);
+    // `--strict` refuses `--no-namespace`, which shares the host's network.
+    command.arg(if namespace {
+        "--strict"
+    } else {
+        "--no-namespace"
+    });
+    command
+        .arg("--")
+        .arg(&program)
+        .args(["poll", "hupinherit"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_writer))
+        .stderr(Stdio::piped());
+    // SAFETY: only async-signal-safe calls run between fork and exec, on a
+    // descriptor that stays open until exec.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setsid() < 0 || libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let (cell, test_deadline) = begin_cell(&describe);
+    let mut leader = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to spawn the session leader: {error}"));
+    drop(slave);
+    let leader_pid = leader.id() as libc::pid_t;
+    let stderr = leader.stderr.take().expect("stderr was piped");
+    let (send, receive) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            match line {
+                Ok(line) => {
+                    if send.send(StderrEvent::Line(line)).is_err() {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let _ = send.send(StderrEvent::Error(error.to_string()));
+                    return;
+                }
+            }
+        }
+        let _ = send.send(StderrEvent::Eof);
+    });
+
+    let started = Instant::now();
+    let (startup_deadline, startup_limit) = phase_deadline(started, STARTUP_BOUND, test_deadline);
+    let (cell_deadline, cell_limit) = phase_deadline(started, WATCHDOG_BACKSTOP, test_deadline);
+    let mut status: Option<ExitStatus> = None;
+    let mut ready_at: Option<Instant> = None;
+    let mut result_at: Option<Instant> = None;
+    let mut signalled = false;
+    let mut lines = Vec::new();
+    let mut truncated = false;
+    let mut stderr_eof = false;
+    let mut failure = None;
+
+    while status.is_none() || !stderr_eof {
+        if status.is_none() {
+            status = leader
+                .try_wait()
+                .expect("failed to poll the session leader");
+        }
+        let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
+        let now = Instant::now();
+        if ready_at.is_none() && stdout.lines().any(|line| line == "READY") {
+            ready_at = Some(now);
+        }
+        if result_at.is_none() && stdout.lines().any(|line| line.starts_with("RESULT ")) {
+            result_at = Some(now);
+        }
+        if failure.is_none() && ready_at.is_none() && status.is_none() && now >= startup_deadline {
+            failure = Some(format!(
+                "cell {cell}: no READY line {:.1}s after starting Hermit, at {startup_limit}",
+                (now - started).as_secs_f64()
+            ));
+        }
+        if let Some(ready) = ready_at {
+            if !signalled && status.is_none() && ready.elapsed() >= EXTERNAL_SIGNAL_DELAY {
+                let pids = pids_with_argv0(&program);
+                if let [pid] = pids[..] {
+                    // SAFETY: plain kill(2) on a pid read from /proc.
+                    if unsafe { libc::kill(pid, libc::SIGHUP) } != 0 {
+                        failure = Some(format!(
+                            "kill({pid}, SIGHUP) failed: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                } else {
+                    failure = Some(format!(
+                        "expected exactly one guest process with argv[0] {}, found {pids:?}",
+                        program.display()
+                    ));
+                }
+                signalled = true;
+            }
+            let (result_deadline, result_limit) =
+                phase_deadline(ready, RESULT_BOUND, test_deadline);
+            if failure.is_none() && result_at.is_none() && now >= result_deadline {
+                failure = Some(format!(
+                    "cell {cell}: no RESULT line {:.1}s after READY, at {result_limit}",
+                    (now - ready).as_secs_f64()
+                ));
+            }
+        }
+        if failure.is_none() && now >= cell_deadline {
+            failure = Some(format!(
+                "cell {cell}: watchdog deadline {:.1}s after starting Hermit, at {cell_limit}; \
+                 status={status:?}, ready={}",
+                (now - started).as_secs_f64(),
+                ready_at.is_some(),
+            ));
+        }
+        if failure.is_some() {
+            break;
+        }
+        match receive.recv_timeout(Duration::from_millis(10)) {
+            Ok(StderrEvent::Line(line)) => {
+                if lines.len() < MAX_DIAGNOSTIC_LINES {
+                    lines.push(line);
+                } else {
+                    truncated = true;
+                }
+            }
+            Ok(StderrEvent::Error(error)) => {
+                failure = Some(format!("failed while draining hermit stderr: {error}"));
+                break;
+            }
+            Ok(StderrEvent::Eof) | Err(mpsc::RecvTimeoutError::Disconnected) => stderr_eof = true,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+
+    if failure.is_some() {
+        // The leader's process group holds Hermit and every guest process.
+        // SAFETY: plain kill(2).
+        unsafe {
+            libc::kill(-leader_pid, libc::SIGKILL);
+        }
+        let _ = leader.kill();
+    }
+    // Always reap the leader here, on normal exit and failure alike.
+    let status = match status {
+        Some(status) => status,
+        None => leader
+            .wait()
+            .expect("failed to wait for the session leader"),
+    };
+    drop(master);
+    reader.join().expect("stderr reader panicked");
+    let stdout = fs::read_to_string(&stdout_path).expect("failed to read guest stdout");
+    let mut stderr = lines.join("\n");
+    if truncated {
+        stderr.push_str(&format!(
+            "\n[watchdog retained the first {MAX_DIAGNOSTIC_LINES} stderr lines]"
+        ));
+    }
+    if let Some(reason) = failure {
+        panic!("{describe}: {reason}\nguest stdout:\n{stdout}\nhermit stderr:\n{stderr}");
+    }
+    let ready_to_result = ready_at
+        .zip(result_at)
+        .map(|(ready, result)| result - ready);
+    eprintln!(
+        "[esi] cell {cell}: {}; READY to RESULT {ready_to_result:?} of host wall time",
+        stdout
+            .lines()
+            .find(|line| line.starts_with("RESULT "))
+            .unwrap_or("no RESULT line")
+    );
+    InheritedTerminalRun {
+        status,
+        stdout,
+        stderr,
+        ready_to_result,
+    }
+}
+
+/// A SIGHUP from outside the container while Hermit holds an inherited
+/// controlling terminal (the guest's `poll hupinherit` mode). A shell leads a
+/// new session whose controlling terminal is a pseudoterminal and starts
+/// Hermit, which the guest inherits the session and the terminal from; the
+/// guest neither opens the terminal nor issues TIOCSCTTY, and none of its
+/// standard descriptors is a terminal. The guest catches SIGHUP and polls no
+/// descriptors for 10 s; 500 ms after its READY line this process sends it
+/// SIGHUP. Natively the poll returns EINTR then. Under Hermit that instant is
+/// set by the host, and no traced call gives Detcore a turn in which to record
+/// it, so Hermit records SIGHUP and SIGCONT as host-timed for the whole
+/// container before the guest's first instruction whenever the launch may pass
+/// the guest a terminal, and no gated wait ends for them: in each run the poll
+/// returns 0 after its full timeout and the handler runs once afterwards.
+/// Round-10 High 2 of https://github.com/rrnewton/hermit/pull/3361: nothing
+/// recorded those signals for an inherited terminal, and the poll returned
+/// EINTR at a turn the host chose
+/// (https://github.com/rrnewton/hermit/issues/3146).
+///
+/// The signal stands for the terminal's own hangup, which cannot be used
+/// here: closing the master hangs the terminal up, Linux sends SIGHUP and
+/// SIGCONT to the session leader, and the leader's exit sends both to the
+/// terminal's foreground process group. That group holds Hermit's container
+/// process too, which answers SIGHUP by ending the run with exit code 129
+/// (`on_container_init_stop_signal` in hermit-cli's container.rs), in both
+/// namespace modes, before the guest's poll returns.
+///
+/// Each run is a separate launch, `PDEATH_RUNS` of them, and none runs under
+/// `--verify`: the signal arrives once per launch, from outside, so the second
+/// run of a verified pair would have no signal and would differ in its INFO
+/// log whatever Hermit did with the first. `--strict` refuses `--no-namespace`,
+/// so this cell runs without it.
+#[test]
+fn ptrace_an_inherited_terminal_keeps_a_poll_to_its_deadline_through_sighup_without_a_namespace() {
+    assert_an_inherited_terminal_keeps_a_poll_to_its_deadline(false);
+}
+
+/// The same cell in the default namespace mode, under `--strict`. A guest
+/// started there inherits the launcher's controlling terminal too, since
+/// neither Hermit nor Reverie starts a new session or process group for it:
+/// the guest prints `CTTY 1`.
+#[test]
+fn ptrace_an_inherited_terminal_keeps_a_poll_to_its_deadline_through_sighup_in_a_namespace() {
+    assert_an_inherited_terminal_keeps_a_poll_to_its_deadline(true);
+}
+
+fn assert_an_inherited_terminal_keeps_a_poll_to_its_deadline(namespace: bool) {
+    for run_index in 1..=PDEATH_RUNS {
+        let run = run_inherited_terminal_cell(namespace);
+        assert!(
+            run.status.success()
+                && run.has_line("CTTY 1")
+                && run.kept_its_deadline()
+                && run.has_line("DONE"),
+            "run {run_index} of {PDEATH_RUNS}, namespace={namespace}, poll hupinherit: expected \
+             CTTY 1, `{HUPINHERIT_KEPT_PREFIX}<ms>{HUPINHERIT_KEPT_SUFFIX}`, DONE, and Hermit \
+             exiting 0\n{}",
+            run.describe()
+        );
+    }
+}
+
 /// `wait4` and `waitid` restart under SA_RESTART, as Linux restarts them: the
 /// waited child signals the parent near 100 ms and exits 100 ms later. The
 /// handler runs near 100 ms, before `HANDLED_BEFORE_EXIT_MS`, the call does not

@@ -275,6 +275,24 @@ fn kernel_signal_bit(raw_signal: i32) -> u64 {
     }
 }
 
+/// The signals recorded as host-timed for every process of the container
+/// before the guest's first instruction (`host_timed_signals_everywhere`):
+/// SIGHUP and SIGCONT when the guest may start with a terminal and blocked
+/// waits decide interruption from the kernel's signal state
+/// (`Config::guest_may_inherit_a_terminal`), and nothing otherwise. Linux sends
+/// both when that terminal hangs up, as it does for one a guest makes its
+/// controlling terminal (`terminal_hangup_signals` in `syscalls/files.rs`), at
+/// a moment set by host timing. The guest makes no traced call that arms them,
+/// so no guest turn could record them
+/// (<https://github.com/rrnewton/hermit/issues/3146>).
+fn startup_host_timed_signals(cfg: &Config) -> u64 {
+    if cfg.backend_supports_blocked_wait_signal_interruption && cfg.guest_may_inherit_a_terminal {
+        kernel_signal_bit(libc::SIGHUP) | kernel_signal_bit(libc::SIGCONT)
+    } else {
+        0
+    }
+}
+
 /// Render an already-sorted thread list for a diagnostic, or `none`.
 fn render_tid_list(tids: &[DetTid]) -> String {
     if tids.is_empty() {
@@ -719,8 +737,10 @@ pub struct Scheduler {
     /// (<https://github.com/rrnewton/hermit/issues/3146>).
     host_timed_signals: BTreeMap<DetPid, u64>,
 
-    /// Signals that a host-timed source armed by a guest can post to any process
-    /// of the container (`HostTimedSignalScope::Container`). Never removed.
+    /// Signals that a host-timed source can post to any process of the
+    /// container: one a guest armed (`HostTimedSignalScope::Container`), and
+    /// from the start, a terminal the guest may have inherited
+    /// (`startup_host_timed_signals`). Never removed.
     host_timed_signals_everywhere: u64,
 
     /// Kernel signal states that tests install for parked futex waiters, in
@@ -1896,7 +1916,7 @@ impl Scheduler {
             models_signal_targets: cfg.sequentialize_threads
                 && cfg.backend_supports_blocked_wait_signal_interruption,
             host_timed_signals: Default::default(),
-            host_timed_signals_everywhere: 0,
+            host_timed_signals_everywhere: startup_host_timed_signals(cfg),
             #[cfg(test)]
             test_kernel_signal_states: Default::default(),
             #[cfg(test)]
@@ -4084,7 +4104,9 @@ impl Scheduler {
 
     /// The signals that no gated wait of `thread` ends for, because a
     /// host-timed source a guest armed can post them to its process
-    /// (`record_host_timed_signals`). Gated waits read this in their own turn.
+    /// (`record_host_timed_signals`), or a terminal the guest may have
+    /// inherited can (`startup_host_timed_signals`). Gated waits read this in
+    /// their own turn.
     pub fn host_timed_signals(&self, thread: DetTid) -> u64 {
         let process = self.sigchld_process(thread);
         self.host_timed_signals_everywhere
@@ -9191,6 +9213,66 @@ mod test {
             scheduler.parked_futex_interrupting_signals(child),
             Some(usr1 | term)
         );
+    }
+
+    /// A launch that may pass the guest a terminal records SIGHUP and SIGCONT
+    /// as host-timed for every process before the guest runs, so a parked
+    /// precise-mode futex wait that catches both ends for neither, in the
+    /// first process and in a forked child alike. Nothing is recorded without
+    /// that terminal, or on a backend whose blocked waits do not read the
+    /// kernel's signal state (https://github.com/rrnewton/hermit/issues/3146).
+    #[test]
+    fn a_launch_that_may_pass_a_terminal_holds_sighup_and_sigcont_from_the_start() {
+        let hup = kernel_signal_bit(libc::SIGHUP);
+        let cont = kernel_signal_bit(libc::SIGCONT);
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        let gated = |guest_may_inherit_a_terminal| Config {
+            sequentialize_threads: true,
+            backend_supports_blocked_wait_signal_interruption: true,
+            guest_may_inherit_a_terminal,
+            ..Config::default()
+        };
+        assert_eq!(startup_host_timed_signals(&gated(true)), hup | cont);
+        assert_eq!(startup_host_timed_signals(&gated(false)), 0);
+        assert_eq!(
+            startup_host_timed_signals(&Config {
+                guest_may_inherit_a_terminal: true,
+                ..Config::default()
+            }),
+            0,
+            "a backend whose waits do not read the kernel's signal state records nothing"
+        );
+
+        let mut scheduler = Scheduler::new(&gated(true));
+        assert!(scheduler.models_signal_targets);
+        let parent = DetTid::from_raw(100);
+        let child = DetTid::from_raw(200);
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, child, true);
+        for thread in [parent, child] {
+            register_known_thread(&mut scheduler, thread);
+        }
+        for (thread, mm_pid) in [(parent, 100), (child, 200)] {
+            assert_eq!(scheduler.host_timed_signals(thread), hup | cont);
+            scheduler.sleep_futex_waiter(
+                &thread,
+                FutexID::private(MmId::initial(DetPid::from_raw(mm_pid)), 0x404110),
+                None,
+                u32::MAX,
+                Some(signal_watch(hup | cont | usr1)),
+            );
+            scheduler
+                .test_kernel_signal_states
+                .insert(thread, signal_state(hup | cont | usr1, 0));
+            assert_eq!(
+                scheduler.parked_futex_interrupting_signals(thread),
+                Some(usr1),
+                "only SIGUSR1 ends the wait of {thread:?}"
+            );
+        }
+
+        let scheduler = Scheduler::new(&gated(false));
+        assert_eq!(scheduler.host_timed_signals(parent), 0);
     }
 
     /// A parent process 100 whose second thread 101 created child process 200

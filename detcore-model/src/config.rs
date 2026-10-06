@@ -121,6 +121,24 @@ pub struct Config {
     #[clap(skip)]
     pub backend_supports_blocked_wait_signal_interruption: bool,
 
+    /// The guest may start with a terminal: one of the launcher's standard
+    /// descriptors is a terminal, the launcher has a controlling terminal that
+    /// the guest inherits with its session, or the launcher could not tell.
+    /// Linux sends SIGHUP and SIGCONT when such a terminal hangs up, at a moment
+    /// the host sets, and the guest makes no traced call that arms it, so where
+    /// blocked waits decide interruption from the kernel's signal state
+    /// ([`Config::backend_supports_blocked_wait_signal_interruption`]) the
+    /// scheduler records both signals as host-timed for every process before
+    /// the guest's first instruction
+    /// (<https://github.com/rrnewton/hermit/issues/3146>).
+    ///
+    /// The host sets it while it prepares the backend configuration. It has no
+    /// legacy key: [`to_legacy_backend_json`] leaves it out and
+    /// [`from_legacy_backend_json`] reads it back as false.
+    #[serde(default)]
+    #[clap(skip)]
+    pub guest_may_inherit_a_terminal: bool,
+
     /// Epoch of the logical time.
     ///
     /// This is the datetime from which all time and date modtimes begin and
@@ -1433,7 +1451,8 @@ impl Default for Config {
 /// form never had, is left out too, and reads back as false: this form serves
 /// only DBT, whose launcher collects no host inputs. So is
 /// [`Config::backend_supports_blocked_wait_signal_interruption`], which
-/// is false for DBT. Every other field is serialized exactly as
+/// is false for DBT, and [`Config::guest_may_inherit_a_terminal`], which only
+/// that capability reads. Every other field is serialized exactly as
 /// `serde_json::to_string(config)` serializes it.
 ///
 /// Use this wherever the JSON is visible to the guest. `hermit run
@@ -1752,10 +1771,12 @@ mod legacy_backend_json {
     /// never written and always reads as false.
     /// `backend_supports_blocked_wait_signal_interruption` is the same: it is
     /// false for DBT, so it is never written and always reads as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 3] = [
+    /// So is `guest_may_inherit_a_terminal`, which only that capability reads.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 4] = [
         "backend",
         "record_host_inputs",
         "backend_supports_blocked_wait_signal_interruption",
+        "guest_may_inherit_a_terminal",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -1844,10 +1865,10 @@ mod legacy_backend_json {
     /// derived `Config` deserializer asks for one element per field in
     /// declaration order; at [`Config::backend`] this reads up to fifteen
     /// elements as the legacy backend keys, and neither the field it asks for
-    /// there nor [`Config::record_host_inputs`] or
-    /// [`Config::backend_supports_blocked_wait_signal_interruption`] takes an
-    /// element. Each gets a placeholder; [`super::from_legacy_backend_json`]
-    /// replaces the first.
+    /// there nor [`Config::record_host_inputs`],
+    /// [`Config::backend_supports_blocked_wait_signal_interruption`] or
+    /// [`Config::guest_may_inherit_a_terminal`] takes an element. Each gets a
+    /// placeholder; [`super::from_legacy_backend_json`] replaces the first.
     struct LegacyPositions<'f, 'l, A> {
         inner: A,
         fields: std::slice::Iter<'f, String>,
@@ -1877,7 +1898,9 @@ mod legacy_backend_json {
                         .map_err(<A::Error as de::Error>::custom)
                 }
                 Some(
-                    "record_host_inputs" | "backend_supports_blocked_wait_signal_interruption",
+                    "record_host_inputs"
+                    | "backend_supports_blocked_wait_signal_interruption"
+                    | "guest_may_inherit_a_terminal",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 _ => self.inner.next_element_seed(seed),
             }
@@ -2118,9 +2141,9 @@ mod legacy_backend_json {
                     Ok(())
                 }
                 // No legacy key; see FIELDS_WITHOUT_A_LEGACY_KEY.
-                "record_host_inputs" | "backend_supports_blocked_wait_signal_interruption" => {
-                    Ok(())
-                }
+                "record_host_inputs"
+                | "backend_supports_blocked_wait_signal_interruption"
+                | "guest_may_inherit_a_terminal" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -2186,6 +2209,7 @@ mod tests {
             "the default configuration must not write a controlled-run legacy key"
         );
         assert!(!config.backend_supports_blocked_wait_signal_interruption);
+        assert!(!config.guest_may_inherit_a_terminal);
     }
 
     #[test]
@@ -2578,8 +2602,9 @@ mod tests {
 
     /// The legacy form's positions are `Config`'s fields in declaration order
     /// with the fifteen legacy keys where `backend` stands and no
-    /// `record_host_inputs` or `backend_supports_blocked_wait_signal_interruption`,
-    /// which is the key order the encoder writes.
+    /// `record_host_inputs`, `backend_supports_blocked_wait_signal_interruption`
+    /// or `guest_may_inherit_a_terminal`, which is the key order the encoder
+    /// writes.
     #[test]
     fn legacy_positions_are_the_encoded_key_order() {
         let names = legacy_backend_keys(&Config::default()).map(|(name, _)| name);
@@ -2594,7 +2619,9 @@ mod tests {
         for field in &fields {
             match field.as_str() {
                 "backend" => expected.extend(names.map(str::to_owned)),
-                "record_host_inputs" | "backend_supports_blocked_wait_signal_interruption" => {}
+                "record_host_inputs"
+                | "backend_supports_blocked_wait_signal_interruption"
+                | "guest_may_inherit_a_terminal" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -2604,10 +2631,11 @@ mod tests {
             .map(|(key, _)| key)
             .collect();
         assert_eq!(keys, expected);
-        // `backend` becomes fifteen keys; `record_host_inputs` and
-        // `backend_supports_blocked_wait_signal_interruption` none.
+        // `backend` becomes fifteen keys; `record_host_inputs`,
+        // `backend_supports_blocked_wait_signal_interruption` and
+        // `guest_may_inherit_a_terminal` none.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len() + 12, keys.len());
+        assert_eq!(fields.len() + 11, keys.len());
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -2701,6 +2729,39 @@ mod tests {
             !from_legacy_backend_json(&array)
                 .unwrap()
                 .backend_supports_blocked_wait_signal_interruption
+        );
+    }
+
+    /// `guest_may_inherit_a_terminal` never enters the legacy form, whatever
+    /// its value: the guest-visible string stays the legacy bytes, and it reads
+    /// back as false from both the object and the array form.
+    #[test]
+    fn guest_may_inherit_a_terminal_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            guest_may_inherit_a_terminal: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("guest_may_inherit_a_terminal"), "{json}");
+        assert!(
+            !from_legacy_backend_json(&json)
+                .unwrap()
+                .guest_may_inherit_a_terminal
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(
+            !from_legacy_backend_json(&array)
+                .unwrap()
+                .guest_may_inherit_a_terminal
         );
     }
 
