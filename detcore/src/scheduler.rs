@@ -2885,6 +2885,23 @@ impl Scheduler {
         self.exec_incarnations.insert(dettid, mm);
     }
 
+    /// Installs the hold an exit grant places for a None or Discard child-exit
+    /// notification, as `complete_child_exit_publication` releases it.
+    #[cfg(test)]
+    pub(crate) fn install_test_child_exit_publication_hold(&mut self, detpid: DetPid) {
+        self.child_exit_publications_pending.insert(detpid);
+    }
+
+    /// Whether `detpid`'s child-exit publication is held (pending) and whether
+    /// one was reported before any hold (completed).
+    #[cfg(test)]
+    pub(crate) fn test_child_exit_publication_state(&self, detpid: DetPid) -> (bool, bool) {
+        (
+            self.child_exit_publications_pending.contains(&detpid),
+            self.child_exit_publications_completed.contains(&detpid),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn select_test_turn(
         &mut self,

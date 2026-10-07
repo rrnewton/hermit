@@ -5828,10 +5828,13 @@ mod tests {
     /// identity check became the capability it selected:
     /// `discover_live_file_metadata` split into the first four fields, the old
     /// `backend_reports_physical_process_exits` became two, and
-    /// `backend_is_kvm` became the last five. One field is newer than that
+    /// `backend_is_kvm` became the last five. Two fields are newer than that
     /// transcription: `process_exits_complete_asynchronously` (Reverie
     /// 056c8cac), true only for in-guest LiteInst, whose process exits complete
-    /// some time after the tool grants them.
+    /// some time after the tool grants them, and
+    /// `reports_child_exit_publication` (Reverie 9cb6f7b7), true for ptrace and
+    /// e9patch, whose tracer reports when the kernel publishes a process's exit
+    /// to its parent.
     fn golden_backend_capabilities(backend: Backend) -> serde_json::Value {
         let sabre = backend == Backend::Sabre;
         let kvm = backend == Backend::Kvm;

@@ -5480,6 +5480,99 @@ mod tests {
         assert!(!sched.next_turns.contains_key(&DetTid::from_raw(57)));
     }
 
+    /// Two backends call `GlobalTool::on_backend_process_exited`, for two
+    /// different events, and Detcore tells them apart only by capability. The
+    /// ptrace tracer (PTRACE and E9PATCH declare
+    /// `reports_child_exit_publication`) reports that the kernel published a
+    /// leader's exit to its parent: that releases the scheduler's publication
+    /// hold and must leave the physical-exit and exec state alone. In-guest
+    /// LiteInst (`process_exits_complete_asynchronously`, no publication
+    /// reports) reports the process's physical exit: that releases its
+    /// physical-exit barrier and clears its exec state, and is not a
+    /// publication. Each case starts from the state both paths could touch, so
+    /// taking the other path fails it.
+    #[test]
+    fn backend_exit_reports_take_the_path_the_backend_capabilities_select() {
+        use reverie::BackendCapabilities;
+        for (name, backend) in [
+            ("PTRACE", BackendCapabilities::PTRACE),
+            ("E9PATCH", BackendCapabilities::E9PATCH),
+            ("LITEINST_IN_GUEST", BackendCapabilities::LITEINST_IN_GUEST),
+        ] {
+            let publishes = backend.reports_child_exit_publication;
+            assert_eq!(publishes, name != "LITEINST_IN_GUEST", "{name}");
+            let config = Config {
+                sequentialize_threads: true,
+                backend,
+                ..Config::default()
+            };
+            let state = GlobalState::initialize(&config, false);
+            let detpid = DetPid::from_raw(43);
+            let leader = DetTid::from_raw(43);
+            state.pending_exec_states.lock().unwrap().insert(
+                detpid,
+                PendingExecState {
+                    caller: leader,
+                    process: detpid,
+                    mm: MmId::initial(detpid),
+                    fd_blocking: Default::default(),
+                },
+            );
+            state
+                .post_exec_fd_blocking
+                .lock()
+                .unwrap()
+                .insert(leader, [42].into_iter().collect());
+            {
+                let mut sched = state.sched.lock().unwrap();
+                sched.install_test_child_exit_publication_hold(detpid);
+                // Only a backend whose exits complete asynchronously (or that
+                // reports physical exits) installs a physical-exit barrier.
+                assert_eq!(
+                    sched.begin_physical_process_exit(detpid),
+                    !publishes,
+                    "{name}"
+                );
+            }
+
+            <GlobalState as GlobalTool>::on_backend_process_exited(&state, detpid.as_raw());
+
+            let sched = state.sched.lock().unwrap();
+            let exec_state_kept = state
+                .pending_exec_states
+                .lock()
+                .unwrap()
+                .contains_key(&detpid);
+            let fd_blocking_kept = state
+                .post_exec_fd_blocking
+                .lock()
+                .unwrap()
+                .contains_key(&leader);
+            if publishes {
+                // The hold is released, not recorded as an early report.
+                assert_eq!(
+                    sched.test_child_exit_publication_state(detpid),
+                    (false, false),
+                    "{name}"
+                );
+                assert!(!sched.process_physically_gone(detpid), "{name}");
+                assert!(exec_state_kept, "{name}");
+                assert!(fd_blocking_kept, "{name}");
+            } else {
+                assert!(sched.pending_async_process_exits().is_empty(), "{name}");
+                assert!(sched.process_physically_gone(detpid), "{name}");
+                assert!(!exec_state_kept, "{name}");
+                assert!(!fd_blocking_kept, "{name}");
+                // Not a publication: the hold is neither released nor recorded.
+                assert_eq!(
+                    sched.test_child_exit_publication_state(detpid),
+                    (true, false),
+                    "{name}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn recorded_assignment_order_rebuilds_the_same_mapping_in_any_replay_order() {
         let mut recording = MountIdPool::from_config(&[], false, &[]);
