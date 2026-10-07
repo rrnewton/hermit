@@ -466,8 +466,10 @@ pub enum EntryLookup {
     /// Every entry other than `.`: an overlay that reports a layer's device
     /// for its non-directories (see [`EntryLookup::Overlay`]). `.` is the
     /// open directory, which reports the overlay's device on every overlay.
-    /// Last, so that adding it left every earlier variant's encoded tag
-    /// unchanged.
+    /// A mount root among the entries that [`EntryLookup::OverlayOwnDevice`]
+    /// does not ask is keyed on the directory's device, as that kind keys it
+    /// (see `Detcore::directory_entry_identity`). Last, so that adding it
+    /// left every earlier variant's encoded tag unchanged.
     OverlayLayerDevices,
 }
 
@@ -537,12 +539,15 @@ impl EntryLookup {
     /// before any entry is keyed, and keeps the first answer that decides for
     /// the whole overlay (see `Detcore::settle_overlay_entry_lookup`), so the
     /// entries the guest reads first, and where it seeks, do not change it.
-    /// Once [`EntryLookup::OverlayOwnDevice`] is settled, a mount over an
-    /// entry that is not asked, including that entry's own backing file bound
-    /// over its path, is keyed on the directory's device: the first class of
-    /// the second known gap at `Detcore::directory_entry_identity`, as on
-    /// every filesystem that does not ask each entry, and the same in every
-    /// read.
+    /// Before the overlay settles and once it has settled as either kind, a
+    /// mount over an entry that [`EntryLookup::OverlayOwnDevice`] does not
+    /// ask, including that entry's own backing file bound over its path, is
+    /// keyed on the directory's device (an overlay settled as
+    /// [`EntryLookup::OverlayLayerDevices`] asks such an entry whether it is
+    /// a mount root for that; see `Detcore::directory_entry_identity`): the
+    /// first class of the second known gap at
+    /// `Detcore::directory_entry_identity`, as on every filesystem that does
+    /// not ask each entry, and the same in every read.
     pub(crate) fn learn(self, entry: &DirEntry, stat: &libc::stat, directory_device: u64) -> Self {
         let decides = self == EntryLookup::Overlay
             && entry.name != b"."
