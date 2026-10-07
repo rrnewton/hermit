@@ -7,8 +7,9 @@ stand-in harness that records how it was called and reports what the case gives 
 RunTest runs ci/buck-e2e/run end to end in a scratch checkout of its scripts, with
 stand-ins for buck2, testx and the staged harness, and checks that a FAIL, an ERROR or
 results ingest.py refuses make the run exit non-zero, and that --failed-verify-logs
-reaches ingest.py. ValidateNodeTest runs ci/buck-e2e/validate-node with stand-ins for
-the steps it calls and checks where it sends the logs of cells that did not pass.
+reaches ingest.py, and what run keeps of each `buck2 test` invocation. ValidateNodeTest
+runs ci/buck-e2e/validate-node with stand-ins for the steps it calls and checks where it
+sends the logs of cells that did not pass and the invocations' records.
 """
 
 from __future__ import annotations
@@ -18,13 +19,16 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 import test_buck_e2e_ingest as ingest_test
+import test_buck_e2e_stages as stages_test
 
 
 CI = Path(__file__).resolve().parent
@@ -681,6 +685,26 @@ class RunTest(unittest.TestCase):
                          ["index.jsonl", "ry1/verify-logs/verify-1/run1_log_detlog",
                           "ry1/verify-logs/verify-1/run2_log_detlog"])
 
+    def test_each_invocation_leaves_its_record_and_an_earlier_runs_records_are_removed(self):
+        work = self.root / "work"
+        work.mkdir()
+        earlier = ["all.event-log.pb.zst", "all.times", "re.log", "rerun-local.rc", "rerun-local.test_id"]
+        for name in earlier:
+            (work / name).write_text("from an earlier run\n")
+        (work / "unrelated.txt").write_text("not an invocation record\n")
+        runs = {"all": [ingest_test.execution(ingest_test.X, 100, "PASS", "rx1"), ingest_test.Y_PASSES]}
+        process = self.run_buck_e2e("local", runs)
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        # The stand-in buck2 writes no event log, so the earlier one must be gone, not kept.
+        records = sorted(p.name for p in work.iterdir()
+                         if p.name.split(".")[0] in ("re", "local", "all", "rerun-local"))
+        self.assertEqual(records, ["all.log", "all.rc", "all.test_id", "all.times"])
+        self.assertTrue((work / "unrelated.txt").exists())
+        self.assertEqual((work / "all.rc").read_text(), "32\n")
+        self.assertEqual((work / "all.test_id").read_text(), "all\n")
+        start, end = map(float, (work / "all.times").read_text().splitlines())
+        self.assertLessEqual(start, end)
+
     def test_failed_verify_logs_inside_work_or_out_is_refused_before_the_run(self):
         runs = {"all": [ingest_test.execution(ingest_test.X, 100, "PASS", "rx1"), ingest_test.Y_PASSES]}
         for target in (self.root / "work" / "verdict", self.root / "work", self.root / "import"):
@@ -691,12 +715,51 @@ class RunTest(unittest.TestCase):
                 self.assertFalse((self.root / "work").exists(), "buck2 ran before the refusal")
 
 
-# Each step validate-node calls: appends its name and argv to FAKE_STEP_CALLS.
+# Each step validate-node calls: appends its name and argv to FAKE_STEP_CALLS, and exits 17
+# if it is the step FAKE_FAIL_STEP names.
 FAKE_STEP = r"""#!/usr/bin/env python3
 import json, os, sys
 with open(os.environ["FAKE_STEP_CALLS"], "a") as calls:
     calls.write(json.dumps([os.path.basename(sys.argv[0])] + sys.argv[1:]) + "\n")
+if os.environ.get("FAKE_FAIL_STEP") == os.path.basename(sys.argv[0]):
+    sys.exit(17)
 """
+# ci/buck-e2e/run, as a step that also writes FAKE_RUN_RECORDS ({file name: text}) into its
+# --work and exits FAKE_RUN_RC, or, given FAKE_RUN_READY, creates that file and waits to be
+# killed, as a run does when the cells outlast the node's deadline.
+FAKE_RUN = FAKE_STEP + r"""
+import time
+work = sys.argv[sys.argv.index("--work") + 1]
+for name, text in json.loads(os.environ.get("FAKE_RUN_RECORDS") or "{}").items():
+    with open(os.path.join(work, name), "w") as f:
+        f.write(text)
+if os.environ.get("FAKE_RUN_READY"):
+    open(os.environ["FAKE_RUN_READY"], "w").close()
+    time.sleep(600)
+sys.exit(int(os.environ.get("FAKE_RUN_RC", "0")))
+"""
+# buck2, for what validate-node asks of it: `log show FILE` prints FILE, which here holds the
+# JSON lines themselves (or fails, with FAKE_BUCK2_LOG_SHOW_FAILS, or never ends, with
+# FAKE_BUCK2_LOG_SHOW_HANGS), and `kill` appends a line to FAKE_BUCK2_KILLS, when set, and
+# exits FAKE_BUCK2_KILL_RC.
+FAKE_NODE_BUCK2 = """#!/bin/sh
+case $1 in
+    log)
+        if [ -n "${FAKE_BUCK2_LOG_SHOW_FAILS:-}" ]; then echo "buck2: cannot read $3" >&2; exit 3; fi
+        if [ -n "${FAKE_BUCK2_LOG_SHOW_HANGS:-}" ]; then exec sleep 600; fi
+        exec cat -- "$3" ;;
+    kill)
+        if [ -n "${FAKE_BUCK2_KILLS:-}" ]; then echo kill >>"$FAKE_BUCK2_KILLS"; fi
+        exit "${FAKE_BUCK2_KILL_RC:-0}" ;;
+esac
+exit 0
+"""
+# What the stand-in run leaves in --work: a hybrid run's two invocations, one with an event log.
+RECORDS = {
+    "re.log": "re console\n", "re.rc": "0\n", "re.test_id": "re\n", "re.times": "1.5\n9.25\n",
+    "re.event-log.pb.zst": "".join(stages_test.two_cells()),
+    "local.log": "local console\n", "local.rc": "32\n",
+}
 
 
 class ValidateNodeTest(unittest.TestCase):
@@ -711,24 +774,32 @@ class ValidateNodeTest(unittest.TestCase):
         self.node = checkout / "ci" / "buck-e2e" / "validate-node"
         shutil.copy2(BUCK_E2E / "validate-node", self.node)
         self.checkout = checkout
-        for step in ("bootstrap/regenerate-rust-deps", "shim/modes/stage-re-inputs", "ci/buck-e2e/stage",
-                     "ci/buck-e2e/run"):
+        shutil.copy2(BUCK_E2E / "stages.py", checkout / "ci" / "buck-e2e" / "stages.py")
+        for step in ("bootstrap/regenerate-rust-deps", "shim/modes/stage-re-inputs", "ci/buck-e2e/stage"):
             write_executable(checkout / step, FAKE_STEP)
+        write_executable(checkout / "ci" / "buck-e2e" / "run", FAKE_RUN)
         # with-proxy, when installed, prefixes the network steps; this one only runs them.
         write_executable(self.root / "bin" / "with-proxy", '#!/bin/sh\nexec "$@"\n')
-        self.buck2 = write_executable(self.root / "bin" / "buck2", "#!/bin/sh\nexit 0\n")
+        self.buck2 = write_executable(self.root / "bin" / "buck2", FAKE_NODE_BUCK2)
         self.calls = self.root / "calls.jsonl"
 
-    def validate_node(self, e2e_result_root, cwd=None, args=(), runner="buck-local"):
-        """Run validate-node ARGS from CWD with E2E_RESULT_ROOT (None: unset)."""
-        environment = {k: v for k, v in os.environ.items() if k != "E2E_RESULT_ROOT"}
+    def node_environment(self, e2e_result_root, runner, added):
+        environment = {k: v for k, v in os.environ.items()
+                       if k not in ("E2E_RESULT_ROOT", "HERMIT_VALIDATE_BUCK_RETENTION_SECONDS",
+                                    "HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS", "DAGRUN_STEP_STARTED_MONOTONIC_NS")}
         environment.update(PATH=f"{self.root / 'bin'}:{os.environ['PATH']}",
                            HERMIT_VALIDATE_E2E_RUNNER=runner, HERMIT_VALIDATE_BUCK2=str(self.buck2),
                            VALIDATE_RUN_STATE=str(self.root / "state"), HERMIT_EPOCH="2026-10-05T00:00:00+00:00",
-                           FAKE_STEP_CALLS=str(self.calls))
+                           FAKE_STEP_CALLS=str(self.calls), **added)
         if e2e_result_root is not None:
             environment["E2E_RESULT_ROOT"] = e2e_result_root
-        return subprocess.run([str(self.node), *args], capture_output=True, text=True, env=environment, cwd=cwd)
+        return environment
+
+    def validate_node(self, e2e_result_root, cwd=None, args=(), runner="buck-local", **added):
+        """Run validate-node ARGS from CWD with E2E_RESULT_ROOT (None: unset); ADDED is added to
+        its environment."""
+        return subprocess.run([str(self.node), *args], capture_output=True, text=True, timeout=120,
+                              env=self.node_environment(e2e_result_root, runner, added), cwd=cwd)
 
     def commit_checkout(self):
         """Make the scratch checkout a git repository with one commit; return its HEAD."""
@@ -751,6 +822,11 @@ class ValidateNodeTest(unittest.TestCase):
         calls = calls_in(self.calls)
         self.assertEqual([call[0] for call in calls], ["regenerate-rust-deps", "stage", "run"])
         self.assertEqual(calls[1], ["stage", "--from-cargo"])
+
+    def test_stage_only_keeps_no_invocation_records(self):
+        process = self.validate_node(str(self.root / "e2e-results"), args=["--stage-only"])
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        self.assertFalse((self.root / "e2e-results").exists())
 
     def test_stage_only_stages_and_needs_no_runner_environment(self):
         environment = {k: v for k, v in os.environ.items()
@@ -781,6 +857,7 @@ class ValidateNodeTest(unittest.TestCase):
         self.assertEqual(process.returncode, 2, process.stdout + process.stderr)
         self.assertIn("SOURCE_SHA is missing", process.stderr)
         self.assertFalse(self.calls.exists(), "a step ran before the node was refused")
+        self.assertFalse((self.root / "e2e-results").exists(), "a refused node replaced the earlier records")
 
     def test_cells_only_with_inputs_staged_for_another_commit_is_refused_before_any_step(self):
         head = self.commit_checkout()
@@ -823,6 +900,277 @@ class ValidateNodeTest(unittest.TestCase):
         self.assertIn("this run keeps no failed-cell verify logs", process.stderr)
         argv = [call for call in calls_in(self.calls) if call[0] == "run"][0]
         self.assertNotIn("--failed-verify-logs", argv)
+
+    def kept(self, results):
+        return results / "buck-invocations"
+
+    def phases(self, results):
+        rows = [line.split("\t") for line in (self.kept(results) / "phases.tsv").read_text().splitlines()]
+        times = [float(time) for time, _ in rows]
+        self.assertEqual(times, sorted(times))
+        return [what for _, what in rows]
+
+    def test_each_invocations_record_is_kept_below_the_e2e_result_root(self):
+        results = self.root / "e2e-results"
+        (self.kept(results)).mkdir(parents=True)
+        (self.kept(results) / "earlier.log").write_text("from an earlier attempt\n")
+        process = self.validate_node(str(results), FAKE_RUN_RECORDS=json.dumps(RECORDS))
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        kept = self.kept(results)
+        self.assertEqual(sorted(p.name for p in kept.iterdir()), sorted([*RECORDS, "phases.tsv", "re.stages.txt"]))
+        for name, text in RECORDS.items():
+            self.assertEqual((kept / name).read_text(), text, name)
+        self.assertEqual((kept / "re.stages.txt").read_text(), stages_test.StagesTest.summary(
+            None, stages_test.two_cells()))
+        phases = self.phases(results)
+        self.assertEqual(phases[:3], ["regenerating the Buck third-party rules",
+                                      "staging the inputs Buck does not build (cargo, target/)",
+                                      "running every cell under Buck (buck-local), "
+                                      "HERMIT_EPOCH=2026-10-05T00:00:00+00:00"])
+        self.assertEqual(phases[3:], ["exit 0"])
+
+    def test_a_run_that_fails_keeps_its_records_and_its_status(self):
+        results = self.root / "e2e-results"
+        process = self.validate_node(str(results), FAKE_RUN_RECORDS=json.dumps(RECORDS), FAKE_RUN_RC="7")
+        self.assertEqual(process.returncode, 7, process.stdout + process.stderr)
+        self.assertEqual((self.kept(results) / "re.event-log.pb.zst").read_text(), RECORDS["re.event-log.pb.zst"])
+        self.assertEqual(self.phases(results)[-1], "exit 7")
+
+    def test_keeping_the_records_never_changes_the_nodes_status(self):
+        results = self.root / "e2e-results"
+        for name, run_status, added in (
+            ("the event log cannot be shown", 0, {"FAKE_BUCK2_LOG_SHOW_FAILS": "1"}),
+            ("the buck2 daemon cannot be killed", 0, {"FAKE_BUCK2_KILL_RC": "1"}),
+            ("both, after a failed run", 7, {"FAKE_BUCK2_LOG_SHOW_FAILS": "1", "FAKE_BUCK2_KILL_RC": "1"}),
+        ):
+            with self.subTest(name):
+                process = self.validate_node(str(results), FAKE_RUN_RECORDS=json.dumps(RECORDS),
+                                             FAKE_RUN_RC=str(run_status), **added)
+                self.assertEqual(process.returncode, run_status, process.stdout + process.stderr)
+                self.assertEqual((self.kept(results) / "re.log").read_text(), RECORDS["re.log"])
+                if "FAKE_BUCK2_LOG_SHOW_FAILS" in added:
+                    self.assertIn("validate-node: the stage summary of the re invocation is incomplete",
+                                  process.stderr)
+
+    def test_a_stalled_stage_summary_costs_only_the_summary(self):
+        results = self.root / "e2e-results"
+        kills = self.root / "kills"
+        summarizer = self.checkout / "ci" / "buck-e2e" / "stages.py"
+        for stalled, run_status in (("log show", 0), ("log show", 7), ("stages.py", 0), ("stages.py", 7)):
+            with self.subTest(stalled=stalled, run_status=run_status):
+                kills.unlink(missing_ok=True)
+                shutil.copy2(BUCK_E2E / "stages.py", summarizer)
+                added = {"FAKE_BUCK2_LOG_SHOW_HANGS": "1"}
+                if stalled == "stages.py":
+                    summarizer.write_text("import time\ntime.sleep(600)\n")
+                    added = {}
+                started = time.monotonic()
+                process = self.validate_node(str(results), FAKE_RUN_RECORDS=json.dumps(RECORDS),
+                                             FAKE_RUN_RC=str(run_status), FAKE_BUCK2_KILLS=str(kills),
+                                             HERMIT_VALIDATE_BUCK_RETENTION_SECONDS="1", **added)
+                elapsed = time.monotonic() - started
+                self.assertEqual(process.returncode, run_status, process.stdout + process.stderr)
+                # One second of budget, half a second more for the kill after it.
+                self.assertLess(elapsed, 10, process.stderr)
+                self.assertIn("validate-node: the stage summary of the re invocation is incomplete", process.stderr)
+                self.assertEqual((self.kept(results) / "re.log").read_text(), RECORDS["re.log"])
+                self.assertEqual(self.phases(results)[-1], f"exit {run_status}")
+                self.assertEqual(kills.read_text(), "kill\n", "the buck2 daemon was not stopped")
+
+    def interrupt(self, results, **added):
+        """Start validate-node in its own process group, as the validation DAG does, and send the
+        group SIGTERM once the run is under way; return the process and the seconds it took to
+        die."""
+        ready = self.root / "run-ready"
+        ready.unlink(missing_ok=True)
+        environment = self.node_environment(str(results), "buck-local",
+                                            dict(FAKE_RUN_RECORDS=json.dumps(RECORDS), FAKE_RUN_READY=str(ready),
+                                                 **added))
+        with open(self.root / "node.stderr", "w") as stderr:
+            process = subprocess.Popen([str(self.node)], stdin=subprocess.DEVNULL, stdout=stderr, stderr=stderr,
+                                       env=environment, start_new_session=True)
+        try:
+            deadline = time.monotonic() + 60
+            while not ready.exists():
+                self.assertIsNone(process.poll(), (self.root / "node.stderr").read_text())
+                self.assertLess(time.monotonic(), deadline, "the run never started")
+                time.sleep(0.02)
+            started = time.monotonic()
+            os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=30)
+            return process, time.monotonic() - started
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+
+    def test_a_group_sigterm_is_recorded_as_a_signal_and_the_node_still_dies_of_it(self):
+        results = self.root / "e2e-results"
+        kills = self.root / "kills"
+        for name, added in (("summaries that work", {}), ("a summary that stalls", {"FAKE_BUCK2_LOG_SHOW_HANGS": "1"})):
+            with self.subTest(name):
+                kills.unlink(missing_ok=True)
+                process, elapsed = self.interrupt(results, FAKE_BUCK2_KILLS=str(kills), **added)
+                stderr = (self.root / "node.stderr").read_text()
+                self.assertEqual(process.returncode, -signal.SIGTERM, stderr)
+                # The validation DAG reaps the group 5 s after its SIGTERM.
+                self.assertLess(elapsed, 5, stderr)
+                phases = self.phases(results)
+                self.assertEqual(phases[-1], "signal TERM")
+                self.assertFalse([row for row in phases if row.startswith("exit ")], phases)
+                self.assertEqual((self.kept(results) / "re.log").read_text(), RECORDS["re.log"])
+                if added:
+                    self.assertIn("validate-node: the stage summary of the re invocation is incomplete", stderr)
+                else:
+                    self.assertEqual((self.kept(results) / "re.stages.txt").read_text(),
+                                     stages_test.StagesTest.summary(None, stages_test.two_cells()))
+                self.assertEqual(kills.read_text(), "kill\n", "the buck2 daemon was not stopped")
+
+    def run_as_step(self, results, wall, **added):
+        """Run validate-node as the validation DAG runs a step with a WALL-second bound: in its own
+        process group, with the start in DAGRUN_STEP_STARTED_MONOTONIC_NS and the bound in
+        HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS. Fail if it is still running at the bound, where
+        dagrun would mark it timed out and reap it; return the process and its seconds from the
+        start."""
+        started_ns = time.monotonic_ns()
+        environment = self.node_environment(str(results), "buck-local", dict(
+            FAKE_RUN_RECORDS=json.dumps(RECORDS), HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS=str(wall),
+            DAGRUN_STEP_STARTED_MONOTONIC_NS=str(started_ns), **added))
+        with open(self.root / "node.stderr", "w") as stderr:
+            process = subprocess.Popen([str(self.node)], stdin=subprocess.DEVNULL, stdout=stderr, stderr=stderr,
+                                       env=environment, start_new_session=True)
+        try:
+            process.wait(timeout=started_ns / 1e9 + wall - time.monotonic())
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=30)
+            self.fail(f"the node was still running at its {wall} s wall bound, so its completed work would be "
+                      f"reported as a timeout:\n{(self.root / 'node.stderr').read_text()}")
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+        return process, time.monotonic() - started_ns / 1e9
+
+    def test_keeping_the_records_ends_inside_the_steps_wall_bound(self):
+        # The cells finish within about a second of a 13 s bound, so about 2 s are left after the
+        # 10 s reserve; the summary stalls and the 30 s retention budget would outlast the bound.
+        results = self.root / "e2e-results"
+        kills = self.root / "kills"
+        for run_status in (0, 7):
+            with self.subTest(run_status=run_status):
+                kills.unlink(missing_ok=True)
+                process, elapsed = self.run_as_step(results, 13, FAKE_RUN_RC=str(run_status),
+                                                    FAKE_BUCK2_KILLS=str(kills), FAKE_BUCK2_LOG_SHOW_HANGS="1",
+                                                    HERMIT_VALIDATE_BUCK_RETENTION_SECONDS="30")
+                stderr = (self.root / "node.stderr").read_text()
+                self.assertEqual(process.returncode, run_status, stderr)
+                # The bound less the 10 s reserve, half a second for the stalled command to be
+                # killed, and slack for the kill after it.
+                self.assertLess(elapsed, 13 - 10 + 2, stderr)
+                self.assertIn("validate-node: the stage summary of the re invocation is incomplete", stderr)
+                self.assertIn("validate-node: the time left before this step's 13 s wall bound, less 10 s for "
+                              "stopping buck2, ran out before ", stderr)
+                self.assertEqual((self.kept(results) / "re.log").read_text(), RECORDS["re.log"])
+                self.assertEqual(self.phases(results)[-1], f"exit {run_status}")
+                self.assertEqual(kills.read_text(), "kill\n", "the buck2 daemon was not stopped")
+
+    def test_no_record_is_kept_once_the_steps_wall_bound_leaves_no_time(self):
+        # A 9 s bound is inside the 10 s reserve from the start.
+        results = self.root / "e2e-results"
+        kills = self.root / "kills"
+        for run_status in (0, 7):
+            with self.subTest(run_status=run_status):
+                kills.unlink(missing_ok=True)
+                process, _elapsed = self.run_as_step(results, 9, FAKE_RUN_RC=str(run_status),
+                                                     FAKE_BUCK2_KILLS=str(kills))
+                stderr = (self.root / "node.stderr").read_text()
+                self.assertEqual(process.returncode, run_status, stderr)
+                self.assertIn("validate-node: the time left before this step's 9 s wall bound, less 10 s for "
+                              "stopping buck2, ran out before ", stderr)
+                self.assertEqual(sorted(p.name for p in self.kept(results).iterdir()), ["phases.tsv"])
+                self.assertEqual(self.phases(results)[-1], f"exit {run_status}")
+                self.assertEqual(kills.read_text(), "kill\n", "the buck2 daemon was not stopped")
+
+    def test_the_retention_budget_still_bounds_the_records_inside_a_long_wall_bound(self):
+        results = self.root / "e2e-results"
+        process, elapsed = self.run_as_step(results, 3600, FAKE_BUCK2_LOG_SHOW_HANGS="1",
+                                            HERMIT_VALIDATE_BUCK_RETENTION_SECONDS="1")
+        stderr = (self.root / "node.stderr").read_text()
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertLess(elapsed, 10, stderr)
+        self.assertIn("validate-node: the 1 s for keeping the Buck invocation records ran out before ", stderr)
+
+    def test_a_step_wall_bound_that_is_not_a_positive_number_of_seconds_is_refused(self):
+        for value in ("0", "-1", "1.5", "soon"):
+            with self.subTest(value=value):
+                process = self.validate_node(str(self.root / "e2e-results"),
+                                             HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS=value,
+                                             DAGRUN_STEP_STARTED_MONOTONIC_NS=str(time.monotonic_ns()))
+                self.assertEqual(process.returncode, 2, process.stdout + process.stderr)
+                self.assertIn("HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS is '", process.stderr)
+                self.assertFalse(self.calls.exists(), "a step ran before the node was refused")
+
+    def test_a_step_wall_bound_without_the_steps_start_is_refused(self):
+        later = str(time.monotonic_ns() + 3600 * 10**9)
+        for start in (None, "", "soon", "-1", "1" * 19, later):
+            with self.subTest(start=start):
+                added = {"HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS": "3600"}
+                if start is not None:
+                    added["DAGRUN_STEP_STARTED_MONOTONIC_NS"] = start
+                process = self.validate_node(str(self.root / "e2e-results"), **added)
+                self.assertEqual(process.returncode, 2, process.stdout + process.stderr)
+                self.assertIn("HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS is set, but DAGRUN_STEP_STARTED_MONOTONIC_NS",
+                              process.stderr)
+                self.assertFalse(self.calls.exists(), "a step ran before the node was refused")
+
+    def test_an_earlier_attempts_records_are_never_kept_for_a_step_that_fails_before_the_run(self):
+        results = self.root / "e2e-results"
+        work = self.root / "state" / "buck-e2e" / "work"
+        work.mkdir(parents=True)
+        for name, text in RECORDS.items():
+            (work / name).write_text(text)
+        (work / "unrelated.txt").write_text("not a record\n")
+        process = self.validate_node(str(results), FAKE_FAIL_STEP="regenerate-rust-deps")
+        self.assertEqual(process.returncode, 17, process.stdout + process.stderr)
+        self.assertEqual([call[0] for call in calls_in(self.calls)], ["regenerate-rust-deps"])
+        self.assertEqual(sorted(p.name for p in self.kept(results).iterdir()), ["phases.tsv"])
+        self.assertEqual(self.phases(results), ["regenerating the Buck third-party rules", "exit 17"])
+        self.assertEqual(sorted(p.name for p in work.iterdir()), ["unrelated.txt"])
+
+    def test_an_earlier_attempts_records_that_cannot_be_removed_are_not_kept(self):
+        results = self.root / "e2e-results"
+        work = self.root / "state" / "buck-e2e" / "work"
+        work.mkdir(parents=True)
+        (work / "re.log").write_text("earlier\n")
+        work.chmod(0o555)
+        self.addCleanup(work.chmod, 0o755)
+        process = self.validate_node(str(results), FAKE_FAIL_STEP="regenerate-rust-deps")
+        self.assertEqual(process.returncode, 17, process.stdout + process.stderr)
+        self.assertIn("cannot remove an earlier attempt's Buck invocation records", process.stderr)
+        self.assertEqual(list(self.kept(results).iterdir()), [])
+
+    def test_a_retention_budget_that_is_not_a_positive_number_of_seconds_is_refused(self):
+        for value in ("0", "-1", "1.5", "soon"):
+            with self.subTest(value=value):
+                process = self.validate_node(str(self.root / "e2e-results"),
+                                             HERMIT_VALIDATE_BUCK_RETENTION_SECONDS=value)
+                self.assertEqual(process.returncode, 2, process.stdout + process.stderr)
+                self.assertIn("HERMIT_VALIDATE_BUCK_RETENTION_SECONDS is", process.stderr)
+                self.assertFalse(self.calls.exists(), "a step ran before the node was refused")
+
+    def test_an_earlier_record_that_cannot_be_removed_costs_only_the_records(self):
+        results = self.root / "e2e-results"
+        stuck = self.kept(results) / "stuck"
+        stuck.mkdir(parents=True)
+        (stuck / "re.log").write_text("earlier\n")
+        stuck.chmod(0o555)
+        self.addCleanup(stuck.chmod, 0o755)
+        process = self.validate_node(str(results), FAKE_RUN_RECORDS=json.dumps(RECORDS))
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        self.assertIn("this run keeps no Buck invocation records", process.stderr)
+        self.assertEqual(len([call for call in calls_in(self.calls) if call[0] == "run"]), 1)
+        self.assertEqual(sorted(p.name for p in self.kept(results).iterdir()), ["stuck"])
 
     def test_a_relative_e2e_result_root_is_resolved_before_the_node_changes_directory(self):
         process = self.validate_node("relative-results", cwd=self.root)

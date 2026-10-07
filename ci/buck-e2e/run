@@ -42,7 +42,10 @@
 # The release hermit is built unstamped (-c hermit_release.unstamped=true: no commit
 # hash or build date in the binary), so a commit that changes no compiled source
 # rebuilds nothing and its cells stay cached. Only scripts/build-buck-release.rs stamps.
-# Each invocation's event log and test-run id are kept in --work.
+# Each invocation's event log, test-run id, console log (NAME.log), exit status (NAME.rc) and
+# start and end time (NAME.times, two epoch-second lines) are kept in --work, as NAME.*
+# for NAME re and local (hybrid), all (local) and rerun-local; a run first removes an
+# earlier run's, so every NAME.* there is this run's.
 #
 # ci/buck-e2e/verdict.py then judges the rows as the cargo flow's e2e nodes judge theirs:
 # the staged test-harness, in import mode, once per (lane, category) bucket of the plan.
@@ -115,6 +118,10 @@ require_staged_source "before the run" 2
 mkdir -p "$out" "$work"
 # A previous run's verdict must not stand beside this run's rows, whether it fails or is unjudged.
 rm -rf -- "${work:?}/verdict"
+# Nor may an earlier run's invocation records: validate-node keeps every one it finds here.
+for previous in re local all rerun-local; do
+    rm -f -- "$work/$previous".{log,rc,test_id,times,event-log.pb.zst}
+done
 extra=("$@")
 tpx=(-- --retry 1 --no-retry-on-skip)
 
@@ -122,10 +129,12 @@ invoke() { # invoke NAME TARGET... [buck2 args...]: one `buck2 test`, its exit s
     local name=$1
     shift
     set +e
+    date -u +%s.%N >"$work/$name.times"
     env -C "$root" "$buck2" test -c hermit_release.unstamped=true "${extra[@]}" "$@" \
         --event-log "$work/$name.event-log.pb.zst" --write-test-id "$work/$name.test_id" \
         "${tpx[@]}" >"$work/$name.log" 2>&1
     echo $? >"$work/$name.rc"
+    date -u +%s.%N >>"$work/$name.times"
     set -e
 }
 

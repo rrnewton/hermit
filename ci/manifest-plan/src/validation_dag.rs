@@ -1416,6 +1416,9 @@ fn materialize_hosted_script_unit_tests(cfg: &mut DagConfig) -> Result<(), Strin
 pub const FULL_BUCK_E2E_LABEL: &str = "full-buck-e2e";
 /// The host node that runs every E2E cell under Buck/Tpx.
 pub const BUCK_CELLS_TAG: &str = "e2e.buck_cells";
+/// The wall bound of e2e.buck_cells, in seconds, which ci/buck-e2e/validate-node
+/// cannot read from dagrun.
+const BUCK_STEP_WALL_ENV: &str = "HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS";
 /// The host node that stages the inputs Buck does not build for
 /// [`BUCK_CELLS_TAG`]. It needs only the pinned Reverie, so it runs beside the
 /// rust-script build and the manifest-plan build that the cells wait for.
@@ -1719,6 +1722,13 @@ fn materialize_buck_e2e(cfg: &mut DagConfig) -> Result<(), String> {
     // recorded, so nothing here measures the cells alone, and running the
     // cells is strictly less work than the node that also staged.
     cells.timeout = 3600;
+    // dagrun gives a step the time it started (DAGRUN_STEP_STARTED_MONOTONIC_NS)
+    // but not its wall bound; validate-node keeps the Buck invocation records
+    // only in what is left of this one. The committed Buck selection is never
+    // clamped, so this is the bound dagrun enforces.
+    cells
+        .env
+        .insert(BUCK_STEP_WALL_ENV.into(), cells.timeout.to_string());
     cells.cpu_timeout = 14400;
     // 422.74 s for the node that also staged (hermit f53e746779, before
     // 02eba338ab overlapped the stage's builds), minus the 258.9 s its step
@@ -2863,6 +2873,15 @@ fn assert_buck_e2e_selection(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(
     if !cells_node.deps.iter().any(|dep| dep == BUCK_STAGE_TAG) {
         return Err(format!(
             "{BUCK_CELLS_TAG} does not wait for {BUCK_STAGE_TAG}"
+        ));
+    }
+    // Keeping the records after the cells ran must end inside the bound dagrun
+    // enforces, or completed work is reaped and reported as a timeout.
+    let wall = cells_node.timeout.to_string();
+    if cells_node.timeout == 0 || cells_node.env.get(BUCK_STEP_WALL_ENV) != Some(&wall) {
+        return Err(format!(
+            "{BUCK_CELLS_TAG} sets {BUCK_STEP_WALL_ENV} to {:?}, expected its wall bound {wall:?}",
+            cells_node.env.get(BUCK_STEP_WALL_ENV)
         ));
     }
     for step in &selected.steps {
@@ -5839,6 +5858,43 @@ sys.exit(37)
         twin(&mut unlabelled).labels.clear();
         let error = assert_buck_e2e_selection(&unlabelled, &cells).unwrap_err();
         assert!(error.contains("Buck E2E"), "{error}");
+    }
+
+    #[test]
+    fn buck_cells_hand_validate_node_their_wall_bound() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let cells = expected_cells(&crate::git_environment::checkout_root()).unwrap();
+        fn cells_node(cfg: &mut DagConfig) -> &mut Step {
+            cfg.steps
+                .iter_mut()
+                .find(|step| step.tag() == BUCK_CELLS_TAG)
+                .unwrap()
+        }
+        let mut committed_cells = committed.clone();
+        let node = cells_node(&mut committed_cells);
+        assert_eq!(node.timeout, 3600);
+        assert_eq!(
+            node.env.get(BUCK_STEP_WALL_ENV).map(String::as_str),
+            Some("3600")
+        );
+
+        let mut missing = committed.clone();
+        cells_node(&mut missing).env.remove(BUCK_STEP_WALL_ENV);
+        let mut longer = committed.clone();
+        cells_node(&mut longer)
+            .env
+            .insert(BUCK_STEP_WALL_ENV.into(), "3601".into());
+        let mut shortened = committed.clone();
+        cells_node(&mut shortened).timeout = 1800;
+        let mut unbounded = committed.clone();
+        cells_node(&mut unbounded).timeout = 0;
+        cells_node(&mut unbounded)
+            .env
+            .insert(BUCK_STEP_WALL_ENV.into(), "0".into());
+        for planted in [missing, longer, shortened, unbounded] {
+            let error = assert_buck_e2e_selection(&planted, &cells).unwrap_err();
+            assert!(error.contains(BUCK_STEP_WALL_ENV), "{error}");
+        }
     }
 
     #[test]

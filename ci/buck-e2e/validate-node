@@ -33,9 +33,33 @@
 #                               $E2E_RESULT_ROOT/buck-failed-verify-logs (see
 #                               ci/buck-e2e/ingest.py --failed-verify-logs), beside the
 #                               rows the import twins publish; the state directory is not
-#                               kept.
+#                               kept. Each `buck2 test` invocation's own record (its console
+#                               log, exit status, test-run id, start and end time and event
+#                               log: NAME.log, .rc, .test_id, .times, .event-log.pb.zst for
+#                               NAME re, local, all and rerun-local, see ci/buck-e2e/run)
+#                               goes to $E2E_RESULT_ROOT/buck-invocations on every exit of
+#                               the cells, with NAME.stages.txt, where that invocation's
+#                               cells spent their time (ci/buck-e2e/stages.py), and
+#                               phases.tsv, the epoch time each step of this node began
+#                               and the time and status it exited with (`exit N`), or the
+#                               signal that ended it (`signal TERM`, INT or HUP). Only
+#                               records this attempt wrote are kept: an earlier attempt's
+#                               are removed from the work directory before any step runs.
+#                               Keeping them is best effort under a time budget (below);
+#                               it never changes the node's status, and on a signal the
+#                               node still dies of that signal.
 # Optional: HERMIT_GIT_DEP_MIRRORS (see bootstrap/git-dep-mirrors.sh) serves Cargo.lock's
 # git dependencies from local mirrors while the third-party rules are regenerated.
+# HERMIT_VALIDATE_BUCK_RETENTION_SECONDS (default 30, a positive integer) bounds the copies
+# and stage summaries made on exit; a node ended by a signal spends at most 2 seconds on
+# them, within the scheduler's grace before it reaps the process group. Every command in
+# that work runs under `timeout --foreground`, so it stays in the node's process group.
+# HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS (a positive integer; the DAG sets it to
+# e2e.buck_cells' wall bound) ends that work 10 seconds, kept for stopping the buck2
+# daemon and exiting, before the bound that dagrun enforces from the step's start in
+# DAGRUN_STEP_STARTED_MONOTONIC_NS, and skips it when that time has gone, so work that
+# completed is never reported as a timeout. When it is set, the start must be a time on
+# CLOCK_MONOTONIC that has passed, or the node exits 2.
 #
 # Steps, all on the host, in the checkout: regenerate the Buck third-party rules
 # (bootstrap/regenerate-rust-deps), stage the RE link inputs for buck-hybrid
@@ -53,7 +77,8 @@
 #
 # Exit status: 0 once the rows are written (or, for --stage-only, once the inputs are
 # staged), whatever the cells' verdicts (the twins judge them); 2 for a usage error or a
-# missing input; otherwise the failing step's status.
+# missing input; otherwise the failing step's status. A node sent TERM, INT or HUP while
+# the cells run dies of that signal.
 set -euo pipefail
 
 usage() { sed -n '2,/^set -euo pipefail$/{/^set /d;s/^# \{0,1\}//;p}' "${BASH_SOURCE[0]}"; }
@@ -73,8 +98,12 @@ fi
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd "$here/../.." && pwd)
 proxy=()
+kept=
 if command -v with-proxy >/dev/null 2>&1; then proxy=(with-proxy); fi
-step() { echo "validate-node: $*" >&2; }
+step() {
+    echo "validate-node: $*" >&2
+    [[ -z $kept ]] || printf '%s\t%s\n' "$(date -u +%s.%N)" "$*" >>"$kept/phases.tsv" || true
+}
 stage_inputs() {
     step "staging the inputs Buck does not build (cargo, target/)"
     "${proxy[@]}" ./ci/buck-e2e/stage --from-cargo
@@ -123,11 +152,124 @@ if [[ -z ${E2E_RESULT_ROOT:-} ]]; then
     echo "validate-node: E2E_RESULT_ROOT is unset; this node runs under scripts/validate.rs" >&2
     exit 2
 fi
+retention_seconds=${HERMIT_VALIDATE_BUCK_RETENTION_SECONDS:-30}
+if [[ ! $retention_seconds =~ ^[1-9][0-9]{0,5}$ ]]; then
+    echo "validate-node: HERMIT_VALIDATE_BUCK_RETENTION_SECONDS is '${retention_seconds}', not a positive number of seconds" >&2
+    exit 2
+fi
+# dagrun exports when this step started, but not its wall bound; the DAG passes the bound.
+step_wall_seconds=${HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS:-}
+step_started_ns=${DAGRUN_STEP_STARTED_MONOTONIC_NS:-}
+step_reserve_seconds=10
+step_left() { # set step_left_us to the microseconds left before this step's wall bound, less the reserve
+    local now_ns
+    now_ns=$(timeout --foreground -k 0.5 2 python3 -c 'import time; print(time.monotonic_ns())') &&
+        [[ $now_ns =~ ^[0-9]{1,18}$ ]] || return 1
+    ((now_ns >= step_started_ns)) || return 1
+    step_left_us=$(((step_started_ns + step_wall_seconds * 1000000000 - now_ns) / 1000 - step_reserve_seconds * 1000000))
+}
+if [[ -n $step_wall_seconds ]]; then
+    if [[ ! $step_wall_seconds =~ ^[1-9][0-9]{0,5}$ ]]; then
+        echo "validate-node: HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS is '${step_wall_seconds}', not a positive number of seconds" >&2
+        exit 2
+    fi
+    if [[ ! $step_started_ns =~ ^[0-9]{1,18}$ ]] || ! step_left; then
+        echo "validate-node: HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS is set, but DAGRUN_STEP_STARTED_MONOTONIC_NS is '${step_started_ns}', not a time on CLOCK_MONOTONIC that has passed" >&2
+        exit 2
+    fi
+fi
 state=$VALIDATE_RUN_STATE/buck-e2e
 failed_logs=$(realpath -m -- "$E2E_RESULT_ROOT")/buck-failed-verify-logs
+invocations=$(realpath -m -- "$E2E_RESULT_ROOT")/buck-invocations
+
+# The invocations' records are evidence, not input, like the failed cells' logs: an earlier
+# attempt's copy that cannot be replaced costs this run its copy, never the run, and so does
+# any copy or summary that fails below.
+if rm -rf -- "${invocations:?}" && mkdir -p -- "$invocations"; then
+    kept=$invocations
+else
+    echo "validate-node: cannot replace the earlier $invocations (above); this run keeps no Buck invocation records" >&2
+fi
+# ci/buck-e2e/run removes an earlier attempt's records from $state/work only once it starts;
+# a step that fails before then must not leave them to be kept as this attempt's.
+if [[ -n $kept ]] && ! rm -f -- "$state/work"/{re,local,all,rerun-local}.{log,rc,test_id,times,event-log.pb.zst}; then
+    echo "validate-node: cannot remove an earlier attempt's Buck invocation records from $state/work (above); this run keeps none" >&2
+    kept=
+fi
+time_left() { # set left to the seconds until the caller's deadline (epoch microseconds); fail once it has passed
+    local now=${EPOCHREALTIME/[^0-9]/}
+    ((now < deadline)) || return 1
+    printf -v left '%d.%06d' $(((deadline - now) / 1000000)) $(((deadline - now) % 1000000))
+}
+keep_invocations() { # $1: a deadline (epoch microseconds); $2: what set it. Copy each invocation's
+    # record from $state/work into $kept, with its stage summary. Each command gets what is left
+    # before $1 and none starts after it, so a stalled copy or summary costs records, never the
+    # node's status or its daemon cleanup.
+    local deadline=$1 left name file
+    for name in re local all rerun-local; do
+        for file in "$state/work/$name".{log,rc,test_id,times,event-log.pb.zst}; do
+            [[ -f $file ]] || continue
+            if ! time_left; then
+                echo "validate-node: $2 ran out before $file" >&2
+                return
+            fi
+            timeout --foreground -k 0.5 "$left" cp -- "$file" "$kept/"
+        done
+        [[ -f $state/work/$name.event-log.pb.zst ]] || continue
+        if ! time_left; then
+            echo "validate-node: $2 ran out before the $name invocation's stage summary" >&2
+            return
+        fi
+        if ! timeout --foreground -k 0.5 "$left" "$buck2" log show "$state/work/$name.event-log.pb.zst" |
+            timeout --foreground -k 0.5 "$left" python3 "$here/stages.py" - >"$kept/$name.stages.txt"; then
+            echo "validate-node: the stage summary of the $name invocation is incomplete (above)" >&2
+        fi
+    done
+}
+exiting=
+on_exit() { # keep the invocations' records, then stop the buck2 daemon; the node's status stands
+    local status=$?
+    set +e
+    exiting=1
+    if [[ -n $kept ]]; then
+        printf '%s\texit %s\n' "$(date -u +%s.%N)" "$status" >>"$kept/phases.tsv"
+        local now deadline why
+        if [[ -n $step_wall_seconds ]] && ! step_left; then
+            deadline=0 why="this step's $step_wall_seconds s wall bound, whose remaining time could not be read,"
+        else
+            # Read after step_left, so the time it took is not counted twice.
+            now=${EPOCHREALTIME/[^0-9]/}
+            deadline=$((now + retention_seconds * 1000000))
+            why="the $retention_seconds s for keeping the Buck invocation records"
+            if [[ -n $step_wall_seconds ]] && ((now + step_left_us < deadline)); then
+                deadline=$((now + step_left_us))
+                why="the time left before this step's $step_wall_seconds s wall bound, less $step_reserve_seconds s for stopping buck2,"
+            fi
+        fi
+        keep_invocations "$deadline" "$why"
+    fi
+    "$buck2" kill >/dev/null 2>&1
+}
+on_signal() { # $1: the signal. Record it, keep what records fit in 2 seconds (none if the exit
+    # had begun keeping them), stop the buck2 daemon, then die of $1 as if it were not caught.
+    # Bash runs this once the foreground command returns; on an uncaught signal its EXIT trap
+    # would see that command's status and record a signal as an ordinary exit.
+    trap - EXIT
+    set +e
+    if [[ -n $kept ]]; then
+        printf '%s\tsignal %s\n' "$(date -u +%s.%N)" "$1" >>"$kept/phases.tsv"
+        [[ -n $exiting ]] || keep_invocations $((${EPOCHREALTIME/[^0-9]/} + 2000000)) "the 2 s a signalled node keeps for the Buck invocation records"
+    fi
+    timeout --foreground -k 0.5 1 "$buck2" kill >/dev/null 2>&1
+    trap - "$1"
+    kill -s "$1" "$$"
+}
 
 cd "$root"
-trap '"$buck2" kill >/dev/null 2>&1 || true' EXIT
+trap on_exit EXIT
+trap 'on_signal TERM' TERM
+trap 'on_signal INT' INT
+trap 'on_signal HUP' HUP
 
 step "regenerating the Buck third-party rules"
 "${proxy[@]}" ./bootstrap/regenerate-rust-deps

@@ -822,7 +822,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_changed_prepared_input_names_each_field_that_moved (2a43eb81) retains
     // all 990: 991 (validate run
     // validate-claude-coord-2a43eb81acf6-1791366692674881018-635384-a5df6dd9 executed 991).
-    ("test.regular_crates", 991),
+    // hermit-manifest-plan's validation_dag::tests::
+    // buck_cells_hand_validate_node_their_wall_bound retains all 991: 992 (validate run
+    // validate-tickhub-ops-2-8d85cb2d50e0-1791374991259209356-157714-59e7d85a executed 992).
+    ("test.regular_crates", 992),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2079,7 +2082,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The two detcore-model legacy-form tests of
     // https://github.com/rrnewton/hermit/pull/3361 listed there retain all 988: 990.
     // The prepared-input field-naming test of 2a43eb81 listed there retains all 990: 991.
-    ("test.regular_crates_on_host", 991),
+    // The Buck cells wall-bound test listed there retains all 991: 992.
+    ("test.regular_crates_on_host", 992),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
