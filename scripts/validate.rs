@@ -17515,7 +17515,7 @@ mod nextest_timeout_tests {
             .collect::<Vec<_>>();
         assert_eq!(
             names.len(),
-            53,
+            54,
             "update the exact CI inventory with new KVM tests"
         );
         let required_cases = [
