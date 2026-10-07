@@ -2926,13 +2926,19 @@ fn liteinst_in_guest_refusal(options: &[&str]) -> Result<(), anyhow::Error> {
 #[test]
 fn liteinst_in_guest_refuses_options_it_cannot_honour() {
     // The default maximum timeslice is on, and the in-guest Tool host cannot
-    // deliver its timer.
-    let error = liteinst_in_guest_refusal(&[]).unwrap_err();
-    assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
-    assert!(
-        error.to_string().contains("pass --max-timeslice=disabled"),
-        "{error:#}"
-    );
+    // deliver its timer. Only a build with the feature gives this advice;
+    // `liteinst_without_the_feature_is_refused_for_the_feature` covers the
+    // build without it.
+    #[cfg(feature = "liteinst")]
+    {
+        let error = liteinst_in_guest_refusal(&[]).unwrap_err();
+        assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+        assert!(
+            error.to_string().contains("pass --max-timeslice=disabled"),
+            "{error:#}"
+        );
+    }
+    // The other refusals hold in every build.
     for (option, reason) in [
         (
             "--run-evidence-dir=/unused/new-path",
@@ -2952,6 +2958,48 @@ fn liteinst_in_guest_refuses_options_it_cannot_honour() {
     liteinst_in_guest_refusal(&["--max-timeslice=disabled"]).unwrap();
     // The in-guest Tool forwards its DETLOG records, so `--verify` compares them.
     liteinst_in_guest_refusal(&["--max-timeslice=disabled", "--verify"]).unwrap();
+    // A build with the feature never refuses for the feature.
+    #[cfg(feature = "liteinst")]
+    run_opts_for(&["hermit", "--backend=liteinst", "run", "fakeprog"])
+        .refuse_liteinst_without_the_feature()
+        .unwrap();
+}
+
+/// Without the `liteinst` feature there is no in-guest runtime to advise
+/// about: a `--backend=liteinst` run that no other in-guest refusal stops,
+/// including one with the default maximum timeslice, is refused for the
+/// missing build feature instead.
+#[test]
+#[cfg(not(feature = "liteinst"))]
+fn liteinst_without_the_feature_is_refused_for_the_feature() {
+    for options in [
+        &[][..],
+        &["--max-timeslice=disabled"][..],
+        &["--verify"][..],
+        &["--max-timeslice=disabled", "--verify"][..],
+    ] {
+        liteinst_in_guest_refusal(options).unwrap_or_else(|error| panic!("{options:?}: {error:#}"));
+        let mut argv = vec!["hermit", "--backend=liteinst", "run"];
+        argv.extend_from_slice(options);
+        argv.push("fakeprog");
+        let error = run_opts_for(&argv)
+            .refuse_liteinst_without_the_feature()
+            .unwrap_err();
+        let unavailable = error
+            .downcast_ref::<hermit::BackendUnavailable>()
+            .unwrap_or_else(|| panic!("{options:?}: {error:#}"));
+        assert_eq!(unavailable.backend(), Backend::Liteinst, "{options:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("compiled without the liteinst backend"),
+            "{options:?}: {error:#}"
+        );
+    }
+    // Other backends are not this refusal's business.
+    run_opts_for(&["hermit", "run", "fakeprog"])
+        .refuse_liteinst_without_the_feature()
+        .unwrap();
 }
 
 /// `RunOpts::refuse_unsupervised_log_cap` for `hermit GLOBAL... run OPTIONS...
@@ -4322,12 +4370,22 @@ impl RunOpts {
     // TODO-HUMAN-REVIEW(PR-3635): Review the in-guest LiteInst option refusals.
     /// Refuses options that in-guest LiteInst cannot honour yet, so a run never
     /// silently drops one of them.
+    ///
+    /// These refusals are static facts about the backend, so they hold in
+    /// every build and come before the availability check: a command gets the
+    /// same verdict whether or not the build has the `liteinst` feature
+    /// (https://github.com/rrnewton/hermit/issues/3418). The maximum-timeslice
+    /// advice is the exception. The timeslice is on by default, so in a build
+    /// without the feature that advice would answer every run, and following
+    /// it would only reach the build-feature refusal one run later. Such a
+    /// build skips it, and `refuse_liteinst_without_the_feature` names the
+    /// missing feature instead.
     fn refuse_unqualified_liteinst_in_guest_options(&self) -> Result<(), Error> {
         if !self.uses_in_guest_liteinst() {
             return Ok(());
         }
         let config = &self.det_opts.det_config;
-        let reason = if config.max_timeslice.is_some() {
+        let reason = if cfg!(feature = "liteinst") && config.max_timeslice.is_some() {
             "it cannot deliver Detcore's preemption timer yet (the in-guest Tool host refuses \
              set_timer with ENOSYS), so the run would fail at its first timeslice; pass \
              --max-timeslice=disabled"
@@ -4347,6 +4405,24 @@ impl RunOpts {
         Err(Error::new(PolicyRefusal).context(format!(
             "--backend=liteinst (in-guest LiteInst) refuses this run: {reason}"
         )))
+    }
+
+    /// In a build without the `liteinst` feature, refuses `--backend=liteinst`
+    /// for the missing feature ("this build was compiled without the liteinst
+    /// backend"), in place of the in-guest maximum-timeslice advice above.
+    ///
+    /// `main` calls it after the policy refusals that hold in every build, so
+    /// an unqualified `--timeout` or an unenforceable `--max-log-bytes` is
+    /// still refused with 122 whatever the build, and before `--verify` reads
+    /// stdin, so this refusal does not
+    /// wait for input either. Builds with the feature are unchanged: they
+    /// check whether the LiteInst runtime is installed later, with the other
+    /// backends.
+    fn refuse_liteinst_without_the_feature(&self) -> Result<(), Error> {
+        if cfg!(feature = "liteinst") || !self.uses_in_guest_liteinst() {
+            return Ok(());
+        }
+        Backend::Liteinst.ensure_available()
     }
 
     /// Why `--max-log-bytes` cannot end a run of this backend in this namespace
@@ -4600,6 +4676,8 @@ impl RunOpts {
         // reason: a refused run must not consume its input. It is also above the
         // DBT arm below, which returns without reaching `RunOpts::run`.
         self.refuse_unsupervised_log_cap(global.max_log_bytes)?;
+        // After the refusals that hold in every build, and before stdin is read.
+        self.refuse_liteinst_without_the_feature()?;
         if self.verify {
             validate_log_level(global)?;
         }
