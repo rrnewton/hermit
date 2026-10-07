@@ -95,6 +95,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     anonymous_object_devices: None,
     exit_process_on_identity_lookup_refusal: false,
     tool_opens_outside_guest_descriptor_table: true,
+    seccomp_filter_inherited: false,
     virtualize_time: false,
     virtualize_metadata: false,
     mountinfo_root_rewrites: Vec::new(),
@@ -177,6 +178,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     anonymous_object_devices: None,
     exit_process_on_identity_lookup_refusal: false,
     tool_opens_outside_guest_descriptor_table: true,
+    seccomp_filter_inherited: false,
     virtualize_time: true, // stat* could depends on this
     virtualize_metadata: true,
     mountinfo_root_rewrites: Vec::new(),
@@ -259,6 +261,7 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     anonymous_object_devices: None,
     exit_process_on_identity_lookup_refusal: false,
     tool_opens_outside_guest_descriptor_table: true,
+    seccomp_filter_inherited: false,
     virtualize_time: true,
     virtualize_metadata: true,
     mountinfo_root_rewrites: Vec::new(),
