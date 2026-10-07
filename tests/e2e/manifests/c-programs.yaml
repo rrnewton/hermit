@@ -8313,10 +8313,10 @@ test:
         assert:
           bitwise_parity: true
         backends_disabled:
-          dbt: A scheduler timer signal interrupting external IO is qualified against the ptrace reference first; qualify DBT separately
-          kvm: A scheduler timer signal interrupting external IO is qualified against the ptrace reference first; qualify KVM separately
-          sabre: A scheduler timer signal interrupting external IO is qualified against the ptrace reference first; qualify SaBRe separately
-          liteinst: A scheduler timer signal interrupting external IO is qualified against the ptrace reference first; qualify LiteInst separately
+          dbt: Config::backend_supports_blocked_wait_signal_interruption is false on DBT, so the scheduler neither sends an alarm to the external-IO blocker whose mask admits it nor orders that thread's report; see https://github.com/rrnewton/hermit/issues/3222
+          kvm: Config::backend_supports_blocked_wait_signal_interruption is false on KVM, so the scheduler neither sends an alarm to the external-IO blocker whose mask admits it nor orders that thread's report; see https://github.com/rrnewton/hermit/issues/3222
+          sabre: Config::backend_supports_blocked_wait_signal_interruption is false on SaBRe, so the scheduler neither sends an alarm to the external-IO blocker whose mask admits it nor orders that thread's report; see https://github.com/rrnewton/hermit/issues/3222
+          liteinst: Config::backend_supports_blocked_wait_signal_interruption is false on LiteInst, so the scheduler neither sends an alarm to the external-IO blocker whose mask admits it nor orders that thread's report; see https://github.com/rrnewton/hermit/issues/3222
       naked:
         ci: false
         ci_disabled_reason: This fixture asserts interrupted external-IO behavior under verification; it has no native nondeterminism oracle.
