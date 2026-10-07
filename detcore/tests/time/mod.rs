@@ -307,6 +307,12 @@ fn tod_gettimeofday_faulting_tz_writes_virtual_tv() {
                 raw_gettimeofday(unmapped.cast(), ptr::null_mut()),
                 (-1, libc::EFAULT)
             );
+            // So does one at the last byte of the address space, whose
+            // `tv_usec` has no address.
+            assert_eq!(
+                raw_gettimeofday(ptr::without_provenance_mut(usize::MAX), ptr::null_mut()),
+                (-1, libc::EFAULT)
+            );
             assert_eq!(unsafe { libc::munmap(readonly.cast(), page_size) }, 0);
         },
         config,
