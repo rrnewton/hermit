@@ -575,14 +575,17 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Fence an exact self-SIGKILL at the scheduler-selected syscall turn.
     ///
-    /// KVM commits this syscall as an immediate, nonreturning process exit. It
-    /// therefore has no later return boundary at which the ordinary pending
-    /// signal path could acquire a delivery permit. Without this preflight, the
-    /// backend's terminal child callback arrives with no generation-bound
-    /// reservation and must fail closed. `ResourceID::Exit` is the same fence
-    /// used by `exit_group`; the KVM-only configuration guard avoids changing
-    /// ptrace, DBT, or non-sequential execution.
-    async fn reserve_kvm_self_sigkill_exit<G: Guest<Self>>(
+    /// This applies only when Detcore holds the backend's process signal
+    /// control (`BackendSignalControlMode::ToolControlled`). A backend that
+    /// installed that control commits this syscall as an immediate,
+    /// nonreturning process exit. It therefore has no later return boundary at
+    /// which the ordinary pending signal path could acquire a delivery permit.
+    /// Without this preflight, the backend's terminal child callback arrives
+    /// with no generation-bound reservation and must fail closed.
+    /// `ResourceID::Exit` is the same fence used by `exit_group`. A run without
+    /// the installed control (`Unchanged`, including every non-sequentialized
+    /// run) keeps its ordinary signal path and reserves nothing.
+    async fn reserve_controlled_self_sigkill_exit<G: Guest<Self>>(
         &self,
         guest: &mut G,
         signal: libc::c_int,
@@ -659,7 +662,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         // ambiguity even when the process has several live threads. Reserve it
         // before the generic process-signal path rejects that thread set.
         if self
-            .reserve_kvm_self_sigkill_exit(guest, call.sig(), Some(DetPid::from_raw(tgid)), None)
+            .reserve_controlled_self_sigkill_exit(
+                guest,
+                call.sig(),
+                Some(DetPid::from_raw(tgid)),
+                None,
+            )
             .await
         {
             return Ok(self.record_or_replay(guest, call).await?);
@@ -694,7 +702,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Tgkill,
     ) -> Result<i64, Error> {
         let _reserved = self
-            .reserve_kvm_self_sigkill_exit(
+            .reserve_controlled_self_sigkill_exit(
                 guest,
                 call.sig(),
                 Some(DetPid::from_raw(call.tgid())),
@@ -723,7 +731,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Tkill,
     ) -> Result<i64, Error> {
         let _reserved = self
-            .reserve_kvm_self_sigkill_exit(
+            .reserve_controlled_self_sigkill_exit(
                 guest,
                 call.sig(),
                 None,
