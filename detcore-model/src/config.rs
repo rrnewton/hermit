@@ -149,7 +149,9 @@ pub struct Config {
     /// count (before Linux 5.9), and whenever it cannot tell. Otherwise, every thread filtered
     /// alike, a child forked from the preparing thread, which inherits its filters, makes these
     /// calls with Detcore's arguments on a descriptor of `/`, and the flag is false only when
-    /// that child exits normally with status 0. A caller whose command installs a filter in the
+    /// that child exits normally with status 0 within the launcher's bound: 10 seconds, or what
+    /// remains of the run's `--timeout` when that is less. A child still running then is killed
+    /// and reaped, and the flag is true. A caller whose command installs a filter in the
     /// child itself (a `pre_exec` callback) sets it, as record mode does, and the launcher
     /// never clears a true. `hermit run --backend=dbt` prepares its configuration without
     /// asking, so there it holds only what the caller set.
@@ -158,17 +160,17 @@ pub struct Config {
     /// on a call's arguments (the descriptor, a path or buffer address, the flags) or on the
     /// calling instruction, since the child makes each call once, on `/`, from Hermit's code; a
     /// `SECCOMP_RET_USER_NOTIF` or `SECCOMP_RET_TRACE` supervisor that answers the child and a
-    /// guest differently, or never answers (the launcher then waits for the child); the audit
-    /// record a `SECCOMP_RET_LOG` filter writes for each call, the child's and the guest's; two
-    /// threads whose filter counts are equal but whose filters differ; a filter a caller's
-    /// `pre_exec` installs, which the caller reports as above; and a filter installed after the
-    /// run's configuration was prepared. An answer asked before a container is cloned and held
-    /// for the runs prepared in it is used only on the thread that asked, or in a container
-    /// cloned from it, and only while that thread's `Seccomp:` mode and `Seccomp_filters:`
-    /// count are unchanged; otherwise the flag is true. Made under every filter whatever this
-    /// holds: the `lstat` of each entry asked, the `fstat` of a directory Detcore does not
-    /// track, and the `statx` and `statmount` with which a `/proc/<pid>/maps` rewrite proves a
-    /// superblock.
+    /// guest differently (one that leaves the child unanswered past the bound sets it true);
+    /// the audit record a `SECCOMP_RET_LOG` filter writes for each call, the child's and the
+    /// guest's; two threads whose filter counts are equal but whose filters differ; a filter a
+    /// caller's `pre_exec` installs, which the caller reports as above; and a filter installed
+    /// after the run's configuration was prepared. An answer asked before a container is cloned
+    /// and held for the runs prepared in it is used only on the thread that asked, or in a
+    /// container cloned from it, and only while that thread's `Seccomp:` mode and
+    /// `Seccomp_filters:` count are unchanged; otherwise the flag is true. Made under every
+    /// filter whatever this holds: the `lstat` of each entry asked, the `fstat` of a directory
+    /// Detcore does not track, and the `statx` and `statmount` with which a `/proc/<pid>/maps`
+    /// rewrite proves a superblock.
     #[serde(default)]
     #[clap(skip)]
     pub seccomp_may_refuse_entry_lookup_syscalls: bool,
