@@ -163,6 +163,48 @@ struct FileIdentity {
     sha256: String,
 }
 
+/// Each identity field that differs between two observations of one path, as
+/// `name before -> after`.
+///
+/// The link count is reported but never compared on its own: adding or
+/// removing a hard link also changes ctime, which is compared. Naming it tells
+/// a writer that only linked or unlinked the inode apart from one that wrote
+/// its bytes. A 2026-10-07 validation refused /src/target/validate/hermit as
+/// "changed while hashing" without saying which field moved, which left
+/// nothing to identify the writer with.
+fn metadata_changes(before: &fs::Metadata, after: &fs::Metadata) -> Vec<String> {
+    let time = |seconds: i64, nanoseconds: i64| format!("{seconds}.{nanoseconds:09}");
+    let fields = [
+        ("dev", before.dev().to_string(), after.dev().to_string()),
+        ("ino", before.ino().to_string(), after.ino().to_string()),
+        ("size", before.len().to_string(), after.len().to_string()),
+        (
+            "mode",
+            format!("{:o}", before.mode()),
+            format!("{:o}", after.mode()),
+        ),
+        (
+            "mtime",
+            time(before.mtime(), before.mtime_nsec()),
+            time(after.mtime(), after.mtime_nsec()),
+        ),
+        (
+            "ctime",
+            time(before.ctime(), before.ctime_nsec()),
+            time(after.ctime(), after.ctime_nsec()),
+        ),
+    ];
+    let mut changed: Vec<String> = fields
+        .into_iter()
+        .filter(|(_, old, new)| old != new)
+        .map(|(name, old, new)| format!("{name} {old} -> {new}"))
+        .collect();
+    if !changed.is_empty() {
+        changed.push(format!("nlink {} -> {}", before.nlink(), after.nlink()));
+    }
+    changed
+}
+
 fn file_identity(path: &Path, executable: bool) -> Result<FileIdentity, String> {
     let before = fs::symlink_metadata(path)
         .map_err(|error| format!("cannot inspect prepared input {}: {error}", path.display()))?;
@@ -197,18 +239,12 @@ fn file_identity(path: &Path, executable: bool) -> Result<FileIdentity, String> 
     }
     let after = fs::symlink_metadata(path)
         .map_err(|error| format!("prepared input disappeared {}: {error}", path.display()))?;
-    if before.dev() != after.dev()
-        || before.ino() != after.ino()
-        || before.len() != after.len()
-        || before.mode() != after.mode()
-        || before.mtime() != after.mtime()
-        || before.mtime_nsec() != after.mtime_nsec()
-        || before.ctime() != after.ctime()
-        || before.ctime_nsec() != after.ctime_nsec()
-    {
+    let changed = metadata_changes(&before, &after);
+    if !changed.is_empty() {
         return Err(format!(
-            "prepared input changed while hashing {}",
-            path.display()
+            "prepared input changed while hashing {}: {}",
+            path.display(),
+            changed.join(", ")
         ));
     }
     Ok(FileIdentity {
@@ -1966,6 +2002,33 @@ mod tests {
             .iter()
             .map(|text| (selection_key(&args(text)), args(text)))
             .collect()
+    }
+
+    #[test]
+    fn a_changed_prepared_input_names_each_field_that_moved() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-prepared-input-change-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("one"), "1").unwrap();
+        fs::write(root.join("two"), "22").unwrap();
+        let one = fs::symlink_metadata(root.join("one")).unwrap();
+        let two = fs::symlink_metadata(root.join("two")).unwrap();
+
+        assert!(metadata_changes(&one, &one).is_empty());
+        let changed = metadata_changes(&one, &two);
+        assert_eq!(
+            changed[..2],
+            [
+                format!("ino {} -> {}", one.ino(), two.ino()),
+                "size 1 -> 2".to_string(),
+            ]
+        );
+        assert!(!changed.iter().any(|field| field.starts_with("mode ")));
+        assert_eq!(changed.last().unwrap(), "nlink 1 -> 1");
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
