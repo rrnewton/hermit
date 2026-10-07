@@ -1253,7 +1253,14 @@ impl GlobalTool for GlobalState {
     /// A backend whose process exits complete asynchronously reports each
     /// physical exit here; see [`GlobalState::complete_physical_process_exit`].
     fn on_backend_process_exited(&self, pid: i32) {
-        self.complete_physical_process_exit(pid);
+        if self.cfg.backend.reports_child_exit_publication {
+            // The kernel has published this process's exit to its parent. It
+            // is not a physical-exit barrier report on this backend, and the
+            // scheduler does not yet act on the publication.
+            trace!("[detcore, dpid {}] backend published the child exit", pid);
+        } else {
+            self.complete_physical_process_exit(pid);
+        }
     }
 
     /// The processes held between their exit grant and their physical exit,

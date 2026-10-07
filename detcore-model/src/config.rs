@@ -1703,6 +1703,10 @@ impl LegacyBackendKeys {
         backend.guest_clock_reads_bypass_backend = self.detect_host_clock_futex_timeouts;
         backend.virtualizes_syscall_clobbers = self.syscall_clobbers_virtualized_by_backend;
         backend.needs_killed_thread_rpc_cancellation = self.cancel_killed_thread_rpcs;
+        // A legacy encoding predates this key. Only the ptrace tracer reports
+        // child-exit publication, and it is the one backend that needs no
+        // killed-thread RPC cancellation.
+        backend.reports_child_exit_publication = !self.cancel_killed_thread_rpcs;
         backend.reports_physical_process_exits = self.backend_reports_physical_process_exits;
         backend.signal_interrupts_external_syscalls = self.backend_reports_physical_process_exits;
         backend.tracks_process_children = self.backend_tracks_process_children;
@@ -2471,7 +2475,10 @@ mod tests {
                 "syscall_clobbers_virtualized_by_backend" => {
                     expected.virtualizes_syscall_clobbers = true
                 }
-                "cancel_killed_thread_rpcs" => expected.needs_killed_thread_rpc_cancellation = true,
+                "cancel_killed_thread_rpcs" => {
+                    expected.needs_killed_thread_rpc_cancellation = true;
+                    expected.reports_child_exit_publication = false;
+                }
                 "backend_reports_physical_process_exits" => {
                     expected.reports_physical_process_exits = true;
                     expected.signal_interrupts_external_syscalls = true;

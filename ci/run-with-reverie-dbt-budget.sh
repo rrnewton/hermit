@@ -1079,7 +1079,14 @@ fi
 # b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9. The native client is unchanged.
 # Carry, not recalibration: no new timing sample or >=5-sample replacement
 # claim is made.
-expected_pin=015d9c00e7e83890246db68a11cfbb2317fe02ee
+# CARRY TO 9cb6f7b7db6549e373ae57fa7035f09aca7d508f (2026-10-07): from
+# 015d9c00e7e83890246db68a11cfbb2317fe02ee. The one commit changes no reverie-dbt file: the reverie-dbt
+# tree is cc882d339affba476229fe5ff209d888d8fa0a38 at both pins, and
+# third-party, rust-toolchain.toml and the root Cargo.toml are unchanged. It
+# changes reverie-ptrace (a child-exit publication report) and
+# reverie/src/capabilities.rs and tool.rs. Carry, not recalibration: no new
+# timing sample or >=5-sample replacement claim is made.
+expected_pin=9cb6f7b7db6549e373ae57fa7035f09aca7d508f
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
