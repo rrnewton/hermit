@@ -1424,7 +1424,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // all 1104: 1105.
     // Thirteen SIGALRM ledger tests in scheduler::parked_tests (signal phase 1, step
     // I1a), re-listed: 1110.
-    ("test.detcore_unit", 1118),
+    // Five SIGALRM ledger control tests (three in scheduler::parked_tests, two
+    // in tool_global; signal phase 1 step I1b), re-listed: 1123.
+    ("test.detcore_unit", 1123),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1990,7 +1992,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same background-signal test, re-listed: 1090.
     // The host twin selects the same seven B5a tests, re-listed: 1096.
     // And the same thirteen SIGALRM ledger tests, re-listed: 1110.
-    ("test.detcore_unit_on_host", 1118),
+    // And the same five SIGALRM ledger control tests, re-listed: 1123.
+    ("test.detcore_unit_on_host", 1123),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

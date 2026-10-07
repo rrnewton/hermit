@@ -33,8 +33,10 @@ use crate::syscalls::threads::KERNEL_SIGSET_SIZE;
 use crate::syscalls::threads::KernelSigaction;
 use crate::syscalls::threads::KernelSigset;
 use crate::tool_global::ResumeStatus;
+use crate::tool_global::SigalrmControl;
 use crate::tool_global::alarm_remaining;
 use crate::tool_global::notify_signal_pending;
+use crate::tool_global::refuse_sigalrm;
 use crate::tool_global::register_alarm;
 use crate::tool_global::resolve_kill_targets;
 use crate::tool_global::resource_request;
@@ -317,6 +319,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let timer: libc::itimerval = guest.memory().read_value(value)?;
         let interval = timeval_to_logical_time(timer.it_interval)?;
         let duration = timeval_to_logical_time(timer.it_value)?;
+        // A zero value disarms the timer, whatever its interval.
+        if duration.as_nanos() != 0 && interval.as_nanos() != 0 {
+            refuse_sigalrm(guest, SigalrmControl::ArmRecurringTimer).await?;
+        }
         let (remaining, old_interval) =
             register_alarm(guest, duration, interval, Signal::SIGALRM).await;
         if let Some(old_value) = call.ovalue() {
@@ -646,6 +652,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let tgid = call.pid();
+        // A process-group or broadcast SIGALRM is refused below (ENOSYS).
+        if call.sig() == libc::SIGALRM && tgid > 0 {
+            refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(tgid))).await?;
+        }
         if can_forward_process_group_signal(
             tgid,
             call.sig(),
@@ -702,6 +712,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Tgkill,
     ) -> Result<i64, Error> {
+        if call.sig() == libc::SIGALRM {
+            refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(call.tid()))).await?;
+        }
         let _reserved = self
             .reserve_controlled_self_sigkill_exit(
                 guest,
@@ -731,6 +744,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Tkill,
     ) -> Result<i64, Error> {
+        if call.sig() == libc::SIGALRM {
+            refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(call.tid()))).await?;
+        }
         let _reserved = self
             .reserve_controlled_self_sigkill_exit(
                 guest,
@@ -787,6 +803,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::RtTgsigqueueinfo,
     ) -> Result<i64, Error> {
+        if call.sig() == libc::SIGALRM {
+            refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(call.tid()))).await?;
+        }
         let value = self.record_or_replay(guest, call).await?;
         // Thread-directed like `tgkill`, so it carries the same wakeup
         // obligation. `sigqueue`/`pthread_sigqueue` reach a parked sibling
@@ -819,6 +838,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         let tgid = call.tgid();
         if tgid <= 0 {
             return Err(Errno::ENOSYS.into());
+        }
+        if call.sig() == libc::SIGALRM {
+            refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(tgid))).await?;
         }
         let targets = resolve_kill_targets(guest, DetPid::from_raw(tgid)).await;
         let tid = deterministic_kill_target(&targets, call.sig())?;

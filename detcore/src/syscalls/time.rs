@@ -34,6 +34,8 @@ use crate::resources::Resources;
 use crate::scheduler::Priority;
 use crate::scheduler::entropy_to_priority;
 use crate::tool_global::ResumeStatus;
+use crate::tool_global::SigalrmControl;
+use crate::tool_global::refuse_sigalrm;
 use crate::tool_global::register_posix_timer;
 use crate::tool_global::thread_observe_time;
 use crate::tool_local::Detcore;
@@ -888,6 +890,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             Some(Signal::SIGALRM)
         };
+        if signal == Some(Signal::SIGALRM) {
+            refuse_sigalrm(guest, SigalrmControl::ArmProducer).await?;
+        }
         let id = {
             let mut timers = guest.thread_state().posix_timers.lock().unwrap();
             timers.create(signal.map(|sig| sig as i32))

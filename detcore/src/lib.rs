@@ -2312,6 +2312,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                             guest,
                             call,
                             args.arg0 as RawFd,
+                            args.arg1 as i32,
                             args.arg3 as u32,
                         )
                         .await

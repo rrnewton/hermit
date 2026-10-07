@@ -34,6 +34,7 @@ use reverie::SignalTaskIdentity;
 use super::parked::*;
 use super::real_timer::TimerFailure;
 use super::*;
+use crate::tool_global::SigalrmControl;
 
 #[derive(Default)]
 struct Backend {
@@ -4033,4 +4034,67 @@ fn an_ignored_or_exited_process_drops_its_pending_sigalrm() {
     s.retire_sigalrm_thread(tid, pid);
     assert!(!s.sigalrm_pending(pid));
     assert!(!s.sigalrm_handled(pid));
+}
+
+/// While no process handles SIGALRM, the ledger refuses no control message,
+/// from any thread, and records an allowed producer arming.
+#[test]
+fn an_empty_sigalrm_ledger_refuses_nothing_and_records_a_producer() {
+    let mut s = liteinst_scheduler();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    for control in [
+        SigalrmControl::SendTo(tid),
+        SigalrmControl::SendToUnnamed,
+        SigalrmControl::ArmRecurringTimer,
+    ] {
+        assert!(!s.sigalrm_control(tid, control), "{control:?}");
+    }
+    assert!(!s.sigalrm_producer_armed());
+    assert!(!s.sigalrm_control(tid, SigalrmControl::ArmProducer));
+    assert!(s.sigalrm_producer_armed());
+}
+
+/// While a process handles SIGALRM: a SIGALRM send that reaches it is refused
+/// (its own included), one that reaches another process is not, a send to a
+/// process the caller cannot name is, every producer arming is (and is not
+/// recorded), and a recurring `ITIMER_REAL` is refused in the handling
+/// process only.
+#[test]
+fn a_sigalrm_handling_process_refuses_sends_to_it_and_every_producer() {
+    let mut s = liteinst_scheduler();
+    let (handler, _, _) = add(&mut s, 100, 100);
+    let (other, _, _) = add(&mut s, 200, 200);
+    s.set_sigalrm_handled(DetPid::from_raw(100), true);
+
+    s.set_running_for_test(other);
+    assert!(s.sigalrm_control(other, SigalrmControl::SendTo(handler)));
+    assert!(!s.sigalrm_control(other, SigalrmControl::SendTo(other)));
+    assert!(s.sigalrm_control(other, SigalrmControl::SendToUnnamed));
+    assert!(s.sigalrm_control(other, SigalrmControl::ArmProducer));
+    assert!(
+        !s.sigalrm_producer_armed(),
+        "a refused arming is not recorded"
+    );
+    assert!(!s.sigalrm_control(other, SigalrmControl::ArmRecurringTimer));
+
+    s.set_running_for_test(handler);
+    assert!(s.sigalrm_control(handler, SigalrmControl::SendTo(handler)));
+    assert!(s.sigalrm_control(handler, SigalrmControl::ArmRecurringTimer));
+}
+
+/// While a process handles SIGALRM, a sender that does not hold the serial
+/// grant is refused whatever it asks: its question could race a commit.
+#[test]
+fn a_sigalrm_control_without_the_serial_grant_is_refused() {
+    let mut s = liteinst_scheduler();
+    let (handler, _, _) = add(&mut s, 100, 100);
+    let (granted, _, _) = add(&mut s, 200, 200);
+    let (outside, _, _) = add(&mut s, 300, 300);
+    s.set_sigalrm_handled(DetPid::from_raw(100), true);
+    s.set_running_for_test(granted);
+
+    assert!(!s.sigalrm_control(granted, SigalrmControl::SendTo(granted)));
+    assert!(s.sigalrm_control(outside, SigalrmControl::SendTo(granted)));
+    assert!(s.sigalrm_control(outside, SigalrmControl::ArmRecurringTimer));
+    let _ = handler;
 }

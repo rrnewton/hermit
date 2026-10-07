@@ -4220,6 +4220,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         // reaches the kernel, for every process of the container, and never
         // forget them (`Scheduler::record_host_timed_signals`).
         let signals = fcntl_host_timed_signals(call.cmd());
+        if signals & kernel_sigset_bit(libc::SIGALRM) != 0 {
+            refuse_sigalrm(guest, SigalrmControl::ArmProducer).await?;
+        }
         if signals != 0
             && guest
                 .config()
@@ -5727,6 +5730,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: Syscall,
         pidfd: RawFd,
+        signal: i32,
         flags: u32,
     ) -> Result<i64, Error> {
         // The kernel currently reserves `flags`; a nonzero value is EINVAL.
@@ -5740,6 +5744,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_detfd(pidfd, |detfd| matches!(detfd.ty(), FdType::Pidfd))?;
         if !is_pidfd {
             return Err(Errno::EBADF.into());
+        }
+        if signal == libc::SIGALRM {
+            // `pidfd_open` records the process a pidfd names; a pidfd with no
+            // recorded target is refused while any process handles SIGALRM.
+            let control = match guest
+                .thread_state()
+                .with_detfd(pidfd, |detfd| detfd.pidfd_target())?
+            {
+                Some(target) => SigalrmControl::SendTo(DetTid::from_raw(target.as_raw())),
+                None => SigalrmControl::SendToUnnamed,
+            };
+            refuse_sigalrm(guest, control).await?;
         }
         Ok(self.record_or_replay(guest, call).await?)
     }

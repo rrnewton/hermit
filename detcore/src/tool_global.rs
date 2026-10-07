@@ -1753,6 +1753,14 @@ impl GlobalTool for GlobalState {
                 R::SharedOpenFile(self.shared_open_file_control(dtid, control)),
             );
         }
+        // A SIGALRM ledger control message: like the messages above, it
+        // carries no logical time and its answer carries none back. It reads
+        // or records ledger state, which changes only at scheduler commits,
+        // in the sender's own turn.
+        if let GlobalRequest::Sigalrm(control) = request {
+            let refused = self.sched.lock().unwrap().sigalrm_control(dtid, control);
+            return (None, R::Sigalrm(refused));
+        }
         if let GlobalRequest::SignalDequeued {
             detpid,
             identity,
@@ -1957,6 +1965,9 @@ impl GlobalTool for GlobalState {
             }
             GlobalRequest::SharedOpenFile(_) => {
                 unreachable!("shared open file control answered before clock accounting")
+            }
+            GlobalRequest::Sigalrm(_) => {
+                unreachable!("SIGALRM ledger control answered before clock accounting")
             }
             GlobalRequest::ParkedRequest(rs, pid, capability) => {
                 let (response, _) = self
@@ -3735,6 +3746,28 @@ pub struct ThreadDeregistration {
     pub(crate) chaos_epochs: Vec<ChaosEpochTransition>,
 }
 
+/// A question about, or a record in, the scheduler's ledger of guest-handled
+/// SIGALRMs (`Scheduler::sigalrm_control`), sent by a guest's Detcore in the
+/// calling thread's turn before the call reaches the kernel. Signal phase 1
+/// refuses each of these with EPERM while it could reach a process that
+/// handles SIGALRM.
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
+pub enum SigalrmControl {
+    /// A send of SIGALRM to the process of this thread.
+    SendTo(DetTid),
+    /// A send of SIGALRM to a process the caller cannot name to Detcore: a
+    /// pidfd with no recorded target (`pidfd_open` records one).
+    SendToUnnamed,
+    /// An arming of a kernel producer of SIGALRM that Detcore does not
+    /// emulate through its alarm path: a POSIX timer, `F_SETSIG` or
+    /// `PR_SET_PDEATHSIG`. Recorded when allowed, so a later handler
+    /// installation can be refused.
+    ArmProducer,
+    /// An arming of a recurring `ITIMER_REAL` (nonzero interval), which phase 1
+    /// does not model for a handling process.
+    ArmRecurringTimer,
+}
+
 /// Messages to the global object.
 ///
 /// This is public only so it can be used in the `GlobalTool` trait.
@@ -4001,6 +4034,10 @@ pub enum GlobalRequest {
     /// `crate::shared_open_files`). Appended after `HostTimedSignals`, for the
     /// same reason.
     SharedOpenFile(OpenFileControl),
+    /// A SIGALRM ledger control message, answered before any clock or
+    /// scheduler accounting (see [`sigalrm_refuses`]). Appended after
+    /// `SharedOpenFile`, for the same reason.
+    Sigalrm(SigalrmControl),
 }
 
 /// Responses from the global object
@@ -4091,6 +4128,9 @@ pub enum GlobalResponse {
     HostTimedSignals(u64),
     /// Appended after `HostTimedSignals`, for the same reason.
     SharedOpenFile(Result<OpenFileControlReply, SharedOpenFileError>),
+    /// Whether the SIGALRM ledger refused the control message. Appended after
+    /// `SharedOpenFile`, for the same reason.
+    Sigalrm(bool),
 }
 
 /// The global request that carries one shared open file control message. It
@@ -5253,6 +5293,38 @@ where
     }
 }
 
+/// Whether the scheduler's SIGALRM ledger refuses `control` for the calling
+/// thread (`Scheduler::sigalrm_control`). Asked in the thread's own turn; it
+/// carries no logical time either way.
+pub async fn sigalrm_refuses<G, T>(guest: &mut G, control: SigalrmControl) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::Sigalrm(control)).await;
+    match response.1 {
+        GlobalResponse::Sigalrm(refused) => refused,
+        _ => unreachable!(),
+    }
+}
+
+/// EPERM when the scheduler's SIGALRM ledger refuses `control`
+/// ([`sigalrm_refuses`]).
+pub async fn refuse_sigalrm<G, T>(
+    guest: &mut G,
+    control: SigalrmControl,
+) -> Result<(), nix::errno::Errno>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if sigalrm_refuses(guest, control).await {
+        Err(nix::errno::Errno::EPERM)
+    } else {
+        Ok(())
+    }
+}
+
 /// Return scheduler-owned lifecycle state for an exact child-process wait.
 pub async fn exact_child_wait_state<G, T>(guest: &mut G, child: DetPid) -> ExactChildWaitState
 where
@@ -6408,6 +6480,91 @@ mod tests {
         fn read_clock(&mut self) -> Result<u64, reverie::Error> {
             panic!("external registration must not read a host clock")
         }
+    }
+
+    /// While the caller's own process handles SIGALRM, every SIGALRM send and
+    /// producer arming the handlers check is refused with EPERM before the
+    /// kernel: the guest injects nothing (`RetirementGuest` panics on an
+    /// injection) and sends no RPC but the ledger's control message.
+    #[tokio::test]
+    async fn sigalrm_sends_and_producer_armings_are_refused_before_the_kernel() {
+        use reverie::Tool;
+        use reverie::syscalls;
+
+        let (config, state, tid, pid) = cancellation_test_state();
+        install_test_registration(&state, tid, Ivar::new());
+        {
+            let mut sched = state.sched.lock().unwrap();
+            sched.set_sigalrm_handled(pid, true);
+            sched.set_running_for_test(tid);
+        }
+        let tool: Detcore = Detcore::new(Tid::from_raw(tid.as_raw()), &config);
+        let mut thread = tool.init_thread_state(Tid::from_raw(tid.as_raw()), None);
+        thread.detpid = Some(pid);
+        let mut guest = RetirementGuest {
+            global: &state,
+            config: &config,
+            thread,
+            requests: Mutex::new(Vec::new()),
+            retired: std::sync::atomic::AtomicBool::new(false),
+        };
+        let (raw_pid, raw_tid) = (pid.as_raw(), tid.as_raw());
+        let eperm = |result: Result<i64, reverie::Error>, what: &str| {
+            assert!(
+                matches!(result, Err(reverie::Error::Errno(errno)) if errno == reverie::Errno::EPERM),
+                "{what}: {result:?}"
+            );
+        };
+
+        let sigalrm = libc::SIGALRM;
+        let tgkill = syscalls::Tgkill::new()
+            .with_tgid(raw_pid)
+            .with_tid(raw_tid)
+            .with_sig(sigalrm);
+        eperm(tool.handle_tgkill(&mut guest, tgkill).await, "tgkill");
+        let tkill = syscalls::Tkill::new().with_tid(raw_tid).with_sig(sigalrm);
+        eperm(tool.handle_tkill(&mut guest, tkill).await, "tkill");
+        let kill = syscalls::Kill::new().with_pid(raw_pid).with_sig(sigalrm);
+        eperm(tool.handle_kill(&mut guest, kill).await, "kill");
+        let queue = syscalls::RtSigqueueinfo::new()
+            .with_tgid(raw_pid)
+            .with_sig(sigalrm);
+        eperm(
+            tool.handle_rt_sigqueueinfo(&mut guest, queue).await,
+            "rt_sigqueueinfo",
+        );
+        let tgqueue = syscalls::RtTgsigqueueinfo::new()
+            .with_tgid(raw_pid)
+            .with_tid(raw_tid)
+            .with_sig(sigalrm);
+        eperm(
+            tool.handle_rt_tgsigqueueinfo(&mut guest, tgqueue).await,
+            "rt_tgsigqueueinfo",
+        );
+        let pdeathsig = syscalls::Prctl::new()
+            .with_option(libc::PR_SET_PDEATHSIG)
+            .with_arg2(sigalrm as libc::c_ulong);
+        eperm(
+            tool.handle_prctl(&mut guest, pdeathsig).await,
+            "PR_SET_PDEATHSIG",
+        );
+        // A NULL sigevent names SIGALRM; the id pointer is never written.
+        let timer = syscalls::TimerCreate::new()
+            .with_clockid(syscalls::ClockId::CLOCK_MONOTONIC)
+            .with_timerid(reverie::syscalls::AddrMut::from_raw(0x1000));
+        eperm(
+            tool.handle_timer_create(&mut guest, timer).await,
+            "timer_create",
+        );
+
+        let requests = guest.requests.lock().unwrap();
+        assert_eq!(requests.len(), 7);
+        assert!(
+            requests
+                .iter()
+                .all(|request| matches!(request, GlobalRequest::Sigalrm(_))),
+            "{requests:?}"
+        );
     }
 
     #[tokio::test]
@@ -9168,6 +9325,60 @@ mod tests {
         ));
         assert!(!state.shared_open_files.lock().unwrap().is_leased(id));
         assert!(state.sched.lock().unwrap().backend_failed());
+    }
+
+    /// A SIGALRM ledger control message is answered with no logical time and
+    /// moves no clock, and its answer is the ledger's: a send to a process that
+    /// handles SIGALRM is refused, one to another process is not.
+    #[tokio::test]
+    async fn sigalrm_control_is_answered_before_clock_accounting() {
+        let config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let (handler, sender) = (DetTid::from_raw(21), DetTid::from_raw(22));
+        {
+            let mut sched = state.sched.lock().unwrap();
+            for tid in [handler, sender] {
+                sched.thread_tree.add_child(tid, tid, true);
+                sched.next_turns.insert(
+                    tid,
+                    ThreadNextTurn {
+                        dettid: tid,
+                        child_tid_addr: 0,
+                        req: Ivar::new(),
+                        resp: Ivar::new(),
+                        protocol: Default::default(),
+                    },
+                );
+            }
+            sched.set_sigalrm_handled(DetPid::from_raw(21), true);
+            sched.set_running_for_test(sender);
+        }
+        let global_before = state.global_time.lock().unwrap().as_nanos();
+        let send_to = |target: DetTid| {
+            state.receive_rpc(
+                reverie::Tid::from_raw(sender.as_raw()),
+                (
+                    DetTime::new(&config),
+                    MmId::initial(sender),
+                    GlobalRequest::Sigalrm(super::SigalrmControl::SendTo(target)),
+                ),
+            )
+        };
+
+        assert_eq!(
+            send_to(handler).await,
+            (None, GlobalResponse::Sigalrm(true))
+        );
+        assert_eq!(
+            send_to(sender).await,
+            (None, GlobalResponse::Sigalrm(false))
+        );
+        let global_time = state.global_time.lock().unwrap();
+        assert_eq!(global_time.as_nanos(), global_before, "no clock accounting");
+        assert!(!global_time.contains_thread(sender));
     }
 
     /// A host-input observation, and a report of a path the guest rebound,

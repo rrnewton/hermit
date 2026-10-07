@@ -52,6 +52,7 @@ use crate::resources::PAUSE_FYI;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::tool_global::SigalrmControl;
 use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::SigWrapper;
@@ -74,6 +75,10 @@ pub(crate) struct SigalrmLedger {
     /// Pending entries whose determinism loss is already recorded, so a
     /// stranded entry is reported once.
     lost: BTreeSet<DetPid>,
+    /// Whether any guest armed a kernel producer of SIGALRM
+    /// (`SigalrmControl::ArmProducer`). Never cleared: the producer may fire
+    /// at any later time.
+    producer_armed: bool,
 }
 
 impl Scheduler {
@@ -109,6 +114,53 @@ impl Scheduler {
             self.sigalrm.pending.remove(&process);
             self.sigalrm.lost.remove(&process);
         }
+    }
+
+    /// Decides a SIGALRM control message from `thread`'s Detcore, sent in its
+    /// turn before the call reaches the kernel; returns whether it is refused.
+    ///
+    /// While no process handles SIGALRM, nothing is refused, so runs without a
+    /// guest handler behave as before; an allowed producer arming is recorded.
+    /// Otherwise a sender that does not hold the serial grant is refused: its
+    /// question could race a commit. A send is refused when it reaches a
+    /// handling process (one the caller cannot name could be one), every
+    /// producer arming is refused, and a recurring `ITIMER_REAL` is refused in
+    /// a handling process.
+    pub(crate) fn sigalrm_control(&mut self, thread: DetTid, control: SigalrmControl) -> bool {
+        if self.sigalrm.handled.is_empty() {
+            if control == SigalrmControl::ArmProducer {
+                self.sigalrm.producer_armed = true;
+            }
+            return false;
+        }
+        if !self.holds_serial_grant(thread) {
+            return true;
+        }
+        let refused = match control {
+            SigalrmControl::SendTo(target) => {
+                self.sigalrm.handled.contains(&self.sigchld_process(target))
+            }
+            SigalrmControl::SendToUnnamed | SigalrmControl::ArmProducer => true,
+            SigalrmControl::ArmRecurringTimer => {
+                self.sigalrm.handled.contains(&self.sigchld_process(thread))
+            }
+        };
+        if refused {
+            info!(
+                "[dtid {}] {:?} refused: a guest handles SIGALRM (signal phase 1).",
+                thread, control
+            );
+        }
+        refused
+    }
+
+    /// Whether any guest armed a kernel producer of SIGALRM; a handler
+    /// installation is refused once one has.
+    // Read by the runtime's handler admission (phase 1 step I3); until then
+    // only tests call it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn sigalrm_producer_armed(&self) -> bool {
+        self.sigalrm.producer_armed
     }
 
     /// Records `thread`'s "SIGALRM virtually blocked" bit, published by its

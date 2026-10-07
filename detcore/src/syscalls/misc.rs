@@ -32,8 +32,10 @@ use crate::random::validate_getrandom_flags;
 use crate::random::write_random_chunk;
 use crate::record_or_replay::RecordOrReplay;
 use crate::scheduler::HostTimedSignalScope;
+use crate::tool_global::SigalrmControl;
 use crate::tool_global::create_session;
 use crate::tool_global::record_host_timed_signals;
+use crate::tool_global::refuse_sigalrm;
 use crate::tool_global::set_process_group;
 use crate::tool_local::Detcore;
 use crate::types::DetPid;
@@ -406,6 +408,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             // the kernel and arms nothing.
             libc::PR_SET_PDEATHSIG => {
                 let signal = call.arg2();
+                if signal == libc::SIGALRM as libc::c_ulong {
+                    refuse_sigalrm(guest, SigalrmControl::ArmProducer).await?;
+                }
                 if (1..=64).contains(&signal)
                     && guest
                         .config()
