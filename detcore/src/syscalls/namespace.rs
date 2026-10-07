@@ -330,7 +330,8 @@ impl AnonymousProcFdIdentity {
 }
 
 /// Match a raw identity against the current process's inherited-stdio
-/// identities (`Detcore::inherited_stdio_identity_stats`). Callers exclude
+/// identities that keep a fixed inode (`Detcore::fixed_stdio_identity_stats`;
+/// on every backend but SaBRe, only stdin's object). Callers exclude
 /// ordinary replacement objects before filling this array.
 ///
 /// When stdio descriptors alias, the LOWEST matching descriptor wins, as in
@@ -437,10 +438,15 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// links use the same device-0 key in this mode
     /// (`own_proc_fd_link_identity`).
     ///
-    /// The stdio descriptors are matched on their own identities
-    /// (`inherited_stdio_identity_stats`). With `virtualize_metadata` that is
-    /// each descriptor's own `fstat`, so a link to a stdout pipe names
-    /// stdout's inode even when stdin is another object.
+    /// The stdio descriptors are matched on their own identities, and only
+    /// where that identity is the stand-in `setup_stdio` caches for all three,
+    /// stdin's object (`fixed_stdio_identity_stats`). With
+    /// `virtualize_metadata` each identity is the descriptor's own `fstat`,
+    /// so a link to stdin's pipe names stdin's fixed inode, and a link to a
+    /// stdout pipe that is not stdin's object names the pooled inode that an
+    /// alias of stdout above descriptor 2 reports, not descriptor 1's fixed
+    /// inode, which no alias reports (round-11 review of
+    /// <https://github.com/rrnewton/hermit/pull/3255>).
     ///
     /// ⚠️ WITHOUT IT THE STDIO MATCH IS STILL AGAINST THE RUNNING PROCESS'S
     /// STDIN. Every descriptor's identity is then the stand-in `setup_stdio`
@@ -464,18 +470,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(None);
         };
         let virtualize_metadata = guest.config().virtualize_metadata;
-        let stdio_raw_inodes = self
-            .inherited_stdio_identity_stats(guest)
-            .await?
-            .map(|stat| {
-                stat.map(|stat| {
-                    if virtualize_metadata {
-                        stat.raw_inode()
-                    } else {
-                        RawInode::new(0, stat.inode)
-                    }
-                })
-            });
+        let stdio_raw_inodes = self.fixed_stdio_identity_stats(guest).await?.map(|stat| {
+            stat.map(|stat| {
+                if virtualize_metadata {
+                    stat.raw_inode()
+                } else {
+                    RawInode::new(0, stat.inode)
+                }
+            })
+        });
         let raw_file = if virtualize_metadata {
             match self
                 .other_proc_fd_link_identity(guest, link, &identity)
@@ -1133,9 +1136,11 @@ mod tests {
         /// With `virtualize_metadata`, the first link a process resolves
         /// asks each inherited stdio descriptor for its own identity, one
         /// `fstat` per descriptor, before it can tell whether the link names
-        /// a stdio object (`inherited_stdio_identity_stats`). The answers are
-        /// cached on the descriptors' open file descriptions, so later links
-        /// ask nothing more.
+        /// a stdio object (`fixed_stdio_identity_stats`, through
+        /// `inherited_stdio_identity_stats`; comparing with the cached
+        /// stand-in asks nothing). The answers are cached on the
+        /// descriptors' open file descriptions, so later links ask nothing
+        /// more.
         const STDIO_IDENTITY_FSTATS: [Sysno; 3] = [Sysno::fstat; 3];
 
         /// A fresh pipe's read end, kept open by the caller, and its
