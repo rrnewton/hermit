@@ -858,7 +858,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests: 5, detcore-model config::tests: 4, hermit-manifest-plan
     // validation_dag::tests: 2) retain all 995: 1006, listed with cargo nextest
     // list --profile ci and this node's arguments.
-    ("test.regular_crates", 1006),
+    // detcore-model's
+    // config::tests::seccomp_filter_inherited_is_written_when_set_and_reads_back
+    // (the same pull request) retains all 1006: 1007, listed the same way.
+    ("test.regular_crates", 1007),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1134,7 +1137,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The twelve https://github.com/rrnewton/hermit/pull/3255 tests (hermit
     // dbt_detconfig_omit_tests: 7, hermit tests: 3, hermit::bin/hermit run::tests:
     // 1, hermit metadata::tests: 1) retain all 954: 966, listed the same way.
-    ("test.hermit_unit", 966),
+    // The four seccomp-state tests of the same pull request (hermit
+    // dbt_detconfig_omit_tests: 2, hermit tests: 2) retain all 966: 970, listed
+    // the same way.
+    ("test.hermit_unit", 970),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1413,7 +1419,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // dirents::test: 2) retain all 1097: 1204, listed the same way.
     // tool_global::tests::a_non_utf8_maps_snapshot_still_consumes_one_number_per_backed_line
     // (the same pull request) retains all 1204: 1205, listed the same way.
-    ("test.detcore_unit", 1205),
+    // syscalls::files::inject_fstat_scratch::getdents_under_an_inherited_seccomp_filter_injects_no_fstatfs
+    // (the same pull request) retains all 1205: 1206, listed the same way.
+    ("test.detcore_unit", 1206),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1996,7 +2004,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // it leaves out by exact name: 1204 - 12 = 1192, listed with this node's
     // arguments.
     // And the non-UTF-8 maps numbering test (1193).
-    ("test.detcore_unit_on_host", 1193),
+    // And the inherited-seccomp getdents test (1194).
+    ("test.detcore_unit_on_host", 1194),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -2083,7 +2092,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the three exit-watch tests too: 953.
     // And the signal-report pipe-page test: 954.
     // The host twin selects the same twelve tests: 966.
-    ("test.hermit_unit_on_host", 966),
+    // The host twin selects the same four seccomp-state tests: 970.
+    ("test.hermit_unit_on_host", 970),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -2169,7 +2179,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // keep the count at 991, its not-sampled test listed there makes 992, and
     // the two review-fix tests listed there make 994.
     // The host twin selects the same eleven tests: 1006.
-    ("test.regular_crates_on_host", 1006),
+    // The host twin selects the same seccomp-state config test: 1007.
+    ("test.regular_crates_on_host", 1007),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
