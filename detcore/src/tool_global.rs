@@ -493,7 +493,19 @@ impl InodePool {
                     .mtime = Some(mtime);
             }
             None => match self.retired_unnumbered.get_mut(&raw_inode) {
-                Some(retired) => *retired = Some(mtime),
+                Some(retired) => {
+                    *retired = Some(mtime);
+                    // Also in its history record, which a directory snapshot
+                    // consults once the host has reused the inode (claude
+                    // re-check of https://github.com/rrnewton/hermit/pull/3849).
+                    if let Some(last) = self
+                        .generations
+                        .get_mut(&raw_inode)
+                        .and_then(|generations| generations.last_mut())
+                    {
+                        last.pending = Some(mtime);
+                    }
+                }
                 None => {
                     self.pending_mtimes.insert(raw_inode, mtime);
                 }
@@ -8787,6 +8799,35 @@ mod tests {
                 "the cached entry is stable"
             );
         }
+    }
+
+    /// A write through a descriptor after the last name of a never-numbered
+    /// file went away reaches that file's history record too, so a directory
+    /// snapshot that names it after the host reused the inode sees the same
+    /// mtime as one that names it without reuse (claude re-check of
+    /// https://github.com/rrnewton/hermit/pull/3849).
+    #[test]
+    fn a_write_after_the_last_name_reaches_the_snapshot_record() {
+        use super::InodeSighting::Listed;
+        use super::InodeSighting::Name;
+        use crate::types::RawInode;
+
+        let t = LogicalTime::from_nanos(0);
+        let seen = super::ObservedMtime::Unobserved;
+        let f = RawInode::new(2049, 12);
+        let fresh = RawInode::new(2049, 13);
+        let cached = |g: RawInode| {
+            let mut pool = super::InodePool::new();
+            pool.set_mtime(f, LogicalTime::from_nanos(1_000));
+            let snapshot = pool.retirements;
+            pool.retire(f);
+            pool.set_mtime(f, LogicalTime::from_nanos(2_000));
+            pool.forget_retired(g);
+            pool.add_sighted_inode(g, seen, t, Name);
+            pool.add_sighted_inode(f, seen, t, Listed(snapshot))
+        };
+        assert_eq!(cached(f), cached(fresh));
+        assert_eq!(cached(f).1, LogicalTime::from_nanos(2_000));
     }
 
     /// Retiring and discarding follow host state (a link count, whether the
