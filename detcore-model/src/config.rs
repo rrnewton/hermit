@@ -1393,9 +1393,10 @@ fn config_wire_default() -> Config {
     config.sched_seed = None;
     // `BackendCapabilities` is defined in Reverie, outside
     // `CONFIG_DEFINITION_SOURCES`, so the source domain cannot see a change to
-    // it. Encode KVM's capabilities rather than the ptrace default: KVM's is
-    // the constant whose optional user address limit is present, so the wire
-    // bytes carry that field's width instead of a bare `None`.
+    // it; only its encoding can. Every field is a bool, so any constant
+    // carries every field's width (see
+    // `config_fingerprint_sees_the_width_of_every_backend_capability`). KVM's
+    // is kept, as it was when one field was optional and only KVM's set it.
     config.backend = BackendCapabilities::KVM;
     config
 }
@@ -1559,12 +1560,13 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// - `backend_reports_physical_process_exits` supplies
 ///   `reports_physical_process_exits` and
 ///   `signal_interrupts_external_syscalls`;
-/// - `backend_is_kvm` supplies the three behaviours it selected that remain
-///   capabilities, including the x86-64 four-level user address limit (the
-///   other two are now answered by the backend itself: refusing a non-leader
-///   exec is a typed refusal it reports per exec, and the `gettimeofday`
-///   repair runs on every backend through its `time(2)` probe and
-///   `Guest::storable_memory_ranges`);
+/// - `backend_is_kvm` supplies the two behaviours it selected that remain
+///   capabilities, `provides_process_signal_control` and
+///   `emulates_child_waits` (the other three are now answered by the backend
+///   itself: refusing a non-leader exec is a typed refusal it reports per
+///   exec, the `gettimeofday` repair runs on every backend through its
+///   `time(2)` probe and `Guest::storable_memory_ranges`, and the user
+///   address limit is each guest's own `Guest::user_address_limit` report);
 /// - every other key supplies the one capability of the same meaning.
 ///
 /// This inverts [`to_legacy_backend_json`] for every capability value the keys
@@ -1728,9 +1730,6 @@ impl LegacyBackendKeys {
         backend.supports_madv_dontneed = self.backend_supports_madvise || self.backend_is_kvm;
         backend.provides_process_signal_control = self.backend_is_kvm;
         backend.emulates_child_waits = self.backend_is_kvm;
-        backend.user_address_limit = self
-            .backend_is_kvm
-            .then_some(reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT);
         backend
     }
 }
@@ -2493,8 +2492,6 @@ mod tests {
                 "backend_is_kvm" => {
                     expected.provides_process_signal_control = true;
                     expected.emulates_child_waits = true;
-                    expected.user_address_limit =
-                        Some(reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT);
                 }
                 "kvm_shared_dequeue_timers" => {
                     // Set alone it contradicts `backend_is_kvm`, so the parse
@@ -3189,23 +3186,36 @@ mod tests {
     }
 
     #[test]
-    fn config_fingerprint_encodes_the_backend_capabilities_optional_field() {
+    fn config_fingerprint_sees_the_width_of_every_backend_capability() {
         // `BackendCapabilities` lives in Reverie, outside the fingerprinted
-        // sources, so only its encoding can reveal a change to it. Its one
-        // optional field must be present in the encoded default, or a change
-        // to that field's width would encode as the same bare `None`.
+        // sources, so only its encoding can reveal a change to it. Every
+        // field is a bool, one byte in the encoding whatever its value, so the
+        // encoded default carries every field, and adding, removing or
+        // widening one changes the bytes. A field that is optional would have
+        // to be present in the default, or a change to its width would encode
+        // as the same bare `None`; this fails first.
         let config = config_wire_default();
-        assert!(config.backend.user_address_limit.is_some());
+        let fields = serde_json::to_value(config.backend).unwrap();
+        let fields = fields.as_object().unwrap();
+        assert!(
+            fields.values().all(serde_json::Value::is_boolean),
+            "{fields:?}"
+        );
         let encode = |config: &Config| {
             bincode::serde::encode_to_vec(config, bincode::config::legacy()).unwrap()
         };
-        let without_limit = config
-            .clone()
-            .with_backend(|backend| backend.user_address_limit = None);
         assert_eq!(
-            encode(&config).len(),
-            encode(&without_limit).len() + std::mem::size_of::<u64>()
+            bincode::serde::encode_to_vec(config.backend, bincode::config::legacy())
+                .unwrap()
+                .len(),
+            fields.len()
         );
+        // The backend's values are part of the encoded default.
+        let flipped = config
+            .clone()
+            .with_backend(|backend| backend.supports_madvise = !backend.supports_madvise);
+        assert_eq!(encode(&flipped).len(), encode(&config).len());
+        assert_ne!(encode(&flipped), encode(&config));
     }
 
     #[test]

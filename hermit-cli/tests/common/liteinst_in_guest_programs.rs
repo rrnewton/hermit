@@ -1813,3 +1813,174 @@ fn verify_digest_records_an_unobservable_recvmsg_and_keeps_the_kernel_result() {
         }
     }
 }
+
+static USER_ADDRESS_ERRNO_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+/// The guest for
+/// `liteinst_in_guest_user_address_limit_queries_keep_the_guest_errno`. Its
+/// probes all go through one raw `read` instruction (`raw_read`, written in
+/// assembly so the compiler cannot copy it), which sets no `errno`, so any
+/// change to `errno` across a probe was made by whoever served it. The
+/// function has unwind information (`.cfi_startproc`) and room after the
+/// instruction, which LiteInst needs before it patches a site. The guest asks
+/// the in-guest LiteInst runtime, when it is loaded, how often that
+/// instruction's installed hook was entered.
+const USER_ADDRESS_ERRNO_GUEST_SOURCE: &str = r#"
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <unistd.h>
+
+long raw_read(long fd, void *buf, unsigned long count);
+/* SYS_read is 0; the five-byte mov puts the syscall at raw_read + 5. */
+#define READ_SITE_OFFSET 5
+__asm__(".text\n"
+        ".p2align 4\n"
+        ".globl raw_read\n"
+        ".type raw_read, @function\n"
+        "raw_read:\n"
+        "\t.cfi_startproc\n"
+        "\tmovl $0, %eax\n"
+        "\tsyscall\n"
+        "\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n"
+        "\tret\n"
+        "\t.cfi_endproc\n"
+        ".size raw_read, .-raw_read\n");
+
+typedef uint64_t (*hook_count_fn)(uint64_t);
+
+int main(void) {
+    hook_count_fn hook_count =
+        (hook_count_fn)dlsym(RTLD_DEFAULT, "reverie_liteinst_site_hook_count");
+    const unsigned char *site_bytes = (const unsigned char *)raw_read + READ_SITE_OFFSET;
+    uint64_t site = (uint64_t)(uintptr_t)site_bytes;
+    if (site_bytes[0] != 0x0f || site_bytes[1] != 0x05) {
+        printf("raw_read + %d is not a syscall instruction\n", READ_SITE_OFFSET);
+        return 1;
+    }
+    uint64_t hooks[4] = {0, 0, 0, 0};
+    char byte = 0;
+    int rng = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (rng < 0) {
+        perror("open /dev/urandom");
+        return 1;
+    }
+    if (hook_count) hooks[0] = hook_count(site);
+    /* An invalid descriptor: Detcore does not ask for the user address
+       limit, and the instruction becomes a patched site. */
+    long warm = raw_read(-1, &byte, 1);
+    if (hook_count) hooks[1] = hook_count(site);
+    /* A zero-length random-device read: Detcore checks the buffer against
+       the user address limit, which this process has not measured yet. */
+    errno = 4242;
+    long cold = raw_read(rng, &byte, 0);
+    int cold_errno = errno;
+    if (hook_count) hooks[2] = hook_count(site);
+    /* The same read of a buffer beyond the limit, now cached: EFAULT. */
+    errno = 4243;
+    long cached = raw_read(rng, (void *)UINTPTR_MAX, 0);
+    int cached_errno = errno;
+    if (hook_count) hooks[3] = hook_count(site);
+    printf("warm=%ld\n", warm);
+    printf("cold=%ld errno=%d\n", cold, cold_errno);
+    printf("cached=%ld errno=%d\n", cached, cached_errno);
+    if (hook_count) {
+        printf("hook entries per probe: warm=%lu cold=%lu cached=%lu\n",
+               (unsigned long)(hooks[1] - hooks[0]), (unsigned long)(hooks[2] - hooks[1]),
+               (unsigned long)(hooks[3] - hooks[2]));
+    } else {
+        printf("hook entries per probe: no in-guest runtime\n");
+    }
+    return 0;
+}
+"#;
+
+fn user_address_errno_guest() -> &'static Path {
+    USER_ADDRESS_ERRNO_GUEST.get_or_init(|| {
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("liteinst-advanced");
+        fs::create_dir_all(&build_root).expect("failed to create LiteInst guest directory");
+        let source = build_root.join("user_address_errno.c");
+        fs::write(&source, USER_ADDRESS_ERRNO_GUEST_SOURCE)
+            .expect("failed to write the user-address errno guest");
+        let guest = build_root.join("user_address_errno");
+        let output = Command::new("cc")
+            .args(["-O2", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&guest)
+            .arg("-ldl")
+            .output()
+            .expect("failed to run cc");
+        assert!(
+            output.status.success(),
+            "{} compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            source.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// In-guest LiteInst runs Detcore on the guest's own thread, so the guest and
+/// Detcore share one C `errno`. Detcore asks the backend for the user address
+/// limit (`Guest::user_address_limit`) before it checks a random-device read's
+/// buffer; on this backend the answer is measured in the guest process with
+/// failing `process_vm_readv` range checks, which set `errno` to `EFAULT`.
+/// The query must leave the guest's `errno` as it found it, also when Detcore
+/// is entered through a patched site's installed hook, which, unlike the
+/// SIGSYS fallback, does not restore `errno` itself.
+///
+/// One raw `read` instruction serves every probe: an invalid descriptor first
+/// (no query; the instruction becomes a patched site), then a zero-length
+/// random-device read (the first query, which measures), then the same read
+/// of a buffer at the top of the address space (the cached answer, EFAULT).
+/// Before each probe the guest sets a sentinel `errno` that no system call
+/// sets. Linux, ptrace and in-guest LiteInst must print the same results with
+/// the sentinel kept, and LiteInst must have entered the instruction's
+/// installed hook once per probe.
+#[test]
+fn liteinst_in_guest_user_address_limit_queries_keep_the_guest_errno() {
+    const PROBES: &str = "warm=-9\ncold=0 errno=4242\ncached=-14 errno=4243\n";
+    let guest = user_address_errno_guest();
+    let native = Command::new(guest)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run the user-address errno guest natively");
+    assert!(native.status.success(), "native: {native:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        format!("{PROBES}hook entries per probe: no in-guest runtime\n"),
+        "native: {native:?}"
+    );
+    let _guard = hermit_run_guard();
+    for (backend, hooks) in [
+        ("ptrace", "no in-guest runtime"),
+        ("liteinst", "warm=1 cold=1 cached=1"),
+    ] {
+        let mut command = Command::new(hermit_binary());
+        command.args(["--log=off", "--backend", backend, "run"]);
+        if backend == "liteinst" {
+            command.arg("--max-timeslice=disabled");
+        }
+        let output = command
+            .args(["--strict", "--"])
+            .arg(guest)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run Hermit");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{backend}: {output:?}");
+        assert_eq!(
+            stdout,
+            format!("{PROBES}hook entries per probe: {hooks}\n"),
+            "{backend}: {output:?}"
+        );
+        if backend == "liteinst" {
+            assert_in_guest_selected(&String::from_utf8_lossy(&output.stderr));
+        }
+    }
+}

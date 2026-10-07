@@ -5828,16 +5828,18 @@ mod tests {
     /// identity check became the capability it selected:
     /// `discover_live_file_metadata` split into the first four fields, the old
     /// `backend_reports_physical_process_exits` became two, and
-    /// `backend_is_kvm` became five, of which the last three remain here:
+    /// `backend_is_kvm` became five, of which the last two remain here:
     /// `refuses_nonleader_exec_with_enosys` became the backend's typed exec
-    /// refusal (Reverie d78f770f) and `failed_gettimeofday_may_store_host_time`
-    /// the guest's storable-memory report (Reverie 8bfb450e). Two fields are
-    /// newer than that transcription: `process_exits_complete_asynchronously`
-    /// (Reverie 056c8cac), true only for in-guest LiteInst, whose process exits
-    /// complete some time after the tool grants them, and
-    /// `reports_child_exit_publication` (Reverie 9cb6f7b7), true for ptrace and
-    /// e9patch, whose tracer reports when the kernel publishes a process's exit
-    /// to its parent.
+    /// refusal (Reverie d78f770f), `failed_gettimeofday_may_store_host_time`
+    /// the guest's storable-memory report (Reverie 8bfb450e) and
+    /// `user_address_limit` the guest's user address limit query (Reverie
+    /// 6f75cc4c). Three fields are newer than that transcription:
+    /// `process_exits_complete_asynchronously` (Reverie 056c8cac), true only
+    /// for in-guest LiteInst, whose process exits complete some time after the
+    /// tool grants them, `supports_madv_dontneed` (Reverie 8d8697aa), true for
+    /// every backend, and `reports_child_exit_publication` (Reverie 9cb6f7b7),
+    /// true for ptrace and e9patch, whose tracer reports when the kernel
+    /// publishes a process's exit to its parent.
     fn golden_backend_capabilities(backend: Backend) -> serde_json::Value {
         let sabre = backend == Backend::Sabre;
         let kvm = backend == Backend::Kvm;
@@ -5870,8 +5872,6 @@ mod tests {
                 matches!(backend, Backend::Ptrace | Backend::E9patch),
             "provides_process_signal_control": kvm,
             "emulates_child_waits": kvm,
-            "user_address_limit":
-                kvm.then_some(reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT),
         })
     }
 

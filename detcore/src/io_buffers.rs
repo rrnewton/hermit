@@ -1049,6 +1049,10 @@ mod event_tests {
         /// What this fake backend answers to
         /// `Guest::is_backend_runtime_bootstrap`.
         backend_runtime_bootstrap: bool,
+        /// Whether this fake backend's `Guest::user_address_limit` query
+        /// fails, and how many times it has been asked.
+        user_address_limit_fails: bool,
+        user_address_limit_queries: Mutex<usize>,
     }
 
     impl EventGuest {
@@ -1281,6 +1285,21 @@ mod event_tests {
             }
             panic!("event fixture must not read a host clock")
         }
+
+        fn user_address_limit(&self) -> Result<reverie::UserAddressLimit, Error> {
+            *self.user_address_limit_queries.lock().unwrap() += 1;
+            if self.user_address_limit_fails {
+                // A failure that carries the errno a bad range would get, so
+                // a guest result cannot pass for the tool's failure.
+                return Err(Errno::EFAULT.into());
+            }
+            // The KVM guest's report, as the fixture's capabilities describe
+            // a KVM backend.
+            Ok(reverie::UserAddressLimit {
+                max_end: reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT,
+                caps_single_vector: true,
+            })
+        }
     }
 
     fn event_guest(ty: FdType, retry_gate: Option<RetryGate>) -> (Detcore, EventGuest) {
@@ -1296,11 +1315,11 @@ mod event_tests {
             detlog_stack: false,
             detlog_regs: false,
             ..Config::default().with_backend(|backend| {
-                // The three behaviours the old `backend_is_kvm` identity flag
-                // selected that remain capabilities.
+                // The two behaviours the old `backend_is_kvm` identity flag
+                // selected that remain capabilities. The third, KVM's user
+                // address limit, is the guest's `user_address_limit` answer.
                 backend.provides_process_signal_control = true;
                 backend.emulates_child_waits = true;
-                backend.user_address_limit = Some(reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT);
                 backend.virtualizes_syscall_clobbers = true;
             })
         };
@@ -1329,6 +1348,8 @@ mod event_tests {
             releases: Mutex::new(0),
             retry_gate: Mutex::new(retry_gate),
             backend_runtime_bootstrap: false,
+            user_address_limit_fails: false,
+            user_address_limit_queries: Mutex::new(0),
         };
         (tool, guest)
     }
@@ -2085,35 +2106,50 @@ mod event_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn rng_readv_event_zero_and_malformed_requests_have_no_observer_effects() {
-        for (count, length, expected, imports) in [
-            (0, 3, Ok(0), 0),
-            (1025, 3, Err(Errno::EINVAL), 0),
-            (1, usize::MAX, Err(Errno::EINVAL), 1),
-        ] {
-            for (_, call, _) in rng_vector_calls(count) {
-                let logs = BufferLog::default();
-                let _subscriber = tracing::subscriber::set_default(logs.clone());
-                let (tool, mut guest) = event_guest(FdType::Rng, None);
-                let memory = guest.memory.clone();
-                memory.put_iovec(0, FIRST_DEST, length);
-                let result = tool.handle_syscall_event(&mut guest, call).await;
-                assert_eq!(
-                    result.map_err(|error| error.into_errno().unwrap()),
-                    expected
-                );
-                assert_eq!(memory.bytes(FIRST_DEST, 8), [CANARY; 8]);
-                assert_eq!(
-                    guest
-                        .thread
-                        .with_detfd(FD, |fd| fd.random_device_offset())
-                        .unwrap(),
-                    0
-                );
-                assert_eq!(*guest.releases.lock().unwrap(), 1);
-                let reads = memory.1.lock().unwrap();
-                assert_eq!(reads.imported_entries, imports);
-                assert!(reads.observer_reads.is_empty());
-                assert!(logs.0.lock().unwrap().is_empty());
+        // A failing user address limit query changes only the requests that
+        // need a range checked, as Linux checks the count before any range.
+        for query_fails in [false, true] {
+            for (count, length, expected, imports) in [
+                (0, 3, Ok(0), 0),
+                (1025, 3, Err(Errno::EINVAL), 0),
+                (1, usize::MAX, Err(Errno::EINVAL), 1),
+            ] {
+                let queries = usize::from(count == 1);
+                let (expected, imports) = if query_fails && queries == 1 {
+                    (None, 0)
+                } else {
+                    (Some(expected), imports)
+                };
+                for (_, call, _) in rng_vector_calls(count) {
+                    let logs = BufferLog::default();
+                    let _subscriber = tracing::subscriber::set_default(logs.clone());
+                    let (tool, mut guest) = event_guest(FdType::Rng, None);
+                    guest.user_address_limit_fails = query_fails;
+                    let memory = guest.memory.clone();
+                    memory.put_iovec(0, FIRST_DEST, length);
+                    let result = tool.handle_syscall_event(&mut guest, call).await;
+                    match expected {
+                        Some(expected) => assert_eq!(
+                            result.map_err(|error| error.into_errno().unwrap()),
+                            expected
+                        ),
+                        None => assert!(matches!(result, Err(Error::Tool(_))), "{result:?}"),
+                    }
+                    assert_eq!(*guest.user_address_limit_queries.lock().unwrap(), queries);
+                    assert_eq!(memory.bytes(FIRST_DEST, 8), [CANARY; 8]);
+                    assert_eq!(
+                        guest
+                            .thread
+                            .with_detfd(FD, |fd| fd.random_device_offset())
+                            .unwrap(),
+                        0
+                    );
+                    assert_eq!(*guest.releases.lock().unwrap(), 1);
+                    let reads = memory.1.lock().unwrap();
+                    assert_eq!(reads.imported_entries, imports);
+                    assert!(reads.observer_reads.is_empty());
+                    assert!(logs.0.lock().unwrap().is_empty());
+                }
             }
         }
     }
@@ -2127,10 +2163,11 @@ mod event_tests {
             OFlag::O_ACCMODE,
             OFlag::O_PATH,
         ] {
-            for address in [0, usize::MAX] {
+            for (address, query_fails) in [(0, false), (usize::MAX, false), (0, true)] {
                 let logs = BufferLog::default();
                 let _subscriber = tracing::subscriber::set_default(logs.clone());
                 let (tool, mut guest) = event_guest(FdType::Rng, None);
+                guest.user_address_limit_fails = query_fails;
                 let fd = DetFd::new(
                     FD,
                     mode,
@@ -2150,18 +2187,28 @@ mod event_tests {
                     .with_buf(AddrMut::from_raw(address))
                     .with_len(0);
                 let result = tool.handle_syscall_event(&mut guest, call.into()).await;
-                let expected = if mode == OFlag::O_RDONLY || mode == OFlag::O_RDWR {
-                    if address == 0 {
+                // The access mode is checked before the range, so only a
+                // readable descriptor asks for the user address limit, and
+                // only there can the query's failure surface, as the tool's.
+                let readable = mode == OFlag::O_RDONLY || mode == OFlag::O_RDWR;
+                if readable && query_fails {
+                    assert!(matches!(result, Err(Error::Tool(_))), "{result:?}");
+                } else {
+                    let expected = if !readable {
+                        Err(Errno::EBADF)
+                    } else if address == 0 {
                         Ok(0)
                     } else {
                         Err(Errno::EFAULT)
-                    }
-                } else {
-                    Err(Errno::EBADF)
-                };
+                    };
+                    assert_eq!(
+                        result.map_err(|error| error.into_errno().unwrap()),
+                        expected
+                    );
+                }
                 assert_eq!(
-                    result.map_err(|error| error.into_errno().unwrap()),
-                    expected
+                    *guest.user_address_limit_queries.lock().unwrap(),
+                    usize::from(readable)
                 );
                 assert_eq!(
                     guest
@@ -2306,6 +2353,81 @@ mod event_tests {
             .into();
         assert!(digest(&mut guest, &call, 4).is_err());
         assert!(logs.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn procfs_reads_refuse_an_impossible_count_before_asking_the_user_address_limit() {
+        // A procfs snapshot read checks the caller's range itself, as
+        // `vfs_read`'s `access_ok` would. A count above isize::MAX is EFAULT
+        // under every limit, so it is refused before the guest is asked for
+        // its limit; a count that fits needs the guest's answer, and a failed
+        // query is the tool's failure, never the guest's EFAULT. Both cases
+        // end before a snapshot is taken.
+        let beyond_limit = reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT as usize;
+        for pread in [false, true] {
+            for query_fails in [false, true] {
+                for (address, len) in [(FIRST_DEST, isize::MAX as usize + 1), (beyond_limit, 8)] {
+                    let (tool, mut guest) = event_guest(FdType::Regular, None);
+                    guest.user_address_limit_fails = query_fails;
+                    let fd = DetFd::new(
+                        FD,
+                        OFlag::O_RDONLY,
+                        FdType::Regular,
+                        OpenFileId::new(DetPid::from_raw(1), 99),
+                    );
+                    fd.set_procfs(
+                        crate::procfs::ProcfsFile::from_path(std::path::Path::new(
+                            "/proc/sys/fs/file-nr",
+                        ))
+                        .unwrap(),
+                    );
+                    guest
+                        .thread
+                        .file_metadata
+                        .lock()
+                        .unwrap()
+                        .file_handles
+                        .insert(FD, fd);
+                    let buf = AddrMut::from_raw(address);
+                    let call: Syscall = if pread {
+                        reverie::syscalls::Pread64::new()
+                            .with_fd(FD)
+                            .with_buf(buf)
+                            .with_len(len)
+                            .with_offset(0)
+                            .into()
+                    } else {
+                        reverie::syscalls::Read::new()
+                            .with_fd(FD)
+                            .with_buf(buf)
+                            .with_len(len)
+                            .into()
+                    };
+                    let result = tool.handle_syscall_event(&mut guest, call).await;
+                    let asks = len <= isize::MAX as usize;
+                    if asks && query_fails {
+                        assert!(matches!(result, Err(Error::Tool(_))), "{result:?}");
+                    } else {
+                        assert!(
+                            matches!(result, Err(Error::Errno(Errno::EFAULT))),
+                            "{result:?}"
+                        );
+                    }
+                    assert_eq!(
+                        *guest.user_address_limit_queries.lock().unwrap(),
+                        usize::from(asks)
+                    );
+                    assert!(
+                        guest
+                            .thread
+                            .with_detfd(FD, |fd| fd.procfs_needs_snapshot())
+                            .unwrap()
+                    );
+                    assert_eq!(guest.injected_zero_reads, 0);
+                    assert!(guest.injected_iovecs.is_empty());
+                }
+            }
+        }
     }
 }
 

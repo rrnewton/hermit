@@ -3460,11 +3460,10 @@ mod tests {
                     if kvm_behaviours {
                         // The behaviours the old `backend_is_kvm` identity flag
                         // selected, other than the exec refusal, which the
-                        // backend now reports per exec (`backend_refuses`).
+                        // backend now reports per exec (`backend_refuses`), and
+                        // the user address limit, which it reports per guest.
                         backend.provides_process_signal_control = true;
                         backend.emulates_child_waits = true;
-                        backend.user_address_limit =
-                            Some(reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT);
                     }
                 })
             };
