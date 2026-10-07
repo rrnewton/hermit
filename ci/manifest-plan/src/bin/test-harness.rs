@@ -2030,6 +2030,29 @@ fn portable_shard_step<'a>(
         .ok_or_else(|| format!("portable shard names missing DAG node {node}"))
 }
 
+// The same exact-name-first resolution for the preflight and check job
+// populations, which ci/run-node.sh hands to validate's hosted selector
+// (map_hosted_portable_tags in scripts/validate.rs). A name with neither an
+// exact node nor a hosted twin is kept, so the selection still rejects it.
+fn resolve_portable_selectors(portable: &dagrun::DagConfig, nodes: Vec<String>) -> Vec<String> {
+    let available = portable
+        .steps
+        .iter()
+        .map(dagrun::Step::tag)
+        .collect::<BTreeSet<_>>();
+    nodes
+        .into_iter()
+        .map(|node| {
+            let hosted = format!("{node}_on_host");
+            if !available.contains(&node) && available.contains(&hosted) {
+                hosted
+            } else {
+                node
+            }
+        })
+        .collect()
+}
+
 // 4200 = 3780 plus the 120 seconds setup.manifest_plan's wall cap grew (180 to
 // 300) in https://github.com/rrnewton/hermit/issues/3381, plus the 300 seconds
 // build.rust_scripts' wall cap grew (900 to 1200) to keep 1.5 times its
@@ -2055,6 +2078,7 @@ fn audit_portable_preflight_budget(
                 .ok_or_else(|| "portable preflight_nodes contains a non-string node".to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let preflight_nodes = resolve_portable_selectors(portable, preflight_nodes);
     // ci/run-node.sh passes --ignore-selected-deps: dependencies outside the
     // declared preflight population are supplied by the workflow, while edges
     // among these five selected nodes remain load-bearing.
@@ -2093,6 +2117,7 @@ fn audit_portable_checks_budget(
                 .ok_or_else(|| "portable check_nodes contains a non-string node".to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let check_nodes = resolve_portable_selectors(portable, check_nodes);
     let selected = dagrun::select_steps_by_tags(portable, &check_nodes, true)
         .map_err(|error| format!("cannot select portable checks closure: {error}"))?;
     let critical_path = dag_critical_path(&selected)?;
@@ -7969,6 +7994,33 @@ sys.exit(1 if failed else 0)
             error.contains(
                 "portable checks job 2940s must cover its 2400s constructed DAG critical path plus at least 600s"
             ),
+            "{error}"
+        );
+        // The check job's public selector check.script_unit_tests resolves to
+        // its hosted twin, whose own wall the audit reads; an unknown selector
+        // still refuses.
+        let mut longer_twin = portable.clone();
+        longer_twin
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "check.script_unit_tests_on_host")
+            .unwrap()
+            .timeout = 2401;
+        let error = super::audit_portable_checks_budget(&portable_workflow, &longer_twin, &shards)
+            .unwrap_err();
+        assert!(
+            error.contains("portable checks critical path changed from 2400s to 2401s"),
+            "{error}"
+        );
+        let mut unknown = shards.clone();
+        unknown["check_nodes"]
+            .as_array_mut()
+            .unwrap()
+            .push("check.no_such_node".into());
+        let error = super::audit_portable_checks_budget(&portable_workflow, &portable, &unknown)
+            .unwrap_err();
+        assert!(
+            error.contains("cannot select portable checks closure"),
             "{error}"
         );
 

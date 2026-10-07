@@ -34,6 +34,14 @@ pub(super) const WORKSPACE_WALL_SECONDS: i64 = 1200;
 pub(super) const HOSTED_WORKSPACE_WALL_SECONDS: i64 = 2100;
 const _: () = assert!(HOSTED_WORKSPACE_WALL_SECONDS >= WORKSPACE_WALL_SECONDS);
 pub(super) const HOSTED_WORKSPACE_WALL_DESCRIPTION: &str = r########" HOSTED WALL BOUND 2026-10-06: this hosted twin's wall is 2100 seconds; the local node keeps 1200, sized for its 32-worker preference, and the command, CPU bound and memory hints here are the local node's. GitHub's hosted portable job runs this node on whatever hardware the runner pool assigns, and its scheduler caps the node to the run's three-CPU budget (logged as "exceeds the run total CPU-core budget --max-cpus 3; capping its guest width and per-step cpu.max to 3"). In https://github.com/rrnewton/hermit/actions/runs/37383177918 (Hermit f43c990b3c96, AMD EPYC 9V45) the node passed in 752.75 seconds: Cargo reported 73 seconds for detcore-dbt and 643 for the workspace (37 crates compiled after a partial cache restore), and the rest, chiefly preparation, took about 37. In https://github.com/rrnewton/hermit/actions/runs/37440093209 (Hermit 47896b1a15dd, AMD EPYC 7763) the same phases took 120 and 1048 seconds (33 crates compiled), 1.6 times longer each, and the node was killed at 1200.07 seconds, 20 seconds into the dev-profile nextest-cpu-wrapper build that took 18 seconds on the faster host; at the same ratio it needed about 1240. The two runs built different Hermit revisions, so this is not an isolated comparison; but the slower run compiled fewer crates and both Cargo phases slowed by the same factor, which points to the runner rather than the build. 2100 is the next 300-second bucket above 1.5 times both the killed run's lower bound of 1200 seconds (1800.1) and the 1240-second estimate (1860). Under the three-CPU cpu.max cap, 2100 seconds of wall allow at most 6300 CPU seconds, inside the unchanged 7200-second CPU bound. The host pressure graph (ci/compat-envelope/pressure-test.rs) clones this node as its build.workspace and so carries the same wall."########;
+/// Wall bound of the authored `check.script_unit_tests` node, which the local
+/// lanes run.
+pub(super) const SCRIPT_UNIT_TESTS_WALL_SECONDS: i64 = 900;
+/// Wall bound of `check.script_unit_tests_on_host`, the hosted twin of
+/// `check.script_unit_tests`; see HOSTED_SCRIPT_UNIT_TESTS_WALL_DESCRIPTION.
+pub(super) const HOSTED_SCRIPT_UNIT_TESTS_WALL_SECONDS: i64 = 1500;
+const _: () = assert!(HOSTED_SCRIPT_UNIT_TESTS_WALL_SECONDS >= SCRIPT_UNIT_TESTS_WALL_SECONDS);
+pub(super) const HOSTED_SCRIPT_UNIT_TESTS_WALL_DESCRIPTION: &str = r########" HOSTED WALL BOUND 2026-10-06: this hosted twin's wall is 1500 seconds; the local node keeps 900, and the command, CPU bound and memory hints here are the local node's. GitHub's hosted portable job runs this node beside check.lint_checks and the selftest.* nodes, and its scheduler caps the node's width (HERMIT_SCRIPT_TEST_JOBS) at the run's three-CPU budget (--max-cpus 3). That run is unboxed: no cgroup holds the node to three CPUs, and its log reports that the node's CPU bound cannot be enforced there, so only the wall applies. In https://github.com/rrnewton/hermit/actions/runs/37543769782 (Hermit d7441caea790) the node was killed at 900.16 seconds. Its other units had finished by 615 seconds; the one test still running was the scripts/validate.rs submodule service-result fixture, started at about 630 seconds, whose child compiles a copied validate.rs with rust-script under its own 300-second bound. That child had run 266.96 seconds and had been compiling its last crate, the validate binary (28.6 seconds locally at three CPUs), for 11.83 seconds, so it would have reached its own bound first and no node wall would have let that revision pass. On the host recorded for this node in docs/TESTING_ENVIRONMENTS.md ("Named measurement hosts"), a run of this node at three CPUs with a cold rust-script cache took 724.57 seconds, and the hosted run reached the same milestones 1.5 to 2.6 times later. The fixture child now compiles at Cargo opt-level 0: a cold three-CPU build of its package fell from 147.71 to 50.85 seconds, and the fixture alone at four CPUs from 146.19 to 84.17. Scaling the hosted child's compile by that ratio and taking 2.6 times the fixture's local non-compile time (about 34 seconds) gives an estimate of about 850 seconds for the hosted node; that is not a hosted measurement, and 900 seconds would leave less than the project's 50% headroom over it. 1500 is the next 300-second bucket above 1.5 times both the measured lower bound of 900.16 seconds (1350.2) and the 850-second estimate (1275). At a width of three, 1500 seconds of wall come to about 4500 CPU seconds, inside the unchanged 7200-second CPU bound wherever a run can enforce it."########;
 pub(super) const RUST_SCRIPT_PRODUCER_RSS_BASELINE_BYTES: i64 = 4 * 1024 * 1024 * 1024;
 pub(super) const RUST_SCRIPT_PRODUCER_HARD_MEM_MAX_BYTES: i64 = 6 * 1024 * 1024 * 1024;
 pub(super) const RUST_SCRIPT_PRODUCER_INNER_JOBS: i64 = 8;
@@ -795,7 +803,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // manifest-plan's
     // stress_series::tests::ineligible_execution_path_evidence_is_the_passed_sabre_attempt_and_nothing_else
     // retains all 982: 983.
-    ("test.regular_crates", 983),
+    // manifest-plan's
+    // validation_dag::tests::hosted_script_unit_tests_twin_changes_only_its_identity_and_wall
+    // retains all 983: 984.
+    ("test.regular_crates", 984),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1835,7 +1846,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The chaos determinism-failure test listed there retains all 980: 981.
     // The same detcore-model legacy-form test retains all 981: 982.
     // The ineligible-execution-path series test listed there retains all 982: 983.
-    ("test.regular_crates_on_host", 983),
+    // The hosted script unit-test twin test listed there retains all 983: 984.
+    ("test.regular_crates_on_host", 984),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
@@ -2862,7 +2874,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 900,
+        timeout: SCRIPT_UNIT_TESTS_WALL_SECONDS,
         cpu_timeout: 7200,
         jobs_flag: Some(""),
         jobs_env: Some("HERMIT_SCRIPT_TEST_JOBS"),

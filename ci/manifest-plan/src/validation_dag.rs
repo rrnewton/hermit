@@ -1359,6 +1359,52 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// The authored script unit-test node, which the local lanes run.
+const SCRIPT_UNIT_TESTS_TAG: &str = "check.script_unit_tests";
+/// Its hosted twin, which carries the longer hosted wall.
+const HOSTED_SCRIPT_UNIT_TESTS_TAG: &str = "check.script_unit_tests_on_host";
+
+/// Give the hosted portable lane its own copy of check.script_unit_tests.
+///
+/// The hosted runner runs the node at three CPUs on slower hardware, so the
+/// twin alone carries a longer wall; its command, dependencies, CPU bound and
+/// memory hints stay the local node's. See
+/// HOSTED_SCRIPT_UNIT_TESTS_WALL_DESCRIPTION for the measurement.
+fn materialize_hosted_script_unit_tests(cfg: &mut DagConfig) -> Result<(), String> {
+    let local = cfg
+        .steps
+        .iter_mut()
+        .find(|step| step.tag() == SCRIPT_UNIT_TESTS_TAG)
+        .ok_or_else(|| format!("{SCRIPT_UNIT_TESTS_TAG} is absent"))?;
+    if !local
+        .labels
+        .iter()
+        .any(|label| label == HOSTED_PORTABLE_LABEL)
+    {
+        return Err(format!(
+            "{SCRIPT_UNIT_TESTS_TAG} lost its {HOSTED_PORTABLE_LABEL} label"
+        ));
+    }
+    if local.timeout != crate::validation_dag_static::SCRIPT_UNIT_TESTS_WALL_SECONDS {
+        return Err(format!(
+            "{SCRIPT_UNIT_TESTS_TAG} has a {}s wall, not its authored {}s",
+            local.timeout,
+            crate::validation_dag_static::SCRIPT_UNIT_TESTS_WALL_SECONDS
+        ));
+    }
+    let mut hosted = local.clone();
+    local.labels.retain(|label| label != HOSTED_PORTABLE_LABEL);
+    hosted.job.push_str(HOSTED_VARIANT_SUFFIX);
+    hosted.labels = vec![HOSTED_PORTABLE_LABEL.into()];
+    hosted.fail_fast_family = Some(hosted.tag());
+    hosted.timeout = crate::validation_dag_static::HOSTED_SCRIPT_UNIT_TESTS_WALL_SECONDS;
+    hosted
+        .description
+        .push_str(crate::validation_dag_static::HOSTED_SCRIPT_UNIT_TESTS_WALL_DESCRIPTION);
+    cfg.steps.push(hosted);
+    Ok(())
+}
+
 /// The label of the Buck E2E nodes a `--e2e-runner buck-local|buck-hybrid` full run
 /// adds to the `full` selection; see [`buck_e2e_selection`].
 pub const FULL_BUCK_E2E_LABEL: &str = "full-buck-e2e";
@@ -2955,6 +3001,80 @@ fn assert_pinned_workspace_split(cfg: &DagConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// check.script_unit_tests_on_host is check.script_unit_tests with only its
+/// hosted identity and longer wall changed, and the local node keeps the
+/// authored wall and leaves the hosted lane to its twin.
+fn assert_hosted_script_unit_tests(cfg: &DagConfig) -> Result<(), String> {
+    let only = |tag: &str| -> Result<&Step, String> {
+        let mut found = cfg.steps.iter().filter(|step| step.tag() == tag);
+        match (found.next(), found.next()) {
+            (Some(step), None) => Ok(step),
+            (None, _) => Err(format!("{tag} is absent")),
+            (Some(_), Some(_)) => Err(format!("{tag} appears more than once")),
+        }
+    };
+    let local = only(SCRIPT_UNIT_TESTS_TAG)?;
+    let hosted = only(HOSTED_SCRIPT_UNIT_TESTS_TAG)?;
+    if local.timeout != crate::validation_dag_static::SCRIPT_UNIT_TESTS_WALL_SECONDS {
+        return Err(format!(
+            "{SCRIPT_UNIT_TESTS_TAG} has a {}s wall, not its authored {}s",
+            local.timeout,
+            crate::validation_dag_static::SCRIPT_UNIT_TESTS_WALL_SECONDS
+        ));
+    }
+    if hosted.timeout != crate::validation_dag_static::HOSTED_SCRIPT_UNIT_TESTS_WALL_SECONDS {
+        return Err(format!(
+            "{HOSTED_SCRIPT_UNIT_TESTS_TAG} has a {}s wall, not the hosted {}s",
+            hosted.timeout,
+            crate::validation_dag_static::HOSTED_SCRIPT_UNIT_TESTS_WALL_SECONDS
+        ));
+    }
+    if local
+        .labels
+        .iter()
+        .any(|label| label == HOSTED_PORTABLE_LABEL)
+    {
+        return Err(format!(
+            "{SCRIPT_UNIT_TESTS_TAG} keeps the {HOSTED_PORTABLE_LABEL} label its hosted twin carries"
+        ));
+    }
+    if hosted.labels != [HOSTED_PORTABLE_LABEL] {
+        return Err(format!(
+            "{HOSTED_SCRIPT_UNIT_TESTS_TAG} has labels {:?}, not only {HOSTED_PORTABLE_LABEL}",
+            hosted.labels
+        ));
+    }
+    if hosted.fail_fast_family.as_deref() != Some(HOSTED_SCRIPT_UNIT_TESTS_TAG) {
+        return Err(format!(
+            "{HOSTED_SCRIPT_UNIT_TESTS_TAG} is not its own fail-fast family"
+        ));
+    }
+    // Everything else is the local node's: undo the four permitted changes and
+    // the description suffix, then compare the two nodes' serialized form.
+    let mut normalized = hosted.clone();
+    normalized.job = local.job.clone();
+    normalized.labels = local.labels.clone();
+    normalized.timeout = local.timeout;
+    normalized.fail_fast_family = local.fail_fast_family.clone();
+    normalized.description = hosted
+        .description
+        .strip_suffix(crate::validation_dag_static::HOSTED_SCRIPT_UNIT_TESTS_WALL_DESCRIPTION)
+        .ok_or_else(|| format!("{HOSTED_SCRIPT_UNIT_TESTS_TAG} lost its hosted wall description"))?
+        .to_string();
+    let one = |step: &Step| {
+        dag_to_json(&DagConfig {
+            steps: vec![step.clone()],
+            ..Default::default()
+        })
+    };
+    if one(&normalized) != one(local) {
+        return Err(format!(
+            "{HOSTED_SCRIPT_UNIT_TESTS_TAG} differs from {SCRIPT_UNIT_TESTS_TAG} in more than its hosted identity and wall"
+        ));
+    }
+    Ok(())
+}
+
 fn assert_rust_script_producer_contract(cfg: &DagConfig) -> Result<(), String> {
     type ProducerContract<'a> = (&'a str, &'a [&'a str], &'a [&'a str], i64, f64);
     let expected: &[ProducerContract<'_>] = &[
@@ -3389,6 +3509,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     assert_fail_closed_manifest_selectors(cfg)?;
     assert_rust_script_producer_contract(cfg)?;
     assert_pinned_workspace_split(cfg)?;
+    assert_hosted_script_unit_tests(cfg)?;
     assert_buck_e2e_selection(cfg, cells)?;
     // 1606 until test.dbt_parity and test.dbt_parity_on_host were retired
     // (slice S13 of https://github.com/rrnewton/hermit/issues/3301); 1605
@@ -3437,9 +3558,11 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // rust-script tools (431 + 1).
     // 433 since e2e.buck_stage took the staging out of e2e.buck_cells, so it
     // waits only for the pinned Reverie (432 + 1).
-    if cfg.steps.len() != 433 {
+    // 434 with check.script_unit_tests_on_host, the hosted twin of
+    // check.script_unit_tests that carries the longer hosted wall (433 + 1).
+    if cfg.steps.len() != 434 {
         return Err(format!(
-            "superset has {} steps, expected 433",
+            "superset has {} steps, expected 434",
             cfg.steps.len()
         ));
     }
@@ -4111,6 +4234,7 @@ pub fn generate(root: &Path) -> Result<DagConfig, String> {
     let mut refreshed = refresh_generated_partitions(static_source, generated)?;
     materialize_hosted_portable_selection(&mut refreshed);
     materialize_hosted_test_variants(&mut refreshed)?;
+    materialize_hosted_script_unit_tests(&mut refreshed)?;
     materialize_buck_e2e(&mut refreshed)?;
     materialize_pinned_root(&mut refreshed)?;
     materialize_focused_preflight(&mut refreshed)?;
@@ -5335,7 +5459,10 @@ sys.exit(37)
             "doc.doctests_on_host".into(),
             "doc.rustdoc_on_host".into(),
             "lint.clippy_on_host".into(),
+            "check.script_unit_tests_on_host".into(),
         ]);
+        // 23 since check.script_unit_tests_on_host took the hosted lane's copy
+        // of check.script_unit_tests, with its longer hosted wall;
         // 22 since test.liteinst_strict_on_host was retired with the LiteInst
         // host hybrid (https://github.com/rrnewton/hermit/issues/3520);
         // 23 since test.detcore_time_on_host was enrolled;
@@ -5351,7 +5478,7 @@ sys.exit(37)
         // change of 2026-09-30 retired build.liteinst_runtime_release_on_host
         // and moved check.dbt_runtime_abi into the pinned root, which gave it
         // the hosted twin check.dbt_runtime_abi_on_host.
-        assert_eq!(new_variants.len(), 22);
+        assert_eq!(new_variants.len(), 23);
         let mut expected = legacy_variants
             .map(str::to_string)
             .into_iter()
@@ -6584,5 +6711,196 @@ sys.exit(37)
         let cells = expected_cells(&crate::git_environment::checkout_root()).unwrap();
         let error = assert_invariants(&changed, &cells).unwrap_err();
         assert!(error.contains("waits for"), "{error}");
+    }
+
+    #[test]
+    fn hosted_script_unit_tests_twin_changes_only_its_identity_and_wall() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        assert_hosted_script_unit_tests(&committed).unwrap();
+        let find = |cfg: &DagConfig, tag: &str| {
+            cfg.steps
+                .iter()
+                .find(|step| step.tag() == tag)
+                .unwrap()
+                .clone()
+        };
+        let local = find(&committed, SCRIPT_UNIT_TESTS_TAG);
+        let hosted = find(&committed, HOSTED_SCRIPT_UNIT_TESTS_TAG);
+        assert_eq!(local.timeout, 900);
+        assert_eq!(hosted.timeout, 1500);
+        assert_eq!(hosted.cpu_timeout, local.cpu_timeout);
+        assert_eq!(hosted.cmd, local.cmd);
+        assert_eq!(hosted.deps, local.deps);
+
+        // Each lane selects exactly one of the two nodes.
+        let tags = |labels: &[&str]| {
+            select_steps_by_labels(
+                &committed,
+                &labels
+                    .iter()
+                    .map(|label| label.to_string())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+            .steps
+            .iter()
+            .map(Step::tag)
+            .collect::<BTreeSet<_>>()
+        };
+        for (labels, selected, absent) in [
+            (
+                &[HOSTED_PORTABLE_LABEL][..],
+                HOSTED_SCRIPT_UNIT_TESTS_TAG,
+                SCRIPT_UNIT_TESTS_TAG,
+            ),
+            (
+                &["full"][..],
+                SCRIPT_UNIT_TESTS_TAG,
+                HOSTED_SCRIPT_UNIT_TESTS_TAG,
+            ),
+            (
+                &["portable"][..],
+                SCRIPT_UNIT_TESTS_TAG,
+                HOSTED_SCRIPT_UNIT_TESTS_TAG,
+            ),
+        ] {
+            let chosen = tags(labels);
+            assert!(chosen.contains(selected), "{labels:?}");
+            assert!(!chosen.contains(absent), "{labels:?}");
+        }
+
+        // The pass rebuilds the committed twin from the authored node.
+        let mut authored = committed.clone();
+        authored
+            .steps
+            .retain(|step| step.tag() != HOSTED_SCRIPT_UNIT_TESTS_TAG);
+        let original = authored
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == SCRIPT_UNIT_TESTS_TAG)
+            .unwrap();
+        original.labels.push(HOSTED_PORTABLE_LABEL.into());
+        original.labels.sort();
+        let mut rebuilt = authored.clone();
+        materialize_hosted_script_unit_tests(&mut rebuilt).unwrap();
+        let one = |step: &Step| {
+            dag_to_json(&DagConfig {
+                steps: vec![step.clone()],
+                ..Default::default()
+            })
+        };
+        assert_eq!(
+            one(&find(&rebuilt, HOSTED_SCRIPT_UNIT_TESTS_TAG)),
+            one(&hosted)
+        );
+        assert_eq!(one(&find(&rebuilt, SCRIPT_UNIT_TESTS_TAG)), one(&local));
+        // It refuses a node that no longer runs in the hosted lane or no
+        // longer carries the authored wall.
+        let error = materialize_hosted_script_unit_tests(&mut committed.clone()).unwrap_err();
+        assert!(error.contains("lost its hosted-portable label"), "{error}");
+        let mut rewalled = authored.clone();
+        rewalled
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == SCRIPT_UNIT_TESTS_TAG)
+            .unwrap()
+            .timeout = 1500;
+        let error = materialize_hosted_script_unit_tests(&mut rewalled).unwrap_err();
+        assert!(error.contains("not its authored 900s"), "{error}");
+
+        // The assertion refuses each way of undoing the twin's contract.
+        let mutated = |tag: &str, edit: &dyn Fn(&mut Step)| {
+            let mut changed = committed.clone();
+            edit(
+                changed
+                    .steps
+                    .iter_mut()
+                    .find(|step| step.tag() == tag)
+                    .unwrap(),
+            );
+            assert_hosted_script_unit_tests(&changed).unwrap_err()
+        };
+        let hosted_wall = mutated(HOSTED_SCRIPT_UNIT_TESTS_TAG, &|step| step.timeout = 900);
+        assert!(
+            hosted_wall.contains("not the hosted 1500s"),
+            "{hosted_wall}"
+        );
+        let local_wall = mutated(SCRIPT_UNIT_TESTS_TAG, &|step| step.timeout = 1500);
+        assert!(local_wall.contains("not its authored 900s"), "{local_wall}");
+        for (what, edit) in [
+            (
+                "command",
+                &(|step: &mut Step| step.cmd.push_str(" --skip-fixture")) as &dyn Fn(&mut Step),
+            ),
+            ("CPU bound", &|step: &mut Step| step.cpu_timeout += 1),
+            ("dependencies", &|step: &mut Step| {
+                step.deps.pop();
+            }),
+            ("memory hint", &|step: &mut Step| {
+                step.hint.hard_mem_max_bytes = step.hint.hard_mem_max_bytes.map(|bytes| bytes + 1)
+            }),
+            ("environment", &|step: &mut Step| {
+                step.env
+                    .insert("HERMIT_SCRIPT_TEST_JOBS".into(), "1".into());
+            }),
+            ("authored description", &|step: &mut Step| {
+                step.description.insert(0, 'x')
+            }),
+        ] {
+            let error = mutated(HOSTED_SCRIPT_UNIT_TESTS_TAG, edit);
+            assert!(
+                error.contains("in more than its hosted identity"),
+                "{what}: {error}"
+            );
+        }
+        let relabeled_local = mutated(SCRIPT_UNIT_TESTS_TAG, &|step| {
+            step.labels.push(HOSTED_PORTABLE_LABEL.into())
+        });
+        assert!(
+            relabeled_local.contains("keeps the hosted-portable label"),
+            "{relabeled_local}"
+        );
+        let relabeled_hosted = mutated(HOSTED_SCRIPT_UNIT_TESTS_TAG, &|step| {
+            step.labels.push("full".into())
+        });
+        assert!(
+            relabeled_hosted.contains("has labels"),
+            "{relabeled_hosted}"
+        );
+        let family = mutated(HOSTED_SCRIPT_UNIT_TESTS_TAG, &|step| {
+            step.fail_fast_family = Some(SCRIPT_UNIT_TESTS_TAG.into())
+        });
+        assert!(family.contains("fail-fast family"), "{family}");
+        let undescribed = mutated(HOSTED_SCRIPT_UNIT_TESTS_TAG, &|step| {
+            step.description = step
+                .description
+                .replace(" HOSTED WALL BOUND 2026-10-06:", " HOSTED WALL 2026-10-06:")
+        });
+        assert!(
+            undescribed.contains("lost its hosted wall description"),
+            "{undescribed}"
+        );
+        let mut duplicated = committed.clone();
+        duplicated.steps.push(hosted.clone());
+        let error = assert_hosted_script_unit_tests(&duplicated).unwrap_err();
+        assert!(error.contains("appears more than once"), "{error}");
+        let mut missing = committed.clone();
+        missing
+            .steps
+            .retain(|step| step.tag() != HOSTED_SCRIPT_UNIT_TESTS_TAG);
+        let error = assert_hosted_script_unit_tests(&missing).unwrap_err();
+        assert!(error.contains("is absent"), "{error}");
+
+        // The assertion is wired into the generator's invariant set.
+        let mut changed = committed.clone();
+        changed
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == HOSTED_SCRIPT_UNIT_TESTS_TAG)
+            .unwrap()
+            .timeout = 900;
+        let cells = expected_cells(&crate::git_environment::checkout_root()).unwrap();
+        let error = assert_invariants(&changed, &cells).unwrap_err();
+        assert!(error.contains("not the hosted 1500s"), "{error}");
     }
 }
