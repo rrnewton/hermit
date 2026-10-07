@@ -84,6 +84,7 @@ use hermit_manifest_plan::runner::retained_verify_invocation_error;
 use hermit_manifest_plan::runner::retained_verify_pass_error;
 use hermit_manifest_plan::runner::run_epoch_from_env;
 use hermit_manifest_plan::runner::skid_overshoot_only_reports;
+use hermit_manifest_plan::runner::validate_expected_guest_exit;
 use hermit_manifest_plan::stress_series::SeriesNoVerdictKind;
 use hermit_manifest_plan::stress_series::SeriesPressureAttempt;
 use hermit_manifest_plan::stress_series::SeriesPressureComparison;
@@ -7343,8 +7344,9 @@ fn result_row_matches_cell(
 /// trusting the runner's outcome. A row that declares a guest exit must have
 /// run verify under `--verify-allow=failure`, with Hermit's status, the
 /// report's guest disposition and both compared outputs all naming exactly the
-/// declaration. An undeclared row must end with a non-negative status (0
-/// outside chaos) and no signal. A report this cannot parse is refused.
+/// declaration. A declaration the runner itself refuses credits nothing. An
+/// undeclared row must end with a non-negative status (0 outside chaos) and no
+/// signal. A report this cannot parse is refused.
 fn matched_attempts_end_as_declared(row: &CellResult) -> bool {
     if row.outcome != "PASS" || !matches!(row.mode.as_str(), "verify" | "replay" | "chaos") {
         return true;
@@ -7365,6 +7367,12 @@ fn matched_attempts_end_as_declared(row: &CellResult) -> bool {
                 .is_some_and(|status| status >= 0 && (row.mode == "chaos" || status == 0))
                 && attempt.signal.is_none();
         };
+        // Check the declaration before matching it, as the per-attempt check
+        // does: a declaration the runner itself would refuse credits nothing,
+        // and an out-of-range signal would overflow the match's `128 + signal`.
+        if validate_expected_guest_exit("result row", &row.mode, Some(declared)).is_err() {
+            return false;
+        }
         let hermit_args = attempt
             .argv
             .iter()
@@ -20791,6 +20799,14 @@ fn self_test(root: &Path) -> Result<(), String> {
             Some(16),
             false,
         ),
+        (
+            "a declared exit code 0, which the runner refuses",
+            &allowed[..],
+            0,
+            (0, 0),
+            Some(0),
+            false,
+        ),
     ] {
         let row = matched_pass_row(&result_row, argv, status, outputs, declared)?;
         if result_row_matches_cell(
@@ -22046,6 +22062,83 @@ mod pressure_sample_tests {
             "verify",
             Some(&code_23),
             std::slice::from_ref(&diverged)
+        ));
+    }
+
+    #[test]
+    fn a_row_declaration_the_runner_refuses_credits_no_matched_comparison() {
+        // The per-attempt check admits a clean exit whatever the row
+        // declares, so the row's own rule is the one that reads the
+        // declaration and must check it first.
+        let declare = |code: Option<i32>, signal: Option<i32>, reason: &str| ExpectedGuestExit {
+            code,
+            signal,
+            reason: reason.into(),
+        };
+        let mut exits_0 = comparison_attempt("verify", 0);
+        exits_0.argv.push("--verify-allow=failure".into());
+        let mut exits_23 = comparison_attempt("verify", 23);
+        exits_23.argv.push("--verify-allow=failure".into());
+        // A clean exit whose report and both compared outputs name signal
+        // -128, which `128 + signal` reads as Hermit's status 0.
+        let mut minus_128 = exits_0.clone();
+        let mut report: JsonValue =
+            serde_json::from_str(minus_128.verification_report.as_ref().unwrap()).unwrap();
+        report["guest_exit_code"] = JsonValue::Null;
+        report["guest_signal"] = json!(-128);
+        for side in ["left", "right"] {
+            report["compared_outputs"][side]["exit_code"] = JsonValue::Null;
+            report["compared_outputs"][side]["signal"] = json!(-128);
+        }
+        replace_report(&mut minus_128, report);
+        let fails = "the fixture guest fails on purpose";
+        for (label, declared, attempt, refusal) in [
+            (
+                "a signal whose 128 + signal overflows",
+                declare(None, Some(i32::MAX), fails),
+                &exits_0,
+                "does not end as its cell declares",
+            ),
+            (
+                "exit code 0",
+                declare(Some(0), None, fails),
+                &exits_0,
+                "does not end as its cell declares",
+            ),
+            (
+                "signal -128",
+                declare(None, Some(-128), fails),
+                &minus_128,
+                "inner report has an invalid guest process disposition",
+            ),
+            (
+                "a blank reason",
+                declare(Some(23), None, " "),
+                &exits_23,
+                "matched report contradicts its inner process disposition",
+            ),
+        ] {
+            let mut row = history_row("verify", "PASS", 1, vec![attempt.clone()]);
+            row.expected_guest_exit = Some(declared);
+            assert!(!matched_attempts_end_as_declared(&row), "{label}");
+            let error = inner_pressure_history(std::slice::from_ref(&row)).unwrap_err();
+            assert!(error.contains(refusal), "{label}: {error}");
+            assert!(
+                !repetition_qualifies_for_promotion("pass", std::slice::from_ref(&row)),
+                "{label}"
+            );
+        }
+        // Undeclared, the same clean match is credited.
+        let row = history_row("verify", "PASS", 1, vec![exits_0]);
+        assert!(matched_attempts_end_as_declared(&row));
+        assert!(
+            inner_pressure_history(std::slice::from_ref(&row))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(repetition_qualifies_for_promotion(
+            "pass",
+            std::slice::from_ref(&row)
         ));
     }
 
