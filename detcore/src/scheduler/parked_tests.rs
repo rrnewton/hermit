@@ -2661,7 +2661,12 @@ fn child_exit_owes_an_rt_sigsuspend_wake_only_for_its_exit_signal() {
 
         grant_child_exit_and_remove_thread(&mut s, child, child_mm);
         assert!(s.complete_physical_process_exit(child_process));
-        assert!(s.step2_drain_prefix().is_ok());
+        // An owed wake holds the pass until the waiter's continuation arrives.
+        assert_eq!(
+            s.step2_drain_prefix().is_err(),
+            owed,
+            "exit signal {exit_signal}"
+        );
         assert_eq!(s.owed_child_exit_wakeups, 1);
         assert_eq!(
             s.blocked.rt_sigsuspend_wake_owed.contains(&parent),
@@ -2707,7 +2712,8 @@ fn child_exit_wake_follows_the_signal_after_exec() {
 
         grant_child_exit_and_remove_thread(&mut s, child, child_mm);
         assert!(s.complete_physical_process_exit(child_process), "{case}");
-        assert!(s.step2_drain_prefix().is_ok(), "{case}");
+        // An owed wake holds the pass until the waiter's continuation arrives.
+        assert_eq!(s.step2_drain_prefix().is_err(), owed, "{case}");
         assert_eq!(s.owed_child_exit_wakeups, 1, "{case}");
         assert_eq!(
             s.blocked.rt_sigsuspend_wake_owed.contains(&parent),
@@ -2715,6 +2721,159 @@ fn child_exit_wake_follows_the_signal_after_exec() {
             "{case}"
         );
     }
+}
+
+/// Make `tid` ordinary runnable work at its default priority.
+fn queue_ordinary_work(s: &mut Scheduler, tid: DetTid) {
+    s.next_turns.get_mut(&tid).unwrap().req = Ivar::full(Ok(Resources::new(tid)));
+    s.runqueue_push_back(tid);
+}
+
+/// Let `waiter`'s owed `rt_sigsuspend` wake settle under one of the two host
+/// timings: the interrupted call's continuation reaches the scheduler before
+/// its next pass, or only after several passes. Until it arrives, every pass
+/// must hold: no queued thread may be selected, no due timer taken, and
+/// virtual time must stand still. Returns the run queue after the first pass
+/// that goes through.
+fn settle_owed_rt_sigsuspend_wake(
+    s: &mut Scheduler,
+    global_time: &Arc<Mutex<GlobalTime>>,
+    waiter: DetTid,
+    op_id: ExternalOpId,
+    continuation_first: bool,
+) -> Vec<DetTid> {
+    let time = global_time.lock().unwrap().as_nanos();
+    if !continuation_first {
+        let queued: Vec<DetTid> = s.run_queue.tids().copied().collect();
+        let timers = s.blocked.timed_waiters.len();
+        for _ in 0..3 {
+            assert!(
+                s.step2_process_blocked(global_time).is_err(),
+                "no turn may run while an owed wake's signal can still merge with another"
+            );
+            assert!(s.take_terminal_deadlock().is_none());
+        }
+        assert!(s.blocked.rt_sigsuspend_wake_owed.contains(&waiter));
+        assert_eq!(s.run_queue.tids().copied().collect::<Vec<_>>(), queued);
+        assert_eq!(s.blocked.timed_waiters.len(), timers);
+        assert_eq!(global_time.lock().unwrap().as_nanos(), time);
+    }
+    post_rt_sigsuspend_continuation(s, waiter, op_id);
+    assert!(s.step2_process_blocked(global_time).is_ok());
+    assert!(s.take_terminal_deadlock().is_none());
+    assert!(s.blocked.rt_sigsuspend_wake_owed.is_empty());
+    assert!(!s.blocked.rt_sigsuspend_blockers.contains_key(&waiter));
+    assert!(!s.blocked.rt_sigsuspend_wakers.contains_key(&waiter));
+    assert_eq!(global_time.lock().unwrap().as_nanos(), time);
+    s.run_queue.tids().copied().collect()
+}
+
+/// Must wake, at one point on every run: a sole-thread parent suspended for a
+/// caught SIGCHLD, a first child that has exited and been reaped, and a second
+/// child that is runnable. Until the parent's interrupted call has posted its
+/// continuation, the first child's SIGCHLD may still be pending for it, and a
+/// second SIGCHLD sent then merges with it or not depending on host timing:
+/// two handler runs on one run, one on another. So no turn may run, which
+/// keeps the second child from exiting, and no due timer may be taken. Both
+/// arrival orders of the continuation end in the same run queue, with the
+/// parent first. Before the fix the first pass let the second child run.
+#[test]
+fn owed_rt_sigsuspend_wake_holds_every_turn_until_its_continuation() {
+    let mut outcomes = Vec::new();
+    for continuation_first in [false, true] {
+        let mut s = physical_exit_reporting_scheduler();
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        let (parent, _, _) = add(&mut s, 100, 100);
+        let (first, first_mm, _) = add_process_child(&mut s, 100, 200);
+        let (second, _, _) = add_process_child(&mut s, 100, 300);
+        let (sleeper, _, _) = add(&mut s, 400, 400);
+        let op_id = grant_rt_sigsuspend(&mut s, parent, rt_sigsuspend_wakers(&[libc::SIGCHLD]));
+        queue_ordinary_work(&mut s, second);
+        let due = s.committed_time;
+        s.blocked.timed_waiters.insert(due, sleeper);
+
+        grant_child_exit_and_remove_thread(&mut s, first, first_mm);
+        assert!(s.complete_physical_process_exit(DetPid::from_raw(200)));
+        let queue =
+            settle_owed_rt_sigsuspend_wake(&mut s, &global_time, parent, op_id, continuation_first);
+        assert_eq!(s.owed_child_exit_wakeups, 1);
+        assert_eq!(s.host_signal_attempts, 0);
+        assert!(s.blocked.timed_waiters.thread_deadline(sleeper).is_none());
+        assert_eq!(queue, vec![parent, sleeper, second]);
+        outcomes.push(queue);
+    }
+    assert_eq!(outcomes[0], outcomes[1]);
+}
+
+/// Must wake, at one point on every run, for each of two child exits that
+/// reach a parent through two successive suspends. This is the shape that
+/// matters when SIGCHLD is blocked outside the suspends: between them the
+/// signal stays pending in the kernel, so a second child's SIGCHLD that
+/// arrives before the first was taken would merge with it and leave nothing
+/// for the second suspend, which would then sleep on one run and return at
+/// once on another. The scheduler never sees the original mask; it keeps the
+/// two exits apart by holding every turn until each owed continuation has
+/// posted. The second exit, sent while the second suspend still waits for its
+/// grant, stays pending because the waking set was blocked before that
+/// request was published; it is owed across the grant and held the same way.
+#[test]
+fn successive_owed_rt_sigsuspend_wakes_each_hold_until_their_continuation() {
+    let mut outcomes = Vec::new();
+    for continuation_first in [false, true] {
+        let mut s = physical_exit_reporting_scheduler();
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        let sigchld = rt_sigsuspend_wakers(&[libc::SIGCHLD]);
+        let (parent, _, _) = add(&mut s, 100, 100);
+        let (first, first_mm, _) = add_process_child(&mut s, 100, 200);
+        let (second, second_mm, _) = add_process_child(&mut s, 100, 300);
+        let (third, _, _) = add_process_child(&mut s, 100, 400);
+        let (sleeper, _, _) = add(&mut s, 500, 500);
+
+        // First suspend; the first child exits and is reaped.
+        let first_op = grant_rt_sigsuspend(&mut s, parent, sigchld);
+        grant_child_exit_and_remove_thread(&mut s, first, first_mm);
+        assert!(s.complete_physical_process_exit(DetPid::from_raw(200)));
+        let queue = settle_owed_rt_sigsuspend_wake(
+            &mut s,
+            &global_time,
+            parent,
+            first_op,
+            continuation_first,
+        );
+        assert_eq!(queue, vec![parent]);
+
+        // The parent's continuation turn runs, and it suspends again.
+        assert!(s.run_queue.remove_tid(parent));
+        let second_request = post_rt_sigsuspend_request(&mut s, parent, sigchld);
+
+        // The second child exits before that suspend is granted. Its wake is
+        // owed to the pending request, which holds no turn yet: nothing can
+        // take the signal from the kernel until the real call runs.
+        grant_child_exit_and_remove_thread(&mut s, second, second_mm);
+        assert!(s.complete_physical_process_exit(DetPid::from_raw(300)));
+        assert!(s.step2_process_blocked(&global_time).is_ok());
+        assert_eq!(s.owed_child_exit_wakeups, 2);
+        assert!(s.blocked.rt_sigsuspend_wake_owed.contains(&parent));
+
+        // Granting the suspend keeps the wake owed, and from then on every
+        // turn and timer waits for its continuation.
+        let second_op = grant_posted_rt_sigsuspend(&mut s, parent, &second_request);
+        queue_ordinary_work(&mut s, third);
+        let due = s.committed_time;
+        s.blocked.timed_waiters.insert(due, sleeper);
+        let queue = settle_owed_rt_sigsuspend_wake(
+            &mut s,
+            &global_time,
+            parent,
+            second_op,
+            continuation_first,
+        );
+        assert_eq!(s.owed_child_exit_wakeups, 2);
+        assert_eq!(s.host_signal_attempts, 0);
+        assert_eq!(queue, vec![parent, sleeper, third]);
+        outcomes.push(queue);
+    }
+    assert_eq!(outcomes[0], outcomes[1]);
 }
 
 #[test]

@@ -3029,7 +3029,33 @@ impl Scheduler {
             return Err(SkipTurn);
         }
         self.step2a_wait_for_vfork_barrier()?;
-        self.step2_deliver_owed_child_exit_signals()
+        self.step2_deliver_owed_child_exit_signals()?;
+        self.step2_await_owed_rt_sigsuspend_wakes()
+    }
+
+    /// Hold every turn, timer and harvest until each thread owed an
+    /// `rt_sigsuspend` wake has posted the continuation of its real call.
+    ///
+    /// The owed signal is already generated, but until the real call returns
+    /// the kernel still holds it pending for the waiter. Another signal of the
+    /// same number sent in that window, for example a second child's exit,
+    /// merges with it or arrives separately depending on host timing alone.
+    /// The posted continuation proves the call has taken the owed signal: the
+    /// call returns only by taking a signal, and its return reinstalls the mask
+    /// that blocks the waking set, so later sends stay pending until the
+    /// waiter's own continuation turn. That turn is a scheduler decision.
+    ///
+    /// The wait cannot be endless. The signal was sent before the mark was
+    /// made; its membership in the waking set and the waiter being its
+    /// process's only live thread make the call's return certain; this path
+    /// releases the scheduler lock so the continuation can be posted; and a
+    /// waiter that dies instead leaves the owed set with its blocking entries.
+    fn step2_await_owed_rt_sigsuspend_wakes(&self) -> Result<(), SkipTurn> {
+        if self.rt_sigsuspend_wake_unconsumed() {
+            std::thread::yield_now();
+            return Err(SkipTurn);
+        }
+        Ok(())
     }
 
     /// Wake the parents owed a child-exit `SIGCHLD` on a backend that reports
@@ -3747,16 +3773,49 @@ impl Scheduler {
     /// True if a thread owed an `rt_sigsuspend` wake is still executing the
     /// real call, so its continuation is not among the `ready` ones yet.
     ///
-    /// The scheduler then waits for it before harvesting any continuation.
-    /// The wait cannot be endless: the signal was already sent, and its
-    /// waking-set membership makes the real call's return certain. Harvesting
-    /// the thread on the first harvest after the wake, rather than whenever
-    /// the host delivers the signal, makes the turn on which it rejoins a
-    /// scheduler decision instead of a host timing.
+    /// The scheduler then waits for it before admitting any other work or
+    /// harvesting any continuation, for the reasons given at
+    /// `step2_await_owed_rt_sigsuspend_wakes`, which applies the same rule
+    /// before timers run. This check reuses step2c's single `ready` snapshot so
+    /// that a wake owed by a timer signal in the same pass is held as well, and
+    /// so that the thread is harvested on exactly the pass this snapshot says
+    /// its continuation arrived.
     fn rt_sigsuspend_wake_in_flight(&self, ready: &[DetTid]) -> bool {
         self.blocked.rt_sigsuspend_wake_owed.iter().any(|dettid| {
             self.blocked.rt_sigsuspend_blockers.contains_key(dettid) && !ready.contains(dettid)
         })
+    }
+
+    /// True if a thread owed an `rt_sigsuspend` wake is in the real call and
+    /// has not yet posted its continuation, reading each request once. A wake
+    /// owed to a request not yet granted is not counted: the waker set was
+    /// blocked before that request was published, so every signal sent until
+    /// the grant stays pending for the real call, whatever the host timing.
+    fn rt_sigsuspend_wake_unconsumed(&self) -> bool {
+        self.blocked.rt_sigsuspend_wake_owed.iter().any(|dettid| {
+            self.blocked
+                .rt_sigsuspend_blockers
+                .get(dettid)
+                .is_some_and(|op_id| !self.blocker_continuation_posted(*dettid, *op_id, true))
+        })
+    }
+
+    /// Whether the thread blocked in `op_id` has posted a request that ends
+    /// that blocking operation.
+    fn blocker_continuation_posted(
+        &self,
+        dettid: DetTid,
+        op_id: ExternalOpId,
+        signal_can_complete: bool,
+    ) -> bool {
+        let nt = self
+            .next_turns
+            .get(&dettid)
+            .expect("internal invariant broken");
+        matches!(
+            nt.req.try_read(),
+            Some(Ok(req)) if blocking_request_is_ready(&req, op_id, signal_can_complete)
+        )
     }
 
     // Force a thread out blocking and into the runnable state, replacing its resource request.
@@ -3809,15 +3868,7 @@ impl Scheduler {
             let ready: Vec<DetTid> = blockers
                 .iter()
                 .filter(|(dtid, op_id, signal_can_complete)| {
-                    let nt = self
-                        .next_turns
-                        .get(dtid)
-                        .expect("internal invariant broken");
-                    if let Some(Ok(req)) = nt.req.try_read() {
-                        blocking_request_is_ready(&req, *op_id, *signal_can_complete)
-                    } else {
-                        false
-                    }
+                    self.blocker_continuation_posted(*dtid, *op_id, *signal_can_complete)
                 })
                 .map(|(dtid, _, _)| *dtid)
                 .collect();
@@ -3846,38 +3897,49 @@ impl Scheduler {
                 }
             };
 
-            // FIXME TODO (T137183027): for record/replay to work properly, we need to ALLOW the
-            // "Nondeterminstic algorithm" below, but record & replay those scheduler events. In
-            // the meantime, use a deterministic eager policy once there is no other runnable work.
-            if self.recordreplay_modes {
-                // Only *real* deterministic work should defer external-IO harvesting.
-                // Internal pollers sit at LAST_PRIORITY and are frequently spinning on
-                // the very result an external-IO blocker will produce (e.g. the reader
-                // side of `echo hi | cat`, where one stage uses InternalIOPolling while
-                // its peer is backgrounded on BlockingExternalIO). Treat a run queue
-                // that holds only pollers as "no deterministic work" so we still harvest
-                // completed IO below; a queued poller must not starve a ready blocker.
-                let only_pollers = if let Some(fp) = self.run_queue.first_priority() {
-                    fp >= LAST_PRIORITY
-                } else {
-                    true
-                };
+            // A thread certain to be woken must join this harvest before any
+            // other work is admitted; see `rt_sigsuspend_wake_in_flight`.
+            if self.rt_sigsuspend_wake_in_flight(&ready) {
+                std::thread::yield_now();
+                return Err(SkipTurn);
+            }
 
+            // Only *real* deterministic work should defer external-IO harvesting.
+            // Internal pollers sit at LAST_PRIORITY and are frequently spinning on
+            // the very result an external-IO blocker will produce (e.g. the reader
+            // side of `echo hi | cat`, where one stage uses InternalIOPolling while
+            // its peer is backgrounded on BlockingExternalIO). Treat a run queue
+            // that holds only pollers as "no deterministic work" so we still harvest
+            // completed IO below; a queued poller must not starve a ready blocker.
+            let only_pollers = if let Some(fp) = self.run_queue.first_priority() {
+                fp >= LAST_PRIORITY
+            } else {
+                true
+            };
+            if !self.run_queue.is_empty() && !only_pollers {
                 // Deterministic work is runnable: let it proceed. Waiting here while such
                 // work exists can deadlock thread creation -- the parent and new child
                 // cannot complete clone while an existing worker blocks indefinitely in
                 // epoll_wait.
-                if !self.run_queue.is_empty() && !only_pollers {
-                    return Ok(());
-                }
+                //
+                // An owed `rt_sigsuspend` continuation is the exception: the scheduler,
+                // not the host, decided when its signal was sent, and every turn was
+                // held until the continuation arrived. It rejoins now, ahead of the
+                // queued work, so a busy sibling cannot postpone it indefinitely. The
+                // set is exact: the check above found every owed blocker in `ready`.
+                let owed: Vec<DetTid> = ready
+                    .iter()
+                    .copied()
+                    .filter(|dtid| self.blocked.rt_sigsuspend_wake_owed.contains(dtid))
+                    .collect();
+                requeue_ready(self, &owed);
+                return Ok(());
+            }
 
-                // A thread certain to be woken must join this harvest; see
-                // `rt_sigsuspend_wake_in_flight`.
-                if self.rt_sigsuspend_wake_in_flight(&ready) {
-                    std::thread::yield_now();
-                    return Err(SkipTurn);
-                }
-
+            // FIXME TODO (T137183027): for record/replay to work properly, we need to ALLOW the
+            // "Nondeterminstic algorithm" below, but record & replay those scheduler events. In
+            // the meantime, use a deterministic eager policy once there is no other runnable work.
+            if self.recordreplay_modes {
                 // Reschedule every blocker whose IO has completed so its continuation can
                 // consume the recorded result. Harvesting all ready blockers (not just the
                 // first) and doing so even when pollers are queued is what breaks the
@@ -3908,26 +3970,10 @@ impl Scheduler {
                 return Err(SkipTurn);
             } // End region which should be deleted.
 
-            // Use the same deterministic-work-first policy as record/replay. Host
+            // The deterministic-work-first policy above applies here too. Host
             // completion timing must not decide whether a ready continuation overtakes
             // guest work that was already runnable. Pollers are excluded because they
             // commonly wait for the completed operation and would otherwise starve it.
-            let only_pollers = if let Some(fp) = self.run_queue.first_priority() {
-                fp >= LAST_PRIORITY
-            } else {
-                true
-            };
-            if !self.run_queue.is_empty() && !only_pollers {
-                return Ok(());
-            }
-
-            // A thread certain to be woken must join this harvest; see
-            // `rt_sigsuspend_wake_in_flight`.
-            if self.rt_sigsuspend_wake_in_flight(&ready) {
-                std::thread::yield_now();
-                return Err(SkipTurn);
-            }
-
             if !ready.is_empty() {
                 requeue_ready(self, &ready);
             }
