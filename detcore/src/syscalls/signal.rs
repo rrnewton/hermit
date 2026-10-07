@@ -465,6 +465,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             {
                 return Ok(KernelSigset::from_ne_bytes(mask));
             }
+            // The probe makes the real call an injection again, so say so in
+            // the compared log, as `blocked_pending_signals` does. Only a
+            // pointer the direct read refuses gets here: an invalid size was
+            // refused before the read.
+            tracing::warn!(
+                "[dtid {}] could not read the rt_sigsuspend mask directly; checking it with an injected rt_sigprocmask",
+                guest.thread_state().dettid
+            );
         }
         read_kernel_sigset(guest, address).await
     }
