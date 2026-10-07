@@ -19,7 +19,7 @@ pub const TEST_WALL_TIMEOUT_MULTIPLIER_ENV: &str = "HERMIT_TEST_WALL_TIMEOUT_MUL
 pub const TIMEOUT_CALIBRATION_CUTOFF_UTC: &str = "2026-09-03T02:18:30Z";
 pub const CALIBRATED_CI_CELL_COUNT: usize = 492;
 pub const DEFAULT_COVERED_CI_CELL_COUNT: usize = 487;
-pub const NON_CI_CELL_COUNT: usize = 172;
+pub const NON_CI_CELL_COUNT: usize = 173;
 /// Additional selected cells covered by the KVM qualification evidence.
 pub const KVM_RATCHET_CALIBRATION_SHA: &str = "92bacf12deba6a717f77cfcbd6afefc5ffb383f2";
 pub const KVM_RATCHET_CALIBRATION_COMPLETED_UTC: &str = "2026-09-04T04:39:00Z";
@@ -109,23 +109,14 @@ pub const PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_SHA: &str =
     "ab7f0dd15120aeecea647940feca712741ec214d";
 pub const PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-10-04T09:41:42Z";
 pub const PROCFS_MOUNTINFO_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
-/// `c-programs/dbt-pid-virtualization` verify on ptrace, promoted after the
-/// scheduler stopped writing a counterfeit `InboundSignal` request for a
-/// thread blocked in a real syscall. The guest's child exit sent a synthesized
-/// SIGCHLD to its vfork parent; the counterfeit lost the parent's continuation
-/// and the run hung. The cell passed ten consecutive strict verify runs at the
-/// evidence SHA.
-pub const VFORK_SIGCHLD_2026_09_25_EVIDENCE_SHA: &str = "ef2e6307b35b0d4b1aac32895f2ca527e26525e4";
-pub const VFORK_SIGCHLD_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T09:25:51Z";
-pub const VFORK_SIGCHLD_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// `c-programs/sigsuspend-alarm-wake` verify on ptrace, a new guest for the
-/// other half of the same scheduler fix: `fire_alarm` signals a thread parked
-/// in the scheduler's `rt_sigsuspend` pool, which must be released to report
-/// its own interrupted syscall, and an alarm the arming thread's suspend mask
-/// blocks must go to a waiter whose mask admits it. The guest is added by the
-/// commit that selects it, so the SHA names the scheduler source the evidence
-/// binary was built from; the ten consecutive strict verify runs used guest
-/// source sha256
+/// scheduler's signals to threads waiting outside the run queue: `fire_alarm`
+/// signals a thread parked in the scheduler's `rt_sigsuspend` pool, which must
+/// be released to report its own interrupted syscall, and an alarm the arming
+/// thread's suspend mask blocks must go to a waiter whose mask admits it. The
+/// guest is added by the commit that selects it, so the SHA names the
+/// scheduler source the evidence binary was built from; the ten consecutive
+/// strict verify runs used guest source sha256
 /// 3f017b5c2a38b388301e0528f6c54296e2a9906bf69f23b9fe1cc5d70fa70ba2.
 pub const SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_SHA: &str =
     "d3c13a40a243715c1688cb9ba3baa01ce37aed89";
@@ -2062,15 +2053,6 @@ mod tests {
         );
         assert_eq!(PROCFS_MOUNTINFO_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(
-            VFORK_SIGCHLD_2026_09_25_EVIDENCE_SHA,
-            "ef2e6307b35b0d4b1aac32895f2ca527e26525e4"
-        );
-        assert_eq!(
-            VFORK_SIGCHLD_2026_09_25_EVIDENCE_COMPLETED_UTC,
-            "2026-09-25T09:25:51Z"
-        );
-        assert_eq!(VFORK_SIGCHLD_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
-        assert_eq!(
             SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_SHA,
             "d3c13a40a243715c1688cb9ba3baa01ce37aed89"
         );
@@ -2139,7 +2121,7 @@ mod tests {
                     < DEFAULT_TEST_WALL_TIMEOUT_SECONDS * 1000
             );
         }
-        assert_eq!(NON_CI_CELL_COUNT, 172);
+        assert_eq!(NON_CI_CELL_COUNT, 173);
         for calibration in EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()
             .chain(&KVM_RATCHET_TIMEOUT_CALIBRATIONS)
