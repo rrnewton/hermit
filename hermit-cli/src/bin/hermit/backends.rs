@@ -134,7 +134,7 @@ fn dbt_branch_clock_mismatch(first: u64, second: u64) -> Option<String> {
 /// Compare the authenticated number of DBT process images as a typed dimension.
 ///
 /// Each process-image initialization record is also compared in the log, at its
-/// arrival position, so a differing count diverges there too. This check names
+/// stream position, so a differing count diverges there too. This check names
 /// that cause directly instead of leaving it to be inferred from a record diff.
 #[cfg(feature = "dbt")]
 fn dbt_initialization_record_mismatch(first: usize, second: usize) -> Option<String> {
@@ -786,8 +786,10 @@ fn decode_dbt_evidence(file: &mut std::fs::File) -> Result<DbtEvidence, Error> {
 /// Write the comparison log for one DBT run from its decoded evidence.
 ///
 /// The log holds `DbtEvidence::all_records()`: every authenticated record in
-/// arrival order, with each process-image initialization record at the position
-/// where it arrived. That is exactly the stream the `all_records_v1` envelope
+/// stream order, with each process-image initialization record where the
+/// Reverie collector placed it, immediately before that image's first comparable
+/// record (or at the end of the stream if the image wrote none). That is exactly
+/// the stream the `all_records_v1` envelope
 /// compares and counts. The refusal guards count `DbtEvidence::records()`
 /// instead, as described on `materialize_dbt_comparison_log`.
 #[cfg(feature = "dbt")]
@@ -866,7 +868,7 @@ fn write_dbt_comparison_records(
 
     // The verdict publishes `all_records_v1`, so nothing between Reverie's
     // authenticated decoder and this log may select records: every record,
-    // initialization records included, must reach the log in arrival order.
+    // initialization records included, must reach the log in stream order.
     // Filtering here would be an undisclosed second selection. Each record was
     // checked above to hold no embedded line boundary, so one record is one line
     // and this count is exact.
@@ -1365,13 +1367,14 @@ pub(super) fn run_dbt(
             failed_log_retention: (!keep_logs)
                 .then(super::verify::default_failed_verify_log_retention),
             // Each log holds `DbtEvidence::all_records()`, so every
-            // process-image initialization record is compared at the position
-            // where it arrived, in addition to the typed count checked above.
-            // Those positions were identical in both runs of all 326 pairs
-            // measured in
-            // https://github.com/rrnewton/hermit/issues/3406#issuecomment-5911491410,
-            // including 202 pairs of the two forking cells, where a child's
-            // initialization record arrives among the parent's records. The
+            // process-image initialization record is compared at its stream
+            // position, in addition to the typed count checked above. The
+            // Reverie collector places each one immediately before its image's
+            // first comparable record, not where the host accepted it: the
+            // accept position of a child's record among its parent's records
+            // is host-ordered, and it differed between two runs of
+            // run_dbt_virtualizes_process_identities
+            // (https://github.com/rrnewton/hermit/issues/3838). The
             // refusal guards in `materialize_dbt_comparison_log` still count
             // only `DbtEvidence::records()`, so a stream holding nothing but
             // initialization records is refused before this comparison.
@@ -2038,30 +2041,32 @@ mod tests {
         // path are compared with the options the DBT adapter uses. The
         // comparison counts five INFO records per side, where `records()` alone
         // holds three, and the report names `all_records_v1`. Moving the child's
-        // initialization record diverges the verdict although the guest records
-        // and the initialization counts are unchanged.
+        // initialization record away from the position the collector gives it,
+        // immediately before the child's first record, diverges the verdict
+        // although the guest records and the initialization counts are
+        // unchanged.
         let parent_first: &[u8] = b"1970-01-01T00:00:00.000000Z INFO detcore: parent record 1\n";
         let parent_second: &[u8] = b"1970-01-01T00:00:00.000000Z INFO detcore: parent record 2\n";
         let child: &[u8] = b"1970-01-01T00:00:00.000000Z INFO detcore: child record 1\n";
-        let arrived = [
+        let canonical = [
             DBT_INITIALIZATION_RECORD,
             parent_first,
-            DBT_INITIALIZATION_RECORD,
             parent_second,
+            DBT_INITIALIZATION_RECORD,
             child,
         ];
         let moved = [
             DBT_INITIALIZATION_RECORD,
             parent_first,
-            parent_second,
             DBT_INITIALIZATION_RECORD,
+            parent_second,
             child,
         ];
         // A diverged comparison keeps its logs, so they must live in a
         // directory this test removes.
         let directory = tempfile::tempdir().unwrap();
 
-        let matched = dbt_verdict(directory.path(), &arrived, &arrived);
+        let matched = dbt_verdict(directory.path(), &canonical, &canonical);
         assert_eq!(matched.verdict, Verdict::Matched);
         assert_eq!(
             matched.compared_log_messages,
@@ -2076,7 +2081,7 @@ mod tests {
         assert_eq!(report["comparison"]["record_envelope"], "all_records_v1");
         assert_eq!(report["bitwise_parity"], true);
 
-        let diverged = dbt_verdict(directory.path(), &arrived, &moved);
+        let diverged = dbt_verdict(directory.path(), &canonical, &moved);
         assert_eq!(diverged.verdict, Verdict::Diverged);
         assert_eq!(
             diverged.compared_log_messages,
@@ -2553,7 +2558,7 @@ mod tests {
     }
 
     /// The published stream reaches the comparison log unchanged and in
-    /// arrival order, initialization records included.
+    /// stream order, initialization records included.
     #[test]
     #[cfg(feature = "dbt")]
     fn dbt_canonical_evidence_materializes_records_unchanged() {
@@ -2576,27 +2581,27 @@ mod tests {
         assert_eq!(compared, 3);
         assert_eq!(fs::read(&path).unwrap(), published.concat());
 
-        // A child's initialization record is published where it arrived, among
-        // its parent's records, and is neither dropped nor moved. Two streams
-        // with the same guest records and the same initialization count,
-        // differing only in where an initialization record arrived, publish
+        // A child's initialization record is published where the stream holds
+        // it, among its parent's records, and is neither dropped nor moved. Two
+        // streams with the same guest records and the same initialization
+        // count, differing only in where an initialization record sits, publish
         // different logs; the typed count alone could not tell them apart.
         let parent_first: &[u8] = b"1970-01-01T00:00:00.000000Z INFO detcore: parent record 1\n";
         let parent_second: &[u8] = b"1970-01-01T00:00:00.000000Z INFO detcore: parent record 2\n";
         let child: &[u8] = b"1970-01-01T00:00:00.000000Z INFO detcore: child record 1\n";
-        let arrived = [
+        let stream = [
             DBT_INITIALIZATION_RECORD,
             parent_first,
             DBT_INITIALIZATION_RECORD,
             parent_second,
             child,
         ];
-        let evidence = decoded_dbt_evidence(&arrived);
-        assert_eq!(evidence.all_records(), arrived);
+        let evidence = decoded_dbt_evidence(&stream);
+        assert_eq!(evidence.all_records(), stream);
         let (file, path) = tempfile::NamedTempFile::new().unwrap().into_parts();
         let compared = materialize_dbt_evidence_log(&evidence, file, &path).unwrap();
         assert_eq!(compared, 5, "both initialization records are INFO records");
-        assert_eq!(fs::read(&path).unwrap(), arrived.concat());
+        assert_eq!(fs::read(&path).unwrap(), stream.concat());
 
         let front_loaded = decoded_dbt_evidence(&[
             DBT_INITIALIZATION_RECORD,
@@ -2612,7 +2617,7 @@ mod tests {
         );
         let (file, path) = tempfile::NamedTempFile::new().unwrap().into_parts();
         materialize_dbt_evidence_log(&front_loaded, file, &path).unwrap();
-        assert_ne!(fs::read(&path).unwrap(), arrived.concat());
+        assert_ne!(fs::read(&path).unwrap(), stream.concat());
     }
 
     /// Evidence without guest records, or with an unframed record, is refused

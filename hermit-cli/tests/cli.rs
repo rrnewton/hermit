@@ -389,7 +389,7 @@ fn read_terminal_dbt_verdict(path: &Path) -> serde_json::Value {
         "unexpected verdict: {verdict}"
     );
     // The DBT log carries every authenticated record, initialization records
-    // included at their arrival positions, so the verdict names all_records_v1.
+    // included at their stream positions, so the verdict names all_records_v1.
     assert_eq!(
         verdict["comparison"]["record_envelope"], "all_records_v1",
         "unexpected verdict: {verdict}"

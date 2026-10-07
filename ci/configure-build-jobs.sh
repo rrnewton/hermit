@@ -1163,8 +1163,28 @@ fi
 # changes reverie-ptrace (a child-exit publication report) and
 # reverie/src/capabilities.rs and tool.rs. Carry, not recalibration: no new
 # timing sample or >=5-sample replacement claim is made.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 9cb6f7b7db6549e373ae57fa7035f09aca7d508f ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 9cb6f7b7db6549e373ae57fa7035f09aca7d508f (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 0f7ffe7e3f82320c45d5d220b846b2a055b29501 (2026-10-07): from
+# 9cb6f7b7db6549e373ae57fa7035f09aca7d508f. The two commits change only
+# reverie-dbt/src/evidence.rs: the evidence collector writes each process
+# image's initialization record immediately before that image's first
+# comparable record, or at the end of the stream if it has none, instead of
+# where the host happened to accept it, and charges a held record against its
+# memory bound when it accepts it. The reverie-dbt tree moves
+# cc882d339affba476229fe5ff209d888d8fa0a38 -> 18468c68a51117f33521dc2327d76c67423faa82.
+# No changed file is an input to the DynamoRIO SDK recipe key above. Compared by
+# git object id at both pins: reverie-dbt/Cargo.toml is blob
+# 0e24d047d544a3daae2d6350270b26ceb74139d1, build.rs is blob
+# e05db6238bf07c96d8a850c5635a8c48590f20b7, native/CMakeLists.txt is blob
+# bcfb298a4f87ed190d7fdc52393e01d1245a8fe3, vendor/dynamorio is tree
+# 117d54d744df23921c531d0fe08537249f5a510a, third-party is tree
+# fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a, the root Cargo.toml is blob
+# 395eddb164895c7c59ff7db11d0a6105d0c69d30 and rust-toolchain.toml is blob
+# b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9. The native client is unchanged
+# (reverie-dbt/native is tree 27a61eb170f7372b5120f0ef92a900e9e8d6071c at both).
+# Carry, not recalibration: no new timing sample or >=5-sample replacement
+# claim is made.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 0f7ffe7e3f82320c45d5d220b846b2a055b29501 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 0f7ffe7e3f82320c45d5d220b846b2a055b29501 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

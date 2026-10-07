@@ -1366,7 +1366,7 @@ mod tests {
     /// envelope it names is not covered by the generic verifier's tests. Pin it
     /// to `all_records_v1`, the envelope the schema-10 ledger accepts: the DBT
     /// log holds every authenticated record, initialization records included at
-    /// their arrival positions. An opaque `caller_defined` predicate here would
+    /// the positions Reverie's collector gives them. An opaque `caller_defined` predicate here would
     /// silently disqualify every DBT verdict from bitwise parity, while
     /// `dbt_evidence_transport_v1` would leave the initialization positions
     /// uncompared. The DBT evidence tests in `backends.rs` check behaviourally
@@ -1397,7 +1397,7 @@ mod tests {
             record_envelope_literal(),
             "RecordEnvelope::all_records_v1()",
             "the DBT adapter compares every authenticated evidence record, initialization \
-             records included at their arrival positions, and also compares the initialization \
+             records included at their stream positions, and also compares the initialization \
              count as a typed dimension. Changing this envelope changes which records are \
              compared, so update the adapter and its evidence together, not just this literal"
         );

@@ -38,7 +38,7 @@ pub enum RecordEnvelopePolicy {
     /// (`evidence_emit_image_initialization`, reverie-dbt native/client.c).
     /// Offline `hermit log-diff` applies this selection to archived evidence
     /// logs when asked. Live DBT verification does not select it: it compares
-    /// under `AllRecordsV1`, with initialization records at their arrival
+    /// under `AllRecordsV1`, with initialization records at their stream
     /// positions, and also compares Reverie's authenticated initialization
     /// count as separate typed evidence.
     DbtEvidenceTransportV1,
