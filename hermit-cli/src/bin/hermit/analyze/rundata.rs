@@ -17,7 +17,10 @@ use std::str::FromStr;
 
 use anyhow::Context;
 use anyhow::bail;
+use clap::CommandFactory;
+use clap::FromArgMatches;
 use clap::Parser;
+use clap::parser::ValueSource;
 use colored::Colorize;
 use detcore::preemptions::PreemptionReader;
 use detcore::preemptions::PreemptionRecord;
@@ -606,10 +609,91 @@ impl AnalyzeOpts {
         RunData::get_raw_runopts(self).install_pmu_config()
     }
 
-    /// The virtual-time epoch a baseline trial starts from, in RFC 3339.
+    /// Replay the given records from the virtual-time epoch they were
+    /// recorded under, as `hermit run` does when it replays one
+    /// (`RunOpts::adopt_replayed_schedule_epoch`): every trial gets that epoch
+    /// as `--epoch`. A record's times are absolute virtual times measured from
+    /// its own epoch, and trials start through `RunOpts::run`, which does not
+    /// reconcile epochs, so without this they would start from the run
+    /// arguments' epoch instead.
+    ///
+    /// Records stored under two different epochs, or an explicit epoch
+    /// (`--epoch` or `HERMIT_EPOCH`) that differs from theirs, are refused
+    /// before any trial. Records written before epochs were stored carry none
+    /// and change nothing. Each recording is named by its option, such as
+    /// `--good`, and its path.
+    pub fn adopt_recorded_epoch(&mut self, recordings: &[(&str, &Path)]) -> anyhow::Result<()> {
+        let mut recorded = None;
+        let mut sources: Vec<String> = Vec::new();
+        for (option, path) in recordings {
+            let Some(epoch) =
+                detcore::preemptions::read_recorded_epoch(path).map_err(anyhow::Error::msg)?
+            else {
+                continue;
+            };
+            let source = format!("{option} {}", path.display());
+            match recorded {
+                None => recorded = Some(epoch),
+                Some(first) if first != epoch => {
+                    return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(
+                        format!(
+                            "{} was recorded under the virtual-time epoch {} and {source} \
+                             under {}. Each record's times are measured from its own epoch, \
+                             so no single replay epoch reproduces both. Record both with the \
+                             same --epoch.",
+                            sources[0],
+                            first.to_rfc3339(),
+                            epoch.to_rfc3339(),
+                        ),
+                    ));
+                }
+                Some(_) => {}
+            }
+            sources.push(source);
+        }
+        let Some(recorded) = recorded else {
+            return Ok(());
+        };
+        let run_cmd = std::iter::once("hermit-run").chain(
+            self.run_arg
+                .iter()
+                .chain(&self.run_args)
+                .map(String::as_str),
+        );
+        let matches = RunOpts::command()
+            .try_get_matches_from(run_cmd)
+            .context("cannot parse the trials' run arguments")?;
+        let recorded_text = recorded.to_rfc3339();
+        if matches.value_source("epoch") == Some(ValueSource::DefaultValue) {
+            self.run_arg.push(format!("--epoch={recorded_text}"));
+            return Ok(());
+        }
+        let explicit = RunOpts::from_arg_matches(&matches)?
+            .det_opts
+            .det_config
+            .epoch;
+        if explicit == recorded {
+            return Ok(());
+        }
+        Err(
+            anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                "the explicit virtual-time epoch {} (from --epoch or HERMIT_EPOCH) differs from \
+                 the epoch {recorded_text} that {} {} recorded under. A record's times are \
+                 absolute virtual times measured from its own epoch, so replaying it from \
+                 another epoch cannot reproduce the run. Omit --epoch to replay from the \
+                 recorded epoch, or pass --epoch={recorded_text}.",
+                explicit.to_rfc3339(),
+                sources.join(" and "),
+                if sources.len() == 1 { "was" } else { "were" },
+            )),
+        )
+    }
+
+    /// The virtual-time epoch the target trial (run 1) starts from, in
+    /// RFC 3339. It replays `--run1-preemptions` when that is given.
     #[cfg(test)]
     pub(crate) fn trial_epoch_for_test(&self) -> String {
-        RunData::new_baseline(self, "epoch-probe".to_owned())
+        RunData::new_run1_target(self, "epoch-probe".to_owned())
             .unwrap()
             .runopts
             .det_opts

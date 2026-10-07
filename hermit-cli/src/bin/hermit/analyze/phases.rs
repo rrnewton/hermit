@@ -734,16 +734,10 @@ impl AnalyzeOpts {
     /// trial runs on the globally selected backend
     /// (`hermit --backend <BACKEND> analyze ...`) and charges the invocation's
     /// shared `--max-log-bytes` budget.
-    pub fn apply_global(&mut self, global: &GlobalOpts) {
-        self.backend = global.backend;
-        self.max_log_bytes = global.max_log_bytes;
-        self.log_budget = global.log_budget();
-    }
-
-    pub fn main(&mut self, global: &GlobalOpts) -> anyhow::Result<ExitStatus> {
+    /// Everything `main` does before phase 0 creates the workspace: a
+    /// refusal here starts nothing.
+    fn prepare(&mut self, global: &GlobalOpts) -> anyhow::Result<()> {
         self.apply_global(global);
-        // Before phase 0 creates the workspace: a refused cap or counter
-        // starts nothing.
         self.refuse_unsupervised_log_cap()?;
         self.refuse_options_trials_do_not_apply()?;
         self.refuse_outputs_trials_overwrite()?;
@@ -757,6 +751,28 @@ impl AnalyzeOpts {
         if self.run2_schedule.is_some() {
             unimplemented!()
         }
+        // The trials that replay these records start from the epoch they were
+        // recorded under (https://github.com/rrnewton/hermit/issues/3870).
+        let run1 = self.run1_preemptions.clone();
+        let run2 = self.run2_preemptions.clone();
+        let recordings: Vec<(&str, &Path)> = [
+            ("--run1-preemptions", run1.as_deref()),
+            ("--run2-preemptions", run2.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(option, path)| Some((option, path?)))
+        .collect();
+        self.adopt_recorded_epoch(&recordings)
+    }
+
+    pub fn apply_global(&mut self, global: &GlobalOpts) {
+        self.backend = global.backend;
+        self.max_log_bytes = global.max_log_bytes;
+        self.log_budget = global.log_budget();
+    }
+
+    pub fn main(&mut self, global: &GlobalOpts) -> anyhow::Result<ExitStatus> {
+        self.prepare(global)?;
 
         self.phase0_initialize()?; // Need this early to set tmp_dir.
         {
@@ -1002,6 +1018,7 @@ mod tests {
 
     use super::*;
     use crate::container::LogCapExceeded;
+    use crate::container::PolicyRefusal;
 
     /// A search round whose trial `--max-log-bytes` ended stops the `--search`
     /// loop and returns that error, still a `LogCapExceeded`, so main reports
@@ -1034,5 +1051,142 @@ mod tests {
                 "the search ran more rounds after round {failing_round} failed"
             );
         }
+    }
+
+    const RECORDED: &str = "2000-12-31T23:59:59.123456789Z";
+    const RECORDED_RFC3339: &str = "2000-12-31T23:59:59.123456789+00:00";
+    const OTHER: &str = "2026-01-01T00:00:00Z";
+
+    /// A preemption record written to `dir` under `name`, with the given
+    /// recorded epoch.
+    fn record_with_epoch(dir: &Path, name: &str, epoch: Option<&str>) -> PathBuf {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test-resources/flaky_cas_sequence_schedules-passing.json");
+        let mut record: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(source).unwrap()).unwrap();
+        if let Some(epoch) = epoch {
+            record["epoch"] = serde_json::Value::from(epoch);
+        }
+        let path = dir.join(format!("{name}.json"));
+        std::fs::write(&path, record.to_string()).unwrap();
+        path
+    }
+
+    /// Through `prepare`, which `main` runs before phase 0: the trial
+    /// configuration `hermit analyze` would use for these records, or its
+    /// refusal.
+    fn prepared_analysis(
+        dir: &Path,
+        run1: Option<&str>,
+        run2: Option<&str>,
+        run_args: &[&str],
+    ) -> anyhow::Result<AnalyzeOpts> {
+        let run1 = format!(
+            "--run1-preemptions={}",
+            record_with_epoch(dir, "run1", run1).display()
+        );
+        let run2 = run2.map(|epoch| {
+            format!(
+                "--run2-preemptions={}",
+                record_with_epoch(dir, "run2", Some(epoch)).display()
+            )
+        });
+        let mut argv = vec!["hermit", "analyze", run1.as_str()];
+        argv.extend(run2.as_deref());
+        argv.push("--");
+        argv.extend(run_args);
+        argv.push("/bin/true");
+        let args = crate::Args::try_parse_from(&argv).unwrap();
+        let crate::Subcommand::Analyze(mut options) = args.command else {
+            panic!("{argv:?} is not analyze")
+        };
+        options.prepare(&args.global)?;
+        options.tmp_dir = Some(dir.to_path_buf());
+        Ok(*options)
+    }
+
+    /// The trial that replays `--run1-preemptions` starts from the epoch the
+    /// record was made under, as `hermit run` replaying it does
+    /// (https://github.com/rrnewton/hermit/issues/3870). Before, it started
+    /// from the run arguments' epoch, the default when none was given. The
+    /// checks run in a child process whose environment fixes `HERMIT_EPOCH`,
+    /// which counts as an explicit epoch: once unset, and once set to an epoch
+    /// other than the recorded one.
+    #[test]
+    fn analyze_replays_a_record_from_the_epoch_it_was_recorded_under() {
+        const CHILD: &str = "HERMIT_ANALYZE_EPOCH_TEST_CHILD";
+        let Some(arm) = std::env::var_os(CHILD) else {
+            let name = format!(
+                "{}::analyze_replays_a_record_from_the_epoch_it_was_recorded_under",
+                module_path!().split_once("::").unwrap().1
+            );
+            for arm in ["unset", "set"] {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child
+                    .args(["--exact", &name, "--nocapture"])
+                    .env(CHILD, arm);
+                if arm == "set" {
+                    child.env("HERMIT_EPOCH", OTHER);
+                } else {
+                    child.env_remove("HERMIT_EPOCH");
+                }
+                let output = child.output().unwrap();
+                assert!(output.status.success(), "{arm}: {output:?}");
+                assert!(
+                    String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                    "{arm}: the child ran no test: {output:?}"
+                );
+            }
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        let refused = |error: anyhow::Error, expected: &str| {
+            assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+            assert!(error.to_string().contains(expected), "{error:#}");
+        };
+        if arm == "set" {
+            refused(
+                prepared_analysis(dir, Some(RECORDED), None, &[]).unwrap_err(),
+                &format!(
+                    "the explicit virtual-time epoch 2026-01-01T00:00:00+00:00 (from --epoch or \
+                     HERMIT_EPOCH) differs from the epoch {RECORDED_RFC3339} that \
+                     --run1-preemptions"
+                ),
+            );
+            return;
+        }
+
+        // A record without an epoch keeps the default.
+        let analysis = prepared_analysis(dir, None, None, &[]).unwrap();
+        assert!(analysis.run_arg.is_empty(), "{:?}", analysis.run_arg);
+        assert_eq!(analysis.trial_epoch_for_test(), "2026-01-01T00:00:00+00:00");
+
+        // The recorded epoch reaches the trials, from either record.
+        let analysis = prepared_analysis(dir, Some(RECORDED), None, &[]).unwrap();
+        assert_eq!(analysis.trial_epoch_for_test(), RECORDED_RFC3339);
+        let analysis = prepared_analysis(dir, None, Some(RECORDED), &[]).unwrap();
+        assert_eq!(analysis.trial_epoch_for_test(), RECORDED_RFC3339);
+
+        // An explicit epoch equal to the recorded one adds no second --epoch.
+        let analysis =
+            prepared_analysis(dir, Some(RECORDED), None, &["--epoch", RECORDED]).unwrap();
+        assert!(analysis.run_arg.is_empty(), "{:?}", analysis.run_arg);
+        assert_eq!(analysis.trial_epoch_for_test(), RECORDED_RFC3339);
+
+        // A different explicit epoch is refused, naming the remedy.
+        refused(
+            prepared_analysis(dir, Some(RECORDED), None, &["--epoch", OTHER]).unwrap_err(),
+            &format!("pass --epoch={RECORDED_RFC3339}"),
+        );
+
+        // Two records under different epochs are refused, naming both.
+        refused(
+            prepared_analysis(dir, Some(RECORDED), Some(OTHER), &[]).unwrap_err(),
+            &format!(
+                "was recorded under the virtual-time epoch {RECORDED_RFC3339} and \
+                 --run2-preemptions"
+            ),
+        );
     }
 }

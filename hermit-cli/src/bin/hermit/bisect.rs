@@ -14,10 +14,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use anyhow::bail;
-use clap::CommandFactory;
-use clap::FromArgMatches;
 use clap::Parser;
-use clap::parser::ValueSource;
 use detcore::preemptions::PreemptionRecord;
 use detcore::types::SchedEvent;
 use hermit::Error;
@@ -27,9 +24,7 @@ use tracing::metadata::LevelFilter;
 
 use super::analyze::AnalyzeOpts;
 use super::analyze::ExitStatusConstraint;
-use super::container::PolicyRefusal;
 use super::global_opts::GlobalOpts;
-use super::run::RunOpts;
 
 /// Bisect two recorded schedules to identify the event ordering that causes a failure.
 #[derive(Debug, Parser)]
@@ -144,75 +139,15 @@ impl BisectOpts {
 
         let good = read_schedule(&self.good, "good")?;
         let bad = read_schedule(&self.bad, "bad")?;
-        if let Some(epoch) = self.recorded_epoch_argument(&good, &bad)? {
-            analyzer.run_arg.push(epoch);
-        }
+        // Each trial's schedule is written anew without an epoch, so the
+        // trials replay from the one the two schedules were recorded under.
+        analyzer.adopt_recorded_epoch(&[("--good", &self.good), ("--bad", &self.bad)])?;
         let good = good.into_global();
         let bad = bad.into_global();
         if good == bad {
             bail!("the --good and --bad schedules contain identical event traces");
         }
         Ok((analyzer, good, bad))
-    }
-
-    /// The `--epoch` every replay needs so that it starts from the epoch the
-    /// schedules were recorded under, as `hermit run` does when it replays one
-    /// (`RunOpts::adopt_replayed_schedule_epoch`). A schedule's times are
-    /// absolute virtual times measured from its own epoch, and bisect writes
-    /// each trial's schedule anew without one, so without this the replays
-    /// would start from the default epoch instead.
-    ///
-    /// Schedules recorded under two different epochs, or an explicit epoch
-    /// (`--epoch` or `HERMIT_EPOCH`) that differs from theirs, are refused
-    /// before any replay. Schedules written before epochs were stored carry
-    /// none, and bisect replays them from the run arguments' epoch as before.
-    fn recorded_epoch_argument(
-        &self,
-        good: &PreemptionRecord,
-        bad: &PreemptionRecord,
-    ) -> Result<Option<String>, Error> {
-        let recorded = match (good.epoch(), bad.epoch()) {
-            (Some(good_epoch), Some(bad_epoch)) if good_epoch != bad_epoch => {
-                return Err(Error::new(PolicyRefusal).context(format!(
-                    "--good {} was recorded under the virtual-time epoch {} and --bad {} \
-                     under {}. Each schedule's times are measured from its own epoch, so \
-                     no single replay epoch reproduces both. Record both schedules with \
-                     the same --epoch.",
-                    self.good.display(),
-                    good_epoch.to_rfc3339(),
-                    self.bad.display(),
-                    bad_epoch.to_rfc3339(),
-                )));
-            }
-            (good_epoch, bad_epoch) => match good_epoch.or(bad_epoch) {
-                Some(recorded) => recorded,
-                None => return Ok(None),
-            },
-        };
-        let matches = RunOpts::command()
-            .try_get_matches_from(
-                std::iter::once("hermit-run").chain(self.run_args.iter().map(String::as_str)),
-            )
-            .context("cannot parse the bisect run arguments")?;
-        if matches.value_source("epoch") == Some(ValueSource::DefaultValue) {
-            return Ok(Some(format!("--epoch={}", recorded.to_rfc3339())));
-        }
-        let explicit = RunOpts::from_arg_matches(&matches)?
-            .det_opts
-            .det_config
-            .epoch;
-        if explicit == recorded {
-            return Ok(None);
-        }
-        let recorded = recorded.to_rfc3339();
-        Err(Error::new(PolicyRefusal).context(format!(
-            "the explicit virtual-time epoch {} (from --epoch or HERMIT_EPOCH) differs from \
-             the epoch {recorded} that the --good and --bad schedules were recorded under. A \
-             schedule's times are absolute virtual times measured from its own epoch, so \
-             replaying it from another epoch cannot reproduce the run. Omit --epoch to replay \
-             from the recorded epoch, or pass --epoch={recorded}.",
-            explicit.to_rfc3339(),
-        )))
     }
 }
 
@@ -237,6 +172,7 @@ fn read_schedule(path: &Path, label: &str) -> anyhow::Result<PreemptionRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::container::PolicyRefusal;
 
     /// Through `main`: bisect refuses `--strict` in its run arguments on an
     /// inexact retired-branch counter before it reads either schedule

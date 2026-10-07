@@ -1133,7 +1133,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // bisect_refuses_schedules_recorded_under_two_epochs}
     // (https://github.com/rrnewton/hermit/issues/3835) retain all 954: 956,
     // measured with cargo nextest list.
-    ("test.hermit_unit", 956),
+    // analyze::phases::tests::analyze_replays_a_record_from_the_epoch_it_was_recorded_under
+    // (https://github.com/rrnewton/hermit/issues/3870) retains all 956: 957,
+    // measured with cargo nextest list.
+    ("test.hermit_unit", 957),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2078,7 +2081,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the three exit-watch tests too: 953.
     // And the signal-report pipe-page test: 954.
     // And the two bisect epoch tests: 956.
-    ("test.hermit_unit_on_host", 956),
+    // And the analyze epoch test: 957.
+    ("test.hermit_unit_on_host", 957),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
