@@ -167,6 +167,10 @@ struct InodePool {
     /// earlier file held the inode must still name that file (codex
     /// re-review of <https://github.com/rrnewton/hermit/pull/3849>, P1).
     generations: HashMap<RawInode, Vec<Generation>>,
+    /// How many history records the snapshot lookups have examined, for the
+    /// test that bounds the lookup's cost.
+    #[cfg(test)]
+    listed_probes: u64,
     /// How many retired mappings a later sighting showed the host had given to
     /// another file (see [`Self::forget_retired`]). Diagnostic only: it
     /// follows host state and never reaches the guest.
@@ -333,6 +337,8 @@ impl InodePool {
             retired_at: HashMap::new(),
             retirements: 0,
             generations: HashMap::new(),
+            #[cfg(test)]
+            listed_probes: 0,
             reused: 0,
         }
     }
@@ -571,14 +577,38 @@ impl InodePool {
         ordinal: u64,
     ) -> Option<DetInode> {
         let generations = self.generations.get_mut(&raw_inode)?;
-        let mut held_from = 0;
-        let index = generations.iter().position(|generation| {
-            let held = snapshot >= held_from;
-            held_from = generation.retired.map_or(u64::MAX, |retired| retired + 1);
-            held && generation
-                .retired
-                .is_some_and(|retired| snapshot <= retired)
-        })?;
+        // Holders are retired in order and the stamps only grow, and only the
+        // last can still hold the inode, so the stamps are sorted. A snapshot
+        // newer than the last retirement saw the current holder, the common
+        // case, answered without a search; an older one finds its holder by
+        // binary search: the first holder retired at or after the snapshot.
+        // The previous holder was retired before the snapshot, so this one
+        // held the inode then (codex re-check of
+        // <https://github.com/rrnewton/hermit/pull/3849>: a scan from the
+        // oldest made churn on one inode quadratic).
+        let last_retired = match generations.last()?.retired {
+            Some(retired) => Some(retired),
+            None => generations.iter().rev().nth(1).and_then(|g| g.retired),
+        };
+        if last_retired.is_none_or(|retired| snapshot > retired) {
+            return None;
+        }
+        #[cfg(test)]
+        let mut probes = 0;
+        let index = generations.partition_point(|generation| {
+            #[cfg(test)]
+            {
+                probes += 1;
+            }
+            generation.retired.is_some_and(|retired| retired < snapshot)
+        });
+        #[cfg(test)]
+        {
+            self.listed_probes += probes;
+        }
+        // The holder at the snapshot still holds the inode: the current file
+        // answers.
+        generations.get(index)?.retired?;
         let current = index + 1 == generations.len();
         let generation = &mut generations[index];
         if let Some(number) = generation.number {
@@ -8828,6 +8858,66 @@ mod tests {
         };
         assert_eq!(cached(f), cached(fresh));
         assert_eq!(cached(f).1, LogicalTime::from_nanos(2_000));
+    }
+
+    /// Ordinary churn reuses one host inode many times. A snapshot lookup
+    /// must not scan the inode's whole history (codex re-check of
+    /// https://github.com/rrnewton/hermit/pull/3849): a snapshot newer than
+    /// the last retirement is answered without examining any record, and an
+    /// older one examines about log2 of the history's length, while still
+    /// naming the file that held the inode when it was taken.
+    #[test]
+    fn a_snapshot_lookup_does_not_scan_the_inodes_history() {
+        use super::InodeSighting::Listed;
+        use super::InodeSighting::Name;
+        use crate::types::RawInode;
+
+        const GENERATIONS: usize = 4096;
+        let t = LogicalTime::from_nanos(0);
+        let seen = super::ObservedMtime::Unobserved;
+        let raw = RawInode::new(2049, 12);
+        let mut pool = super::InodePool::new();
+        // Each holder is numbered, seen in a snapshot, and retired; the next
+        // file the host gives the inode is opened by name.
+        let mut held = Vec::with_capacity(GENERATIONS);
+        for _ in 0..GENERATIONS {
+            pool.forget_retired(raw);
+            let number = pool.add_sighted_inode(raw, seen, t, Name).0;
+            held.push((pool.retirements, number));
+            pool.retire(raw);
+        }
+        // The current holder, numbered after the last retirement.
+        pool.forget_retired(raw);
+        let current = pool.add_sighted_inode(raw, seen, t, Name).0;
+
+        pool.listed_probes = 0;
+        for _ in 0..1000 {
+            let snapshot = pool.retirements;
+            assert_eq!(
+                pool.add_sighted_inode(raw, seen, t, Listed(snapshot)).0,
+                current
+            );
+        }
+        assert_eq!(
+            pool.listed_probes, 0,
+            "a current snapshot examined history records"
+        );
+
+        let bound = (GENERATIONS.ilog2() + 2) as u64;
+        for step in (0..GENERATIONS).step_by(37) {
+            let (snapshot, number) = held[step];
+            pool.listed_probes = 0;
+            assert_eq!(
+                pool.add_sighted_inode(raw, seen, t, Listed(snapshot)).0,
+                number,
+                "the snapshot taken while holder {step} held the inode"
+            );
+            assert!(
+                pool.listed_probes <= bound,
+                "holder {step}: {} probes for {GENERATIONS} generations",
+                pool.listed_probes
+            );
+        }
     }
 
     /// Retiring and discarding follow host state (a link count, whether the
