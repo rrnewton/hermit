@@ -1952,6 +1952,13 @@ pub struct ThreadState<T> {
     #[serde(skip)]
     pub(crate) restart_block: Option<crate::syscalls::helpers::RestartBlock>,
 
+    /// Whether this thread's process has a guest handler for SIGALRM, so that
+    /// signal phase 1's table (`sigalrm_phase1`) gates its syscalls. Set by the
+    /// runtime's handler admission (phase 1 step I3), in the same turn it
+    /// publishes the disposition to the scheduler's ledger; until then only
+    /// tests set it.
+    pub(crate) sigalrm_handled: bool,
+
     /// Per-thread checkpoints used to add only new work to the process totals.
     pub(crate) last_accounted_user_time: LogicalTime,
     pub(crate) last_accounted_system_time: LogicalTime,
@@ -2490,6 +2497,7 @@ impl<T> ThreadState<T> {
             parent_process_cpu_time: None,
             parent_cpu_publication: None,
             restart_block: None,
+            sigalrm_handled: false,
             last_accounted_user_time,
             last_accounted_system_time,
             thread_cpu_start_user_time: last_accounted_user_time,

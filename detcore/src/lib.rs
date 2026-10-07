@@ -63,6 +63,7 @@ mod record_or_replay;
 mod resources;
 mod scheduler;
 mod shared_open_files;
+mod sigalrm_phase1;
 mod sock_diag;
 mod stat;
 mod syscall_classification;
@@ -1808,6 +1809,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     },
                     // A new thread has made no syscall yet.
                     restart_block: None,
+                    // A fork child inherits its parent's signal dispositions.
+                    sigalrm_handled: pts.1.sigalrm_handled,
                     last_accounted_user_time,
                     last_accounted_system_time,
                     thread_cpu_start_user_time: last_accounted_user_time,
@@ -1973,6 +1976,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             result => result?,
         }
         guest.thread_state_mut().past_global_first_execve = true;
+        // exec resets a handled signal to its default action.
+        guest.thread_state_mut().sigalrm_handled = false;
         // Only a successful exec reaches this callback. Delete the old image's
         // POSIX timer IDs while exec still owns its scheduler turn; the global
         // notification below cancels their deadlines before the pre-handler
@@ -2302,7 +2307,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // Only an emulated RNG readv supplies authoritative imported geometry.
         // A generic pre-dispatch snapshot would become stale across pipe waits.
         let mut rng_readv_output = None;
+        // Signal phase 1: a process that handles SIGALRM runs only the calls
+        // its table places (`sigalrm_phase1`).
+        let sigalrm_refusal = if guest.thread_state().sigalrm_handled {
+            self.sigalrm_phase1_gate(guest, call)
+        } else {
+            None
+        };
         let res = match classify_syscall(call.number()) {
+            _ if sigalrm_refusal.is_some() => Err(sigalrm_refusal.expect("checked").into()),
             // Outbound TCP channels under a network trace mode; never with no mode.
             _ if self.network_trace_owns(guest, &call) => {
                 self.handle_network_trace_syscall(guest, call).await

@@ -656,6 +656,24 @@ pub(crate) struct ProcfsSnapshotContext {
 }
 
 impl ProcfsFile {
+    /// Whether taking this file's snapshot cannot wait interruptibly in the
+    /// kernel: signal phase 1 admits reads of these from a process that
+    /// handles SIGALRM (`sigalrm_phase1`). Exactly the kinds the phase's 6
+    /// target cells read after installing their handler; their capture takes
+    /// no interruptible lock (other kinds, such as the RTC files, do).
+    pub(crate) fn capture_cannot_wait(&self) -> bool {
+        matches!(
+            self.kind,
+            ProcfsKind::Uptime
+                | ProcfsKind::SystemStat
+                | ProcfsKind::InterruptCounters
+                | ProcfsKind::ProcessStat
+                | ProcfsKind::ProcessStatus
+                | ProcfsKind::SelfSchedstat
+                | ProcfsKind::BlockStat
+        )
+    }
+
     /// Recognizes procfs files that contain observed volatile fields.
     pub(crate) fn from_path(path: &Path) -> Option<Self> {
         let path = normalize_observed_path(path)?;

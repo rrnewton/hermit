@@ -289,6 +289,10 @@ struct OpenFileDescription {
     resource: Option<ResourceID>,
     /// Deterministic snapshot state for selected procfs files.
     procfs: Option<ProcfsFile>,
+    /// Signal phase 1's kernel account of the file, recorded at its open by a
+    /// process that handles SIGALRM (`sigalrm_phase1::kernel_provenance`).
+    #[serde(default)]
+    sigalrm_phase1: Option<crate::sigalrm_phase1::Phase1Provenance>,
     /// Sorted directory stream, created by the first `getdents` call that
     /// succeeds on this open file description.
     #[serde(default)]
@@ -419,6 +423,7 @@ impl DetFd {
                 random_device_offset: 0,
                 resource: None,
                 procfs: None,
+                sigalrm_phase1: None,
                 directory: None,
                 directory_host_order: false,
                 directory_lock: Default::default(),
@@ -659,6 +664,31 @@ impl DetFd {
             d.procfs
                 .as_ref()
                 .is_some_and(|procfs| procfs.needs_snapshot() || procfs.position().1.is_some())
+        })
+    }
+
+    /// Signal phase 1's kernel account of this file, if one was recorded.
+    pub(crate) fn sigalrm_phase1_provenance(
+        &self,
+    ) -> Option<crate::sigalrm_phase1::Phase1Provenance> {
+        self.with_description(|d| d.sigalrm_phase1)
+    }
+
+    /// Record signal phase 1's kernel account of this file.
+    pub(crate) fn set_sigalrm_phase1_provenance(
+        &self,
+        provenance: crate::sigalrm_phase1::Phase1Provenance,
+    ) {
+        self.with_description(|d| d.sigalrm_phase1 = Some(provenance));
+    }
+
+    /// Whether this procfs file's snapshot cannot wait to be taken
+    /// (`ProcfsFile::capture_cannot_wait`).
+    pub(crate) fn procfs_capture_cannot_wait(&self) -> bool {
+        self.with_description(|d| {
+            d.procfs
+                .as_ref()
+                .is_some_and(ProcfsFile::capture_cannot_wait)
         })
     }
 

@@ -136,11 +136,22 @@ impl Scheduler {
         if !self.holds_serial_grant(thread) {
             return true;
         }
+        if control == SigalrmControl::UnadmittedStdioIo {
+            if self.sigalrm_due(thread) {
+                self.record_sigalrm_loss(
+                    DetPid::from_raw(thread.as_raw()),
+                    thread,
+                    "a due SIGALRM found it entering I/O on inherited stdio that may sleep unadmitted",
+                );
+            }
+            return false;
+        }
         let refused = match control {
             SigalrmControl::SendTo(target) => {
                 self.sigalrm.handled.contains(&self.sigchld_process(target))
             }
             SigalrmControl::SendToUnnamed | SigalrmControl::ArmProducer => true,
+            SigalrmControl::UnadmittedStdioIo => unreachable!("answered above"),
             SigalrmControl::ArmRecurringTimer => {
                 self.sigalrm.handled.contains(&self.sigchld_process(thread))
             }

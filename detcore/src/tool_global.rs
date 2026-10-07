@@ -3765,13 +3765,19 @@ pub enum SigalrmControl {
     /// pidfd with no recorded target (`pidfd_open` records one).
     SendToUnnamed,
     /// An arming of a kernel producer of SIGALRM that Detcore does not
-    /// emulate through its alarm path: a POSIX timer, `F_SETSIG` or
-    /// `PR_SET_PDEATHSIG`. Recorded when allowed, so a later handler
-    /// installation can be refused.
+    /// emulate through its alarm path (a POSIX timer, `F_SETSIG` or
+    /// `PR_SET_PDEATHSIG`), or of a file lease, which makes another process's
+    /// open wait for the lease break with no scheduler admission. Recorded
+    /// when allowed, so a later handler installation can be refused.
     ArmProducer,
     /// An arming of a recurring `ITIMER_REAL` (nonzero interval), which phase 1
     /// does not model for a handling process.
     ArmRecurringTimer,
+    /// The caller, in a process that handles SIGALRM, is about to run
+    /// synchronous I/O on inherited stdio, which may sleep with no scheduler
+    /// admission. Never refused: a SIGALRM already due is recorded as a
+    /// determinism loss (design closure 1).
+    UnadmittedStdioIo,
 }
 
 /// Messages to the global object.
@@ -6571,6 +6577,106 @@ mod tests {
                 .all(|request| matches!(request, GlobalRequest::Sigalrm(_))),
             "{requests:?}"
         );
+    }
+
+    /// In a process that handles SIGALRM, signal phase 1's gate refuses what
+    /// its table does not place, with EOPNOTSUPP, and allows what it places,
+    /// with no RPC either way.
+    #[tokio::test]
+    async fn sigalrm_phase1_gate_refuses_unplaced_calls() {
+        use reverie::Tool;
+        use reverie::syscalls::Syscall;
+        use reverie::syscalls::SyscallArgs;
+        use reverie::syscalls::Sysno;
+
+        let (config, state, tid, pid) = cancellation_test_state();
+        install_test_registration(&state, tid, Ivar::new());
+        let tool: Detcore = Detcore::new(Tid::from_raw(tid.as_raw()), &config);
+        let mut thread = tool.init_thread_state(Tid::from_raw(tid.as_raw()), None);
+        thread.detpid = Some(pid);
+        thread.sigalrm_handled = true;
+        let guest = RetirementGuest {
+            global: &state,
+            config: &config,
+            thread,
+            requests: Mutex::new(Vec::new()),
+            retired: std::sync::atomic::AtomicBool::new(false),
+        };
+        let raw = |sysno, a0, a1| Syscall::from_raw(sysno, SyscallArgs::new(a0, a1, 0, 0, 0, 0));
+
+        for (sysno, a0, a1) in [
+            (Sysno::rt_sigsuspend, 0x1000, 8),
+            (Sysno::signalfd4, usize::MAX, 0x1000),
+            (Sysno::epoll_pwait2, 3, 0),
+            (Sysno::nanosleep, 0x1000, 0),
+            (Sysno::fcntl, 3, libc::F_SETLKW as usize),
+            (Sysno::execve, 0x1000, 0),
+            // stdin, and a descriptor Detcore does not model.
+            (Sysno::read, 0, 0x1000),
+            (Sysno::read, 77, 0x1000),
+            // stderr, which may be a socket Detcore labels Regular.
+            (Sysno::close, 2, 0),
+            // No ioctl is placed.
+            (Sysno::ioctl, 1, libc::TCGETS as usize),
+        ] {
+            assert_eq!(
+                tool.sigalrm_phase1_gate(&guest, raw(sysno, a0, a1)),
+                Some(nix::errno::Errno::EOPNOTSUPP),
+                "{sysno}"
+            );
+        }
+        for (sysno, a0, a1) in [(Sysno::getpid, 0, 0), (Sysno::write, 1, 0x1000)] {
+            assert_eq!(
+                tool.sigalrm_phase1_gate(&guest, raw(sysno, a0, a1)),
+                None,
+                "{sysno}"
+            );
+        }
+        assert!(guest.requests.lock().unwrap().is_empty(), "no RPC");
+    }
+
+    /// While any process handles SIGALRM, a file lease is refused before the
+    /// kernel: its break would make another process's open wait with no
+    /// scheduler admission. Releasing a lease is not refused.
+    #[tokio::test]
+    async fn a_file_lease_is_refused_while_a_guest_handles_sigalrm() {
+        use reverie::Tool;
+        use reverie::syscalls;
+        use reverie::syscalls::FcntlCmd;
+
+        let (config, state, tid, pid) = cancellation_test_state();
+        install_test_registration(&state, tid, Ivar::new());
+        {
+            let mut sched = state.sched.lock().unwrap();
+            sched.set_sigalrm_handled(DetPid::from_raw(99), true);
+            sched.set_running_for_test(tid);
+        }
+        let tool: Detcore = Detcore::new(Tid::from_raw(tid.as_raw()), &config);
+        let mut thread = tool.init_thread_state(Tid::from_raw(tid.as_raw()), None);
+        thread.detpid = Some(pid);
+        let mut guest = RetirementGuest {
+            global: &state,
+            config: &config,
+            thread,
+            requests: Mutex::new(Vec::new()),
+            retired: std::sync::atomic::AtomicBool::new(false),
+        };
+        for lease in [libc::F_RDLCK, libc::F_WRLCK] {
+            let fcntl = syscalls::Fcntl::new()
+                .with_fd(3)
+                .with_cmd(FcntlCmd::F_SETLEASE(lease));
+            let result = tool.handle_fcntl(&mut guest, fcntl).await;
+            assert!(
+                matches!(result, Err(reverie::Error::Errno(errno)) if errno == reverie::Errno::EPERM),
+                "{lease}: {result:?}"
+            );
+        }
+        let requests = guest.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| matches!(
+            request,
+            GlobalRequest::Sigalrm(super::SigalrmControl::ArmProducer)
+        )));
     }
 
     #[tokio::test]

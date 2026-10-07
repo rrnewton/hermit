@@ -1325,7 +1325,19 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// `fstatat(dirfd, path, AT_SYMLINK_NOFOLLOW)` for a path the guest named
-    /// in a call that has not run yet and must still read `inputs`, its paths.
+    /// in a call that has not run yet and must still read `inputs`, its paths
+    /// ([`Detcore::inject_statat`]).
+    async fn inject_lstatat<G: Guest<Self>>(
+        guest: &mut G,
+        dirfd: RawFd,
+        path: syscalls::PathPtr<'_>,
+        inputs: [Option<syscalls::PathPtr<'_>>; 2],
+    ) -> Result<libc::stat, Errno> {
+        Self::inject_statat(guest, dirfd, path, inputs, AtFlags::AT_SYMLINK_NOFOLLOW).await
+    }
+
+    /// `fstatat(dirfd, path, flags)` for a path the guest named in a call that
+    /// has not run yet and must still read `inputs`, its paths.
     ///
     /// The buffer is staged as the utimensat target lookup stages its own: in
     /// the guest stack scratch, below the red zone, where a raw syscall may
@@ -1334,11 +1346,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// lookup, so that the call reads its inputs unchanged (claude review of
     /// <https://github.com/rrnewton/hermit/pull/3849>, P3-2). Otherwise it is
     /// a transient private page, unmapped before the guest resumes.
-    async fn inject_lstatat<G: Guest<Self>>(
+    pub(crate) async fn inject_statat<G: Guest<Self>>(
         guest: &mut G,
         dirfd: RawFd,
         path: syscalls::PathPtr<'_>,
         inputs: [Option<syscalls::PathPtr<'_>>; 2],
+        flags: AtFlags,
     ) -> Result<libc::stat, Errno> {
         let lstatat = move |statptr: StatPtr<'_>| {
             Syscall::Newfstatat(
@@ -1346,7 +1359,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .with_dirfd(dirfd)
                     .with_path(Some(path))
                     .with_stat(Some(statptr))
-                    .with_flags(AtFlags::AT_SYMLINK_NOFOLLOW),
+                    .with_flags(flags),
             )
         };
         // The scratch starts 128 bytes below the stack pointer, at addresses
@@ -1745,6 +1758,26 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Ask for permission to resolve this path into a file:
         let request = guest.thread_state().mk_request(resource, Permission::R);
         resource_request(guest, request).await;
+        // Signal phase 1 (`sigalrm_phase1`): in a process that handles SIGALRM,
+        // an open that may wait (a FIFO, a character or block device) is
+        // refused. Checked after the grant: no other guest runs before the open.
+        if guest.thread_state().sigalrm_handled
+            && !call.flags().intersects(OFlag::O_DIRECTORY | OFlag::O_PATH)
+            && let Some(path) = call.path()
+            && crate::sigalrm_phase1::open_refused(
+                Self::inject_statat(
+                    guest,
+                    call.dirfd(),
+                    path,
+                    [Some(path), None],
+                    AtFlags::empty(),
+                )
+                .await,
+                call.flags().contains(OFlag::O_NONBLOCK),
+            )
+        {
+            return Err(Errno::EOPNOTSUPP.into());
+        }
         let res = self.record_or_replay(guest, Syscall::Openat(call)).await;
 
         match res {
@@ -1925,10 +1958,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .expect("timer-slack classification disappeared")
                         .bind_timer_slack_identity(identity.0, identity.1);
                 }
+                // Signal phase 1: what the kernel says this file is, for the
+                // table's descriptor rules (`sigalrm_phase1`).
+                let provenance = guest
+                    .thread_state()
+                    .sigalrm_handled
+                    .then(|| crate::sigalrm_phase1::kernel_provenance(guest.pid().as_raw(), fd));
                 guest.thread_state().with_detfd(fd, |detfd| {
                     detfd.set_path(&observed_path);
                     if let Some(procfs) = procfs.clone() {
                         detfd.set_procfs(procfs);
+                    }
+                    if let Some(provenance) = provenance {
+                        detfd.set_sigalrm_phase1_provenance(provenance);
                     }
                 })?;
                 resource_release_all(guest).await;
@@ -3332,6 +3374,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         if let Some(resource) = resource {
+            let container_output = crate::sigalrm_phase1::is_container_output(&resource);
             let mut request = guest.thread_state().mk_request(resource, Permission::W);
             if should_tag_host_timed_internal_pipe_io(
                 guest.config().backend.internal_pipe_turns_are_host_timed,
@@ -3342,6 +3385,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 request.fyi(HOST_TIMED_INTERNAL_PIPE_IO_FYI);
             }
             resource_request(guest, request).await;
+            // Signal phase 1, design closure 1: a write to inherited stdout or
+            // stderr may sleep with no scheduler admission. Once the grant is
+            // taken no SIGALRM commits until this call ends, so one already due
+            // is the only one it can strand: recorded as a determinism loss.
+            if guest.thread_state().sigalrm_handled && container_output {
+                sigalrm_refuses(guest, SigalrmControl::UnadmittedStdioIo).await;
+            }
         }
 
         // Only route writes through the nonblockable-fd path when the fd is actually
@@ -4232,6 +4282,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         // forget them (`Scheduler::record_host_timed_signals`).
         let signals = fcntl_host_timed_signals(call.cmd());
         if signals & kernel_sigset_bit(libc::SIGALRM) != 0 {
+            refuse_sigalrm(guest, SigalrmControl::ArmProducer).await?;
+        }
+        // A lease makes another process's open of the file wait for the
+        // lease break, interruptibly, with no scheduler admission.
+        if matches!(call.cmd(), F_SETLEASE(lease) if lease != libc::F_UNLCK) {
             refuse_sigalrm(guest, SigalrmControl::ArmProducer).await?;
         }
         if signals != 0
