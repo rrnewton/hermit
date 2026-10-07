@@ -65,6 +65,7 @@ static USERFAULTFD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static EXIT_REAPING_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static UNSCHEDULED_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DUP_ALIAS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static CLOSE_RANGE_PORT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_COMPAT_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_SEMANTIC_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_COMPRESSED_FIXTURES: OnceLock<[PathBuf; 2]> = OnceLock::new();
@@ -1662,6 +1663,42 @@ fn liteinst_in_guest_dup_aliases_share_one_cursor_after_fork() {
             stdout.contains("aliases continue one stream=1"),
             "{backend}: {stdout}"
         );
+        outputs.push(stdout);
+    }
+    assert_eq!(
+        outputs[0], outputs[1],
+        "in-guest LiteInst differs from ptrace"
+    );
+}
+
+/// close_range(3, ~0U, 0) closes a bound socket, and Detcore must account
+/// for it like a close: the socket's port goes back to the allocator, so the
+/// next bind to port 0 gets the same port. Under in-guest LiteInst the range
+/// also covers the runtime's coordinator connection, and the runtime once
+/// answered such a call itself, before Detcore saw it: the port was never
+/// released and the second bind got the next port. Both backends must reuse
+/// the port and print the same output.
+#[test]
+fn liteinst_in_guest_close_range_releases_ports_like_ptrace() {
+    let _guard = hermit_run_guard();
+    let guest = c_guest(&CLOSE_RANGE_PORT_GUEST, "close_range_releases_port");
+    let mut outputs = Vec::new();
+    for backend in ["ptrace", "liteinst"] {
+        let mut command = Command::new(hermit_binary());
+        command.args(["--log=info", "--backend", backend, "run"]);
+        if backend == "liteinst" {
+            command.arg("--max-timeslice=disabled");
+        }
+        let output = command
+            .arg(format!("--epoch={VIRTUAL_TIME_EPOCH}"))
+            .args(["--strict", "--"])
+            .arg(guest)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run Hermit");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(output.status.success(), "{backend}: {output:?}");
+        assert_eq!(stdout, "port reused=1\n", "{backend}: {output:?}");
         outputs.push(stdout);
     }
     assert_eq!(

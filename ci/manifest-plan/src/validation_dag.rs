@@ -239,6 +239,7 @@ pub const HOSTED_PORTABLE_EXCLUDED_BACKENDS: &[&str] = &["kvm"];
 pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_backend_stats_report_the_guests_own_dispatch_paths",
     "liteinst_in_guest_programs::liteinst_in_guest_abnormal_exit_after_registration_does_not_hang",
+    "liteinst_in_guest_programs::liteinst_in_guest_close_range_releases_ports_like_ptrace",
     "liteinst_in_guest_programs::liteinst_in_guest_cpuid_in_a_late_loaded_library_runs",
     "liteinst_in_guest_programs::liteinst_in_guest_detcore_micro_suite",
     "liteinst_in_guest_programs::liteinst_in_guest_dispatch_record_reports_patched_sites",
