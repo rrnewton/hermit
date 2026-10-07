@@ -192,7 +192,26 @@ impl RecordVersion {
 // inode columns over the recorded raw bytes, during recording and again during
 // replay. An older recording replayed under the new numbering could show the
 // guest different bytes, although no event shape changed.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x123);
+// 0x123 -> 0x124: inode names that Detcore recomputes over the recorded procfs
+// bytes and readlink targets changed value, with no change of event shape.
+// A /proc/*/maps line is keyed on the identity stat reports for its file (it
+// was keyed on the header's device and inode, which differ from stat's on
+// btrfs and overlayfs). The ino: line of /proc/*/fdinfo/<fd> is keyed on the descriptor's device and
+// inode, except that a pipe or socket is keyed on its inode alone, on device
+// 0, when metadata is not virtualized -- always the case for record and
+// replay. A pipe or socket link, /proc/<pid>/fd/<fd>, is keyed on the inode its
+// target names, on device 0 (it was keyed on the probed pipefs or sockfs
+// device). When stdio descriptors alias one object, the lowest matching
+// descriptor's stdio inode now wins instead of the last: another process's
+// link to an inherited stdin pipe, and a maps line naming the stdin file, read
+// 1000 where they read 1002. A guest can branch on any of these bytes, so
+// replaying an older stream under the new names could change its control flow
+// and event consumption. A recording made at 0x123 still carries the old
+// names, so this change needs its own version even though 0x123 is recent.
+// The device-and-inode keys of maps lines, fdinfo and getdents first changed
+// within 0x121, in 0baaaaac239c, which raised no version; recordings made
+// before that commit carry 0x121 or lower and are refused already.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x124);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -217,7 +236,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x123);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x123;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x124;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -445,6 +464,10 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         backend: <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities(),
         backend_supports_blocked_wait_signal_interruption: false,
         guest_may_inherit_a_terminal: false,
+        anonymous_object_devices: None,
+        exit_process_on_identity_lookup_refusal: false,
+        // The tracer's own reads take tracer descriptors.
+        tool_opens_outside_guest_descriptor_table: true,
         has_uts_namespace: true,
         // The path to the directory where syscalls will be recorded.
         replay_data: Some(data.to_path_buf()),
@@ -683,6 +706,16 @@ mod tests {
     #[test]
     fn record_version_rejects_pre_request_ordinal_inode_streams() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x122)));
+    }
+
+    /// A 0x123 recording's procfs inode numbers were keyed on each maps
+    /// header's own device and inode, and its pipe and socket links on the
+    /// probed pipefs or sockfs device. Replay re-renders them from the
+    /// recorded raw bytes under the current keys, so the version gate must
+    /// refuse the recording rather than show its guest other numbers.
+    #[test]
+    fn record_version_rejects_pre_raw_identity_inode_streams() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x123)));
     }
 
     #[test]
