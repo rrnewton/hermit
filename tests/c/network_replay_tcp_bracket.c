@@ -101,6 +101,24 @@
 #define PAYLOAD_SIZE 3
 #define FIXTURE_DEADLINE_SECONDS 8
 #define CONTROLLER_ACCEPT_DEADLINE_SECONDS 30
+/*
+ * The client's own bounds: how long it waits for the peer, and its alarm.
+ * Under Hermit they count the guest's virtual time, not wall time. While a
+ * recorded send or poll waits for the real peer, each retry advances virtual
+ * time by a fixed amount however little wall time it took, so virtual time
+ * runs ahead of the wall clock in proportion to how long the host keeps the
+ * peer from answering: in one failed run, 8 virtual seconds passed in about
+ * one wall second, and a peer delayed by host load turned into a client
+ * timeout or into a SIGALRM that record refuses. These bounds therefore lie
+ * far beyond any virtual time a run can reach within the wall-clock bounds,
+ * which stay where wall time is measured: the controllers'
+ * alarm(FIXTURE_DEADLINE_SECONDS) and socket timeouts, and the tests' own
+ * process timeouts. The alarm still ends a client stuck on itself at once:
+ * when every guest thread is blocked, Hermit advances virtual time straight
+ * to the next timer.
+ */
+#define CLIENT_PEER_WAIT_SECONDS 3600
+#define CLIENT_DEADLINE_SECONDS (2 * CLIENT_PEER_WAIT_SECONDS)
 #define ADDRESS_LENGTH_SENTINEL 123
 /* Above FD_SETSIZE, so only a raw select bitmap can name it. */
 #define HIGH_ALIAS_FD 1100
@@ -129,7 +147,7 @@ static void fail_message(const char *message) {
 
 static void set_deadline(void) {
   signal(SIGPIPE, SIG_IGN);
-  alarm(FIXTURE_DEADLINE_SECONDS);
+  alarm(CLIENT_DEADLINE_SECONDS);
 }
 
 static void set_socket_timeouts(int fd) {
@@ -312,7 +330,7 @@ static void *run_reader(void *raw) {
   struct pollfd interest = {.fd = reader->fd, .events = POLLIN};
   int ready;
   do {
-    ready = poll(&interest, 1, 5000);
+    ready = poll(&interest, 1, CLIENT_PEER_WAIT_SECONDS * 1000);
   } while (ready < 0 && errno == EINTR);
   if (ready < 0) {
     reader->error = errno;
@@ -831,15 +849,15 @@ static int run_select_client(const char *port_text) {
   FD_ZERO(&readable);
   FD_SET(socket_fd, &readable);
   FD_SET(pipe_fds[0], &readable);
-  struct timeval wait = {.tv_sec = 5, .tv_usec = 0};
+  struct timeval wait = {.tv_sec = CLIENT_PEER_WAIT_SECONDS, .tv_usec = 0};
   ready = select(nfds, &readable, NULL, NULL, &wait);
   FD_ZERO(&expected);
   FD_SET(socket_fd, &expected);
   if (ready != 1)
     fail_message("select did not report the first input");
   expect_set(nfds, &readable, &expected, "first-input select");
-  if (wait.tv_sec < 0 || wait.tv_sec > 5 || wait.tv_usec < 0 || wait.tv_usec >= 1000000 ||
-      (wait.tv_sec == 5 && wait.tv_usec != 0))
+  if (wait.tv_sec < 0 || wait.tv_sec > CLIENT_PEER_WAIT_SECONDS || wait.tv_usec < 0 ||
+      wait.tv_usec >= 1000000 || (wait.tv_sec == CLIENT_PEER_WAIT_SECONDS && wait.tv_usec != 0))
     fail_message("select reported an impossible remaining time");
 
   /* With the socket readable and writable and a byte in the pipe, each set
@@ -876,7 +894,7 @@ static int run_select_client(const char *port_text) {
    * kernel's remaining time from its caller; pass the wrapper directly. */
   FD_ZERO(&readable);
   FD_SET(socket_fd, &readable);
-  struct timespec long_wait = {.tv_sec = 5, .tv_nsec = 0};
+  struct timespec long_wait = {.tv_sec = CLIENT_PEER_WAIT_SECONDS, .tv_nsec = 0};
   struct {
     const sigset_t *mask;
     size_t size;
@@ -885,8 +903,8 @@ static int run_select_client(const char *port_text) {
   if (ready != 1)
     fail_message("pselect6 did not report the second input");
   expect_set(nfds, &readable, &expected, "second-input pselect6");
-  if (long_wait.tv_sec < 0 || long_wait.tv_sec > 4 || long_wait.tv_nsec < 0 ||
-      long_wait.tv_nsec >= 1000000000)
+  if (long_wait.tv_sec < 0 || long_wait.tv_sec > CLIENT_PEER_WAIT_SECONDS - 1 ||
+      long_wait.tv_nsec < 0 || long_wait.tv_nsec >= 1000000000)
     fail_message("pselect6 did not report a remaining time below its timeout");
   char second[PAYLOAD_SIZE];
   receive_exact(socket_fd, second, sizeof(second));
