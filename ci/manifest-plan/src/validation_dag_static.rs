@@ -826,7 +826,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // validation_dag::tests: 2) retain all 991: 1002, listed with cargo nextest
     // list --profile ci and this node's arguments.
     // detcore-model's
-    // config::tests::seccomp_filter_inherited_is_written_when_set_and_reads_back
+    // config::tests::seccomp_may_refuse_entry_lookup_syscalls_is_written_when_set_and_reads_back
     // (the same pull request) retains all 1002: 1003, listed the same way.
     ("test.regular_crates", 1003),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
@@ -1365,7 +1365,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // dirents::test: 2) retain all 1076: 1183, listed the same way.
     // tool_global::tests::a_non_utf8_maps_snapshot_still_consumes_one_number_per_backed_line
     // (the same pull request) retains all 1183: 1184, listed the same way.
-    // syscalls::files::inject_fstat_scratch::getdents_under_an_inherited_seccomp_filter_injects_no_fstatfs
+    // syscalls::files::inject_fstat_scratch::getdents_where_seccomp_may_refuse_the_lookup_injects_no_fstatfs
     // (the same pull request) retains all 1184: 1185, listed the same way.
     // syscalls::files::inject_fstat_scratch::getdents_keys_an_overlay_entry_alike_whatever_was_read_before
     // (the same pull request) retains all 1185: 1186, listed the same way.
