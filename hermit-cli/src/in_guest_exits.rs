@@ -172,27 +172,40 @@ impl ConnectionAdmission for InGuestExitAdmission {
     fn admit(&self, peer: OwnedFd) -> io::Result<Admitted> {
         let admitted = self.admit_and_watch(peer);
         if let Err(error) = &admitted {
-            let diagnostic = format!("in-guest LiteInst refused a guest connection: {error}");
-            eprintln!("hermit: {diagnostic}");
-            record_failure(&self.outcome, diagnostic);
-            if let Some(Ok(Started { watching, .. })) = self.started.lock().unwrap().as_ref() {
-                watching.reporter.backend_failed(reverie::BackendFailure {
-                    pid: reverie::Pid::from_raw(0),
-                    tid: reverie::Tid::from_raw(0),
-                    phase: ADMISSION_PHASE,
-                });
-                if let Err(error) = watching.watch.fail_and_kill_all() {
-                    eprintln!(
-                        "hermit: in-guest LiteInst could not kill every guest after that failure: {error}"
-                    );
-                }
-            }
+            self.fail_admission(error);
         }
         admitted
+    }
+
+    /// The server could not even offer the connection for admission (its
+    /// peer pidfd could not be obtained). That is a refused connection too.
+    fn admission_failed(&self, error: &io::Error) {
+        self.fail_admission(error);
     }
 }
 
 impl InGuestExitAdmission {
+    /// Fails the run for a refused connection: the named diagnostic, the
+    /// persistent run failure, Detcore's `backend_failed`, and `SIGKILL` to
+    /// every watched guest.
+    fn fail_admission(&self, error: &io::Error) {
+        let diagnostic = format!("in-guest LiteInst refused a guest connection: {error}");
+        eprintln!("hermit: {diagnostic}");
+        record_failure(&self.outcome, diagnostic);
+        if let Some(Ok(Started { watching, .. })) = self.started.lock().unwrap().as_ref() {
+            watching.reporter.backend_failed(reverie::BackendFailure {
+                pid: reverie::Pid::from_raw(0),
+                tid: reverie::Tid::from_raw(0),
+                phase: ADMISSION_PHASE,
+            });
+            if let Err(error) = watching.watch.fail_and_kill_all() {
+                eprintln!(
+                    "hermit: in-guest LiteInst could not kill every guest after that failure: {error}"
+                );
+            }
+        }
+    }
+
     fn admit_and_watch(&self, peer: OwnedFd) -> io::Result<Admitted> {
         let process_id = guest_visible_pid(&peer)?;
         let proc_dir = open_proc_dir(&peer)?;
@@ -568,6 +581,25 @@ mod tests {
         let admission = InGuestExitAdmission::default();
         let me = pidfd_open(std::process::id());
         assert!(admission.admit(me).is_err());
+    }
+
+    /// A connection the server could not offer for admission (its peer pidfd
+    /// could not be obtained) fails the run like a refused one (Codex
+    /// verification of 823ae24c, HIGH).
+    #[tokio::test]
+    async fn a_connection_without_a_peer_pidfd_fails_the_run_at_once() {
+        let tool = Arc::new(FakeTool::default());
+        let admission = admission(PRODUCTION, &tool);
+        admission.admission_failed(&io::Error::from_raw_os_error(libc::EMFILE));
+        assert_eq!(*tool.failures.lock().unwrap(), [(0, ADMISSION_PHASE)]);
+        let failure = admission
+            .failure()
+            .expect("an unadmittable connection is a run failure");
+        assert!(
+            failure.starts_with("in-guest LiteInst refused a guest connection:"),
+            "{failure}"
+        );
+        admission.drain(Duration::from_secs(30)).await.unwrap();
     }
 
     #[tokio::test]

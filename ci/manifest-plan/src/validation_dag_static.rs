@@ -1032,7 +1032,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // metadata::tests::record_version_rejects_pre_request_ordinal_inode_streams
     // and replay::tests::replay_refuses_a_recording_from_before_inode_request_ordinals
     // (https://github.com/rrnewton/hermit/issues/2897) retain all 923: 925.
-    ("test.hermit_unit", 925),
+    // Re-listed with the admission-failed hook test: 926.
+    ("test.hermit_unit", 926),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1723,7 +1724,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same two auto-reap tests: 920.
     // The host twin selects the same three tests: 923.
     // And the same two record-version tests (925).
-    ("test.hermit_unit_on_host", 925),
+    // The host twin selects the same tests: 926.
+    ("test.hermit_unit_on_host", 926),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
