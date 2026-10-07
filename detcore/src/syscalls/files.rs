@@ -8288,17 +8288,22 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///   Detcore sees any result.
     ///
     /// The last two would make a listing signal or kill a program that runs
-    /// natively, so the `fstatfs` is injected only where no such filter can
-    /// apply: Detcore refuses a guest's own filter, and the launcher sets
-    /// [`crate::Config::seccomp_may_refuse_entry_lookup_syscalls`] whenever any thread of the
-    /// process that starts the guest runs under one (or it cannot tell), since
-    /// a filter is inherited by every guest that thread starts. Then every entry is asked, no `fstatfs` is injected,
-    /// and nothing is cached. The backend's own filter, such as the ptrace
-    /// backend's, lets Detcore's injections through. The `fstatat` of each
-    /// asked entry and the `fstat` of a directory Detcore does not track
-    /// (see [`Self::directory_device`]) are injected regardless, and a filter
-    /// that traps or kills those still signals or kills the guest; Detcore
-    /// injects both numbers for other guest calls too.
+    /// natively. So the `fstatfs`, and on an overlay the `mmap`, `statx` and
+    /// `munmap` with which [`Self::entry_is_on_the_listed_mount`] asks whether
+    /// an entry is a mount root, are injected only where the launcher found
+    /// that no filter may refuse them: Detcore refuses a guest's own filter,
+    /// and the launcher sets
+    /// [`crate::Config::seccomp_may_refuse_entry_lookup_syscalls`] when a
+    /// filter of the process that starts the guest, which every guest it
+    /// starts inherits, may refuse one of those calls, or when it cannot tell
+    /// (that field says how it asks, and what its answer cannot show). Then
+    /// every entry is asked, none of those calls is injected, and nothing is
+    /// cached. The backend's own filter, such as the ptrace backend's, lets
+    /// Detcore's injections through. The `fstatat` of each asked entry and the
+    /// `fstat` of a directory Detcore does not track (see
+    /// [`Self::directory_device`]) are injected regardless, and a filter that
+    /// traps or kills those still signals or kills the guest; Detcore injects
+    /// both numbers for other guest calls too.
     ///
     /// The getdents handlers call this before the real call, after
     /// [`Self::directory_device`].
@@ -14707,7 +14712,8 @@ pub(crate) mod inject_fstat_scratch {
     // `fstatfs` (`SECCOMP_RET_TRAP`): the ptrace backend then reports
     // `ENOSYS` and requeues the `SIGSYS`, which reaches the guest for a call
     // it never made. With `seccomp_may_refuse_entry_lookup_syscalls` set, which the launcher
-    // sets whenever it runs under a filter, no `fstatfs` is injected, so the
+    // sets when a filter it runs under may refuse the call (or it cannot
+    // tell), no `fstatfs` is injected, so the
     // guest gets no `SIGSYS`; every entry is asked and keyed exactly as when
     // the type is unknown, and nothing is remembered. Both getdents paths,
     // two reads each.

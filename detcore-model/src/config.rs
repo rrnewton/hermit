@@ -140,12 +140,31 @@ pub struct Config {
     /// or sandbox the launcher ran under) may trap, kill, fail, trace or notify on one of them,
     /// for a call the program never made. When true Detcore makes none of them and asks every
     /// entry, as when the filesystem type is unknown. False, the default, means they succeed.
-    /// The launcher sets it when the `Seccomp:` line of any of its threads'
-    /// `/proc/self/task/<tid>/status` is not 0 (a filter belongs to the thread that installed it
-    /// unless synchronized, and any thread may start the guest), read before any guest exists,
-    /// and whenever it cannot tell; Detcore never infers it. A caller whose command installs a
-    /// filter in the child itself (a `pre_exec` callback) sets it, and the launcher never clears
-    /// a true.
+    ///
+    /// The launcher sets it before any guest exists, and Detcore never infers it. False when
+    /// none of the launcher's threads (`/proc/self/task/<tid>/status`) runs under seccomp. True
+    /// when some thread's `Seccomp:` mode and `Seccomp_filters:` count differ from those of the
+    /// thread preparing the run (a filter belongs to the thread that installed it unless
+    /// synchronized, and any thread may start the guest), when the kernel prints no filter
+    /// count (before Linux 5.9), and whenever it cannot tell. Otherwise, every thread filtered
+    /// alike, a child forked from the preparing thread, which inherits its filters, makes these
+    /// calls with Detcore's arguments on a descriptor of `/`, and the flag is false only when
+    /// that child exits normally with status 0. A caller whose command installs a filter in the
+    /// child itself (a `pre_exec` callback) sets it, as record mode does, and the launcher
+    /// never clears a true. `hermit run --backend=dbt` prepares its configuration without
+    /// asking, so there it holds only what the caller set.
+    ///
+    /// What that child cannot show, so a false may still meet a refusal: a filter that decides
+    /// on a call's arguments (the descriptor, a path or buffer address, the flags) or on the
+    /// calling instruction, since the child makes each call once, on `/`, from Hermit's code; a
+    /// `SECCOMP_RET_USER_NOTIF` or `SECCOMP_RET_TRACE` supervisor that answers the child and a
+    /// guest differently, or never answers (the launcher then waits for the child); the audit
+    /// record a `SECCOMP_RET_LOG` filter writes for each call, the child's and the guest's; two
+    /// threads whose filter counts are equal but whose filters differ; a filter a caller's
+    /// `pre_exec` installs, which the caller reports as above; and a filter installed after the
+    /// launcher asked. Made under every filter whatever this holds: the `lstat` of each entry
+    /// asked, the `fstat` of a directory Detcore does not track, and the `statx` and
+    /// `statmount` with which a `/proc/<pid>/maps` rewrite proves a superblock.
     #[serde(default)]
     #[clap(skip)]
     pub seccomp_may_refuse_entry_lookup_syscalls: bool,
@@ -1608,8 +1627,9 @@ impl Default for Config {
 /// [`Config::seccomp_may_refuse_entry_lookup_syscalls`] came after the bytes this form
 /// preserves. DBT's launcher leaves the first three at their serde defaults
 /// (`None`, `false` and `false`), and the fourth at its default, `false`,
-/// unless the launcher itself runs under a seccomp filter, which the guest
-/// then inherits. Each is left out while it holds that default, so a
+/// unless a library run entry point finds that a seccomp filter the guest
+/// inherits from the launcher may refuse one of those calls (`hermit run
+/// --backend=dbt` does not ask). Each is left out while it holds that default, so a
 /// configuration that does not use it encodes to the earlier bytes, and is
 /// written at its usual position, exactly as `serde_json::to_string(config)`
 /// writes it, when it does not; [`from_legacy_backend_json`] reads an absent
@@ -1964,8 +1984,8 @@ mod legacy_backend_json {
     /// The fields `Config` gained after the bytes the legacy form preserves,
     /// each with a test of whether a configuration holds the field's serde
     /// default. DBT's launcher leaves each at that default, except
-    /// `seccomp_may_refuse_entry_lookup_syscalls` when the launcher runs under a seccomp
-    /// filter.
+    /// `seccomp_may_refuse_entry_lookup_syscalls` when a library run entry point finds that
+    /// a seccomp filter the guest inherits may refuse a lookup call.
     ///
     /// The encoder leaves such a field out while it holds its default, so a
     /// configuration that does not use it still encodes to the earlier bytes,

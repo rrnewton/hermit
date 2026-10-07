@@ -3699,88 +3699,329 @@ fn prepare_run_config(config: DetConfig, backend: Backend) -> DetConfig {
     let mut config = prepare_backend_config(config, backend);
     // A seccomp filter is inherited across fork and exec and can never be
     // removed, so a filter on the thread that starts a guest is on that guest,
-    // on every backend, before any guest exists to install one of its own.
-    config.seccomp_may_refuse_entry_lookup_syscalls =
-        config.seccomp_may_refuse_entry_lookup_syscalls || launcher_inherits_a_seccomp_filter();
+    // on every backend, before any guest exists to install one of its own. A
+    // caller's true is kept without asking: record mode sets it, and so does a
+    // caller whose command installs a filter in the child, which nothing here
+    // can see.
+    if !config.seccomp_may_refuse_entry_lookup_syscalls {
+        config.seccomp_may_refuse_entry_lookup_syscalls =
+            seccomp_may_refuse_entry_lookup_syscalls();
+    }
     config
 }
 
-/// Whether any thread of this process runs under a seccomp filter, read from
-/// the `Seccomp:` line of each `/proc/self/task/<tid>/status`.
+/// Whether a seccomp filter that a guest of this process inherits may refuse
+/// a system call Detcore injects while listing a directory, the launcher's
+/// answer for [`DetConfig::seccomp_may_refuse_entry_lookup_syscalls`].
 ///
-/// Every thread is read, not `/proc/self/status`, which shows the thread
-/// group leader's: a filter belongs to the thread that installed it and to
-/// the threads it creates afterwards, unless installed with
-/// `SECCOMP_FILTER_FLAG_TSYNC`, and the thread that forks a guest (a runtime
-/// worker, or a caller's own thread that called [`run`]) need not be the
-/// leader. A thread that exits while the list is read is skipped; any other
-/// failure to read counts as a filter: the answer only lets Detcore skip a
-/// probe it could otherwise make, so not knowing must mean not probing.
+/// 1. Every thread's `/proc/self/task/<tid>/status` is read, not only
+///    `/proc/self/status`, which shows the thread group leader's: a filter
+///    belongs to the thread that installed it and to the threads it creates
+///    afterwards, unless installed with `SECCOMP_FILTER_FLAG_TSYNC`, and the
+///    thread that forks a guest (a runtime worker, or a caller's own thread
+///    that called [`run`]) need not be the leader or this thread. No thread
+///    under seccomp: false, and nothing is forked.
+/// 2. Some thread is under seccomp: each thread's `Seccomp:` mode and
+///    `Seccomp_filters:` count must equal this thread's
+///    (`/proc/thread-self/status`), with mode 2 (filter). Any other state
+///    (a thread filtered unlike this one, strict mode, a kernel before Linux
+///    5.9, which prints no filter count) answers true, and nothing is forked.
+/// 3. Otherwise a child forked from this thread, which inherits exactly this
+///    thread's filters, makes the calls themselves
+///    ([`entry_lookup_probe_child`]); false only when it exits normally with
+///    status 0. A child that a filter killed or trapped, a call that failed,
+///    a fork that failed, and a child that cannot be waited for all answer
+///    true.
 ///
-/// What this cannot see: a filter a thread installs after this is read, and
-/// one a caller's `Command` installs in the child itself (a `pre_exec`
-/// callback, or a seccomp filter set on the command where the backend keeps
-/// it). A caller that does either sets
-/// [`DetConfig::seccomp_may_refuse_entry_lookup_syscalls`] itself; a true there is never
-/// cleared.
-fn launcher_inherits_a_seccomp_filter() -> bool {
-    seccomp_filter_in_any_task(Path::new("/proc/self/task"))
+/// A thread that exits while its status is listed is skipped; any other
+/// failure to read answers true: the answer only lets Detcore make calls it
+/// could otherwise do without, so not knowing must mean not making them. What
+/// this cannot see is named on the field.
+fn seccomp_may_refuse_entry_lookup_syscalls() -> bool {
+    may_refuse_entry_lookup_syscalls(
+        launcher_seccomp(
+            Path::new("/proc/self/task"),
+            Path::new("/proc/thread-self/status"),
+        ),
+        entry_lookup_syscalls_succeed_in_a_child,
+    )
 }
 
-/// [`launcher_inherits_a_seccomp_filter`] over the task directory `tasks`.
-fn seccomp_filter_in_any_task(tasks: &Path) -> bool {
+/// [`seccomp_may_refuse_entry_lookup_syscalls`] given what the threads report,
+/// calling `probe` (whether a child of this thread could make the calls) only
+/// when every thread is filtered as this one is.
+fn may_refuse_entry_lookup_syscalls(
+    threads: LauncherSeccomp,
+    probe: impl FnOnce() -> bool,
+) -> bool {
+    match threads {
+        LauncherSeccomp::Unfiltered => false,
+        LauncherSeccomp::Unknown => true,
+        LauncherSeccomp::Uniform => !probe(),
+    }
+}
+
+/// What the threads of the launching process report about seccomp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LauncherSeccomp {
+    /// No thread runs under seccomp, so a guest inherits no filter.
+    Unfiltered,
+    /// Every thread reports the same filter mode and filter count as the
+    /// calling thread, so a child of the calling thread is filtered as a
+    /// guest forked by any of them, up to what the field's residuals name.
+    Uniform,
+    /// Anything else, including a status that could not be read.
+    Unknown,
+}
+
+/// The seccomp lines of one thread's `/proc/<pid>/task/<tid>/status`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SeccompStatus {
+    /// `Seccomp:`, 0 (none), 1 (strict) or 2 (filter). A kernel built without
+    /// seccomp prints no such line and can run no filter, so a missing line
+    /// reads as 0; `None` when the value is not a number.
+    mode: Option<u32>,
+    /// `Seccomp_filters:`, the number of filters on the thread (Linux 5.9);
+    /// `None` when the line is missing or its value is not a number.
+    filters: Option<u32>,
+}
+
+/// The [`SeccompStatus`] in the text of a `/proc/<pid>/task/<tid>/status`.
+fn parse_seccomp_status(status: &str) -> SeccompStatus {
+    let value = |name: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .map(|value| value.trim().parse::<u32>().ok())
+    };
+    SeccompStatus {
+        mode: value("Seccomp:").unwrap_or(Some(0)),
+        filters: value("Seccomp_filters:").flatten(),
+    }
+}
+
+/// [`LauncherSeccomp`] for the threads listed in the task directory `tasks`,
+/// compared with the calling thread's status read from `own_status`, which is
+/// read only when some thread is under seccomp.
+fn launcher_seccomp(tasks: &Path, own_status: &Path) -> LauncherSeccomp {
+    let unknown = |path: &Path, error: std::io::Error| {
+        tracing::debug!(
+            "could not read {} ({error}); assuming a seccomp filter the guest inherits may \
+             refuse what Detcore asks while listing a directory",
+            path.display()
+        );
+        LauncherSeccomp::Unknown
+    };
     let entries = match std::fs::read_dir(tasks) {
         Ok(entries) => entries,
-        Err(error) => {
-            tracing::debug!(
-                "could not list {} ({error}); assuming the guest may run under an inherited \
-                 seccomp filter",
-                tasks.display()
-            );
-            return true;
-        }
+        Err(error) => return unknown(tasks, error),
     };
+    let mut threads = Vec::new();
     for entry in entries {
         let status_path = match entry {
             Ok(entry) => entry.path().join("status"),
-            Err(error) => {
-                tracing::debug!(
-                    "could not list {} ({error}); assuming the guest may run under an \
-                     inherited seccomp filter",
-                    tasks.display()
-                );
-                return true;
-            }
+            Err(error) => return unknown(tasks, error),
         };
         match std::fs::read_to_string(&status_path) {
-            Ok(status) if seccomp_filter_in_status(&status) => return true,
-            Ok(_) => {}
+            Ok(status) => threads.push(parse_seccomp_status(&status)),
             // The thread exited after the directory was listed: it starts no
             // guest.
             Err(error)
                 if matches!(error.raw_os_error(), Some(libc::ENOENT) | Some(libc::ESRCH)) => {}
-            Err(error) => {
-                tracing::debug!(
-                    "could not read {} ({error}); assuming the guest may run under an \
-                     inherited seccomp filter",
-                    status_path.display()
-                );
-                return true;
-            }
+            Err(error) => return unknown(&status_path, error),
         }
     }
-    false
+    // The calling thread is always listed, so an empty list was not this
+    // process's.
+    if threads.is_empty() {
+        return LauncherSeccomp::Unknown;
+    }
+    if threads.iter().all(|thread| thread.mode == Some(0)) {
+        return LauncherSeccomp::Unfiltered;
+    }
+    let own = match std::fs::read_to_string(own_status) {
+        Ok(status) => parse_seccomp_status(&status),
+        Err(error) => return unknown(own_status, error),
+    };
+    if own.mode == Some(2) && own.filters.is_some() && threads.iter().all(|thread| *thread == own) {
+        LauncherSeccomp::Uniform
+    } else {
+        LauncherSeccomp::Unknown
+    }
 }
 
-/// Whether a `/proc/<pid>/status` text reports a seccomp mode. The `Seccomp:`
-/// line holds 0 (none), 1 (strict) or 2 (filter); any value other than 0 means
-/// a syscall Detcore injects may be refused. A kernel built without seccomp
-/// prints no such line and can run no filter.
-fn seccomp_filter_in_status(status: &str) -> bool {
+/// Whether a child of the calling thread made the calls of
+/// [`entry_lookup_probe_child`] and exited normally with status 0.
+fn entry_lookup_syscalls_succeed_in_a_child() -> bool {
+    matches!(
+        entry_lookup_probe_status(),
+        Some(status) if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+    )
+}
+
+/// Fork a child of the calling thread that runs [`entry_lookup_probe_child`]
+/// on a descriptor of `/`, and return its wait status. `None` when the
+/// descriptor cannot be opened, the fork fails, or the child cannot be waited
+/// for, as when this process ignores `SIGCHLD` (Hermit never changes that
+/// disposition, so it is the one Hermit inherited) and the kernel reaps the
+/// child itself (`ECHILD`).
+fn entry_lookup_probe_status() -> Option<libc::c_int> {
+    // SAFETY: sysconf has no preconditions.
+    let page_len = match usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }) {
+        Ok(len) if len >= PROBE_STATX_OFFSET + std::mem::size_of::<libc::statx>() => len,
+        _ => return None,
+    };
+    // SAFETY: the path is NUL-terminated; the descriptor is closed below.
+    let dirfd = unsafe {
+        libc::open(
+            c"/".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if dirfd < 0 {
+        return None;
+    }
+    // SAFETY: the child makes only raw system calls and exits (see
+    // `entry_lookup_probe_child`), so it never takes a lock that another
+    // thread of this process held at the fork.
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        // SAFETY: this is the child of the fork above, `dirfd` is open on a
+        // directory, and `page_len` is the page size, checked above.
+        unsafe { entry_lookup_probe_child(dirfd, page_len) }
+    }
+    let status = if pid < 0 {
+        None
+    } else {
+        let mut status = 0;
+        loop {
+            // SAFETY: waits for the child forked above into a valid out
+            // pointer.
+            let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+            if waited == pid {
+                break Some(status);
+            }
+            if waited == -1 && std::io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+            {
+                continue;
+            }
+            break None;
+        }
+    };
+    // SAFETY: closes the descriptor opened above, which nothing else uses.
+    unsafe { libc::close(dirfd) };
     status
-        .lines()
-        .find_map(|line| line.strip_prefix("Seccomp:"))
-        .is_some_and(|mode| mode.trim() != "0")
+}
+
+/// Where [`entry_lookup_probe_child`] puts the `statx` buffer in its page,
+/// after the path `.` and its NUL, as `Detcore::entry_is_on_the_listed_mount`
+/// lays out a one-character name.
+const PROBE_STATX_OFFSET: usize = 8;
+
+/// The child of [`entry_lookup_probe_status`]. It makes, on the descriptor
+/// `dirfd` of `/`, the calls Detcore injects while listing a directory when
+/// [`DetConfig::seccomp_may_refuse_entry_lookup_syscalls`] is false, with the
+/// arguments Detcore gives them, and exits with status 0 when every call
+/// succeeded and 1 when one failed:
+///
+/// - `fstatfs(dirfd, buf)`, the filesystem type
+///   (`Detcore::inject_fstatfs_type`), with the buffer on the stack;
+/// - `mmap(NULL, page_len, PROT_READ | PROT_WRITE, MAP_PRIVATE |
+///   MAP_ANONYMOUS, -1, 0)`, `statx(dirfd, ".", AT_SYMLINK_NOFOLLOW |
+///   AT_NO_AUTOMOUNT, STATX_INO, buf)` with the path and the buffer in that
+///   page, and `munmap` of it: the overlay mount-root check
+///   (`Detcore::entry_is_on_the_listed_mount`).
+///
+/// A filter that traps or kills on one of them ends the child by `SIGSYS`
+/// instead. First, so that such an end writes no core file and is neither
+/// caught nor held: the process is made undumpable, which a `core_pattern`
+/// pipe respects too, `RLIMIT_CORE` is set to 0, and `SIGSYS` is reset to its
+/// default action and unblocked (the kernel does both for a seccomp `SIGSYS`
+/// anyway; this is for a handler the fork copied).
+///
+/// Only raw system calls are made, every argument as a full `long`, as the
+/// variadic `syscall` reads them: another thread of the parent may have held
+/// a lock at the fork, which stays held here.
+///
+/// # Safety
+///
+/// Only in the child of a `fork`, with `dirfd` open on a directory and
+/// `page_len` the page size, at least `PROBE_STATX_OFFSET` plus the size of a
+/// `statx`.
+unsafe fn entry_lookup_probe_child(dirfd: libc::c_int, page_len: usize) -> ! {
+    use libc::c_long;
+    let dirfd = c_long::from(dirfd);
+    let no_core = libc::rlimit64 {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // A `struct kernel_sigaction` (handler, flags, restorer, mask) of zeros:
+    // SIG_DFL, no flags, no signal blocked during a handler.
+    let default_action = [0u64; 4];
+    let sigsys = 1u64 << (libc::SIGSYS - 1);
+    let sigset_size: c_long = 8;
+    let mut statfs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: raw system calls on this child's own memory: every pointer
+    // passed is to a live local or to the page mapped here and unmapped last.
+    let succeeded = unsafe {
+        libc::syscall(
+            libc::SYS_prctl,
+            c_long::from(libc::PR_SET_DUMPABLE),
+            0 as c_long,
+            0 as c_long,
+            0 as c_long,
+            0 as c_long,
+        );
+        libc::syscall(
+            libc::SYS_prlimit64,
+            0 as c_long,
+            c_long::from(libc::RLIMIT_CORE),
+            &no_core as *const libc::rlimit64 as c_long,
+            0 as c_long,
+        );
+        libc::syscall(
+            libc::SYS_rt_sigaction,
+            c_long::from(libc::SIGSYS),
+            default_action.as_ptr() as c_long,
+            0 as c_long,
+            sigset_size,
+        );
+        libc::syscall(
+            libc::SYS_rt_sigprocmask,
+            c_long::from(libc::SIG_UNBLOCK),
+            &sigsys as *const u64 as c_long,
+            0 as c_long,
+            sigset_size,
+        );
+        libc::syscall(libc::SYS_fstatfs, dirfd, statfs.as_mut_ptr() as c_long) == 0 && {
+            let page = libc::syscall(
+                libc::SYS_mmap,
+                0 as c_long,
+                page_len as c_long,
+                c_long::from(libc::PROT_READ | libc::PROT_WRITE),
+                c_long::from(libc::MAP_PRIVATE | libc::MAP_ANONYMOUS),
+                -1 as c_long,
+                0 as c_long,
+            );
+            page != -1 && {
+                let path = page as *mut u8;
+                path.write(b'.');
+                path.add(1).write(0);
+                let asked = libc::syscall(
+                    libc::SYS_statx,
+                    dirfd,
+                    page,
+                    c_long::from(libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT),
+                    c_long::from(libc::STATX_INO),
+                    path.add(PROBE_STATX_OFFSET) as c_long,
+                ) == 0;
+                let unmapped = libc::syscall(libc::SYS_munmap, page, page_len as c_long) == 0;
+                asked && unmapped
+            }
+        }
+    };
+    // SAFETY: ends this child without running anything of the parent's.
+    unsafe { libc::_exit(if succeeded { 0 } else { 1 }) }
 }
 
 /// What the selected backend can do, as Detcore consumes it.
@@ -6217,118 +6458,468 @@ mod tests {
         assert!(!super::DetConfig::default().tool_opens_outside_guest_descriptor_table);
     }
 
-    /// The `Seccomp:` line decides: 0 is no filter, 1 (strict) and 2 (filter)
-    /// are, and a status without the line comes from a kernel that cannot run
-    /// one. `Seccomp_filters:`, which newer kernels print next to it, is not
-    /// mistaken for it.
+    /// The `Seccomp:` and `Seccomp_filters:` lines, in either order. A status
+    /// without `Seccomp:` comes from a kernel that cannot run a filter; one
+    /// without `Seccomp_filters:` from a kernel before Linux 5.9, which does
+    /// not count them.
     #[test]
-    fn a_seccomp_mode_other_than_zero_counts_as_an_inherited_filter() {
-        let status = |mode: &str| {
-            format!("Name:\thermit\nNoNewPrivs:\t1\nSeccomp:\t{mode}\nSeccomp_filters:\t0\n")
-        };
-        assert!(!super::seccomp_filter_in_status(&status("0")));
-        assert!(super::seccomp_filter_in_status(&status("1")));
-        assert!(super::seccomp_filter_in_status(&status("2")));
-        assert!(!super::seccomp_filter_in_status(
-            "Name:\thermit\nSeccomp_filters:\t3\n"
-        ));
-        assert!(super::seccomp_filter_in_status(
-            "Seccomp_filters:\t1\nSeccomp:\t2\n"
-        ));
-    }
-
-    /// Held by every test here that reads this process's seccomp state, so
-    /// that the thread [`a_filter_on_a_thread_other_than_the_leader_counts`]
-    /// filters is not seen by another test in the same process.
-    static SECCOMP_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Every task's status is read: one with a filter is enough, a task whose
-    /// status vanished (it exited) is skipped, and a task list that cannot be
-    /// read counts as a filter.
-    #[test]
-    fn a_seccomp_filter_on_any_task_counts_as_an_inherited_filter() {
-        let root = tempfile::tempdir().unwrap();
-        let tasks = root.path().join("task");
-        let status = |mode: &str| format!("Name:\thermit\nSeccomp:\t{mode}\n");
-        for (tid, mode) in [("100", "0"), ("101", "0")] {
-            std::fs::create_dir_all(tasks.join(tid)).unwrap();
-            std::fs::write(tasks.join(tid).join("status"), status(mode)).unwrap();
-        }
-        // A thread that exited after the list was read has no status.
-        std::fs::create_dir_all(tasks.join("102")).unwrap();
-        assert!(!super::seccomp_filter_in_any_task(&tasks));
-        std::fs::create_dir_all(tasks.join("103")).unwrap();
-        std::fs::write(tasks.join("103").join("status"), status("2")).unwrap();
-        assert!(super::seccomp_filter_in_any_task(&tasks));
-        assert!(super::seccomp_filter_in_any_task(
-            &root.path().join("absent")
-        ));
-    }
-
-    /// Codex review round 9 of https://github.com/rrnewton/hermit/pull/3255:
-    /// a filter installed by a thread other than the thread group leader,
-    /// without `SECCOMP_FILTER_FLAG_TSYNC`, is on that thread and on any guest
-    /// it forks, but not on the leader, whose state `/proc/self/status`
-    /// shows. Here a thread installs a filter that allows every call, so the
-    /// mode is 2 on that thread alone, and the launcher's answer is true
-    /// while the thread lives, where reading `/proc/self/status` gave the
-    /// leader's.
-    #[test]
-    fn a_filter_on_a_thread_other_than_the_leader_counts() {
-        let _held = SECCOMP_STATE
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let leader =
-            super::seccomp_filter_in_status(&std::fs::read_to_string("/proc/self/status").unwrap());
-        let (installed_tx, installed_rx) = std::sync::mpsc::channel();
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-        let filtered = std::thread::spawn(move || {
-            let allow = [libc::sock_filter {
-                code: (libc::BPF_RET | libc::BPF_K) as u16,
-                jt: 0,
-                jf: 0,
-                k: libc::SECCOMP_RET_ALLOW,
-            }];
-            let program = libc::sock_fprog {
-                len: allow.len() as u16,
-                filter: allow.as_ptr() as *mut libc::sock_filter,
-            };
-            // SAFETY: both prctls act on this thread only; the program
-            // outlives the call, which copies it.
-            let installed = unsafe {
-                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0
-                    && libc::prctl(
-                        libc::PR_SET_SECCOMP,
-                        libc::SECCOMP_MODE_FILTER,
-                        &program as *const libc::sock_fprog,
-                    ) == 0
-            };
-            installed_tx.send(installed).unwrap();
-            done_rx.recv().unwrap();
-        });
-        assert!(
-            installed_rx.recv().unwrap(),
-            "precondition: the thread installs its filter: {}",
-            std::io::Error::last_os_error()
+    fn seccomp_status_reads_the_mode_and_the_filter_count() {
+        let status =
+            |mode: Option<u32>, filters: Option<u32>| super::SeccompStatus { mode, filters };
+        assert_eq!(
+            super::parse_seccomp_status(
+                "Name:\thermit\nNoNewPrivs:\t1\nSeccomp:\t2\nSeccomp_filters:\t3\n"
+            ),
+            status(Some(2), Some(3))
         );
         assert_eq!(
-            super::seccomp_filter_in_status(&std::fs::read_to_string("/proc/self/status").unwrap()),
-            leader,
-            "precondition: the leader's status does not show another thread's filter"
+            super::parse_seccomp_status("Seccomp_filters:\t1\nSeccomp:\t2\n"),
+            status(Some(2), Some(1))
         );
-        assert!(super::launcher_inherits_a_seccomp_filter());
-        done_tx.send(()).unwrap();
-        filtered.join().unwrap();
+        assert_eq!(
+            super::parse_seccomp_status("Name:\thermit\nSeccomp:\t0\n"),
+            status(Some(0), None)
+        );
+        assert_eq!(
+            super::parse_seccomp_status("Name:\thermit\n"),
+            status(Some(0), None)
+        );
+        assert_eq!(
+            super::parse_seccomp_status("Seccomp:\tfilter\nSeccomp_filters:\tmany\n"),
+            status(None, None)
+        );
     }
 
-    /// The run config carries this process's own seccomp state on every
-    /// backend, and a caller's true is never cleared.
+    /// A task directory of threads with the given status texts (`None`: the
+    /// thread exited after the list was read, so it has no status), in a new
+    /// temporary directory, and the path of a status file of its own that
+    /// holds `own` (`None`: no such file).
+    fn task_directory(
+        threads: &[Option<&str>],
+        own: Option<&str>,
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let tasks = root.path().join("task");
+        std::fs::create_dir(&tasks).unwrap();
+        for (tid, status) in threads.iter().enumerate() {
+            let thread = tasks.join((100 + tid).to_string());
+            std::fs::create_dir(&thread).unwrap();
+            if let Some(status) = status {
+                std::fs::write(thread.join("status"), status).unwrap();
+            }
+        }
+        let own_status = root.path().join("thread-self-status");
+        if let Some(own) = own {
+            std::fs::write(&own_status, own).unwrap();
+        }
+        (root, tasks, own_status)
+    }
+
+    /// No thread under seccomp is `Unfiltered` without reading the calling
+    /// thread's status; every thread filtered as the calling thread is
+    /// `Uniform`; anything else, and anything that cannot be read, is
+    /// `Unknown`.
     #[test]
-    fn the_run_config_carries_the_launchers_seccomp_state() {
-        let _held = SECCOMP_STATE
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let own = super::launcher_inherits_a_seccomp_filter();
+    fn launcher_seccomp_compares_every_thread_with_the_calling_thread() {
+        use super::LauncherSeccomp::*;
+        let none = "Name:\thermit\nSeccomp:\t0\nSeccomp_filters:\t0\n";
+        let none_old_kernel = "Name:\thermit\nSeccomp:\t0\n";
+        let no_seccomp_kernel = "Name:\thermit\n";
+        let three = "Name:\thermit\nSeccomp:\t2\nSeccomp_filters:\t3\n";
+        let four = "Name:\thermit\nSeccomp:\t2\nSeccomp_filters:\t4\n";
+        let filtered_old_kernel = "Name:\thermit\nSeccomp:\t2\n";
+        let strict = "Name:\thermit\nSeccomp:\t1\nSeccomp_filters:\t0\n";
+        let unreadable_mode = "Name:\thermit\nSeccomp:\tfilter\nSeccomp_filters:\t3\n";
+        /// A case's name, its threads' statuses, the calling thread's status,
+        /// and the answer.
+        type Case<'a> = (
+            &'a str,
+            &'a [Option<&'a str>],
+            Option<&'a str>,
+            super::LauncherSeccomp,
+        );
+        let cases: &[Case<'_>] = &[
+            (
+                "no thread under seccomp, one thread gone, no own status",
+                &[
+                    Some(none),
+                    None,
+                    Some(none_old_kernel),
+                    Some(no_seccomp_kernel),
+                ],
+                None,
+                Unfiltered,
+            ),
+            (
+                "all filtered alike",
+                &[Some(three), None, Some(three)],
+                Some(three),
+                Uniform,
+            ),
+            (
+                "one thread with another filter count",
+                &[Some(three), Some(four)],
+                Some(three),
+                Unknown,
+            ),
+            (
+                "the calling thread unfiltered",
+                &[Some(none), Some(three)],
+                Some(none),
+                Unknown,
+            ),
+            (
+                "a kernel without filter counts",
+                &[Some(filtered_old_kernel)],
+                Some(filtered_old_kernel),
+                Unknown,
+            ),
+            ("strict mode", &[Some(strict)], Some(strict), Unknown),
+            (
+                "a mode that is not a number",
+                &[Some(unreadable_mode)],
+                Some(unreadable_mode),
+                Unknown,
+            ),
+            ("no own status", &[Some(three)], None, Unknown),
+            ("no thread listed", &[], Some(three), Unknown),
+        ];
+        for (case, threads, own, expected) in cases {
+            let (_root, tasks, own_status) = task_directory(threads, *own);
+            assert_eq!(
+                super::launcher_seccomp(&tasks, &own_status),
+                *expected,
+                "{case}"
+            );
+        }
+        // A task list that cannot be read, and a status that cannot be read
+        // for another reason than the thread having exited.
+        let (root, tasks, own_status) = task_directory(&[Some(three)], Some(three));
+        assert_eq!(
+            super::launcher_seccomp(&root.path().join("absent"), &own_status),
+            Unknown
+        );
+        std::fs::create_dir(tasks.join("200")).unwrap();
+        std::fs::create_dir(tasks.join("200").join("status")).unwrap();
+        assert_eq!(super::launcher_seccomp(&tasks, &own_status), Unknown);
+    }
+
+    /// Only `Uniform` asks the probe, and then the answer is its opposite.
+    #[test]
+    fn only_threads_filtered_alike_are_probed() {
+        use super::LauncherSeccomp::*;
+        let unasked = || -> bool { panic!("the probe must not run") };
+        assert!(!super::may_refuse_entry_lookup_syscalls(
+            Unfiltered, unasked
+        ));
+        assert!(super::may_refuse_entry_lookup_syscalls(Unknown, unasked));
+        assert!(!super::may_refuse_entry_lookup_syscalls(Uniform, || true));
+        assert!(super::may_refuse_entry_lookup_syscalls(Uniform, || false));
+    }
+
+    /// The environment variable naming the test below that a fresh process
+    /// of this test binary runs, under the seccomp filter that test installs.
+    const SECCOMP_SCENARIO: &str = "HERMIT_TEST_SECCOMP_SCENARIO";
+
+    /// Run test `name` of this module in a fresh process of this test binary,
+    /// with [`SECCOMP_SCENARIO`] naming it, in an empty working directory, and
+    /// require that it passes and that the directory stays empty: no core
+    /// file was written there.
+    fn run_seccomp_scenario(name: &str) {
+        let cwd = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("tests::{name}"),
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(SECCOMP_SCENARIO, name)
+            .current_dir(cwd.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{name} in a fresh process: {}\nstdout:\n{stdout}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let written: Vec<_> = std::fs::read_dir(cwd.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(written.is_empty(), "{name} wrote {written:?}");
+    }
+
+    /// Whether this process is the fresh one [`run_seccomp_scenario`] starts
+    /// for test `name`.
+    fn in_seccomp_scenario(name: &str) -> bool {
+        std::env::var_os(SECCOMP_SCENARIO).is_some_and(|scenario| scenario == name)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    const AUDIT_ARCH_NATIVE: u32 = 0xc000_003e; // AUDIT_ARCH_X86_64
+    #[cfg(target_arch = "aarch64")]
+    const AUDIT_ARCH_NATIVE: u32 = 0xc000_00b7; // AUDIT_ARCH_AARCH64
+
+    /// A seccomp program that answers `verdict` for system call `nr` and
+    /// allows every other call; a call made through another architecture's
+    /// calling convention kills the process.
+    fn seccomp_program(nr: libc::c_long, verdict: u32) -> [libc::sock_filter; 7] {
+        let statement = |code: u32, k: u32| libc::sock_filter {
+            code: code as u16,
+            jt: 0,
+            jf: 0,
+            k,
+        };
+        let jump_if_equal = |k: u32, jt: u8, jf: u8| libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            jt,
+            jf,
+            k,
+        };
+        let load_word = |offset: u32| statement(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, offset);
+        let ret = |verdict: u32| statement(libc::BPF_RET | libc::BPF_K, verdict);
+        [
+            // struct seccomp_data: nr at offset 0, arch at offset 4.
+            load_word(4),
+            jump_if_equal(AUDIT_ARCH_NATIVE, 1, 0),
+            ret(libc::SECCOMP_RET_KILL_PROCESS),
+            load_word(0),
+            jump_if_equal(u32::try_from(nr).unwrap(), 0, 1),
+            ret(verdict),
+            ret(libc::SECCOMP_RET_ALLOW),
+        ]
+    }
+
+    /// Install `program` on the calling thread, after no_new_privs, and on
+    /// every other thread of this process too when `every_thread`
+    /// (`SECCOMP_FILTER_FLAG_TSYNC`). Panics if that fails.
+    fn install_seccomp(program: &[libc::sock_filter], every_thread: bool) {
+        let fprog = libc::sock_fprog {
+            len: u16::try_from(program.len()).unwrap(),
+            filter: program.as_ptr() as *mut libc::sock_filter,
+        };
+        let flags = if every_thread {
+            libc::SECCOMP_FILTER_FLAG_TSYNC
+        } else {
+            0
+        };
+        // SAFETY: the program outlives the call, which copies it; each
+        // argument is passed as the full register the kernel reads.
+        let installed = unsafe {
+            libc::prctl(
+                libc::PR_SET_NO_NEW_PRIVS,
+                1 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+            ) == 0
+                && libc::syscall(
+                    libc::SYS_seccomp,
+                    libc::SECCOMP_SET_MODE_FILTER as libc::c_long,
+                    flags as libc::c_long,
+                    &fprog as *const libc::sock_fprog as libc::c_long,
+                ) == 0
+        };
+        assert!(
+            installed,
+            "precondition: the seccomp filter is installed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// The launcher's view of this process now.
+    fn this_launcher_seccomp() -> super::LauncherSeccomp {
+        super::launcher_seccomp(
+            std::path::Path::new("/proc/self/task"),
+            std::path::Path::new("/proc/thread-self/status"),
+        )
+    }
+
+    /// Under a filter that every thread shares, the probe child's wait status,
+    /// checked by `child`, and the launcher's answer.
+    fn probe_under(program: &[libc::sock_filter], child: impl FnOnce(libc::c_int)) -> bool {
+        install_seccomp(program, true);
+        assert_eq!(this_launcher_seccomp(), super::LauncherSeccomp::Uniform);
+        let status = super::entry_lookup_probe_status().expect("the probe child is waited for");
+        child(status);
+        super::seccomp_may_refuse_entry_lookup_syscalls()
+    }
+
+    fn exited_with(status: libc::c_int, code: libc::c_int) {
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == code,
+            "the probe child should have exited with {code}: wait status {status:#x}"
+        );
+    }
+
+    fn killed_by_sigsys_without_a_core(status: libc::c_int) {
+        assert!(
+            libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS,
+            "the probe child should have been ended by SIGSYS: wait status {status:#x}"
+        );
+        assert!(
+            !libc::WCOREDUMP(status),
+            "the probe child dumped a core: wait status {status:#x}"
+        );
+    }
+
+    /// No filter: nothing to ask, so the flag is false and nothing is
+    /// forked. A launcher that itself inherited a filter cannot run this.
+    #[test]
+    fn without_a_filter_the_launcher_probes_nothing_and_answers_false() {
+        let name = "without_a_filter_the_launcher_probes_nothing_and_answers_false";
+        if !in_seccomp_scenario(name) {
+            return run_seccomp_scenario(name);
+        }
+        assert_eq!(
+            this_launcher_seccomp(),
+            super::LauncherSeccomp::Unfiltered,
+            "this test needs a process that runs under no seccomp filter"
+        );
+        assert!(!super::seccomp_may_refuse_entry_lookup_syscalls());
+    }
+
+    /// A filter that refuses another call (`swapon`) lets every lookup call
+    /// through, so the child exits 0 and the flag stays false: the run lists
+    /// directories as it does without a filter.
+    #[test]
+    fn a_filter_that_refuses_only_another_call_leaves_the_flag_false() {
+        let name = "a_filter_that_refuses_only_another_call_leaves_the_flag_false";
+        if !in_seccomp_scenario(name) {
+            return run_seccomp_scenario(name);
+        }
+        let program = seccomp_program(
+            libc::SYS_swapon,
+            libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        );
+        assert!(!probe_under(&program, |status| exited_with(status, 0)));
+    }
+
+    /// `SECCOMP_RET_TRAP` on `fstatfs`: the child is ended by `SIGSYS`,
+    /// without a core, and the flag is true.
+    #[test]
+    fn a_filter_that_traps_fstatfs_makes_the_flag_true() {
+        let name = "a_filter_that_traps_fstatfs_makes_the_flag_true";
+        if !in_seccomp_scenario(name) {
+            return run_seccomp_scenario(name);
+        }
+        let program = seccomp_program(libc::SYS_fstatfs, libc::SECCOMP_RET_TRAP);
+        assert!(probe_under(&program, killed_by_sigsys_without_a_core));
+    }
+
+    /// `SECCOMP_RET_KILL_PROCESS` on `fstatfs`: as for a trap.
+    #[test]
+    fn a_filter_that_kills_on_fstatfs_makes_the_flag_true() {
+        let name = "a_filter_that_kills_on_fstatfs_makes_the_flag_true";
+        if !in_seccomp_scenario(name) {
+            return run_seccomp_scenario(name);
+        }
+        let program = seccomp_program(libc::SYS_fstatfs, libc::SECCOMP_RET_KILL_PROCESS);
+        assert!(probe_under(&program, killed_by_sigsys_without_a_core));
+    }
+
+    /// `SECCOMP_RET_ERRNO(EPERM)` on `fstatfs`: the call fails, the child
+    /// exits 1, and the flag is true.
+    #[test]
+    fn a_filter_that_fails_fstatfs_makes_the_flag_true() {
+        let name = "a_filter_that_fails_fstatfs_makes_the_flag_true";
+        if !in_seccomp_scenario(name) {
+            return run_seccomp_scenario(name);
+        }
+        let program = seccomp_program(
+            libc::SYS_fstatfs,
+            libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        );
+        assert!(probe_under(&program, |status| exited_with(status, 1)));
+    }
+
+    /// `SECCOMP_RET_TRACE` on `fstatfs` with no tracer attached: the kernel
+    /// fails the call with `ENOSYS`, the child exits 1, and the flag is true.
+    #[test]
+    fn a_filter_that_traces_fstatfs_without_a_tracer_makes_the_flag_true() {
+        let name = "a_filter_that_traces_fstatfs_without_a_tracer_makes_the_flag_true";
+        if !in_seccomp_scenario(name) {
+            return run_seccomp_scenario(name);
+        }
+        let program = seccomp_program(libc::SYS_fstatfs, libc::SECCOMP_RET_TRACE);
+        assert!(probe_under(&program, |status| exited_with(status, 1)));
+    }
+
+    /// A filter that allows `fstatfs` but fails `statx` with `EPERM`, as
+    /// container profiles older than `statx` did: Detcore's overlay check
+    /// injects `statx` once `fstatfs` reports an overlay, and an `EPERM`
+    /// there stops the guest, so the child makes that call too, exits 1, and
+    /// the flag is true.
+    #[test]
+    fn a_filter_that_fails_statx_makes_the_flag_true() {
+        let name = "a_filter_that_fails_statx_makes_the_flag_true";
+        if !in_seccomp_scenario(name) {
+            return run_seccomp_scenario(name);
+        }
+        let program = seccomp_program(
+            libc::SYS_statx,
+            libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        );
+        assert!(probe_under(&program, |status| exited_with(status, 1)));
+    }
+
+    /// A thread filtered unlike the calling thread may be the one that forks
+    /// a guest, and a child of the calling thread does not inherit its
+    /// filters, so the answer is true without a probe: here first a thread
+    /// with a filter the calling thread does not have, then, with every
+    /// thread under one filter, a thread with one filter more.
+    #[test]
+    fn a_thread_filtered_unlike_the_caller_makes_the_flag_true_without_a_probe() {
+        let name = "a_thread_filtered_unlike_the_caller_makes_the_flag_true_without_a_probe";
+        if !in_seccomp_scenario(name) {
+            return run_seccomp_scenario(name);
+        }
+        let allow_all = [libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ALLOW,
+        }];
+        let with_a_filtered_thread = |check: &dyn Fn()| {
+            let (installed_tx, installed_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+            let thread = std::thread::spawn(move || {
+                install_seccomp(&allow_all, false);
+                installed_tx.send(()).unwrap();
+                done_rx.recv().unwrap();
+            });
+            installed_rx.recv().unwrap();
+            check();
+            done_tx.send(()).unwrap();
+            thread.join().unwrap();
+        };
+        let unprobed = || {
+            let threads = this_launcher_seccomp();
+            assert_eq!(threads, super::LauncherSeccomp::Unknown);
+            assert!(super::may_refuse_entry_lookup_syscalls(threads, || {
+                panic!("the probe must not run")
+            }));
+        };
+        with_a_filtered_thread(&unprobed);
+        install_seccomp(
+            &seccomp_program(
+                libc::SYS_swapon,
+                libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+            ),
+            true,
+        );
+        assert_eq!(this_launcher_seccomp(), super::LauncherSeccomp::Uniform);
+        with_a_filtered_thread(&unprobed);
+    }
+
+    /// The run config carries the launcher's answer on every backend, and a
+    /// caller's true is kept.
+    #[test]
+    fn the_run_config_carries_the_launchers_seccomp_answer() {
+        let own = super::seccomp_may_refuse_entry_lookup_syscalls();
         for backend in [
             Backend::Ptrace,
             Backend::Dbt,
