@@ -111,7 +111,20 @@ const TEST_LEDGER_REPOSITORY: &str = "https://github.com/rrnewton/hermit_test_le
 /// headline (<https://github.com/rrnewton/dev-hermit/issues/463>). Version 3
 /// floors dbt's cells like every other backend's, now that dbt is compared;
 /// the website still reads version 2, whose dbt cells are in no floor.
-const PARITY_SUMMARY_SCHEMA: &str = "parity-summary/v3";
+/// Version 4 drops the rows a `parity.retraction` withdraws and counts them
+/// in `retracted_rows`: section 9 of the parity summary format, version 4
+/// (dev-hermit `ai_docs/parity-summary-format-v4.md`, sha256
+/// 426e58d84924a83f96d07888bb20b56b024c7e96372f4e48179d81d4c0f80899).
+const PARITY_SUMMARY_SCHEMA: &str = "parity-summary/v4";
+/// The event that withdraws published parity events (format v4 section 9).
+const PARITY_RETRACTION_EVENT_TYPE: &str = "parity.retraction";
+/// A retraction's reason is at most this many characters, as a refusal's
+/// message is (dev-hermit `parity_ledger.REFUSAL_ERROR_LIMIT`).
+const PARITY_RETRACTION_REASON_LIMIT: usize = 4000;
+/// An owner home directory, which no public ledger text may name. Built from
+/// parts so this file does not itself hold the path the portability check
+/// refuses.
+const OWNER_HOME_NEEDLE: &str = concat!("/", "home", "/");
 const LEDGER_PARITY_SUMMARY: &str = "scorecard/parity.json";
 /// The ledger store `series.py append-parity` publishes `parity-ledger/v1`
 /// rows into, as `parity/<team>/<host>/<YYYY-MM>.jsonl`.
@@ -7038,6 +7051,9 @@ struct ParitySummary {
     refused_rows: usize,
     /// Rows of a cell a run had already reported; the most adverse was kept.
     duplicate_rows: usize,
+    /// Lines that pass the row check and that a retraction line withdraws;
+    /// they are counted here and nowhere else ([`parity_retraction`]).
+    retracted_rows: usize,
     /// Lines that pass the row check with `"source_tree_dirty": true`,
     /// duplicates and rows a conflicting commit refuses included.
     source_tree_dirty_rows: usize,
@@ -7051,6 +7067,82 @@ struct ParitySummary {
     legacy_dropped: BTreeMap<String, usize>,
     /// The same, counted by distinct cell (`<canonical test id>@<backend>`).
     legacy_dropped_cells: BTreeMap<String, usize>,
+}
+
+/// A `parity.retraction` line of the `parity/` store, as dev-hermit's
+/// `parity_ledger.validate_retraction` admits it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParityRetraction {
+    schema: String,
+    event_type: String,
+    event_id: String,
+    team: String,
+    host: String,
+    emitted_at: String,
+    retracts: Vec<String>,
+    reason: String,
+}
+
+/// The event ids a line withdraws when it is a retraction line: a
+/// `parity.retraction` that keeps every rule of section 9 of the parity
+/// summary format, version 4. Any other line is `None` and is read as a row,
+/// so a malformed retraction withdraws nothing and the row check refuses it.
+fn parity_retraction(text: &str) -> Option<Vec<String>> {
+    let event: ParityRetraction = serde_json::from_str(text).ok()?;
+    // ASCII only, by the same byte rules as the writer, so no Unicode digit,
+    // whitespace or surrogate rule can make the two readers disagree.
+    let segment = |value: &str| {
+        !value.is_empty()
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            && value != "."
+            && value != ".."
+            && !value.contains("__")
+    };
+    let event_id = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    let emitted = event.emitted_at.as_bytes();
+    let utc = emitted.len() == 20
+        && emitted.iter().enumerate().all(|(index, byte)| match index {
+            4 | 7 => *byte == b'-',
+            10 => *byte == b'T',
+            13 | 16 => *byte == b':',
+            19 => *byte == b'Z',
+            _ => byte.is_ascii_digit(),
+        });
+    let reason = &event.reason;
+    let public_reason = !reason.is_empty()
+        && reason.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+        && !reason.starts_with(' ')
+        && !reason.ends_with(' ')
+        && !reason.contains(OWNER_HOME_NEEDLE)
+        && reason.len() <= PARITY_RETRACTION_REASON_LIMIT;
+    let mut digest = Sha256::new();
+    digest.update(PARITY_RETRACTION_EVENT_TYPE.as_bytes());
+    for retracted in &event.retracts {
+        digest.update([0]);
+        digest.update(retracted.as_bytes());
+    }
+    digest.update([0]);
+    digest.update(reason.as_bytes());
+    let identity = format!("{:x}", digest.finalize());
+    (event.schema == "parity-ledger/v1"
+        && event.event_type == PARITY_RETRACTION_EVENT_TYPE
+        && segment(&event.team)
+        && segment(&event.host)
+        && utc
+        && !event.retracts.is_empty()
+        && event.retracts.iter().all(|retracted| event_id(retracted))
+        && event.retracts.windows(2).all(|pair| pair[0] < pair[1])
+        && public_reason
+        && event.event_id == identity)
+        .then_some(event.retracts)
 }
 
 /// The `(producer, run_id, test_id, backend)` of a line that failed to parse
@@ -7294,10 +7386,27 @@ fn summarize_parity(
     let mut duplicate_rows = 0usize;
     let mut lines = input.lines.iter().collect::<Vec<_>>();
     lines.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
-    let parsed = lines
-        .iter()
-        .map(|line| classify_parity_row(&line.text))
-        .collect::<Vec<_>>();
+    // A retraction line is not a row, and a row it names is withdrawn: counted
+    // in `retracted_rows` and nowhere else (format v4 section 9).
+    let mut retracted = BTreeSet::new();
+    lines.retain(|line| match parity_retraction(&line.text) {
+        Some(withdrawn) => {
+            retracted.extend(withdrawn);
+            false
+        }
+        None => true,
+    });
+    let mut retracted_rows = 0usize;
+    let mut parsed = Vec::with_capacity(lines.len());
+    lines.retain(|line| {
+        let row = classify_parity_row(&line.text);
+        if matches!(&row, Ok((row, _, _)) if retracted.contains(&row.event_id)) {
+            retracted_rows += 1;
+            return false;
+        }
+        parsed.push(row);
+        true
+    });
     // One entry of `parsed` per line read, and at most one count per entry,
     // so each count, and their sum, is at most `rows_read`.
     let mut source_tree_dirty_rows = 0usize;
@@ -7551,6 +7660,7 @@ fn summarize_parity(
         runs: briefs,
         refused_rows,
         duplicate_rows,
+        retracted_rows,
         source_tree_dirty_rows,
         source_tree_unreported_rows,
         refusals,
@@ -8121,6 +8231,12 @@ then the latest emission.\n\n",
         out.push_str(&format!(
             "\n{} duplicate row(s) reported a cell its run had already reported; the most adverse report of each cell was kept.\n",
             summary.duplicate_rows
+        ));
+    }
+    if summary.retracted_rows > 0 {
+        out.push_str(&format!(
+            "\n{} parity row(s) were withdrawn by a `parity.retraction` in the ledger and are in no figure.\n",
+            summary.retracted_rows
         ));
     }
     if !summary.refusals.is_empty() {
@@ -43816,6 +43932,186 @@ mod parity_summary_tests {
         }
     }
 
+    /// A retraction exactly as dev-hermit's `parity_ledger.build_retraction`
+    /// wrote it for two made-up ids. Its event id is the one Python computed,
+    /// so this pins the identity rule across the two readers (format v4
+    /// section 9).
+    const PYTHON_RETRACTION: &str = r#"{"schema":"parity-ledger/v1","event_type":"parity.retraction","event_id":"7650c684afddf151114be11535920aba2575d260178d2b69ad1850dcb77e6d24","team":"hermit","host":"fixturehost","emitted_at":"2026-10-07T12:00:00Z","retracts":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"reason":"test fixture published by a leaking spool path"}"#;
+
+    /// Lines that each break exactly one admission rule while carrying the
+    /// correct event id for their fields; dev-hermit's
+    /// `NEAR_MISS_RETRACTIONS` holds the same lines, so both readers refuse
+    /// the same ones (format v4 section 9).
+    const NEAR_MISS_RETRACTIONS: [(&str, &str); 5] = [
+        (
+            "an Arabic-Indic digit in emitted_at",
+            r#"{"schema":"parity-ledger/v1","event_type":"parity.retraction","event_id":"7650c684afddf151114be11535920aba2575d260178d2b69ad1850dcb77e6d24","team":"hermit","host":"fixturehost","emitted_at":"2026-10-\u0660\u0667T12:00:00Z","retracts":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"reason":"test fixture published by a leaking spool path"}"#,
+        ),
+        (
+            "a leading space in the reason",
+            r#"{"schema":"parity-ledger/v1","event_type":"parity.retraction","event_id":"2ef670064ef75f945065f928b6848dfb12a31d8f5379d581aa1933225c406634","team":"hermit","host":"fixturehost","emitted_at":"2026-10-07T12:00:00Z","retracts":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"reason":" test fixture"}"#,
+        ),
+        (
+            "a NUL in the reason",
+            r#"{"schema":"parity-ledger/v1","event_type":"parity.retraction","event_id":"5f39975a17fd697ccae203dd6bd50b08a49cd06a2b71055da4e9bb09f7f89b0a","team":"hermit","host":"fixturehost","emitted_at":"2026-10-07T12:00:00Z","retracts":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"reason":"test\u0000fixture"}"#,
+        ),
+        (
+            "a unit separator ending the reason",
+            r#"{"schema":"parity-ledger/v1","event_type":"parity.retraction","event_id":"b37a11c607b32403675a1721c679d43a3fedb3a4ea4bc2e45bb4194b605631fa","team":"hermit","host":"fixturehost","emitted_at":"2026-10-07T12:00:00Z","retracts":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"reason":"test fixture\u001f"}"#,
+        ),
+        (
+            "a non-ASCII letter in the team",
+            r#"{"schema":"parity-ledger/v1","event_type":"parity.retraction","event_id":"7650c684afddf151114be11535920aba2575d260178d2b69ad1850dcb77e6d24","team":"h\u00e9rmit","host":"fixturehost","emitted_at":"2026-10-07T12:00:00Z","retracts":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"reason":"test fixture published by a leaking spool path"}"#,
+        ),
+    ];
+
+    /// The retraction line withdrawing `rows`, built by the same rule.
+    fn retraction_of(rows: &[&ParityLedgerRow]) -> String {
+        let mut retracts = rows
+            .iter()
+            .map(|row| row.event_id.clone())
+            .collect::<Vec<_>>();
+        retracts.sort();
+        let reason = "test fixture published by a leaking spool path";
+        let mut digest = Sha256::new();
+        digest.update(PARITY_RETRACTION_EVENT_TYPE.as_bytes());
+        for retracted in &retracts {
+            digest.update([0]);
+            digest.update(retracted.as_bytes());
+        }
+        digest.update([0]);
+        digest.update(reason.as_bytes());
+        serde_json::json!({
+            "schema": "parity-ledger/v1",
+            "event_type": PARITY_RETRACTION_EVENT_TYPE,
+            "event_id": format!("{:x}", digest.finalize()),
+            "team": "hermit",
+            "host": "fixture-host-b",
+            "emitted_at": "2026-09-29T05:00:00Z",
+            "retracts": retracts,
+            "reason": reason,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_python_built_retraction_is_a_retraction_line_and_a_tampered_one_is_not() {
+        let ids = vec!["a".repeat(64), "b".repeat(64)];
+        assert_eq!(parity_retraction(PYTHON_RETRACTION), Some(ids));
+        let tampered = [
+            PYTHON_RETRACTION.replace("7650c684", "7650c685"),
+            PYTHON_RETRACTION.replace(r#""aaaa"#, r#""cccc"#),
+            PYTHON_RETRACTION.replace("leaking", "leaky"),
+            PYTHON_RETRACTION.replace(r#""team":"hermit""#, r#""team":"her/mit""#),
+            PYTHON_RETRACTION.replace(r#","reason""#, r#","extra":1,"reason""#),
+            // A non-ASCII digit, which a Unicode `\d` would admit.
+            PYTHON_RETRACTION.replace("2026-10-07T", "2026-10-\u{0660}7T"),
+            PYTHON_RETRACTION.replace(r#""reason":"test"#, r#""reason":" test"#),
+        ];
+        for line in tampered {
+            assert_eq!(parity_retraction(&line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn each_shared_near_miss_retraction_is_refused() {
+        for (label, line) in NEAR_MISS_RETRACTIONS {
+            assert_eq!(parity_retraction(line), None, "{label}");
+        }
+    }
+
+    #[test]
+    fn a_retraction_withdraws_its_rows_from_every_figure_and_counts_them() {
+        let kept = row(diverged(
+            "backend-parity-c/epoll-readiness",
+            KVM,
+            5,
+            100,
+            6,
+            2,
+            false,
+        ));
+        let fixture = |test: &str| {
+            let mut row = envelope(
+                ParityProducer::Validate,
+                "validate-fixture-run",
+                "2026-09-29T04:10:00Z",
+                test,
+                KVM,
+                LedgerVerdict::RecordMissing,
+                Some(TIMED_OUT),
+                origin(LedgerPostPassState::Failed, "manifest_c_programs"),
+                None,
+            );
+            row.source_tree_dirty = true;
+            row
+        };
+        let (one, two) = (
+            fixture("backend-parity-c/one"),
+            fixture("backend-parity-c/two"),
+        );
+        let rows = [line(&kept), line(&one), line(&two)];
+        let summarize = |lines: &[String]| {
+            summarize_parity(&store(lines), &no_cells(), &|_| None, &|_| None, &|_| {
+                Ok(None)
+            })
+        };
+        let before = summarize(&rows);
+        assert_eq!((before.runs.len(), before.source_tree_dirty_rows), (2, 2));
+        let mut lines = rows.to_vec();
+        lines.push(retraction_of(&[&two, &one]));
+        let after = summarize(&lines);
+        assert_eq!(
+            (after.rows_read, after.retracted_rows, after.refused_rows),
+            (4, 2, 0)
+        );
+        assert_eq!((after.source_tree_dirty_rows, after.duplicate_rows), (0, 0));
+        assert_eq!(
+            after
+                .runs
+                .iter()
+                .map(|brief| brief.run_id.as_str())
+                .collect::<Vec<_>>(),
+            [RUN]
+        );
+        assert_eq!(only_run(&after).line, only_run(&before).line);
+        let value = serde_json::to_value(&after).unwrap();
+        assert_eq!(value["schema"], "parity-summary/v4");
+        assert_eq!(value["retracted_rows"], 2);
+        assert!(render_parity_section(&after).contains(
+            "2 parity row(s) were withdrawn by a `parity.retraction` in the ledger and are in no figure."
+        ));
+    }
+
+    #[test]
+    fn a_malformed_retraction_withdraws_nothing_and_is_refused() {
+        let kept = row(diverged(
+            "backend-parity-c/epoll-readiness",
+            KVM,
+            5,
+            100,
+            6,
+            2,
+            false,
+        ));
+        let forged = retraction_of(&[&kept]).replace("fixture published", "fixture  published");
+        let summary = summarize_parity(
+            &store(&[line(&kept), forged]),
+            &no_cells(),
+            &|_| None,
+            &|_| None,
+            &|_| Ok(None),
+        );
+        assert_eq!(
+            (
+                summary.retracted_rows,
+                summary.refused_rows,
+                summary.runs.len()
+            ),
+            (0, 1, 1)
+        );
+    }
+
     #[test]
     fn a_retired_id_row_joins_its_successor() {
         let retired = "backend-parity-c/pidfd-open-self";
@@ -44167,7 +44463,7 @@ mod parity_summary_tests {
         let encoded =
             String::from_utf8(encoded_parity_summary(&summary).unwrap().unwrap()).unwrap();
         let value: JsonValue = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(value["schema"], "parity-summary/v3");
+        assert_eq!(value["schema"], "parity-summary/v4");
         assert_eq!(
             value["producers"][0]["total"]["floor_credit"]
                 .as_f64()
@@ -45760,7 +46056,7 @@ mod parity_summary_tests {
     /// of the summary, of a run in `producers` and of a brief in `runs`.
     #[test]
     fn the_summary_run_and_brief_keys_are_in_the_formats_order() {
-        const SUMMARY_KEYS: [&str; 14] = [
+        const SUMMARY_KEYS: [&str; 15] = [
             "schema",
             "generated_from",
             "store_present",
@@ -45769,6 +46065,7 @@ mod parity_summary_tests {
             "runs",
             "refused_rows",
             "duplicate_rows",
+            "retracted_rows",
             "source_tree_dirty_rows",
             "source_tree_unreported_rows",
             "refusals",
@@ -45815,7 +46112,7 @@ mod parity_summary_tests {
             BRIEF_KEYS
         );
         let value: JsonValue = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value["schema"], "parity-summary/v3");
+        assert_eq!(value["schema"], "parity-summary/v4");
         assert_eq!(value["producers"][0]["source_tree_dirty"], false);
         assert_eq!(value["runs"][0]["source_tree_dirty"], false);
         assert_eq!(value["runs"][0]["headline"], true);
