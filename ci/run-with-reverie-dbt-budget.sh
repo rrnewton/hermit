@@ -1006,7 +1006,13 @@ fi
 # reverie-dbt, the root Cargo.toml, third-party or rust-toolchain.toml
 # changes, so the four budget inputs are unchanged. Carry, not recalibration:
 # no new timing sample or >=5-sample replacement claim is made.
-expected_pin=a9f2ef666a83920146f2e9362487ec867c6ccced
+# CARRY TO ba18ad41ef79d932927ba3fd890bd437e26233a4 (2026-10-06): from
+# a9f2ef666a83920146f2e9362487ec867c6ccced. The one commit changes only reverie-kvm (a
+# PIE main image's placement); no file under reverie-dbt, the root Cargo.toml,
+# third-party or rust-toolchain.toml changes, so the four budget inputs are
+# unchanged. Carry, not recalibration: no new timing sample or >=5-sample
+# replacement claim is made.
+expected_pin=ba18ad41ef79d932927ba3fd890bd437e26233a4
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
