@@ -231,7 +231,9 @@ pub const HOSTED_PORTABLE_EXCLUDED_BACKENDS: &[&str] = &["kvm"];
 /// initialization failed: CPUID faulting is unavailable: No such device`, and
 /// the runtime-staging case failed earlier only because the prebuilt tree did
 /// not yet ship the runtime it launches. The five `liteinst_in_guest_verify_`
-/// cases came later and run guests under the same runtime. Only
+/// cases came later and run guests under the same runtime, as do the two
+/// inode-identity cases of
+/// <https://github.com/rrnewton/hermit/pull/3255>. Only
 /// `test.cli_on_host` excludes
 /// them, with one exact-name filterset (`-E 'not (test(=NAME) | ...)'`) rather
 /// than substring `--skip`s; the local `test.cli` keeps running every one in
@@ -250,6 +252,7 @@ pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_in_guest_programs::liteinst_in_guest_formatting_and_sequence_utilities",
     "liteinst_in_guest_programs::liteinst_in_guest_heap_growth_avoids_trampoline_mappings",
     "liteinst_in_guest_programs::liteinst_in_guest_identity_utilities",
+    "liteinst_in_guest_programs::liteinst_in_guest_maps_inodes_equal_stat_inodes",
     "liteinst_in_guest_programs::liteinst_in_guest_max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe",
     "liteinst_in_guest_programs::liteinst_in_guest_path_and_language_utilities",
     "liteinst_in_guest_programs::liteinst_in_guest_python_entropy",
@@ -264,6 +267,7 @@ pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_in_guest_programs::liteinst_in_guest_semantic_file_and_sqlite_utilities",
     "liteinst_in_guest_programs::liteinst_in_guest_semantic_text_utilities",
     "liteinst_in_guest_programs::liteinst_in_guest_shell_and_entropy_consumer",
+    "liteinst_in_guest_programs::liteinst_in_guest_untracked_directory_descriptor_lists_stat_inodes",
     "liteinst_in_guest_programs::liteinst_in_guest_virtual_identity_and_time",
     "liteinst_in_guest_verify_compares_the_records_the_guest_forwards",
     "liteinst_in_guest_verify_forwards_records_by_the_cli_filters_per_target_answer",
@@ -272,6 +276,162 @@ pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_in_guest_verify_with_records_past_the_log_bound_is_no_result",
     "run_liteinst_finds_the_runtime_staged_as_an_installed_resource",
 ];
+
+/// `test.hermit_integration` cases the GitHub-hosted portable profile excludes
+/// by exact name, as (test binary, test name) pairs.
+///
+/// Each needs two host properties that no hosted profile declares: a btrfs
+/// file system under the target's temporary directory (`CARGO_TARGET_TMPDIR`),
+/// where a `/proc/<pid>/maps` line and `stat` report different devices for
+/// the same file, and a kernel that reports `STATX_MNT_ID_UNIQUE` (Linux 6.8
+/// or newer). Each fails loudly, naming the missing property, rather than
+/// passing without exercising its subject. The local `test.hermit_integration`
+/// runs them in the pinned root, whose `/src/target` is a bind mount of the
+/// host's target directory (`ci/hermetic/run-in-pinned-root.sh`), so it
+/// inherits the host's file system and kernel. Only the cloned twin
+/// `test.hermit_integration_on_host` excludes them, with one exact-name
+/// filterset (`-E 'not ((binary(=BINARY) & test(=NAME)) | ...)'`) appended to
+/// its command, and a test below holds both sides to this list.
+pub const HOSTED_PORTABLE_BTRFS_INTEGRATION_TESTS: &[(&str, &str)] = &[(
+    "procfs_determinism",
+    "dbt_maps_lines_prove_their_device_with_a_full_descriptor_table",
+)];
+
+/// `test.detcore_unit` cases the GitHub-hosted portable profile excludes by
+/// exact name, as (test binary, test name) pairs.
+///
+/// Each runs Detcore's device proof for a mapped or named file
+/// (`superblock_in_page` in `detcore/src/syscalls/files.rs`) through a
+/// scripted guest that forwards the proof's `statx`, and its `statmount`
+/// unless the test scripts the answer, to the kernel the test process runs
+/// on. Each needs that kernel to report `STATX_MNT_ID_UNIQUE` (Linux 6.8 or
+/// newer). Without it the proof refuses rather than read mountinfo through
+/// the guest's descriptor table, which the scripted guest shares. With that
+/// bit withheld from every forwarded `statx`, three of these tests fail on a
+/// precondition that names unique mount ids, one on the system calls it
+/// expects the proof to inject, and eight on the typed refusal.
+/// `statmount_reports_the_superblock_mountinfo_lists` also needs a
+/// `statmount` the kernel permits. No hosted profile declares either
+/// property. The local `test.detcore_unit` and `quick.detcore_unit` run every
+/// one in the pinned root, which shares the host's kernel. Only the cloned
+/// twin `test.detcore_unit_on_host` excludes them, with the same kind of
+/// exact-name filterset as `HOSTED_PORTABLE_BTRFS_INTEGRATION_TESTS`, and a
+/// test below holds both sides to this list.
+pub const HOSTED_PORTABLE_UNIQUE_MOUNT_ID_DETCORE_TESTS: &[(&str, &str)] = &[
+    (
+        "detcore",
+        "syscalls::files::inject_fstat_scratch::a_maps_proof_refuses_rather_than_read_mountinfo_in_the_guests_table",
+    ),
+    (
+        "detcore",
+        "syscalls::files::inject_fstat_scratch::a_path_with_the_headers_inode_needs_the_headers_superblock",
+    ),
+    (
+        "detcore",
+        "syscalls::files::inject_fstat_scratch::a_statmount_that_decides_nothing_proves_nothing_falls_back_or_refuses",
+    ),
+    (
+        "detcore",
+        "syscalls::files::inject_fstat_scratch::an_unrecorded_maps_line_contradicted_by_its_headers_record_is_refused",
+    ),
+    (
+        "detcore",
+        "syscalls::files::inject_fstat_scratch::an_unrecorded_maps_line_that_agrees_with_its_headers_record_is_keyed",
+    ),
+    (
+        "detcore",
+        "syscalls::files::inject_fstat_scratch::another_address_spaces_maps_line_ignores_the_readers_record",
+    ),
+    (
+        "detcore",
+        "syscalls::files::inject_fstat_scratch::mapping_recorded_identity_discards_a_record_with_another_inode",
+    ),
+    (
+        "detcore",
+        "syscalls::files::inject_fstat_scratch::mapping_stat_identity_keys_a_numbered_tasks_deleted_executable_on_its_exe_link",
+    ),
+    (
+        "detcore",
+        "syscalls::files::inject_fstat_scratch::mapping_stat_identity_keys_the_readers_deleted_executable_on_proc_self_exe",
+    ),
+    (
+        "detcore",
+        "syscalls::files::inject_fstat_scratch::numeric_maps_spellings_resolve_through_the_task_they_name",
+    ),
+    (
+        "detcore",
+        "syscalls::files::inject_fstat_scratch::statmount_reports_the_superblock_mountinfo_lists",
+    ),
+    (
+        "detcore",
+        "syscalls::files::inject_fstat_scratch::step_two_needs_the_executables_pathname_and_superblock",
+    ),
+];
+
+/// The exact-name filterset a hosted twin appends to the command it clones
+/// from its local step, with its leading space: one
+/// `(binary(=BINARY) & test(=NAME))` term per case.
+fn hosted_exact_name_filterset(cases: &[(&str, &str)]) -> String {
+    let exclusions = cases
+        .iter()
+        .map(|(binary, name)| format!("(binary(={binary}) & test(={name}))"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    format!(" -E 'not ({exclusions})'")
+}
+
+/// The filterset `test.hermit_integration_on_host` appends to the command it
+/// clones from `test.hermit_integration`, with its leading space.
+fn hosted_btrfs_integration_filterset() -> String {
+    hosted_exact_name_filterset(HOSTED_PORTABLE_BTRFS_INTEGRATION_TESTS)
+}
+
+/// The filterset `test.detcore_unit_on_host` appends to the command it clones
+/// from `test.detcore_unit`, with its leading space.
+fn hosted_unique_mount_id_detcore_filterset() -> String {
+    hosted_exact_name_filterset(HOSTED_PORTABLE_UNIQUE_MOUNT_ID_DETCORE_TESTS)
+}
+
+/// The exact-name exclusions a cloned hosted twin appends, and what they
+/// exclude, for each twin that has any.
+fn hosted_exact_name_exclusion(tag: &str) -> Option<(String, &'static str)> {
+    match tag {
+        "test.hermit_integration_on_host" => Some((hosted_btrfs_integration_filterset(), "btrfs")),
+        "test.detcore_unit_on_host" => Some((
+            hosted_unique_mount_id_detcore_filterset(),
+            "unique-mount-id",
+        )),
+        _ => None,
+    }
+}
+
+/// Append a twin's exact-name exclusions to the hosted step, which is cloned
+/// from its local step before the pinned-root wrapper is added, and declare
+/// the count its own registry entry gives that narrower selection instead of
+/// the local count it was cloned with.
+fn exclude_hosted_cases(hosted: &mut Step, filterset: &str, what: &str) -> Result<(), String> {
+    let tag = hosted.tag();
+    // Nextest reads a filterset after `--` as a test-binary argument, so the
+    // exclusion is appended only to a command that has neither.
+    if hosted.cmd.contains(" -E ") || hosted.cmd.contains(" -- ") {
+        return Err(format!(
+            "{tag} already has a filterset or test-binary arguments; \
+             cannot append the {what} exclusions"
+        ));
+    }
+    hosted.cmd.push_str(filterset);
+    let expected = NEXTEST_EXPECTED_COUNTS
+        .iter()
+        .find(|(entry, _)| *entry == tag)
+        .map(|(_, count)| count.to_string())
+        .ok_or_else(|| format!("{tag} has no Nextest expected-count entry"))?;
+    let declared = hosted
+        .env
+        .get_mut("NEXTEST_EXPECTED_EXECUTED")
+        .ok_or_else(|| format!("{tag} was cloned without NEXTEST_EXPECTED_EXECUTED"))?;
+    *declared = expected;
+    Ok(())
+}
 
 fn hosted_portable_excludes(cell: &DagManifest) -> bool {
     cell.backend
@@ -1263,6 +1423,9 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
             hosted.job.push_str(HOSTED_VARIANT_SUFFIX);
             hosted.labels = vec![HOSTED_PORTABLE_LABEL.into()];
             hosted.fail_fast_family = Some(hosted.tag());
+            if let Some((filterset, what)) = hosted_exact_name_exclusion(&hosted.tag()) {
+                exclude_hosted_cases(&mut hosted, &filterset, what)?;
+            }
             let owner = hosted.tag();
             for result in hosted.result_manifests.iter_mut().flatten() {
                 if let ResultManifest::StructuredTestResults(result) = result {
@@ -5502,6 +5665,181 @@ sys.exit(37)
     }
 
     #[test]
+    fn hosted_integration_twin_leaves_out_the_btrfs_cases_by_exact_name() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let step = |tag: &str| {
+            committed
+                .steps
+                .iter()
+                .find(|step| step.tag() == tag)
+                .unwrap_or_else(|| panic!("{tag} is missing"))
+        };
+        let local = step("test.hermit_integration");
+        let hosted = step("test.hermit_integration_on_host");
+        let filterset = hosted_btrfs_integration_filterset();
+        assert_eq!(
+            hosted.cmd.matches(" -E ").count(),
+            1,
+            "{} must carry exactly one filterset",
+            hosted.tag()
+        );
+        assert!(
+            hosted.cmd.ends_with(&filterset),
+            "{} must end with {filterset:?}",
+            hosted.tag()
+        );
+        let argv = shell_words::split(&local.cmd).unwrap();
+        let boundary = argv.iter().position(|arg| arg == "--").unwrap();
+        let local_payload = &argv[boundary + 5];
+        assert_eq!(
+            &hosted.cmd[..hosted.cmd.len() - filterset.len()],
+            local_payload,
+            "the hosted twin may differ from the local payload only by the filterset"
+        );
+        let local_argv = shell_words::split(local_payload).unwrap();
+        assert!(!local_argv.iter().any(|arg| arg == "-E" || arg == "--"));
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for (binary, name) in HOSTED_PORTABLE_BTRFS_INTEGRATION_TESTS {
+            // The local selection builds and runs this binary, and nothing in
+            // it names or skips the excluded case.
+            assert!(
+                local_argv
+                    .windows(2)
+                    .any(|pair| pair[0] == "--test" && pair[1] == *binary),
+                "test.hermit_integration must select --test {binary}"
+            );
+            assert!(
+                !local_payload.contains(name),
+                "test.hermit_integration must keep running {name}"
+            );
+            // An exact test(=NAME) term matches nothing if the test is
+            // renamed, so the name must still be a test function in its file.
+            let source =
+                std::fs::read_to_string(repository.join(format!("hermit-cli/tests/{binary}.rs")))
+                    .unwrap();
+            assert_eq!(
+                source.matches(&format!("fn {name}()")).count(),
+                1,
+                "hermit-cli/tests/{binary}.rs must define {name} once"
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_detcore_unit_twin_leaves_out_the_unique_mount_id_cases_by_exact_name() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let step = |tag: &str| {
+            committed
+                .steps
+                .iter()
+                .find(|step| step.tag() == tag)
+                .unwrap_or_else(|| panic!("{tag} is missing"))
+        };
+        let pinned_payload = |tag: &str| {
+            let argv = shell_words::split(&step(tag).cmd).unwrap();
+            let boundary = argv.iter().position(|arg| arg == "--").unwrap();
+            assert_eq!(argv[boundary + 3], PINNED_ROOT_COMMAND_GUARD);
+            argv[boundary + 5].clone()
+        };
+        let hosted = step("test.detcore_unit_on_host");
+        let filterset = hosted_unique_mount_id_detcore_filterset();
+        assert_eq!(
+            hosted.cmd.matches(" -E ").count(),
+            1,
+            "{} must carry exactly one filterset",
+            hosted.tag()
+        );
+        assert!(
+            hosted.cmd.ends_with(&filterset),
+            "{} must end with {filterset:?}",
+            hosted.tag()
+        );
+        assert_eq!(
+            hosted.cmd[..hosted.cmd.len() - filterset.len()],
+            pinned_payload("test.detcore_unit"),
+            "the hosted twin may differ from the local payload only by the filterset"
+        );
+        // Each exact test(=NAME) term excludes at most one test, so the hosted
+        // twin executes exactly this many fewer only if no name repeats.
+        let mut distinct = HOSTED_PORTABLE_UNIQUE_MOUNT_ID_DETCORE_TESTS.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct, HOSTED_PORTABLE_UNIQUE_MOUNT_ID_DETCORE_TESTS,
+            "the list must be sorted and name each case once"
+        );
+        // Both local nodes that run the Detcore library's unit tests keep
+        // running every excluded case: neither filters, skips or names one.
+        for tag in ["test.detcore_unit", "quick.detcore_unit"] {
+            let payload = pinned_payload(tag);
+            let argv = shell_words::split(&payload).unwrap();
+            assert!(
+                !argv
+                    .iter()
+                    .any(|arg| arg == "-E" || arg == "--" || arg == "--skip"),
+                "{tag} must not narrow its selection: {payload}"
+            );
+            assert!(
+                argv.windows(2)
+                    .any(|pair| pair[0] == "-p" && pair[1] == "hermit-detcore"),
+                "{tag} must select -p hermit-detcore"
+            );
+            assert!(
+                argv.iter().any(|arg| arg == "--lib"),
+                "{tag} must select --lib"
+            );
+            for (_, name) in HOSTED_PORTABLE_UNIQUE_MOUNT_ID_DETCORE_TESTS {
+                let leaf = name.rsplit("::").next().unwrap();
+                assert!(!payload.contains(leaf), "{tag} must keep running {name}");
+            }
+        }
+        // Nextest names the library's unit-test binary after the library
+        // target, which the binary(=detcore) term must match.
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = std::fs::read_to_string(repository.join("detcore/Cargo.toml")).unwrap();
+        assert!(
+            manifest.contains("\n[lib]\nname = \"detcore\"\n"),
+            "detcore/Cargo.toml must name its library target detcore"
+        );
+        // An exact test(=NAME) term matches nothing if the test is renamed or
+        // moved, so every name must still be a test function in the module its
+        // path names. Rustfmt indents the module's items, so the module ends at
+        // the first closing brace in column zero after it opens.
+        let files =
+            std::fs::read_to_string(repository.join("detcore/src/syscalls/files.rs")).unwrap();
+        assert_eq!(files.matches("mod inject_fstat_scratch {").count(), 1);
+        let start = files.find("mod inject_fstat_scratch {").unwrap();
+        let module = &files[start..start + files[start..].find("\n}\n").unwrap()];
+        for (binary, name) in HOSTED_PORTABLE_UNIQUE_MOUNT_ID_DETCORE_TESTS {
+            assert_eq!(*binary, "detcore", "{name} must name the library's binary");
+            let leaf = name
+                .strip_prefix("syscalls::files::inject_fstat_scratch::")
+                .unwrap_or_else(|| {
+                    panic!("{name} is not in syscalls::files::inject_fstat_scratch")
+                });
+            let definition = format!("fn {leaf}()");
+            assert_eq!(
+                files.matches(&definition).count(),
+                1,
+                "detcore/src/syscalls/files.rs must define {leaf} once"
+            );
+            assert_eq!(
+                module.matches(&definition).count(),
+                1,
+                "{leaf} must be defined in inject_fstat_scratch"
+            );
+        }
+        let count =
+            |step: &Step| -> usize { step.env["NEXTEST_EXPECTED_EXECUTED"].parse().unwrap() };
+        assert_eq!(
+            count(hosted) + HOSTED_PORTABLE_UNIQUE_MOUNT_ID_DETCORE_TESTS.len(),
+            count(step("test.detcore_unit")),
+            "{} must execute exactly the excluded cases fewer",
+            hosted.tag()
+        );
+    }
+
+    #[test]
     fn hosted_nextest_selections_keep_local_cases_and_failure_limits() {
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let mut checked = BTreeSet::new();
@@ -5568,6 +5906,34 @@ sys.exit(37)
                     .join(" | ");
                 assert_eq!(local_payload.matches(" -- ").count(), 1);
                 local_payload.replacen(" -- ", &format!(" -E 'not ({exclusions})' -- "), 1)
+            } else if local_tag == "test.hermit_integration" {
+                // The hosted twin appends the exact-name btrfs exclusions,
+                // which the local selection must keep running; see
+                // hosted_integration_twin_leaves_out_the_btrfs_cases_by_exact_name.
+                assert!(!local_payload.contains(" -E "));
+                for (_, name) in HOSTED_PORTABLE_BTRFS_INTEGRATION_TESTS {
+                    assert!(
+                        !local_payload.contains(name),
+                        "test.hermit_integration must keep running {name}"
+                    );
+                }
+                format!("{local_payload}{}", hosted_btrfs_integration_filterset())
+            } else if local_tag == "test.detcore_unit" {
+                // The hosted twin appends the exact-name unique-mount-id
+                // exclusions, which the local selection must keep running; see
+                // hosted_detcore_unit_twin_leaves_out_the_unique_mount_id_cases_by_exact_name.
+                assert!(!local_payload.contains(" -E "));
+                for (_, name) in HOSTED_PORTABLE_UNIQUE_MOUNT_ID_DETCORE_TESTS {
+                    let leaf = name.rsplit("::").next().unwrap();
+                    assert!(
+                        !local_payload.contains(leaf),
+                        "test.detcore_unit must keep running {name}"
+                    );
+                }
+                format!(
+                    "{local_payload}{}",
+                    hosted_unique_mount_id_detcore_filterset()
+                )
             } else {
                 local_payload
             };
@@ -5600,10 +5966,11 @@ sys.exit(37)
             // excludes at most one test, so the hosted twin executes exactly
             // that many fewer only if every listed name exists and nothing
             // else is excluded.
-            let hosted_only_skips = if local_tag == "test.cli" {
-                HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS.len()
-            } else {
-                0
+            let hosted_only_skips = match local_tag.as_str() {
+                "test.cli" => HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS.len(),
+                "test.hermit_integration" => HOSTED_PORTABLE_BTRFS_INTEGRATION_TESTS.len(),
+                "test.detcore_unit" => HOSTED_PORTABLE_UNIQUE_MOUNT_ID_DETCORE_TESTS.len(),
+                _ => 0,
             };
             let count =
                 |step: &Step| -> usize { step.env["NEXTEST_EXPECTED_EXECUTED"].parse().unwrap() };
