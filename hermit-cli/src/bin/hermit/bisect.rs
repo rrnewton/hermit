@@ -14,7 +14,10 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use anyhow::bail;
+use clap::CommandFactory;
+use clap::FromArgMatches;
 use clap::Parser;
+use clap::parser::ValueSource;
 use detcore::preemptions::PreemptionRecord;
 use detcore::types::SchedEvent;
 use hermit::Error;
@@ -24,7 +27,9 @@ use tracing::metadata::LevelFilter;
 
 use super::analyze::AnalyzeOpts;
 use super::analyze::ExitStatusConstraint;
+use super::container::PolicyRefusal;
 use super::global_opts::GlobalOpts;
+use super::run::RunOpts;
 
 /// Bisect two recorded schedules to identify the event ordering that causes a failure.
 #[derive(Debug, Parser)]
@@ -85,6 +90,16 @@ pub struct BisectOpts {
 
 impl BisectOpts {
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        let (mut analyzer, good, bad) = self.prepare(global)?;
+        analyzer.bisect_schedule_pair(good, bad)
+    }
+
+    /// Everything `main` does before the first replay: the refusals, the two
+    /// schedules, and the trial configuration they imply.
+    fn prepare(
+        &self,
+        global: &GlobalOpts,
+    ) -> Result<(AnalyzeOpts, Vec<SchedEvent>, Vec<SchedEvent>), Error> {
         let mut analyzer = AnalyzeOpts {
             target_stdout: self.target_stdout.clone(),
             target_stderr: self.target_stderr.clone(),
@@ -129,15 +144,79 @@ impl BisectOpts {
 
         let good = read_schedule(&self.good, "good")?;
         let bad = read_schedule(&self.bad, "bad")?;
+        if let Some(epoch) = self.recorded_epoch_argument(&good, &bad)? {
+            analyzer.run_arg.push(epoch);
+        }
+        let good = good.into_global();
+        let bad = bad.into_global();
         if good == bad {
             bail!("the --good and --bad schedules contain identical event traces");
         }
+        Ok((analyzer, good, bad))
+    }
 
-        analyzer.bisect_schedule_pair(good, bad)
+    /// The `--epoch` every replay needs so that it starts from the epoch the
+    /// schedules were recorded under, as `hermit run` does when it replays one
+    /// (`RunOpts::adopt_replayed_schedule_epoch`). A schedule's times are
+    /// absolute virtual times measured from its own epoch, and bisect writes
+    /// each trial's schedule anew without one, so without this the replays
+    /// would start from the default epoch instead.
+    ///
+    /// Schedules recorded under two different epochs, or an explicit epoch
+    /// (`--epoch` or `HERMIT_EPOCH`) that differs from theirs, are refused
+    /// before any replay. Schedules written before epochs were stored carry
+    /// none, and bisect replays them from the run arguments' epoch as before.
+    fn recorded_epoch_argument(
+        &self,
+        good: &PreemptionRecord,
+        bad: &PreemptionRecord,
+    ) -> Result<Option<String>, Error> {
+        let recorded = match (good.epoch(), bad.epoch()) {
+            (Some(good_epoch), Some(bad_epoch)) if good_epoch != bad_epoch => {
+                return Err(Error::new(PolicyRefusal).context(format!(
+                    "--good {} was recorded under the virtual-time epoch {} and --bad {} \
+                     under {}. Each schedule's times are measured from its own epoch, so \
+                     no single replay epoch reproduces both. Record both schedules with \
+                     the same --epoch.",
+                    self.good.display(),
+                    good_epoch.to_rfc3339(),
+                    self.bad.display(),
+                    bad_epoch.to_rfc3339(),
+                )));
+            }
+            (good_epoch, bad_epoch) => match good_epoch.or(bad_epoch) {
+                Some(recorded) => recorded,
+                None => return Ok(None),
+            },
+        };
+        let matches = RunOpts::command()
+            .try_get_matches_from(
+                std::iter::once("hermit-run").chain(self.run_args.iter().map(String::as_str)),
+            )
+            .context("cannot parse the bisect run arguments")?;
+        if matches.value_source("epoch") == Some(ValueSource::DefaultValue) {
+            return Ok(Some(format!("--epoch={}", recorded.to_rfc3339())));
+        }
+        let explicit = RunOpts::from_arg_matches(&matches)?
+            .det_opts
+            .det_config
+            .epoch;
+        if explicit == recorded {
+            return Ok(None);
+        }
+        let recorded = recorded.to_rfc3339();
+        Err(Error::new(PolicyRefusal).context(format!(
+            "the explicit virtual-time epoch {} (from --epoch or HERMIT_EPOCH) differs from \
+             the epoch {recorded} that the --good and --bad schedules were recorded under. A \
+             schedule's times are absolute virtual times measured from its own epoch, so \
+             replaying it from another epoch cannot reproduce the run. Omit --epoch to replay \
+             from the recorded epoch, or pass --epoch={recorded}.",
+            explicit.to_rfc3339(),
+        )))
     }
 }
 
-fn read_schedule(path: &Path, label: &str) -> anyhow::Result<Vec<SchedEvent>> {
+fn read_schedule(path: &Path, label: &str) -> anyhow::Result<PreemptionRecord> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("failed to read --{label} schedule {}", path.display()))?;
     let record: PreemptionRecord = serde_json::from_str(&contents)
@@ -152,7 +231,7 @@ fn read_schedule(path: &Path, label: &str) -> anyhow::Result<Vec<SchedEvent>> {
             path.display()
         );
     }
-    Ok(record.into_global())
+    Ok(record)
 }
 
 #[cfg(test)]
@@ -308,6 +387,161 @@ mod tests {
         );
     }
 
+    /// The two flaky_cas fixtures, written to `dir` as the --good and --bad
+    /// schedules with the given recorded epochs.
+    fn schedules_with_epochs(
+        dir: &Path,
+        good: Option<&str>,
+        bad: Option<&str>,
+    ) -> (PathBuf, PathBuf) {
+        let resources = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-resources");
+        let write = |fixture: &str, epoch: Option<&str>| {
+            let source = resources.join(format!("flaky_cas_sequence_schedules-{fixture}.json"));
+            let mut record: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(source).unwrap()).unwrap();
+            if let Some(epoch) = epoch {
+                record["epoch"] = serde_json::Value::from(epoch);
+            }
+            let path = dir.join(format!("{fixture}.json"));
+            fs::write(&path, record.to_string()).unwrap();
+            path
+        };
+        (write("passing", good), write("failing", bad))
+    }
+
+    /// Through `prepare`: the trial configuration `hermit bisect` would replay
+    /// these schedules with, or its refusal.
+    fn prepared_trials(
+        dir: &Path,
+        good: Option<&str>,
+        bad: Option<&str>,
+        run_args: &[&str],
+    ) -> Result<AnalyzeOpts, Error> {
+        let (good, bad) = schedules_with_epochs(dir, good, bad);
+        let good = format!("--good={}", good.display());
+        let bad = format!("--bad={}", bad.display());
+        let mut argv = vec!["hermit", "bisect", good.as_str(), bad.as_str(), "--"];
+        argv.extend(run_args);
+        argv.push("/bin/true");
+        let args = crate::Args::try_parse_from(&argv).unwrap();
+        let crate::Subcommand::Bisect(options) = args.command else {
+            panic!("{argv:?} is not bisect")
+        };
+        let (mut analyzer, _, _) = options.prepare(&args.global)?;
+        analyzer.tmp_dir = Some(dir.to_path_buf());
+        Ok(analyzer)
+    }
+
+    const RECORDED: &str = "2000-12-31T23:59:59.123456789Z";
+    const RECORDED_RFC3339: &str = "2000-12-31T23:59:59.123456789+00:00";
+
+    /// Bisect replays from the epoch its schedules were recorded under, as
+    /// `hermit run` does when it replays one
+    /// (https://github.com/rrnewton/hermit/issues/3835). Before, every trial
+    /// started from the run arguments' epoch, the default when none was
+    /// given. The checks run in a child process whose environment fixes
+    /// `HERMIT_EPOCH`, which counts as an explicit epoch: once unset, and once
+    /// set to an epoch other than the recorded one.
+    #[test]
+    fn bisect_replays_from_the_epoch_its_schedules_were_recorded_under() {
+        const CHILD: &str = "HERMIT_BISECT_EPOCH_TEST_CHILD";
+        const OTHER: &str = "2026-01-01T00:00:00Z";
+        let Some(arm) = std::env::var_os(CHILD) else {
+            let name = format!(
+                "{}::bisect_replays_from_the_epoch_its_schedules_were_recorded_under",
+                module_path!().split_once("::").unwrap().1
+            );
+            for arm in ["unset", "set"] {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child
+                    .args(["--exact", &name, "--nocapture"])
+                    .env(CHILD, arm);
+                if arm == "set" {
+                    child.env("HERMIT_EPOCH", OTHER);
+                } else {
+                    child.env_remove("HERMIT_EPOCH");
+                }
+                let output = child.output().unwrap();
+                assert!(output.status.success(), "{arm}: {output:?}");
+                assert!(
+                    String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                    "{arm}: the child ran no test: {output:?}"
+                );
+            }
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        if arm == "set" {
+            let error = prepared_trials(dir, Some(RECORDED), Some(RECORDED), &[]).unwrap_err();
+            assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+            assert!(
+                error.to_string().contains(&format!(
+                    "the explicit virtual-time epoch 2026-01-01T00:00:00+00:00 (from --epoch or \
+                     HERMIT_EPOCH) differs from the epoch {RECORDED_RFC3339}"
+                )),
+                "{error:#}"
+            );
+            return;
+        }
+
+        // The default epoch, for schedules that carry none.
+        let trials = prepared_trials(dir, None, None, &[]).unwrap();
+        assert!(trials.run_arg.is_empty(), "{:?}", trials.run_arg);
+        assert_eq!(trials.trial_epoch_for_test(), "2026-01-01T00:00:00+00:00");
+
+        // The recorded epoch, from either schedule or both.
+        for (good, bad) in [
+            (Some(RECORDED), Some(RECORDED)),
+            (Some(RECORDED), None),
+            (None, Some(RECORDED)),
+        ] {
+            let trials = prepared_trials(dir, good, bad, &[]).unwrap();
+            assert_eq!(
+                trials.trial_epoch_for_test(),
+                RECORDED_RFC3339,
+                "{good:?} / {bad:?}"
+            );
+        }
+
+        // An explicit epoch equal to the recorded one adds no second --epoch.
+        let trials =
+            prepared_trials(dir, Some(RECORDED), Some(RECORDED), &["--epoch", RECORDED]).unwrap();
+        assert!(trials.run_arg.is_empty(), "{:?}", trials.run_arg);
+        assert_eq!(trials.trial_epoch_for_test(), RECORDED_RFC3339);
+
+        // An explicit epoch that differs is refused, naming the remedy.
+        let error =
+            prepared_trials(dir, Some(RECORDED), Some(RECORDED), &["--epoch", OTHER]).unwrap_err();
+        assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("pass --epoch={RECORDED_RFC3339}")),
+            "{error:#}"
+        );
+    }
+
+    /// Schedules recorded under two different epochs are refused before any
+    /// replay: no single replay epoch reproduces both.
+    #[test]
+    fn bisect_refuses_schedules_recorded_under_two_epochs() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = prepared_trials(
+            dir.path(),
+            Some(RECORDED),
+            Some("2026-01-01T00:00:00Z"),
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+        let message = error.to_string();
+        assert!(
+            message.contains(RECORDED_RFC3339) && message.contains("2026-01-01T00:00:00+00:00"),
+            "{error:#}"
+        );
+    }
+
     #[test]
     fn schedule_fixture_contains_events() {
         let schedule = read_schedule(
@@ -316,6 +550,6 @@ mod tests {
             "good",
         )
         .unwrap();
-        assert!(!schedule.is_empty());
+        assert!(schedule.contains_schedevents());
     }
 }

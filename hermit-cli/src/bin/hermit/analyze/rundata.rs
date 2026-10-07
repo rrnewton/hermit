@@ -606,6 +606,18 @@ impl AnalyzeOpts {
         RunData::get_raw_runopts(self).install_pmu_config()
     }
 
+    /// The virtual-time epoch a baseline trial starts from, in RFC 3339.
+    #[cfg(test)]
+    pub(crate) fn trial_epoch_for_test(&self) -> String {
+        RunData::new_baseline(self, "epoch-probe".to_owned())
+            .unwrap()
+            .runopts
+            .det_opts
+            .det_config
+            .epoch
+            .to_rfc3339()
+    }
+
     /// Refuses (exit 122) `--save-config` and `--summary-json` in the run
     /// arguments, before any workspace, schedule read or trial exists. Every
     /// trial writes its configuration and summary into the workspace under
