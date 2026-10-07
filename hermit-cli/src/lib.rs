@@ -3729,9 +3729,9 @@ fn prepare_run_config(config: DetConfig, backend: Backend) -> DetConfig {
 /// 3. Otherwise a child forked from this thread, which inherits exactly this
 ///    thread's filters, makes the calls themselves
 ///    ([`entry_lookup_probe_child`]); false only when it exits normally with
-///    status 0. A child that a filter killed or trapped, a call that failed,
-///    a fork that failed, and a child that cannot be waited for all answer
-///    true.
+///    status 0. A child that a filter killed or trapped, a call that failed
+///    (the child's own preparation included), a fork that failed, and a
+///    child that cannot be waited for all answer true.
 ///
 /// A thread that exits while its status is listed is skipped; any other
 /// failure to read answers true: the answer only lets Detcore make calls it
@@ -3936,8 +3936,16 @@ const PROBE_STATX_OFFSET: usize = 8;
 /// instead. First, so that such an end writes no core file and is neither
 /// caught nor held: the process is made undumpable, which a `core_pattern`
 /// pipe respects too, `RLIMIT_CORE` is set to 0, and `SIGSYS` is reset to its
-/// default action and unblocked (the kernel does both for a seccomp `SIGSYS`
-/// anyway; this is for a handler the fork copied).
+/// default action and unblocked. The kernel resets a blocked or ignored
+/// `SIGSYS` itself when a filter traps, but delivers it to a handler, which
+/// the fork copied from the parent and which can make a trapped call look as
+/// if it returned 0. So unless each of those four calls returns 0, and
+/// `SIGSYS`'s action, read back into a buffer whose handler is not `SIG_DFL`
+/// until the kernel writes it, is `SIG_DFL`, the child exits 1 without making
+/// any of the calls above: a filter that fails one of them, or fakes its
+/// success (`SECCOMP_RET_ERRNO` with errno 0 returns 0 and changes nothing),
+/// cannot leave a copied handler to answer for a trapped call (Codex review
+/// round 10 of https://github.com/rrnewton/hermit/pull/3255).
 ///
 /// Only raw system calls are made, every argument as a full `long`, as the
 /// variadic `syscall` reads them: another thread of the parent may have held
@@ -3958,6 +3966,9 @@ unsafe fn entry_lookup_probe_child(dirfd: libc::c_int, page_len: usize) -> ! {
     // A `struct kernel_sigaction` (handler, flags, restorer, mask) of zeros:
     // SIG_DFL, no flags, no signal blocked during a handler.
     let default_action = [0u64; 4];
+    // Where `SIGSYS`'s action is read back: its handler is not SIG_DFL (0)
+    // unless the kernel writes it.
+    let mut sigsys_action = [u64::MAX; 4];
     let sigsys = 1u64 << (libc::SIGSYS - 1);
     let sigset_size: c_long = 8;
     let mut statfs = std::mem::MaybeUninit::<libc::statfs>::uninit();
@@ -3971,54 +3982,63 @@ unsafe fn entry_lookup_probe_child(dirfd: libc::c_int, page_len: usize) -> ! {
             0 as c_long,
             0 as c_long,
             0 as c_long,
-        );
-        libc::syscall(
-            libc::SYS_prlimit64,
-            0 as c_long,
-            c_long::from(libc::RLIMIT_CORE),
-            &no_core as *const libc::rlimit64 as c_long,
-            0 as c_long,
-        );
-        libc::syscall(
-            libc::SYS_rt_sigaction,
-            c_long::from(libc::SIGSYS),
-            default_action.as_ptr() as c_long,
-            0 as c_long,
-            sigset_size,
-        );
-        libc::syscall(
-            libc::SYS_rt_sigprocmask,
-            c_long::from(libc::SIG_UNBLOCK),
-            &sigsys as *const u64 as c_long,
-            0 as c_long,
-            sigset_size,
-        );
-        libc::syscall(libc::SYS_fstatfs, dirfd, statfs.as_mut_ptr() as c_long) == 0 && {
-            let page = libc::syscall(
-                libc::SYS_mmap,
+        ) == 0
+            && libc::syscall(
+                libc::SYS_prlimit64,
                 0 as c_long,
-                page_len as c_long,
-                c_long::from(libc::PROT_READ | libc::PROT_WRITE),
-                c_long::from(libc::MAP_PRIVATE | libc::MAP_ANONYMOUS),
-                -1 as c_long,
+                c_long::from(libc::RLIMIT_CORE),
+                &no_core as *const libc::rlimit64 as c_long,
                 0 as c_long,
-            );
-            page != -1 && {
-                let path = page as *mut u8;
-                path.write(b'.');
-                path.add(1).write(0);
-                let asked = libc::syscall(
-                    libc::SYS_statx,
-                    dirfd,
-                    page,
-                    c_long::from(libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT),
-                    c_long::from(libc::STATX_INO),
-                    path.add(PROBE_STATX_OFFSET) as c_long,
-                ) == 0;
-                let unmapped = libc::syscall(libc::SYS_munmap, page, page_len as c_long) == 0;
-                asked && unmapped
+            ) == 0
+            && libc::syscall(
+                libc::SYS_rt_sigaction,
+                c_long::from(libc::SIGSYS),
+                default_action.as_ptr() as c_long,
+                0 as c_long,
+                sigset_size,
+            ) == 0
+            && libc::syscall(
+                libc::SYS_rt_sigprocmask,
+                c_long::from(libc::SIG_UNBLOCK),
+                &sigsys as *const u64 as c_long,
+                0 as c_long,
+                sigset_size,
+            ) == 0
+            && libc::syscall(
+                libc::SYS_rt_sigaction,
+                c_long::from(libc::SIGSYS),
+                0 as c_long,
+                sigsys_action.as_mut_ptr() as c_long,
+                sigset_size,
+            ) == 0
+            && sigsys_action[0] == libc::SIG_DFL as u64
+            && libc::syscall(libc::SYS_fstatfs, dirfd, statfs.as_mut_ptr() as c_long) == 0
+            && {
+                let page = libc::syscall(
+                    libc::SYS_mmap,
+                    0 as c_long,
+                    page_len as c_long,
+                    c_long::from(libc::PROT_READ | libc::PROT_WRITE),
+                    c_long::from(libc::MAP_PRIVATE | libc::MAP_ANONYMOUS),
+                    -1 as c_long,
+                    0 as c_long,
+                );
+                page != -1 && {
+                    let path = page as *mut u8;
+                    path.write(b'.');
+                    path.add(1).write(0);
+                    let asked = libc::syscall(
+                        libc::SYS_statx,
+                        dirfd,
+                        page,
+                        c_long::from(libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT),
+                        c_long::from(libc::STATX_INO),
+                        path.add(PROBE_STATX_OFFSET) as c_long,
+                    ) == 0;
+                    let unmapped = libc::syscall(libc::SYS_munmap, page, page_len as c_long) == 0;
+                    asked && unmapped
+                }
             }
-        }
     };
     // SAFETY: ends this child without running anything of the parent's.
     unsafe { libc::_exit(if succeeded { 0 } else { 1 }) }
@@ -6863,6 +6883,113 @@ mod tests {
             libc::SYS_statx,
             libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
         );
+        assert!(probe_under(&program, |status| exited_with(status, 1)));
+    }
+
+    /// A seccomp program that traps `fstatfs`, answers `sigaction_verdict`
+    /// for an `rt_sigaction` of `SIGSYS`, and allows every other call; a call
+    /// made through another architecture's calling convention kills the
+    /// process.
+    #[cfg(target_arch = "x86_64")]
+    fn sigsys_setup_program(sigaction_verdict: u32) -> [libc::sock_filter; 11] {
+        let statement = |code: u32, k: u32| libc::sock_filter {
+            code: code as u16,
+            jt: 0,
+            jf: 0,
+            k,
+        };
+        let jump_if_equal = |k: u32, jt: u8, jf: u8| libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            jt,
+            jf,
+            k,
+        };
+        let load_word = |offset: u32| statement(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, offset);
+        let ret = |verdict: u32| statement(libc::BPF_RET | libc::BPF_K, verdict);
+        [
+            // struct seccomp_data: nr at offset 0, arch at offset 4, the low
+            // word of args[0] at offset 16 on a little-endian machine.
+            load_word(4),
+            jump_if_equal(AUDIT_ARCH_NATIVE, 1, 0),
+            ret(libc::SECCOMP_RET_KILL_PROCESS),
+            load_word(0),
+            jump_if_equal(u32::try_from(libc::SYS_fstatfs).unwrap(), 0, 1),
+            ret(libc::SECCOMP_RET_TRAP),
+            jump_if_equal(u32::try_from(libc::SYS_rt_sigaction).unwrap(), 0, 3),
+            load_word(16),
+            jump_if_equal(u32::try_from(libc::SIGSYS).unwrap(), 0, 1),
+            ret(sigaction_verdict),
+            ret(libc::SECCOMP_RET_ALLOW),
+        ]
+    }
+
+    /// Install a `SIGSYS` handler that makes a call a filter trapped look as
+    /// if it returned 0, as a handler that emulates refused calls does. A
+    /// child forked afterwards inherits it.
+    #[cfg(target_arch = "x86_64")]
+    fn install_a_sigsys_handler_that_fakes_success() {
+        extern "C" fn fake_success(
+            _signal: libc::c_int,
+            _info: *mut libc::siginfo_t,
+            context: *mut libc::c_void,
+        ) {
+            // SAFETY: the kernel passes an SA_SIGINFO handler the context
+            // of the interrupted thread, which it restores on return.
+            unsafe {
+                (*context.cast::<libc::ucontext_t>()).uc_mcontext.gregs[libc::REG_RAX as usize] = 0;
+            }
+        }
+        let handler: extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) =
+            fake_success;
+        // SAFETY: a zeroed sigaction is a valid one; the handler only writes
+        // the context the kernel gives it.
+        let installed = unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = handler as libc::sighandler_t;
+            action.sa_flags = libc::SA_SIGINFO;
+            libc::sigaction(libc::SIGSYS, &action, std::ptr::null_mut()) == 0
+        };
+        assert!(
+            installed,
+            "precondition: the SIGSYS handler is installed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    // Codex review of https://github.com/rrnewton/hermit/pull/3255, round
+    // 10, P1. A launcher whose filter refuses `rt_sigaction` of `SIGSYS`
+    // (`EPERM`) keeps a handler that makes a trapped call return 0, and the
+    // probe child, which ignored the results of its preparation, inherited
+    // that handler: its trapped `fstatfs` "succeeded", it exited 0, and the
+    // flag was false, while a guest, whose exec resets the handler, would be
+    // ended by the `SIGSYS` of Detcore's injected call. Now a preparation
+    // call that fails makes the child exit 1 before any of the calls, and
+    // the flag is true.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_filter_that_refuses_resetting_sigsys_makes_the_flag_true() {
+        let name = "a_filter_that_refuses_resetting_sigsys_makes_the_flag_true";
+        if !in_seccomp_scenario(name) {
+            return run_seccomp_scenario(name);
+        }
+        install_a_sigsys_handler_that_fakes_success();
+        let program = sigsys_setup_program(libc::SECCOMP_RET_ERRNO | libc::EPERM as u32);
+        assert!(probe_under(&program, |status| exited_with(status, 1)));
+    }
+
+    // The same, with `SECCOMP_RET_ERRNO` and errno 0, which makes the
+    // `rt_sigaction` return 0 and change nothing: its result alone cannot
+    // tell, so the child reads `SIGSYS`'s action back into a buffer that does
+    // not start out as `SIG_DFL`, and exits 1 unless it shows `SIG_DFL`.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_filter_that_fakes_resetting_sigsys_makes_the_flag_true() {
+        let name = "a_filter_that_fakes_resetting_sigsys_makes_the_flag_true";
+        if !in_seccomp_scenario(name) {
+            return run_seccomp_scenario(name);
+        }
+        install_a_sigsys_handler_that_fakes_success();
+        let program = sigsys_setup_program(libc::SECCOMP_RET_ERRNO);
         assert!(probe_under(&program, |status| exited_with(status, 1)));
     }
 
