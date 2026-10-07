@@ -686,7 +686,7 @@ impl Scheduler {
             // thread alone (`fire_timer_signal`). A child-exit `SIGCHLD` keeps
             // its sends: the branch above when it is due, `fire_alarm` below
             // otherwise.
-            self.fire_timer_signal(id.process(), tid, signal);
+            self.fire_timer_signal(deadline, id.process(), tid, signal);
         } else {
             self.fire_alarm(id.process(), tid, signal);
         }

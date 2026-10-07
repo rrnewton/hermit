@@ -32,8 +32,8 @@ mod threads;
 /// interrupted wait with the deadline it kept.
 pub(crate) use threads::FutexDeadline;
 /// The kernel's view of a guest thread's signals, which the scheduler reads when
-/// it commits a wake for a parked precise-mode futex waiter.
-#[cfg(test)]
+/// it commits a wake for a parked precise-mode futex waiter, and when it
+/// records the signals pending for a call committed outside the runnable set.
 pub(crate) use threads::KernelSignalState;
 /// Watches a thread the scheduler released into `rt_sigsuspend` until it is
 /// seen asleep there (`Scheduler::step1b_hold_for_rt_sigsuspend_entry`).

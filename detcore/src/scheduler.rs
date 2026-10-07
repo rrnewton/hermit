@@ -88,7 +88,6 @@ use crate::resources::Resources;
 use crate::scheduler::replayer::StopReason;
 use crate::scheduler::replayer::events_consistent;
 use crate::scheduler::replayer::events_match;
-#[cfg(test)]
 use crate::syscalls::KernelSignalState;
 use crate::syscalls::read_kernel_signal_state;
 use crate::types::ChildWaitExitClass;
@@ -893,6 +892,20 @@ pub struct Scheduler {
     /// Set when such a thread was not seen asleep within the observer's bound;
     /// the scheduler loop ends the run with it (`exit_on_scheduler_refusal`).
     rt_sigsuspend_entry_refusal: Option<RtSigsuspendEntryRefusal>,
+    /// `rt_sigsuspend` waiters whose sleep step1b confirmed, each with the
+    /// operation the confirmation belongs to: the syscall layer saw the thread
+    /// asleep in that call under the mask then recorded in
+    /// `blocked.out_of_scheduler_masks` (`timer_copy_candidate`).
+    confirmed_rt_sigsuspend_sleeps: BTreeMap<DetTid, ExternalOpId>,
+    /// Blocking external calls that install no signal mask of their own, as
+    /// recorded at their commit (`timer_copy_candidate`).
+    own_mask_background_calls: BTreeMap<DetTid, OwnMaskBackgroundCall>,
+    /// For a process and a signal number, the thread that a timer's signal
+    /// was last sent to alone and that the release barrier has not yet
+    /// requeued (`fire_timer_signal`). An entry is meaningful only while that
+    /// thread is in `blocked.signaled_background`, and it is removed whenever
+    /// the thread leaves that set or its pool (`forget_timer_copy_records`).
+    outstanding_timer_copies: BTreeMap<(DetPid, i32), DetTid>,
     #[cfg(test)]
     host_signal_attempts: u64,
     /// When set, a signal the scheduler would send to a guest thread is
@@ -1716,6 +1729,20 @@ struct RtSigsuspendEntryHold {
     entry: Option<RtSigsuspendEntry>,
 }
 
+/// A blocking external call that installs no signal mask of its own, as the
+/// scheduler recorded it when it committed the call
+/// (`Scheduler::own_mask_background_calls`, read by
+/// `Scheduler::timer_copy_candidate`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OwnMaskBackgroundCall {
+    /// The operation the commit began.
+    op_id: ExternalOpId,
+    /// The signals pending for the thread or its process when the call was
+    /// committed (`SigPnd | ShdPnd`), read while the thread was still stopped
+    /// at its request.
+    pending_at_commit: u64,
+}
+
 /// The thread whose `rt_sigsuspend` entry the syscall layer should observe,
 /// with the operation the observation belongs to
 /// (`Scheduler::rt_sigsuspend_entry_probe`).
@@ -2237,6 +2264,9 @@ impl Scheduler {
             signaled_background_refusal: None,
             rt_sigsuspend_entry_holds: BTreeMap::new(),
             rt_sigsuspend_entry_refusal: None,
+            confirmed_rt_sigsuspend_sleeps: BTreeMap::new(),
+            own_mask_background_calls: BTreeMap::new(),
+            outstanding_timer_copies: BTreeMap::new(),
             #[cfg(test)]
             host_signal_attempts: 0,
             #[cfg(test)]
@@ -3408,6 +3438,7 @@ impl Scheduler {
         self.blocked.sigchld_ready.remove(dtid);
         self.blocked.signaled_background.remove(dtid);
         self.rt_sigsuspend_entry_holds.remove(dtid);
+        self.forget_timer_copy_records(*dtid);
         self.blocked.child_waiters.remove(dtid);
         self.blocked.physical_child_ready.remove(dtid);
         self.blocked.physical_child_waiters.retain(|_, waiters| {
@@ -3736,6 +3767,12 @@ impl Scheduler {
                             .out_of_scheduler_masks
                             .insert(thread, Some(blocked));
                         self.rt_sigsuspend_entry_holds.remove(&thread);
+                        // The thread is asleep in this call under `blocked`
+                        // until a signal it admits wakes it, so a timer's
+                        // signal that it admits may be sent to it alone
+                        // (`timer_copy_candidate`).
+                        self.confirmed_rt_sigsuspend_sleeps
+                            .insert(thread, hold.op_id);
                     }
                     Some(RtSigsuspendEntry::Unconfirmed { observed, waited })
                         if self.rt_sigsuspend_entry_refusal.is_none() =>
@@ -3878,6 +3915,7 @@ impl Scheduler {
                 // Left its pool, exited, or unregistered: nothing to order.
                 _ => {
                     self.blocked.signaled_background.remove(&dtid);
+                    self.forget_timer_copy_records(dtid);
                 }
             }
         }
@@ -3917,6 +3955,9 @@ impl Scheduler {
                 external.is_some() ^ sigsuspend.is_some(),
                 "ready thread must belong to exactly one blocking pool"
             );
+            // The thread's wake is folded here, so a timer copy it was sent
+            // alone is no longer outstanding (`fire_timer_signal`).
+            self.forget_timer_copy_records(dtid);
             self.run_queue.push_eager_io_repoll(dtid);
         }
         Ok(())
@@ -4060,8 +4101,8 @@ impl Scheduler {
     }
 
     /// `fire_alarm` for the signal of an expired `alarm`, `setitimer` or POSIX
-    /// timer of `dpid`, where the scheduler models signal targets
-    /// (`models_signal_targets`); `dtid` is the thread the timer names.
+    /// timer of `dpid`, due at `deadline`, where the scheduler models signal
+    /// targets (`models_signal_targets`); `dtid` is the thread the timer names.
     ///
     /// `fire_alarm` sends with `kill(2)`, which queues the signal on the
     /// process. The kernel gives it to the named thread only if that thread
@@ -4070,19 +4111,34 @@ impl Scheduler {
     /// under the ptrace backend the kernel gives the signal to a thread
     /// sleeping in `rt_sigsuspend` or another blocking call, and that thread
     /// was never armed to be woken: the run then stops as a deadlock
-    /// (https://github.com/rrnewton/hermit/pull/3224). Here the scheduler
-    /// chooses the thread itself (`timer_signal_recipient`) and sends to that
-    /// thread alone (`HostSignalSend::ThreadDirected`), so the kernel cannot
-    /// give the signal to another; `send_signal_to_guest` then wakes or arms
-    /// the chosen thread as it would for `fire_alarm`.
+    /// (https://github.com/rrnewton/hermit/pull/3224). Here, when a thread will
+    /// take the signal before it runs any guest instruction or exits
+    /// (`timer_copy_candidate`), the scheduler sends it to that thread alone
+    /// (`HostSignalSend::ThreadDirected`), so the kernel cannot give it to
+    /// another; `send_signal_to_guest` then arms the thread for the release
+    /// barrier as it would for `fire_alarm`. The named thread is preferred,
+    /// then thread-ID order (`timer_signal_recipient`). When no thread is a
+    /// candidate, the signal is sent with `kill(2)` exactly as `fire_alarm`
+    /// sends it, and the kernel coalesces it with a copy already pending on
+    /// the process, as on Linux.
     ///
-    /// When no thread is known to admit the signal, it is sent with `kill(2)`
-    /// exactly as `fire_alarm` sends it, and it stays pending on the process
-    /// in the kernel's shared queue until a thread unblocks it in that
-    /// thread's own turn. That happens when every live thread's mask blocks
-    /// the signal, or when the only threads that admit it are vfork parents,
-    /// threads an earlier signal already released from their wait, or
-    /// threads whose mask is unknown (`timer_signal_recipient`).
+    /// While a copy sent to one thread alone is outstanding (sent, and the
+    /// release barrier has not yet requeued that thread), a further expiry of
+    /// the same signal in the same process is coalesced here: nothing is sent,
+    /// and an INFO record names the process, the signal, the holder and the
+    /// virtual time. The woken holder takes its copy at a host-timed moment,
+    /// so a second kernel send would be dropped or delivered as host timing
+    /// decides. The window is exactly the holder's stay in
+    /// `blocked.signaled_background`, and the record
+    /// (`outstanding_timer_copies`) is removed wherever the holder leaves that
+    /// set or its pool (`forget_timer_copy_records`): its removal, the
+    /// barrier's requeue, never a host-timed event. Today the schedule cannot
+    /// reach this branch: a pass pops at most one timer before it skips once
+    /// a thread is armed (`step2b_process_timed`), and the barrier that
+    /// requeues the holder runs before the next pop
+    /// (`step2_release_signaled_background`). The branch keeps the rule at
+    /// the send rather than in that ordering. `timer_getoverrun` stays 0:
+    /// overruns are not modeled (`syscalls/time.rs`).
     ///
     /// Known differences from Linux:
     /// * The guest sees `si_code` `SI_TKILL` for a signal sent to one thread.
@@ -4091,7 +4147,16 @@ impl Scheduler {
     ///   process can send to another, and `SI_TIMER` for a POSIX timer.
     /// * A `SIGEV_THREAD_ID` timer is still treated as directed at the
     ///   process (`timer_create` in `syscalls/time.rs`).
-    fn fire_timer_signal(&mut self, dpid: DetPid, dtid: DetTid, sig: Signal) {
+    /// * Distinct timers of one process that share a signal are coalesced
+    ///   with one another, as `fire_alarm`'s `kill(2)` sends already are;
+    ///   Linux queues each POSIX timer's signal separately.
+    fn fire_timer_signal(
+        &mut self,
+        deadline: LogicalTime,
+        dpid: DetPid,
+        dtid: DetTid,
+        sig: Signal,
+    ) {
         #[cfg(test)]
         {
             self.host_signal_attempts += 1;
@@ -4103,17 +4168,41 @@ impl Scheduler {
             );
             return;
         };
+        let key = (dpid, sig as i32);
+        if let Some(&holder) = self.outstanding_timer_copies.get(&key) {
+            let outstanding = self.blocked.signaled_background.contains(&holder);
+            debug_assert!(
+                outstanding,
+                "a timer copy record outlived its holder's stay in signaled_background"
+            );
+            if outstanding {
+                info!(
+                    "[dpid {}] Timer signal {} expired at {} ns while thread {} has not yet taken the copy sent to it alone; coalesced with that copy, nothing sent.",
+                    dpid,
+                    sig,
+                    deadline.as_nanos(),
+                    holder
+                );
+                return;
+            }
+            self.outstanding_timer_copies.remove(&key);
+        }
         match self.timer_signal_recipient(dpid, preferred, sig) {
             Some(recipient) => {
                 info!(
-                    "[dtid {}] Alarm fired, delivering signal {} to guest thread {} alone: its mask admits the signal.",
+                    "[dtid {}] Alarm fired, delivering signal {} to guest thread {} alone: it takes the signal before it runs any guest instruction.",
                     preferred, sig, recipient
                 );
                 self.signal_guest_thread_directed(recipient, sig);
+                // The send armed the recipient for the release barrier
+                // (`arm_signaled_background`) unless it had already exited.
+                if self.blocked.signaled_background.contains(&recipient) {
+                    self.outstanding_timer_copies.insert(key, recipient);
+                }
             }
             None => {
                 info!(
-                    "[dtid {}] Alarm fired, delivering signal {} to guest process: no thread is known to admit it, so it stays pending on the process.",
+                    "[dtid {}] Alarm fired, delivering signal {} to guest process: no thread takes it alone, so it is sent to the process as fire_alarm sends it.",
                     preferred, sig
                 );
                 self.signal_guest(preferred, sig);
@@ -4121,35 +4210,16 @@ impl Scheduler {
         }
     }
 
-    /// The thread of `process` that a timer's signal is sent to
-    /// (`fire_timer_signal`): `preferred` if it admits the signal, otherwise
-    /// the first thread in thread-ID order that does. `None` when no thread is
-    /// known to admit it.
+    /// The thread of `process` that a timer's signal is sent to alone
+    /// (`fire_timer_signal`): `preferred` if it is a candidate
+    /// (`timer_copy_candidate`), otherwise the first candidate in thread-ID
+    /// order; `None` when there is none.
     ///
-    /// The masks are those `kernel_sigchld_target` uses, read at the same
-    /// kind of point (a step2b timed pop or the step2d empty-queue time skip,
-    /// where no guest thread holds the turn), so the choice is a function of
-    /// the schedule. POSIX lets any thread that does not block a
-    /// process-directed signal take it; preferring `preferred` follows Linux,
-    /// which tries the thread the timer names first, and thread-ID order
-    /// stands in for the kernel's round-robin `curr_target`.
-    ///
-    /// Three kinds of thread are never chosen:
-    /// * A vfork parent: it sleeps killable until the child execs or exits,
-    ///   so a non-fatal signal sent to it alone would wait for that.
-    /// * A thread that an earlier signal already released from its wait
-    ///   (`BlockedPool::signaled_background`). The kernel has woken it, and
-    ///   from a host-timed moment on it runs under the mask the kernel
-    ///   restores when the call returns, not the one recorded when the call
-    ///   was committed. Another thread that admits the signal can take it, as
-    ///   Linux allows.
-    /// * A thread whose mask is unknown. Its mask cannot be read only once it
-    ///   no longer exists, which for a thread the guest did not kill means it
-    ///   was killed from outside the container (`kernel_sigchld_target`); the
-    ///   kernel skips an exiting thread too (`wants_signal` and
-    ///   `PF_EXITING`). If no other thread admits the signal, it is sent to
-    ///   the process, where such a thread is in the same position as for any
-    ///   signal sent from outside.
+    /// POSIX lets any thread that does not block a process-directed signal
+    /// take it; preferring `preferred` follows Linux, which tries the thread
+    /// the timer names first, and thread-ID order stands in for the kernel's
+    /// round-robin `curr_target`. Nothing is read from the kernel here: every
+    /// input was recorded at a committed point.
     fn timer_signal_recipient(
         &self,
         process: DetPid,
@@ -4160,13 +4230,129 @@ impl Scheduler {
         let mut threads = self.process_signal_targets(process);
         // Stable, so the rest stay in thread-ID order.
         threads.sort_by_key(|thread| *thread != preferred);
-        threads.into_iter().find(|thread| {
-            !self.vfork_barriers.contains_key(thread)
-                && !self.blocked.signaled_background.contains(thread)
-                && self
-                    .thread_signal_mask(*thread)
-                    .is_some_and(|mask| mask & bit == 0)
-        })
+        threads
+            .into_iter()
+            .find(|thread| self.timer_copy_candidate(*thread, bit))
+    }
+
+    /// Whether a timer's signal, `bit` its mask bit, may be sent to `thread`
+    /// alone (`fire_timer_signal`): whether `thread` will take it before it
+    /// runs any guest instruction or exits.
+    ///
+    /// A timer fires at a step2b pop or the step2d empty-queue time skip, when
+    /// no guest thread holds the turn. Each thread of the process is then in
+    /// one of these states:
+    /// * Running guest code: impossible, since no thread holds the turn.
+    /// * Held in a ptrace stop at a queued request of any kind (an exit, an
+    ///   `rt_sigprocmask`, a parked futex wait, a yield): not a candidate. An
+    ///   exit takes no further signal, and another request may block the
+    ///   signal before the thread next returns to user mode.
+    /// * Blocked in a background call that installs no signal mask of its
+    ///   own (`external_io_blockers`, committed without a temporary mask): a
+    ///   candidate if the mask read at its commit admits the signal and the
+    ///   signal was not pending for the thread or its process then
+    ///   (`OwnMaskBackgroundCall`). Until the scheduler requeues it, it runs
+    ///   no guest instruction, and its mask is the one it stopped with.
+    ///   Asleep, it is woken by the signal; if its call has already returned
+    ///   and it waits at its posted continuation, that continuation only
+    ///   finishes the call, and it takes the signal when it next returns to
+    ///   user mode. With the signal already pending at its commit, a copy sent
+    ///   to it alone could sit next to the pending one where Linux keeps one,
+    ///   so it is not a candidate.
+    /// * Blocked in a background call that installs a temporary mask of its
+    ///   own: not a candidate, since from a host-timed moment on it runs under
+    ///   the mask the kernel restores when the call returns. Under
+    ///   `models_signal_targets` two calls are committed that way, each with
+    ///   its temporary mask recorded at the commit: `pselect6` with more
+    ///   descriptors than the scheduler polls, and `rt_sigsuspend` when a
+    ///   signal its new mask admits is already pending (`syscalls/signal.rs`).
+    ///   `ppoll`, `epoll_pwait` with a mask, `epoll_pwait2`, `io_pgetevents`
+    ///   and `rt_sigtimedwait` are never committed as background calls there.
+    /// * Released by an earlier signal and not yet requeued
+    ///   (`blocked.signaled_background`), whether or not it has reported back:
+    ///   not a candidate. The kernel has woken it, and it runs under the mask
+    ///   the kernel restores, from a host-timed moment on.
+    /// * In `rt_sigsuspend` with its entry not yet confirmed (a hold in
+    ///   `rt_sigsuspend_entry_holds`): not a candidate, and no timer fires
+    ///   while a hold lasts (`step1b_hold_for_rt_sigsuspend_entry`).
+    /// * In `rt_sigsuspend` with its sleep confirmed for its current operation
+    ///   (`confirmed_rt_sigsuspend_sleeps`): a candidate if the confirmed mask
+    ///   admits the signal. It sleeps until a signal it admits arrives, so the
+    ///   signal wakes it. That it sleeps under a mask admitting the signal also
+    ///   means the signal is not pending on its process: the kernel does not
+    ///   let `rt_sigsuspend` sleep while a signal it admits is pending.
+    /// * In `rt_sigsuspend` after the syscall layer gave up confirming its
+    ///   entry within the host-time bound (`RtSigsuspendEntry::Unconfirmed`):
+    ///   not a candidate. The hold is kept, a refusal is recorded and the run
+    ///   ends (`RtSigsuspendEntryRefusal`), so no timer fires.
+    /// * A vfork parent: not a candidate. It sleeps killable until the child
+    ///   execs or exits, so a non-fatal signal sent to it alone waits for that.
+    /// * Exiting, killed by the guest (`logically_kill_thread`): not a
+    ///   candidate, since it was taken out of every pool
+    ///   (`remove_blocking_entries`).
+    /// * Gone (exited, a zombie, or reaped): not in `process_signal_targets`.
+    /// * Its mask unknown or unreadable at its commit: not a candidate.
+    /// * Any thread on a backend whose signals interrupt external calls
+    ///   (`signal_interrupts_external_syscalls`): not a candidate, since such
+    ///   a thread is not armed; no backend sets that with
+    ///   `models_signal_targets`.
+    ///
+    /// Every input is scheduler state, and nothing is read from the kernel
+    /// here. Membership changes only at points of the schedule: a commit,
+    /// whose mask and pending-signal read is made while the thread is still
+    /// stopped at its request; step1b's confirmation; the release barrier's
+    /// requeue; and removal. The one host-time bound on the path is the
+    /// entry bound: when it expires, the run ends with a refusal, so a loaded
+    /// host can turn a run into a refusal but cannot send the signal to a
+    /// different thread. A background call that returns on its own is
+    /// requeued by `step2c` at a pass host timing chooses, after which it is
+    /// no candidate; that is the envelope every external call already has,
+    /// and it is a residual of this rule. Operation IDs keep a stale record
+    /// harmless: a confirmation or commit counts only for the operation the
+    /// thread is in.
+    fn timer_copy_candidate(&self, thread: DetTid, bit: u64) -> bool {
+        if self.backend.signal_interrupts_external_syscalls
+            || self.vfork_barriers.contains_key(&thread)
+            || self.blocked.signaled_background.contains(&thread)
+            || self.rt_sigsuspend_entry_holds.contains_key(&thread)
+            || self.run_queue.contains_tid(thread)
+        {
+            return false;
+        }
+        let admits = matches!(
+            self.blocked.out_of_scheduler_masks.get(&thread),
+            Some(Some(mask)) if mask & bit == 0
+        );
+        if !admits {
+            return false;
+        }
+        let confirmed_sleep = self
+            .blocked
+            .rt_sigsuspend_blockers
+            .get(&thread)
+            .is_some_and(|op| self.confirmed_rt_sigsuspend_sleeps.get(&thread) == Some(op));
+        let own_mask_call = self
+            .blocked
+            .external_io_blockers
+            .get(&thread)
+            .is_some_and(|op| {
+                self.own_mask_background_calls
+                    .get(&thread)
+                    .is_some_and(|call| call.op_id == *op && call.pending_at_commit & bit == 0)
+            });
+        confirmed_sleep || own_mask_call
+    }
+
+    /// Drop what lets a timer's signal be sent to `thread` alone, and any copy
+    /// outstanding for it (`timer_copy_candidate`, `fire_timer_signal`).
+    /// Called wherever the thread leaves its blocking pool or
+    /// `blocked.signaled_background`: its removal, the release barrier, and
+    /// `step2c`'s requeue.
+    fn forget_timer_copy_records(&mut self, thread: DetTid) {
+        self.confirmed_rt_sigsuspend_sleeps.remove(&thread);
+        self.own_mask_background_calls.remove(&thread);
+        self.outstanding_timer_copies
+            .retain(|_, holder| *holder != thread);
     }
 
     // Follow Linux semantics for delivering a signal to a thread within a process group.
@@ -4987,19 +5173,28 @@ impl Scheduler {
     /// when it cannot be read. Ordered by the schedule only while `thread` is
     /// stopped at a request (`kernel_sigchld_target`).
     fn read_thread_blocked_mask(&self, thread: DetTid) -> Option<u64> {
+        self.read_thread_signal_state(thread)
+            .map(|state| state.blocked)
+    }
+
+    /// `thread`'s signal state as the kernel reports it
+    /// (`/proc/<pid>/task/<tid>/status`); `None` when it cannot be read.
+    /// Ordered by the schedule only while `thread` is stopped at a request,
+    /// as `read_thread_blocked_mask` is.
+    fn read_thread_signal_state(&self, thread: DetTid) -> Option<KernelSignalState> {
         #[cfg(test)]
         self.test_kernel_mask_reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(test)]
         if let Some(state) = self.test_kernel_signal_states.get(&thread) {
-            return Some(state.blocked);
+            return Some(*state);
         }
         let process = self.sigchld_process(thread);
         match read_kernel_signal_state(
             reverie::Pid::from_raw(process.as_raw()),
             reverie::Pid::from_raw(thread.as_raw()),
         ) {
-            Ok(state) => Some(state.blocked),
+            Ok(state) => Some(state),
             Err(errno) => {
                 debug!(
                     "[dtid {}] cannot read its signal mask ({}); it is not a SIGCHLD target.",
@@ -5157,6 +5352,17 @@ impl Scheduler {
                         external.is_some() ^ sigsuspend.is_some(),
                         "ready thread must belong to exactly one blocking pool"
                     );
+                    // This step runs only once the release barrier has
+                    // requeued every armed thread (`step2_process_blocked`),
+                    // so no timer copy can be outstanding for this thread.
+                    debug_assert!(
+                        !scheduler
+                            .outstanding_timer_copies
+                            .values()
+                            .any(|holder| holder == ready_dtid),
+                        "a harvested thread still holds an outstanding timer copy"
+                    );
+                    scheduler.forget_timer_copy_records(*ready_dtid);
                     scheduler.run_queue.push_eager_io_repoll(*ready_dtid);
                 }
             };
@@ -6037,9 +6243,20 @@ impl Scheduler {
                 // `hermit-cli/src/lib.rs`). On a backend whose IDs are
                 // guest-virtual, a `/proc` read of `dettid` would name an
                 // unrelated host thread or none at all.
-                let sleeping_mask = self
-                    .models_signal_targets
-                    .then(|| blocked_signal_mask.or_else(|| self.read_thread_blocked_mask(dettid)));
+                //
+                // For an external call that installs no mask of its own, the
+                // same read also records the signals pending for the thread
+                // then (`OwnMaskBackgroundCall`): such a call may be sent a
+                // timer's signal alone only if that signal was not already
+                // pending (`timer_copy_candidate`).
+                let own_mask_state = (self.models_signal_targets
+                    && blocked_signal_mask.is_none()
+                    && matches!(rid, ResourceID::BlockingExternalIO(_)))
+                .then(|| self.read_thread_signal_state(dettid));
+                let sleeping_mask = self.models_signal_targets.then(|| match own_mask_state {
+                    Some(state) => state.map(|state| state.blocked),
+                    None => blocked_signal_mask.or_else(|| self.read_thread_blocked_mask(dettid)),
+                });
                 self.run_queue.consume_yield_exclusion();
                 self.unblock_guest(dettid, resp)?;
 
@@ -6053,6 +6270,15 @@ impl Scheduler {
                 assert!(old.is_none(), "thread started a second external operation");
                 if let Some(mask) = sleeping_mask {
                     self.blocked.out_of_scheduler_masks.insert(dettid, mask);
+                }
+                if let Some(Some(state)) = own_mask_state {
+                    self.own_mask_background_calls.insert(
+                        dettid,
+                        OwnMaskBackgroundCall {
+                            op_id: *op_id,
+                            pending_at_commit: state.pending,
+                        },
+                    );
                 }
                 // The real `rt_sigsuspend` copies its mask from guest memory
                 // only once the thread runs. No other guest thread may run
@@ -11645,14 +11871,85 @@ mod test {
         );
     }
 
-    /// Commit `thread`'s `rt_sigsuspend` with `mask` its temporary mask.
-    fn suspend_with_mask(scheduler: &mut Scheduler, thread: DetTid, mask: u64) {
+    /// Commit `thread`'s `rt_sigsuspend` with `mask` its temporary mask, and
+    /// leave its entry unconfirmed: the scheduler still holds for the syscall
+    /// layer to see the thread asleep (`step1b_hold_for_rt_sigsuspend_entry`).
+    fn suspend_unconfirmed(scheduler: &mut Scheduler, thread: DetTid, mask: u64) -> ExternalOpId {
+        let op = ExternalOpId::new(thread, 1);
         commit_out_of_scheduler_call(
             scheduler,
             thread,
-            ResourceID::BlockingRtSigsuspend(ExternalOpId::new(thread, 1)),
+            ResourceID::BlockingRtSigsuspend(op),
             Some(mask),
         );
+        op
+    }
+
+    /// Commit `thread`'s `rt_sigsuspend` with `mask` its temporary mask, and
+    /// confirm its sleep as step1b does once the syscall layer has seen the
+    /// thread asleep under that mask. On a scheduler that does not model
+    /// signal targets there is no hold, and nothing to confirm.
+    fn suspend_with_mask(scheduler: &mut Scheduler, thread: DetTid, mask: u64) {
+        let op = suspend_unconfirmed(scheduler, thread, mask);
+        scheduler.report_rt_sigsuspend_entry(
+            thread,
+            op,
+            RtSigsuspendEntry::Asleep { blocked: mask },
+        );
+        let _ = scheduler.step1b_hold_for_rt_sigsuspend_entry();
+        assert!(!scheduler.rt_sigsuspend_entry_holds.contains_key(&thread));
+    }
+
+    /// Commit `thread`'s blocking external call that installs no signal mask
+    /// of its own, with `blocked` its mask and `pending` the signals pending
+    /// for it as the kernel reports them while it is stopped at its request.
+    fn commit_own_mask_call(
+        scheduler: &mut Scheduler,
+        thread: DetTid,
+        blocked: u64,
+        pending: u64,
+    ) -> ExternalOpId {
+        scheduler.test_kernel_signal_states.insert(
+            thread,
+            KernelSignalState {
+                pending,
+                shared_pending: pending,
+                blocked,
+                ..Default::default()
+            },
+        );
+        let op = ExternalOpId::new(thread, 291);
+        commit_out_of_scheduler_call(scheduler, thread, ResourceID::BlockingExternalIO(op), None);
+        op
+    }
+
+    /// Leave `thread` held in a ptrace stop at a request for `rid`, queued and
+    /// not yet granted, with `blocked` its mask as the kernel reports it.
+    fn queue_request(scheduler: &mut Scheduler, thread: DetTid, rid: ResourceID, blocked: u64) {
+        scheduler.test_kernel_signal_states.insert(
+            thread,
+            KernelSignalState {
+                blocked,
+                ..Default::default()
+            },
+        );
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        let req = scheduler.next_turns.get(&thread).unwrap().req.clone();
+        let mut request = Resources::new(thread);
+        request.insert(rid, Permission::RW);
+        scheduler.request_put(&req, request, &global_time);
+        scheduler.runqueue_push_back(thread);
+    }
+
+    /// A request to end `thread`'s life in process 100, without ending its
+    /// thread group.
+    fn exit_request() -> ResourceID {
+        let process = DetPid::from_raw(100);
+        ResourceID::Exit {
+            group: false,
+            process,
+            mm: MmId::initial(process),
+        }
     }
 
     /// Commit `thread`'s vfork through its own `BlockingVfork` grant, the
@@ -11775,17 +12072,19 @@ mod test {
         }
     }
 
-    /// The thread a timer names takes its signal when it admits it, and
-    /// otherwise the first thread in thread-ID order that does. A thread whose
-    /// mask blocks the signal is passed over, and a POSIX timer is treated as
-    /// an alarm is.
+    /// The thread a timer names takes its signal when it may take it alone
+    /// (`timer_copy_candidate`), and otherwise the first thread in thread-ID
+    /// order that may. A thread whose mask blocks the signal is passed over,
+    /// and a POSIX timer is treated as an alarm is.
     #[test]
     fn a_timer_signal_prefers_the_named_thread_then_thread_id_order() {
         let alrm = kernel_signal_bit(libc::SIGALRM);
         let posix = |leader| timed_waiters::SignalTimerId::Posix(leader, 0);
 
-        // The leader admits the alarm: it takes it, its wait ends, and the
-        // worker that also admits it is left asleep.
+        // The leader admits the alarm, but it is parked in a futex wait: held
+        // in a ptrace stop at a queued request, so it is not sent the signal
+        // alone. The worker asleep in `rt_sigsuspend` under a mask that
+        // admits it takes it, and the leader stays parked.
         let mut scheduler = gated_scheduler();
         let (leader, workers, _) = timer_family(&mut scheduler, alrm, &[101]);
         suspend_with_mask(&mut scheduler, workers[0], 0);
@@ -11798,11 +12097,19 @@ mod test {
         );
         assert_eq!(
             host_signal_sends(&scheduler),
-            vec![(leader, Signal::SIGALRM, HostSignalSend::ThreadDirected)]
+            vec![(workers[0], Signal::SIGALRM, HostSignalSend::ThreadDirected)]
         );
-        assert!(!scheduler.is_parked_futex_waiter(leader));
-        assert!(scheduler.run_queue.contains_tid(leader));
-        assert!(scheduler.blocked.signaled_background.is_empty());
+        assert!(scheduler.is_parked_futex_waiter(leader));
+        assert!(!scheduler.run_queue.contains_tid(leader));
+        assert_eq!(
+            scheduler
+                .blocked
+                .signaled_background
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![workers[0]]
+        );
 
         // The leader blocks it, 101 blocks it, and 102 and 103 admit it: 102
         // takes it.
@@ -11997,15 +12304,18 @@ mod test {
         );
     }
 
-    /// A thread blocked in a real external call takes a timer's signal on the
-    /// same terms as an `rt_sigsuspend` waiter. When the mask recorded at its
-    /// commit admits the signal, it alone is sent the signal, thread-directed,
-    /// and it is armed with its request still empty, so every pass waits for
-    /// its own report rather than letting `step2c` take the report at a pass
-    /// host timing chooses (https://github.com/rrnewton/hermit/issues/3222).
-    /// When its call had already returned before the send, its report is the
-    /// continuation it posted, and the next pass requeues it with that; the
-    /// signal stays pending in the kernel until the thread next runs.
+    /// A thread blocked in a real external call that installs no signal mask
+    /// of its own takes a timer's signal on the same terms as an
+    /// `rt_sigsuspend` waiter whose sleep was confirmed. When the mask read at
+    /// its commit admits the signal and the signal was not pending for it
+    /// then, it alone is sent the signal, thread-directed, and it is armed
+    /// with its request still empty, so every pass waits for its own report
+    /// rather than letting `step2c` take the report at a pass host timing
+    /// chooses (https://github.com/rrnewton/hermit/issues/3222). When its call
+    /// had already returned before the send, its report is the continuation
+    /// it posted, and the next pass requeues it with that; the signal stays
+    /// pending in the kernel until the thread next returns to user mode, which
+    /// it does before it runs any guest instruction.
     #[test]
     fn an_alarm_goes_to_the_external_io_blocker_whose_mask_admits_it() {
         let alrm = kernel_signal_bit(libc::SIGALRM);
@@ -12015,13 +12325,7 @@ mod test {
             let mut scheduler = gated_scheduler();
             let (leader, workers, stranger) = timer_family(&mut scheduler, !alrm, &[101]);
             let worker = workers[0];
-            let op = ExternalOpId::new(worker, 291);
-            commit_out_of_scheduler_call(
-                &mut scheduler,
-                worker,
-                ResourceID::BlockingExternalIO(op),
-                Some(0),
-            );
+            let op = commit_own_mask_call(&mut scheduler, worker, 0, 0);
             if already_returned {
                 let req = scheduler.next_turns.get(&worker).unwrap().req.clone();
                 let mut continuation = Resources::new(worker);
@@ -12082,19 +12386,27 @@ mod test {
         }
     }
 
-    /// A thread blocked in a real external call that a timer's signal is not
-    /// known to wake keeps the process-directed send to the thread the timer
-    /// names, and stays in its pool with its request empty: its recorded mask
-    /// blocks the signal or is unknown, it is a vfork parent (committed
-    /// through its own grant, with a mask that admits the signal), an earlier
-    /// signal already released it, or the scheduler does not model signal
-    /// targets. Requeueing it would wait for a report that may never come.
+    /// A thread blocked in a real external call that a timer's signal may not
+    /// be sent to alone (`timer_copy_candidate`) keeps the process-directed
+    /// send to the thread the timer names, and stays in its pool with its
+    /// request empty. That holds when its mask blocks the signal, is unknown,
+    /// or could not be read at its commit; when its call installs a temporary
+    /// mask of its own, which it sleeps under from a host-timed moment on;
+    /// when the signal was already pending for it at its commit, so that a
+    /// copy sent to it alone would sit next to the pending one where Linux
+    /// keeps one; when it is a vfork parent (committed through its own grant,
+    /// with a mask that admits the signal); when an earlier signal already
+    /// released it; and when the scheduler does not model signal targets.
+    /// Requeueing it would wait for a report that may never come.
     #[test]
     fn a_timer_signal_leaves_an_external_io_blocker_it_cannot_wake_in_its_pool() {
         let alrm = kernel_signal_bit(libc::SIGALRM);
         for case in [
             "mask blocks the signal",
             "mask unknown",
+            "mask unreadable at its commit",
+            "temporary mask of its own",
+            "signal pending at its commit",
             "vfork parent",
             "released by an earlier signal",
             "no signal-target model",
@@ -12109,22 +12421,41 @@ mod test {
             };
             let (leader, workers, _) = timer_family(&mut scheduler, !alrm, &[101]);
             let worker = workers[0];
-            let op = if case == "vfork parent" {
-                commit_vfork_parent(&mut scheduler, worker, Some(0))
-            } else {
-                let op = ExternalOpId::new(worker, 291);
-                let mask = if case == "mask blocks the signal" {
-                    alrm
-                } else {
-                    0
-                };
-                commit_out_of_scheduler_call(
-                    &mut scheduler,
-                    worker,
-                    ResourceID::BlockingExternalIO(op),
-                    Some(mask),
-                );
-                op
+            let op = match case {
+                "vfork parent" => commit_vfork_parent(&mut scheduler, worker, Some(0)),
+                "mask blocks the signal" => commit_own_mask_call(&mut scheduler, worker, alrm, 0),
+                "signal pending at its commit" => {
+                    commit_own_mask_call(&mut scheduler, worker, 0, alrm)
+                }
+                "temporary mask of its own" => {
+                    let op = ExternalOpId::new(worker, 291);
+                    commit_out_of_scheduler_call(
+                        &mut scheduler,
+                        worker,
+                        ResourceID::BlockingExternalIO(op),
+                        Some(0),
+                    );
+                    op
+                }
+                "mask unreadable at its commit" => {
+                    let _failing_read = crate::syscalls::signal_state_read_seam::install(|_, _| {
+                        Some(Err(reverie::syscalls::Errno::ESRCH))
+                    });
+                    let op = ExternalOpId::new(worker, 291);
+                    commit_out_of_scheduler_call(
+                        &mut scheduler,
+                        worker,
+                        ResourceID::BlockingExternalIO(op),
+                        None,
+                    );
+                    assert_eq!(
+                        scheduler.blocked.out_of_scheduler_masks.get(&worker),
+                        Some(&None),
+                        "{case}"
+                    );
+                    op
+                }
+                _ => commit_own_mask_call(&mut scheduler, worker, 0, 0),
             };
             match case {
                 "mask unknown" => {
@@ -12170,6 +12501,390 @@ mod test {
             assert_eq!(request_resources(&scheduler, worker), None, "{case}");
             assert!(scheduler.is_parked_futex_waiter(leader), "{case}");
         }
+    }
+
+    /// A thread held in a ptrace stop at a queued request (an `Exit`, a
+    /// `sched_yield`, any request the scheduler has not yet granted) is never
+    /// sent a timer's signal alone, whatever its mask admits. Its next step is
+    /// granted in a later turn, and an `Exit` is carried out by an injected
+    /// `exit` that takes no signal-delivery stop, so a copy sent to it alone
+    /// would be lost with it: Linux drops a thread's private signals when it
+    /// exits. The signal goes to the process with `kill(2)`, as `fire_alarm`
+    /// sends it, naming the thread the timer names, and nothing is armed
+    /// (Codex round-9 finding on https://github.com/rrnewton/hermit/pull/3224).
+    #[test]
+    fn a_timer_signal_never_goes_to_a_thread_stopped_at_a_queued_request() {
+        let alrm = kernel_signal_bit(libc::SIGALRM);
+        for (label, rid) in [
+            ("exit", exit_request()),
+            ("sched_yield", ResourceID::SchedYield),
+        ] {
+            for named_is_queued in [false, true] {
+                let case = format!("{label}, named_is_queued={named_is_queued}");
+                let mut scheduler = gated_scheduler();
+                let (leader, workers, _) = timer_family(&mut scheduler, !alrm, &[101]);
+                let worker = workers[0];
+                queue_request(&mut scheduler, worker, rid.clone(), 0);
+                let named = if named_is_queued { worker } else { leader };
+                scheduler.dispatch_timed_signal(
+                    LogicalTime::from_nanos(1),
+                    timed_waiters::SignalTimerId::Alarm(leader),
+                    named,
+                    Signal::SIGALRM,
+                    true,
+                );
+                assert_eq!(
+                    host_signal_sends(&scheduler),
+                    vec![(named, Signal::SIGALRM, HostSignalSend::ProcessDirected)],
+                    "{case}"
+                );
+                assert!(scheduler.blocked.signaled_background.is_empty(), "{case}");
+                assert!(scheduler.run_queue.contains_tid(worker), "{case}");
+                assert_eq!(
+                    request_resources(&scheduler, worker),
+                    Some(vec![rid.clone()]),
+                    "{case}"
+                );
+                assert!(scheduler.is_parked_futex_waiter(leader), "{case}");
+            }
+        }
+    }
+
+    /// A timer names a thread held at a queued `Exit` whose mask admits the
+    /// signal, while another thread of the process will take the signal before
+    /// it runs any guest instruction: an `rt_sigsuspend` waiter whose sleep was
+    /// confirmed under a mask that admits it, or a thread in a real external
+    /// call under its own mask that admits it. That other thread is sent the
+    /// signal alone and armed, and the exiting thread is left at its request.
+    #[test]
+    fn a_timer_signal_goes_past_a_thread_at_a_queued_exit_to_one_that_will_take_it() {
+        let alrm = kernel_signal_bit(libc::SIGALRM);
+        for case in [
+            "confirmed rt_sigsuspend sleep",
+            "external call under its own mask",
+        ] {
+            let mut scheduler = gated_scheduler();
+            let (leader, workers, _) = timer_family(&mut scheduler, !alrm, &[101, 102]);
+            let (exiting, taker) = (workers[0], workers[1]);
+            if case == "confirmed rt_sigsuspend sleep" {
+                suspend_with_mask(&mut scheduler, taker, 0);
+            } else {
+                commit_own_mask_call(&mut scheduler, taker, 0, 0);
+            }
+            queue_request(&mut scheduler, exiting, exit_request(), 0);
+            scheduler.dispatch_timed_signal(
+                LogicalTime::from_nanos(1),
+                timed_waiters::SignalTimerId::Alarm(leader),
+                exiting,
+                Signal::SIGALRM,
+                true,
+            );
+            assert_eq!(
+                host_signal_sends(&scheduler),
+                vec![(taker, Signal::SIGALRM, HostSignalSend::ThreadDirected)],
+                "{case}"
+            );
+            assert_eq!(
+                scheduler
+                    .blocked
+                    .signaled_background
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec![taker],
+                "{case}"
+            );
+            assert!(scheduler.run_queue.contains_tid(exiting), "{case}");
+            assert_eq!(
+                request_resources(&scheduler, exiting),
+                Some(vec![exit_request()]),
+                "{case}"
+            );
+        }
+    }
+
+    /// With two threads that will take a timer's signal before running any
+    /// guest instruction, the one the timer names takes it when it is one of
+    /// them, and otherwise the first of them in thread-ID order. A thread at a
+    /// queued `Exit` that admits the signal comes first in thread-ID order and
+    /// is passed over whether or not the timer names it.
+    #[test]
+    fn a_timer_signal_prefers_the_named_candidate_then_thread_id_order() {
+        let alrm = kernel_signal_bit(libc::SIGALRM);
+        for (named, expected) in [(100, 102), (101, 102), (102, 102), (103, 103)] {
+            let case = format!("named={named}");
+            let mut scheduler = gated_scheduler();
+            let (leader, workers, _) = timer_family(&mut scheduler, !alrm, &[101, 102, 103]);
+            commit_own_mask_call(&mut scheduler, workers[1], 0, 0);
+            suspend_with_mask(&mut scheduler, workers[2], 0);
+            queue_request(&mut scheduler, workers[0], exit_request(), 0);
+            scheduler.dispatch_timed_signal(
+                LogicalTime::from_nanos(1),
+                timed_waiters::SignalTimerId::Alarm(leader),
+                DetTid::from_raw(named),
+                Signal::SIGALRM,
+                true,
+            );
+            let expected = DetTid::from_raw(expected);
+            assert_eq!(
+                host_signal_sends(&scheduler),
+                vec![(expected, Signal::SIGALRM, HostSignalSend::ThreadDirected)],
+                "{case}"
+            );
+            assert_eq!(
+                scheduler
+                    .blocked
+                    .signaled_background
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec![expected],
+                "{case}"
+            );
+            assert!(scheduler.run_queue.contains_tid(workers[0]), "{case}");
+        }
+    }
+
+    /// An `rt_sigsuspend` waiter whose sleep is not yet confirmed is never
+    /// sent a timer's signal alone, even when the mask its call carries admits
+    /// it: the real call copies its mask from guest memory only once the
+    /// thread runs, so until the syscall layer has seen it asleep under that
+    /// mask, whether it takes the signal before running guest code is a matter
+    /// of host timing. In a running scheduler no timer is popped while such a
+    /// hold stands (`step1b_hold_for_rt_sigsuspend_entry` ends the pass
+    /// first); the dispatch here is reached directly. The signal goes to the
+    /// process, nothing is armed, and the hold is kept.
+    #[test]
+    fn a_timer_signal_never_goes_to_an_rt_sigsuspend_waiter_whose_sleep_is_unconfirmed() {
+        let alrm = kernel_signal_bit(libc::SIGALRM);
+        let mut scheduler = gated_scheduler();
+        let (leader, workers, _) = timer_family(&mut scheduler, !alrm, &[101]);
+        let worker = workers[0];
+        let op = suspend_unconfirmed(&mut scheduler, worker, 0);
+        assert_eq!(
+            scheduler.blocked.out_of_scheduler_masks.get(&worker),
+            Some(&Some(0))
+        );
+        scheduler.dispatch_timed_signal(
+            LogicalTime::from_nanos(1),
+            timed_waiters::SignalTimerId::Alarm(leader),
+            leader,
+            Signal::SIGALRM,
+            true,
+        );
+        assert_eq!(
+            host_signal_sends(&scheduler),
+            vec![(leader, Signal::SIGALRM, HostSignalSend::ProcessDirected)]
+        );
+        assert!(scheduler.blocked.signaled_background.is_empty());
+        assert_eq!(
+            scheduler
+                .rt_sigsuspend_entry_holds
+                .get(&worker)
+                .map(|hold| hold.op_id),
+            Some(op)
+        );
+    }
+
+    /// The second of two expiries that come while the first may still be
+    /// pending on the process adds no copy for one thread. The first comes
+    /// while every thread blocks the signal, so it is sent with `kill(2)` and
+    /// stays pending on the process. Thread 101 then comes to admit the
+    /// signal in a state where it takes that pending signal at a moment host
+    /// timing chooses: stopped at a queued request, inside an `rt_sigsuspend`
+    /// whose sleep is not yet confirmed, back from one without having been
+    /// seen asleep, in a call that installs a temporary mask of its own, or in
+    /// an external call entered while the signal was pending for it. The
+    /// second expiry goes to the process too, where the kernel merges it with
+    /// the pending one as Linux does. A copy sent to 101 alone would sit next
+    /// to the shared one and 101 would take the signal twice where Linux
+    /// delivers it once (Codex round-9 finding on
+    /// https://github.com/rrnewton/hermit/pull/3224).
+    #[test]
+    fn a_second_expiry_while_the_first_may_be_pending_adds_no_copy_for_one_thread() {
+        let alrm = kernel_signal_bit(libc::SIGALRM);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        for case in [
+            "stopped at a queued request",
+            "rt_sigsuspend sleep not yet confirmed",
+            "back from rt_sigsuspend without being seen asleep",
+            "call with a temporary mask of its own",
+            "external call entered with the signal pending",
+        ] {
+            let mut scheduler = gated_scheduler();
+            let (leader, workers, _) = timer_family(&mut scheduler, !alrm, &[101]);
+            let worker = workers[0];
+            scheduler.test_kernel_signal_states.insert(
+                worker,
+                KernelSignalState {
+                    blocked: alrm,
+                    ..Default::default()
+                },
+            );
+            let fire = |scheduler: &mut Scheduler, at: u64| {
+                scheduler.dispatch_timed_signal(
+                    LogicalTime::from_nanos(at),
+                    timed_waiters::SignalTimerId::Alarm(leader),
+                    leader,
+                    Signal::SIGALRM,
+                    true,
+                )
+            };
+            fire(&mut scheduler, 1_000);
+            assert_eq!(
+                host_signal_sends(&scheduler),
+                vec![(leader, Signal::SIGALRM, HostSignalSend::ProcessDirected)],
+                "{case}"
+            );
+            match case {
+                "stopped at a queued request" => {
+                    queue_request(&mut scheduler, worker, ResourceID::SchedYield, 0)
+                }
+                "rt_sigsuspend sleep not yet confirmed" => {
+                    suspend_unconfirmed(&mut scheduler, worker, 0);
+                }
+                "back from rt_sigsuspend without being seen asleep" => {
+                    let op = suspend_unconfirmed(&mut scheduler, worker, 0);
+                    let req = scheduler.next_turns.get(&worker).unwrap().req.clone();
+                    let mut continuation = Resources::new(worker);
+                    continuation.insert(ResourceID::BlockedExternalContinue(op), Permission::RW);
+                    scheduler.request_put(&req, continuation, &global_time);
+                    let _ = scheduler.step1b_hold_for_rt_sigsuspend_entry();
+                    assert!(
+                        scheduler.blocked.signaled_background.contains(&worker),
+                        "{case}"
+                    );
+                }
+                "call with a temporary mask of its own" => {
+                    commit_out_of_scheduler_call(
+                        &mut scheduler,
+                        worker,
+                        ResourceID::BlockingExternalIO(ExternalOpId::new(worker, 291)),
+                        Some(0),
+                    );
+                }
+                _ => {
+                    commit_own_mask_call(&mut scheduler, worker, 0, alrm);
+                }
+            }
+            fire(&mut scheduler, 2_000);
+            assert_eq!(
+                host_signal_sends(&scheduler),
+                vec![(leader, Signal::SIGALRM, HostSignalSend::ProcessDirected); 2],
+                "{case}"
+            );
+        }
+    }
+
+    /// A second expiry of a timer's signal while the copy sent to one thread
+    /// alone for the first is outstanding (sent, and that thread's wake not
+    /// yet folded into a scheduler pass) is merged with that copy: nothing is
+    /// sent, and one INFO record names the process, the signal, the thread
+    /// holding the copy and the virtual time of the expiry. The woken thread
+    /// takes its copy at a moment host timing chooses, so a second send would
+    /// be merged or delivered again depending on that timing. Once the pass
+    /// requeues the thread, the record is gone and the next expiry is sent
+    /// again, to the next thread that will take it.
+    #[test]
+    fn a_second_expiry_before_the_first_copy_is_taken_is_merged_with_it() {
+        if !super::exec_teardown_tests::in_isolated_log_test(
+            module_path!(),
+            "a_second_expiry_before_the_first_copy_is_taken_is_merged_with_it",
+        ) {
+            return;
+        }
+        let log = SchedulerInfoLog::default();
+        let _subscriber = tracing::subscriber::set_default(log.clone());
+        let alrm = kernel_signal_bit(libc::SIGALRM);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        let mut scheduler = gated_scheduler();
+        let (leader, workers, _) = timer_family(&mut scheduler, !alrm, &[101, 102]);
+        suspend_with_mask(&mut scheduler, workers[0], 0);
+        suspend_with_mask(&mut scheduler, workers[1], 0);
+        let fire = |scheduler: &mut Scheduler, at: u64| {
+            scheduler.dispatch_timed_signal(
+                LogicalTime::from_nanos(at),
+                timed_waiters::SignalTimerId::Alarm(leader),
+                leader,
+                Signal::SIGALRM,
+                true,
+            )
+        };
+        let first_copy = (workers[0], Signal::SIGALRM, HostSignalSend::ThreadDirected);
+        fire(&mut scheduler, 1_000);
+        assert_eq!(host_signal_sends(&scheduler), vec![first_copy]);
+        fire(&mut scheduler, 2_000);
+        assert_eq!(host_signal_sends(&scheduler), vec![first_copy]);
+        let merged: Vec<String> = log
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.contains("coalesced"))
+            .cloned()
+            .collect();
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        for field in ["[dpid 100]", "SIGALRM", "thread 101", "at 2000 ns"] {
+            assert!(merged[0].contains(field), "{field} in {:?}", merged[0]);
+        }
+
+        // 101's delivery stop is posted, and the next pass requeues it.
+        post_inbound_signal(&mut scheduler, workers[0], libc::SIGALRM, &global_time);
+        assert!(scheduler.step2_release_signaled_background().is_ok());
+        assert!(scheduler.run_queue.contains_tid(workers[0]));
+        fire(&mut scheduler, 3_000);
+        assert_eq!(
+            host_signal_sends(&scheduler),
+            vec![
+                first_copy,
+                (workers[1], Signal::SIGALRM, HostSignalSend::ThreadDirected)
+            ]
+        );
+    }
+
+    /// A thread holding a timer copy sent to it alone that exits before it
+    /// takes the copy releases the merge: the record goes with it, and the
+    /// next expiry is sent again, to the next thread that will take it. Linux
+    /// drops a thread's private signals when it exits, so a record kept past
+    /// its holder would merge every later expiry of that signal in the
+    /// process into a copy nobody holds.
+    #[test]
+    fn a_timer_copy_holder_that_exits_releases_the_next_expiry() {
+        let alrm = kernel_signal_bit(libc::SIGALRM);
+        let mut scheduler = gated_scheduler();
+        let (leader, workers, _) = timer_family(&mut scheduler, !alrm, &[101, 102]);
+        suspend_with_mask(&mut scheduler, workers[0], 0);
+        suspend_with_mask(&mut scheduler, workers[1], 0);
+        let fire = |scheduler: &mut Scheduler, at: u64| {
+            scheduler.dispatch_timed_signal(
+                LogicalTime::from_nanos(at),
+                timed_waiters::SignalTimerId::Alarm(leader),
+                leader,
+                Signal::SIGALRM,
+                true,
+            )
+        };
+        let process = DetPid::from_raw(100);
+        let first_copy = (workers[0], Signal::SIGALRM, HostSignalSend::ThreadDirected);
+        fire(&mut scheduler, 1_000);
+        assert_eq!(host_signal_sends(&scheduler), vec![first_copy]);
+        assert_eq!(
+            scheduler
+                .outstanding_timer_copies
+                .get(&(process, libc::SIGALRM)),
+            Some(&workers[0])
+        );
+
+        scheduler.logically_kill_thread(&workers[0], &process, MmId::initial(process));
+        assert!(scheduler.outstanding_timer_copies.is_empty());
+        fire(&mut scheduler, 2_000);
+        assert_eq!(
+            host_signal_sends(&scheduler),
+            vec![
+                first_copy,
+                (workers[1], Signal::SIGALRM, HostSignalSend::ThreadDirected)
+            ]
+        );
     }
 
     /// The barrier runs before anything else in a pass: while an armed thread
