@@ -1423,8 +1423,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (codex re-check of https://github.com/rrnewton/hermit/pull/3849) retains
     // all 1104: 1105.
     // Thirteen SIGALRM ledger tests in scheduler::parked_tests (signal phase 1, step
-    // I1a), re-listed: 1110.
-    ("test.detcore_unit", 1118),
+    // I1a), re-listed: 1118.
+    // procfs_inode::tests::{dot_entries_name_the_directory_and_its_parent,
+    // only_anonymous_devices_with_1024_byte_blocks_may_be_procfs,
+    // other_directories_keep_host_keys, path_keys_cannot_equal_procfs_inodes,
+    // procfs_entry_key_ignores_the_host_inode} and
+    // tool_global::tests::a_rebuilt_procfs_entry_keeps_its_number_when_keyed_by_path
+    // (procfs inodes keyed by path) retain all 1118: 1124.
+    ("test.detcore_unit", 1124),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1470,7 +1476,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 87).
     // inode_reuse::nothing_is_retired_without_sequentialized_threads (the same
     // reviews) retains all 87 (measured 88).
-    ("test.detcore_misc", 88),
+    // procfs_inode::a_rebuilt_proc_fd_entry_keeps_its_number (procfs inodes
+    // keyed by path) retains all 88 (measured 89).
+    ("test.detcore_misc", 89),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -1922,8 +1930,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.app_strict_verify_on_host", 8),
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
-    // The host node carries the identical 85-test tests_misc selection.
-    ("test.detcore_misc_on_host", 88),
+    // The host node carries the identical tests_misc selection.
+    ("test.detcore_misc_on_host", 89),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -1989,8 +1997,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same unidentified-stop SIGCHLD refusal test: 1088 + 1 = 1089.
     // The host twin selects the same background-signal test, re-listed: 1090.
     // The host twin selects the same seven B5a tests, re-listed: 1096.
-    // And the same thirteen SIGALRM ledger tests, re-listed: 1110.
-    ("test.detcore_unit_on_host", 1118),
+    // And the same thirteen SIGALRM ledger tests, re-listed: 1118.
+    // The host twin selects the same six procfs path-key tests: 1118 + 6 = 1124.
+    ("test.detcore_unit_on_host", 1124),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

@@ -9305,6 +9305,56 @@ mod tests {
         );
     }
 
+    /// Linux numbers a per-process procfs entry when it builds the entry's
+    /// dentry, and the host can evict the dentry and build it again under a
+    /// new number. Two `lsof` listings of `/proc/3/fd` found the same numbers
+    /// in one `--verify` run and new ones in the other, where the host had
+    /// rebuilt the entries between the listings. Keyed by path, the guest
+    /// sees the same numbers either way.
+    #[test]
+    fn a_rebuilt_procfs_entry_keeps_its_number_when_keyed_by_path() {
+        use std::path::PathBuf;
+
+        use crate::procfs_inode::DirectoryInodes;
+        use crate::procfs_inode::ProcfsDirectory;
+        use crate::types::DetInode;
+
+        let t = LogicalTime::from_nanos(0);
+        let seen = super::ObservedMtime::Unobserved;
+        let proc_device = libc::makedev(0, 23);
+        let names: [&[u8]; 4] = [b".", b"..", b"0", b"1"];
+        // The guest numbers of two listings of `/proc/3/fd`, in which the
+        // host reports the inode numbers `first` and then `second`.
+        let listings = |by_path: bool, first: [u64; 4], second: [u64; 4]| -> Vec<DetInode> {
+            let mut pool = super::InodePool::new();
+            let directory =
+                by_path.then(|| ProcfsDirectory::new(PathBuf::from("/proc/3/fd"), false));
+            let inodes = DirectoryInodes::new(proc_device, directory);
+            let mut numbers = Vec::new();
+            for host in [first, second] {
+                for (name, ino) in names.iter().zip(host) {
+                    let raw = inodes.entry_inode(name, ino);
+                    let sighting = super::InodeSighting::Listed(0);
+                    numbers.push(pool.add_sighted_inode(raw, seen, t, sighting).0);
+                }
+            }
+            numbers
+        };
+        let cached = [4_100, 4_000, 4_101, 4_102];
+        // The open directory pins `.` and `..`; the fd entries were rebuilt.
+        let rebuilt = [4_100, 4_000, 4_901, 4_902];
+        assert_eq!(
+            listings(true, cached, cached),
+            listings(true, cached, rebuilt),
+            "a host rebuilding procfs dentries changed guest inode numbers"
+        );
+        // The control: keyed by host inode, the rebuilt entries were renumbered.
+        assert_ne!(
+            listings(false, cached, cached),
+            listings(false, cached, rebuilt)
+        );
+    }
+
     /// Only an exact whole-second 0 or 1 host mtime is canonical
     /// (https://github.com/rrnewton/hermit/issues/3639).
     #[test]
