@@ -1045,7 +1045,25 @@ fi
 # third-party or rust-toolchain.toml changes, so the four budget inputs are
 # unchanged. Carry, not recalibration: no new timing sample or >=5-sample
 # replacement claim is made.
-expected_pin=c496dd8e91ec8c318633460a07353b9f83b36cb4
+# CARRY TO 31acc5e3f344aff55ca011abf5c7cd1553e33855 (2026-10-07): from
+# c496dd8e91ec8c318633460a07353b9f83b36cb4. The one commit on top (the same patch as
+# 71791d21e36e99a570d379746c173e1793945b93, patch id 7d263929aee8728ce4948203aee3e3d5db868651)
+# changes reverie-dbt only in native/client.c, src/backend_stats.rs,
+# src/launcher.rs and src/lib.rs: a terminal exit sets a flag in the image's
+# stats record, and a failed run keeps its captured output. The reverie-dbt
+# tree moves 3573f362207f61db433c8db6ffb3df77c6502e63 -> f5e3bad9517ec8b41b8c2c0827b814d676d7df57.
+# No changed file is an input to the DynamoRIO SDK recipe key above. Compared by
+# git object id at both pins: reverie-dbt/Cargo.toml is blob
+# 0e24d047d544a3daae2d6350270b26ceb74139d1, build.rs is blob
+# e05db6238bf07c96d8a850c5635a8c48590f20b7, native/CMakeLists.txt is blob
+# bcfb298a4f87ed190d7fdc52393e01d1245a8fe3, vendor/dynamorio is tree
+# 117d54d744df23921c531d0fe08537249f5a510a, third-party is tree
+# fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a, the root Cargo.toml is blob
+# 395eddb164895c7c59ff7db11d0a6105d0c69d30 and rust-toolchain.toml is blob
+# b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9. Client preparation still rebuilds
+# the on-demand client from the new client.c. Carry, not recalibration: no new
+# timing sample or >=5-sample replacement claim is made.
+expected_pin=31acc5e3f344aff55ca011abf5c7cd1553e33855
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
