@@ -19,16 +19,22 @@
 //! - the toolchain file, the root Cargo.toml and Cargo configuration (.cargo),
 //!   the ignore files on the way to the third-party directory, the Reindeer pin
 //!   and launcher, the build recipe, this program and its caller;
+//! - the Buck package Reindeer names its targets under, and the `.gitignore`
+//!   files it applies: it walks up from the third-party directory to the nearest
+//!   directory holding `.buckconfig` or `.buckroot`, whether or not that is
+//!   inside the checkout, and applies the `.gitignore` of every directory from
+//!   there down;
 //! - `cargo --version`;
 //! - the compiler Reindeer queries, as Reindeer finds it (RUSTC, else rustc
 //!   from PATH): its `-vV`, and for each platform target in reindeer.toml the
 //!   `target_` lines of `--print=cfg --target T`, which Reindeer copies into the
 //!   platform's cfg. The answers are recorded, not the compiler's name, so a
 //!   wrapper or a toolchain changed in place is covered;
-//! - every file under shim/third-party/rust except what Reindeer and Cargo
-//!   generate there (vendor, BUCK, .cargo, registry, git, target,
-//!   .package-cache), whether or not Git ignores it, read through symbolic
-//!   links with each link's target recorded.
+//! - every file under shim/third-party/rust except vendor, BUCK and .cargo,
+//!   which regenerate-rust-deps removes before Reindeer runs and Reindeer
+//!   writes, whether or not Git ignores it, read through symbolic links with
+//!   each link's target recorded. Nothing is left out for its name alone: a
+//!   local package under a directory named `target` is read like any other.
 //!
 //! reindeer.toml is read with a TOML parser, so keys are compared after
 //! decoding (`"fixups_dir"` is `fixups_dir`). A setting that makes
@@ -86,21 +92,17 @@ const NAME: &str = "rust-deps-cache-key.rs";
 const USAGE: &str = "usage: rust-deps-cache-key.rs REPO_ROOT";
 /// Changes whenever what an entry holds, or how the key is formed, changes, so
 /// an entry stored under an earlier recipe is never restored.
-const RECIPE: &str = "3";
+const RECIPE: &str = "4";
 /// Reindeer's third-party directory, which regenerate-rust-deps passes as
 /// `--third-party-dir`; reindeer.toml and the default fixups directory are in it.
 const THIRD_PARTY_DIR: &str = "shim/third-party/rust";
 const REINDEER_TOML: &str = "shim/third-party/rust/reindeer.toml";
-/// What Reindeer and Cargo generate in the third-party directory.
-const GENERATED: [&str; 7] = [
-    "vendor",
-    "BUCK",
-    ".cargo",
-    "registry",
-    "git",
-    "target",
-    ".package-cache",
-];
+/// What regenerate-rust-deps removes from the third-party directory before
+/// Reindeer runs, and Reindeer then writes; nothing else there is output.
+const GENERATED: [&str; 3] = ["vendor", "BUCK", ".cargo"];
+/// The files whose presence makes a directory the root of Reindeer's Buck
+/// cell (pinned Reindeer's `buck_package`, src/path.rs).
+const BUCK_MARKERS: [&str; 2] = [".buckconfig", ".buckroot"];
 /// Inputs at fixed paths, hashed whether or not Git tracks or ignores them.
 const FIXED_INPUTS: [&str; 13] = [
     "Cargo.lock",
@@ -283,6 +285,7 @@ fn run(root: &Path) -> Result<Outcome, String> {
             .unwrap_or(path);
         paths.insert(relative.as_os_str().as_bytes().to_vec());
     }
+    record_buck_cell(&mut manifest)?;
     let mut ancestors = Vec::new();
     walk(Path::new(THIRD_PARTY_DIR), &mut ancestors, &mut paths)?;
     if fs::symlink_metadata(".cargo").is_ok() {
@@ -299,6 +302,62 @@ fn run(root: &Path) -> Result<Outcome, String> {
         return Err("Cargo.lock is not a readable file".to_owned());
     }
     Ok(Outcome::Key(manifest.key()))
+}
+
+/// Records the Buck package pinned Reindeer derives and the `.gitignore` files
+/// it applies. `buck_package` (src/path.rs) walks up from the canonical
+/// third-party directory to the nearest directory holding a marker and names
+/// every generated target after the third-party directory's path below it, or
+/// after nothing when no directory up to `/` holds one. `load_gitignore`
+/// (src/gitignore.rs) applies the `.gitignore` of each directory from that one
+/// down to the third-party directory, the third-party directory's alone when
+/// there is no marker. Each file is named by its place relative to the
+/// third-party directory, so the key does not depend on where the checkout is.
+fn record_buck_cell(manifest: &mut Manifest) -> Result<(), String> {
+    let third_party = fs::canonicalize(THIRD_PARTY_DIR)
+        .map_err(|err| format!("cannot resolve {THIRD_PARTY_DIR}: {err}"))?;
+    let mut cell = None;
+    for (up, dir) in third_party.ancestors().enumerate() {
+        if has_buck_marker(dir)? {
+            cell = Some((up, dir));
+            break;
+        }
+    }
+    let (levels, package) = match cell {
+        Some((up, dir)) => (
+            up,
+            third_party
+                .strip_prefix(dir)
+                .expect("an ancestor is a prefix")
+                .as_os_str()
+                .as_bytes(),
+        ),
+        None => (0, &b""[..]),
+    };
+    let marker: &[u8] = if cell.is_some() {
+        b"marker"
+    } else {
+        b"no marker"
+    };
+    manifest.record(&[b"buck package", marker, package]);
+    let dirs: Vec<&Path> = third_party.ancestors().take(levels + 1).collect();
+    for (up, dir) in dirs.iter().enumerate().rev() {
+        let name = format!("{}.gitignore", "../".repeat(up));
+        manifest.record_path_as(name.as_bytes(), &dir.join(".gitignore"))?;
+    }
+    Ok(())
+}
+
+/// Whether `dir` holds a Buck cell marker, as `fs::exists` answers, which is
+/// what pinned Reindeer asks; an error is an error here too.
+fn has_buck_marker(dir: &Path) -> Result<bool, String> {
+    for marker in BUCK_MARKERS {
+        let path = dir.join(marker);
+        if fs::exists(&path).map_err(|err| format!("cannot read {}: {err}", path.display()))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Why `config` (a parsed reindeer.toml) makes Reindeer read something the key
@@ -511,7 +570,11 @@ impl Manifest {
     /// Records what is at `path`: a link's target, then a file's SHA-256, a
     /// dangling link, a directory, something else, or nothing.
     fn record_path(&mut self, path: &Path) -> Result<PathKind, String> {
-        let name = path.as_os_str().as_bytes();
+        self.record_path_as(path.as_os_str().as_bytes(), path)
+    }
+
+    /// Records what is at `path`, as `record_path` does, under `name`.
+    fn record_path_as(&mut self, name: &[u8], path: &Path) -> Result<PathKind, String> {
         let link = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata.file_type().is_symlink(),
             Err(err) if err.kind() == io::ErrorKind::NotFound => {

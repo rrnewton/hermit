@@ -21,8 +21,13 @@
 # stores nothing, so the original lock vendors again; a keyed input that changes
 # while Reindeer runs stores nothing; a fixup Git ignores, a fixup reached
 # through a directory link (its referent edited), a workspace member manifest
-# Git ignores (also at a path JSON must escape), and the compiler's target cfg
-# and version each change the key, and RUSTC names the compiler queried; a
+# Git ignores (also at a path JSON must escape), a Buck cell marker added
+# nearer the third-party directory, a .gitignore outside the checkout that the
+# nearest marker brings into force, two checkouts whose paths below the marker
+# (so Reindeer's package) differ, a local package under a third-party
+# directory named target, git, registry or .package-cache, and the compiler's
+# target cfg and version each change the key, and RUSTC names the compiler
+# queried; a
 # platform target written as a multi-line or escaped string, or under an escaped
 # key, is queried as Reindeer decodes it; reindeer.toml settings the key cannot
 # cover (fixups_dir, cargo.rustc, cargo.cargo, gitignore_checksum_exclude, an
@@ -153,8 +158,11 @@ done
 exec "$(type -P rm)" "\$@"
 EOF
 # Reindeer stub: --third-party-dir DIR --manifest-path PATH vendor|buckify [--stdout].
-# Its BUCK names the lock, the fixups it reads through links, and the target cfg
-# the compiler reports. FIXTURE_REWRITE_LOCK=REV makes vendor resolve the lock
+# Its BUCK names the lock, the fixups it reads through links, the target cfg
+# the compiler reports, and, as pinned Reindeer does, the Buck package below
+# the nearest .buckconfig or .buckroot with the .gitignore files from there
+# down (src/path.rs, src/gitignore.rs), and every file in the third-party
+# directory but the vendor, .cargo and BUCK it writes. FIXTURE_REWRITE_LOCK=REV makes vendor resolve the lock
 # to REV, as pinned Reindeer may (it vendors with locked: false);
 # FIXTURE_EDIT_FIXUP=1 makes it edit a fixup while it runs.
 cat >"$repo/bootstrap/reindeer" <<'EOF'
@@ -171,6 +179,18 @@ fi
 lock=$(sha256sum <Cargo.lock | cut -c1-64)
 fixups=$(find -L "$dir/fixups" -type f -print0 | LC_ALL=C sort -z | xargs -0 cat | sha256sum | cut -c1-64)
 cfg=$("${RUSTC-rustc}" --print=cfg --target x86_64-unknown-linux-gnu | grep '^target_' | sha256sum | cut -c1-64)
+real=$(cd -- "$dir" && pwd -P)
+chain=() up=$real package=none
+while :; do
+  chain+=("$up/.gitignore")
+  if [[ -e $up/.buckconfig || -e $up/.buckroot ]]; then package=${real#"$up"}; break; fi
+  if [[ $up == / ]]; then chain=("$real/.gitignore"); break; fi
+  up=$(dirname -- "$up")
+done
+ignores=$({ cat -- "${chain[@]}" 2>/dev/null || true; } | sha256sum | cut -c1-64)
+files=$( (cd -- "$dir" && { find -L . \( -path ./vendor -o -path ./.cargo -o -path ./BUCK \) -prune \
+  -o -type f -print0 2>/dev/null || true; } | LC_ALL=C sort -z | { xargs -0 -r sha256sum 2>/dev/null || true; }) |
+  sha256sum | cut -c1-64)
 case $5 in
   vendor)
     mkdir -p "$dir/vendor/crate" "$dir/.cargo/registry/cache"
@@ -179,7 +199,7 @@ case $5 in
     printf '[source.vendored-sources]\ndirectory = "vendor"\n' >"$dir/.cargo/config.toml"
     ;;
   buckify)
-    raw="# raw BUCK for $lock; fixups $fixups; cfg $cfg"
+    raw="# raw BUCK for $lock; fixups $fixups; cfg $cfg; package $package; ignores $ignores; files $files"
     if [[ ${6:-} == --stdout ]]; then echo "$raw"
     else echo "$raw" >"$dir/BUCK"; fi
     ;;
@@ -430,6 +450,88 @@ regen member_escaped_edit
 expect_vendored member_escaped_edit
 rm -rf -- "${repo:?}/${escaped_member:?}"
 
+# expect_input_keyed WARM AGAIN EDIT: WARM vendored a new input and AGAIN
+# restored it; EDIT, after the input changed, must vendor (not restore WARM's
+# entry) and produce what a run without the cache produces, which differs from
+# WARM's tree.
+expect_input_keyed() {
+  expect_vendored "$1"
+  expect_restored "$2"
+  expect_vendored "$3"
+  regen "$3_off" HERMIT_RUST_DEPS_CACHE=off
+  expect_vendored "$3_off"
+  cmp -s "$tmp/$3.tree" "$tmp/$3_off.tree" || fail "$3: tree differs from the uncached run's"
+  cmp -s "$tmp/$1.tree" "$tmp/$3_off.tree" && fail "$3_off: the change did not change the output"
+  return 0
+}
+
+# Buck cell markers. The fixture has none up to /, so Reindeer names its
+# targets after no package and applies only the third-party .gitignore.
+for marker_dir in "$repo/shim/third-party/rust" "$repo/shim/third-party" "$repo/shim" "$repo" "$tmp"; do
+  up=$(cd -- "$marker_dir" && pwd -P)
+  while :; do
+    [[ ! -e $up/.buckconfig && ! -e $up/.buckroot ]] || fail "marker: the fixture has a marker at $up already"
+    [[ $up != / ]] || break
+    up=$(dirname -- "$up")
+  done
+done
+# A marker nearer the third-party directory than any other: the package
+# changes, then the .gitignore it brings into force.
+third_party_ignore=$repo/shim/third-party/.gitignore
+regen marker_before
+touch -- "$repo/shim/third-party/.buckroot"
+regen marker_new
+expect_vendored marker_new
+cmp -s "$tmp/marker_before.tree" "$tmp/marker_new.tree" && fail "marker_new: the marker did not change the output"
+regen marker_again
+echo '/fixups/one/' >"$third_party_ignore"
+regen marker_edit
+expect_input_keyed marker_new marker_again marker_edit
+rm -f -- "$repo/shim/third-party/.buckroot" "$third_party_ignore"
+# A marker outside the checkout: the .gitignore beside it applies too.
+outside_ignore=$tmp/.gitignore
+echo '/nothing/' >"$outside_ignore"
+touch -- "$tmp/.buckroot"
+regen outside_new
+regen outside_again
+echo '/repo/shim/third-party/rust/fixups/one/' >"$outside_ignore"
+regen outside_edit
+expect_input_keyed outside_new outside_again outside_edit
+rm -f -- "$tmp/.buckroot" "$outside_ignore"
+# Two clones of one commit under the marker, differing only in their directory
+# names: the package, and so every label Reindeer writes, differs between them,
+# and nothing else Reindeer reads does.
+fixture_git clone -q -- "$repo" "$tmp/package-x"
+fixture_git clone -q -- "$repo" "$tmp/package-y"
+touch -- "$tmp/.buckroot"
+regen_repo=$tmp/package-x
+regen package_x_new
+regen package_x_again
+regen_repo=$tmp/package-y
+regen package_y
+expect_input_keyed package_x_new package_x_again package_y
+regen_repo=$repo
+rm -rf -- "${tmp:?}/package-x" "${tmp:?}/package-y"
+rm -f -- "$tmp/.buckroot"
+
+# A local package under a third-party directory whose name Cargo also uses for
+# output; nothing regenerate-rust-deps runs writes there, so Reindeer reads it.
+for output_name in target git registry .package-cache; do
+  dep=$repo/shim/third-party/rust/$output_name/dep
+  mkdir -p "$dep/src"
+  printf '[package]\nname = "dep"\n' >"$dep/Cargo.toml"
+  echo 'mod alpha;' >"$dep/src/lib.rs"
+  : >"$dep/src/alpha.rs"
+  : >"$dep/src/beta.rs"
+  case_name=local_${output_name#.}
+  regen "${case_name}_new"
+  regen "${case_name}_again"
+  echo 'mod beta;' >"$dep/src/lib.rs"
+  regen "${case_name}_edit"
+  expect_input_keyed "${case_name}_new" "${case_name}_again" "${case_name}_edit"
+  rm -rf -- "${repo:?}/shim/third-party/rust/${output_name:?}"
+done
+
 # The compiler Reindeer queries, with the cargo version unchanged: another
 # target cfg, the same again, and another version. A RUSTC wrapper that reports
 # the same cfg restores that entry; with RUSTC not followed it would restore the
@@ -459,6 +561,7 @@ for target_line in 'target = """x86_64-unknown-linux-musl"""' "target = '''x86_6
   regen target_form_again
   expect_restored target_form_again
   regen target_form_cfg FIXTURE_RUSTC_MUSL_CFG='target_feature="crt-static"'
+  expect_ok target_form_cfg
   [[ $(calls target_form_cfg) == "vendor buckify buckify " ]] ||
     fail "target_form_cfg: the musl cfg did not change the key for $target_line"
 done
