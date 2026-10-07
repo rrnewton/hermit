@@ -88,6 +88,7 @@ use super::verify::ComparisonOptions;
 use super::verify::LogCompareStrictness;
 use super::verify::NoResultReason;
 use super::verify::SecondRun;
+use super::verify::SignalTerminationReports;
 use super::verify::VerificationReport;
 use super::verify::VerificationRun;
 use super::verify::VerificationRuntime;
@@ -99,7 +100,6 @@ use super::verify::retain_logs_after_verification_error;
 use super::verify::retain_verification_error;
 use super::verify::retain_verification_logs;
 use super::verify::run_verification_execution;
-use super::verify::signal_termination_report;
 use super::verify::temp_log_files_in;
 use super::verify::validate_log_level;
 use super::verify::verification_log_level;
@@ -6262,6 +6262,10 @@ impl RunOpts {
                     return Err(error);
                 }
             };
+        // Prepared now, with the forwarded records in place: the comparison
+        // consumes the log. Written if the verification ends unverified.
+        let mut signal_reports = SignalTerminationReports::default();
+        signal_reports.prepare("run 1", out1.status, &log1_path);
 
         // With --verify the first run's `--log` output was diverted to a
         // temporary file for later comparison rather than shown to the user.
@@ -6311,9 +6315,8 @@ impl RunOpts {
                 String::from_utf8_lossy(&out1.stdout),
                 String::from_utf8_lossy(&out1.stderr),
             );
-            if let Some(report) = signal_termination_report("run 1", out1.status, &log1_path) {
-                eprint!("{report}");
-            }
+            // Written here, after the run's own output.
+            drop(signal_reports);
             // ⚠️ RECORD THE DISPOSITION HERE, WHERE IT IS KNOWN. `out1.status`
             // is in hand, yet the pre-stamped `no_result` record was previously
             // left untouched on this path -- so the artifact reported
@@ -6468,13 +6471,7 @@ impl RunOpts {
             );
         }
 
-        // A run 2 whose exit status is not allowed is reported as run 1 is
-        // above, before the comparison below consumes its log.
-        if !self.verify_allow.satisfies(out2.status)
-            && let Some(report) = signal_termination_report("run 2", out2.status, &log2_path)
-        {
-            eprint!("{report}");
-        }
+        signal_reports.prepare("run 2", out2.status, &log2_path);
 
         // Say what was actually established. Buffer hashing is ON BY DEFAULT, so
         // this qualification is now reachable only when the caller has asked for
@@ -6629,6 +6626,7 @@ impl RunOpts {
             emit_compared_guest_output(false, &out1, &out2)?;
             return outcome.into_exit_status();
         }
+        signal_reports.verified();
         let status = outcome.guest_status;
 
         let backend_banner = match self.selected_backend() {

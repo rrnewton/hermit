@@ -1211,6 +1211,10 @@ pub(super) fn run_dbt(
         }
         return Err(error);
     }
+    // Prepared while the log exists, as the ptrace path does; written if the
+    // verification ends unverified.
+    let mut signal_reports = super::verify::SignalTerminationReports::default();
+    signal_reports.prepare("run 1", process_status(first_raw.status), &log1_path);
     if print_verify_logs {
         std::io::stderr().write_all(&fs::read(&log1_path)?)?;
     }
@@ -1221,11 +1225,8 @@ pub(super) fn run_dbt(
             String::from_utf8_lossy(&first.stdout),
             String::from_utf8_lossy(&first.stderr),
         );
-        if let Some(report) =
-            super::verify::signal_termination_report("run 1", first.status, &log1_path)
-        {
-            eprint!("{report}");
-        }
+        // Written here, after the run's own output.
+        drop(signal_reports);
         // Record the rejected first run where its disposition is known, as the
         // ptrace path does. Left alone, the pre-stamped `not_run` record keeps
         // `guest_exit_code: null`, so the runner cannot tell this completed
@@ -1307,6 +1308,7 @@ pub(super) fn run_dbt(
         }
         return Err(error);
     }
+    signal_reports.prepare("run 2", process_status(second_raw.status), &log2_path);
     let second_stats = match stats2.finish() {
         Ok(stats) => stats,
         Err(error) => {
@@ -1406,6 +1408,7 @@ pub(super) fn run_dbt(
     if !outcome.verified() {
         return outcome.into_exit_status();
     }
+    signal_reports.verified();
 
     std::io::stdout().write_all(&first.stdout)?;
     std::io::stderr().write_all(&first.stderr)?;
@@ -2299,6 +2302,46 @@ mod tests {
         assert!(
             record < publish,
             "the rejected first run must be recorded before the report is written"
+        );
+
+        // A signal that ended either run is reported from that run's log,
+        // which the comparison consumes: each report is prepared once the
+        // run's log is materialized, before anything that can return, and is
+        // discarded only after the runs verified.
+        let after = |needle: &str| {
+            canonical
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} in the DBT run path"))
+        };
+        let materialized1 =
+            after("materialize_dbt_evidence_log(&first_evidence, log1_file, &log1_path)");
+        let prepared1 = after(
+            "signal_reports.prepare(\"run 1\", process_status(first_raw.status), &log1_path);",
+        );
+        let rejected = after("if !verify_allow.satisfies(process_status(first_raw.status))");
+        let materialized2 =
+            after("materialize_dbt_evidence_log(&second_evidence, log2_file, &log2_path)");
+        let prepared2 = after(
+            "signal_reports.prepare(\"run 2\", process_status(second_raw.status), &log2_path);",
+        );
+        let verified = after("signal_reports.verified();");
+        assert!(
+            materialized1 < prepared1 && prepared1 < rejected,
+            "run 1's signal report must be prepared from its materialized log before the \
+             first-run rejection"
+        );
+        assert!(
+            materialized2 < prepared2 && prepared2 < second_stats,
+            "run 2's signal report must be prepared from its materialized log before the \
+             statistics can return an error"
+        );
+        assert!(
+            prepared2 < comparison && exit < verified,
+            "the signal reports must be discarded only after an unverified outcome returned"
+        );
+        assert!(
+            rejected_arm.contains("drop(signal_reports);"),
+            "a rejected first run must report its signal"
         );
     }
 

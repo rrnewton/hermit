@@ -1071,7 +1071,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // nextest list).
     // The 933 pinned before https://github.com/rrnewton/hermit/pull/3361 and its three tests above,
     // re-listed together: 936 (measured with cargo nextest list --profile ci).
-    ("test.hermit_unit", 936),
+    // The verify signal report's six verify::tests (signal_termination_report_*
+    // and a_log_tail_starts_at_a_whole_line) retain all 936: 942 (measured
+    // with cargo nextest list).
+    ("test.hermit_unit", 942),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1414,7 +1417,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // cells are restoration targets of
     // https://github.com/rrnewton/hermit/issues/3745), and all 207 prior
     // identities are retained (275, measured with cargo nextest list).
-    ("test.hermit_integration", 275),
+    // signal_determinism's six verify signal-report tests (verify_reports_*,
+    // verify_writes_no_signal_report_when_the_signaled_runs_verify and
+    // verify_signal_report_cannot_replace_the_disposition_on_a_full_stderr)
+    // retain all 275 (281, measured with cargo nextest list).
+    ("test.hermit_integration", 281),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -1840,7 +1847,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the four private-page guard tests (207).
     // The host twin also selects the 68 external_signal_interrupt tests
     // (https://github.com/rrnewton/hermit/pull/3361) (275, measured).
-    ("test.hermit_integration_on_host", 275),
+    // And the six verify signal-report tests (281).
+    ("test.hermit_integration_on_host", 281),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -1892,7 +1900,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same blocked-wait backend-contract test and two inherited-terminal
     // tests (905, measured).
     // The host twin selects the same tests, re-listed together: 936.
-    ("test.hermit_unit_on_host", 936),
+    // The host twin selects the same six signal-report tests: 942.
+    ("test.hermit_unit_on_host", 942),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

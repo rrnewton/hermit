@@ -1229,7 +1229,9 @@ pub(crate) fn signal_termination_report(
         .lines()
         .filter(|line| is_info_detlog(line))
         .map(|line| {
-            line.split_once(detcore::detlog::RECORD_SEPARATOR)
+            // The last separator, as the DETLOG reader splits: the human
+            // text before it can hold the same characters, in a pathname.
+            line.rsplit_once(detcore::detlog::RECORD_SEPARATOR)
                 .map_or(line, |(human, _)| human)
         })
         .collect();
@@ -1255,6 +1257,52 @@ pub(crate) fn signal_termination_report(
         report.push('\n');
     }
     Some(report)
+}
+
+/// The [`signal_termination_report`]s of a verification's runs, prepared
+/// while each run's log exists, because the comparison consumes the logs.
+///
+/// They are written to stderr once, when this is dropped, unless
+/// [`Self::verified`] discarded them first. So every way a verification ends
+/// without verifying its runs reports the signals that ended them: a status
+/// `--verify-allow` refuses, a comparison that rejects runs whose statuses
+/// `--verify-allow=both` or `failure` admitted, or an error. A verification
+/// that verifies its runs has nothing to explain and prints nothing.
+///
+/// Each line is written separately through
+/// [`crate::tracing::write_stderr_diagnostic`]: while `--max-log-bytes` is in
+/// force a line stderr cannot take at once is omitted rather than waited for,
+/// and a write that fails is ignored, so the report can neither delay nor
+/// replace the verification's own disposition. A line a full pipe refuses
+/// costs only that line.
+#[must_use]
+#[derive(Default)]
+pub(crate) struct SignalTerminationReports(Vec<String>);
+
+impl SignalTerminationReports {
+    /// Prepare the report of run `label`, if `status` is a termination by a
+    /// signal. `log` must still hold the run's log.
+    pub(crate) fn prepare(&mut self, label: &str, status: ExitStatus, log: &Path) {
+        self.0.extend(signal_termination_report(label, status, log));
+    }
+
+    /// The runs verified: discard the reports.
+    pub(crate) fn verified(mut self) {
+        self.0.clear();
+    }
+}
+
+impl Drop for SignalTerminationReports {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        for report in &self.0 {
+            for line in report.split_inclusive('\n') {
+                crate::tracing::write_stderr_diagnostic(line);
+            }
+        }
+    }
 }
 
 /// Whether `line` is an INFO DETLOG record. A record starts with its level,
@@ -2181,6 +2229,32 @@ mod tests {
         fs::write(&empty, "INFO detcore::scheduler: COMMIT turn\n").unwrap();
         let report = signal_termination_report("run 2", status, &empty).unwrap();
         assert!(report.contains("hold no INFO DETLOG record"), "{report}");
+    }
+
+    #[test]
+    fn signal_termination_report_keeps_a_separator_inside_the_human_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("run1_log");
+        // A pathname may hold the separator's characters; only the last
+        // separator starts the machine-readable suffix.
+        let human = format!(
+            "INFO detcore: DETLOG [syscall] openat(AT_FDCWD, \"/tmp/p{}guest\", O_RDONLY) = Ok(3)",
+            detcore::detlog::RECORD_SEPARATOR
+        );
+        fs::write(
+            &log,
+            format!(
+                "{human}{}{{\"schema\":1}}\n",
+                detcore::detlog::RECORD_SEPARATOR
+            ),
+        )
+        .unwrap();
+        let status = ExitStatus::Signaled(reverie::process::Signal::SIGSEGV, false);
+        let report = signal_termination_report("run 1", status, &log).unwrap();
+        assert_eq!(
+            report.lines().nth(1),
+            Some(format!("::   {human}").as_str())
+        );
     }
 
     #[test]

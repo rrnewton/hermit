@@ -14,6 +14,7 @@ use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::os::unix::process::CommandExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -412,20 +413,15 @@ fn pending_signal_and_mask_survive_exec() {
     );
 }
 
-/// Runs `script` under `hermit run --verify`, which must exit with `status`,
-/// and returns its stderr, which must report `run` terminated by SIGUSR1 and end that report with the guest's
-/// last system call, its `kill`.
-fn verify_signal_report(script: &str, run: &str, status: i32) -> String {
+/// Runs `script` under `hermit run --verify` with `options`, which must exit
+/// with `status`, and returns its stderr, which must report `run` terminated by
+/// SIGUSR1 and end that report with the guest's last system call, its `kill`.
+fn verify_signal_report(options: &[&str], script: &str, run: &str, status: i32) -> String {
     let mut command = Command::new(hermit_test::hermit_binary());
-    command.args([
-        "run",
-        "--verify",
-        "--base-env=minimal",
-        "--",
-        "/bin/sh",
-        "-c",
-        script,
-    ]);
+    command
+        .args(["run", "--verify", "--base-env=minimal"])
+        .args(options)
+        .args(["--", "/bin/sh", "-c", script]);
     hermit_test::configure_guest_execution(&mut command);
     let output = command
         .output()
@@ -465,6 +461,7 @@ fn verify_signal_report(script: &str, run: &str, status: i32) -> String {
 fn verify_reports_the_last_records_of_a_run_1_killed_by_a_signal() {
     let _guard = hermit_signal_lock();
     let stderr = verify_signal_report(
+        &[],
         "echo before; kill -USR1 $$",
         "run 1",
         HERMIT_INTERNAL_FAILURE_EXIT,
@@ -475,23 +472,190 @@ fn verify_reports_the_last_records_of_a_run_1_killed_by_a_signal() {
     );
 }
 
-#[test]
-fn verify_reports_the_last_records_of_a_run_2_killed_by_a_signal() {
-    let _guard = hermit_signal_lock();
+/// A marker file named `name` that does not exist yet, which a guest creates
+/// in run 1 so that run 2 can behave differently.
+fn run_1_marker(name: &str) -> PathBuf {
     let directory = Path::new(env!("CARGO_TARGET_TMPDIR")).join("verify-signal-report");
     fs::create_dir_all(&directory).expect("failed to create the marker directory");
-    let marker = directory.join("run-1-finished");
+    let marker = directory.join(name);
     match fs::remove_file(&marker) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => panic!("failed to remove {}: {error}", marker.display()),
     }
+    marker
+}
+
+#[test]
+fn verify_reports_the_last_records_of_a_run_2_killed_by_a_signal() {
+    let _guard = hermit_signal_lock();
+    let marker = run_1_marker("run-1-finished");
     // Run 1 leaves the marker and succeeds; run 2 finds it and is killed.
     let script = format!(
         "if [ -e '{0}' ]; then kill -USR1 $$; else : > '{0}'; fi",
         marker.display()
     );
     // The comparison then reports the runs as nondeterministic.
-    let stderr = verify_signal_report(&script, "run 2", 1);
+    let stderr = verify_signal_report(&[], &script, "run 2", 1);
     assert!(!stderr.contains("The run 1 guest"), "{stderr}");
+}
+
+/// `--verify-allow=both` admits run 2's signal, and the comparison still
+/// rejects the runs, whose statuses differ: the signal is reported.
+#[test]
+fn verify_reports_an_admitted_run_2_signal_the_comparison_rejects() {
+    let _guard = hermit_signal_lock();
+    let marker = run_1_marker("run-1-finished-allow-both");
+    let script = format!(
+        "if [ -e '{0}' ]; then kill -USR1 $$; else : > '{0}'; fi",
+        marker.display()
+    );
+    let stderr = verify_signal_report(&["--verify-allow=both"], &script, "run 2", 1);
+    assert!(!stderr.contains("The run 1 guest"), "{stderr}");
+}
+
+/// `--verify-allow=failure` admits run 1's signal, so run 2 runs, exits 1, and
+/// the comparison rejects the runs: run 1's signal is reported from the log
+/// the comparison consumed.
+#[test]
+fn verify_reports_an_admitted_run_1_signal_the_comparison_rejects() {
+    let _guard = hermit_signal_lock();
+    let marker = run_1_marker("run-1-killed-allow-failure");
+    let script = format!(
+        "if [ -e '{0}' ]; then exit 1; else : > '{0}'; kill -USR1 $$; fi",
+        marker.display()
+    );
+    let stderr = verify_signal_report(&["--verify-allow=failure"], &script, "run 1", 1);
+    assert!(
+        !stderr.contains("First run errored during --verify"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("The run 2 guest"), "{stderr}");
+}
+
+/// Two runs killed by the same signal at the same point verify under
+/// `--verify-allow=failure`; the report is only for a rejected verification.
+#[test]
+fn verify_writes_no_signal_report_when_the_signaled_runs_verify() {
+    let _guard = hermit_signal_lock();
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command.args([
+        "run",
+        "--verify",
+        "--base-env=minimal",
+        "--verify-allow=failure",
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo before; kill -USR1 $$",
+    ]);
+    hermit_test::configure_guest_execution(&mut command);
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start hermit: {error}"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // hermit ends as the verified guest did, by the same signal.
+    assert_eq!(
+        output.status.signal(),
+        Some(libc::SIGUSR1),
+        "unexpected status\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Determinism verified."),
+        "the runs did not verify\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("guest was terminated by signal"),
+        "a verified run wrote a signal report\nstderr:\n{stderr}"
+    );
+}
+
+/// The signal report is a diagnostic: it must not replace or delay the
+/// verification's own disposition when stderr cannot take it.
+///
+/// Under `--max-log-bytes` stderr here is a 4096-byte pipe in `O_NONBLOCK`
+/// mode that nobody reads until hermit exits, and the guest's last records
+/// name long paths, so the report is larger than the pipe. Written with
+/// `eprint!`, the report fails with `EAGAIN` once the pipe is full and the
+/// print macro panics: hermit exits 101 instead of the rejected first run's
+/// 125. On a blocking pipe the same write would wait forever.
+#[test]
+fn verify_signal_report_cannot_replace_the_disposition_on_a_full_stderr() {
+    use std::os::unix::io::FromRawFd;
+    let _guard = hermit_signal_lock();
+
+    let path = format!("/{}", "p".repeat(300));
+    let script = format!(
+        "for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ -e {path} ]; done; kill -USR1 $$"
+    );
+    let mut fds = [0i32; 2];
+    // SAFETY: `fds` holds two descriptors.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+    // SAFETY: fcntl on descriptors this test owns.
+    let pipe_bytes = unsafe {
+        libc::fcntl(write_fd, libc::F_SETPIPE_SZ, 4096);
+        libc::fcntl(write_fd, libc::F_GETPIPE_SZ)
+    };
+    assert_eq!(pipe_bytes, 4096, "pipe capacity");
+    // SAFETY: as above.
+    unsafe {
+        let flags = libc::fcntl(write_fd, libc::F_GETFL);
+        libc::fcntl(write_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+    // SAFETY: each descriptor is owned by exactly one of these.
+    let (mut reader, writer) =
+        unsafe { (fs::File::from_raw_fd(read_fd), Stdio::from_raw_fd(write_fd)) };
+
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command
+        .args([
+            "--max-log-bytes=64M",
+            "run",
+            "--verify",
+            "--base-env=minimal",
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .stdout(Stdio::null())
+        .stderr(writer);
+    hermit_test::configure_guest_execution(&mut command);
+    let started = Instant::now();
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to start hermit: {error}"));
+    // Dropped so that only hermit holds the write end.
+    drop(command);
+    // Bounded, so a report that waits is a failure rather than a hang.
+    let deadline = Duration::from_secs(60);
+    let status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => break Some(status),
+            None if started.elapsed() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    let mut delivered = Vec::new();
+    reader
+        .read_to_end(&mut delivered)
+        .expect("failed to read the delivered stderr");
+    let delivered = String::from_utf8_lossy(&delivered);
+    let status = status.unwrap_or_else(|| {
+        panic!("hermit had not exited after {deadline:?}\nstderr:\n{delivered}")
+    });
+    assert_eq!(
+        status.code(),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
+        "the report replaced the rejected first run's status\nstderr:\n{delivered}"
+    );
+    assert!(
+        delivered.contains(":: The run 1 guest was terminated by signal 10 (SIGUSR1)."),
+        "the report's first line fits in the pipe and must arrive\nstderr:\n{delivered}"
+    );
 }
