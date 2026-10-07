@@ -10831,7 +10831,8 @@ mod test {
 
     /// A sibling's send arms nothing where it cannot wake the background call
     /// at a known point, under the rules a timer's send follows: a vfork
-    /// parent, a recorded mask that blocks the signal or is unknown, and
+    /// parent, a recorded mask that blocks the signal (a realtime one
+    /// included) or is unknown, and
     /// `SIGKILL`, which ends the thread group without a delivery stop. Nor
     /// does it arm on a scheduler that does not model signal targets, or on a
     /// backend whose signal interrupts an external syscall through its own
@@ -10840,9 +10841,16 @@ mod test {
     #[test]
     fn a_sibling_signal_leaves_a_waiter_it_cannot_wake_in_its_pool() {
         let usr1 = kernel_signal_bit(libc::SIGUSR1);
-        let cases: [(&str, Option<u64>, bool, libc::c_int); 4] = [
+        let rtmin_plus_one = 35;
+        let cases: [(&str, Option<u64>, bool, libc::c_int); 5] = [
             ("vfork parent", Some(0), true, libc::SIGUSR1),
             ("blocked", Some(usr1), false, libc::SIGUSR1),
+            (
+                "blocked realtime",
+                Some(kernel_signal_bit(rtmin_plus_one)),
+                false,
+                rtmin_plus_one,
+            ),
             ("unknown mask", None, false, libc::SIGUSR1),
             ("SIGKILL", Some(0), false, libc::SIGKILL),
         ];
@@ -11987,6 +11995,181 @@ mod test {
             host_signal_sends(&scheduler),
             vec![(parent, Signal::SIGCHLD, HostSignalSend::ProcessDirected)]
         );
+    }
+
+    /// A thread blocked in a real external call takes a timer's signal on the
+    /// same terms as an `rt_sigsuspend` waiter. When the mask recorded at its
+    /// commit admits the signal, it alone is sent the signal, thread-directed,
+    /// and it is armed with its request still empty, so every pass waits for
+    /// its own report rather than letting `step2c` take the report at a pass
+    /// host timing chooses (https://github.com/rrnewton/hermit/issues/3222).
+    /// When its call had already returned before the send, its report is the
+    /// continuation it posted, and the next pass requeues it with that; the
+    /// signal stays pending in the kernel until the thread next runs.
+    #[test]
+    fn an_alarm_goes_to_the_external_io_blocker_whose_mask_admits_it() {
+        let alrm = kernel_signal_bit(libc::SIGALRM);
+        for already_returned in [false, true] {
+            let case = format!("already_returned={already_returned}");
+            let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+            let mut scheduler = gated_scheduler();
+            let (leader, workers, stranger) = timer_family(&mut scheduler, !alrm, &[101]);
+            let worker = workers[0];
+            let op = ExternalOpId::new(worker, 291);
+            commit_out_of_scheduler_call(
+                &mut scheduler,
+                worker,
+                ResourceID::BlockingExternalIO(op),
+                Some(0),
+            );
+            if already_returned {
+                let req = scheduler.next_turns.get(&worker).unwrap().req.clone();
+                let mut continuation = Resources::new(worker);
+                continuation.insert(ResourceID::BlockedExternalContinue(op), Permission::RW);
+                scheduler.request_put(&req, continuation, &global_time);
+            }
+
+            scheduler.dispatch_timed_signal(
+                LogicalTime::from_nanos(1),
+                timed_waiters::SignalTimerId::Alarm(leader),
+                leader,
+                Signal::SIGALRM,
+                true,
+            );
+
+            assert_eq!(
+                host_signal_sends(&scheduler),
+                vec![(worker, Signal::SIGALRM, HostSignalSend::ThreadDirected)],
+                "{case}"
+            );
+            assert!(
+                scheduler.blocked.signaled_background.contains(&worker),
+                "{case}"
+            );
+            assert!(
+                !scheduler.blocked.signaled_background.contains(&stranger),
+                "{case}"
+            );
+            assert!(!scheduler.run_queue.contains_tid(worker), "{case}");
+            assert!(scheduler.is_parked_futex_waiter(leader), "{case}");
+            if already_returned {
+                assert!(
+                    scheduler.step2_release_signaled_background().is_ok(),
+                    "{case}"
+                );
+                assert!(scheduler.run_queue.contains_tid(worker), "{case}");
+                assert!(scheduler.blocked.external_io_blockers.is_empty(), "{case}");
+                assert_eq!(
+                    request_resources(&scheduler, worker),
+                    Some(vec![ResourceID::BlockedExternalContinue(op)]),
+                    "{case}"
+                );
+            } else {
+                assert_eq!(request_resources(&scheduler, worker), None, "{case}");
+                for _ in 0..2 {
+                    assert!(
+                        scheduler.step2_release_signaled_background().is_err(),
+                        "{case}"
+                    );
+                    assert!(!scheduler.run_queue.contains_tid(worker), "{case}");
+                }
+                assert_eq!(
+                    scheduler.blocked.external_io_blockers.get(&worker),
+                    Some(&op),
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    /// A thread blocked in a real external call that a timer's signal is not
+    /// known to wake keeps the process-directed send to the thread the timer
+    /// names, and stays in its pool with its request empty: its recorded mask
+    /// blocks the signal or is unknown, it is a vfork parent (committed
+    /// through its own grant, with a mask that admits the signal), an earlier
+    /// signal already released it, or the scheduler does not model signal
+    /// targets. Requeueing it would wait for a report that may never come.
+    #[test]
+    fn a_timer_signal_leaves_an_external_io_blocker_it_cannot_wake_in_its_pool() {
+        let alrm = kernel_signal_bit(libc::SIGALRM);
+        for case in [
+            "mask blocks the signal",
+            "mask unknown",
+            "vfork parent",
+            "released by an earlier signal",
+            "no signal-target model",
+        ] {
+            let mut scheduler = if case == "no signal-target model" {
+                Scheduler::new(&Config {
+                    sequentialize_threads: true,
+                    ..Config::default()
+                })
+            } else {
+                gated_scheduler()
+            };
+            let (leader, workers, _) = timer_family(&mut scheduler, !alrm, &[101]);
+            let worker = workers[0];
+            let op = if case == "vfork parent" {
+                commit_vfork_parent(&mut scheduler, worker, Some(0))
+            } else {
+                let op = ExternalOpId::new(worker, 291);
+                let mask = if case == "mask blocks the signal" {
+                    alrm
+                } else {
+                    0
+                };
+                commit_out_of_scheduler_call(
+                    &mut scheduler,
+                    worker,
+                    ResourceID::BlockingExternalIO(op),
+                    Some(mask),
+                );
+                op
+            };
+            match case {
+                "mask unknown" => {
+                    scheduler
+                        .blocked
+                        .out_of_scheduler_masks
+                        .insert(worker, None);
+                }
+                "released by an earlier signal" => {
+                    scheduler.wake_signaled_guest(worker, Signal::SIGUSR1);
+                    assert!(
+                        scheduler.blocked.signaled_background.contains(&worker),
+                        "{case}"
+                    );
+                }
+                _ => {}
+            }
+            let armed_before = scheduler.blocked.signaled_background.clone();
+
+            scheduler.dispatch_timed_signal(
+                LogicalTime::from_nanos(1),
+                timed_waiters::SignalTimerId::Alarm(leader),
+                leader,
+                Signal::SIGALRM,
+                true,
+            );
+
+            assert_eq!(
+                host_signal_sends(&scheduler),
+                vec![(leader, Signal::SIGALRM, HostSignalSend::ProcessDirected)],
+                "{case}"
+            );
+            assert_eq!(
+                scheduler.blocked.signaled_background, armed_before,
+                "{case}"
+            );
+            assert_eq!(
+                scheduler.blocked.external_io_blockers.get(&worker),
+                Some(&op),
+                "{case}"
+            );
+            assert!(!scheduler.run_queue.contains_tid(worker), "{case}");
+            assert_eq!(request_resources(&scheduler, worker), None, "{case}");
+            assert!(scheduler.is_parked_futex_waiter(leader), "{case}");
+        }
     }
 
     /// The barrier runs before anything else in a pass: while an armed thread
