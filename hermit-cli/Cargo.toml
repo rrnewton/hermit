@@ -86,6 +86,7 @@ uuid = { version = "1.24.0", features = ["rng-getrandom", "serde", "v4", "v5", "
 # Exact token locations and digests bind the complete source inventory.
 proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
 quote = "1.0.47"
+ruzstd = "0.9.0"
 sha2 = "0.10.9"
 # Parse actual container call arguments, including conditional local labels.
 syn = { version = "2.0.119", features = ["full", "visit"] }

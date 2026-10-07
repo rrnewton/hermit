@@ -74,6 +74,7 @@ rust_library(
         "fbsource//third-party/rust:rand_pcg",
         "fbsource//third-party/rust:raw-cpuid",
         "fbsource//third-party/rust:regex",
+        "fbsource//third-party/rust:ruzstd",
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:serde_json",
         "fbsource//third-party/rust:sha2",

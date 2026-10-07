@@ -795,6 +795,10 @@ pub(crate) struct DetOptions {
     pub det_config: DetConfig,
 }
 
+/// How long the tracer may spend writing one fatal core before it gives up
+/// on it. The guest's clock does not move meanwhile; only the host waits.
+const FATAL_CORE_TIME_LIMIT: Duration = Duration::from_secs(10);
+
 /// Command-line options for the "run" subcommand.
 #[derive(Debug, Parser, Clone)]
 pub struct RunOpts {
@@ -840,6 +844,46 @@ pub struct RunOpts {
     /// never serialized, like `resolved_happens_before`.
     #[clap(skip)]
     host_input_log: Option<PathBuf>,
+
+    /// Opt in to keeping a core file for each guest process that a
+    /// core-dumping signal (SIGSEGV, SIGABRT, SIGBUS, ...) kills. The core is
+    /// written zstd-compressed into DIR as
+    /// `hermit-<HERMIT PID>-core.<PID>.<TID>.<SIGNAL>.zst`, where PID and TID
+    /// are the guest's. Off by default: without this option no core is
+    /// written. Only ptrace-backed backends write cores. A run that exits 0
+    /// (for `--verify`, whose two runs also matched) deletes its cores again.
+    #[clap(long, value_name = "DIR")]
+    fatal_core_dir: Option<PathBuf>,
+
+    /// With `--fatal-core-dir`, the most bytes one compressed core may take. A
+    /// core that does not fit is retried with only its stack, then with only
+    /// its registers and memory layout.
+    #[clap(long, value_name = "BYTES", default_value_t = 256 << 20, requires = "fatal_core_dir")]
+    fatal_core_max_bytes: u64,
+
+    /// With `--fatal-core-dir`, the most bytes the regular files directly in
+    /// DIR may take together, counting files that were there before the run.
+    #[clap(long, value_name = "BYTES", default_value_t = 1 << 30, requires = "fatal_core_dir")]
+    fatal_core_total_max_bytes: u64,
+
+    /// Runtime-only: `--fatal-core-dir`, held open by the controller so the
+    /// run container reaches it through `/proc/self/fd` whatever its mount
+    /// namespace hides (see [`descriptor_path`]). Opened by `main` just before
+    /// the guest starts.
+    #[clap(skip)]
+    fatal_core_dir_handle: Option<std::sync::Arc<File>>,
+
+    /// Runtime-only: which `--verify` run this is, so the two runs' cores do
+    /// not share names.
+    #[clap(skip)]
+    fatal_core_run_label: Option<&'static str>,
+
+    /// Runtime-only: the controller's process ID, recorded when
+    /// `--fatal-core-dir` is opened, which names this invocation's cores. The
+    /// tracer computes names inside the run's PID namespace, where its own
+    /// process ID is not the controller's.
+    #[clap(skip)]
+    fatal_core_owner_pid: u32,
 
     /// Whether this invocation's epoch was captured from the host clock because
     /// neither `--epoch` nor `HERMIT_EPOCH` supplied an explicit input.
@@ -4726,6 +4770,14 @@ impl RunOpts {
     }
 
     pub fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        let result = self.main_without_core_cleanup(global);
+        if matches!(result, Ok(ExitStatus::Exited(0))) {
+            self.discard_fatal_cores_after_success();
+        }
+        result
+    }
+
+    fn main_without_core_cleanup(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         // Set up an early tracing option before we're ready to set the global default:
 
         // The backend is a global option (`hermit --backend X run ...`), the only
@@ -4905,6 +4957,9 @@ impl RunOpts {
         };
         // });
 
+        // Last, so that a run refused above creates no directory.
+        self.open_fatal_core_dir()?;
+
         // DBT uses its dedicated CLI launch adapter. SaBRe, LiteInst, KVM,
         // e9patch, and ptrace use the common container and run/verify machinery.
         match backend {
@@ -5078,6 +5133,14 @@ impl RunOpts {
         {
             anyhow::bail!(
                 "--skid-margin configures the Reverie ptrace PMU timer and requires a ptrace-backed backend"
+            );
+        }
+        if self.fatal_core_dir.is_some()
+            && (self.namespace_only || !matches!(backend, Backend::Ptrace | Backend::E9patch))
+        {
+            anyhow::bail!(
+                "--fatal-core-dir captures cores at the ptrace backend's exit stop, so it \
+                 needs --backend=ptrace or --backend=e9patch, without --namespace-only"
             );
         }
         if self.image.is_some() && self.no_namespace {
@@ -6303,6 +6366,8 @@ impl RunOpts {
         let host_inputs_path = descriptor_path(&host_inputs_file);
         run1_options.host_input_log = Some(host_inputs_path.clone());
         run2_options.host_input_log = Some(host_inputs_path.clone());
+        run1_options.fatal_core_run_label = Some("run1");
+        run2_options.fatal_core_run_label = Some("run2");
 
         // Captured BEFORE run 1 so the same values can be put back before run 2.
         // See the restore call below for the measurement this exists for.
@@ -7055,7 +7120,70 @@ impl RunOpts {
         config.record_host_inputs = self.host_input_log.is_some();
         config.host_input_log = self.host_input_log.clone();
         config.untraced_code_range = untraced_code_range(self.selected_backend());
+        config.fatal_core_capture = self.fatal_core_capture();
         config
+    }
+
+    /// Where and within what bounds the tracer keeps fatal cores, or `None`,
+    /// the default, to keep none.
+    fn fatal_core_capture(&self) -> Option<detcore::FatalCoreCapture> {
+        let handle = self.fatal_core_dir_handle.as_ref()?;
+        Some(detcore::FatalCoreCapture {
+            dir: descriptor_path(handle),
+            file_prefix: self.fatal_core_file_prefix(),
+            max_core_bytes: self.fatal_core_max_bytes,
+            max_total_bytes: self.fatal_core_total_max_bytes,
+            time_limit: FATAL_CORE_TIME_LIMIT,
+        })
+    }
+
+    /// The name prefix of every core this run writes.
+    fn fatal_core_file_prefix(&self) -> String {
+        match self.fatal_core_run_label {
+            Some(label) => format!("hermit-{}-{label}-", self.fatal_core_owner_pid),
+            None => format!("hermit-{}-", self.fatal_core_owner_pid),
+        }
+    }
+
+    /// Opens `--fatal-core-dir`, creating it, so that the guest's run can
+    /// reach it. Called once every refusal that needs no guest has passed.
+    fn open_fatal_core_dir(&mut self) -> Result<(), Error> {
+        if let Some(dir) = &self.fatal_core_dir {
+            fs::create_dir_all(dir)
+                .with_context(|| format!("creating --fatal-core-dir {}", dir.display()))?;
+            let handle = File::open(dir)
+                .with_context(|| format!("opening --fatal-core-dir {}", dir.display()))?;
+            self.fatal_core_dir_handle = Some(std::sync::Arc::new(handle));
+            self.fatal_core_owner_pid = std::process::id();
+        }
+        Ok(())
+    }
+
+    /// A run that succeeded keeps no cores: removes every file in
+    /// `--fatal-core-dir` that this invocation named, including any temporary
+    /// file a capture left behind.
+    fn discard_fatal_cores_after_success(&self) {
+        let (Some(dir), Some(_)) = (&self.fatal_core_dir, &self.fatal_core_dir_handle) else {
+            return;
+        };
+        let prefix = format!("hermit-{}-", self.fatal_core_owner_pid);
+        let temp_prefix = format!(".{prefix}");
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        let mut removed = 0;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if (name.starts_with(&prefix) || name.starts_with(&temp_prefix))
+                && fs::remove_file(entry.path()).is_ok()
+            {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            eprintln!("hermit: the run exited 0, so its {removed} fatal core file(s) were removed");
+        }
     }
 
     /// The `--timeout` bound, if the caller asked for one.

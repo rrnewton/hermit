@@ -713,6 +713,32 @@ pub struct Config {
     #[serde(skip)]
     #[clap(skip)]
     pub untraced_code_range: Option<(u64, u64)>,
+
+    /// Opt-in capture of a core file for a guest thread killed by a signal
+    /// whose default action dumps core; `None`, the default, writes nothing.
+    /// A host path and host-side limits, read only by the global state at a
+    /// fatal exit stop, so set programmatically, like `host_input_log`, and
+    /// never serialized.
+    #[serde(skip)]
+    #[clap(skip)]
+    pub fatal_core_capture: Option<FatalCoreCapture>,
+}
+
+/// Where and how much [`Config::fatal_core_capture`] may write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FatalCoreCapture {
+    /// Directory receiving the compressed cores. Its regular files, whoever
+    /// wrote them, count against `max_total_bytes`.
+    pub dir: PathBuf,
+    /// Prefix of every file name this run writes, so the run can find and
+    /// remove its own cores.
+    pub file_prefix: String,
+    /// Most bytes one compressed core may occupy.
+    pub max_core_bytes: u64,
+    /// Most bytes all regular files in `dir` may occupy together.
+    pub max_total_bytes: u64,
+    /// Longest one capture may take before it gives up.
+    pub time_limit: std::time::Duration,
 }
 
 fn try_parse_numbers_with_colon(from_str: &str) -> anyhow::Result<(DetTid, u64)> {

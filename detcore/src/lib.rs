@@ -45,6 +45,7 @@ mod dirents;
 #[allow(missing_docs)]
 pub mod edit_distance;
 pub mod exit_dependencies;
+mod fatal_core;
 mod fd;
 mod host_inputs;
 mod io_buffers;
@@ -86,6 +87,7 @@ use std::time::Duration;
 pub use config::BlockingMode;
 pub use config::CONFIG_FINGERPRINT_ENV;
 pub use config::Config;
+pub use config::FatalCoreCapture;
 pub use config::RunsPostFork;
 pub use config::SchedHeuristic;
 pub use config::config_wire_fingerprint;

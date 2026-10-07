@@ -85,6 +85,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "external_signal_interrupt",
             "--test",
+            "fatal_core_capture",
+            "--test",
             "file_nr_determinism",
             "--test",
             "first_seen_mtime",

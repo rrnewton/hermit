@@ -1655,6 +1655,12 @@ impl GlobalTool for GlobalState {
             .collect()
     }
 
+    fn on_fatal_signal_exit(&self, exit: &reverie::FatalSignalExit) {
+        if let Some(capture) = &self.cfg.fatal_core_capture {
+            crate::fatal_core::capture_and_log(capture, exit);
+        }
+    }
+
     fn report_backend_failure(&self, event: reverie::BackendFailure) {
         let (wake, deferred) = {
             let mut sched = self.sched.lock().unwrap();
