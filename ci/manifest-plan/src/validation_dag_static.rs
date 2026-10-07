@@ -1152,7 +1152,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // only_threads_filtered_alike_are_probed, eight real-filter scenarios and
     // the_run_config_carries_the_launchers_seccomp_answer): 972 - 4 + 12 =
     // 980, listed the same way.
-    ("test.hermit_unit", 980),
+    // The two probe-preparation tests of the same pull request (hermit tests:
+    // a_filter_that_refuses_resetting_sigsys_makes_the_flag_true,
+    // a_filter_that_fakes_resetting_sigsys_makes_the_flag_true) retain all
+    // 980: 982, listed the same way.
+    ("test.hermit_unit", 982),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2117,7 +2121,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same four seccomp-state tests: 970.
     // The host twin selects the same two thread-seccomp tests: 972.
     // And the same twelve seccomp-probe tests in place of four: 980.
-    ("test.hermit_unit_on_host", 980),
+    // And the same two probe-preparation tests: 982.
+    ("test.hermit_unit_on_host", 982),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
