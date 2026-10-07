@@ -2694,7 +2694,33 @@ impl GlobalState {
             state.caller == *dettid && (*mm == state.mm || *mm == state.mm.for_exec(state.process))
         }) {
             let prepared = pending.remove(detpid).unwrap();
-            sched.finish_exec_teardown(prepared.caller, *detpid, prepared.mm, false);
+            // Whether the exec succeeded. The caller installs the candidate
+            // image's MmId immediately before it injects the exec, and a
+            // failed exec restores the old MmId and sends CancelExec, which
+            // consumes this preparation, before the caller runs again. The
+            // caller holds its turn throughout, so no guest thread can kill it
+            // in between: a guest `SIGKILL` sent before this turn kills it
+            // before the preparation exists (on SaBRe the `SIGKILL` edge also
+            // retires it). So a caller that dies holding the candidate MmId
+            // with its preparation unconsumed passed the exec's point of no
+            // return, where Linux has already reset the exit signal and
+            // counted the exec (`begin_new_exec`: `de_thread` and
+            // `self_exec_id`), and died before the new image's post-exec
+            // callback. That happens when a signal left pending across the
+            // exec, whose handler the exec reset to the default action, kills
+            // the new image as soon as it resumes: Reverie's ptrace backend
+            // forwards it before `handle_post_exec` (R4-F3 of the review of
+            // this series). No callback will follow, so commit the exec here,
+            // before the teardown exposes the dead process to its parent's
+            // waits, and retire the complete sibling cohort the exec killed,
+            // as `recv_retire_exec_transfer` does. Only a host-originated kill
+            // landing between a failed exec's return and its CancelExec is
+            // misread as a success; it is outside the deterministic model.
+            let succeeded = *mm == prepared.mm.for_exec(prepared.process);
+            if succeeded {
+                sched.thread_tree.note_successful_exec(*detpid);
+            }
+            sched.finish_exec_teardown(prepared.caller, *detpid, prepared.mm, succeeded);
             // The local caller can have installed its candidate exec MmId
             // before cancellation. It still owns the original registration;
             // consume that exact prepared incarnation rather than discarding

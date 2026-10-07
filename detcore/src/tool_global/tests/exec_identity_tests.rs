@@ -1828,3 +1828,158 @@ async fn exec_death_before_its_callback_still_commits_the_exec_once() {
         assert_eq!(sched.ready_child_wait(PARENT, child_wait()), Some(LEADER));
     }
 }
+
+/// How a state-preserving leader exec (the ptrace backend's ordinary exec)
+/// ends when its post-exec callback never runs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LeaderExecEnd {
+    /// The exec succeeded and the new image died before its callback: a
+    /// signal left pending across the exec, whose handler the exec reset to
+    /// the default action, killed it as soon as Reverie resumed it.
+    DiesAfterTheExec,
+    /// The leader died before it installed the candidate image, so it never
+    /// injected the exec.
+    DiesBeforeTheExec,
+    /// The exec failed, the leader cancelled its preparation, and then died.
+    FailsThenDies,
+}
+
+/// R4-F3 of the review of this series: a leader cloned with exit signal
+/// SIGUSR1 execs while a caught SIGUSR2 is pending. The exec succeeds and
+/// resets the handler to the default action, and Reverie's ptrace backend
+/// forwards the pending SIGUSR2 before the new image's post-exec callback,
+/// so the process dies with its preparation unconsumed. Linux reset the exit
+/// signal and counted the exec inside the exec syscall, so the parent's
+/// ordinary wait4(WNOHANG) must find the zombie; before the fix terminal
+/// cleanup treated the exec as failed, and Detcore kept SIGUSR1 and
+/// generation 0, so that wait returned ECHILD. The exec also killed the
+/// leader's sibling, which is retired with it. A leader that dies before
+/// installing the candidate image, or after a failed and cancelled exec,
+/// keeps its old exit signal and generation and its sibling.
+#[tokio::test]
+async fn leader_exec_death_before_its_callback_commits_the_exec_only_after_the_exec() {
+    for end in [
+        LeaderExecEnd::DiesAfterTheExec,
+        LeaderExecEnd::DiesBeforeTheExec,
+        LeaderExecEnd::FailsThenDies,
+    ] {
+        let config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        }
+        .with_backend(|backend| {
+            backend.needs_killed_thread_rpc_cancellation = false;
+        });
+        let state = GlobalState::initialize(&config, false);
+        let tool = Detcore::new(Tid::from_raw(LEADER.as_raw()), &config);
+        let mut parent = tool.init_thread_state(Tid::from_raw(PARENT.as_raw()), None);
+        parent.detpid = Some(PARENT);
+        parent.thread_start_entered = true;
+        parent.clone_flags = Some(CloneFlags::empty());
+        let mut leader = tool.init_thread_state(
+            Tid::from_raw(LEADER.as_raw()),
+            Some((Tid::from_raw(PARENT.as_raw()), &parent)),
+        );
+        leader.detpid = Some(LEADER);
+        leader.thread_start_entered = true;
+        leader.clone_flags = Some(CloneFlags::CLONE_THREAD | CloneFlags::CLONE_VM);
+        let mut worker = tool.init_thread_state(
+            Tid::from_raw(WORKER.as_raw()),
+            Some((Tid::from_raw(LEADER.as_raw()), &leader)),
+        );
+        worker.detpid = Some(LEADER);
+        worker.thread_start_entered = true;
+        let old_mm = leader.mm_id;
+        {
+            let mut sched = state.sched.lock().unwrap();
+            sched.thread_tree.add_child(PARENT, PARENT, true);
+            sched.thread_tree.add_child_with_wait_metadata(
+                PARENT,
+                LEADER,
+                true,
+                false,
+                libc::SIGUSR1,
+            );
+            sched.thread_tree.add_child(LEADER, WORKER, false);
+        }
+        for thread in [&leader, &worker] {
+            install_test_registration(&state, thread.dettid, Ivar::new());
+            state
+                .sched
+                .lock()
+                .unwrap()
+                .install_test_exec_incarnation(thread.dettid, old_mm);
+        }
+        for thread in [&parent, &leader, &worker] {
+            state.global_time.lock().unwrap().update_global_time(
+                thread.dettid,
+                thread.thread_logical_time.as_nanos(),
+                thread.thread_logical_time.inherited_nanos(),
+            );
+        }
+        let rpc = |request| (leader.thread_logical_time.clone(), old_mm, request);
+        assert_eq!(
+            state
+                .receive_rpc(
+                    Tid::from_raw(LEADER.as_raw()),
+                    rpc(GlobalRequest::PrepareExec(
+                        LEADER,
+                        old_mm,
+                        Default::default()
+                    )),
+                )
+                .await,
+            (None, GlobalResponse::PrepareExec(()))
+        );
+        assert_eq!(exec_wait_identity(&state), CLONED_WITH_SIGUSR1, "{end:?}");
+        match end {
+            LeaderExecEnd::DiesAfterTheExec => leader.mm_id = old_mm.for_exec(LEADER),
+            LeaderExecEnd::DiesBeforeTheExec => {}
+            LeaderExecEnd::FailsThenDies => {
+                assert_eq!(
+                    state
+                        .receive_rpc(
+                            Tid::from_raw(LEADER.as_raw()),
+                            rpc(GlobalRequest::CancelExec(LEADER)),
+                        )
+                        .await,
+                    (None, GlobalResponse::CancelExec(()))
+                );
+            }
+        }
+        consume_with_status(
+            &state,
+            &tool,
+            LEADER,
+            leader,
+            ExitStatus::Signaled(Signal::SIGUSR2, false),
+        )
+        .await;
+        assert!(
+            state.pending_exec_states.lock().unwrap().is_empty(),
+            "{end:?}"
+        );
+        if end == LeaderExecEnd::DiesAfterTheExec {
+            assert_eq!(exec_wait_identity(&state), AFTER_ONE_EXEC, "{end:?}");
+            let mut sched = state.sched.lock().unwrap();
+            assert!(!sched.next_turns.contains_key(&WORKER), "{end:?}");
+            assert_eq!(
+                sched.exact_child_wait_state(PARENT, LEADER),
+                ExactChildWaitState::LogicallyExited,
+                "{end:?}"
+            );
+            assert_eq!(
+                sched.ready_child_wait(PARENT, child_wait()),
+                Some(LEADER),
+                "{end:?}"
+            );
+        } else {
+            {
+                let sched = state.sched.lock().unwrap();
+                assert!(sched.next_turns.contains_key(&WORKER), "{end:?}");
+                assert!(!sched.next_turns.contains_key(&LEADER), "{end:?}");
+            }
+            assert_eq!(exec_wait_identity(&state), CLONED_WITH_SIGUSR1, "{end:?}");
+        }
+    }
+}
