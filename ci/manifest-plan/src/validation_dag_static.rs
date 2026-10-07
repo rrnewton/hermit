@@ -854,7 +854,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and rename runner::tests::selected_portable_parity_candidates_preserve_identical_guest_arguments
     // to runner::tests::population_parity_candidates_preserve_identical_guest_arguments:
     // 992 + 2 = 994 (the same listing gives 729).
-    ("test.regular_crates", 995),
+    // main::tests::rejects_io_buffer_comparison_relaxation_with_reason, for the
+    // refusal of compare_io_buffers=false with a reason, retains all 995: 996.
+    ("test.regular_crates", 996),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2146,7 +2148,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The parity-population identity changes listed for test.regular_crates
     // keep the count at 991, its not-sampled test listed there makes 992, and
     // the two review-fix tests listed there make 994.
-    ("test.regular_crates_on_host", 995),
+    // The compare_io_buffers refusal test listed there retains all 995: 996.
+    ("test.regular_crates_on_host", 996),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
