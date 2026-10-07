@@ -904,6 +904,13 @@ class ValidateNodeTest(unittest.TestCase):
     def kept(self, results):
         return results / "buck-invocations"
 
+    def exit_time(self, results):
+        """The epoch time phases.tsv records for the node's exit: when it began keeping records."""
+        rows = [line.split("\t") for line in (self.kept(results) / "phases.tsv").read_text().splitlines()]
+        exits = [float(time) for time, what in rows if what.startswith("exit ")]
+        self.assertEqual(len(exits), 1, rows)
+        return exits[0]
+
     def phases(self, results):
         rows = [line.split("\t") for line in (self.kept(results) / "phases.tsv").read_text().splitlines()]
         times = [float(time) for time, _ in rows]
@@ -1053,24 +1060,41 @@ class ValidateNodeTest(unittest.TestCase):
         return process, time.monotonic() - started_ns / 1e9
 
     def test_keeping_the_records_ends_inside_the_steps_wall_bound(self):
-        # The cells finish within about a second of a 13 s bound, so about 2 s are left after the
-        # 10 s reserve; the summary stalls and the 30 s retention budget would outlast the bound.
+        # The step's bound less the 10 s reserve is shorter than the 30 s retention budget, so it
+        # sets the deadline for keeping records; the summary stalls, so the node must cut it at
+        # that deadline: not earlier (it uses the time it has) and not later (the retention
+        # budget, or the bound itself, would follow). Every time is judged against the deadline
+        # the node computes from its own exit, never against how long the node took to get
+        # there: under load the steps before the exit take seconds (10.8 s in a box validation
+        # of hermit 78c0eca2), which once spent the whole 3 s a 13 s bound leaves. A bound that
+        # leaves less than a second at the exit tests nothing, so the next, longer one is tried.
         results = self.root / "e2e-results"
         kills = self.root / "kills"
         for run_status in (0, 7):
             with self.subTest(run_status=run_status):
-                kills.unlink(missing_ok=True)
-                process, elapsed = self.run_as_step(results, 13, FAKE_RUN_RC=str(run_status),
-                                                    FAKE_BUCK2_KILLS=str(kills), FAKE_BUCK2_LOG_SHOW_HANGS="1",
-                                                    HERMIT_VALIDATE_BUCK_RETENTION_SECONDS="30")
-                stderr = (self.root / "node.stderr").read_text()
-                self.assertEqual(process.returncode, run_status, stderr)
-                # The bound less the 10 s reserve, half a second for the stalled command to be
-                # killed, and slack for the kill after it.
-                self.assertLess(elapsed, 13 - 10 + 2, stderr)
+                for wall in (13, 25, 60):
+                    kills.unlink(missing_ok=True)
+                    started = time.time()
+                    process, _elapsed = self.run_as_step(results, wall, FAKE_RUN_RC=str(run_status),
+                                                         FAKE_BUCK2_KILLS=str(kills), FAKE_BUCK2_LOG_SHOW_HANGS="1",
+                                                         HERMIT_VALIDATE_BUCK_RETENTION_SECONDS="30")
+                    ended = time.time()
+                    stderr = (self.root / "node.stderr").read_text()
+                    self.assertEqual(process.returncode, run_status, stderr)
+                    deadline = started + wall - 10
+                    if self.exit_time(results) < deadline - 1:
+                        break
+                else:
+                    self.fail(f"the node reached its exit less than 1 s before the deadline of a {wall} s "
+                              f"bound, so nothing was left to cut:\n{stderr}")
+                # Cut at the deadline: not before it (less a little for the clocks read), and no
+                # later than the half second the stalled command gets after its timeout, the
+                # buck2 kill and the exit.
+                self.assertGreater(ended, deadline - 0.5, stderr)
+                self.assertLess(ended, deadline + 3, stderr)
                 self.assertIn("validate-node: the stage summary of the re invocation is incomplete", stderr)
-                self.assertIn("validate-node: the time left before this step's 13 s wall bound, less 10 s for "
-                              "stopping buck2, ran out before ", stderr)
+                self.assertIn(f"validate-node: the time left before this step's {wall} s wall bound, less 10 s "
+                              "for stopping buck2, ran out before ", stderr)
                 self.assertEqual((self.kept(results) / "re.log").read_text(), RECORDS["re.log"])
                 self.assertEqual(self.phases(results)[-1], f"exit {run_status}")
                 self.assertEqual(kills.read_text(), "kill\n", "the buck2 daemon was not stopped")
@@ -1094,11 +1118,14 @@ class ValidateNodeTest(unittest.TestCase):
 
     def test_the_retention_budget_still_bounds_the_records_inside_a_long_wall_bound(self):
         results = self.root / "e2e-results"
-        process, elapsed = self.run_as_step(results, 3600, FAKE_BUCK2_LOG_SHOW_HANGS="1",
-                                            HERMIT_VALIDATE_BUCK_RETENTION_SECONDS="1")
+        process, _elapsed = self.run_as_step(results, 3600, FAKE_BUCK2_LOG_SHOW_HANGS="1",
+                                             HERMIT_VALIDATE_BUCK_RETENTION_SECONDS="1")
+        ended = time.time()
         stderr = (self.root / "node.stderr").read_text()
         self.assertEqual(process.returncode, 0, stderr)
-        self.assertLess(elapsed, 10, stderr)
+        # The 1 s budget counts from the node's exit, however long it took to get there; the
+        # stalled summary then gets half a second after its timeout, then the buck2 kill.
+        self.assertLess(ended - self.exit_time(results), 1 + 3, stderr)
         self.assertIn("validate-node: the 1 s for keeping the Buck invocation records ran out before ", stderr)
 
     def test_a_step_wall_bound_that_is_not_a_positive_number_of_seconds_is_refused(self):
