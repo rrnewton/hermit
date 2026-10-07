@@ -1407,7 +1407,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_stale_directory_entry_does_not_renumber_a_held_file} (the reviews of
     // https://github.com/rrnewton/hermit/pull/3849) retain all 1100 (1102,
     // measured with cargo nextest list).
-    ("test.detcore_unit", 1102),
+    // tool_global::tests::a_stale_directory_entry_keeps_its_file_after_the_inode_is_reused
+    // (codex re-review of https://github.com/rrnewton/hermit/pull/3849)
+    // retains all 1102: 1103.
+    ("test.detcore_unit", 1103),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1972,7 +1975,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same unidentified-stop SIGCHLD refusal test: 1088 + 1 = 1089.
     // The host twin selects the same background-signal test, re-listed: 1090.
     // The host twin selects the same seven B5a tests, re-listed: 1096.
-    ("test.detcore_unit_on_host", 1102),
+    ("test.detcore_unit_on_host", 1103),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

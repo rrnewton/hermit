@@ -162,6 +162,11 @@ struct InodePool {
     /// How many retirements there have been. Each follows a guest's removal
     /// of a last name, so the count is the guest's, like the counter.
     retirements: u64,
+    /// Every file that has held each host inode, oldest first, kept after a
+    /// later file discards a retirement: a directory snapshot taken while an
+    /// earlier file held the inode must still name that file (codex
+    /// re-review of <https://github.com/rrnewton/hermit/pull/3849>, P1).
+    generations: HashMap<RawInode, Vec<Generation>>,
     /// How many retired mappings a later sighting showed the host had given to
     /// another file (see [`Self::forget_retired`]). Diagnostic only: it
     /// follows host state and never reaches the guest.
@@ -188,6 +193,18 @@ pub enum InodeSighting {
     /// <https://github.com/rrnewton/hermit/pull/3849>, P1). So it shows a
     /// new file only for an inode retired before it was taken.
     Listed(u64),
+}
+
+/// One file that held a host inode (see `InodePool::generations`). It held
+/// the inode from just after the previous file's retirement until its own.
+#[derive(Debug)]
+struct Generation {
+    /// Its number, or `None` while nothing has numbered it.
+    number: Option<DetInode>,
+    /// The retirement count at which it lost its last name, if it has.
+    retired: Option<u64>,
+    /// The mtime a write left on it before anything numbered it.
+    pending: Option<LogicalTime>,
 }
 
 /// Everything we know (globally) about a DetInode.
@@ -315,6 +332,7 @@ impl InodePool {
             retired_unnumbered: HashMap::new(),
             retired_at: HashMap::new(),
             retirements: 0,
+            generations: HashMap::new(),
             reused: 0,
         }
     }
@@ -367,6 +385,16 @@ impl InodePool {
         match sighting {
             InodeSighting::Name => self.forget_retired(raw_inode),
             InodeSighting::Listed(snapshot) => {
+                if let Some(answer) = self.listed_generation(raw_inode, snapshot, ordinal) {
+                    let mtime = self
+                        .detinodes_info
+                        .get_mut(&answer)
+                        .expect("Internal invariant broken, det_ino missing entry");
+                    if mtime.mtime.is_none() {
+                        mtime.mtime = observed.first_seen_mtime(epoch);
+                    }
+                    return (answer, mtime.mtime.unwrap_or(epoch));
+                }
                 if self
                     .retired_at
                     .get(&raw_inode)
@@ -394,10 +422,25 @@ impl InodePool {
                 let mtime = match self.retired_unnumbered.remove(&raw_inode) {
                     Some(mtime) => {
                         self.retired.insert(raw_inode, new);
+                        if let Some(last) = self
+                            .generations
+                            .get_mut(&raw_inode)
+                            .and_then(|generations| generations.last_mut())
+                        {
+                            last.number = Some(new);
+                        }
                         mtime
                     }
                     None => {
                         assert!(self.inodes.insert(raw_inode, new).is_none());
+                        self.generations
+                            .entry(raw_inode)
+                            .or_default()
+                            .push(Generation {
+                                number: Some(new),
+                                retired: None,
+                                pending: None,
+                            });
                         self.pending_mtimes.remove(&raw_inode)
                     }
                 };
@@ -465,11 +508,23 @@ impl InodePool {
     /// removal reaches here follows host state (its `st_nlink`), and must not
     /// shift other files' numbers.
     fn retire(&mut self, raw_inode: RawInode) {
-        self.retired_at.insert(raw_inode, self.retirements);
+        let stamp = self.retirements;
+        self.retired_at.insert(raw_inode, stamp);
         self.retirements += 1;
+        let generations = self.generations.entry(raw_inode).or_default();
         match self.inodes.remove(&raw_inode) {
             Some(dino) => {
                 self.retired.insert(raw_inode, dino);
+                match generations.last_mut() {
+                    Some(last) if last.number == Some(dino) && last.retired.is_none() => {
+                        last.retired = Some(stamp);
+                    }
+                    _ => generations.push(Generation {
+                        number: Some(dino),
+                        retired: Some(stamp),
+                        pending: None,
+                    }),
+                }
             }
             // Nothing numbered it yet, but a write may have left a pending
             // mtime, which must stay with this file (claude review of
@@ -477,8 +532,58 @@ impl InodePool {
             None => {
                 let pending = self.pending_mtimes.remove(&raw_inode);
                 self.retired_unnumbered.insert(raw_inode, pending);
+                generations.push(Generation {
+                    number: None,
+                    retired: Some(stamp),
+                    pending,
+                });
             }
         }
+    }
+
+    /// The number of the file that held `raw_inode` when a directory snapshot
+    /// was taken after `snapshot` retirements, if that file has since lost its
+    /// last name. A file that held it then and was never numbered is numbered
+    /// now, as `ordinal`. `None` when the inode's holder at the snapshot still
+    /// holds it, or nothing ever retired one of its holders, so that the
+    /// current file answers.
+    ///
+    /// A file held the inode from just after the previous holder's retirement
+    /// (the host cannot reuse an inode before it is freed) through its own:
+    /// the retirement with stamp `r` happened when the count was `r`, so a
+    /// snapshot that saw it still named has `snapshot <= r`.
+    fn listed_generation(
+        &mut self,
+        raw_inode: RawInode,
+        snapshot: u64,
+        ordinal: u64,
+    ) -> Option<DetInode> {
+        let generations = self.generations.get_mut(&raw_inode)?;
+        let mut held_from = 0;
+        let index = generations.iter().position(|generation| {
+            let held = snapshot >= held_from;
+            held_from = generation.retired.map_or(u64::MAX, |retired| retired + 1);
+            held && generation
+                .retired
+                .is_some_and(|retired| snapshot <= retired)
+        })?;
+        let current = index + 1 == generations.len();
+        let generation = &mut generations[index];
+        if let Some(number) = generation.number {
+            return Some(number);
+        }
+        let new = DetInode::mint(ordinal);
+        generation.number = Some(new);
+        let mut mtime = generation.pending;
+        // The latest holder, still retired and reached first by this entry, is
+        // numbered as a descriptor would number it.
+        if current && let Some(pending) = self.retired_unnumbered.remove(&raw_inode) {
+            self.retired.insert(raw_inode, new);
+            mtime = pending;
+        }
+        let prev = self.detinodes_info.insert(new, DetInodeInfo { mtime });
+        assert!(prev.is_none()); // Should not have been previously used.
+        Some(new)
     }
 
     /// `raw_inode` names a file that has a name, or that was just created
@@ -487,8 +592,9 @@ impl InodePool {
     /// counter value.
     fn forget_retired(&mut self, raw_inode: RawInode) {
         self.retired_at.remove(&raw_inode);
-        if let Some(dino) = self.retired.remove(&raw_inode) {
-            self.detinodes_info.remove(&dino);
+        // Its number and mtime stay in `generations` and `detinodes_info` for
+        // directory snapshots taken while it held the inode.
+        if self.retired.remove(&raw_inode).is_some() {
             self.reused += 1;
         }
         if self.retired_unnumbered.remove(&raw_inode).is_some() {
@@ -8627,6 +8733,60 @@ mod tests {
             reused, number,
             "a snapshot taken after the retirement shows a new file"
         );
+    }
+
+    /// A snapshot entry must name the file that held the inode when the
+    /// snapshot was taken, even after a later file the host gave the freed
+    /// inode discarded that file's retirement. Codex re-review of
+    /// https://github.com/rrnewton/hermit/pull/3849, P1 (Claude re-review
+    /// P2-A): number F, take a snapshot, unlink F, create and number G, then
+    /// read F's cached entry; reuse and a fresh inode must agree on every
+    /// number, whether or not F was numbered before the snapshot.
+    #[test]
+    fn a_stale_directory_entry_keeps_its_file_after_the_inode_is_reused() {
+        use super::InodeSighting::Listed;
+        use super::InodeSighting::Name;
+        use crate::types::DetInode;
+        use crate::types::RawInode;
+
+        let t = LogicalTime::from_nanos(0);
+        let seen = super::ObservedMtime::Unobserved;
+        let f = RawInode::new(2049, 12);
+        let fresh = RawInode::new(2049, 13);
+        let history = |g: RawInode, numbered_first: bool| -> Vec<DetInode> {
+            let mut pool = super::InodePool::new();
+            let mut numbers = Vec::new();
+            if numbered_first {
+                numbers.push(pool.add_sighted_inode(f, seen, t, Name).0);
+            }
+            let snapshot = pool.retirements;
+            pool.retire(f);
+            pool.forget_retired(g); // G's open.
+            numbers.push(pool.add_sighted_inode(g, seen, t, Name).0);
+            numbers.push(pool.add_sighted_inode(f, seen, t, Listed(snapshot)).0);
+            numbers.push(pool.add_sighted_inode(f, seen, t, Listed(snapshot)).0);
+            numbers.push(
+                pool.add_sighted_inode(RawInode::new(2049, 40), seen, t, Name)
+                    .0,
+            );
+            numbers
+        };
+        for numbered_first in [true, false] {
+            let reused = history(f, numbered_first);
+            assert_eq!(
+                reused,
+                history(fresh, numbered_first),
+                "numbered_first={numbered_first}: host reuse changed a number"
+            );
+            let cached = reused[reused.len() - 3];
+            let g = reused[reused.len() - 4];
+            assert_ne!(cached, g, "F's cached entry took G's number");
+            assert_eq!(
+                cached,
+                reused[reused.len() - 2],
+                "the cached entry is stable"
+            );
+        }
     }
 
     /// Retiring and discarding follow host state (a link count, whether the
