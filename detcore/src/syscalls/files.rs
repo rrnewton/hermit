@@ -4184,24 +4184,35 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// the scheduler's nonblockize-and-retry.
     ///
     /// Outside record/replay that holds for every scheduler-managed type. In
-    /// record/replay it holds only for a pipe that is already physically
-    /// nonblocking, which is how `handle_pipe2` leaves every guest-created pipe
-    /// in both phases. Forwarding the guest's clear would make the recording's
-    /// next read on that pipe a blocking external read, which deadlocks the
-    /// sequentialized scheduler while the writer waits for its turn. Both phases
-    /// take the same branch, because `fd_type` and `physically_nonblocking` are
-    /// Detcore bookkeeping that record and replay evolve identically: an F_SETFL
-    /// is still recorded and replayed, with the kernel given `flags | O_NONBLOCK`
+    /// record/replay it holds only for a container-internal channel that is
+    /// already physically nonblocking: a pipe, which is how `handle_pipe2`
+    /// leaves every guest-created pipe in both phases, or a socketpair endpoint,
+    /// which is how `handle_socketpair` leaves both ends. Forwarding the guest's
+    /// clear would make the recording's next read on that channel a blocking
+    /// read on an fd that `syscall_targets_internal_fd` calls internal, which
+    /// deadlocks the sequentialized scheduler while the writer waits for its
+    /// turn. Both phases take the same branch, because `fd_type`,
+    /// `socketpair_endpoint` and `physically_nonblocking` are Detcore
+    /// bookkeeping that record and replay evolve identically: an F_SETFL is
+    /// still recorded and replayed, with the kernel given `flags | O_NONBLOCK`
     /// in record and the recorded result returned in replay; a FIONBIO returns
-    /// before `record_or_replay`, so neither phase records or applies it. Sockets
-    /// and eventfds stay external in record/replay. A pipe whose physical
-    /// O_NONBLOCK came from the guest rather than from Detcore is also kept
-    /// nonblocking; in record/replay the only such pipes are `pipe2` pipes,
+    /// before `record_or_replay`, so neither phase records or applies it. Other
+    /// sockets and eventfds stay external in record/replay. A pipe whose
+    /// physical O_NONBLOCK came from the guest rather than from Detcore is also
+    /// kept nonblocking; in record/replay the only such pipes are `pipe2` pipes,
     /// which Detcore has already made nonblocking.
-    fn keeps_physically_nonblocking(&self, fd_type: FdType, physically_nonblocking: bool) -> bool {
+    fn keeps_physically_nonblocking(
+        &self,
+        fd_type: FdType,
+        socketpair_endpoint: bool,
+        physically_nonblocking: bool,
+    ) -> bool {
         self.cfg.use_nonblocking_sockets()
             && match fd_type {
                 FdType::Pipe => !self.cfg.recordreplay_modes || physically_nonblocking,
+                FdType::Socket if socketpair_endpoint => {
+                    !self.cfg.recordreplay_modes || physically_nonblocking
+                }
                 FdType::Socket | FdType::Eventfd => !self.cfg.recordreplay_modes,
                 _ => false,
             }
@@ -4248,11 +4259,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
             F_SETFL(flags) => {
-                let (fd_type, physically_nonblocking) = guest
-                    .thread_state()
-                    .with_detfd(fd, |detfd| (detfd.ty(), detfd.physically_nonblocking()))?;
-                let force_nonblocking =
-                    self.keeps_physically_nonblocking(fd_type, physically_nonblocking);
+                let (fd_type, socketpair_endpoint, physically_nonblocking) =
+                    guest.thread_state().with_detfd(fd, |detfd| {
+                        (
+                            detfd.ty(),
+                            detfd.is_socketpair_endpoint(),
+                            detfd.physically_nonblocking(),
+                        )
+                    })?;
+                let force_nonblocking = self.keeps_physically_nonblocking(
+                    fd_type,
+                    socketpair_endpoint,
+                    physically_nonblocking,
+                );
                 let physical_flags = if force_nonblocking {
                     flags | OFlag::O_NONBLOCK.bits()
                 } else {
@@ -4368,11 +4387,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         // ioctl to their proxied pipe fd, and clearing it would violate the scheduler's
         // nonblockize-and-retry invariant. This mirrors F_SETFL's forced state split.
         if let Some(enabled) = nonblocking {
-            let (fd_type, physically_nonblocking) = guest
-                .thread_state()
-                .with_detfd(fd, |detfd| (detfd.ty(), detfd.physically_nonblocking()))?;
-            if self.keeps_physically_nonblocking(fd_type, physically_nonblocking)
-                && physically_nonblocking
+            let (fd_type, socketpair_endpoint, physically_nonblocking) =
+                guest.thread_state().with_detfd(fd, |detfd| {
+                    (
+                        detfd.ty(),
+                        detfd.is_socketpair_endpoint(),
+                        detfd.physically_nonblocking(),
+                    )
+                })?;
+            if self.keeps_physically_nonblocking(
+                fd_type,
+                socketpair_endpoint,
+                physically_nonblocking,
+            ) && physically_nonblocking
             {
                 guest.thread_state().with_detfd(fd, |detfd| {
                     detfd.set_logical_nonblocking(enabled);
@@ -5204,6 +5231,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                 FdType::Socket,
             )
             .await?;
+
+            // Both endpoints are container-internal by construction: socketpair(2)
+            // creates the pair itself, so no peer outside the container can ever
+            // hold one. Record that here, at the only point where it is known,
+            // so potentially-blocking I/O on them takes the same
+            // nonblockize-and-retry path as a pipe rather than being treated as
+            // external blocking I/O against an fd Detcore just made SOCK_NONBLOCK.
+            // See `syscall_targets_internal_fd`. Only when the endpoints really
+            // are physically nonblocking, which is the same condition as `call2`
+            // above: under `debug_externalize_sockets` they stay external.
+            if self.cfg.use_nonblocking_sockets() {
+                for fd in fds {
+                    let _ = guest
+                        .thread_state()
+                        .with_detfd(fd, |detfd| detfd.set_socketpair_endpoint());
+                }
+            }
 
             self.maybe_set_nonblocking_fd(guest, fds[0]);
             self.maybe_set_nonblocking_fd(guest, fds[1]);

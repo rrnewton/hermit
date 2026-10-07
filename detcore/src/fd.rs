@@ -340,6 +340,11 @@ struct OpenFileDescription {
     /// trace mode is active.
     #[serde(default)]
     network_socket: NetworkSocketKind,
+    /// True when this socket is one end of a `socketpair(2)`, whose two
+    /// endpoints are therefore both container-internal. See
+    /// `syscall_targets_internal_fd`.
+    #[serde(default)]
+    socketpair_endpoint: bool,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#2373)
     /// The `flock(2)` mode this open file description currently holds, as the
@@ -424,6 +429,7 @@ impl DetFd {
                 network_channel: false,
                 network_lowat: None,
                 network_socket: NetworkSocketKind::NotInet,
+                socketpair_endpoint: false,
                 flock_mode: None,
                 flock_mode_known: true,
                 flock_mode_ever_known: true,
@@ -991,6 +997,21 @@ impl DetFd {
     /// The socket's family and type as the network trace classified it.
     pub(crate) fn network_socket(&self) -> NetworkSocketKind {
         self.with_description(|d| d.network_socket)
+    }
+
+    /// Mark this open file as one end of a `socketpair(2)`. Like
+    /// `set_netlink_route` this applies to the open file description, so a dup
+    /// or fork alias of the same endpoint is covered too -- which is the case
+    /// that matters, since the usual way to use a socketpair is to fork and let
+    /// each side inherit one end.
+    pub(crate) fn set_socketpair_endpoint(&self) {
+        self.with_description(|d| d.socketpair_endpoint = true);
+    }
+
+    /// Whether this open file is one end of a `socketpair(2)`, and therefore
+    /// container-internal.
+    pub(crate) fn is_socketpair_endpoint(&self) -> bool {
+        self.with_description(|d| d.socketpair_endpoint)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED

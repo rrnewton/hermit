@@ -1406,6 +1406,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_socketpair_blocking_read.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_socketpair_blocking_read.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration suite compiles this workload and checks, for a pipe and for stream, seqpacket and datagram socketpairs, that a blocking read waits for the other process's write under record and replay instead of returning EAGAIN, on a fresh channel each through the original descriptor, through a dup with the original closed (recv on a socketpair), and in a forked child through its inherited descriptor (recvmsg on a socketpair), with and without the reader first clearing O_NONBLOCK with FIONBIO or F_SETFL."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/recvmsg_iov_overwritten_by_payload.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/recvmsg_iov_overwritten_by_payload.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test runs this probe on ptrace under --strict execution with ordinary --verify (the Stripped comparator) in two modes, and requires the retained verify log's recvmsg digest to hash the plain receive's buffer, and for a receive whose iovec array is its own receive buffer to record one counted unobserved entry while the guest receives the kernel's result; it remains a guest fixture because a generic manifest cannot inspect the buffer-digest entries."

@@ -2602,6 +2602,116 @@ fn record_pipe_read_after_clearing_nonblocking_waits_for_its_writer() {
     );
 }
 
+/// Records and then replays a guest that blocks reading a `kind` channel
+/// (see `tests/c/record_replay_socketpair_blocking_read.c`) until the other
+/// process writes to it, on a fresh channel per round: through the original
+/// descriptor, through a dup with the original closed, and in a forked child
+/// through its inherited descriptor. On a socketpair the dup round uses recv
+/// and send, and the fork round recvmsg and sendmsg. With `clear`, `fionbio`
+/// or `setfl`, each reader first turns O_NONBLOCK on and off again that way.
+/// Both phases must exit 0 and print what Linux gives the guest: every
+/// receive returns the writer's five bytes. The guest's own output is checked
+/// because `--verify` compares a recording with its own replay, and that
+/// comparison matches when the recording itself captured the wrong result.
+/// Returns a description of each phase that failed.
+fn blocking_read_failures(kind: &str, clear: Option<&str>) -> Vec<String> {
+    let program = &workload("c_record_replay_socketpair_blocking_read").path;
+    let label = match clear {
+        Some(clear) => format!("{kind} {clear}"),
+        None => kind.to_owned(),
+    };
+    let (dup_receive, fork_receive) = if kind == "pipe" {
+        ("read", "read")
+    } else {
+        ("recv", "recvmsg")
+    };
+    let expected = format!(
+        "{kind} original: read=5 errno=0 data=hello\n\
+         {kind} dup: {dup_receive}=5 errno=0 data=hello\n\
+         {kind} fork: {fork_receive}=5 errno=0 data=hello\n"
+    );
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let mut record = Command::new("timeout");
+    record
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "record", "start", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg("--")
+        .arg(program)
+        .arg(kind)
+        .args(clear);
+    let mut replay = Command::new("timeout");
+    replay
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "replay", "--autopilot"])
+        .arg(format!("--data-dir={}", data_dir.path().display()));
+    let mut failures = Vec::new();
+    for (phase, mut command) in [("record", record), ("replay", replay)] {
+        let output = command
+            .output()
+            .unwrap_or_else(|error| panic!("failed to start {label} {phase}: {error}"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !output.status.success() || stdout != expected {
+            failures.push(format!(
+                "{label} {phase}: status {}\nstdout:\n{stdout}stderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr),
+            ));
+            // A replay of a failed recording says nothing more.
+            break;
+        }
+    }
+    failures
+}
+
+/// Control for the socketpair test below: a pipe read already waits for its
+/// writer under record, because a pipe is container-internal.
+#[test]
+fn record_pipe_blocking_read_waits_for_forked_writer() {
+    let _guard = hermit_record_lock();
+    let failures = blocking_read_failures("pipe", None);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Both ends of a `socketpair(2)` are container-internal, like a pipe's, and
+/// Hermit makes them physically nonblocking in the same way. Record used to
+/// treat them as external I/O and issue the read once, so the guest saw
+/// EAGAIN from a blocking read whenever its writer had not yet run. Every
+/// socket type runs, so a failure reports all the types it affects.
+#[test]
+fn record_socketpair_blocking_read_waits_for_forked_writer() {
+    let _guard = hermit_record_lock();
+    let failures: Vec<String> = ["stream", "seqpacket", "dgram"]
+        .into_iter()
+        .flat_map(|kind| blocking_read_failures(kind, None))
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A guest that clears O_NONBLOCK on a socketpair endpoint, with FIONBIO as
+/// Python's `socket.setblocking(True)` does or with a read-modify-write
+/// F_SETFL, must still get a blocking read that waits for its writer. Record
+/// used to forward the clear to the kernel for sockets, so the endpoint
+/// became physically blocking while it was still classified internal, and
+/// the next read tripped a debug assertion in Detcore (a hang in release
+/// builds). `record_pipe_read_after_clearing_nonblocking_waits_for_its_writer`
+/// is the pipe counterpart.
+#[test]
+fn record_socketpair_read_after_clearing_nonblocking_waits_for_its_writer() {
+    let _guard = hermit_record_lock();
+    let failures: Vec<String> = ["stream", "seqpacket", "dgram"]
+        .into_iter()
+        .flat_map(|kind| {
+            ["fionbio", "setfl"]
+                .into_iter()
+                .flat_map(move |clear| blocking_read_failures(kind, Some(clear)))
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// The scheduler records that place a guest's SIGCHLD in a ptrace log: every
 /// committed turn, the delivery of each inbound SIGCHLD, and the synthetic
 /// "Alarm fired" send.

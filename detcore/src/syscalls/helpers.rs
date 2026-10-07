@@ -186,8 +186,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         // host syscall, as documented by this method.
         debug_assert!(
             !self.cfg.sequentialize_threads || !syscall_targets_internal_fd(guest, call),
-            "record_or_replay_blocking (BlockingExternalIO) reached for an internal pipe fd \
-             on syscall {}; internal fds must use the InternalIOPolling path",
+            "record_or_replay_blocking (BlockingExternalIO) reached for an internal fd \
+             (pipe or socketpair endpoint) on syscall {}; internal fds must use the \
+             InternalIOPolling path",
             call.name()
         );
         {
@@ -250,16 +251,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         };
 
-        // Is this operation on a container-INTERNAL fd (currently: pipes)? Internal
-        // pipes are made physically nonblocking even in record/replay (see
-        // handle_pipe2), so they can take the deterministic InternalIOPolling
-        // nonblockize-and-retry path. They must NOT be forced onto the
-        // BlockingExternalIO path in R/R: a pipe reader and its paired writer are not
-        // independent, so descheduling the reader as "external blocking IO" deadlocks
-        // the sequentialized scheduler (the documented R/R pipe hang). Truly external
-        // endpoints (host fds, network sockets) still use BlockingExternalIO. Sockets
-        // are left external for now: there is no internal-vs-external socket detection
-        // yet (see the handle_accept4 comment).
+        // Is this operation on a container-INTERNAL fd (a pipe or a socketpair
+        // endpoint)? Internal fds are made physically nonblocking even in
+        // record/replay (see handle_pipe2 and handle_socketpair), so they can take the
+        // deterministic InternalIOPolling nonblockize-and-retry path. They must NOT be
+        // forced onto the BlockingExternalIO path in R/R: a reader and its paired
+        // writer are not independent, so descheduling the reader as "external
+        // blocking IO" deadlocks the sequentialized scheduler (the documented R/R pipe
+        // hang), and a one-shot read on the physically nonblocking fd returns EAGAIN.
+        // Truly external endpoints (host fds, network sockets) still use
+        // BlockingExternalIO. Other sockets are left external for now: there is no
+        // internal-vs-external socket detection yet (see the handle_accept4 comment).
         let internal_fd = syscall_targets_internal_fd(guest, wrapped);
 
         if !self.cfg.sequentialize_threads
@@ -283,7 +285,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             let mut rsrc = Resources::new(guest.thread_state().dettid);
             rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
             rsrc.fyi(call.name());
-            // In record/replay mode, route an internal-fd (pipe) read/write through the
+            // In record/replay mode, route an internal-fd (pipe or socketpair) read/write through the
             // record/replay subtool so its data is captured on record and reproduced on
             // replay (see retry_nonblocking_syscall). In plain `hermit run` there is no
             // recorder, so execute directly (subtool = None).
@@ -805,19 +807,35 @@ pub fn ioaction_based_on_fd_status<
 
 /// Does this single-fd syscall operate on a container-INTERNAL file descriptor?
 ///
-/// Currently this recognizes pipes, whose two endpoints are always both owned by guest
-/// processes inside the deterministic container. Internal pipes are made physically
-/// nonblocking (see `handle_pipe2`) so a potentially-blocking op on them can use the
-/// deterministic `InternalIOPolling` nonblockize-and-retry strategy instead of
-/// `BlockingExternalIO`. Treating an internal pipe as external blocking IO deadlocks
-/// the sequentialized scheduler in record/replay, because a pipe reader and its paired
-/// writer are not independent.
+/// This recognizes pipes, whose two endpoints are always both owned by guest
+/// processes inside the deterministic container, and `socketpair(2)` endpoints, which
+/// have that same property for the same reason. Internal fds are made physically
+/// nonblocking (see `handle_pipe2` and `handle_socketpair`) so a potentially-blocking
+/// op on them can use the deterministic `InternalIOPolling` nonblockize-and-retry
+/// strategy instead of `BlockingExternalIO`. Treating an internal fd as external
+/// blocking IO deadlocks the sequentialized scheduler in record/replay, because a
+/// reader and its paired writer are not independent.
 ///
-/// Sockets are intentionally NOT classified as internal here: there is no reliable
-/// internal-vs-external socket detection yet (loopback / AF_UNIX-to-another-guest vs a
-/// real host peer), so sockets conservatively remain external. Syscalls whose fd is not
-/// directly extractable (e.g. poll/ppoll, which carry a pointer to an fd array) return
-/// false and keep their existing handling.
+/// A socketpair is the one socket case where internality is known at creation time:
+/// the kernel creates BOTH ends, so no peer outside the container can ever hold one.
+/// That is why it does not need the general internal-vs-external socket detection
+/// (loopback / AF_UNIX-to-another-guest vs a real host peer) that remains unsolved;
+/// every OTHER socket still conservatively remains external.
+///
+/// The residual assumption, stated because it is an assumption and not a proof: a
+/// guest could pass a socketpair endpoint out of the container over `SCM_RIGHTS` to a
+/// process on the host. A pipe fd can escape by exactly the same route and this code
+/// has always accepted that for pipes, so recognizing socketpairs widens no exposure
+/// class -- but neither claim is airtight.
+///
+/// The converse gap: a socketpair endpoint or pipe that a guest RECEIVES over
+/// `SCM_RIGHTS` is untracked by Detcore, so it is not recognized here and keeps the
+/// kernel-authoritative external path. Its open file description is still physically
+/// nonblocking, so a blocking read through the received descriptor can return EAGAIN
+/// under record, as it already could for a received pipe.
+///
+/// Syscalls whose fd is not directly extractable (e.g. poll/ppoll, which carry a
+/// pointer to an fd array) return false and keep their existing handling.
 pub fn syscall_targets_internal_fd<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     guest: &mut G,
     call: Syscall,
@@ -825,7 +843,9 @@ pub fn syscall_targets_internal_fd<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     match get_fd(call) {
         Some(fd) => guest
             .thread_state()
-            .with_detfd(fd, |detfd| matches!(detfd.ty(), FdType::Pipe))
+            .with_detfd(fd, |detfd| {
+                matches!(detfd.ty(), FdType::Pipe) || detfd.is_socketpair_endpoint()
+            })
             .unwrap_or(false),
         None => false,
     }
