@@ -2,8 +2,10 @@
 # Regression test for the cache in bootstrap/regenerate-rust-deps
 # (bootstrap/rust-deps-cache.sh).
 #
-# Runs the real regenerate-rust-deps and cache helper in a fixture checkout
-# whose cargo, Reindeer, feature check and reverie-dbt patch are stubs; the
+# Runs the real regenerate-rust-deps, cache functions and key helper
+# (rust-deps-cache-key.rs, run from this checkout against the fixture) in a
+# fixture checkout whose cargo, Reindeer, feature check and reverie-dbt patch
+# are stubs; the
 # Reindeer stub logs each call and derives its output from Cargo.lock. Accept:
 # the first run vendors and stores an entry; a second run with the same inputs
 # calls Reindeer not at all and leaves a byte-identical tree, with the
@@ -19,16 +21,26 @@
 # stores nothing, so the original lock vendors again; a keyed input that changes
 # while Reindeer runs stores nothing; a fixup Git ignores, a fixup reached
 # through a directory link (its referent edited), a workspace member manifest
-# Git ignores, and the compiler's target cfg and version each change the key, and
-# RUSTC names the compiler queried; reindeer.toml settings the key cannot cover (fixups_dir,
-# rustc, cargo, gitignore_checksum_exclude, no platform table, a target in a
-# multi-line or escaped string) vendor without storing, while a multi-line string
-# elsewhere and Hermit's own reindeer.toml keep the cache; an eviction whose removal fails part-way leaves no entry a restore
-# accepts; and an entry without its raw BUCK is replaced by the next publish.
+# Git ignores (also at a path JSON must escape), and the compiler's target cfg
+# and version each change the key, and RUSTC names the compiler queried; a
+# platform target written as a multi-line or escaped string, or under an escaped
+# key, is queried as Reindeer decodes it; reindeer.toml settings the key cannot
+# cover (fixups_dir, cargo.rustc, cargo.cargo, gitignore_checksum_exclude, an
+# unknown key, no platform table), also under escaped keys, vendor without
+# storing, while a multi-line string elsewhere and Hermit's own reindeer.toml
+# keep the cache; a key that cannot be computed (cargo metadata failing or
+# printing broken JSON, an unreadable directory under the third-party
+# directory, a helper printing something other than a key or declining without
+# a reason), before or after Reindeer runs, vendors without
+# restoring or storing; an eviction whose removal fails part-way leaves no
+# entry a restore accepts; an entry without its raw BUCK is not copied from and
+# is replaced by the next publish; and a publish paused with its staging complete keeps that staging,
+# however old, while another run publishes and removes abandoned staging, then
+# stores an entry that restores.
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-for f in regenerate-rust-deps rust-deps-cache.sh; do
+for f in regenerate-rust-deps rust-deps-cache.sh rust-deps-cache-key.rs; do
   [[ -f $script_dir/$f ]] || { echo "test-rust-deps-cache: missing $script_dir/$f" >&2; exit 2; }
 done
 
@@ -44,24 +56,51 @@ fixture_git() {
 
 repo=$tmp/repo
 cache=$tmp/cache
-log=$tmp/reindeer.log
 mkdir -p "$tmp/bin" "$repo/bootstrap" "$repo/scripts" "$repo/reverie" \
   "$repo/shim/third-party/rust/fixups/one"
 cp -- "$script_dir/regenerate-rust-deps" "$script_dir/rust-deps-cache.sh" "$repo/bootstrap/"
 
-cat >"$tmp/bin/cargo" <<'EOF'
+# The key helper is the real one, built and run from this checkout (where its
+# toolchain and any prepared binary resolve), against the fixture. rust-script
+# builds it with the real cargo, which the stub passes anything but --version
+# and metadata to.
+cat >"$repo/bootstrap/rust-deps-cache-key.rs" <<EOF
 #!/usr/bin/env bash
+exec env -C "$script_dir/.." "$script_dir/rust-deps-cache-key.rs" "\$@"
+EOF
+real_cargo=$(type -P cargo || true)
+cat >"$tmp/bin/cargo" <<EOF
+#!/usr/bin/env bash
+real_cargo='$real_cargo'
+real_path='$PATH'
+EOF
+cat >>"$tmp/bin/cargo" <<'EOF'
 case $1 in
   --version) echo "${FIXTURE_CARGO_VERSION:-cargo 1.0.0 (fixture)}" ;;
-  # A workspace member, when the fixture has one, as `cargo metadata` names it.
+  # Each workspace member the fixture has, as `cargo metadata` names it: in
+  # JSON, so a backslash or a quote in its path is escaped.
   metadata)
-    if [[ -f member/Cargo.toml ]]; then
-      printf '{"packages":[{"name":"member","manifest_path":"%s/member/Cargo.toml"}]}\n' "$PWD"
-    else
-      echo '{"packages":[]}'
+    # FIXTURE_METADATA_FAIL=FILE: every call after the first (regenerate-rust-deps'
+    # own check) fails.
+    if [[ -n ${FIXTURE_METADATA_FAIL:-} ]]; then
+      echo call >>"$FIXTURE_METADATA_FAIL"
+      [[ $(wc -l <"$FIXTURE_METADATA_FAIL") -lt 2 ]] || { echo "fixture cargo: metadata failed" >&2; exit 101; }
     fi
+    [[ -z ${FIXTURE_METADATA_JSON:-} ]] || { echo "$FIXTURE_METADATA_JSON"; exit 0; }
+    packages=
+    for manifest in member*/Cargo.toml; do
+      [[ -f $manifest ]] || continue
+      path=$PWD/$manifest
+      path=${path//\\/\\\\}
+      path=${path//\"/\\\"}
+      packages+="${packages:+,}{\"name\":\"member\",\"manifest_path\":\"$path\"}"
+    done
+    echo "{\"packages\":[$packages]}"
     ;;
-  *) echo "fixture cargo: unexpected $*" >&2; exit 2 ;;
+  *)
+    [[ -n $real_cargo ]] || { echo "fixture cargo: no real cargo for $*" >&2; exit 2; }
+    exec env -u RUSTC PATH="$real_path" "$real_cargo" "$@"
+    ;;
 esac
 EOF
 cat >"$tmp/bin/rustc" <<'EOF'
@@ -72,9 +111,24 @@ case $1 in
     echo 'debug_assertions'
     echo "target_arch=\"${3%%-*}\""
     [[ -z ${FIXTURE_RUSTC_CFG:-} ]] || echo "$FIXTURE_RUSTC_CFG"
+    [[ $3 != *-musl || -z ${FIXTURE_RUSTC_MUSL_CFG:-} ]] || echo "$FIXTURE_RUSTC_MUSL_CFG"
     ;;
   *) echo "fixture rustc: unexpected $*" >&2; exit 2 ;;
 esac
+EOF
+# A flock that, when FIXTURE_FLOCK_PAUSE names a cache root holding complete
+# staging, pauses before taking the exclusive lock (`flock 9`) until
+# $FIXTURE_FLOCK_PAUSE.resume exists: a publish stopped after filling its
+# staging and before renaming it in.
+mkdir -p "$tmp/flockbin"
+cat >"$tmp/flockbin/flock" <<EOF
+#!/usr/bin/env bash
+if [[ \$* == 9 && -n \${FIXTURE_FLOCK_PAUSE:-} ]] &&
+  compgen -G "\$FIXTURE_FLOCK_PAUSE/.staging-*/BUCK.reindeer" >/dev/null; then
+  touch -- "\$FIXTURE_FLOCK_PAUSE.paused"
+  until [[ -e \$FIXTURE_FLOCK_PAUSE.resume ]]; do sleep 0.1; done
+fi
+exec "$(type -P flock)" "\$@"
 EOF
 # A RUSTC wrapper that adds a target feature, as a -C target-feature flag would.
 cat >"$tmp/rustc-wrapper" <<EOF
@@ -136,8 +190,8 @@ cat >"$repo/scripts/patch-reverie-dbt-buck.rs" <<'EOF'
 #!/usr/bin/env bash
 echo "# patched" >>"$1"
 EOF
-chmod +x "$tmp/bin/cargo" "$tmp/bin/rustc" "$tmp/rustc-wrapper" "$tmp/rmbin/rm" \
-  "$repo/bootstrap/reindeer" "$repo/scripts/"*.rs
+chmod +x "$tmp/bin/cargo" "$tmp/bin/rustc" "$tmp/rustc-wrapper" "$tmp/rmbin/rm" "$tmp/flockbin/flock" \
+  "$repo/bootstrap/reindeer" "$repo/bootstrap/rust-deps-cache-key.rs" "$repo/scripts/"*.rs
 echo '# none' >"$repo/shim/third-party/rust/shared-cell-aliases.txt"
 reindeer_toml=$repo/shim/third-party/rust/reindeer.toml
 printf '[cargo]\n\n[platform.linux-x86_64]\ntarget = "x86_64-unknown-linux-gnu"\n' >"$reindeer_toml"
@@ -166,21 +220,36 @@ fixture_git init -q "$repo"
 lock_at "$rev_a"
 commit_all base
 
-# regen NAME [ENV...]: runs regenerate-rust-deps with a private cache root that
-# keeps every entry unless ENV says otherwise; records its rc, stderr, the
-# Reindeer calls it made, and a hash of the tree.
+# What the key helper's build needs from the caller's environment: the
+# toolchain, rust-script's cache, and the prepared-binary runner's settings.
+toolchain_env=(
+  RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+  CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+  XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+)
+for var in RUSTUP_TOOLCHAIN HERMIT_RUST_SCRIPT_ARTIFACT_ROOT HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED \
+  HERMIT_REAL_RUST_SCRIPT; do
+  [[ -z ${!var:-} ]] || toolchain_env+=("$var=${!var}")
+done
+
+# regen NAME [ENV...]: runs regenerate-rust-deps in $regen_repo (default the
+# fixture) with a private cache root that keeps every entry unless ENV says
+# otherwise; records its rc, stderr, the Reindeer calls it made, and a hash of
+# the tree.
+regen_repo=$repo
 regen() {
   local name=$1
   shift
+  local log=$tmp/$name.reindeer.log
   : >"$log"
   local rc=0
-  env -i PATH="$tmp/bin:$PATH" HOME="$tmp" GIT_CONFIG_NOSYSTEM=1 \
+  env -i PATH="$tmp/bin:$PATH" HOME="$tmp" GIT_CONFIG_NOSYSTEM=1 "${toolchain_env[@]}" \
     HERMIT_BUCK2_SHARED_TOOL_CACHE="$cache" HERMIT_RUST_DEPS_CACHE_KEEP=100 \
     FIXTURE_REINDEER_LOG="$log" "$@" \
-    "$repo/bootstrap/regenerate-rust-deps" >"$tmp/$name.out" 2>"$tmp/$name.err" || rc=$?
+    "$regen_repo/bootstrap/regenerate-rust-deps" >"$tmp/$name.out" 2>"$tmp/$name.err" || rc=$?
   echo "$rc" >"$tmp/$name.rc"
   tr '\n' ' ' <"$log" >"$tmp/$name.calls"
-  (cd "$repo/shim/third-party/rust" && find BUCK .cargo vendor -type f -print0 |
+  (cd "$regen_repo/shim/third-party/rust" && find BUCK .cargo vendor -type f -print0 |
     LC_ALL=C sort -z | xargs -0 sha256sum) >"$tmp/$name.tree" 2>&1 || true
 }
 calls() { cat "$tmp/$1.calls"; }
@@ -190,6 +259,13 @@ entries() {
   [[ -d $root ]] || { echo 0; return; }
   find "$root" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended \
     -regex '.*/[0-9a-f]{64}' | wc -l
+}
+# stored counts everything under the shared cache root but its lock and the
+# staging and retired directories, so an entry under a name no key has counts.
+stored() {
+  local root=$cache/rust-deps
+  [[ -d $root ]] || { echo 0; return; }
+  find "$root" -mindepth 1 -maxdepth 1 ! -name '.*' | wc -l
 }
 expect_rc() {
   [[ $(cat "$tmp/$1.rc") == "$2" ]] || fail "$1: expected exit $2, got $(cat "$tmp/$1.rc"): $(cat "$tmp/$1.err")"
@@ -338,6 +414,21 @@ echo 'edition = "2021"' >>"$repo/member/Cargo.toml"
 regen member_edit
 expect_vendored member_edit
 rm -rf -- "${repo:?}/member"
+# The same at a path JSON escapes: only its decoded path names the file.
+escaped_member='member\name'
+printf '%s\n' '/member\\name/' >>"$repo/.git/info/exclude"
+mkdir -p "$repo/$escaped_member"
+printf '[package]\nname = "member"\n' >"$repo/$escaped_member/Cargo.toml"
+[[ -z $(fixture_git -C "$repo" ls-files --others --exclude-standard -- "$escaped_member") ]] ||
+  fail "member_escaped: the fixture's member is not excluded"
+regen member_escaped_new
+expect_vendored member_escaped_new
+regen member_escaped_again
+expect_restored member_escaped_again
+echo 'edition = "2021"' >>"$repo/$escaped_member/Cargo.toml"
+regen member_escaped_edit
+expect_vendored member_escaped_edit
+rm -rf -- "${repo:?}/${escaped_member:?}"
 
 # The compiler Reindeer queries, with the cargo version unchanged: another
 # target cfg, the same again, and another version. A RUSTC wrapper that reports
@@ -354,30 +445,112 @@ regen rustc_wrapper RUSTC="$tmp/rustc-wrapper"
 expect_restored rustc_wrapper
 cmp -s "$tmp/rustc_cfg.tree" "$tmp/rustc_wrapper.tree" || fail "rustc_wrapper: tree differs from the same cfg's"
 
-# Settings the key cannot cover vendor, warn, and store nothing.
-before=$(entries)
-for setting in fixups_dir rustc cargo gitignore_checksum_exclude; do
-  { echo "$setting = \"elsewhere\""; fixture_git -C "$repo" show HEAD:shim/third-party/rust/reindeer.toml; } >"$reindeer_toml"
-  regen "declined_$setting"
-  expect_vendored "declined_$setting"
-  grep -q "not using the rust-deps cache: .*sets a path" "$tmp/declined_$setting.err" ||
-    fail "declined_$setting: no warning"
-done
-echo '[cargo]' >"$reindeer_toml"
-regen declined_no_platform
-expect_vendored declined_no_platform
-grep -q 'not using the rust-deps cache: .*no platform table' "$tmp/declined_no_platform.err" ||
-  fail "declined_no_platform: no warning"
-for value in '"""x86_64-unknown-linux-musl"""' "'''x86_64-unknown-linux-musl'''" '"x86_64\u002dunknown-linux-musl"'; do
+# A platform target in a multi-line string, in a literal string, and as an
+# escaped value under an escaped key is queried as Reindeer decodes it: its
+# cfg changing re-vendors.
+for target_line in 'target = """x86_64-unknown-linux-musl"""' "target = '''x86_64-unknown-linux-musl'''" \
+  '"targ\u0065t" = "x86_64\u002dunknown-linux-musl"'; do
   { fixture_git -C "$repo" show HEAD:shim/third-party/rust/reindeer.toml
-    printf '\n[platform.musl]\ntarget = %s\n' "$value"; } >"$reindeer_toml"
-  regen declined_quoting
-  expect_vendored declined_quoting
-  grep -q 'not using the rust-deps cache: .*quotes a value' "$tmp/declined_quoting.err" ||
-    fail "declined_quoting: no warning for target = $value"
+    printf '\n[platform.musl]\n%s\n' "$target_line"; } >"$reindeer_toml"
+  regen target_form_new
+  expect_vendored target_form_new
+  ! grep -q 'not using the rust-deps cache' "$tmp/target_form_new.err" ||
+    fail "target_form_new: cache declined for $target_line"
+  regen target_form_again
+  expect_restored target_form_again
+  regen target_form_cfg FIXTURE_RUSTC_MUSL_CFG='target_feature="crt-static"'
+  [[ $(calls target_form_cfg) == "vendor buckify buckify " ]] ||
+    fail "target_form_cfg: the musl cfg did not change the key for $target_line"
 done
+fixture_git -C "$repo" checkout -q -- shim/third-party/rust/reindeer.toml
+
+# Settings the key cannot cover, also under escaped keys, vendor, warn, and
+# store nothing.
+before=$(entries)
+platform=$'[platform.linux-x86_64]\ntarget = "x86_64-unknown-linux-gnu"\n'
+declined=(
+  $'fixups_dir = "elsewhere"\n'"$platform"
+  $'"fixups\\u005fdir" = "elsewhere"\n'"$platform"
+  $'[cargo]\nrustc = "elsewhere"\n'"$platform"
+  $'[cargo]\n"rust\\u0063" = "elsewhere"\n'"$platform"
+  $'[cargo]\ncargo = "elsewhere"\n'"$platform"
+  $'[vendor]\ngitignore_checksum_exclude = ["x"]\n'"$platform"
+  $'unknown_setting = 1\n'"$platform"
+  $'[cargo]\n'
+)
+for i in "${!declined[@]}"; do
+  printf '%s' "${declined[$i]}" >"$reindeer_toml"
+  regen "declined_$i"
+  expect_vendored "declined_$i"
+  grep -q "not using the rust-deps cache: .*reindeer.toml" "$tmp/declined_$i.err" ||
+    fail "declined_$i: no warning for: ${declined[$i]}"
+done
+grep -q 'fixups_dir' "$tmp/declined_1.err" || fail "declined_1: the escaped key was not decoded"
+grep -q 'cargo.rustc' "$tmp/declined_3.err" || fail "declined_3: the escaped key was not decoded"
+grep -q 'no platform table' "$tmp/declined_7.err" || fail "declined_7: the platform-less case did not say so"
 [[ $(entries) == "$before" ]] || fail "declined: cache changed from $before to $(entries) entries"
 fixture_git -C "$repo" checkout -q -- shim/third-party/rust/reindeer.toml
+
+# A key that cannot be computed vendors with a warning, restoring and storing
+# nothing, although an entry for the checkout exists.
+third_party=$repo/shim/third-party/rust
+regen key_setup
+expect_restored key_setup
+before=$(stored)
+expect_uncached() {
+  expect_vendored "$1"
+  grep -q "$2" "$tmp/$1.err" || fail "$1: no warning matching '$2': $(cat "$tmp/$1.err")"
+  [[ $(stored) == "$before" ]] || fail "$1: cache changed from $before to $(stored) stored names"
+}
+regen key_metadata_fails FIXTURE_METADATA_FAIL="$tmp/metadata-calls"
+expect_uncached key_metadata_fails 'its key could not be computed'
+regen key_metadata_json FIXTURE_METADATA_JSON='{"packages":[{"manifest_path":"'
+expect_uncached key_metadata_json 'its key could not be computed'
+mkdir -p "$third_party/unreadable"
+chmod 000 "$third_party/unreadable"
+if [[ -r $third_party/unreadable ]]; then
+  echo "test-rust-deps-cache: skipping the unreadable-directory cases: this user reads mode 000" >&2
+  unreadable_works=
+else
+  unreadable_works=1
+  regen key_unreadable
+  expect_uncached key_unreadable 'its key could not be computed'
+fi
+chmod 755 "$third_party/unreadable"
+rmdir -- "${third_party:?}/unreadable"
+# A helper that prints a partial key, or declines without a reason.
+cp -- "$repo/bootstrap/rust-deps-cache-key.rs" "$tmp/key-shim"
+printf '#!/usr/bin/env bash\necho 0123abcd\n' >"$repo/bootstrap/rust-deps-cache-key.rs"
+regen key_partial
+expect_uncached key_partial 'not a key'
+printf '#!/usr/bin/env bash\nexit 3\n' >"$repo/bootstrap/rust-deps-cache-key.rs"
+regen key_declined_silently
+expect_uncached key_declined_silently 'declined without giving a reason'
+cp -- "$tmp/key-shim" "$repo/bootstrap/rust-deps-cache-key.rs"
+# A Reindeer that leaves an unreadable directory in the third-party directory: the key
+# computed afterwards fails, so nothing is stored.
+if [[ -n $unreadable_works ]]; then
+  mv -- "$repo/bootstrap/reindeer" "$tmp/reindeer-real"
+  cat >"$repo/bootstrap/reindeer" <<EOF
+#!/usr/bin/env bash
+if [[ \$5 == vendor ]]; then
+  mkdir -p "$third_party/broken"
+  chmod 000 "$third_party/broken"
+fi
+exec "$tmp/reindeer-real" "\$@"
+EOF
+  chmod +x "$repo/bootstrap/reindeer"
+  regen key_recheck_fails HERMIT_BUCK2_SHARED_TOOL_CACHE="$tmp/cache-recheck"
+  expect_vendored key_recheck_fails
+  grep -q 'could not be read again' "$tmp/key_recheck_fails.err" || fail "key_recheck_fails: no warning"
+  [[ $(entries "$tmp/cache-recheck") == 0 ]] ||
+    fail "key_recheck_fails: stored $(entries "$tmp/cache-recheck") entries"
+  chmod 755 "$third_party/broken"
+  rmdir -- "${third_party:?}/broken"
+  mv -f -- "$tmp/reindeer-real" "$repo/bootstrap/reindeer"
+fi
+[[ -z $(fixture_git -C "$repo" status --porcelain) ]] ||
+  fail "key cases: the fixture was left changed: $(fixture_git -C "$repo" status --porcelain)"
 
 # A multi-line string elsewhere, as Hermit's buckfile_imports is, keeps the
 # cache; and Hermit's own reindeer.toml is one the cache accepts.
@@ -389,10 +562,10 @@ grep -q 'not using the rust-deps cache' "$tmp/multiline_new.err" && fail "multil
 regen multiline_again
 expect_restored multiline_again
 fixture_git -C "$repo" checkout -q -- shim/third-party/rust/reindeer.toml
-# shellcheck source=bootstrap/rust-deps-cache.sh
-if reason=$(cd -- "$script_dir/.." && source ./bootstrap/rust-deps-cache.sh && rust_deps_cache_unsupported); then
-  fail "the cache declines Hermit's reindeer.toml: $reason"
-fi
+key_status=0
+hermit_key=$("$script_dir/rust-deps-cache-key.rs" "$script_dir/..") || key_status=$?
+[[ $key_status == 0 && $hermit_key =~ ^[0-9a-f]{64}$ ]] ||
+  fail "the cache does not serve Hermit's own checkout (exit $key_status): $hermit_key"
 
 # An eviction whose removal fails part-way: no restore may serve what is left.
 regen evict_setup
@@ -409,15 +582,62 @@ cmp -s "$tmp/first.tree" "$tmp/evict_after.tree" || fail "evict_after: tree diff
 leftover=$(find "$cache/rust-deps" -mindepth 1 -maxdepth 1 -name '.evict-*' | wc -l)
 [[ $leftover == 0 ]] || fail "evict_after: $leftover retired entries were not removed"
 
-# An entry without its raw BUCK is replaced by the next publish.
+# An entry without its raw BUCK is absent to a restore (nothing is copied from
+# it) and is replaced by the next publish.
 regen marker_setup
 expect_restored marker_setup
 marker_key=$(sed -n 's/^restored .* from .*\/\([0-9a-f]\{64\}\)$/\1/p' "$tmp/marker_setup.err")
 rm -f -- "$cache/rust-deps/${marker_key:?}/BUCK.reindeer"
 regen markerless
 expect_vendored markerless
+grep -q 'restoring .* failed' "$tmp/markerless.err" && fail "markerless: a restore copied from the entry"
 regen marker_replaced
 expect_restored marker_replaced
+
+# A publish paused with its staging complete, the staging aged past any age
+# limit: another run publishes meanwhile and removes only abandoned staging
+# (an unlocked directory, however new), leaving the paused one whole; resumed,
+# it stores an entry that restores. The paused run uses its own clone, as two
+# validation checkouts would.
+stage_root=$tmp/cache-stage/rust-deps
+fixture_git clone -q -- "$repo" "$tmp/repo-a"
+mkdir -p "$stage_root/.staging-abandoned-000000/vendor"
+regen_repo=$tmp/repo-a
+regen stage_a HERMIT_BUCK2_SHARED_TOOL_CACHE="$tmp/cache-stage" PATH="$tmp/flockbin:$tmp/bin:$PATH" \
+  FIXTURE_FLOCK_PAUSE="$stage_root" FIXTURE_CARGO_VERSION="cargo 1.0.4 (fixture)" &
+stage_a_pid=$!
+regen_repo=$repo
+for _ in $(seq 600); do
+  [[ ! -e $stage_root.paused ]] || break
+  kill -0 "$stage_a_pid" 2>/dev/null || break
+  sleep 0.1
+done
+if [[ ! -e $stage_root.paused ]]; then
+  fail "stage: the first publish never paused: $(cat "$tmp/stage_a.err" 2>/dev/null)"
+  touch -- "$stage_root.resume"
+  wait "$stage_a_pid" || true
+else
+  live=$(find "$stage_root" -mindepth 1 -maxdepth 1 -name '.staging-*' ! -name '.staging-abandoned-*')
+  touch -d '3 hours ago' -- "$live"
+  regen stage_b HERMIT_BUCK2_SHARED_TOOL_CACHE="$tmp/cache-stage" FIXTURE_CARGO_VERSION="cargo 1.0.5 (fixture)"
+  expect_vendored stage_b
+  [[ -f $live/vendor/crate/source && -f $live/BUCK.reindeer ]] ||
+    fail "stage_b: the paused publish's staging was damaged or removed"
+  [[ ! -e $stage_root/.staging-abandoned-000000 ]] || fail "stage_b: abandoned staging was not removed"
+  touch -- "$stage_root.resume"
+  wait "$stage_a_pid" || true
+  expect_vendored stage_a
+  grep -q 'did not complete' "$tmp/stage_a.err" && fail "stage_a: the publish failed: $(cat "$tmp/stage_a.err")"
+  [[ $(entries "$tmp/cache-stage") == 2 ]] ||
+    fail "stage: expected 2 cache entries, found $(entries "$tmp/cache-stage")"
+  regen_repo=$tmp/repo-a
+  regen stage_a_again HERMIT_BUCK2_SHARED_TOOL_CACHE="$tmp/cache-stage" FIXTURE_CARGO_VERSION="cargo 1.0.4 (fixture)"
+  regen_repo=$repo
+  expect_restored stage_a_again
+  cmp -s "$tmp/stage_a.tree" "$tmp/stage_a_again.tree" || fail "stage_a_again: restored tree differs from the generated one"
+fi
+leftover=$(find "$stage_root" -mindepth 1 -maxdepth 1 -name '.staging-*' | wc -l)
+[[ $leftover == 0 ]] || fail "stage: $leftover staging directories were left"
 
 if [[ $failures -ne 0 ]]; then
   echo "test-rust-deps-cache: $failures failure(s)" >&2

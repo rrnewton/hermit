@@ -599,7 +599,8 @@ empty crates.
 
 What Reindeer generates (the vendored crates, its BUCK before the
 postprocessing, and the vendored-sources `.cargo/config.toml`) is kept in a
-cache entry named by everything Reindeer reads: `Cargo.lock` (which pins git
+cache entry named by everything Reindeer reads. `bootstrap/rust-deps-cache-key.rs`
+computes the name and lists what it covers: `Cargo.lock` (which pins git
 dependencies by commit), every `Cargo.toml` Git lists and each workspace member
 manifest `cargo metadata` names, ignored or not, the toolchain file and cargo
 version, the compiler Reindeer queries (`RUSTC`, else `rustc`) with its
@@ -607,22 +608,29 @@ version, the compiler Reindeer queries (`RUSTC`, else `rustc`) with its
 `reindeer.toml`, every file under `shim/third-party/rust` whether Git ignores it
 or not and following links (apart from the generated `vendor`, `BUCK` and
 `.cargo` and Cargo's `registry`, `git`, `target` and `.package-cache`), the
-ignore files on the way to them, and the Reindeer pin and scripts. A
-`reindeer.toml` that sets a path the key does not read (`fixups_dir`, `cargo`,
-`rustc` or `gitignore_checksum_exclude`), defines no platform table (Reindeer
-then uses built-in platforms), or gives a platform target in a multi-line or
-escaped string is not cached: the run warns and vendors.
+ignore files on the way to them, and the Reindeer pin and scripts. It reads
+`reindeer.toml` and the `cargo metadata` output with TOML and JSON parsers, so
+quoting and escapes do not hide a setting or a path from it. A `reindeer.toml`
+that makes Reindeer read something the key does not cover (`fixups_dir`,
+`cargo.cargo`, `cargo.rustc`, `vendor.gitignore_checksum_exclude`, or a key the
+helper does not know) or that defines no platform table (Reindeer then uses
+built-in platforms) is not cached: the run warns and vendors. So is a checkout
+whose key cannot be computed, because a command fails, an input cannot be read
+or something does not parse: the run warns, vendors and stores nothing.
 
 A checkout whose inputs match an earlier run's restores the entry instead of
-vendoring, about 3 s instead of 26 s with local mirrors (the key itself takes
-about 0.6 s), and then runs the postprocessing and its comparison as a
+vendoring, about 2.5 s instead of 26 s with local mirrors (the key itself takes
+about 0.3 s), and then runs the postprocessing and its comparison as a
 generated checkout does. The two-run comparison of Reindeer's own output ran
 when the entry was generated. Output is stored only when `Cargo.lock` is
 unchanged after Reindeer ran and the key computed again then matches the one
 computed before, so a run that rewrites the lock or whose inputs change while
-it runs stores nothing. An entry is published and evicted by renaming it in
+it runs stores nothing, and so does one whose inputs can no longer be read. An
+entry is built in a staging directory, published and evicted by renaming it in
 and out of place under the cache lock, and a restore requires its raw BUCK, so
-an interrupted publish or eviction leaves nothing a restore accepts. The cache
+an interrupted publish or eviction leaves nothing a restore accepts. A publish
+holds a lock on its staging directory until it is renamed in, and a later
+publish removes only staging whose lock nobody holds. The cache
 lives at `rust-deps/` under the Buck2 tool cache root above, so
 `HERMIT_BUCK2_SHARED_TOOL_CACHE` shares it across a validation host's
 checkouts; it trusts its writers as that cache does. Each entry takes about

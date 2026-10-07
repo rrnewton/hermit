@@ -65,13 +65,19 @@ source "$script_dir/rust-deps-cache.sh"
 cache_root=$(rust_deps_cache_root)
 cache_key=
 restored=1
-if [[ -n $cache_root ]] && unsupported=$(rust_deps_cache_unsupported); then
-  echo "warning: not using the rust-deps cache: $unsupported" >&2
-  cache_root=
-fi
 if [[ -n $cache_root ]]; then
-  cache_key=$(rust_deps_cache_key)
-  [[ $cache_key =~ ^[0-9a-f]{64}$ ]] || { echo "rust-deps cache key is malformed: '$cache_key'" >&2; exit 1; }
+  # A checkout the key cannot cover, or a key that cannot be computed, is
+  # generated without the cache: nothing restored, nothing stored.
+  key_status=0
+  cache_key=$(rust_deps_cache_key "$repo_root") || key_status=$?
+  if [[ $key_status -eq 3 ]]; then
+    echo "warning: not using the rust-deps cache: $cache_key" >&2
+  elif [[ $key_status -ne 0 ]]; then
+    echo "warning: not using the rust-deps cache: its key could not be computed (above)" >&2
+  fi
+  [[ $key_status -eq 0 ]] || cache_key=
+fi
+if [[ -n $cache_key ]]; then
   restored=0
   rust_deps_cache_restore "$cache_root" "$cache_key" "$third_party_dir" "$first_output" || restored=$?
   if [[ $restored -eq 2 ]]; then
@@ -101,10 +107,10 @@ else
   # generation, which a later run with the original inputs would restore.
   git diff --exit-code -- Cargo.lock
   if [[ -n $cache_key ]]; then
-    if [[ $(rust_deps_cache_key) == "$cache_key" ]]; then
+    if recheck_key=$(rust_deps_cache_key "$repo_root") && [[ $recheck_key == "$cache_key" ]]; then
       rust_deps_cache_publish "$cache_root" "$cache_key" "$third_party_dir" "$first_output"
     else
-      echo "warning: the rust-deps cache inputs changed while Reindeer ran; not storing its output" >&2
+      echo "warning: the rust-deps cache inputs changed while Reindeer ran, or could not be read again; not storing its output" >&2
     fi
   fi
 fi
