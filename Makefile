@@ -211,6 +211,7 @@ LINT_CHECK_TARGETS := \
     lint-check-compat-git-location \
     lint-check-run-pinned-tool \
     lint-check-git-dep-mirrors \
+    lint-check-rust-deps-cache \
     lint-check-fill-git-mirrors \
     lint-check-validate-stop-paths \
     lint-check-merge-gate-policy \
@@ -285,6 +286,9 @@ lint-check-run-pinned-tool:
 
 lint-check-git-dep-mirrors:
 	./bootstrap/test-git-dep-mirrors.sh
+
+lint-check-rust-deps-cache:
+	./bootstrap/test-rust-deps-cache.sh
 
 lint-check-fill-git-mirrors:
 	./scripts/test-fill-git-mirrors.sh

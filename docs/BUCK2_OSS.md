@@ -597,6 +597,24 @@ paths. Those patterns must not move into `shim/.gitignore`: pinned Reindeer
 reads ignore files through the shim cell root and would otherwise generate
 empty crates.
 
+What Reindeer generates (the vendored crates, its BUCK before the
+postprocessing, and the vendored-sources `.cargo/config.toml`) is kept in a
+cache entry named by everything Reindeer reads: `Cargo.lock` (which pins git
+dependencies by commit), every `Cargo.toml`, the toolchain file and cargo
+version, the files under `shim/third-party/rust` that Git does not ignore, the
+ignore files on the way to them, and the Reindeer pin and scripts. A checkout
+whose inputs match an earlier run's restores the entry instead of vendoring,
+about 3 s instead of 25 s with local mirrors, and then runs the postprocessing
+and its comparison as a generated checkout does. The two-run comparison of
+Reindeer's own output ran when the entry was generated. The cache lives at
+`rust-deps/` under the Buck2 tool cache root above, so
+`HERMIT_BUCK2_SHARED_TOOL_CACHE` shares it across a validation host's
+checkouts; it trusts its writers as that cache does. Each entry takes about
+370 MB and the newest `HERMIT_RUST_DEPS_CACHE_KEEP` (default 3) by last use are
+kept. `HERMIT_RUST_DEPS_CACHE=off` vendors every time; the release build sets
+it. Cargo's download caches under `shim/third-party/rust/.cargo` are removed
+after vendoring, so a generated and a restored checkout hold the same files.
+
 ## What a reproduction should produce
 
 Measured 2026-09-20 on x86_64 Linux with warm tool and crate caches:

@@ -5088,7 +5088,11 @@ fn build_validate_dag_artifact(dotslash: &Path) -> Result<(), String> {
         publish_unwind_buck_input(&root, &evidence_dir, require_unwind_closure()?)?;
 
     checked_output(
-        Command::new(root.join("bootstrap/regenerate-rust-deps")).current_dir(&root),
+        // A release vendors from its own lock rather than trusting a host
+        // cache another checkout wrote (bootstrap/rust-deps-cache.sh).
+        Command::new(root.join("bootstrap/regenerate-rust-deps"))
+            .current_dir(&root)
+            .env("HERMIT_RUST_DEPS_CACHE", "off"),
         "deterministic Rust dependency regeneration",
     )?;
     let generated_buck = root.join("shim/third-party/rust/BUCK");
@@ -5409,7 +5413,11 @@ fn run(options: Options, cgroups: BoxedCgroups) -> Result<(), String> {
 
     let regenerate = root.join("bootstrap/regenerate-rust-deps");
     checked_output(
-        Command::new(&regenerate).current_dir(&root),
+        // A release vendors from its own lock rather than trusting a host
+        // cache another checkout wrote (bootstrap/rust-deps-cache.sh).
+        Command::new(&regenerate)
+            .current_dir(&root)
+            .env("HERMIT_RUST_DEPS_CACHE", "off"),
         "deterministic Rust dependency regeneration",
     )?;
     let generated_buck = root.join("shim/third-party/rust/BUCK");
