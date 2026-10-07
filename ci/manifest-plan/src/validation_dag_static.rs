@@ -1313,7 +1313,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // is deleted with the capability it tested, which reverie-kvm's time(2)
     // and Guest::storable_memory_ranges replace: 1068 - 1 = 1067, measured with
     // cargo nextest list --profile ci -p hermit-detcore --lib --bins.
-    ("test.detcore_unit", 1067),
+    // io_buffers::event_tests::procfs_reads_refuse_an_impossible_count_before_asking_the_user_address_limit
+    // retains all 1067: 1067 + 1 = 1068, measured with cargo nextest list
+    // --profile ci -p hermit-detcore --lib --bins. Two iovecs::tests are
+    // renamed in the same change (backend_user_address_limit_selects_the_policy
+    // -> guest_reported_user_address_limit_is_the_one_enforced and
+    // rng_iovecs_native_oracle_failures_keep_their_tool_identity ->
+    // rng_iovecs_limit_query_failures_keep_their_tool_identity), count unchanged.
+    ("test.detcore_unit", 1068),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1826,7 +1833,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // listed for test.detcore_unit (1041, measured).
     // The host twin selects the same tests, re-listed together: 1068.
     // The host twin loses the same deleted time test: 1067.
-    ("test.detcore_unit_on_host", 1067),
+    // The host twin also selects the same procfs user-address-limit ordering
+    // test and the two renamed iovecs tests: 1067 + 1 = 1068.
+    ("test.detcore_unit_on_host", 1068),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

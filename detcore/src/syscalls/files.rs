@@ -293,19 +293,23 @@ fn copy_procfs_output<M: MemoryAccess>(
 /// before the file is read, so an address range beyond the user address limit
 /// is `EFAULT` even at EOF, when nothing would be copied. A procfs snapshot read
 /// never hands that range to the kernel.
+///
+/// `limit` is asked for the guest's user address limit only when the answer
+/// can matter, so a count that no limit admits is `EFAULT` before any query
+/// can fail.
 fn validate_procfs_destination(
-    policy: crate::iovecs::UserAddressPolicy,
+    limit: impl FnOnce() -> Result<crate::iovecs::UserAddressLimit, Error>,
     destination: Option<AddrMut<'_, u8>>,
     len: usize,
 ) -> Result<(), Error> {
-    // No count past isize::MAX fits below a user address limit. The native
-    // check would refuse it as an invalid iovec rather than a bad range.
+    // No count past isize::MAX fits below a user address limit, so `read`'s
+    // `access_ok` refuses it, whatever the limit.
     if isize::try_from(len).is_err() {
         return Err(Errno::EFAULT.into());
     }
     // Two descriptors keep the range uncapped, as `access_ok` sees it; a
-    // single one is capped at MAX_RW_COUNT first (`import_ubuf`).
-    policy.validate(&[
+    // single one may be capped at MAX_RW_COUNT first (`import_ubuf`).
+    limit()?.validate(&[
         crate::iovecs::ImportedIovec {
             base: destination.map_or(0, |address| address.as_raw()),
             len,
@@ -2536,12 +2540,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // physical zero-length read of that placeholder returns EINVAL
                 // even though the logical random-device read must return zero.
                 require_random_device_read_access(status_flags)?;
-                let policy = crate::iovecs::UserAddressPolicy::for_backend(
-                    guest.config().backend.user_address_limit,
-                );
+                let limit =
+                    crate::iovecs::UserAddressLimit::from_query(guest.user_address_limit())?;
                 // vfs_read still checks access_ok for a zero-length buffer:
                 // NULL is valid, but an address beyond TASK_SIZE is EFAULT.
-                policy.validate(&[crate::iovecs::ImportedIovec {
+                limit.validate(&[crate::iovecs::ImportedIovec {
                     base: call.buf().map_or(0, |address| address.as_raw()),
                     len: 0,
                 }])?;
@@ -2567,9 +2570,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             })?;
         if serves_procfs_snapshot {
             validate_procfs_destination(
-                crate::iovecs::UserAddressPolicy::for_backend(
-                    guest.config().backend.user_address_limit,
-                ),
+                || crate::iovecs::UserAddressLimit::from_query(guest.user_address_limit()),
                 call.buf(),
                 call.len(),
             )?;
@@ -2693,9 +2694,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             })?;
         if serves_procfs_snapshot {
             validate_procfs_destination(
-                crate::iovecs::UserAddressPolicy::for_backend(
-                    guest.config().backend.user_address_limit,
-                ),
+                || crate::iovecs::UserAddressLimit::from_query(guest.user_address_limit()),
                 call.buf(),
                 call.len(),
             )?;
@@ -3379,14 +3378,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         rng_output: &mut Option<Vec<crate::io_buffers::BufferExtent>>,
     ) -> Result<i64, Error> {
         require_random_device_read_access(detfd.status_flags())?;
-        let policy = crate::iovecs::UserAddressPolicy::for_backend(
-            guest.config().backend.user_address_limit,
-        );
         let iovecs = crate::iovecs::import_read_iovecs(
             &guest.memory(),
             request.address,
             request.count,
-            policy,
+            || crate::iovecs::UserAddressLimit::from_query(guest.user_address_limit()),
         )?;
         let total = iovecs.iter().map(|iov| iov.len).sum();
         validate_random_vector_read(request.offset, total, request.flags)?;
