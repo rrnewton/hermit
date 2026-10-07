@@ -817,7 +817,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // guest_may_inherit_a_terminal_never_enters_the_legacy_form
     // (https://github.com/rrnewton/hermit/pull/3361) retain all 988: 990
     // (measured with cargo nextest list --profile ci).
-    ("test.regular_crates", 990),
+    // hermit-manifest-plan's nextest_binaries::tests::
+    // a_changed_prepared_input_names_each_field_that_moved (2a43eb81) retains
+    // all 990: 991 (validate run
+    // validate-claude-coord-2a43eb81acf6-1791366692674881018-635384-a5df6dd9 executed 991).
+    ("test.regular_crates", 991),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2018,7 +2022,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The two framework-retry ledger tests listed there retain all 986: 988.
     // The two detcore-model legacy-form tests of
     // https://github.com/rrnewton/hermit/pull/3361 listed there retain all 988: 990.
-    ("test.regular_crates_on_host", 990),
+    // The prepared-input field-naming test of 2a43eb81 listed there retains all 990: 991.
+    ("test.regular_crates_on_host", 991),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
