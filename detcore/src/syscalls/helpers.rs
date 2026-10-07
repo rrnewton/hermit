@@ -4473,6 +4473,74 @@ mod kernel_signal_wait_failures {
         }
     }
 
+    /// A `SIGCHLD` that arrives after the read before an injection stops it in a
+    /// way that cannot be identified, and a second one, pending at the next
+    /// read, would stop the injection made again and replace the first in the
+    /// backend's one slot. The first may have been a signal whose loss matters,
+    /// so the wait is refused before that injection, with or without a
+    /// deadline (round-10 High 1 on https://github.com/rrnewton/hermit/pull/3361),
+    /// and the backend still holds the first signal. This is the refusal a
+    /// flood of external `SIGCHLD` racing a timed futex wait's first injections
+    /// met on hermit main ccbe5ae8 (`external_signal_interrupt`'s test of the
+    /// flood, now
+    /// `ptrace_timed_futex_wait_and_poll_keep_their_deadline_after_a_sigchld_flood`,
+    /// which sends its flood before the wait starts).
+    #[tokio::test]
+    async fn a_sigchld_after_an_unidentified_stop_is_refused_before_it_replaces_it() {
+        let chld = kernel_sigset_bit(libc::SIGCHLD);
+        for deadline in [true, false] {
+            let (mut guest, kernel) = stopping_guest(0, 0);
+            {
+                let mut kernel = kernel.lock().unwrap();
+                // Pending only after the first read: the injection's stop is not
+                // identified. Sent once more, so it is pending again at the read
+                // before the injection made again.
+                kernel.pending_repost = chld;
+                kernel.repost_after_take = 1;
+            }
+            let _proc = scripted_proc(&kernel);
+            let mut wait = KernelSignalWait::new(&guest, 0, true, Errno::ERESTARTNOHAND)
+                .with_deadline(deadline);
+
+            let result = inject_mask_absorbing(&mut wait, &mut guest, guest_mask()).await;
+
+            let refused = refusal(result);
+            assert_eq!(
+                refused,
+                HeldSignalRefusal {
+                    wait: None,
+                    held: None,
+                    replacing: Some(libc::SIGCHLD),
+                    loss: HeldSignalLoss::Replaced,
+                },
+                "deadline={deadline}"
+            );
+            let message = HeldSignalRefusal {
+                wait: Some(Sysno::futex),
+                ..refused
+            }
+            .to_string();
+            assert!(
+                message.starts_with(
+                    "unsupported: the futex wait cannot keep a held signal that could not be \
+                     identified: the pending SIGCHLD would stop the next injection and replace it"
+                ),
+                "deadline={deadline}: {message}"
+            );
+            assert!(wait.held_unidentified, "deadline={deadline}");
+            let kernel = kernel.lock().unwrap();
+            assert_eq!(
+                kernel.requested.len(),
+                1,
+                "deadline={deadline}: the second injection is not made"
+            );
+            assert_eq!(kernel.taken, vec![libc::SIGCHLD], "deadline={deadline}");
+            assert_eq!(kernel.held_slot, Some(libc::SIGCHLD), "deadline={deadline}");
+            assert!(kernel.lost.is_empty(), "deadline={deadline}");
+            assert_eq!(kernel.pending, chld, "deadline={deadline}");
+        }
+    }
+
     /// In a wait with a deadline, a held `SIGCHLD` that would not end the wait
     /// is not dropped when another pending signal would stop the next
     /// injection. The injection used to be made, and the stop replaced the held
