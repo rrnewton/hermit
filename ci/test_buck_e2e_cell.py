@@ -33,7 +33,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-import time
 import unittest
 from pathlib import Path
 
@@ -558,22 +557,30 @@ class CellTest(unittest.TestCase):
         self.assertEqual(len(self.calls_by("harness")), 1)
 
     def test_only_local_kvm_cells_take_a_slot(self) -> None:
-        env = self.slot_env(1)
-        self.hold_slot(0)
-        # A cell that waited for the held slot would block for half its deadline, 50 s here,
-        # before running without one. The wall-clock bound sits well below that wait and well
-        # above the few seconds a loaded host adds to a cell's startup (5.7 s measured under a
-        # full local validate, which a 4 s bound reported as a wait).
-        deadline_s = 100
-        for backend, route in (("ptrace", "local"), ("dbt", "local"), ("kvm", "re")):
+        # Slot 0 is held and slot 1 does not exist. A cell that tries for a slot first opens
+        # every slot file for append, which creates slot.1, before it takes a slot or waits for
+        # one: the local KVM cell takes slot 1. A slot.1 that never appears therefore shows
+        # that a cell did neither, however slowly a loaded host ran it.
+        for backend, route in (("kvm", "local"), ("ptrace", "local"), ("dbt", "local"), ("kvm", "re")):
             with self.subTest(backend=backend, route=route):
-                started = time.monotonic()
-                done, result = self.run_cell(backend, HERMIT_E2E_ROUTE=route,
-                                             CELL_DEADLINE_S=str(deadline_s), **env)
+                self.calls.write_text("")
+                env = self.slot_env(2, f"kvm-slots-{backend}-{route}")
+                self.hold_slot(0)
+                done, result = self.run_cell(backend, HERMIT_E2E_ROUTE=route, CELL_DEADLINE_S="100",
+                                             **env)
                 self.assertEqual(done["status"], "passed", done)
-                self.assertEqual((result["kvm_slot"], result["kvm_slot_wait_ms"]), ("", 0), result)
-                self.assertLess(time.monotonic() - started, deadline_s / 4,
-                                "a cell that takes no slot must not wait")
+                [harness] = self.calls_by("harness")
+                self.assert_no_slot_descriptor(harness)
+                slot_files = sorted(p.name for p in self.slot_dir.iterdir())
+                if (backend, route) == ("kvm", "local"):
+                    self.assertEqual(result["kvm_slot"], "1", result)
+                    self.assertEqual(harness["slots"], {"slot.0": "locked", "slot.1": "locked"})
+                    self.assertEqual(slot_files, ["slot.0", "slot.1"])
+                else:
+                    self.assertEqual((result["kvm_slot"], result["kvm_slot_wait_ms"]), ("", 0), result)
+                    self.assertEqual(harness["slots"], {"slot.0": "locked"})
+                    self.assertEqual(slot_files, ["slot.0"],
+                                     "a cell that takes no slot must not try for one")
 
     def test_bad_kvm_slot_count_is_an_error(self) -> None:
         done, _ = self.run_cell("kvm", **dict(self.slot_env(1), HERMIT_E2E_KVM_SLOTS="0"))
