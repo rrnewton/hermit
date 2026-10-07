@@ -55,6 +55,7 @@ use reverie::syscalls::SyscallInfo;
 
 use crate::digest::Digest;
 use crate::dirents::DirentFormat;
+use crate::syscalls::helpers::poll_nfds;
 use crate::types::DetTid;
 
 /// One contiguous run of guest bytes a completed syscall moved.
@@ -173,6 +174,12 @@ fn whole(addr: Option<u64>, len: u64) -> Vec<BufferExtent> {
         Some(addr) if len > 0 => vec![BufferExtent { addr, len }],
         _ => Vec::new(),
     }
+}
+
+/// The bytes of the `pollfd` array a call with `nfds` reads, counted as Linux
+/// counts its entries (see [`poll_nfds`]). Cannot overflow.
+fn pollfd_array_len(nfds: libc::nfds_t) -> u64 {
+    u64::from(poll_nfds(nfds)) * std::mem::size_of::<libc::pollfd>() as u64
 }
 
 /// Walk an `iovec` array and return the segments the syscall actually filled,
@@ -430,14 +437,17 @@ fn extents<M: MemoryAccess>(
         // Rewritten in place across the WHOLE array: `poll` sets `revents` on
         // every entry, not just on the `ret` that were ready, so the extent is
         // the array and not a prefix of it -- and it is reached even when
-        // `ret == 0`, via `ret_gates_output`.
+        // `ret == 0`, via `ret_gates_output`. Linux takes `nfds` as an
+        // `unsigned int`, so only its low 32 bits count: a guest that sets the
+        // high word gets the low word's array, and the observer must not read
+        // more.
         Syscall::Poll(c) => whole(
             c.fds().map(|p| p.as_raw() as u64),
-            c.nfds() * std::mem::size_of::<libc::pollfd>() as u64,
+            pollfd_array_len(c.nfds()),
         ),
         Syscall::Ppoll(c) => whole(
             c.fds().map(|p| p.as_raw() as u64),
-            c.nfds() * std::mem::size_of::<libc::pollfd>() as u64,
+            pollfd_array_len(c.nfds()),
         ),
 
         _ => Vec::new(),
@@ -2259,6 +2269,37 @@ mod tests {
         );
         assert!(whole(None, 24).is_empty());
         assert!(whole(Some(0x2000), 0).is_empty());
+    }
+
+    /// Linux reads `nfds` as an `unsigned int`; a high word set by the guest
+    /// must not grow the observed array (2^32 + 1 entries would be a 32 GiB
+    /// read for a one-descriptor call).
+    #[test]
+    fn poll_family_extents_use_the_low_32_bits_of_nfds() {
+        let memory = LocalMemory::new();
+        let nfds = (1_u64 << 32) | 1;
+        for call in [
+            Syscall::Poll(
+                syscalls::Poll::new()
+                    .with_fds(AddrMut::from_raw(0x2000))
+                    .with_nfds(nfds as _),
+            ),
+            Syscall::Ppoll(
+                syscalls::Ppoll::new()
+                    .with_fds(AddrMut::from_raw(0x2000))
+                    .with_nfds(nfds as _),
+            ),
+        ] {
+            assert_eq!(
+                extents(&memory, &call, 1).unwrap(),
+                vec![BufferExtent {
+                    addr: 0x2000,
+                    len: std::mem::size_of::<libc::pollfd>() as u64,
+                }],
+                "{}",
+                call.name()
+            );
+        }
     }
 
     /// The gap this file had: `poll(...) = 0` produced no record at all,

@@ -63,7 +63,7 @@ fn expected_invariant() -> String {
 /// The select client's whole stdout: every check it makes passed.
 fn expected_select_output() -> String {
     format!(
-        "select=ebadf,timeout,pipe-writable,first,three-sets,second,eof aggregate=abcdef \
+        "select=ebadf,poll-limit,timeout,pipe-writable,first,three-sets,second,eof aggregate=abcdef \
          outbound_hex={OUTBOUND_HEX} outbound_fnv1a64={:016x}\n",
         fnv1a64(b"request\nnext\ndone\n")
     )
@@ -1243,6 +1243,38 @@ fn tcp_record_refuses_operations_outside_a_channel() {
         assert_refused(&refused, &label, reason, remedy);
     }
     controller.stop_without_connection();
+}
+
+/// Linux reads the `nfds` of `poll` and `ppoll` as an `unsigned int`. Record
+/// reads the pollfd array before it knows whether the call names a channel,
+/// so it must size that read the same way: the fixture's poll and ppoll on a
+/// readable pipe pass `nfds` with its high word set and its low word 1, and
+/// each must return 1 under record as natively, not fail the run.
+#[test]
+fn record_reads_poll_family_nfds_as_linux_does() {
+    let _guard = super::hermit_record_lock();
+    let fixture = &super::workload("c_network_replay_tcp_bracket").path;
+    let directory = tempfile::tempdir().expect("create network record evidence directory");
+    let evidence = directory.path();
+    let expected = "poll-high-word poll=1/pollin ppoll=1/pollin\n";
+
+    let native = bounded_command(
+        fixture,
+        &[OsStr::new("poll-high-word")],
+        NATIVE_CLIENT_WALL_SECONDS,
+    );
+    assert_success(&native, "native poll-high-word");
+    assert_eq!(String::from_utf8_lossy(&native.stdout), expected);
+
+    let label = "record-poll-high-word";
+    let mut arguments = run_arguments(0, 1_000_000);
+    arguments.push(format!(
+        "--record-networking={}",
+        evidence.join(format!("{label}.trace")).display()
+    ));
+    let recorded = hermit_command(evidence, label, &arguments, fixture, &["poll-high-word"]);
+    assert_success(&recorded, label);
+    assert_eq!(String::from_utf8_lossy(&recorded.stdout), expected);
 }
 
 const HTTP_RESPONSE: &[u8] =

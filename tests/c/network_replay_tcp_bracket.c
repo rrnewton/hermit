@@ -18,8 +18,10 @@
  * The select client runs the same protocol on one thread, waiting with
  * select, pselect6 and glibc's select and pselect, alongside a pipe that
  * the host answers for. Before the request it checks that a closed
- * descriptor fails the call with EBADF, that a wait in which nothing
- * arrives times out with no time left, and that only the pipe is writable.
+ * descriptor fails the call with EBADF, that poll and ppoll with more
+ * entries than RLIMIT_NOFILE fail with EINVAL though the array names the
+ * socket, that a wait in which nothing arrives times out with no time left,
+ * and that only the pipe is writable.
  *
  * The other client modes each do one thing network record/replay must
  * refuse: end before sending the whole request, send with sendmsg or
@@ -57,6 +59,12 @@
  * byte, and a child process rewrites the unsent second half during that
  * wait. Linux sends the rewritten bytes. The shared and replace
  * controllers report what each connection received instead of checking it.
+ *
+ * The poll-high-word mode needs no controller: it polls a readable pipe
+ * with poll and then ppoll, passing nfds with its high word set. Linux reads
+ * nfds as an unsigned int, so each is a one-entry call that returns 1.
+ * Record reads the pollfd array before it knows whether the call names a
+ * channel, so it must size that read as Linux does.
  */
 
 #include <arpa/inet.h>
@@ -713,6 +721,45 @@ static void expect_set(int nfds, const fd_set *actual, const fd_set *expected,
 
 /* The match protocol on one thread, waiting with the select family on the
  * socket and a pipe. Every result is checked against what Linux returns. */
+/* One more entry than Hermit's default RLIMIT_NOFILE (1048576). */
+#define POLL_OVER_LIMIT_ENTRIES ((size_t)1048577)
+
+/* Linux refuses a poll or ppoll with more entries than RLIMIT_NOFILE with
+ * EINVAL before it reads the array, so a ready socket in its first entry is
+ * neither reported nor written. */
+static void check_poll_count_limit(int socket_fd) {
+  struct rlimit limit;
+  if (getrlimit(RLIMIT_NOFILE, &limit) != 0)
+    fail("getrlimit");
+  if (limit.rlim_cur >= POLL_OVER_LIMIT_ENTRIES)
+    fail_message("RLIMIT_NOFILE is too high for the poll count check");
+  size_t bytes = POLL_OVER_LIMIT_ENTRIES * sizeof(struct pollfd);
+  struct pollfd *entries =
+      mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (entries == MAP_FAILED)
+    fail("mmap pollfds");
+  /* Every other entry is descriptor -1, which poll ignores, so an
+   * implementation that read the array would report only the socket. One
+   * memset sets them: a loop over a million entries takes seconds under
+   * Hermit's chaos scheduler, which preempts by instruction count, long
+   * enough for the controller to give up on the connection. */
+  memset(entries, 0xff, bytes);
+  entries[0] = (struct pollfd){.fd = socket_fd, .events = POLLOUT};
+  errno = 0;
+  long ready = syscall(SYS_poll, entries, POLL_OVER_LIMIT_ENTRIES, 0);
+  if (ready != -1 || errno != EINVAL)
+    fail_message("poll over RLIMIT_NOFILE entries did not fail with EINVAL");
+  struct timespec zero = {0};
+  errno = 0;
+  ready = syscall(SYS_ppoll, entries, POLL_OVER_LIMIT_ENTRIES, &zero, NULL, (size_t)8);
+  if (ready != -1 || errno != EINVAL)
+    fail_message("ppoll over RLIMIT_NOFILE entries did not fail with EINVAL");
+  if (entries[0].revents != 0)
+    fail_message("a refused poll wrote revents");
+  if (munmap(entries, bytes) != 0)
+    fail("munmap pollfds");
+}
+
 static int run_select_client(const char *port_text) {
   set_deadline();
   struct sockaddr_in address = loopback_address(parse_port(port_text));
@@ -748,6 +795,8 @@ static int run_select_client(const char *port_text) {
   if (ready != -1 || errno != EBADF)
     fail_message("pselect6 naming a closed descriptor did not fail with EBADF");
   expect_set(nfds, &readable, &expected, "EBADF pselect6");
+
+  check_poll_count_limit(socket_fd);
 
   /* Nothing arrives before the request, so a timed wait expires, clears
    * every set, and reports no time left. */
@@ -856,7 +905,8 @@ static int run_select_client(const char *port_text) {
   if (recv(socket_fd, &eof_byte, 1, 0) != 0)
     fail_message("peer half-close did not produce EOF after abcdef");
 
-  printf("select=ebadf,timeout,pipe-writable,first,three-sets,second,eof aggregate=abcdef "
+  printf("select=ebadf,poll-limit,timeout,pipe-writable,first,three-sets,second,eof "
+         "aggregate=abcdef "
          "outbound_hex=%s outbound_fnv1a64=%016llx\n",
          OUTBOUND_HEX, (unsigned long long)expected_outbound_digest());
   close(pipe_fds[0]);
@@ -1367,7 +1417,29 @@ static int run_backpressure_client(const char *port_text, enum backpressure_kind
   return 0;
 }
 
+static int run_poll_high_word(void) {
+  int fds[2];
+  if (pipe(fds) != 0)
+    fail("pipe");
+  if (write(fds[1], "x", 1) != 1)
+    fail("write pipe");
+  // The low word is 1. Taken whole, the count is more entries than any array
+  // can hold.
+  const unsigned long nfds = 0xffffffff00000001UL;
+  struct pollfd polled = {.fd = fds[0], .events = POLLIN};
+  long poll_ready = syscall(SYS_poll, &polled, nfds, 0);
+  struct pollfd ppolled = {.fd = fds[0], .events = POLLIN};
+  struct timespec zero = {0, 0};
+  long ppoll_ready = syscall(SYS_ppoll, &ppolled, nfds, &zero, NULL, (size_t)8);
+  printf("poll-high-word poll=%ld/%s ppoll=%ld/%s\n", poll_ready,
+         polled.revents == POLLIN ? "pollin" : "other", ppoll_ready,
+         ppolled.revents == POLLIN ? "pollin" : "other");
+  return poll_ready == 1 && ppoll_ready == 1 ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
+  if (argc == 2 && strcmp(argv[1], "poll-high-word") == 0)
+    return run_poll_high_word();
   if (argc == 5 && strcmp(argv[1], "controller") == 0)
     return run_controller(argv[2], argv[3], argv[4]);
   if (argc == 5 && strcmp(argv[1], "backpressure-controller") == 0)
@@ -1405,7 +1477,8 @@ int main(int argc, char **argv) {
         return run_refused_client(argv[2], argv[3]);
   }
   fprintf(stderr,
-          "usage: %s controller|backpressure-controller|shared-controller|"
+          "usage: %s poll-high-word | "
+          "controller|backpressure-controller|shared-controller|"
           "replace-controller PORT_FILE REPORT_FILE CONTACT_FILE | client PORT "
           "match|mismatch|select|backpressure-nonblocking|backpressure-blocking|"
           "backpressure-interleaved|backpressure-observe|backpressure-replace|"

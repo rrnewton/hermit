@@ -1012,7 +1012,13 @@ fi
 # third-party or rust-toolchain.toml changes, so the four budget inputs are
 # unchanged. Carry, not recalibration: no new timing sample or >=5-sample
 # replacement claim is made.
-expected_pin=ba18ad41ef79d932927ba3fd890bd437e26233a4
+# CARRY TO ace0cc59c18bac0cee5503a192868a2f82d95691 (2026-10-06): from
+# ba18ad41ef79d932927ba3fd890bd437e26233a4. The one commit changes only reverie-kvm (which
+# thread owns a guest's ppoll); no file under reverie-dbt, the root
+# Cargo.toml, third-party or rust-toolchain.toml changes, so the four budget
+# inputs are unchanged. Carry, not recalibration: no new timing sample or
+# >=5-sample replacement claim is made.
+expected_pin=ace0cc59c18bac0cee5503a192868a2f82d95691
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
