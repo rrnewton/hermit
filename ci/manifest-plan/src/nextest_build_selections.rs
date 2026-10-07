@@ -610,7 +610,14 @@ mod tests {
                     .iter()
                     .any(|binary| binary == "child_time_rpc")
             );
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "286");
+            // The hosted twin leaves out the btrfs maps-proof case
+            // (HOSTED_PORTABLE_BTRFS_INTEGRATION_TESTS in validation_dag.rs).
+            let expected = if tag == "test.hermit_integration" {
+                "297"
+            } else {
+                "296"
+            };
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], expected);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
