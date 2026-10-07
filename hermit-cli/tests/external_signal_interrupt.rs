@@ -621,6 +621,11 @@ fn run_cell_observed(
         (!external && observe == Observe::Default).then(|| trial.path().join("verify.json"));
     let info_log = (observe == Observe::InfoLog).then(|| trial.path().join("info.log"));
     let mut command = Command::new(hermit_binary::hermit_binary());
+    // Not cargo's `LD_LIBRARY_PATH`, under which the guest's dynamic loader
+    // stats build directories that other validation nodes are writing, so the
+    // two runs of a `--verify` pair could see different directory sizes
+    // (https://github.com/rrnewton/hermit/issues/3846).
+    command.env_remove("LD_LIBRARY_PATH");
     if verify_report.is_some() {
         command.arg("--log=info");
     }
@@ -2439,6 +2444,8 @@ fn run_inherited_terminal_cell(namespace: bool, event: TerminalEvent) -> Inherit
     // with Hermit's status.
     let mut command = Command::new("/bin/sh");
     command
+        // As above: keep the guest's loader out of the build directories.
+        .env_remove("LD_LIBRARY_PATH")
         .arg("-c")
         .arg(r#""$@"; exit "$?""#)
         .arg("sh")

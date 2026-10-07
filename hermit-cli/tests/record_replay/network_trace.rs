@@ -260,7 +260,13 @@ fn hermit_command(
             .arg(safehermit)
             .args(["--sh-deadline", &HERMIT_WALL_SECONDS.to_string()]);
     }
+    // Cargo's `LD_LIBRARY_PATH` names this build's own directories. A guest
+    // that inherited it would have its dynamic loader stat them while other
+    // validation nodes write there, so one run of a `--verify` pair could see
+    // a directory size the other did not
+    // (https://github.com/rrnewton/hermit/issues/3846). Hermit does not use it.
     command
+        .env_remove("LD_LIBRARY_PATH")
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args(arguments)
         .arg("--")
