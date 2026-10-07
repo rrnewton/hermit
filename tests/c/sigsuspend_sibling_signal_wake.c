@@ -83,6 +83,26 @@
  * before the release, and the kernel installs it, or after the waiter is
  * asleep, and changes nothing; raw-race meets the same choice with its
  * SIGUSR1 sent together with the store.
+ *
+ * Two last phases cover the other ways a signal ends the wait:
+ *
+ *   restart-handled: SIGUSR2's handler is installed with SA_RESTART, and the
+ *                    sibling's SIGUSR2 still ends the wait with -1 and EINTR
+ *                    and one handler run on the waiting thread. Linux never
+ *                    restarts sigsuspend after a handler runs: the call
+ *                    returns ERESTARTNOHAND, which signal delivery turns into
+ *                    EINTR whatever the handler's flags say.
+ *   fatal-term:      a forked child waits in sigsuspend with SIGTERM at its
+ *                    default disposition, and the parent sends it SIGTERM a
+ *                    second later. The child must end by that signal, so
+ *                    waitpid reports WIFSIGNALED with WTERMSIG equal to
+ *                    SIGTERM.
+ *
+ * Measured with a standalone copy of each phase on main at 04a34b2d, strict
+ * verify of fatal-term diverged in 3 of 3 runs: the child's rt_sigsuspend
+ * finished with ERESTARTNOHAND in one run and ERESTARTSYS in the other, the
+ * second defect above. restart-handled matched in 3 of 3 runs on main; it
+ * keeps a handler's SA_RESTART flag from being taken to restart the wait.
  */
 
 #define _GNU_SOURCE
@@ -352,6 +372,83 @@ static int raw_phase(const char* name, void* (*sibling_main)(void*)) {
            usr2_runs == 1 && on_waiter);
 }
 
+/* restart-handled (see the comment at the top). Returns 0 on success. */
+static int restart_handled_phase(void) {
+  struct sigaction sa;
+  struct sigaction previous;
+  memset(&sa, 0, sizeof(sa));
+  sigemptyset(&sa.sa_mask);
+  sa.sa_handler = on_usr2;
+  sa.sa_flags = SA_RESTART;
+  if (sigaction(SIGUSR2, &sa, &previous) != 0) {
+    puts("SIGSUSPEND_SIBLING_SIGACTION_FAILED");
+    return 1;
+  }
+  usr2_runs = 0;
+  usr2_on_waiter = 0;
+
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, sibling, NULL) != 0) {
+    puts("SIGSUSPEND_SIBLING_PTHREAD_CREATE_FAILED");
+    return 1;
+  }
+  sigset_t empty;
+  sigemptyset(&empty);
+  errno = 0;
+  int rc = sigsuspend(&empty);
+  int eintr = rc == -1 && errno == EINTR;
+
+  if (pthread_join(thread, NULL) != 0) {
+    puts("SIGSUSPEND_SIBLING_PTHREAD_JOIN_FAILED");
+    return 1;
+  }
+  if (sigaction(SIGUSR2, &previous, NULL) != 0) {
+    puts("SIGSUSPEND_SIBLING_SIGACTION_FAILED");
+    return 1;
+  }
+  printf(
+      "restart-handled rc=%d eintr=%d usr2_runs=%d usr2_on_waiter=%d\n",
+      rc,
+      eintr,
+      (int)usr2_runs,
+      (int)usr2_on_waiter);
+  return !(rc == -1 && eintr && usr2_runs == 1 && usr2_on_waiter);
+}
+
+/* fatal-term (see the comment at the top). Returns 0 on success. */
+static int fatal_term_phase(void) {
+  pid_t child = fork();
+  if (child < 0) {
+    puts("SIGSUSPEND_SIBLING_FORK_FAILED");
+    return 1;
+  }
+  if (child == 0) {
+    sigset_t empty;
+    sigemptyset(&empty);
+    sigsuspend(&empty);
+    _exit(9);
+  }
+  sleep_one_second();
+  if (kill(child, SIGTERM) != 0) {
+    puts("SIGSUSPEND_SIBLING_KILL_FAILED");
+    return 1;
+  }
+  int status = 0;
+  if (waitpid(child, &status, 0) != child) {
+    puts("SIGSUSPEND_SIBLING_WAITPID_FAILED");
+    return 1;
+  }
+  int signaled = WIFSIGNALED(status);
+  int termsig = signaled ? WTERMSIG(status) : 0;
+  int exited = WIFEXITED(status);
+  printf(
+      "fatal-term signaled=%d termsig=%d exited=%d\n",
+      signaled,
+      termsig,
+      exited);
+  return !(signaled && termsig == SIGTERM && !exited);
+}
+
 int main(void) {
   struct sigaction sa;
   memset(&sa, 0, sizeof(sa));
@@ -394,6 +491,12 @@ int main(void) {
         raw_phase("raw-blocked", block_usr1_before_wait) != 0 ||
         raw_phase("raw-race", block_usr1_during_wait) != 0 ||
         raw_phase("raw-stale", block_usr1_after_entry) != 0) {
+      puts("SIGSUSPEND_SIBLING_SIGNAL_WAKE_FAILED");
+      return 1;
+    }
+  }
+  for (int round = 0; round < ROUNDS; round++) {
+    if (restart_handled_phase() != 0 || fatal_term_phase() != 0) {
       puts("SIGSUSPEND_SIBLING_SIGNAL_WAKE_FAILED");
       return 1;
     }
