@@ -370,6 +370,26 @@ impl CapturedResults {
             .collect::<Result<BTreeMap<_, _>, _>>()?;
         hermit_manifest_plan::ledger::RawResultInputCensusV1::from_inputs(run_id, commit, &inputs)
     }
+
+    /// Every retried cell in the captured bytes. Call it only after
+    /// [`Self::census`] succeeded, which proves these bytes are still the
+    /// files on disk.
+    pub fn framework_retries(
+        &self,
+    ) -> Result<hermit_manifest_plan::ledger::FrameworkRetriesV1, String> {
+        let inputs = self
+            .inputs
+            .as_ref()
+            .map_err(Clone::clone)?
+            .iter()
+            .map(|(path, bytes)| {
+                path.to_str()
+                    .map(|path| (path.to_owned(), bytes.clone()))
+                    .ok_or_else(|| "raw result path is not UTF-8".to_owned())
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        hermit_manifest_plan::ledger::FrameworkRetriesV1::from_inputs(&inputs)
+    }
 }
 
 #[cfg(test)]

@@ -2923,19 +2923,28 @@ struct SkidRetry {
     final_outcome: String,
 }
 
-/// Every SKID-RETRY in `histories`.
+/// One retried attempt of a cell's history, whatever its cause, and the
+/// outcome the cell's complete history selected.
+#[derive(Clone, Debug)]
+struct RetriedAttempt<'a> {
+    row: &'a CellResult,
+    cause: RetryCause,
+    final_outcome: String,
+}
+
+/// Every retried attempt in `histories`, with its cause.
 ///
 /// Every row but the last of a history is an attempt the harness retried (or,
 /// for imported rows, one this run's policy would have retried), so the cause
 /// is recomputed from that row with the same rule that launched the retry. An
 /// imported history continues past an attempt exactly when that rule retries
-/// it ([`imported_results`]), so an imported typed skid attempt followed by
-/// its producer's next attempt is a SKID-RETRY, counted as an executed one is.
-fn skid_retries(
+/// it ([`imported_results`]), so an imported retried attempt followed by its
+/// producer's next attempt is counted as an executed one is.
+fn retried_attempts<'a>(
     retries: Retries,
     cells: &[SelectedCell],
-    histories: &[Vec<CellResult>],
-) -> Vec<SkidRetry> {
+    histories: &'a [Vec<CellResult>],
+) -> Vec<RetriedAttempt<'a>> {
     let mut found = Vec::new();
     for (cell, history) in cells.iter().zip(histories) {
         let Some((_, retried)) = history.split_last() else {
@@ -2946,21 +2955,85 @@ fn skid_retries(
             Err(_) => "ERROR".into(),
         };
         for row in retried {
-            if let Some(RetryCause::SkidOvershoot { reports }) =
-                attempt_retry_cause(retries, cell, row)
-            {
-                found.push(SkidRetry {
-                    test: row.test.clone(),
-                    mode: row.mode.clone(),
-                    backend: row.backend.clone(),
-                    attempt: row.attempt,
-                    reports,
+            if let Some(cause) = attempt_retry_cause(retries, cell, row) {
+                found.push(RetriedAttempt {
+                    row,
+                    cause,
                     final_outcome: final_outcome.clone(),
                 });
             }
         }
     }
     found
+}
+
+/// Every SKID-RETRY in `histories`; see [`retried_attempts`].
+fn skid_retries(
+    retries: Retries,
+    cells: &[SelectedCell],
+    histories: &[Vec<CellResult>],
+) -> Vec<SkidRetry> {
+    retried_attempts(retries, cells, histories)
+        .into_iter()
+        .filter_map(|retried| match retried.cause {
+            RetryCause::SkidOvershoot { reports } => Some(SkidRetry {
+                test: retried.row.test.clone(),
+                mode: retried.row.mode.clone(),
+                backend: retried.row.backend.clone(),
+                attempt: retried.row.attempt,
+                reports,
+                final_outcome: retried.final_outcome,
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The summary.json entry for a PRODUCT-RETRY or HOST-INPUT-RETRY: the
+/// retried attempt, what it observed and where its first divergence was, and
+/// the outcome the cell's complete history selected. A final PASS here is a
+/// failure the retry turned into a pass.
+fn retried_attempt_json(retried: &RetriedAttempt<'_>) -> serde_json::Value {
+    let row = retried.row;
+    serde_json::json!({
+        "test": row.test,
+        "mode": row.mode,
+        "backend": row.backend,
+        "attempt": row.attempt,
+        "outcome": row.outcome,
+        "result": row.result,
+        "first_divergent_scheduler_turn": row.first_divergent_scheduler_turn,
+        "first_divergent_record": row.first_divergent_record,
+        "first_divergent_syscall": row.first_divergent_syscall,
+        "final_outcome": retried.final_outcome,
+    })
+}
+
+/// The line printed for each PRODUCT-RETRY or HOST-INPUT-RETRY.
+fn retried_attempt_line(label: &str, retried: &RetriedAttempt<'_>) -> String {
+    let row = retried.row;
+    let coords = [
+        ("turn", row.first_divergent_scheduler_turn),
+        ("rec", row.first_divergent_record),
+        ("sys", row.first_divergent_syscall),
+    ]
+    .iter()
+    .filter_map(|(key, value)| value.map(|value| format!(" {key}={value}")))
+    .collect::<String>();
+    let observed = row
+        .result
+        .and_then(|result| serde_json::to_value(result).ok())
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unrecorded".into());
+    format!(
+        "test-harness: {label} {} ({}/{}): attempt {} was {} ({observed}{coords}) and was retried; final outcome {}",
+        row.test,
+        row.mode,
+        row.backend.as_deref().unwrap_or("native"),
+        row.attempt,
+        row.outcome,
+        retried.final_outcome
+    )
 }
 
 /// The line printed for a typed skid attempt that is not followed by a retry.
@@ -3387,6 +3460,36 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             retry.final_outcome
         );
     }
+    // The other retries are counted the same way: a PRODUCT-RETRY follows a
+    // measured product failure, including a verify divergence without an
+    // overshoot marker, and a final PASS selected after one is a failure the
+    // retry turned into a pass (https://github.com/rrnewton/hermit/issues/1845).
+    let retried = retried_attempts(args.retries, &cells, &attempt_results);
+    let product_retried = retried
+        .iter()
+        .filter(|retried| retried.cause == RetryCause::ProductFailure)
+        .collect::<Vec<_>>();
+    let host_input_retried = retried
+        .iter()
+        .filter(|retried| retried.cause == RetryCause::HostInputChanged)
+        .collect::<Vec<_>>();
+    if expected > 0 {
+        println!(
+            "test-harness: PRODUCT-RETRY count {} ({} final PASS); HOST-INPUT-RETRY count {}",
+            product_retried.len(),
+            product_retried
+                .iter()
+                .filter(|retried| retried.final_outcome == "PASS")
+                .count(),
+            host_input_retried.len()
+        );
+    }
+    for retried in &product_retried {
+        println!("{}", retried_attempt_line("PRODUCT-RETRY", retried));
+    }
+    for retried in &host_input_retried {
+        println!("{}", retried_attempt_line("HOST-INPUT-RETRY", retried));
+    }
     let host_inapplicable = results
         .iter()
         .filter(|result| result.outcome == "HOST-INAPPLICABLE")
@@ -3439,6 +3542,18 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 "overshoot_reports": retry.reports,
                 "final_outcome": retry.final_outcome,
             }))
+            .collect::<Vec<_>>(),
+        // Retries of a measured product failure, and of a divergence a host
+        // file changing explains; see the PRODUCT-RETRY lines above.
+        "product_retries": product_retried.len(),
+        "product_retry_cells": product_retried
+            .iter()
+            .map(|retried| retried_attempt_json(retried))
+            .collect::<Vec<_>>(),
+        "host_input_retries": host_input_retried.len(),
+        "host_input_retry_cells": host_input_retried
+            .iter()
+            .map(|retried| retried_attempt_json(retried))
             .collect::<Vec<_>>(),
         "host_inapplicable": host_inapplicable,
         "cell_cpu_usage_usec": cell_cpu_usage_usec,
@@ -4431,18 +4546,20 @@ report.write_bytes((root/'verification.json').read_bytes())
                 .remove(0)
         };
 
-        // (scenario, harness exit success, attempts launched, SKID-RETRY count)
-        for (scenario, succeeds, launched, skid_retries) in [
-            ("skid-then-match", true, 2, 1),
-            ("skid-then-match-sabre", true, 2, 1),
-            ("skid-twice", false, 2, 1),
-            ("skid-no-retry", false, 1, 0),
-            ("unmarked-skid", false, 1, 0),
-            ("diverged-marked", false, 2, 0),
-            ("diverged-then-skid", false, 2, 0),
-            ("rejected-guest-skid", false, 1, 0),
-            ("crashed-operand-skid", false, 1, 0),
-            ("skid-wrong-stdout", false, 1, 0),
+        // (scenario, harness exit success, attempts launched, SKID-RETRY
+        // count, PRODUCT-RETRY count)
+        for (scenario, succeeds, launched, skid_retries, product_retries) in [
+            ("skid-then-match", true, 2, 1, 0),
+            ("skid-then-match-sabre", true, 2, 1, 0),
+            ("skid-twice", false, 2, 1, 0),
+            ("skid-no-retry", false, 1, 0, 0),
+            ("unmarked-skid", false, 1, 0, 0),
+            ("diverged-marked", false, 2, 0, 1),
+            ("diverged-then-skid", false, 2, 0, 1),
+            ("unmarked-diverged-then-match", true, 2, 0, 1),
+            ("rejected-guest-skid", false, 1, 0, 0),
+            ("crashed-operand-skid", false, 1, 0, 0),
+            ("skid-wrong-stdout", false, 1, 0, 0),
         ] {
             let fixture = std::env::temp_dir().join(format!(
                 "hermit-harness-skid-retry-{}-{:?}-{scenario}",
@@ -4533,13 +4650,14 @@ plan={'skid-then-match':['skid','matched'],'skid-then-match-sabre':['skid','matc
  'skid-twice':['skid','skid'],
  'skid-no-retry':['skid'],'unmarked-skid':['unmarked'],'diverged-marked':['diverged','diverged'],
  'diverged-then-skid':['diverged','skid'],'rejected-guest-skid':['rejected'],
- 'crashed-operand-skid':['crashed'],'skid-wrong-stdout':['skid','matched']}
+ 'crashed-operand-skid':['crashed'],'skid-wrong-stdout':['skid','matched'],
+ 'unmarked-diverged-then-match':['unmarked-diverged','matched']}
 kind=plan[(root/'scenario').read_text()][n]
 report=pathlib.Path(a[a.index('--verify-json')+1])
 logdir=pathlib.Path(a[a.index('--verify-log-dir')+1])
 logdir.mkdir(parents=True,exist_ok=True)
 (logdir/'run1_log_fixture.log').write_text('INFO detcore: shared\nINFO detcore: complete\n')
-report.write_bytes((root/(('skid' if kind=='unmarked' else kind)+'.json')).read_bytes())
+report.write_bytes((root/({'unmarked':'skid','unmarked-diverged':'diverged'}.get(kind,kind)+'.json')).read_bytes())
 evidence=os.environ.get('HERMIT_SABRE_PATH_EVIDENCE')
 if evidence:
  line='{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}\n'
@@ -4547,7 +4665,7 @@ if evidence:
 if kind in ('skid','diverged','rejected','crashed'):
  sys.stderr.write('HERMIT_SKID_OVERSHOOT rcb_actual=39951476 rcb_target=39950647 skid_margin=1000 overshoot=829\n'
   'HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=2\n')
-sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'diverged':1}[kind])
+sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'diverged':1,'unmarked-diverged':1}[kind])
 "#,
             )
             .unwrap();
@@ -4602,6 +4720,20 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
             assert!(
                 stdout.contains(&format!("; SKID-RETRY count {skid_retries}\n")),
                 "{scenario}: the summary line must carry the SKID-RETRY count: {stdout}"
+            );
+            // Every retry is counted, not only a SKID-RETRY.
+            assert_eq!(
+                summary["product_retries"],
+                json!(product_retries),
+                "{scenario}"
+            );
+            assert_eq!(summary["host_input_retries"], json!(0), "{scenario}");
+            assert!(
+                stdout.contains(&format!(
+                    "test-harness: PRODUCT-RETRY count {product_retries} ({} final PASS); HOST-INPUT-RETRY count 0\n",
+                    usize::from(scenario == "unmarked-diverged-then-match")
+                )),
+                "{scenario}: the summary must carry the PRODUCT-RETRY count: {stdout}"
             );
             let first = &rows[0];
             match scenario {
@@ -4882,6 +5014,25 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                         stdout.contains("[attempt 1 of at most 2; retrying this cell only]"),
                         "{stdout}"
                     );
+                    // Counted and located, though the overshoot marker it
+                    // also carries is not what retried it.
+                    assert_eq!(
+                        summary["product_retry_cells"],
+                        json!([{
+                            "test": "parity/skid", "mode": "verify", "backend": "ptrace",
+                            "attempt": 1, "outcome": "FAIL", "result": "determinism-failure",
+                            "first_divergent_scheduler_turn": 4,
+                            "first_divergent_record": 9, "first_divergent_syscall": 2,
+                            "final_outcome": "FAIL",
+                        }]),
+                        "{scenario}"
+                    );
+                    assert!(
+                        stdout.contains(
+                            "test-harness: PRODUCT-RETRY parity/skid (verify/ptrace): attempt 1 was FAIL (determinism-failure turn=4 rec=9 sys=2) and was retried; final outcome FAIL\n"
+                        ),
+                        "{stdout}"
+                    );
                 }
                 "skid-wrong-stdout" => {
                     // A typed, marked overshoot whose compared runs both
@@ -4950,6 +5101,31 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                         "the relabelled row differs from a qualifying one only in its declaration"
                     );
                     assert!(!stdout.contains("retrying this cell only"), "{stdout}");
+                }
+                "unmarked-diverged-then-match" => {
+                    // A divergence with no overshoot marker, then a match: the
+                    // framework retry selects PASS, and the count says so.
+                    assert_eq!(first.outcome, "FAIL", "{scenario}");
+                    assert_eq!(rows[1].outcome, "PASS", "{scenario}");
+                    assert_eq!(summary["passed"], json!(1), "{scenario}");
+                    assert_eq!(
+                        summary["product_retry_cells"],
+                        json!([{
+                            "test": "parity/skid", "mode": "verify", "backend": "ptrace",
+                            "attempt": 1, "outcome": "FAIL", "result": "determinism-failure",
+                            "first_divergent_scheduler_turn": 4,
+                            "first_divergent_record": 9, "first_divergent_syscall": 2,
+                            "final_outcome": "PASS",
+                        }]),
+                        "{scenario}"
+                    );
+                    assert!(
+                        stdout.contains(
+                            "test-harness: PRODUCT-RETRY parity/skid (verify/ptrace): attempt 1 was FAIL (determinism-failure turn=4 rec=9 sys=2) and was retried; final outcome PASS\n"
+                        ),
+                        "{stdout}"
+                    );
+                    assert!(!stdout.contains("SKID-RETRY:"), "{scenario}: {stdout}");
                 }
                 _ => {}
             }

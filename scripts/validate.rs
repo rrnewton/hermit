@@ -8233,6 +8233,25 @@ fn add_raw_census(
         }
     }
 }
+/// Every cell the harness ran more than once, from the bytes the raw census
+/// just bound (https://github.com/rrnewton/hermit/issues/1845). Like the
+/// census, it revises no verdict; without a census there is nothing to bind it
+/// to, and the row carries neither field.
+fn add_framework_retries(
+    record: &mut serde_json::Value,
+    retries: Option<Result<hermit_manifest_plan::ledger::FrameworkRetriesV1, String>>,
+) {
+    match retries.map(|retries| {
+        retries.and_then(|retries| serde_json::to_value(retries).map_err(|error| error.to_string()))
+    }) {
+        None => {}
+        Some(Ok(retries)) => record["framework_retries_v1"] = retries,
+        Some(Err(error)) => {
+            eprintln!("validate: framework retry summary unavailable: {error}");
+            record["framework_retries_error"] = error.into();
+        }
+    }
+}
 #[cfg(test)]
 mod concurrent_validate_path_tests {
     use std::io::Write;
@@ -24100,7 +24119,7 @@ fn write_ledger_with_snapshot(
         );
         return None;
     }
-    let census = match raw_inputs {
+    let (census, retries) = match raw_inputs {
         Some((snapshot, authority)) => {
             let result = authority
                 .as_mut()
@@ -24113,11 +24132,16 @@ fn write_ledger_with_snapshot(
             if let Err(error) = &result {
                 *authority = Err(error.clone());
             }
-            result
+            let retries = result.is_ok().then(|| snapshot.framework_retries());
+            (result, retries)
         }
-        None => Err("raw publisher authority was not admitted for this invocation".into()),
+        None => (
+            Err("raw publisher authority was not admitted for this invocation".into()),
+            None,
+        ),
     };
     add_raw_census(&mut record, census);
+    add_framework_retries(&mut record, retries);
     let line = format!("{}\n", serde_json::to_string(&record).unwrap());
     let explicit = std::env::var(LEDGER_ENV)
         .ok()
@@ -32961,6 +32985,12 @@ raise SystemExit(0 if result.wasSuccessful() else 1)
                 .unwrap()
                 .verify_inputs(&typed, &BTreeMap::new())
                 .unwrap();
+            // The retry summary is published from the same census-bound bytes.
+            assert_eq!(
+                row["framework_retries_v1"],
+                serde_json::json!({"schema": 1, "retried_cells": 0,
+                    "retried_cells_final_pass": 0, "cells": []})
+            );
             let reopened: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
             assert_eq!(
@@ -32982,6 +33012,9 @@ raise SystemExit(0 if result.wasSuccessful() else 1)
             assert_eq!(custom["cell_results"], row["cell_results"]);
             assert_eq!(custom["test_results"], row["test_results"]);
             assert!(custom.get("raw_result_input_census_v1").is_none());
+            // Without a census there are no bound bytes to summarize.
+            assert!(custom.get("framework_retries_v1").is_none());
+            assert!(custom.get("framework_retries_error").is_none());
             assert!(
                 custom["raw_result_input_census_error"]
                     .as_str()
@@ -33503,6 +33536,32 @@ mod raw_census_publication_tests {
                 .remove("raw_result_input_census_v1");
             assert_eq!(row, original);
         }
+    }
+
+    #[test]
+    fn framework_retries_are_added_beside_the_census_and_change_no_verdict() {
+        let original = serde_json::json!({"schema_version":10,"result":"pass",
+            "raw_result":"pass","executed_tests":1,"passed_tests":1});
+        let mut row = original.clone();
+        add_framework_retries(&mut row, None);
+        assert_eq!(row, original);
+        let rows = [
+            r#"{"lane":"portable","category":"fixture","test":"fixture/rescued","mode":"verify","backend":"ptrace","attempt":1,"outcome":"FAIL","failure_class":"product_failure"}"#,
+            r#"{"lane":"portable","category":"fixture","test":"fixture/rescued","mode":"verify","backend":"ptrace","attempt":2,"outcome":"PASS"}"#,
+        ]
+        .join("\n");
+        let retries = hermit_manifest_plan::ledger::FrameworkRetriesV1::from_inputs(
+            &BTreeMap::from([("one/results.jsonl".to_string(), rows.into_bytes())]),
+        );
+        add_framework_retries(&mut row, Some(retries));
+        assert_eq!(row["framework_retries_v1"]["retried_cells"], 1);
+        assert_eq!(row["framework_retries_v1"]["retried_cells_final_pass"], 1);
+        assert_eq!(row["result"], "pass");
+        row.as_object_mut().unwrap().remove("framework_retries_v1");
+        assert_eq!(row, original);
+        add_framework_retries(&mut row, Some(Err("unreadable".into())));
+        assert_eq!(row["framework_retries_error"], "unreadable");
+        assert!(row.get("framework_retries_v1").is_none());
     }
 }
 

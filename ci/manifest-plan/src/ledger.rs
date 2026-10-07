@@ -24,6 +24,9 @@ pub use schema10::*;
 mod admission;
 pub use admission::*;
 
+mod framework_retries;
+pub use framework_retries::*;
+
 /// The stable fields emitted by `validate/aggregate.py --json` and JSONL stores.
 /// Optional fields reflect honest reconstructed rows where a measurement was not
 /// available; unrecognized fields are retained for forward compatibility.

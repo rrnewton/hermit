@@ -809,7 +809,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // detcore-dbt's tests::only_a_linux_error_from_a_handler_reaches_the_guest and
     // tests::a_failed_thread_start_ends_the_run_instead_of_failing_the_syscall
     // retain all 984: 986.
-    ("test.regular_crates", 986),
+    // ledger::framework_retries::tests::every_retried_cell_is_counted_with_its_first_attempt_and_selected_outcome
+    // and ledger::framework_retries::tests::an_unreadable_history_refuses_rather_than_undercounting
+    // (https://github.com/rrnewton/hermit/issues/1845) retain all 986: 988.
+    ("test.regular_crates", 988),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1863,7 +1866,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The ineligible-execution-path series test listed there retains all 982: 983.
     // The hosted script unit-test twin test listed there retains all 983: 984.
     // The two detcore-dbt handler-error tests listed there retain all 984: 986.
-    ("test.regular_crates_on_host", 986),
+    // The two framework-retry ledger tests listed there retain all 986: 988.
+    ("test.regular_crates_on_host", 988),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
