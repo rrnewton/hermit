@@ -2581,11 +2581,15 @@ mod tests {
         assert_eq!(compared, 3);
         assert_eq!(fs::read(&path).unwrap(), published.concat());
 
-        // A child's initialization record is published where the stream holds
-        // it, among its parent's records, and is neither dropped nor moved. Two
-        // streams with the same guest records and the same initialization
-        // count, differing only in where an initialization record sits, publish
-        // different logs; the typed count alone could not tell them apart.
+        // Materialization publishes an initialization record where the decoded
+        // stream holds it, neither dropped nor moved. This stream is built by
+        // hand: the Reverie collector would place the second initialization
+        // record immediately before "child record 1", but the artifact carries
+        // no image identity, so the decoder cannot enforce that placement and
+        // accepts this layout too. Two streams with the same guest records and
+        // the same initialization count, differing only in where an
+        // initialization record sits, publish different logs; the typed count
+        // alone could not tell them apart.
         let parent_first: &[u8] = b"1970-01-01T00:00:00.000000Z INFO detcore: parent record 1\n";
         let parent_second: &[u8] = b"1970-01-01T00:00:00.000000Z INFO detcore: parent record 2\n";
         let child: &[u8] = b"1970-01-01T00:00:00.000000Z INFO detcore: child record 1\n";
