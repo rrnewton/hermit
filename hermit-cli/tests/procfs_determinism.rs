@@ -2087,9 +2087,10 @@ fn logged_seccomp_answer(log: &str) -> bool {
 // The launcher asks whether a seccomp filter Hermit inherits may refuse a call
 // Detcore injects to choose how getdents numbers a directory's entries
 // (`fstatfs`, and on an overlay `mmap`, `statx` and `munmap`). Where one may,
-// Detcore numbers every entry from its own lstat and injects none of those
-// calls (`seccomp_may_refuse_entry_lookup_syscalls`). The numbers a guest
-// lists must not depend on which way was chosen. This lists one directory
+// Detcore numbers every entry from its own lstat and makes none of those
+// choosing calls (`seccomp_may_refuse_entry_lookup_syscalls`); it still maps
+// and unmaps the buffer each directory snapshot is read into. The numbers a
+// guest lists must not depend on which way was chosen. This lists one directory
 // three times: with no filter; under a filter that refuses only swapon, where
 // the launcher's child finds the lookup calls allowed; and under a filter that
 // fails statx with EPERM, as an allowlist profile does for a call it does not

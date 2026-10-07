@@ -169,7 +169,8 @@ pub struct Config {
     /// container cloned from it, and only while that thread's `Seccomp:` mode and
     /// `Seccomp_filters:` count are unchanged; otherwise the flag is true. Made under every
     /// filter whatever this holds: the `lstat` of each entry asked, the `fstat` of a directory
-    /// Detcore does not track, and the `statx` and `statmount` with which a `/proc/<pid>/maps`
+    /// Detcore does not track, the `mmap` and `munmap` of the private mapping a directory
+    /// snapshot is read into, and the `statx` and `statmount` with which a `/proc/<pid>/maps`
     /// rewrite proves a superblock.
     #[serde(default)]
     #[clap(skip)]

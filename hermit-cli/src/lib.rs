@@ -4263,8 +4263,11 @@ fn wait_for_probe_child(
         "hermit: warning: the seccomp probe child did not exit within {} ms and was killed. \
          A seccomp filter of this thread ({filters}), which every guest it starts inherits, \
          kept one of the child's system calls waiting, as a SECCOMP_RET_USER_NOTIF filter \
-         does when its supervisor does not answer; Detcore will not inject fstatfs, mmap, \
-         statx or munmap while it lists a directory in this run.\n",
+         does when its supervisor does not answer. Detcore will key each directory this run \
+         lists as its Every policy does: it will not inject fstatfs, or the mmap, statx and \
+         munmap of the overlay mount-root question, but it still injects the mmap, lseek, \
+         getdents and munmap that read a directory snapshot, an fstatat per entry, and an \
+         fstat of a directory it does not track.\n",
         bound.as_millis()
     ));
     None

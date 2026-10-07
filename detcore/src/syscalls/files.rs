@@ -8420,11 +8420,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// question keys that listing as `Every` keys it (see
     /// [`Self::settle_overlay_entry_lookup`]). The backend's own filter, such
     /// as the ptrace backend's, lets Detcore's injections through. The
-    /// `fstatat` of each asked entry and the
+    /// `fstatat` of each asked entry, the
     /// `fstat` of a directory Detcore does not track (see
-    /// [`Self::directory_device`]) are injected regardless, and a filter that
-    /// traps or kills those still signals or kills the guest; Detcore injects
-    /// both numbers for other guest calls too.
+    /// [`Self::directory_device`]), and the `mmap` and `munmap` of the private
+    /// mapping a directory snapshot is read into (see
+    /// [`Self::snapshot_directory_privately`]) are injected regardless, and a
+    /// filter that traps or kills those still signals or kills the guest;
+    /// Detcore injects all four numbers for other guest calls too.
     ///
     /// The getdents handlers call this before the real call, after
     /// [`Self::directory_device`].
