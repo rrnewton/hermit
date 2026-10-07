@@ -4624,13 +4624,39 @@ mod tests {
                 .status
                 .success()
         );
-        fs::write(product.join("seed"), "seed\n").expect("seed file");
-        assert!(git_in(&product, &["add", "seed"]).unwrap().status.success());
+        // No automatic maintenance in the fixture. `git commit` starts
+        // `git maintenance run --auto --detach` in the background, and on Git
+        // 2.55 that runs `git worktree prune`, which deletes a worktree's
+        // administrative directory as soon as it lacks its `gitdir` file --
+        // as the `git worktree add` below leaves it for a moment. A
+        // GitHub-hosted run (Git 2.55, no `gc.auto=0` in /etc/gitconfig)
+        // failed that way: "could not open '.git/worktrees/linked/locked'
+        // for writing: No such file or directory"
+        // (https://github.com/rrnewton/hermit/actions/runs/37677024126).
         assert!(
-            git_in(&product, &["commit", "-qm", "seed"])
+            git_in(&product, &["config", "maintenance.auto", "false"])
                 .unwrap()
                 .status
                 .success()
+        );
+        fs::write(product.join("seed"), "seed\n").expect("seed file");
+        assert!(git_in(&product, &["add", "seed"]).unwrap().status.success());
+        let trace = base.join("commit.trace");
+        let committed = under_git_env(|| {
+            isolated_git_command()?
+                .arg("-C")
+                .arg(&product)
+                .args(["commit", "-qm", "seed"])
+                .env("GIT_TRACE", &trace)
+                .output()
+                .map_err(|error| format!("could not run git commit: {error}"))
+        })
+        .expect("run git commit");
+        assert!(committed.status.success(), "commit the seed");
+        let traced = fs::read_to_string(&trace).expect("read the commit trace");
+        assert!(
+            !traced.contains("maintenance run"),
+            "the fixture's commit started background maintenance:\n{traced}"
         );
 
         let linked = base.join("linked");
