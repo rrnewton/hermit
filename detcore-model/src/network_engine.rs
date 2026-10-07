@@ -53,10 +53,73 @@ use crate::network_trace::NetworkTraceValidationError;
 use crate::network_trace::NetworkTransportV1;
 use crate::time::LogicalTime;
 
+/// Serde for the guest bytes that network requests and replies carry, as one
+/// byte string rather than serde's default for `Vec<u8>`, a sequence of
+/// separately serialized `u8` elements.
+///
+/// Requests cross a serializer on their way to the global state: the RPC
+/// transport of a backend whose tool runs in the guest process, and, in a build
+/// with debug assertions (the `dev` and `validate` profiles), reverie-ptrace's
+/// round trip of every request through bincode. A blocking send that waits for
+/// buffer space passes its whole unsent remainder on every wait, so the
+/// per-element cost of a sequence is paid again on every wait: a 252 KB
+/// remainder took about 21 ms per bincode round trip in a `dev` build, against
+/// 0.02 ms as a byte string, and the replay of a send that had waited a few
+/// thousand times outran its test's wall bound. Bincode writes both forms
+/// identically, a length and then the raw bytes, so the encoding does not
+/// change; decoding still accepts a sequence, which is how self-describing
+/// formats such as JSON write bytes.
+mod guest_bytes {
+    use std::fmt;
+
+    use serde::Deserializer;
+    use serde::Serializer;
+    use serde::de::Error;
+    use serde::de::SeqAccess;
+    use serde::de::Visitor;
+
+    pub(super) fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(bytes)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<u8>, D::Error> {
+        deserializer.deserialize_byte_buf(GuestBytes)
+    }
+
+    struct GuestBytes;
+
+    impl<'de> Visitor<'de> for GuestBytes {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("guest bytes")
+        }
+
+        fn visit_bytes<E: Error>(self, bytes: &[u8]) -> Result<Vec<u8>, E> {
+            Ok(bytes.to_vec())
+        }
+
+        fn visit_byte_buf<E: Error>(self, bytes: Vec<u8>) -> Result<Vec<u8>, E> {
+            Ok(bytes)
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Vec<u8>, A::Error> {
+            // Never trust a length hint for an allocation.
+            let mut bytes = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(1 << 16));
+            while let Some(byte) = sequence.next_element()? {
+                bytes.push(byte);
+            }
+            Ok(bytes)
+        }
+    }
+}
+
 /// Something the recorder pulled from a host socket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NetworkArrival {
-    Bytes(Vec<u8>),
+    Bytes(#[serde(with = "guest_bytes")] Vec<u8>),
     /// The peer shut down its write side (the host `recv` returned 0).
     PeerWriteClosed,
     /// The host socket reported this positive errno.
@@ -66,7 +129,7 @@ pub enum NetworkArrival {
 /// What a guest receive observes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NetworkRecvOutcome {
-    Data(Vec<u8>),
+    Data(#[serde(with = "guest_bytes")] Vec<u8>),
     /// End of stream: `recv` returns 0.
     Eof,
     /// A pending socket error, consumed by this receive.
@@ -327,6 +390,7 @@ pub enum NetworkRequest {
     /// See [`NetworkEngine::record_send`].
     RecordSend {
         id: OpenFileId,
+        #[serde(with = "guest_bytes")]
         bytes: Vec<u8>,
         at: Option<SendMark>,
         waits: u64,
@@ -336,6 +400,7 @@ pub enum NetworkRequest {
     /// See [`NetworkEngine::replay_send`].
     ReplaySend {
         id: OpenFileId,
+        #[serde(with = "guest_bytes")]
         bytes: Vec<u8>,
         nonblocking: bool,
         waits: u64,
@@ -1146,6 +1211,38 @@ mod tests {
         SendMark { offset, events }
     }
 
+    /// Round-trips `request` through bincode in `config`, and checks that its
+    /// guest `bytes` are written exactly as a plain `Vec<u8>` would be: their
+    /// length, then the raw bytes.
+    fn assert_bincode_round_trip<C: bincode::config::Config>(
+        request: &NetworkRequest,
+        bytes: &[u8],
+        config: C,
+    ) {
+        let encoded = bincode::serde::encode_to_vec(request, config).unwrap();
+        let (decoded, read): (NetworkRequest, usize) =
+            bincode::serde::decode_from_slice(&encoded, config).unwrap();
+        assert_eq!((&decoded, read), (request, encoded.len()));
+        let plain = bincode::serde::encode_to_vec(bytes.to_vec(), config).unwrap();
+        assert!(
+            encoded.windows(plain.len()).any(|window| window == plain),
+            "{request:?} does not carry its bytes as bincode writes a Vec<u8>"
+        );
+    }
+
+    /// Round-trips `request` through the encodings requests cross on their way
+    /// to the global state: bincode, legacy (reverie-ptrace's debug round trip)
+    /// and standard, and JSON, which writes guest bytes as a sequence.
+    fn assert_survives_rpc_encodings(request: &NetworkRequest, bytes: &[u8]) {
+        assert_bincode_round_trip(request, bytes, bincode::config::legacy());
+        assert_bincode_round_trip(request, bytes, bincode::config::standard());
+        let json = serde_json::to_string(request).unwrap();
+        assert_eq!(
+            &serde_json::from_str::<NetworkRequest>(&json).unwrap(),
+            request
+        );
+    }
+
     fn peer() -> NetworkAddressV1 {
         NetworkAddressV1::Inet4 {
             address: [127, 0, 0, 1],
@@ -1708,6 +1805,12 @@ mod tests {
             engine.apply(at(7), replay(b"b", 2)),
             Ok(NetworkReply::Sent(1))
         );
+
+        // Both kinds of request reach the global state through a serializer
+        // with their guest bytes intact.
+        let every_byte: Vec<u8> = (0..=u8::MAX).collect();
+        assert_survives_rpc_encodings(&send(&every_byte, 2), &every_byte);
+        assert_survives_rpc_encodings(&replay(&every_byte, 2), &every_byte);
     }
 
     #[test]
