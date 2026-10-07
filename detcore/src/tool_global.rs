@@ -10577,6 +10577,63 @@ mod tests {
         );
     }
 
+    /// A pathname is guest-chosen bytes, so the guest decides whether its own
+    /// maps is UTF-8. `sanitize_maps` passes a non-UTF-8 snapshot through
+    /// unchanged, but the snapshot must still send one numbering request per
+    /// backed line, in text order, repeats included: the pool consumes a
+    /// number per request, so sending none would let the encoding of one
+    /// pathname shift every number the run hands out afterwards. Each raw
+    /// device is requested on its first sighting, in text order. Nothing is
+    /// resolved, because no line of this snapshot is ever looked up.
+    #[test]
+    fn a_non_utf8_maps_snapshot_still_consumes_one_number_per_backed_line() {
+        use crate::types::RawInode;
+
+        let raw: &[u8] = b"10000000-10001000 r-xp 00000000 00:01 900                        /a.so\n\
+                           20000000-20001000 r-xp 00000000 00:2a 901                        /tmp/\xff\n\
+                           28000000-28001000 rw-p 00000000 00:00 0                          [heap]\n\
+                           30000000-30001000 r-xp 00000000 00:01 900                        /a.so\n";
+        let dev_01 = libc::makedev(0, 0x01);
+        let dev_2a = libc::makedev(0, 0x2a);
+        let mut minter = PoolMinter::new(Default::default());
+        let table = futures::executor::block_on(crate::procfs::mint_mapping_identities(
+            raw,
+            &std::collections::BTreeMap::new(),
+            &mut minter,
+        ))
+        .unwrap();
+        assert_eq!(
+            crate::procfs::sanitize_maps(raw, &table),
+            raw,
+            "a non-UTF-8 snapshot is passed through unchanged"
+        );
+        assert_eq!(
+            minter.calls,
+            [
+                MintCall::Inodes(vec![
+                    RawInode::new(dev_01, 900),
+                    RawInode::new(dev_2a, 901),
+                    RawInode::new(dev_01, 900),
+                ]),
+                MintCall::Device(dev_01),
+                MintCall::Device(dev_2a),
+            ]
+        );
+        let t = LogicalTime::from_nanos(0);
+        assert_eq!(
+            minter
+                .inodes
+                .add_inode(
+                    RawInode::new(dev_01, 902),
+                    super::ObservedMtime::Unobserved,
+                    t
+                )
+                .0,
+            crate::types::DetInode::mint(crate::consts::DET_INODE_OFFSET.as_raw() + 3),
+            "the next newly seen file gets the number after the snapshot's three requests"
+        );
+    }
+
     /// The stdio override is looked up by the identity `stat` reports for the
     /// mapped file, which is how the stdio map is keyed (from each stdio
     /// descriptor's cached `stat`). On btrfs the header's device is the

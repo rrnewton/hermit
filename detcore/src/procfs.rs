@@ -3517,11 +3517,19 @@ pub(crate) trait MappingIdentityMinter {
 /// native Linux as well, while the inode numbers agree. The device pool
 /// numbers first sightings only, so asking once per header consumes nothing
 /// a repeated request would not.
+///
+/// A snapshot that is not UTF-8 renders nothing (see
+/// [`request_numbers_for_unrendered_mappings`]) but still sends those
+/// requests.
 pub(crate) async fn mint_mapping_identities<M: MappingIdentityMinter>(
     contents: &[u8],
     stdio_by_raw_file: &BTreeMap<RawInode, DetInode>,
     minter: &mut M,
 ) -> Result<MappingIdentities, M::Error> {
+    if std::str::from_utf8(contents).is_err() {
+        request_numbers_for_unrendered_mappings(contents, minter).await;
+        return Ok(MappingIdentities::new());
+    }
     let lines = mapping_lines_in_text_order(contents);
     // Each line's own record, in text order.
     let records: Vec<Option<RawInode>> = lines
@@ -3589,6 +3597,44 @@ pub(crate) async fn mint_mapping_identities<M: MappingIdentityMinter>(
         identities.insert(line.clone(), (det_dev, det_inode.as_raw()));
     }
     Ok(identities)
+}
+
+/// The numbering requests of a snapshot that is not UTF-8.
+///
+/// A pathname is guest-chosen bytes, so the guest decides whether its own
+/// `maps` is UTF-8. `sanitize_maps`/`sanitize_smaps` pass such a snapshot
+/// through unchanged, so no identity minted here is rendered -- but the pools
+/// number files in request order and every request consumes a number, so
+/// sending none would let the encoding of one pathname decide which numbers
+/// every later file gets. This sends what the pool saw before per-line
+/// resolution existed: one request per backed header, in text order, repeats
+/// and stdio-backed lines included, then each raw device on its first
+/// sighting. Each entry is keyed on the header's own pair, unresolved,
+/// because nothing from this snapshot is looked up again.
+async fn request_numbers_for_unrendered_mappings<M: MappingIdentityMinter>(
+    contents: &[u8],
+    minter: &mut M,
+) {
+    let headers: Vec<(u64, u64)> = String::from_utf8_lossy(contents)
+        .lines()
+        .filter_map(mapping_header_identity)
+        .collect();
+    // One batch even when empty, as the UTF-8 path sends.
+    minter
+        .inodes(
+            headers
+                .iter()
+                .map(|&(device, inode)| RawInode::new(device, inode))
+                .collect(),
+        )
+        .await;
+    // Lookup only: the devices are requested in text order.
+    let mut requested_devices = std::collections::HashSet::new();
+    for &(device, _) in &headers {
+        if requested_devices.insert(device) {
+            minter.device(device).await;
+        }
+    }
 }
 
 /// Paths under which the guest can `stat` the file a mapping names, most
