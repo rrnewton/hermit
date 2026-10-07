@@ -1140,8 +1140,24 @@ fi
 # b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9. Client preparation still rebuilds
 # the on-demand client from the new client.c. Carry, not recalibration: no new
 # timing sample or >=5-sample replacement claim is made.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 31acc5e3f344aff55ca011abf5c7cd1553e33855 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 31acc5e3f344aff55ca011abf5c7cd1553e33855 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 015d9c00e7e83890246db68a11cfbb2317fe02ee (2026-10-07): from
+# 31acc5e3f344aff55ca011abf5c7cd1553e33855. The one commit changes reverie-dbt only in src/launcher.rs: an
+# output reader stopped after a failed run first reads what is already in its
+# pipe, bounded to 1 MiB, and its tests no longer sleep. The reverie-dbt tree
+# moves f5e3bad9517ec8b41b8c2c0827b814d676d7df57 -> cc882d339affba476229fe5ff209d888d8fa0a38.
+# No changed file is an input to the DynamoRIO SDK recipe key above. Compared by
+# git object id at both pins: reverie-dbt/Cargo.toml is blob
+# 0e24d047d544a3daae2d6350270b26ceb74139d1, build.rs is blob
+# e05db6238bf07c96d8a850c5635a8c48590f20b7, native/CMakeLists.txt is blob
+# bcfb298a4f87ed190d7fdc52393e01d1245a8fe3, vendor/dynamorio is tree
+# 117d54d744df23921c531d0fe08537249f5a510a, third-party is tree
+# fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a, the root Cargo.toml is blob
+# 395eddb164895c7c59ff7db11d0a6105d0c69d30 and rust-toolchain.toml is blob
+# b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9. The native client is unchanged.
+# Carry, not recalibration: no new timing sample or >=5-sample replacement
+# claim is made.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 015d9c00e7e83890246db68a11cfbb2317fe02ee ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 015d9c00e7e83890246db68a11cfbb2317fe02ee (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
