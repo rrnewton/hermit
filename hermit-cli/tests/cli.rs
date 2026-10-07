@@ -14539,8 +14539,11 @@ fn run_timeout_refuses_backends_where_it_cannot_bound_the_run() {
 /// `set_timer` with `ENOSYS`, which Detcore treats as fatal. A run with the default maximum
 /// timeslice must be REFUSED before dispatch, not fail inside the guest. The
 /// refusal comes from argument validation, so it holds in builds without the
-/// `liteinst` feature or runtime too.
+/// LiteInst runtime too. A build without the `liteinst` feature refuses the
+/// backend itself instead, which
+/// `run_liteinst_without_the_feature_refuses_and_names_the_flag` covers.
 #[test]
+#[cfg(feature = "liteinst")]
 fn liteinst_in_guest_refuses_a_maximum_timeslice_before_dispatch() {
     let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -14583,7 +14586,9 @@ fn liteinst_in_guest_refuses_a_maximum_timeslice_before_dispatch() {
 /// snapshots stdin. The snapshot reads stdin to its end, so a refusal checked
 /// after it would wait for input that may never come instead of exiting. Stdin
 /// here is a pipe that the test holds open and never writes to; the run is
-/// refused for its maximum timeslice.
+/// refused for its maximum timeslice. A build without the `liteinst` feature
+/// refuses the backend itself instead, and that refusal must not wait for input
+/// either.
 #[test]
 fn liteinst_in_guest_refuses_verify_without_reading_stdin() {
     use std::io::Read;
@@ -14638,19 +14643,28 @@ fn liteinst_in_guest_refuses_verify_without_reading_stdin() {
         .read_to_string(&mut stderr)
         .expect("cannot read hermit's stderr");
 
+    #[cfg(feature = "liteinst")]
+    let (exit, class, reason) = (
+        HERMIT_POLICY_REFUSAL_EXIT,
+        "HERMIT_POLICY_REFUSAL class=policy-refusal",
+        "pass --max-timeslice=disabled",
+    );
+    #[cfg(not(feature = "liteinst"))]
+    let (exit, class, reason) = (
+        HERMIT_INTERNAL_FAILURE_EXIT,
+        "HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=liteinst",
+        "compiled without the liteinst backend",
+    );
     // EXIT-CLASS: hermit
     assert_eq!(
         status.code(),
-        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        Some(exit),
         "status {status:?}, stderr:\n{stderr}"
     );
+    assert!(stderr.contains(class), "stderr:\n{stderr}");
     assert!(
-        stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
-        "stderr:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("pass --max-timeslice=disabled"),
-        "the refusal must name the timeslice. stderr:\n{stderr}"
+        stderr.contains(reason),
+        "the refusal must give its reason. stderr:\n{stderr}"
     );
     assert!(!stdout.contains("unreachable"), "the guest must not run");
 }
