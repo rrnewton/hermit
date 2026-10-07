@@ -8060,16 +8060,45 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Asking every entry is never less faithful than asking fewer: an entry
     /// whose `lstat` does not report its `d_ino` is keyed on the directory's
     /// device either way. So when the `fstatfs` fails or cannot be asked (an
-    /// unwritable stack scratch, `ENOSYS` under a seccomp policy), every
-    /// entry is asked, as before the type was consulted, and nothing is
-    /// cached; the failure never becomes the getdents' result. The getdents
-    /// handlers call this before the real call, after
+    /// unwritable stack scratch, for example), every entry is asked, as
+    /// before the type was consulted, and nothing is cached; the failure
+    /// never becomes the getdents' result.
+    ///
+    /// The `fstatfs` is a syscall the guest never made, run in the guest's
+    /// thread under every seccomp filter the guest runs under, and a filter's
+    /// verdict on it is not always an errno Detcore can fall back from:
+    ///
+    /// - `SECCOMP_RET_ERRNO` fails the call, and every entry is asked, as
+    ///   above.
+    /// - `SECCOMP_RET_TRAP` skips the call and sends the thread a `SIGSYS`;
+    ///   the ptrace backend reports `ENOSYS` and requeues the signal to the
+    ///   guest, which by default dies of it.
+    /// - `SECCOMP_RET_KILL_THREAD` and `SECCOMP_RET_KILL_PROCESS` kill before
+    ///   Detcore sees any result.
+    ///
+    /// The last two would make a listing signal or kill a program that runs
+    /// natively, so the `fstatfs` is injected only where no such filter can
+    /// apply: Detcore refuses a guest's own filter, and the launcher sets
+    /// [`crate::Config::seccomp_filter_inherited`] whenever the process that starts
+    /// the guest runs under one (or cannot tell), since a filter is inherited
+    /// by every guest. Then every entry is asked, no `fstatfs` is injected,
+    /// and nothing is cached. The backend's own filter, such as the ptrace
+    /// backend's, lets Detcore's injections through. The `fstatat` of each
+    /// asked entry and the `fstat` of a directory Detcore does not track
+    /// (see [`Self::directory_device`]) are injected regardless, and a filter
+    /// that traps or kills those still signals or kills the guest; Detcore
+    /// injects both numbers for other guest calls too.
+    ///
+    /// The getdents handlers call this before the real call, after
     /// [`Self::directory_device`].
     async fn directory_entry_lookup<G: Guest<Self>>(
         &self,
         guest: &mut G,
         fd: RawFd,
     ) -> EntryLookup {
+        if guest.config().seccomp_filter_inherited {
+            return EntryLookup::Every;
+        }
         let cached = guest
             .thread_state()
             .with_detfd(fd, |detfd| detfd.directory_entry_lookup());
@@ -10376,6 +10405,12 @@ pub(crate) mod inject_fstat_scratch {
         /// (descriptor, whether a stack guard was live) of each injected
         /// fstatfs.
         fstatfs_calls: Vec<(RawFd, bool)>,
+        /// Whether a seccomp filter traps every injected fstatfs. The ptrace
+        /// backend then reports `ENOSYS` and requeues the `SIGSYS` to the
+        /// guest; this guest counts the signal in `sigsys_queued`.
+        fstatfs_traps: bool,
+        /// How many `SIGSYS` a trapped injection queued for the guest.
+        sigsys_queued: usize,
         /// (name, inode): an injected getdents64 reports `inode` as the
         /// `d_ino` of the entry `name`, for an inode number the test cannot
         /// give a file, such as a btrfs subvolume's.
@@ -10438,6 +10473,8 @@ pub(crate) mod inject_fstat_scratch {
                 touched: std::sync::Mutex::new(Vec::new()),
                 fstatfs_answer: None,
                 fstatfs_calls: Vec::new(),
+                fstatfs_traps: false,
+                sigsys_queued: 0,
                 getdents_inode_answers: Vec::new(),
             };
             (tool, guest)
@@ -10856,6 +10893,10 @@ pub(crate) mod inject_fstat_scratch {
                     let buffer = call.buf().expect("fstatfs without a buffer").as_raw();
                     self.fstatfs_calls
                         .push((call.fd(), self.guard_live.load(Ordering::SeqCst)));
+                    if self.fstatfs_traps {
+                        self.sigsys_queued += 1;
+                        return Err(Errno::ENOSYS);
+                    }
                     match self.fstatfs_answer {
                         Some(Ok(f_type)) => {
                             let mut answer: libc::statfs = unsafe { std::mem::zeroed() };
@@ -13849,9 +13890,10 @@ pub(crate) mod inject_fstat_scratch {
     }
 
     // Asking every entry is never less faithful than asking fewer, so an
-    // `fstatfs` that fails -- `ENOSYS` under a seccomp policy, or `EFAULT`
-    // from an unwritable stack scratch -- asks every entry, never fails the
-    // getdents, and is not remembered: the next getdents asks again.
+    // `fstatfs` that fails -- with the errno a seccomp filter's
+    // `SECCOMP_RET_ERRNO` gives it, or `EFAULT` from an unwritable stack
+    // scratch -- asks every entry, never fails the getdents, and is not
+    // remembered: the next getdents asks again.
     #[tokio::test]
     async fn getdents_asks_every_entry_when_the_filesystem_type_is_unknown() {
         for unwritable_scratch in [false, true] {
@@ -13904,6 +13946,73 @@ pub(crate) mod inject_fstat_scratch {
                 let expected_cache = if tracked { Ok(None) } else { Err(Errno::EBADF) };
                 assert_eq!(cached, expected_cache, "{case}: nothing is remembered");
             }
+        }
+    }
+
+    // Codex review of https://github.com/rrnewton/hermit/pull/3255, finding
+    // F2. A seccomp filter the guest inherited may trap the injected
+    // `fstatfs` (`SECCOMP_RET_TRAP`): the ptrace backend then reports
+    // `ENOSYS` and requeues the `SIGSYS`, which reaches the guest for a call
+    // it never made. With `seccomp_filter_inherited` set, which the launcher
+    // sets whenever it runs under a filter, no `fstatfs` is injected, so the
+    // guest gets no `SIGSYS`; every entry is asked and keyed exactly as when
+    // the type is unknown, and nothing is remembered. Both getdents paths,
+    // two reads each.
+    #[tokio::test]
+    async fn getdents_under_an_inherited_seccomp_filter_injects_no_fstatfs() {
+        for tracked in [false, true] {
+            let (dir, unknown_fd, _, _) = directory_with_entries();
+            let trapped_fd = std::fs::File::open(dir.path()).unwrap().into_raw_fd();
+            let mut runs = Vec::new();
+            for (fd, inherited) in [(unknown_fd, false), (trapped_fd, true)] {
+                let scratch = Pages::map(1, 1);
+                let (tool, mut guest) =
+                    ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+                guest.answers_determinize_inode = true;
+                guest.config.seccomp_filter_inherited = inherited;
+                if inherited {
+                    guest.fstatfs_traps = true;
+                } else {
+                    guest.fstatfs_answer = Some(Err(Errno::ENOSYS));
+                }
+                if tracked {
+                    tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
+                        .await
+                        .expect("precondition: Detcore tracks the directory");
+                }
+                let case = format!("tracked {tracked}, inherited filter {inherited}");
+                let asked_before = guest.fstatat_paths.len();
+                let keyed_before = guest.determinized.lock().unwrap().len();
+
+                let first = getdents64_of(&tool, &mut guest, fd).await;
+                let second = getdents64_of(&tool, &mut guest, fd).await;
+                let cached = guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.directory_entry_lookup());
+                close_unless_detcore_did(&guest, fd);
+
+                assert!(
+                    first.as_ref().is_ok_and(|len| *len > 0),
+                    "{case}: {first:?}"
+                );
+                assert!(second.as_ref().is_ok(), "{case}: {second:?}");
+                assert_eq!(
+                    entries_asked(&guest, fd, asked_before),
+                    [".", "..", "covered", "lower", "plain", "vanished"],
+                    "{case}: every entry is asked"
+                );
+                let expected_cache = if tracked { Ok(None) } else { Err(Errno::EBADF) };
+                assert_eq!(cached, expected_cache, "{case}: nothing is remembered");
+                if inherited {
+                    assert_eq!(guest.sigsys_queued, 0, "{case}: the guest gets no SIGSYS");
+                    assert_eq!(guest.fstatfs_calls, [], "{case}: no fstatfs is injected");
+                }
+                runs.push(guest.determinized.lock().unwrap()[keyed_before..].to_vec());
+            }
+            assert_eq!(
+                runs[1], runs[0],
+                "tracked {tracked}: the same keys as when the type is unknown"
+            );
         }
     }
 

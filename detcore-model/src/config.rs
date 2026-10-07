@@ -132,6 +132,20 @@ pub struct Config {
     #[clap(skip)]
     pub tool_opens_outside_guest_descriptor_table: bool,
 
+    /// Whether the guest may run under a seccomp filter it did not install: one the launcher
+    /// itself ran under (from a container runtime, supervisor or sandbox), which every process
+    /// Hermit starts inherits. Filters stack and the most restrictive action wins, so such a
+    /// filter judges every syscall Detcore makes the guest execute on its own behalf, and a
+    /// filter that traps or kills one signals or kills the guest for a call the program never
+    /// made. Detcore then avoids injected syscalls that only make it cheaper (the `fstatfs` that
+    /// picks which directory entries are `lstat`ed). False, the default, means no such filter
+    /// can exist. The launcher sets it from the `Seccomp:` line of its own `/proc/self/status`,
+    /// read before any guest exists, and sets it whenever it cannot tell; Detcore never infers
+    /// it.
+    #[serde(default)]
+    #[clap(skip)]
+    pub seccomp_filter_inherited: bool,
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1058): Review process-signal identity translation.
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1585,11 +1599,14 @@ impl Default for Config {
 /// replay`, which runs only on the ptrace backend.
 ///
 /// [`Config::anonymous_object_devices`],
-/// [`Config::exit_process_on_identity_lookup_refusal`] and
-/// [`Config::tool_opens_outside_guest_descriptor_table`] came after the bytes
-/// this form preserves, and DBT's launcher leaves each at its serde default
-/// (`None`, `false` and `false`). Each is left out while it holds that default,
-/// so a configuration that does not use it encodes to the earlier bytes, and is
+/// [`Config::exit_process_on_identity_lookup_refusal`],
+/// [`Config::tool_opens_outside_guest_descriptor_table`] and
+/// [`Config::seccomp_filter_inherited`] came after the bytes this form
+/// preserves. DBT's launcher leaves the first three at their serde defaults
+/// (`None`, `false` and `false`), and the fourth at its default, `false`,
+/// unless the launcher itself runs under a seccomp filter, which the guest
+/// then inherits. Each is left out while it holds that default, so a
+/// configuration that does not use it encodes to the earlier bytes, and is
 /// written at its usual position, exactly as `serde_json::to_string(config)`
 /// writes it, when it does not; [`from_legacy_backend_json`] reads an absent
 /// key as the default. Every other field is serialized exactly as
@@ -1942,7 +1959,9 @@ mod legacy_backend_json {
 
     /// The fields `Config` gained after the bytes the legacy form preserves,
     /// each with a test of whether a configuration holds the field's serde
-    /// default. DBT's launcher leaves each at that default.
+    /// default. DBT's launcher leaves each at that default, except
+    /// `seccomp_filter_inherited` when the launcher runs under a seccomp
+    /// filter.
     ///
     /// The encoder leaves such a field out while it holds its default, so a
     /// configuration that does not use it still encodes to the earlier bytes,
@@ -1954,7 +1973,7 @@ mod legacy_backend_json {
     /// Only this encoder may leave a field out. `Config` itself never skips
     /// one, because it also crosses positional bincode, which has no field
     /// names and would misread every field after a skipped one.
-    pub(super) const FIELDS_LEFT_OUT_AT_THEIR_DEFAULTS: [(&str, HoldsItsDefault); 3] = [
+    pub(super) const FIELDS_LEFT_OUT_AT_THEIR_DEFAULTS: [(&str, HoldsItsDefault); 4] = [
         ("anonymous_object_devices", |config| {
             config.anonymous_object_devices.is_none()
         }),
@@ -1963,6 +1982,9 @@ mod legacy_backend_json {
         }),
         ("tool_opens_outside_guest_descriptor_table", |config| {
             !config.tool_opens_outside_guest_descriptor_table
+        }),
+        ("seccomp_filter_inherited", |config| {
+            !config.seccomp_filter_inherited
         }),
     ];
 
@@ -2885,6 +2907,7 @@ mod tests {
             anonymous_object_devices: Some(AnonymousObjectDevices { pipe: 1, socket: 2 }),
             exit_process_on_identity_lookup_refusal: true,
             tool_opens_outside_guest_descriptor_table: true,
+            seccomp_filter_inherited: true,
             ..Config::default()
         };
         let all: Vec<&str> = left_out.iter().map(|(name, _)| *name).collect();
@@ -3281,6 +3304,18 @@ mod tests {
             "tool_opens_outside_guest_descriptor_table",
             Config {
                 tool_opens_outside_guest_descriptor_table: true,
+                ..Config::default()
+            },
+            "true",
+        );
+    }
+
+    #[test]
+    fn seccomp_filter_inherited_is_written_when_set_and_reads_back() {
+        assert_left_out_at_its_default_and_written_when_set(
+            "seccomp_filter_inherited",
+            Config {
+                seccomp_filter_inherited: true,
                 ..Config::default()
             },
             "true",

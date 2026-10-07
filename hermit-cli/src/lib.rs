@@ -3307,6 +3307,48 @@ mod dbt_detconfig_omit_tests {
         );
         assert_dbt_detconfig_round_trips(&config);
     }
+
+    /// With the field false, which is what a launcher outside any seccomp
+    /// filter gives DBT, the key is absent from `HERMIT_DBT_DETCONFIG`, so the
+    /// value the guest can read keeps its baseline bytes.
+    #[test]
+    fn seccomp_filter_inherited_false_is_absent_from_the_dbt_config() {
+        for (name, config) in [
+            ("default", default_config()),
+            (
+                "dbt",
+                prepare_backend_config(default_config(), Backend::Dbt),
+            ),
+        ] {
+            assert!(!config.seccomp_filter_inherited, "{name}");
+            let encoded = dbt_detconfig_json(&config).unwrap();
+            assert!(
+                !encoded.contains("seccomp_filter_inherited"),
+                "{name}: {encoded}"
+            );
+        }
+    }
+
+    /// The DBT config decodes back to the same config with the field false,
+    /// whose key is omitted, and with it true, whose key is emitted, so a DBT
+    /// guest under an inherited filter does not probe.
+    #[test]
+    fn seccomp_filter_inherited_round_trips_through_the_dbt_config() {
+        let mut config = default_config();
+        config.seccomp_filter_inherited = false;
+        assert_dbt_detconfig_round_trips(&config);
+
+        config.seccomp_filter_inherited = true;
+        let encoded = dbt_detconfig_json(&config).unwrap();
+        assert_eq!(
+            encoded
+                .matches(r#""seccomp_filter_inherited":true"#)
+                .count(),
+            1,
+            "{encoded}"
+        );
+        assert_dbt_detconfig_round_trips(&config);
+    }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -3494,7 +3536,7 @@ pub fn run_with_backend_timeout(
         let summary_path = print_summary_to_json_file.clone();
         return ptrace_completion::run(timeout, move |control| async move {
             let report = SkidOvershootReport::begin(true);
-            let config = prepare_backend_config(config, backend);
+            let config = prepare_run_config(config, backend);
             let result = dispatch_backend(
                 command,
                 config,
@@ -3511,7 +3553,7 @@ pub fn run_with_backend_timeout(
     if backend == Backend::Kvm {
         ensure_kvm_stdin_reserved()?;
     }
-    let config = prepare_backend_config(config, backend);
+    let config = prepare_run_config(config, backend);
     let result = run_with_backend_inner(
         command,
         config,
@@ -3647,6 +3689,48 @@ fn controlling_terminal_device() -> Option<i64> {
 fn parse_controlling_terminal_device(stat: &str) -> Option<i64> {
     let after_command = stat.get(stat.rfind(')')? + 1..)?;
     after_command.split_ascii_whitespace().nth(4)?.parse().ok()
+}
+
+/// [`prepare_backend_config`] plus what only the launching process can observe
+/// about itself. Every run entry point prepares its config here; the DBT config
+/// tests call `prepare_backend_config` directly, so their bytes do not depend
+/// on the host that runs them.
+fn prepare_run_config(config: DetConfig, backend: Backend) -> DetConfig {
+    let mut config = prepare_backend_config(config, backend);
+    // A seccomp filter is inherited across fork and exec and can never be
+    // removed, so a filter on this process is on every guest it starts, on
+    // every backend, before any guest exists to install one of its own.
+    config.seccomp_filter_inherited =
+        config.seccomp_filter_inherited || launcher_inherits_a_seccomp_filter();
+    config
+}
+
+/// Whether this process runs under a seccomp filter, read from the `Seccomp:`
+/// line of its own `/proc/self/status`. An unreadable status counts as a
+/// filter: the answer only lets Detcore skip a probe it could otherwise make,
+/// so not knowing must mean not probing.
+fn launcher_inherits_a_seccomp_filter() -> bool {
+    match std::fs::read_to_string("/proc/self/status") {
+        Ok(status) => seccomp_filter_in_status(&status),
+        Err(error) => {
+            tracing::debug!(
+                "could not read /proc/self/status ({error}); assuming the guest may run under \
+                 an inherited seccomp filter"
+            );
+            true
+        }
+    }
+}
+
+/// Whether a `/proc/<pid>/status` text reports a seccomp mode. The `Seccomp:`
+/// line holds 0 (none), 1 (strict) or 2 (filter); any value other than 0 means
+/// a syscall Detcore injects may be refused. A kernel built without seccomp
+/// prints no such line and can run no filter.
+fn seccomp_filter_in_status(status: &str) -> bool {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Seccomp:"))
+        .is_some_and(|mode| mode.trim() != "0")
 }
 
 /// What the selected backend can do, as Detcore consumes it.
@@ -4012,7 +4096,7 @@ pub fn run_with_output_backend_timeout(
             let report = SkidOvershootReport::begin(true);
             let result = dispatch_output_backend(
                 command,
-                prepare_backend_config(config, backend),
+                prepare_run_config(config, backend),
                 print_summary,
                 &summary_path,
                 backend,
@@ -4055,7 +4139,7 @@ pub fn run_with_output_backend_timeout_and_skid_overshoots(
             let report = SkidOvershootReport::begin(true);
             let result = dispatch_output_backend(
                 command,
-                prepare_backend_config(config, backend),
+                prepare_run_config(config, backend),
                 print_summary,
                 &summary_path,
                 backend,
@@ -4072,7 +4156,7 @@ pub fn run_with_output_backend_timeout_and_skid_overshoots(
         // public output-capture callers without one retain this reservation.
         ensure_kvm_stdin_reserved()?;
     }
-    let config = prepare_backend_config(config, backend);
+    let config = prepare_run_config(config, backend);
     let result = run_with_output_backend_inner(
         command,
         config,
@@ -6081,6 +6165,56 @@ mod tests {
             );
         }
         assert!(!super::DetConfig::default().tool_opens_outside_guest_descriptor_table);
+    }
+
+    /// The `Seccomp:` line decides: 0 is no filter, 1 (strict) and 2 (filter)
+    /// are, and a status without the line comes from a kernel that cannot run
+    /// one. `Seccomp_filters:`, which newer kernels print next to it, is not
+    /// mistaken for it.
+    #[test]
+    fn a_seccomp_mode_other_than_zero_counts_as_an_inherited_filter() {
+        let status = |mode: &str| {
+            format!("Name:\thermit\nNoNewPrivs:\t1\nSeccomp:\t{mode}\nSeccomp_filters:\t0\n")
+        };
+        assert!(!super::seccomp_filter_in_status(&status("0")));
+        assert!(super::seccomp_filter_in_status(&status("1")));
+        assert!(super::seccomp_filter_in_status(&status("2")));
+        assert!(!super::seccomp_filter_in_status(
+            "Name:\thermit\nSeccomp_filters:\t3\n"
+        ));
+        assert!(super::seccomp_filter_in_status(
+            "Seccomp_filters:\t1\nSeccomp:\t2\n"
+        ));
+    }
+
+    /// The run config carries this process's own seccomp state on every
+    /// backend, and a caller's true is never cleared.
+    #[test]
+    fn the_run_config_carries_the_launchers_seccomp_state() {
+        let own = super::launcher_inherits_a_seccomp_filter();
+        for backend in [
+            Backend::Ptrace,
+            Backend::Dbt,
+            Backend::Kvm,
+            Backend::Sabre,
+            Backend::Liteinst,
+            Backend::E9patch,
+        ] {
+            let mut config = super::DetConfig {
+                virtualize_metadata: false,
+                ..super::DetConfig::default()
+            };
+            assert_eq!(
+                super::prepare_run_config(config.clone(), backend).seccomp_filter_inherited,
+                own,
+                "{backend:?}"
+            );
+            config.seccomp_filter_inherited = true;
+            assert!(
+                super::prepare_run_config(config, backend).seccomp_filter_inherited,
+                "{backend:?}"
+            );
+        }
     }
 
     #[test]

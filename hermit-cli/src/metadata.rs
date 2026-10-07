@@ -473,6 +473,10 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         exit_process_on_identity_lookup_refusal: false,
         // The tracer's own reads take tracer descriptors.
         tool_opens_outside_guest_descriptor_table: true,
+        // Record and replay never virtualize metadata, so Detcore never asks
+        // which filesystem a directory is on. Claiming a possible filter keeps
+        // any such ask from injecting a syscall the recording did not capture.
+        seccomp_filter_inherited: true,
         has_uts_namespace: true,
         // The path to the directory where syscalls will be recorded.
         replay_data: Some(data.to_path_buf()),
