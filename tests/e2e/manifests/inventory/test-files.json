@@ -1408,7 +1408,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/recvmsg_iov_overwritten_by_payload.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/recvmsg_iov_overwritten_by_payload.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test runs this probe under strict verification on ptrace with a readable and an unmapped payload target, and requires the retained verify log's recvmsg digest to hash the post-call walk's extent when it is readable and to record one counted unobserved entry, with the guest receiving the kernel's result, when it is not; it remains a guest fixture because a generic manifest cannot inspect the buffer-digest entries."
+      "why": "tests/c/recvmsg_iov_overwritten_by_payload.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test runs this probe on ptrace under --strict execution with ordinary --verify (the Stripped comparator) in two modes, and requires the retained verify log's recvmsg digest to hash the plain receive's buffer, and for a receive whose iovec array is its own receive buffer to record one counted unobserved entry while the guest receives the kernel's result; it remains a guest fixture because a generic manifest cannot inspect the buffer-digest entries."
     },
     {
       "disposition": "manifest-test",

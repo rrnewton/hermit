@@ -2067,11 +2067,13 @@ pub fn compare_complete_prefix_with_filter(
 /// `detlog_io_buffers` writes it when a receive's buffers cannot be observed
 /// after the call. The whole record is matched from the level onwards, with
 /// its producer module and structured kind, so text elsewhere (a pathname in
-/// a syscall record, say) cannot be counted.
+/// a syscall record, say) cannot be counted. Tracing span context
+/// (`name{fields}:` groups, present under `--verify-verbose` or a trace log
+/// level) may sit between the level and the module.
 pub fn is_unobserved_receive(line: &str) -> bool {
     static RECORD: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
-            r#"^\S+\s+INFO detcore::io_buffers: DETLOG \[iobuf\]\[dtid \d+\] recvmsg in fd=\S+ unobserved ret=\d+ reason=[a-z-]+(?: [a-z]+=\S+)? DETLOG_RECORD=\{"schema":1,"event":\{"kind":"other"\}\}$"#,
+            r#"^\S+\s+INFO (?:[\w.]+(?:\{.*?\})?:)*\s?detcore::io_buffers: DETLOG \[iobuf\]\[dtid \d+\] recvmsg in fd=\S+ unobserved ret=\d+ reason=[a-z-]+(?: [a-z]+=\S+)? DETLOG_RECORD=\{"schema":1,"event":\{"kind":"other"\}\}$"#,
         )
         .unwrap()
     });
@@ -3482,6 +3484,17 @@ mod test {
         let decoy = r#"2026-10-07T08:56:08.497110Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #3: openat(-100, "/tmp/DETLOG [iobuf][dtid 3] recvmsg in fd=4 unobserved ret=16 reason=x", 0) = Ok(3) DETLOG_RECORD={"schema":1,"event":{"kind":"other"}}"#;
         assert!(!super::is_unobserved_receive(decoy));
         assert!(!super::is_unobserved_receive(HASHED));
+        // With span context, as under --verify-verbose.
+        let spanned = UNOBSERVED.replace(
+            "  INFO detcore::io_buffers:",
+            "  INFO syscall.intercept{tid=3 syscall=recvmsg args=SyscallArgs { arg0: 4, arg5: 0 }}: detcore::io_buffers:",
+        );
+        assert!(super::is_unobserved_receive(&spanned));
+        let spanned_decoy = decoy.replace(
+            "  INFO detcore:",
+            "  INFO syscall.intercept{tid=3 syscall=openat}: detcore:",
+        );
+        assert!(!super::is_unobserved_receive(&spanned_decoy));
         let directory = tempfile::tempdir().unwrap();
         let log = directory.path().join("log");
         std::fs::write(
