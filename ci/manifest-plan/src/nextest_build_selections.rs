@@ -47,7 +47,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         | "super.weekly_pmu_parallel_memory_diagnostic_mem_race_top_detcore" => {
             Some(&["-p", "hermit-detcore", "--test", "tests_parallelism"])
         }
-        "test.hermit_integration" | "privileged-test.pmu_integration_cases" => Some(&[
+        "test.hermit_integration" | "test.pmu_integration_cases" => Some(&[
             "-p",
             "hermit",
             "--features",
@@ -611,7 +611,7 @@ mod tests {
                     .any(|binary| binary == "child_time_rpc")
             );
             // 287 listed, less the 25 external_signal_interrupt ptrace cases
-            // that need the PMU timer, which privileged-test.pmu_integration_cases
+            // that need the PMU timer, which test.pmu_integration_cases
             // runs.
             assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "262");
             // The explicit utimensat mtime regression

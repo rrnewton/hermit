@@ -391,7 +391,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "privileged-test.pmu_ptrace_completion_cases",
     "privileged-test.pmu_cli_cases",
     "privileged-test.pmu_detcore_time_cases",
-    "privileged-test.pmu_integration_cases",
+    "test.pmu_integration_cases",
     "privileged-test.cli_kvm",
     "privileged-only-cpuid.faulting",
     "privileged-only-pmu.preemption",
@@ -490,7 +490,7 @@ const PROFILES: [Profile; 12] = [
     // portable then each gained build.workspace_compile_in_pinned_root, the
     // Cargo half of build.workspace_in_pinned_root, which carries the same two
     // labels: 88/89 and 74/75 before. full then gained
-    // privileged-test.pmu_integration_cases when the 25 external_signal_interrupt
+    // test.pmu_integration_cases when the 25 external_signal_interrupt
     // ptrace cases that need the PMU timer left test.hermit_integration and
     // its hosted twin: 89/90 before. portable and hosted-portable are
     // unchanged because the node carries only the full label.
@@ -2426,7 +2426,7 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // were retired with the LiteInst host hybrid
     // (https://github.com/rrnewton/hermit/issues/3520). 134 since
     // test.record_replay joined the Nextest producers. 135 since
-    // privileged-test.pmu_integration_cases took the 25 external_signal_interrupt
+    // test.pmu_integration_cases took the 25 external_signal_interrupt
     // ptrace cases that need the PMU timer.
     if expected.len() != 135 {
         return Err(format!(
@@ -2444,7 +2444,7 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // test.liteinst_strict and test.liteinst_strict_on_host were retired with
     // the LiteInst host hybrid (https://github.com/rrnewton/hermit/issues/3520);
     // 42 since test.record_replay joined it; 43 since
-    // privileged-test.pmu_integration_cases joined it.
+    // test.pmu_integration_cases joined it.
     if expected_counts.len() != 43 {
         return Err(format!(
             "Nextest expected-count registry has {} entries, expected 43",
@@ -2583,7 +2583,7 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // hosted twin, liteinst.strict and super.liteinst_python3_verify_diagnostics
     // were retired with the LiteInst host hybrid
     // (https://github.com/rrnewton/hermit/issues/3520), and 69 with
-    // test.record_replay, and 70 with privileged-test.pmu_integration_cases.
+    // test.record_replay, and 70 with test.pmu_integration_cases.
     if actual_group_counts != [70, 56, 7, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
@@ -3569,7 +3569,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // waits only for the pinned Reverie (432 + 1).
     // 434 with check.script_unit_tests_on_host, the hosted twin of
     // check.script_unit_tests that carries the longer hosted wall (433 + 1).
-    // 435 with privileged-test.pmu_integration_cases, which runs the 25
+    // 435 with test.pmu_integration_cases, which runs the 25
     // external_signal_interrupt ptrace cases that need the PMU timer (434 + 1).
     if cfg.steps.len() != 435 {
         return Err(format!(
@@ -5819,7 +5819,7 @@ sys.exit(37)
         // test.detcore_time joined full, 88 before
         // privileged-test.pmu_detcore_time_cases did) - 22 replaced + 19
         // full-buck-e2e nodes (18, and 86 in all, before e2e.buck_stage).
-        // 88 since privileged-test.pmu_integration_cases joined full (91 full
+        // 88 since test.pmu_integration_cases joined full (91 full
         // nodes).
         assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 88);
 

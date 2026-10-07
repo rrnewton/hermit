@@ -13662,7 +13662,7 @@
       "group": "test",
       "job": "hermit_integration",
       "desc": "Portable Hermit integration targets (batched compile, serial test binaries)",
-      "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): all five current full-population runs were red for existing test failures, so their partial peaks are censored and do not lower the estimate. The last successful historical peak was 5351632896 bytes and an older 4-GiB run OOMed. The 6-GiB baseline rounds above the successful floor and the 8-GiB hard cap preserves 2 GiB more headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md. REGISTRATION 2026-10-05 (https://github.com/rrnewton/hermit/issues/3146): external_signal_interrupt runs here on the ptrace backend. A signal that Linux would deliver must end the tests/c/external_signal_interrupt.c guest's blocked futex, poll, epoll, select or child wait, and an ignored, blocked or default-ignored signal must leave the wait running to its deadline. test.liteinst_strict, where earlier rounds of https://github.com/rrnewton/hermit/pull/3361 registered the binary, no longer exists, and the binary's LiteInst cells are restoration targets (https://github.com/rrnewton/hermit/issues/3745). PMU CASES MOVED 2026-10-07: 25 external_signal_interrupt ptrace cases assert guest-observed virtual-time bounds (a 300 ms timed wait must end within 300-350 virtual ms) or watchdog progress that hold only with the PMU preemption timer. GitHub-hosted runners have no PMU, so hermit falls back to --max-timeslice=disabled, and in https://github.com/rrnewton/hermit/actions/runs/37631051557 exactly these 25 failed in test.hermit_integration_on_host (300 ms waits took 454-895 virtual ms). Forcing --max-timeslice=disabled locally fails the same 25 of 69 and no other; with the timer all 69 pass. This node and its hosted twin skip them by exact name and privileged-test.pmu_integration_cases runs them after privileged-pmu.preemption has shown the PMU works; the two filters are exact complements over this selection, so the full label runs each case once.",
+      "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): all five current full-population runs were red for existing test failures, so their partial peaks are censored and do not lower the estimate. The last successful historical peak was 5351632896 bytes and an older 4-GiB run OOMed. The 6-GiB baseline rounds above the successful floor and the 8-GiB hard cap preserves 2 GiB more headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md. REGISTRATION 2026-10-05 (https://github.com/rrnewton/hermit/issues/3146): external_signal_interrupt runs here on the ptrace backend. A signal that Linux would deliver must end the tests/c/external_signal_interrupt.c guest's blocked futex, poll, epoll, select or child wait, and an ignored, blocked or default-ignored signal must leave the wait running to its deadline. test.liteinst_strict, where earlier rounds of https://github.com/rrnewton/hermit/pull/3361 registered the binary, no longer exists, and the binary's LiteInst cells are restoration targets (https://github.com/rrnewton/hermit/issues/3745). PMU CASES MOVED 2026-10-07: 25 external_signal_interrupt ptrace cases assert guest-observed virtual-time bounds (a 300 ms timed wait must end within 300-350 virtual ms) or watchdog progress that hold only with the PMU preemption timer. GitHub-hosted runners have no PMU, so hermit falls back to --max-timeslice=disabled, and in https://github.com/rrnewton/hermit/actions/runs/37631051557 exactly these 25 failed in test.hermit_integration_on_host (300 ms waits took 454-895 virtual ms). Forcing --max-timeslice=disabled locally fails the same 25 of 69 and no other; with the timer all 69 pass. This node and its hosted twin skip them by exact name and test.pmu_integration_cases runs them after privileged-pmu.preemption has shown the PMU works; the two filters are exact complements over this selection, so the full label runs each case once.",
       "labels": [
         "full",
         "portable"
@@ -14712,10 +14712,10 @@
       "fail_fast_family": "privileged-test.pmu_detcore_time_cases"
     },
     {
-      "group": "privileged-test",
+      "group": "test",
       "job": "pmu_integration_cases",
       "desc": "Run the 25 external_signal_interrupt ptrace cases that need the PMU timer",
-      "description": "The 25 external_signal_interrupt ptrace cases whose assertions hold only with the PMU preemption timer: each bounds a guest-observed virtual time (a 300 ms timed wait must end within 300-350 virtual ms, a wait ended by a signal within its slack) or requires a spinning guest thread to make progress before a watchdog. GitHub-hosted runners have no PMU, so hermit continues with --max-timeslice=disabled; in https://github.com/rrnewton/hermit/actions/runs/37631051557 at hermit ccbe5ae8 test.hermit_integration_on_host failed exactly these 25, with 300 ms waits taking 454-895 virtual ms. Forcing --max-timeslice=disabled into the cells locally fails the same 25 of the binary's 69 and no other; with the timer all 69 pass. The overshoot without the timer is a product defect of its own, not a test defect, and these assertions keep full force here. test.hermit_integration and its hosted twin skip the 25 by exact name; this node runs the same prepared selection with the complementary filter, so the full label runs each case once, after privileged-pmu.preemption has shown the PMU works. Like the other privileged-test PMU nodes it carries only the full label: local scripts/validate.rs full runs it, .github/workflows/ci-privileged.yml does not. Memory hints are test.hermit_integration's, whose selection this is. Measured on the measurement host recorded in docs/TESTING_ENVIRONMENTS.md, 2026-10-07: cargo nextest run --profile ci with this selection and filter, -j 1, ran 25 of 25 passing in 76.3-94.2 s of nextest time over three runs at one-minute load averages of 21-31, so the estimate is 80 s and the wall limit 600 s.",
+      "description": "The 25 external_signal_interrupt ptrace cases whose assertions hold only with the PMU preemption timer: each bounds a guest-observed virtual time (a 300 ms timed wait must end within 300-350 virtual ms, a wait ended by a signal within its slack) or requires a spinning guest thread to make progress before a watchdog. GitHub-hosted runners have no PMU, so hermit continues with --max-timeslice=disabled; in https://github.com/rrnewton/hermit/actions/runs/37631051557 at hermit ccbe5ae8 test.hermit_integration_on_host failed exactly these 25, with 300 ms waits taking 454-895 virtual ms. Forcing --max-timeslice=disabled into the cells locally fails the same 25 of the binary's 69 and no other; with the timer all 69 pass. The overshoot without the timer is a product defect of its own, not a test defect, and these assertions keep full force here. test.hermit_integration and its hosted twin skip the 25 by exact name; this node runs the same prepared selection with the complementary filter, so the full label runs each case once, after privileged-pmu.preemption has shown the PMU works. Like the privileged-test PMU nodes it carries only the full label: local scripts/validate.rs full runs it, .github/workflows/ci-privileged.yml does not. It is in the test group, not privileged-test, because it executes the 54 hermit-cli integration binaries of test.hermit_integration and declares them (ci/audit-test-binary-registration.py requires the declaration to match the executed targets); a privileged-* consumer of those binaries would make each one a fused shared binary of privileged-build.privileged_tests, which this node does not use. Memory hints are test.hermit_integration's, whose selection this is. Measured on the measurement host recorded in docs/TESTING_ENVIRONMENTS.md, 2026-10-07: cargo nextest run --profile ci with this selection and filter, -j 1, ran 25 of 25 passing in 76.3-94.2 s of nextest time over three runs at one-minute load averages of 21-31, so the estimate is 80 s and the wall limit 600 s.",
       "labels": [
         "full"
       ],
@@ -14725,8 +14725,64 @@
           "kind": "structured-test-results",
           "schema": 2,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
-          "owner": "privileged-test.pmu_integration_cases"
+          "owner": "test.pmu_integration_cases"
         }
+      ],
+      "integration_test_binaries": [
+        "aio_nr_determinism",
+        "arch_status_determinism",
+        "chaos_sched_yield_progress",
+        "chaos_stress_pmu_detection",
+        "child_time_rpc",
+        "chown_virtual_root_identity",
+        "cli_owned_lifecycle",
+        "clock_determinism",
+        "clock_discipline_determinism",
+        "clock_passthrough",
+        "container_init_deadline",
+        "cpufreq_avg_determinism",
+        "dispatch_stats",
+        "epoll_determinism",
+        "epoll_pwait_zero_timeout_progress",
+        "external_signal_interrupt",
+        "file_nr_determinism",
+        "first_seen_mtime",
+        "fp_reduction_determinism",
+        "futex2_refusal",
+        "hashseed_determinism",
+        "inode_nr_determinism",
+        "kernel_keyring",
+        "key_users_determinism",
+        "mmap_determinism",
+        "node_vmstat_determinism",
+        "numa_maps_determinism",
+        "perf_event_refusal",
+        "pidfd_creation",
+        "process_isolation_refusals",
+        "proc_fdinfo_determinism",
+        "proc_locks_determinism",
+        "procfs_determinism",
+        "procfs_positioned_determinism",
+        "pty_nr_determinism",
+        "python_stdlib",
+        "reopened_pipe_progress",
+        "robust_futex_owner_death",
+        "run_evidence",
+        "self_sched_determinism",
+        "self_schedstat_determinism",
+        "signal_determinism",
+        "smaps_determinism",
+        "smaps_rollup_determinism",
+        "sockstat_determinism",
+        "softnet_stat_determinism",
+        "swaps_determinism",
+        "thp_stats_determinism",
+        "utimensat_mtime",
+        "verification_report_cli",
+        "verification_report_consumers",
+        "verify_claim_names_its_limit",
+        "writev_determinism",
+        "zero_copy_pipe_fallback"
       ],
       "deps": [
         "build.e2e_artifact_in_pinned_root",
@@ -14759,7 +14815,7 @@
         "measured_effective_cores": null,
         "measured_cpu_utilization": null
       },
-      "fail_fast_family": "privileged-test.pmu_integration_cases"
+      "fail_fast_family": "test.pmu_integration_cases"
     },
     {
       "group": "privileged-build",
@@ -34401,7 +34457,7 @@
       "group": "test",
       "job": "hermit_integration_on_host",
       "desc": "Portable Hermit integration targets (batched compile, serial test binaries)",
-      "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): all five current full-population runs were red for existing test failures, so their partial peaks are censored and do not lower the estimate. The last successful historical peak was 5351632896 bytes and an older 4-GiB run OOMed. The 6-GiB baseline rounds above the successful floor and the 8-GiB hard cap preserves 2 GiB more headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md. REGISTRATION 2026-10-05 (https://github.com/rrnewton/hermit/issues/3146): external_signal_interrupt runs here on the ptrace backend. A signal that Linux would deliver must end the tests/c/external_signal_interrupt.c guest's blocked futex, poll, epoll, select or child wait, and an ignored, blocked or default-ignored signal must leave the wait running to its deadline. test.liteinst_strict, where earlier rounds of https://github.com/rrnewton/hermit/pull/3361 registered the binary, no longer exists, and the binary's LiteInst cells are restoration targets (https://github.com/rrnewton/hermit/issues/3745). PMU CASES MOVED 2026-10-07: 25 external_signal_interrupt ptrace cases assert guest-observed virtual-time bounds (a 300 ms timed wait must end within 300-350 virtual ms) or watchdog progress that hold only with the PMU preemption timer. GitHub-hosted runners have no PMU, so hermit falls back to --max-timeslice=disabled, and in https://github.com/rrnewton/hermit/actions/runs/37631051557 exactly these 25 failed in test.hermit_integration_on_host (300 ms waits took 454-895 virtual ms). Forcing --max-timeslice=disabled locally fails the same 25 of 69 and no other; with the timer all 69 pass. This node and its hosted twin skip them by exact name and privileged-test.pmu_integration_cases runs them after privileged-pmu.preemption has shown the PMU works; the two filters are exact complements over this selection, so the full label runs each case once.",
+      "description": "MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): all five current full-population runs were red for existing test failures, so their partial peaks are censored and do not lower the estimate. The last successful historical peak was 5351632896 bytes and an older 4-GiB run OOMed. The 6-GiB baseline rounds above the successful floor and the 8-GiB hard cap preserves 2 GiB more headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md. REGISTRATION 2026-10-05 (https://github.com/rrnewton/hermit/issues/3146): external_signal_interrupt runs here on the ptrace backend. A signal that Linux would deliver must end the tests/c/external_signal_interrupt.c guest's blocked futex, poll, epoll, select or child wait, and an ignored, blocked or default-ignored signal must leave the wait running to its deadline. test.liteinst_strict, where earlier rounds of https://github.com/rrnewton/hermit/pull/3361 registered the binary, no longer exists, and the binary's LiteInst cells are restoration targets (https://github.com/rrnewton/hermit/issues/3745). PMU CASES MOVED 2026-10-07: 25 external_signal_interrupt ptrace cases assert guest-observed virtual-time bounds (a 300 ms timed wait must end within 300-350 virtual ms) or watchdog progress that hold only with the PMU preemption timer. GitHub-hosted runners have no PMU, so hermit falls back to --max-timeslice=disabled, and in https://github.com/rrnewton/hermit/actions/runs/37631051557 exactly these 25 failed in test.hermit_integration_on_host (300 ms waits took 454-895 virtual ms). Forcing --max-timeslice=disabled locally fails the same 25 of 69 and no other; with the timer all 69 pass. This node and its hosted twin skip them by exact name and test.pmu_integration_cases runs them after privileged-pmu.preemption has shown the PMU works; the two filters are exact complements over this selection, so the full label runs each case once.",
       "labels": [
         "hosted-portable"
       ],
