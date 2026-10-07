@@ -39,6 +39,9 @@ pub(crate) use threads::KernelSignalState;
 /// seen asleep there (`Scheduler::step1b_hold_for_rt_sigsuspend_entry`).
 pub(crate) use threads::confirm_rt_sigsuspend_entry;
 pub(crate) use threads::read_kernel_signal_state;
+/// Lets scheduler tests answer a signal-state read with a failure.
+#[cfg(test)]
+pub(crate) use threads::signal_state_read_seam;
 pub(crate) mod time;
 
 use crate::consts::DET_SPECIAL_INODE_OFFSET;

@@ -10922,6 +10922,37 @@ mod test {
                 assert!(scheduler.pending_cross_task_signals.is_empty(), "{case}");
             }
         }
+
+        // The vfork parent above is built by hand. Committed through its own
+        // `BlockingVfork` grant, it records the mask read while it was
+        // stopped at its request, which here admits SIGUSR1, so the vfork
+        // barrier alone keeps it in its pool; or, when that read fails, no
+        // mask, which keeps it as well.
+        for kernel_mask in [Some(0), None] {
+            let case = format!("vfork parent through its grant, kernel mask {kernel_mask:?}");
+            let (mut scheduler, _parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+            let op = commit_vfork_parent(&mut scheduler, creator, kernel_mask);
+
+            scheduler.notify_signal_pending(creator, SigWrapper(libc::SIGUSR1));
+
+            assert!(scheduler.blocked.signaled_background.is_empty(), "{case}");
+            assert_eq!(
+                scheduler
+                    .blocked
+                    .external_io_blockers
+                    .get(&creator)
+                    .copied(),
+                Some(op),
+                "{case}"
+            );
+            assert!(!scheduler.run_queue.contains_tid(creator), "{case}");
+            assert_eq!(request_resources(&scheduler, creator), None, "{case}");
+            assert!(scheduler.pending_cross_task_signals.is_empty(), "{case}");
+            assert!(
+                scheduler.step2_release_signaled_background().is_ok(),
+                "{case}"
+            );
+        }
     }
 
     /// When the only thread left is asleep in `rt_sigsuspend` and a sibling's
@@ -11616,6 +11647,46 @@ mod test {
         );
     }
 
+    /// Commit `thread`'s vfork through its own `BlockingVfork` grant, the
+    /// state production records for a vfork parent: it waits in the
+    /// external-IO pool under the vfork barrier, and since its request
+    /// carries no mask, the grant records the mask read from the kernel while
+    /// the thread was stopped at the request: `kernel_mask`, or no mask when
+    /// `kernel_mask` is `None` and the read fails.
+    fn commit_vfork_parent(
+        scheduler: &mut Scheduler,
+        thread: DetTid,
+        kernel_mask: Option<u64>,
+    ) -> ExternalOpId {
+        let op = ExternalOpId::new(thread, 1);
+        let _failing_read = match kernel_mask {
+            Some(blocked) => {
+                scheduler.test_kernel_signal_states.insert(
+                    thread,
+                    KernelSignalState {
+                        blocked,
+                        ..Default::default()
+                    },
+                );
+                None
+            }
+            None => Some(crate::syscalls::signal_state_read_seam::install(|_, _| {
+                Some(Err(reverie::syscalls::Errno::ESRCH))
+            })),
+        };
+        commit_out_of_scheduler_call(scheduler, thread, ResourceID::BlockingVfork(op), None);
+        assert!(scheduler.vfork_barriers.contains_key(&thread));
+        assert_eq!(
+            scheduler.blocked.external_io_blockers.get(&thread),
+            Some(&op)
+        );
+        assert_eq!(
+            scheduler.blocked.out_of_scheduler_masks.get(&thread),
+            Some(&kernel_mask)
+        );
+        op
+    }
+
     /// Process 100, whose leader is parked in a futex wait that admits only
     /// `leader_unblocked`, with `workers` registered in it and not yet in any
     /// call. A second process, 300, has a thread asleep in `rt_sigsuspend`
@@ -11777,11 +11848,20 @@ mod test {
     /// pending on the process until a thread unblocks it in its own turn;
     /// nothing is armed. That covers every thread blocking it, and the only
     /// admitting threads being a vfork parent (it sleeps killable) or a thread
-    /// whose mask is unknown.
+    /// whose mask is unknown. A vfork parent is tested both built by hand and
+    /// committed through its own `BlockingVfork` grant, with the kernel mask
+    /// read there admitting the signal (only the vfork barrier keeps it) or
+    /// unreadable.
     #[test]
     fn a_timer_signal_no_thread_is_known_to_admit_stays_pending_on_the_process() {
         let alrm = kernel_signal_bit(libc::SIGALRM);
-        for case in ["every thread blocks it", "vfork parent", "unknown mask"] {
+        for case in [
+            "every thread blocks it",
+            "vfork parent",
+            "vfork parent through its grant, mask admits",
+            "vfork parent through its grant, mask unreadable",
+            "unknown mask",
+        ] {
             let mut scheduler = gated_scheduler();
             let (leader, workers, _) = timer_family(&mut scheduler, !alrm, &[101]);
             let worker = workers[0];
@@ -11790,6 +11870,12 @@ mod test {
                 "vfork parent" => {
                     suspend_with_mask(&mut scheduler, worker, 0);
                     scheduler.vfork_barriers.insert(worker, None);
+                }
+                "vfork parent through its grant, mask admits" => {
+                    commit_vfork_parent(&mut scheduler, worker, Some(0));
+                }
+                "vfork parent through its grant, mask unreadable" => {
+                    commit_vfork_parent(&mut scheduler, worker, None);
                 }
                 _ => {
                     suspend_with_mask(&mut scheduler, worker, 0);
