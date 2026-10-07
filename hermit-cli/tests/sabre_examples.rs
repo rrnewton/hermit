@@ -1134,12 +1134,14 @@ fn sabre_verify_across_host_action(
 /// divergence. It reports it without naming it the cause, because SaBRe's
 /// loader runs an exec'd program's `.preinit_array` before Detcore starts:
 /// guest code Hermit does not observe could have made the change. The run
-/// stays a divergence.
+/// stays a divergence. The guest starts no child process, so the two runs
+/// have no child exit whose order host timing decides
+/// ([`host_input::HOST_INPUT_GUEST_WITHOUT_CHILDREN`]).
 #[test]
 fn sabre_reports_a_replaced_host_file_without_naming_it_the_cause() {
     let Some((root, stderr, report)) = sabre_verify_across_host_action(
         "sabre-host-input-replaced",
-        host_input::HOST_INPUT_GUEST,
+        host_input::HOST_INPUT_GUEST_WITHOUT_CHILDREN,
         true,
         ["go", "go"],
     ) else {

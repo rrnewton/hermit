@@ -33,6 +33,31 @@ pub const HOST_INPUT_GUEST: &str = r#"
     stat -c %i "$1/F" || exit 3
 "#;
 
+/// [`HOST_INPUT_GUEST`] without a child process: the shell opens `F` itself
+/// with a builtin's redirection (`: <`), stats it with the `[` builtin (as
+/// `cat`'s `fstat` did, so that run 1 meets the original inode and gives it a
+/// virtual number before the replacement), reads the FIFO and echoes with
+/// builtins, and `exec`s the final `stat`, so it never forks.
+///
+/// For SaBRe, where a child's exit is still ordered by host timing. The
+/// shell's wait for its child and the child's `SIGCHLD` reach the coordinator
+/// in either order (docs/SABRE_COMPATIBILITY.md: child completion ordering
+/// belongs to the SIGCHLD owner). On a GitHub-hosted runner, whose `/bin/sh` is
+/// dash, the two runs of [`HOST_INPUT_GUEST`] committed them in different
+/// orders at the first `cat`'s exit
+/// (https://github.com/rrnewton/hermit/actions/runs/37666223480). That divergence is in the
+/// coordinator's part of the log, ahead of every record the guest forwards, so
+/// no host replacement after it could be reported. A guest with no child
+/// gives the runs nothing to order but the opens.
+pub const HOST_INPUT_GUEST_WITHOUT_CHILDREN: &str = r#"
+    : < "$1/F" || exit 3
+    [ -f "$1/F" ] || exit 3
+    read line < "$1/fifo" || exit 3
+    echo "$line"
+    : < "$1/F" || exit 3
+    exec stat -c %i "$1/F"
+"#;
+
 /// A guest that replaces `F` itself, in one run only: after the host's line
 /// it moves `A` over `F` when the line is `moveA`, and otherwise moves `B` to
 /// `H`, leaving `F` alone. Both are one `mv`, which opens no file named here,
