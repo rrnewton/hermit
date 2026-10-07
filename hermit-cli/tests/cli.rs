@@ -103,6 +103,7 @@ static KVM_EXACT_CHILD_WAITS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KVM_GETTIMEOFDAY_EFAULT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KVM_TASK_IDS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_UNSUPPORTED_SYSCALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static GETTIMEOFDAY_UNREADABLE_BUFFER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_SELF_SIGQUEUE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_STDERR_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_LOG_ENV_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -903,6 +904,32 @@ fn dbt_prlimit_self_guest() -> &'static Path {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review the DBT unsupported-syscall fixture build.
+fn gettimeofday_unreadable_buffer_guest() -> &'static Path {
+    GETTIMEOFDAY_UNREADABLE_BUFFER_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("gettimeofday-unreadable-buffer");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create gettimeofday unreadable-buffer guest directory");
+        let guest = build_root.join("gettimeofday_unreadable_buffer");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/gettimeofday_unreadable_buffer.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile gettimeofday unreadable-buffer guest");
+        assert!(
+            output.status.success(),
+            "gettimeofday unreadable-buffer guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
 fn dbt_unsupported_syscall_guest() -> &'static Path {
     DBT_UNSUPPORTED_SYSCALL_GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -4132,6 +4159,134 @@ fn run_dbt_recovers_after_failed_exec() {
         stderr(&output),
     );
 }
+/// The reference behavior for the guest the DBT backend-failure tests use:
+/// ptrace reads the guest's unreadable timeval word through the tracer, so
+/// Detcore confirms that the failed gettimeofday stored nothing, and the
+/// guest sees EFAULT as on Linux.
+#[test]
+fn run_ptrace_returns_efault_for_gettimeofday_into_an_unreadable_page() {
+    let guest = gettimeofday_unreadable_buffer_guest()
+        .to_str()
+        .expect("gettimeofday unreadable-buffer guest path should be UTF-8");
+    let args = ["run", "--", guest];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "gettimeofday returned -1 errno=EFAULT\n");
+}
+
+/// A forked child makes the failing call before any exec. Hermit's DBT
+/// runtime runs Detcore in such a child too, and its copied runtime used to
+/// write no stats record, so its failure went unseen when its parent ignored
+/// it.
+#[test]
+fn run_dbt_fails_when_a_forked_child_ends_on_a_backend_failure_before_exec() {
+    if dbt_unavailable("run_dbt_fails_when_a_forked_child_ends_on_a_backend_failure_before_exec") {
+        return;
+    }
+    let guest = gettimeofday_unreadable_buffer_guest()
+        .to_str()
+        .expect("gettimeofday unreadable-buffer guest path should be UTF-8");
+    let args = [
+        "--backend",
+        "dbt",
+        "run",
+        "--allow-unsupported-syscalls",
+        "--",
+        guest,
+        "fork",
+    ];
+    let output = hermit(&args);
+    let stderr = stderr(&output);
+
+    assert_eq!(
+        stdout(&output),
+        "parent ignored the child's status\n",
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("detcore-dbt: Detcore failed handling a syscall: "),
+        "the child's diagnostic is missing:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("1 guest process(es) ended on a DBT backend or Tool failure"),
+        "the run did not name the child's failure:\n{stderr}"
+    );
+    assert_eq!(output.status.code(), Some(101), "{stderr}");
+}
+
+/// A shell runs a child whose Detcore handler fails with a tool error, ignores
+/// the child's exit status, and exits 0. Under `--allow-unsupported-syscalls`
+/// without `--verify` the guest tree has no isolated process group, so the
+/// DBT client's terminal path ends only the child. The run must still fail.
+#[test]
+fn run_dbt_fails_when_a_child_ends_on_a_backend_failure_its_parent_ignores() {
+    if dbt_unavailable("run_dbt_fails_when_a_child_ends_on_a_backend_failure_its_parent_ignores") {
+        return;
+    }
+    let child = gettimeofday_unreadable_buffer_guest()
+        .to_str()
+        .expect("gettimeofday unreadable-buffer guest path should be UTF-8");
+    let script = format!("{child}; echo parent-saw-status:$?");
+    let args = [
+        "--backend",
+        "dbt",
+        "run",
+        "--allow-unsupported-syscalls",
+        "--",
+        "/bin/sh",
+        "-c",
+        &script,
+    ];
+    let output = hermit(&args);
+    let stderr = stderr(&output);
+
+    // The child never printed; the parent saw exit 101 and went on.
+    assert_eq!(stdout(&output), "parent-saw-status:101\n", "{stderr}");
+    assert!(
+        stderr.contains("detcore-dbt: Detcore failed handling a syscall: "),
+        "the child's diagnostic is missing:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("1 guest process(es) ended on a DBT backend or Tool failure"),
+        "the run did not name the child's failure:\n{stderr}"
+    );
+    assert_eq!(output.status.code(), Some(101), "{stderr}");
+}
+
+/// The same failing guest under `--verify`, where the process group is
+/// isolated and protected evidence turns the failure into an error. The
+/// error must not hide the child's diagnostic, which the guest tree wrote to
+/// its captured stderr.
+#[test]
+fn run_dbt_verify_keeps_the_diagnostic_of_a_backend_failure() {
+    if dbt_unavailable("run_dbt_verify_keeps_the_diagnostic_of_a_backend_failure") {
+        return;
+    }
+    let child = gettimeofday_unreadable_buffer_guest()
+        .to_str()
+        .expect("gettimeofday unreadable-buffer guest path should be UTF-8");
+    let script = format!("{child}; echo parent-saw-status:$?");
+    let args = [
+        "--backend",
+        "dbt",
+        "run",
+        "--allow-unsupported-syscalls",
+        "--verify",
+        "--",
+        "/bin/sh",
+        "-c",
+        &script,
+    ];
+    let output = hermit(&args);
+    let stderr = stderr(&output);
+
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("detcore-dbt: Detcore failed handling a syscall: "),
+        "the failed run's diagnostic was dropped:\n{stderr}"
+    );
+}
+
 #[test]
 fn run_dbt_rejects_unfollowed_execveat() {
     if dbt_unavailable("run_dbt_rejects_unfollowed_execveat") {

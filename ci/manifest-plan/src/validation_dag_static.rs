@@ -1523,7 +1523,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // liteinst_replay_with_a_conflicting_epoch_is_refused_in_every_build and
     // liteinst_verify_with_a_quiet_log_level_is_refused_in_every_build retain
     // all 203: 205, re-listed.
-    ("test.cli", 205),
+    // run_ptrace_returns_efault_for_gettimeofday_into_an_unreadable_page,
+    // run_dbt_fails_when_a_child_ends_on_a_backend_failure_its_parent_ignores,
+    // run_dbt_fails_when_a_forked_child_ends_on_a_backend_failure_before_exec and
+    // run_dbt_verify_keeps_the_diagnostic_of_a_backend_failure retain all 205:
+    // 209.
+    ("test.cli", 209),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -1654,7 +1659,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // removed set is exactly those five.
     // The two LiteInst refusal tests added to test.cli start no guest, so the
     // filterset is unchanged: 205 - 39 = 166, listed the same way.
-    ("test.cli_on_host", 166),
+    // The same four unreadable-page and DBT backend-failure tests start no
+    // in-guest LiteInst guest, so the filterset is unchanged: 209 - 39 = 170.
+    ("test.cli_on_host", 170),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 54),
