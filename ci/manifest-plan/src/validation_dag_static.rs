@@ -806,7 +806,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // manifest-plan's
     // validation_dag::tests::hosted_script_unit_tests_twin_changes_only_its_identity_and_wall
     // retains all 983: 984.
-    ("test.regular_crates", 984),
+    // detcore-dbt's tests::only_a_linux_error_from_a_handler_reaches_the_guest and
+    // tests::a_failed_thread_start_ends_the_run_instead_of_failing_the_syscall
+    // retain all 984: 986.
+    ("test.regular_crates", 986),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1852,7 +1855,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same detcore-model legacy-form test retains all 981: 982.
     // The ineligible-execution-path series test listed there retains all 982: 983.
     // The hosted script unit-test twin test listed there retains all 983: 984.
-    ("test.regular_crates_on_host", 984),
+    // The two detcore-dbt handler-error tests listed there retain all 984: 986.
+    ("test.regular_crates_on_host", 986),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
