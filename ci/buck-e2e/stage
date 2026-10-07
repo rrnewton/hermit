@@ -9,7 +9,12 @@
 #   hermit      the cargo validate-profile hermit, for -c hermit_e2e.hermit=staged
 #   src/        `git archive HEAD`: the source snapshot cells read (no .git, no submodules)
 #   build/      `test-harness build` fixtures for every CI-selected cell, built from src/
-#   run-state/  the compat fixtures (tests/compat/prepare_real_compat_fixtures.sh)
+#   run-state/  the compat fixtures (tests/compat/prepare_real_compat_fixtures.sh):
+#               strict-compat/ prepared on the host for the host-portability compat
+#               bucket, compat-pinned/ prepared inside the pinned root
+#               (ci/hermetic/run-in-pinned-root.sh) for the gating compat-pinned bucket,
+#               whose guests resolve their programs and libc in the image. A --bundle
+#               must carry both.
 #   SOURCE_SHA  HEAD
 #
 # usage: ci/buck-e2e/stage --from-cargo [--target-dir DIR]   build them here with cargo
@@ -50,6 +55,13 @@ if [[ $mode == cargo ]]; then
     for lib in libunwind.so.8 libunwind-x86_64.so.8; do
         [[ -e $host_libdir/$lib ]] || need "$host_libdir/$lib" libunwind-devel
     done
+    # The compat-pinned fixtures are compiled inside the pinned image, against its glibc
+    # (https://github.com/rrnewton/hermit/issues/3712), so the image must be present.
+    if ! why=$("$root/ci/hermetic/run-in-pinned-root.sh" --check-image 2>&1); then
+        echo "ci/buck-e2e/stage: the pinned-root image is unavailable (${why//$'\n'/ });" \
+            "build it with ci/hermetic/build-image.sh" >&2
+        exit 1
+    fi
 fi
 rm -rf "${staged:?}"
 mkdir -p "$staged"
@@ -151,5 +163,16 @@ for lane in portable privileged; do
         "$staged/bin/test-harness" build --repo-root "$staged/src" --source-sha "$sha" --ci-only --lane "$lane" --jobs 32 >/dev/null
 done
 env -C "$staged/src" ./tests/compat/prepare_real_compat_fixtures.sh "$staged/run-state/strict-compat/real-compat-fixtures" >/dev/null
+# The gating compat-pinned fixtures, compiled by the image's toolchain as the cargo flow's
+# compatpinnedprep.fixtures does. The wrapper mounts the source read-only at /src, over
+# a private copy holding the mountpoints it adds (as cell.sh does), so src/ stays exactly
+# the snapshot cells read.
+pinned_src=$tmp/pinned-src
+mkdir -p "$pinned_src/target" "$pinned_src/agent-utils/rs/target" "$pinned_src/agent-utils/rs/.agent-utils-locks" \
+    "$pinned_src/agent-utils/rs/.agent-utils-snapshots" "$tmp/pinned-out"
+cp -a --reflink=auto "$staged/src/." "$pinned_src/"
+VALIDATE_RUN_STATE="$staged/run-state" "$root/ci/hermetic/run-in-pinned-root.sh" --src "$pinned_src" --out "$tmp/pinned-out" \
+    --env VALIDATE_RUN_STATE -- \
+    ./tests/compat/prepare_real_compat_fixtures.sh /validate-run-state/compat-pinned/real-compat-fixtures >/dev/null
 echo "$sha" >"$staged/SOURCE_SHA"
 echo "staged $(du -sh "$staged" | cut -f1) for $sha"

@@ -133,9 +133,22 @@ the three under https://github.com/rrnewton/hermit/issues/3489). The 150 red cel
 enabled with `ci: false`, so the run type requires the 62. Three more SaBRe
 cells, `compat/lua-direct`, `compat/perl-direct` and `compat/df-direct`, keep
 the old corpus's single-image argv for the programs whose `compat.yaml` rows
-run under a bash wrapper; they passed 3/3, so the run type requires 65 of 215
+run under a bash wrapper; they passed 3/3, so the run type required 65 of 215
 SaBRe cells. The `Stripped` comparator precludes B3, B4, L2, or any canonical
 parity claim.
+
+Since 2026-10-06 these 215 SaBRe cells live in
+`tests/e2e/manifests/compat-pinned.yaml` and run inside the pinned root, so
+each guest uses the image's programs and its glibc 2.42 rather than the
+host's (https://github.com/rrnewton/hermit/issues/3712). The run type now
+requires 63 of them. Two of the 65 stopped gating: the image's uptime (GNU
+coreutils 9.11) derives the boot time from `CLOCK_BOOTTIME`, which Detcore
+answers with the same virtual wall time as every other clock, so uptime exits
+1; and with the image's ruby, one system-call site in the image's libc.so.6
+runs outside SaBRe's rewritten path, so the harness refuses the cell. Each
+keeps a `ci: false` reason in the manifest. `tests/e2e/manifests/compat.yaml`
+still runs every row on the host, on ptrace only, as a diagnostic
+host-portability check.
 
 The guest's own dynamic loader loads `libdetcore_sabre.so`, against the C
 library the guest already has. A validation builds it once, in the pinned root,

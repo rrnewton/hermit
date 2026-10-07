@@ -193,9 +193,10 @@ if [[ -z "$shards" ]]; then
     strict_compat_node_count=$(jq -er '.strict_compat_nodes | if length > 0 then length else error("no strict compatibility steps") end' "$MAP")
     final_node_count=$(jq -er '.final_nodes | if length > 0 then length else error("no final steps") end' "$MAP")
     # Same hosted-portable filter as ci-portable.yml and check-shard-coverage.sh:
-    # GitHub-hosted runners have no PMU, so this selection omits KVM cells.
+    # GitHub-hosted runners have no PMU, so this selection omits KVM cells, and
+    # it omits the compat-pinned cells, which no hosted-portable node runs.
     e2e_cell_count=$(jq -er '
-        [.cells[] | select(.lane == "portable" and .backend != "kvm")] as $portable
+        [.cells[] | select(.lane == "portable" and .backend != "kvm" and .category != "compat-pinned")] as $portable
         | if (.schema == 1 and ($portable | length) > 0)
           then $portable | length
           else error("invalid or empty portable E2E plan")

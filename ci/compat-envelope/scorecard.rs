@@ -42,6 +42,9 @@ use fs2::FileExt;
 use hermit_manifest_plan::backend_parity::BackendParityReport;
 use hermit_manifest_plan::backend_parity::BackendParityVerdict;
 use hermit_manifest_plan::canonical_verdict;
+use hermit_manifest_plan::compat_guest_root::IMAGE_DIGEST_FILE;
+use hermit_manifest_plan::compat_guest_root::IMAGE_PATHS_FILE;
+use hermit_manifest_plan::compat_guest_root::ImagePaths;
 use hermit_manifest_plan::ledger::HistoryRow;
 use hermit_manifest_plan::logdiff_report::LOG_DIFF_REPORT_SCHEMA;
 use hermit_manifest_plan::logdiff_report::LogDiffComparison;
@@ -64,6 +67,8 @@ use hermit_manifest_plan::retired_ids::RetiredIds;
 use hermit_manifest_plan::runner::ExpectedGuestExit;
 use hermit_manifest_plan::runner::ExpectedOutputFailureReason;
 use hermit_manifest_plan::runner::FailureClass;
+use hermit_manifest_plan::runner::GuestRoot;
+use hermit_manifest_plan::runner::ManifestSet;
 use hermit_manifest_plan::runner::ObservedResult;
 use hermit_manifest_plan::runner::parse_expected_output_failure_reason;
 use hermit_manifest_plan::runner::records_stripped_comparator;
@@ -189,13 +194,17 @@ Commands:
       bind their finalized ledger row and retained raw-input census before
       reporting writeback completion.
   verify-results --results DIR [--lanes portable,privileged]
-                 [--exclude-backend BACKEND]...
+                 [--exclude-backend BACKEND]... [--exclude-category CATEGORY]...
       Check the tracked files, then require a fresh PASS row at HEAD for every
       selected regression cell in the named lanes. The default is both lanes.
       --exclude-backend omits one Hermit backend's cells (ptrace, dbt, kvm,
       sabre, or liteinst) from the required population and reports how many
       were omitted; it must match at least one selected cell. The hosted
       portable profile uses it for kvm because GitHub-hosted runners have no PMU.
+      --exclude-category omits one manifest category's cells the same way and
+      must also match at least one selected cell. The hosted portable profile
+      uses it for compat-pinned, whose guests need the pinned root that
+      GitHub-hosted runners do not have.
   self-test
       Run the regression tier: exercise accepting and refusing result sets
       in process. It runs no guest, none of this tool's commands, no ledger
@@ -1453,7 +1462,24 @@ struct ResultRow {
     first_divergent_record: Option<u64>,
     #[serde(default)]
     first_divergent_syscall: Option<u64>,
+    /// The root filesystem the cell's guest resolved its program and libc in,
+    /// as the harness recorded it: the pinned root image, the starting host,
+    /// or a Buck remote-execution worker. `None` (absent or `null`) on rows
+    /// written before the harness recorded it and on an import-mode error row,
+    /// which ran no guest. [`GuestRootPolicy`] admits a row of a
+    /// `guest_root: pinned` bucket only when it is pinned. It is deliberately
+    /// not part of [`Self::evidence_identity`]; see [`GuestRootPolicy`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    guest_root: Option<GuestRoot>,
+    /// For a pinned row, the [`ImagePaths::identity`] of the root the harness
+    /// verified before it ran the cell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    guest_root_identity: Option<String>,
 }
+
+/// A row's recorded guest root and, for a pinned row, that root's identity
+/// ([`ResultRow::recorded_guest_root`]).
+type RecordedGuestRoot = (Option<GuestRoot>, Option<String>);
 
 #[derive(Debug)]
 enum ValidateRowEvidence {
@@ -1626,6 +1652,39 @@ impl ExpectedOutputFailure {
 }
 
 impl ResultRow {
+    /// The guest root this row records and, when pinned, that root's identity:
+    /// what [`GuestRootPolicy`] admits the row by, and what
+    /// [`Self::evidence_identity`] leaves out. The duplicate and distinctness
+    /// comparisons that key on the evidence identity compare this too, so two
+    /// rows that differ only in their recorded root are different evidence.
+    fn recorded_guest_root(&self) -> RecordedGuestRoot {
+        (self.guest_root, self.guest_root_identity.clone())
+    }
+
+    /// Whether this is an `ERROR` row that carries nothing a guest produced:
+    /// no observed result, no attempt, no backend-parity report, no
+    /// divergence position, and no command line. That is the shape of the
+    /// runner's import-mode error row (`imported_results.rs`, `error_row`),
+    /// the one row that may legitimately record no guest root, because the
+    /// importing process ran no guest for the cell. Any of those fields would
+    /// be guest or comparison evidence that later readers interpret (an
+    /// attempt's canonical report becomes `FAIL` or `Diverged`), so a row
+    /// carrying one must say which root produced it.
+    fn is_guestless_error(&self) -> bool {
+        self.outcome == "ERROR"
+            && self.result.is_none()
+            && self.attempts.is_empty()
+            && self.backend_parity.is_none()
+            && self.first_divergent_scheduler_turn.is_none()
+            && self.first_divergent_virtual_nanoseconds.is_none()
+            && self.first_divergent_record.is_none()
+            && self.first_divergent_syscall.is_none()
+            && self.effective_args.is_empty()
+            && self.argv.is_empty()
+            && self.guest_argv.is_empty()
+            && self.shell_command.is_empty()
+    }
+
     fn retry_fixture(&self) -> Result<Option<RetryFixture>, String> {
         let Some(artifact_dir) = self.artifact_dir.as_deref() else {
             return Ok(None);
@@ -3610,6 +3669,7 @@ fn bind_parity_history(
         })?;
         if let Some(previous) = attempts.get(&candidate.row.attempt) {
             if previous.evidence_identity != candidate.evidence_identity
+                || previous.row.recorded_guest_root() != candidate.row.recorded_guest_root()
                 || previous.row.artifact_dir != candidate.row.artifact_dir
                 || previous.row.result != candidate.row.result
                 || previous.row.failure_class != candidate.row.failure_class
@@ -4067,6 +4127,7 @@ fn run() -> Result<(), String> {
             let mut result_root = None;
             let mut lanes = BTreeSet::from(["portable".to_string(), "privileged".to_string()]);
             let mut excluded_backends = BTreeSet::new();
+            let mut excluded_categories = BTreeSet::new();
             while let Some(arg) = args.next() {
                 match arg.as_str() {
                     "--exclude-backend" => {
@@ -4083,6 +4144,19 @@ fn run() -> Result<(), String> {
                         }
                         if !excluded_backends.insert(backend.clone()) {
                             return Err(format!("--exclude-backend {backend} was given twice"));
+                        }
+                    }
+                    "--exclude-category" => {
+                        let category = args
+                            .next()
+                            .ok_or("--exclude-category requires a manifest category")?;
+                        if category.is_empty() || category.starts_with('-') {
+                            return Err(format!(
+                                "--exclude-category requires a manifest category; got `{category}`"
+                            ));
+                        }
+                        if !excluded_categories.insert(category.clone()) {
+                            return Err(format!("--exclude-category {category} was given twice"));
                         }
                     }
                     "--results" => {
@@ -4111,7 +4185,15 @@ fn run() -> Result<(), String> {
             }
             let result_root = result_root.ok_or("verify-results requires --results DIR")?;
             check_tracked(&root)?;
-            verify_results(&root, &result_root, &lanes, &excluded_backends)?;
+            verify_results(
+                &root,
+                &result_root,
+                &lanes,
+                &VerifyExclusions {
+                    backends: excluded_backends,
+                    categories: excluded_categories,
+                },
+            )?;
         }
         "observe-results" => {
             let mut result_root = None;
@@ -7125,6 +7207,35 @@ fn parity_rows_text(count: usize) -> String {
     format!("{count} parity {}", if count == 1 { "row" } else { "rows" })
 }
 
+/// Why `row` cannot be admitted when its test, as written or as its retired
+/// id resolves, is in a bucket that requires a guest root: a
+/// `parity-ledger/v1` row records no guest root, so nothing shows which root
+/// either compared run used, and a match from runs whose guests read the host's
+/// programs and libc would count as parity of a pinned cell
+/// (<https://github.com/rrnewton/hermit/issues/3712>). A test id starts with
+/// its bucket and a slash, which `ManifestSet::load` requires.
+///
+/// The parity selection rule reads `c-programs` alone, so no producer writes
+/// such a row today. This keeps one from earning credit if one is ever
+/// written, until the row records its root.
+fn parity_guest_root_problem(buckets: &GuestRootBuckets, row: &ParityLedgerRow) -> Option<String> {
+    let canonical = retired_ids().resolve(&row.test_id);
+    [row.test_id.as_str(), canonical]
+        .into_iter()
+        .find_map(|test| {
+            let (bucket, _) = test.split_once('/')?;
+            let required = buckets.required(bucket)?;
+            Some(format!(
+                "parity ledger row {} ({} run {}): test {test} is in bucket {bucket}, which \
+                 requires guest_root {}, and a parity-ledger/v1 row records no guest root",
+                row.cell,
+                row.producer,
+                row.run_id,
+                required.as_str()
+            ))
+        })
+}
+
 /// The two lines that count the rows outside every clean headline, byte for
 /// byte as section 7 of the parity summary format, version 3, gives them and
 /// the site's parity panel prints them: the rows from a dirty source tree,
@@ -7206,6 +7317,13 @@ impl ParityRunAccumulator {
 /// [`ParityCellSummary::adversity_cmp`], the summary does not depend on the
 /// order the store was listed or the rows were written in.
 ///
+/// A row whose test is in a bucket that `buckets` says requires a guest root
+/// is refused as well ([`parity_guest_root_problem`]): a `parity-ledger/v1`
+/// row records no guest root, so nothing shows which root either compared run
+/// used (<https://github.com/rrnewton/hermit/issues/3712>). Like the
+/// conflicting-commit refusal, it comes after the row check, so section 7's
+/// classification below still counts the row.
+///
 /// `on_main_of` says whether the managed checkout's [`PARITY_MAIN_REF`]
 /// reaches a Hermit commit, so a branch run never headlines over a main run.
 /// `committed_of` reads the parity selection a Hermit commit committed to
@@ -7232,6 +7350,7 @@ impl ParityRunAccumulator {
 fn summarize_parity(
     input: &ParityStoreInput,
     tracked: &TrackedCells,
+    buckets: &GuestRootBuckets,
     depth_of: &dyn Fn(&str) -> Option<SourceDepth>,
     on_main_of: &dyn Fn(&str) -> Option<bool>,
     committed_of: &dyn Fn(&str) -> Result<Option<CommittedParityCells>, String>,
@@ -7277,6 +7396,9 @@ fn summarize_parity(
                     shas.len(),
                     shas.iter().map(String::as_str).collect::<Vec<_>>().join(", ")
                 ));
+            }
+            if let Some(problem) = parity_guest_root_problem(buckets, &row) {
+                return Err(problem);
             }
             Ok((row, instant))
         });
@@ -7714,6 +7836,7 @@ fn parity_summary_without_store(tracked: &TrackedCells) -> ParitySummary {
     summarize_parity(
         &ParityStoreInput::default(),
         tracked,
+        &GuestRootBuckets::none(),
         &|_| None,
         &|_| None,
         &|_| Ok(None),
@@ -7726,21 +7849,25 @@ fn parity_summary_without_store(tracked: &TrackedCells) -> ParitySummary {
 /// at most six, however many runs it holds ([`ParityCommitFacts`], and the
 /// tool's own commit, which only `scorecard/parity.json` records).
 ///
-/// The only error is the ledger's own location ([`ledger_root`]), which the
-/// determinism files need as well. A store that cannot be read is refused in
-/// the summary instead ([`parity_store_input`]). When the managed checkout
+/// The only errors are the ledger's own location ([`ledger_root`]), which the
+/// determinism files need as well, and manifests that cannot say which buckets
+/// require a guest root ([`GuestRootBuckets::load`]), without which no row can
+/// be admitted. A store that cannot be read is refused in the summary instead
+/// ([`parity_store_input`]). When the managed checkout
 /// cannot place the runs against main ([`parity_main_checkout`],
 /// [`git_commits_off_main`]), every run's place is unknown and ranks as a main
 /// run, as the "last tested at" line treats an unknown ancestry; ledger
 /// publication does not stop for a headline's order.
 fn load_parity_summary(root: &Path, tracked: &TrackedCells) -> Result<ParitySummary, String> {
     let ledger = ledger_root(root, false)?;
+    let buckets = GuestRootBuckets::load(root)?;
     let input = parity_store_input(&ledger);
     let main = parity_main_checkout(&ledger);
     let facts = ParityCommitFacts::read(root, main.as_deref(), &parity_store_shas(&input));
     let mut summary = summarize_parity(
         &input,
         tracked,
+        &buckets,
         &|sha| facts.depth(sha),
         &|sha| facts.on_main(sha),
         &|sha| facts.committed(sha),
@@ -9787,6 +9914,7 @@ fn admitted_match_report(report: &canonical_verdict::VerificationReport) -> bool
 }
 
 fn apply_pressure_summary(
+    buckets: &GuestRootBuckets,
     tracked: &mut TrackedCells,
     summary: &PressureSummary,
     head: &str,
@@ -9880,6 +10008,13 @@ fn apply_pressure_summary(
             ));
             continue;
         };
+        // A pressure summary records no guest root, so it cannot stand for a
+        // cell whose bucket requires one. Enforced here, in the fold every
+        // pressure writer shares, so no writer path can skip it.
+        if let Some(problem) = pressure_guest_root_problem(buckets, &tracked.cells[index].id) {
+            skipped.push((display_id(&row.cell), problem));
+            continue;
+        }
         // REFUSAL REMOVED BY OWNER RULING. This used to refuse any row whose
         // cell was green, on the grounds that "ordinary validate owns green
         // evidence". Two things were wrong with it. It made the producer and
@@ -10353,7 +10488,8 @@ fn apply_validate_results_from(
                 .then(left.evidence_identity.cmp(&right.evidence_identity))
         });
         let mut distinct = Vec::with_capacity(classified.len());
-        let mut identities_by_attempt = BTreeMap::<(String, u64), (String, Option<String>)>::new();
+        let mut identities_by_attempt =
+            BTreeMap::<(String, u64), (String, RecordedGuestRoot, Option<String>)>::new();
         for (candidate, evidence) in classified {
             let key = (candidate.row.run_id.clone(), candidate.row.attempt);
             let classification_identity = (candidate.row.result.is_some()
@@ -10367,8 +10503,9 @@ fn apply_validate_results_from(
                 .map_err(|error| format!("cannot encode row classification: {error}"))
             })
             .transpose()?;
-            if let Some((identity, classification)) = identities_by_attempt.get(&key) {
+            if let Some((identity, root, classification)) = identities_by_attempt.get(&key) {
                 if identity == &candidate.evidence_identity
+                    && *root == candidate.row.recorded_guest_root()
                     && (classification.is_none()
                         || classification_identity.is_none()
                         || classification == &classification_identity)
@@ -10384,7 +10521,11 @@ fn apply_validate_results_from(
             }
             identities_by_attempt.insert(
                 key,
-                (candidate.evidence_identity.clone(), classification_identity),
+                (
+                    candidate.evidence_identity.clone(),
+                    candidate.row.recorded_guest_root(),
+                    classification_identity,
+                ),
             );
             distinct.push((candidate, evidence));
         }
@@ -10743,6 +10884,7 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
     let detcore_tree = git_rev_parse(root, "HEAD:detcore")?;
     let census = CurrentResultCensus::open(results)?;
     let rows = read_result_candidate_files(&census.inputs(), &head)?;
+    require_recorded_guest_roots(root, rows.values().flatten())?;
     let series = snapshot_series_source(&ledger_root(root, false)?.join("series"))?;
     let events = read_series_rows(&series)?;
     // The same audit the snapshot refresh applies: a series event covering one
@@ -10983,6 +11125,7 @@ fn import_results(
     let retained_cell_count = retained_comparison_cell_count(&retained_cells);
     let (stripped_pass_cells, stripped_pass_rows) = retained_stripped_pass_counts(&retained_cells);
     let current = read_current_pressure_evidence(root, current_summaries, &before)?;
+    let buckets = GuestRootBuckets::load(root)?;
     let mut tracked = tracked_from(&derived, Some(before.clone()), None, false)?;
     // The removal below runs before the fold, so it must not remove a
     // canonical comparison that this input cannot replace.
@@ -11020,6 +11163,7 @@ fn import_results(
             };
             let depth = BTreeMap::from([("hermit".to_string(), hermit_depth)]);
             apply_pressure_summary(
+                &buckets,
                 &mut tracked,
                 &current_result.summary,
                 &current_result.summary.hermit_sha,
@@ -11423,6 +11567,7 @@ fn update_observations(
     let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
     reconcile_history_catalogue(root, &mut tracked)?;
     let before = tracked.clone();
+    let buckets = GuestRootBuckets::load(root)?;
     let mut changed_cells = BTreeSet::new();
     let mut total_rows = 0usize;
     let mut total_skipped = 0usize;
@@ -11469,6 +11614,7 @@ fn update_observations(
             .map(|cell| cell.last_tested.clone())
             .collect::<Vec<_>>();
         let outcome = apply_pressure_summary(
+            &buckets,
             &mut tracked,
             &summary,
             expected_head,
@@ -11550,8 +11696,14 @@ fn project_observations(root: &Path, series_root: &Path, refreshed_at: &str) -> 
         .filter(|row| !representation.represented_event_ids.contains(&row.event_id))
         .cloned()
         .collect::<Vec<_>>();
-    let mut projection =
-        apply_series_rows(root, &mut tracked, &unrepresented, Some(&snapshot.source))?;
+    let buckets = GuestRootBuckets::load(root)?;
+    let mut projection = apply_series_rows(
+        &buckets,
+        root,
+        &mut tracked,
+        &unrepresented,
+        Some(&snapshot.source),
+    )?;
     projection.represented_rows += representation.represented_event_ids.len();
     let skipped = &projection.skipped;
 
@@ -12283,6 +12435,7 @@ where
     let depth = source_depths(root, measured)?;
     let census = CurrentResultCensus::open(results)?;
     let result_rows = read_result_candidate_files(&census.inputs(), measured)?;
+    require_recorded_guest_roots(root, result_rows.values().flatten())?;
     let finalized = options
         .finalized
         .as_ref()
@@ -12365,7 +12518,9 @@ where
         })
         .cloned()
         .collect::<Vec<_>>();
+    let buckets = GuestRootBuckets::load(root)?;
     let _initial_projection = apply_series_rows(
+        &buckets,
         root,
         &mut tracked,
         &initial_rows,
@@ -12454,6 +12609,7 @@ where
         .cloned()
         .collect::<Vec<_>>();
     let projection = apply_series_rows(
+        &buckets,
         root,
         &mut tracked,
         &projected_rows,
@@ -13939,6 +14095,11 @@ fn retained_binding_candidates(
     Ok(by_source)
 }
 
+/// Bind the selected lines of retained result files to the series attempts
+/// they witness (`import-results --bind-attempts-only`). Every selected row
+/// first passes [`require_recorded_guest_roots`], as it does in every other
+/// reader, so a row of a `guest_root: pinned` bucket that ran in another root
+/// binds nothing.
 fn bind_retained_attempts(root: &Path, inputs: &[RetainedBindingInput]) -> Result<(), String> {
     let _lock = acquire_history_write_lock(root)?;
     let worktree = observation_worktree_state(root)?;
@@ -13963,6 +14124,12 @@ fn bind_retained_attempts(root: &Path, inputs: &[RetainedBindingInput]) -> Resul
         .map(|(path, bytes)| (path.clone(), bytes.as_slice()))
         .collect::<Vec<_>>();
     let candidates = retained_binding_candidates(&selected_inputs)?;
+    require_recorded_guest_roots(
+        root,
+        candidates
+            .values()
+            .flat_map(|cells| cells.values().flatten()),
+    )?;
     let ledger = ledger_root(root, false)?;
     let source = snapshot_series_source(&ledger.join("series"))?;
     let events = read_series_rows(&source)?;
@@ -15427,18 +15594,26 @@ fn remove_replaceable_projected_observations(
 }
 
 fn apply_series_rows(
+    buckets: &GuestRootBuckets,
     ambient_git_root: &Path,
     tracked: &mut TrackedCells,
     rows: &[SeriesRow],
     projection_source: Option<&str>,
 ) -> Result<ProjectObservationsOutcome, String> {
     let mut updated = tracked.clone();
-    let outcome = apply_series_rows_inner(ambient_git_root, &mut updated, rows, projection_source)?;
+    let outcome = apply_series_rows_inner(
+        buckets,
+        ambient_git_root,
+        &mut updated,
+        rows,
+        projection_source,
+    )?;
     *tracked = updated;
     Ok(outcome)
 }
 
 fn apply_series_rows_inner(
+    buckets: &GuestRootBuckets,
     _ambient_git_root: &Path,
     tracked: &mut TrackedCells,
     rows: &[SeriesRow],
@@ -15481,6 +15656,21 @@ fn apply_series_rows_inner(
         }
         let cell_index = indices[0];
         let cell = &tracked.cells[cell_index];
+        // A series event records no guest root, so it cannot stand for a cell
+        // whose bucket requires one. Such a cell's evidence is admitted only
+        // from a result row that ran in that root; an event for the same
+        // attempt is already represented by that row and never reaches here.
+        if let Some(required) = buckets.required(&cell.id.category) {
+            skipped.push(format!(
+                "{label}: {} is in bucket {}, which requires guest_root {}, and a series event \
+                 records no guest root; only a result row admitted in that root can stand for \
+                 the cell (https://github.com/rrnewton/hermit/issues/3712)",
+                display_id(&cell.id),
+                cell.id.category,
+                required.as_str()
+            ));
+            continue;
+        }
         let provenance = series_provenance(row.producer);
         let evidence = match series_evidence(row, &cell.id) {
             Some(evidence) => evidence,
@@ -16679,13 +16869,15 @@ fn verify_results(
     root: &Path,
     result_root: &Path,
     lanes: &BTreeSet<String>,
-    excluded_backends: &BTreeSet<String>,
+    exclusions: &VerifyExclusions,
 ) -> Result<(), String> {
     let derived = derive(root)?;
     let head = git_head(root)?;
-    let (expected, omitted) = select_verified_cells(&derived.selected, lanes, excluded_backends)?;
+    let selection = select_verified_cells(&derived.selected, lanes, exclusions)?;
+    let expected = &selection.expected;
     let candidates = read_result_candidates(result_root, &head)?;
-    let admission = verify_candidate_set(&expected, candidates)?;
+    require_recorded_guest_roots(root, candidates.values().flatten())?;
+    let admission = verify_candidate_set(expected, candidates)?;
     let admitted = admission.passed + admission.diagnostic_failures.len();
     if admitted != expected.len() {
         return Err(format!(
@@ -16716,49 +16908,102 @@ fn verify_results(
     for line in below_l2_summary(&admission) {
         println!("{line}");
     }
-    if !excluded_backends.is_empty() {
-        println!(
-            "Omitted by --exclude-backend {}: {omitted} selected cells were not required and are not counted as passed.",
-            excluded_backends
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(",")
-        );
+    for line in exclusion_summary(exclusions, &selection) {
+        println!("{line}");
     }
     println!("Result directory: {}", result_root.display());
     Ok(())
 }
 
+/// The populations `verify-results` leaves out of the required set: whole
+/// Hermit backends (`--exclude-backend`) and whole manifest categories
+/// (`--exclude-category`).
+#[derive(Debug, Default)]
+struct VerifyExclusions {
+    backends: BTreeSet<String>,
+    categories: BTreeSet<String>,
+}
+
+/// The required population of one `verify-results` call, and how many selected
+/// cells each exclusion flag removed from it. A cell that both flags name is
+/// counted once, under `--exclude-category`.
+#[derive(Debug)]
+struct VerifiedSelection {
+    expected: BTreeSet<CellId>,
+    omitted_by_category: usize,
+    omitted_by_backend: usize,
+}
+
+/// The "Omitted by ..." lines printed after a passing `verify-results`, one per
+/// exclusion flag that was given.
+fn exclusion_summary(exclusions: &VerifyExclusions, selection: &VerifiedSelection) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (flag, values, omitted) in [
+        (
+            "--exclude-category",
+            &exclusions.categories,
+            selection.omitted_by_category,
+        ),
+        (
+            "--exclude-backend",
+            &exclusions.backends,
+            selection.omitted_by_backend,
+        ),
+    ] {
+        if !values.is_empty() {
+            lines.push(format!(
+                "Omitted by {flag} {}: {omitted} selected cells were not required and are not counted as passed.",
+                values.iter().cloned().collect::<Vec<_>>().join(",")
+            ));
+        }
+    }
+    lines
+}
+
 /// Split the selected cells in `lanes` into the required population and the
-/// number omitted by `excluded_backends`. Each excluded backend must name at
-/// least one selected cell, so a stale exclusion cannot linger unnoticed.
+/// numbers omitted by each exclusion. Each excluded category must name at
+/// least one selected cell, and each excluded backend at least one cell the
+/// category exclusions left, so a stale exclusion cannot linger unnoticed.
 fn select_verified_cells(
     selected: &BTreeSet<CellId>,
     lanes: &BTreeSet<String>,
-    excluded_backends: &BTreeSet<String>,
-) -> Result<(BTreeSet<CellId>, usize), String> {
+    exclusions: &VerifyExclusions,
+) -> Result<VerifiedSelection, String> {
     let in_lanes = selected
         .iter()
         .filter(|id| lanes.contains(&id.lane))
         .collect::<Vec<_>>();
-    for backend in excluded_backends {
-        if !in_lanes.iter().any(|id| id.backend == *backend) {
+    for category in &exclusions.categories {
+        if !in_lanes.iter().any(|id| id.category == *category) {
+            return Err(format!(
+                "--exclude-category {category} matches no selected cell in the named lanes"
+            ));
+        }
+    }
+    let after_categories = in_lanes
+        .iter()
+        .filter(|id| !exclusions.categories.contains(&id.category))
+        .collect::<Vec<_>>();
+    for backend in &exclusions.backends {
+        if !after_categories.iter().any(|id| id.backend == *backend) {
             return Err(format!(
                 "--exclude-backend {backend} matches no selected cell in the named lanes"
             ));
         }
     }
-    let expected = in_lanes
+    let expected = after_categories
         .iter()
-        .filter(|id| !excluded_backends.contains(&id.backend))
-        .map(|id| (*id).clone())
+        .filter(|id| !exclusions.backends.contains(&id.backend))
+        .map(|id| (**id).clone())
         .collect::<BTreeSet<_>>();
     if expected.is_empty() {
         return Err("selected lanes contain no regression cells".into());
     }
-    let omitted = in_lanes.len() - expected.len();
-    Ok((expected, omitted))
+    Ok(VerifiedSelection {
+        omitted_by_category: in_lanes.len() - after_categories.len(),
+        omitted_by_backend: after_categories.len() - expected.len(),
+        expected,
+    })
 }
 
 /// The lines that keep stripped passes and diagnostic failures visible beside
@@ -17101,6 +17346,251 @@ mod local_rev_parse_tests {
     }
 }
 
+/// Admission of result rows by the guest root they record.
+///
+/// A `guest_root: pinned` bucket (`tests/e2e/manifests/compat-pinned.yaml`)
+/// exists so that its verdicts never depend on the validating host's programs
+/// or libc (<https://github.com/rrnewton/hermit/issues/3712>). The test
+/// harness refuses to run such a bucket anywhere else, and its import mode
+/// refuses a row that ran anywhere else. This applies the same rule where the
+/// scorecard reads result rows, so that a row from another producer, an edited
+/// row, or a row copied between result directories cannot count a host
+/// guest's verdict for a pinned cell. A row of such a bucket is admitted only
+/// when it records `guest_root: pinned` and the `guest_root_identity` that the
+/// [`IMAGE_PATHS_FILE`] of its own commit gives, or when it records no root
+/// and carries no guest evidence at all ([`ResultRow::is_guestless_error`]):
+/// an import-mode error row, which ran no guest and carries no verdict. A row
+/// of any other bucket is admitted whatever root it records. Which buckets
+/// require a root is read from the checkout's manifests, the same tree that
+/// selects the cells.
+///
+/// The root is deliberately NOT part of [`ResultRow::evidence_identity`].
+/// That identity is a cross-repository contract: dev-hermit's
+/// `ci-hub/series/series.py` (`_cell_result_evidence_sha256`) recomputes it
+/// byte for byte from an explicit key list, and series events record it, so
+/// binding the root on this side alone would make every pinned row's identity
+/// disagree with its series events. Instead every reader applies this policy
+/// to every row before it uses the row's identity, and the duplicate and
+/// distinctness comparisons that key on the identity also compare
+/// [`ResultRow::recorded_guest_root`].
+struct GuestRootPolicy {
+    manifests: ManifestSet,
+    /// For each commit of a row that needs one, the [`ImagePaths::identity`]
+    /// that the commit's listing gives, or why it gives none.
+    identities: BTreeMap<String, Result<String, String>>,
+}
+
+impl GuestRootPolicy {
+    /// The policy for `rows`: the manifests of the checkout at `root`, and the
+    /// pinned-root identity of every commit that one of `rows` in a
+    /// `guest_root: pinned` bucket names.
+    fn load<'a>(
+        root: &Path,
+        rows: impl IntoIterator<Item = &'a ResultRow>,
+    ) -> Result<Self, String> {
+        let manifests = ManifestSet::load(root).map_err(|error| {
+            format!("cannot read which manifest buckets require a guest root: {error}")
+        })?;
+        let commits = rows
+            .into_iter()
+            .filter(|row| manifests.required_guest_root(&row.category) == Some(GuestRoot::Pinned))
+            .map(|row| row.hermit_sha.clone())
+            .collect::<BTreeSet<_>>();
+        let identities = pinned_root_identities_at(root, &commits)?;
+        Ok(Self {
+            manifests,
+            identities,
+        })
+    }
+
+    /// `Err` says why `row` cannot be admitted; the message continues a
+    /// sentence whose subject is the row.
+    fn check(&self, row: &ResultRow) -> Result<(), String> {
+        let Some(required) = self.manifests.required_guest_root(&row.category) else {
+            return Ok(());
+        };
+        match row.guest_root {
+            Some(recorded) if recorded == required => {}
+            None if row.is_guestless_error() => return Ok(()),
+            None if row.outcome == "ERROR" => {
+                return Err(format!(
+                    "is in bucket {}, which requires guest_root {}, but the row records no \
+                     root while carrying guest or comparison evidence (a result, an attempt, \
+                     a backend-parity report, a divergence position or a command line); only \
+                     an ERROR row with none of those may omit its root",
+                    row.category,
+                    required.as_str()
+                ));
+            }
+            recorded => {
+                return Err(format!(
+                    "is in bucket {}, which requires guest_root {}, but the row ran in {}",
+                    row.category,
+                    required.as_str(),
+                    recorded.map_or("an unrecorded root", GuestRoot::as_str)
+                ));
+            }
+        }
+        if required != GuestRoot::Pinned {
+            return Ok(());
+        }
+        match self.identities.get(&row.hermit_sha) {
+            Some(Ok(expected)) if row.guest_root_identity.as_deref() == Some(expected.as_str()) => {
+                Ok(())
+            }
+            Some(Ok(expected)) => Err(format!(
+                "is in bucket {}, which requires the pinned root that {} records (identity \
+                 {expected}), but the row verified {}",
+                row.category,
+                row.hermit_sha,
+                row.guest_root_identity.as_deref().unwrap_or("no identity")
+            )),
+            Some(Err(why)) => Err(format!(
+                "is in bucket {}, which requires the pinned root that {} records, and that \
+                 root cannot be read: {why}",
+                row.category, row.hermit_sha
+            )),
+            None => Err(format!(
+                "is in bucket {}, which requires the pinned root that {} records, and that \
+                 commit's listing was not read",
+                row.category, row.hermit_sha
+            )),
+        }
+    }
+}
+
+/// The [`ImagePaths::identity`] that each commit's [`IMAGE_PATHS_FILE`] gives,
+/// checked against the image its [`IMAGE_DIGEST_FILE`] pins exactly as
+/// [`ImagePaths::load`] checks a checkout, or why a commit gives none. Read
+/// from this clone's object store with one `git cat-file --batch`.
+fn pinned_root_identities_at(
+    root: &Path,
+    commits: &BTreeSet<String>,
+) -> Result<BTreeMap<String, Result<String, String>>, String> {
+    let mut identities = BTreeMap::new();
+    let mut asked = Vec::new();
+    let mut names = Vec::new();
+    for commit in commits {
+        if !is_object_id(commit) {
+            identities.insert(
+                commit.clone(),
+                Err(format!("`{commit}` is not a commit id")),
+            );
+            continue;
+        }
+        names.push(format!("{commit}:{IMAGE_PATHS_FILE}"));
+        names.push(format!("{commit}:{IMAGE_DIGEST_FILE}"));
+        asked.push(commit);
+    }
+    if asked.is_empty() {
+        return Ok(identities);
+    }
+    let answers = git_cat_file_batch(root, &names)?
+        .ok_or_else(|| format!("git cat-file --batch failed in {}", root.display()))?;
+    for (commit, pair) in asked.into_iter().zip(answers.chunks(2)) {
+        let file = |answer: &Option<(String, Vec<u8>)>, path: &str| match answer {
+            Some((kind, bytes)) if kind == "blob" => String::from_utf8(bytes.clone())
+                .map_err(|_| format!("{commit}:{path} is not UTF-8")),
+            Some((kind, _)) => Err(format!("{commit}:{path} is a {kind}, not a file")),
+            None => Err(format!("{commit} has no {path} in this clone")),
+        };
+        let identity = file(&pair[0], IMAGE_PATHS_FILE).and_then(|listing| {
+            let pinned = file(&pair[1], IMAGE_DIGEST_FILE)?;
+            let listing = ImagePaths::parse(&listing)?;
+            listing.require_image(pinned.trim())?;
+            Ok(listing.identity())
+        });
+        identities.insert(commit.clone(), identity);
+    }
+    Ok(identities)
+}
+
+/// Apply [`GuestRootPolicy`] to every candidate; `Err` names the first
+/// refused row's file and cell.
+fn require_recorded_guest_roots<'a>(
+    root: &Path,
+    candidates: impl IntoIterator<Item = &'a ResultCandidate>,
+) -> Result<(), String> {
+    let candidates = candidates.into_iter().collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let policy = GuestRootPolicy::load(root, candidates.iter().map(|candidate| &candidate.row))?;
+    for candidate in candidates {
+        policy.check(&candidate.row).map_err(|error| {
+            format!(
+                "{}: the result for {} {error}",
+                candidate.path.display(),
+                candidate
+                    .row
+                    .id()
+                    .map_or_else(|| candidate.row.test.clone(), |id| display_id(&id))
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Which manifest buckets require a guest root, and which one: the checkout's
+/// manifests read once, keyed the way [`ManifestSet::required_guest_root`]
+/// keys them (the first document of a bucket decides).
+///
+/// The pressure fold and the series projection consult it because neither a
+/// pressure summary nor a series event records the root its guest ran in, so
+/// neither can stand for a cell whose bucket requires one
+/// (<https://github.com/rrnewton/hermit/issues/3712>).
+struct GuestRootBuckets(BTreeMap<String, GuestRoot>);
+
+impl GuestRootBuckets {
+    /// The buckets of the checkout at `root`.
+    fn load(root: &Path) -> Result<Self, String> {
+        let manifests = ManifestSet::load(root).map_err(|error| {
+            format!("cannot read which manifest buckets require a guest root: {error}")
+        })?;
+        Ok(Self::of(&manifests))
+    }
+
+    fn of(manifests: &ManifestSet) -> Self {
+        let mut first = BTreeMap::new();
+        for document in &manifests.documents {
+            first
+                .entry(document.bucket.clone())
+                .or_insert(document.guest_root);
+        }
+        Self(
+            first
+                .into_iter()
+                .filter_map(|(bucket, required)| required.map(|required| (bucket, required)))
+                .collect(),
+        )
+    }
+
+    /// No bucket requires a root: for a caller with no summary or event to
+    /// check, and for fixtures whose cells belong to no such bucket.
+    fn none() -> Self {
+        Self(BTreeMap::new())
+    }
+
+    fn required(&self, category: &str) -> Option<GuestRoot> {
+        self.0.get(category).copied()
+    }
+}
+
+/// Why a pressure summary row cannot stand for `cell` when the cell's bucket
+/// requires a guest root: a pressure summary records none, and the pressure
+/// graph has no pinned-root producer, so such a row ran its guest on the host
+/// (<https://github.com/rrnewton/hermit/issues/3712>).
+fn pressure_guest_root_problem(buckets: &GuestRootBuckets, cell: &CellId) -> Option<String> {
+    let required = buckets.required(&cell.category)?;
+    Some(format!(
+        "{} is in bucket {}, which requires guest_root {}, and a pressure summary records no \
+         guest root",
+        display_id(cell),
+        cell.category,
+        required.as_str()
+    ))
+}
+
 fn read_result_candidates(
     root: &Path,
     head: &str,
@@ -17322,6 +17812,9 @@ fn read_retained_results(
         }
     }
 
+    // Before any row's evidence identity is used below.
+    require_recorded_guest_roots(root, grouped.values().flatten())?;
+
     // Repeatability, ptrace-reference parity and the below-L2 stripped pass
     // are different measurements. A newer result in one domain cannot
     // supersede a result in another.
@@ -17532,12 +18025,16 @@ fn select_retained_ordinary_attempt(
     sha: &str,
     candidates: Vec<ResultCandidate>,
 ) -> Result<Option<(ResultCandidate, RetainedComparisonDomain)>, String> {
-    let mut by_attempt = BTreeMap::<u64, BTreeMap<String, ResultCandidate>>::new();
+    let mut by_attempt =
+        BTreeMap::<u64, BTreeMap<(String, RecordedGuestRoot), ResultCandidate>>::new();
     for candidate in candidates {
         by_attempt
             .entry(candidate.row.attempt)
             .or_default()
-            .entry(candidate.evidence_identity.clone())
+            .entry((
+                candidate.evidence_identity.clone(),
+                candidate.row.recorded_guest_root(),
+            ))
             .or_insert(candidate);
     }
     let mut attempts = Vec::with_capacity(by_attempt.len());
@@ -17691,6 +18188,7 @@ fn admit_current_dbt_divergence_without_retained_logs(
 }
 
 fn checked_current_pressure_result(
+    buckets: &GuestRootBuckets,
     tracked: &TrackedCells,
     mut summary: PressureSummary,
     current_tree: &str,
@@ -17710,6 +18208,7 @@ fn checked_current_pressure_result(
         cell.measurement = MeasurementState::NeverMeasured;
     }
     apply_pressure_summary(
+        buckets,
         &mut checked,
         &summary,
         &summary.hermit_sha,
@@ -17746,6 +18245,12 @@ fn read_current_pressure_evidence(
     tracked: &TrackedCells,
 ) -> Result<CurrentPressureEvidence, String> {
     let current_tree = git_rev_parse(root, "HEAD:detcore")?;
+    // Read only when there is a summary to check, as the result readers do.
+    let buckets = if summaries.is_empty() {
+        GuestRootBuckets::none()
+    } else {
+        GuestRootBuckets::load(root)?
+    };
     let mut results: BTreeMap<CellId, Vec<CurrentPressureResult>> = BTreeMap::new();
     let mut uncheckable: BTreeMap<CellId, Vec<String>> = BTreeMap::new();
     let mut offered_rows = 0usize;
@@ -17789,6 +18294,13 @@ fn read_current_pressure_evidence(
                 uncheckable.entry(cell).or_default().push(problem.clone());
                 continue;
             }
+            if let Some(problem) = pressure_guest_root_problem(&buckets, &cell) {
+                uncheckable
+                    .entry(cell)
+                    .or_default()
+                    .push(format!("{}: {problem}", path.display()));
+                continue;
+            }
             let one = PressureSummary {
                 schema: summary.schema,
                 hermit_sha: summary.hermit_sha.clone(),
@@ -17796,7 +18308,7 @@ fn read_current_pressure_evidence(
                 source_tree_dirty: summary.source_tree_dirty,
                 rows: vec![row.clone()],
             };
-            match checked_current_pressure_result(tracked, one, &current_tree) {
+            match checked_current_pressure_result(&buckets, tracked, one, &current_tree) {
                 Ok(result) => {
                     results.entry(cell).or_default().push(result);
                 }
@@ -18424,7 +18936,10 @@ fn verify_candidate_set(
             .filter(|candidate| candidate.row.attempt == terminal_attempt)
         {
             distinct
-                .entry(candidate.evidence_identity.as_str())
+                .entry((
+                    candidate.evidence_identity.as_str(),
+                    candidate.row.recorded_guest_root(),
+                ))
                 .or_insert(candidate);
         }
         if distinct.len() != 1 {
@@ -20395,6 +20910,8 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
             first_divergent_record: None,
             first_divergent_syscall: None,
             backend_parity: None,
+            guest_root: None,
+            guest_root_identity: None,
             expected_guest_exit: None,
             attempts: vec![{
                 let report = serde_json::to_string(&canonical_verdict::VerificationReport {
@@ -22126,6 +22643,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         invocation.run_id = "fixture-pass-rep1-attempt2".into();
     }
     let retried_outcome = apply_pressure_summary(
+        &GuestRootBuckets::none(),
         &mut retried,
         &pressure_summary("sha-1", "tree-1", vec![first_attempt, second_attempt]),
         "sha-1",
@@ -22167,12 +22685,26 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
             pressure_repeat(4, "replay-failure", Some(30), Some(1000)),
         ],
     );
-    apply_pressure_summary(&mut observed, &campaign, "sha-1", "tree-1", &depth_fixture)
-        .map_err(|e| format!("pressure-observation campaign bracket failed: {e}"))?;
+    apply_pressure_summary(
+        &GuestRootBuckets::none(),
+        &mut observed,
+        &campaign,
+        "sha-1",
+        "tree-1",
+        &depth_fixture,
+    )
+    .map_err(|e| format!("pressure-observation campaign bracket failed: {e}"))?;
     let once = encoded_cells(&observed)?;
     let mut repeated = observed.clone();
-    apply_pressure_summary(&mut repeated, &campaign, "sha-1", "tree-1", &depth_fixture)
-        .map_err(|e| format!("repeated pressure-observation bracket failed: {e}"))?;
+    apply_pressure_summary(
+        &GuestRootBuckets::none(),
+        &mut repeated,
+        &campaign,
+        "sha-1",
+        "tree-1",
+        &depth_fixture,
+    )
+    .map_err(|e| format!("repeated pressure-observation bracket failed: {e}"))?;
     let twice = encoded_cells(&repeated)?;
     if twice != once {
         let first_difference = once
@@ -22191,6 +22723,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
     let mut stored_once: TrackedCells = serde_json::from_str(&once)
         .map_err(|error| format!("cannot reload stored pressure observation: {error}"))?;
     apply_pressure_summary(
+        &GuestRootBuckets::none(),
         &mut stored_once,
         &campaign,
         "sha-1",
@@ -22240,8 +22773,15 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         let legacy_bytes = encoded_cells(&legacy)?;
         let mut reloaded: TrackedCells = serde_json::from_str(&legacy_bytes)
             .map_err(|error| format!("cannot reload legacy pressure fixture: {error}"))?;
-        apply_pressure_summary(&mut reloaded, &campaign, "sha-1", "tree-1", &depth_fixture)
-            .map_err(|error| format!("legacy pressure reimport failed: {error}"))?;
+        apply_pressure_summary(
+            &GuestRootBuckets::none(),
+            &mut reloaded,
+            &campaign,
+            "sha-1",
+            "tree-1",
+            &depth_fixture,
+        )
+        .map_err(|error| format!("legacy pressure reimport failed: {error}"))?;
         if encoded_cells(&reloaded)? != legacy_bytes {
             return Err(format!(
                 "reimport changed legacy pressure evidence or duplicated coordinates (command fields {legacy_fields})"
@@ -22286,6 +22826,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
     }
     let same_engine = pressure_summary("sha-doc", "tree-1", vec![pressure_row("pass", None, None)]);
     apply_pressure_summary(
+        &GuestRootBuckets::none(),
         &mut observed,
         &same_engine,
         "sha-doc",
@@ -22518,6 +23059,8 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         first_divergent_record: Some(12),
         first_divergent_syscall: Some(9),
         backend_parity: None,
+        guest_root: None,
+        guest_root_identity: None,
         expected_guest_exit: None,
         attempts: vec![validate_attempt("FAIL")],
     };
@@ -23194,6 +23737,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
     ];
     let uncheckable_summary = pressure_summary("sha-1", "tree-1", vec![uncheckable_row]);
     let uncheckable_error = checked_current_pressure_result(
+        &GuestRootBuckets::none(),
         &TrackedCells {
             schema: SCHEMA,
             projection: None,
@@ -23242,6 +23786,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
     dbt_row.cell = dbt_id.clone();
     dbt_row.evidence_errors = vec![MISSING_RETAINED_VERIFY_LOGS.into()];
     let admitted_dbt = checked_current_pressure_result(
+        &GuestRootBuckets::none(),
         &dbt_tracked,
         pressure_summary("sha-1", "tree-1", vec![dbt_row.clone()]),
         "tree-1",
@@ -23262,6 +23807,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         .evidence_errors
         .push("second evidence error".into());
     if checked_current_pressure_result(
+        &GuestRootBuckets::none(),
         &dbt_tracked,
         pressure_summary("sha-1", "tree-1", vec![extra_error]),
         "tree-1",
@@ -23278,6 +23824,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         .expect("fixture report has comparison")
         .strictness = canonical_verdict::LogCompareStrictness::Stripped;
     if checked_current_pressure_result(
+        &GuestRootBuckets::none(),
         &dbt_tracked,
         pressure_summary("sha-1", "tree-1", vec![weak_dbt]),
         "tree-1",
@@ -23361,6 +23908,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         );
     }
     if checked_current_pressure_result(
+        &GuestRootBuckets::none(),
         &TrackedCells {
             schema: SCHEMA,
             projection: None,
@@ -24720,6 +25268,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
 
         let mut projected_seed = combined_baseline_cells.clone();
         apply_series_rows(
+            &GuestRootBuckets::none(),
             &result_command_root,
             &mut projected_seed,
             std::slice::from_ref(&series_row),
@@ -29263,6 +29812,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         vec![pressure_row("crash-error", None, None)],
     );
     apply_pressure_summary(
+        &GuestRootBuckets::none(),
         &mut observed,
         &next_source,
         "sha-2",
@@ -29306,6 +29856,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
     dirty.source_tree_dirty = true;
     let mut refusal_target = observed.clone();
     if apply_pressure_summary(
+        &GuestRootBuckets::none(),
         &mut refusal_target,
         &dirty,
         "sha-1",
@@ -29317,6 +29868,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         return Err("dirty pressure observations were accepted".into());
     }
     if apply_pressure_summary(
+        &GuestRootBuckets::none(),
         &mut refusal_target,
         &first,
         "wrong-sha",
@@ -29325,6 +29877,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
     )
     .is_ok()
         || apply_pressure_summary(
+            &GuestRootBuckets::none(),
             &mut refusal_target,
             &first,
             "sha-1",
@@ -29338,6 +29891,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
     let mut missing_invocation = first.clone();
     missing_invocation.rows[0].invocation = None;
     if apply_pressure_summary(
+        &GuestRootBuckets::none(),
         &mut refusal_target,
         &missing_invocation,
         "sha-1",
@@ -29362,6 +29916,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         }],
     );
     if apply_pressure_summary(
+        &GuestRootBuckets::none(),
         &mut refusal_target,
         &infrastructure,
         "sha-1",
@@ -29378,6 +29933,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         vec![pressure_row("sandbox-denied", None, None)],
     );
     if apply_pressure_summary(
+        &GuestRootBuckets::none(),
         &mut refusal_target,
         &sandbox_denied,
         "sha-1",
@@ -29408,6 +29964,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
     ];
     let mut batched = observed.clone();
     let batch_outcome = apply_pressure_summary(
+        &GuestRootBuckets::none(),
         &mut batched,
         &pressure_summary("sha-1", "tree-1", batch_rows.clone()),
         "sha-1",
@@ -29419,6 +29976,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
     let mut singly_skipped = 0usize;
     for row in batch_rows {
         match apply_pressure_summary(
+            &GuestRootBuckets::none(),
             &mut singly,
             &pressure_summary("sha-1", "tree-1", vec![row]),
             "sha-1",
@@ -29473,6 +30031,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         verification.first_divergent_record = record;
         verification.first_divergent_syscall = syscall;
         if apply_pressure_summary(
+            &GuestRootBuckets::none(),
             &mut refusal_target,
             &pressure_summary("sha-1", "tree-1", vec![contradictory]),
             "sha-1",
@@ -29492,9 +30051,15 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
     // harder than validate did and finding it red.
     let mut green_target = observed.clone();
     green_target.cells[0].status = CellStatus::Green;
-    let green_outcome =
-        apply_pressure_summary(&mut green_target, &first, "sha-1", "tree-1", &depth_fixture)
-            .map_err(|e| format!("green-cell admission bracket failed: {e}"))?;
+    let green_outcome = apply_pressure_summary(
+        &GuestRootBuckets::none(),
+        &mut green_target,
+        &first,
+        "sha-1",
+        "tree-1",
+        &depth_fixture,
+    )
+    .map_err(|e| format!("green-cell admission bracket failed: {e}"))?;
     if green_outcome.rows != 1 || !green_outcome.skipped.is_empty() {
         return Err("a green cell was not admitted on equal terms with a red one".into());
     }
@@ -29537,6 +30102,8 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         first_divergent_record: None,
         first_divergent_syscall: None,
         backend_parity: None,
+        guest_root: None,
+        guest_root_identity: None,
         expected_guest_exit: None,
         attempts: vec![serde_json::json!({
             "argv":["fixture"],
@@ -30062,6 +30629,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         None,
     );
     let native_outcome = apply_series_rows(
+        &GuestRootBuckets::none(),
         &root,
         &mut native_projection,
         &[
@@ -30109,6 +30677,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
     let native_only_before = serde_json::to_vec(&native_only)
         .map_err(|error| format!("cannot encode native-only atomicity fixture: {error}"))?;
     let native_only_error = apply_series_rows(
+        &GuestRootBuckets::none(),
         &root,
         &mut native_only,
         &[series_row(
@@ -30182,7 +30751,13 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
             None,
         ),
     ];
-    let projected = apply_series_rows(&root, &mut projected_from_series, &projection_rows, None)?;
+    let projected = apply_series_rows(
+        &GuestRootBuckets::none(),
+        &root,
+        &mut projected_from_series,
+        &projection_rows,
+        None,
+    )?;
     let projected_cell = &projected_from_series.cells[0];
     if projected.cells != 1
         || projected.rows != 2
@@ -30262,7 +30837,13 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         None,
     );
     older_row.series.tree = older_hermit_tree;
-    apply_series_rows(&root, &mut preserve_newer, &[older_row], None)?;
+    apply_series_rows(
+        &GuestRootBuckets::none(),
+        &root,
+        &mut preserve_newer,
+        &[older_row],
+        None,
+    )?;
     if preserve_newer.cells[0].last_tested.as_ref() != Some(&current_last_tested) {
         return Err("older series history replaced a newer imported last_tested record".into());
     }
@@ -30420,7 +31001,13 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         }
     }
 
-    let preserved = apply_series_rows(&root, &mut preserve_import, &[current_validate_row], None)?;
+    let preserved = apply_series_rows(
+        &GuestRootBuckets::none(),
+        &root,
+        &mut preserve_import,
+        &[current_validate_row],
+        None,
+    )?;
     if preserved.represented_rows != 1 || preserved.replaced_observations != 0 {
         return Err(format!(
             "stable source event did not map one-to-one to preserved evidence: {preserved:?}"
@@ -30462,9 +31049,15 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
     );
     wrong_attempt.run_id = "fixture-attempt-collision".into();
     wrong_attempt.series.attempt = Some(2);
-    if !apply_series_rows(&root, &mut attempt_collision, &[wrong_attempt], None)
-        .expect_err("same-run different-attempt evidence was accepted")
-        .contains("records outer attempt 2")
+    if !apply_series_rows(
+        &GuestRootBuckets::none(),
+        &root,
+        &mut attempt_collision,
+        &[wrong_attempt],
+        None,
+    )
+    .expect_err("same-run different-attempt evidence was accepted")
+    .contains("records outer attempt 2")
     {
         return Err("same-run different-attempt refusal lost its exact reason".into());
     }
@@ -30489,8 +31082,14 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         Some(fixture_detcore_tree.clone()),
         None,
     );
-    let no_comparison_error = apply_series_rows(&root, &mut no_comparison, &[no_result], None)
-        .expect_err("a no_result row was accepted as evidence");
+    let no_comparison_error = apply_series_rows(
+        &GuestRootBuckets::none(),
+        &root,
+        &mut no_comparison,
+        &[no_result],
+        None,
+    )
+    .expect_err("a no_result row was accepted as evidence");
     if !no_comparison_error.contains("fixture/boundary/verify/ptrace")
         || !no_comparison_error.contains("produced no comparison")
         || !no_comparison.cells[0].observations.is_empty()
@@ -30580,8 +31179,13 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
                 projection: None,
                 cells: vec![boundary_cell(Vec::new(), CellStatus::Green)],
             };
-            let outcome =
-                apply_series_rows(&root, &mut tracked, &captured_rows, Some(&snapshot.source))?;
+            let outcome = apply_series_rows(
+                &GuestRootBuckets::none(),
+                &root,
+                &mut tracked,
+                &captured_rows,
+                Some(&snapshot.source),
+            )?;
             tracked.projection = Some(ObservationProjection {
                 source: snapshot.source,
                 source_repository: None,
@@ -30834,7 +31438,14 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
                 cells: vec![boundary_cell(Vec::new(), CellStatus::Green)],
             };
             let before = serde_json::to_vec(&atomic).map_err(|e| e.to_string())?;
-            if apply_series_rows(&root, &mut atomic, &[container_series.clone(), bad], None).is_ok()
+            if apply_series_rows(
+                &GuestRootBuckets::none(),
+                &root,
+                &mut atomic,
+                &[container_series.clone(), bad],
+                None,
+            )
+            .is_ok()
                 || serde_json::to_vec(&atomic).map_err(|e| e.to_string())? != before
             {
                 return Err(format!(
@@ -30927,6 +31538,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
     let before_contradiction = serde_json::to_vec(&atomic_series)
         .map_err(|error| format!("cannot encode no-verdict atomicity fixture: {error}"))?;
     let contradiction = apply_series_rows(
+        &GuestRootBuckets::none(),
         &root,
         &mut atomic_series,
         &[series_unavailable, contradictory_timeout],
@@ -31004,7 +31616,13 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         wrong_team,
         empty_host,
     ];
-    let exact = apply_series_rows(&root, &mut exact_mapping, &exact_rows, None)?;
+    let exact = apply_series_rows(
+        &GuestRootBuckets::none(),
+        &root,
+        &mut exact_mapping,
+        &exact_rows,
+        None,
+    )?;
     if exact.rows != 2
         || exact.skipped.len() != 5
         || !exact.skipped[0].contains("no exact test/mode/backend match")
@@ -31153,7 +31771,13 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
             }),
             cells: vec![target_cell],
         };
-        let outcome = apply_series_rows(store, &mut target, &ambient_rows, Some(source_identity))?;
+        let outcome = apply_series_rows(
+            &GuestRootBuckets::none(),
+            store,
+            &mut target,
+            &ambient_rows,
+            Some(source_identity),
+        )?;
         refresh_measurement(&mut target);
         if outcome.rows != ambient_rows.len() || !outcome.skipped.is_empty() {
             return Err("object-store-independent projection dropped recorded rows".into());
@@ -31198,6 +31822,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
     }
     let mut repeated = projected_fixture.clone();
     let repeated_outcome = apply_series_rows(
+        &GuestRootBuckets::none(),
         &empty_store,
         &mut repeated,
         &ambient_rows,
@@ -31218,6 +31843,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         .event_ids
         .insert("foreign-series-event".into());
     if !apply_series_rows(
+        &GuestRootBuckets::none(),
         &empty_store,
         &mut foreign_event,
         &ambient_rows,
@@ -31894,6 +32520,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         // asserts on the message. Asserting Ok here would have quietly passed on
         // the wrong path.
         let refused = apply_pressure_summary(
+            &GuestRootBuckets::none(),
             &mut refused,
             &pressure_summary("sha-nc", "tree-nc", vec![no_report]),
             "sha-nc",
@@ -31925,6 +32552,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
             cells: vec![bare_cell(&id)],
         };
         let admitted_fold = apply_pressure_summary(
+            &GuestRootBuckets::none(),
             &mut admitted,
             &pressure_summary(
                 "sha-nc",
@@ -33840,6 +34468,59 @@ mod post_verdict_transaction_tests {
             format!("{:x}", Sha256::digest(report.as_bytes())).into();
         failed["attempts"][0]["verification_report"] = report.into();
         failed
+    }
+
+    /// Binding retained attempts applies the guest-root policy too: a row of
+    /// the `compat-pinned` bucket that ran on the host binds nothing and
+    /// leaves the history untouched, while the same row from the pinned root
+    /// its commit records passes the policy (and then stops only because this
+    /// fixture has no series ledger to bind it to).
+    #[test]
+    fn retained_bindings_refuse_a_pinned_bucket_row_from_another_root() {
+        let _fixture_lock = history_fixture_lock();
+        let fixture = Fixture::new();
+        let head = fixture.options.results_head.as_ref().unwrap().clone();
+        let identity = pinned_root_identities_at(&fixture.root, &BTreeSet::from([head.clone()]))
+            .unwrap()[&head]
+            .clone()
+            .unwrap();
+        let before = read_history_files(&fixture.root).unwrap();
+        let bind = |root: &str, identity: Option<&str>| {
+            let mut row = historical_retry_row(&head, &format!("pinned-from-{root}"), 1);
+            row["category"] = "compat-pinned".into();
+            row["guest_root"] = root.into();
+            if let Some(identity) = identity {
+                row["guest_root_identity"] = identity.into();
+            }
+            let mut raw = serde_json::to_vec(&row).unwrap();
+            raw.push(b'\n');
+            let path = fixture
+                ._directory
+                .path()
+                .join(format!("pinned-from-{root}.jsonl"));
+            fs::write(&path, &raw).unwrap();
+            bind_retained_attempts(
+                &fixture.root,
+                &[RetainedBindingInput {
+                    path,
+                    sha256: format!("{:x}", Sha256::digest(&raw)),
+                    lines: BTreeSet::from([1]),
+                }],
+            )
+            .unwrap_err()
+        };
+        let error = bind("host", None);
+        assert!(
+            error.contains(
+                "is in bucket compat-pinned, which requires guest_root pinned, but the row ran \
+                 in host"
+            ),
+            "{error}"
+        );
+        assert!(read_history_files(&fixture.root).unwrap() == before);
+        let error = bind("pinned", Some(&identity));
+        assert!(!error.contains("is in bucket compat-pinned"), "{error}");
+        assert!(read_history_files(&fixture.root).unwrap() == before);
     }
 
     #[test]
@@ -39091,6 +39772,7 @@ mod post_verdict_transaction_tests {
             );
             let mut tracked = review3655_red_cell(&id);
             let error = apply_pressure_summary(
+                &GuestRootBuckets::none(),
                 &mut tracked,
                 &summary,
                 &measured,
@@ -39114,9 +39796,14 @@ mod post_verdict_transaction_tests {
                 rows: vec![summary.rows[0].clone()],
                 ..summary.clone()
             };
-            let error = checked_current_pressure_result(&review3655_red_cell(&id), one, "tree-1")
-                .err()
-                .unwrap_or_else(|| panic!("{label}: the current-summary reader admitted the row"));
+            let error = checked_current_pressure_result(
+                &GuestRootBuckets::none(),
+                &review3655_red_cell(&id),
+                one,
+                "tree-1",
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{label}: the current-summary reader admitted the row"));
             assert!(
                 error.contains("internally inconsistent"),
                 "{label}: {error}"
@@ -39133,9 +39820,15 @@ mod post_verdict_transaction_tests {
             );
             mixed.rows[1].verification = Some(report.clone());
             let mut tracked = review3655_red_cell(&id);
-            let outcome =
-                apply_pressure_summary(&mut tracked, &mixed, &measured, "tree-1", &BTreeMap::new())
-                    .unwrap();
+            let outcome = apply_pressure_summary(
+                &GuestRootBuckets::none(),
+                &mut tracked,
+                &mixed,
+                &measured,
+                "tree-1",
+                &BTreeMap::new(),
+            )
+            .unwrap();
             assert_eq!(outcome.rows, 1, "{label}");
             assert_eq!(outcome.skipped.len(), 1, "{label}");
             assert!(
@@ -39162,6 +39855,7 @@ mod post_verdict_transaction_tests {
                 review3655_pressure_passes(&id, &measured, "tree-1", &invocation, Some(report));
             let mut tracked = review3655_red_cell(&id);
             let outcome = apply_pressure_summary(
+                &GuestRootBuckets::none(),
                 &mut tracked,
                 &summary,
                 &measured,
@@ -39172,6 +39866,104 @@ mod post_verdict_transaction_tests {
             assert_eq!((outcome.rows, outcome.skipped.len()), (2, 0), "{label}");
             assert!(review3655_has_pressure_pass(&tracked.cells[0]), "{label}");
         }
+    }
+
+    /// A pressure summary records no guest root, so the fold every pressure
+    /// writer shares skips and names a row for a cell whose bucket requires
+    /// one (<https://github.com/rrnewton/hermit/issues/3712>). A summary made
+    /// only of such rows is refused and changes nothing, the current-summary
+    /// check refuses the row, and beside an admitted row it is skipped and
+    /// named while the admitted row is stored. Control: a requirement on
+    /// another bucket leaves the same rows admitted.
+    #[test]
+    fn the_pressure_fold_refuses_rows_for_a_pinned_bucket_cell() {
+        let measured = "b".repeat(40);
+        let (id, _) = stripped_row(&measured);
+        let invocation = review3655_canonical_pressure_invocation(&measured);
+        let report = review3655_typed_report(&verify_canonical_report(&measured));
+        let summary =
+            review3655_pressure_passes(&id, &measured, "tree-1", &invocation, Some(report));
+        let pinned = GuestRootBuckets(BTreeMap::from([(id.category.clone(), GuestRoot::Pinned)]));
+
+        let mut tracked = review3655_red_cell(&id);
+        let before = serde_json::to_vec(&tracked).unwrap();
+        let error = apply_pressure_summary(
+            &pinned,
+            &mut tracked,
+            &summary,
+            &measured,
+            "tree-1",
+            &BTreeMap::new(),
+        )
+        .err()
+        .expect("the fold stored pressure rows for a pinned-bucket cell");
+        assert!(
+            error.contains("every one of the 2 offered row(s) was untrustworthy")
+                && error.contains(
+                    "which requires guest_root pinned, and a pressure summary records no guest root"
+                ),
+            "{error}"
+        );
+        assert_eq!(serde_json::to_vec(&tracked).unwrap(), before);
+
+        let one = PressureSummary {
+            rows: vec![summary.rows[0].clone()],
+            ..summary.clone()
+        };
+        let error =
+            checked_current_pressure_result(&pinned, &review3655_red_cell(&id), one, "tree-1")
+                .err()
+                .expect("the current-summary check admitted a pinned-bucket row");
+        assert!(error.contains("records no guest root"), "{error}");
+
+        // Beside a cell of an unpinned bucket, only the pinned row is skipped.
+        let mut two = review3655_red_cell(&id);
+        let mut pinned_cell = two.cells[0].clone();
+        pinned_cell.id.category = "compat-pinned".into();
+        pinned_cell.id.test = "compat-pinned/addr2line".into();
+        let pinned_id = pinned_cell.id.clone();
+        two.cells.push(pinned_cell);
+        let mut mixed = summary.clone();
+        mixed.rows[1].cell = pinned_id.clone();
+        let outcome = apply_pressure_summary(
+            &GuestRootBuckets(BTreeMap::from([(
+                "compat-pinned".to_string(),
+                GuestRoot::Pinned,
+            )])),
+            &mut two,
+            &mixed,
+            &measured,
+            "tree-1",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!((outcome.rows, outcome.skipped.len()), (1, 1));
+        assert_eq!(outcome.skipped[0].0, display_id(&pinned_id));
+        assert!(
+            outcome.skipped[0].1.contains("records no guest root"),
+            "{:?}",
+            outcome.skipped
+        );
+        assert!(review3655_has_pressure_pass(&two.cells[0]));
+        assert!(two.cells[1].observations.is_empty() && two.cells[1].last_tested.is_none());
+
+        // Control: the requirement belongs to the bucket, not to the rows.
+        let other = GuestRootBuckets(BTreeMap::from([(
+            "compat-pinned".to_string(),
+            GuestRoot::Pinned,
+        )]));
+        let mut tracked = review3655_red_cell(&id);
+        let outcome = apply_pressure_summary(
+            &other,
+            &mut tracked,
+            &summary,
+            &measured,
+            "tree-1",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!((outcome.rows, outcome.skipped.len()), (2, 0));
+        assert!(review3655_has_pressure_pass(&tracked.cells[0]));
     }
 
     /// The same refusal through the writers: `update-observations` refuses a
@@ -39227,6 +40019,75 @@ mod post_verdict_transaction_tests {
             !review3655_has_pressure_pass(tracked_cell(&fixture.cells(), &id)),
             "the import stored a pressure pass from a canonical match without bitwise parity"
         );
+    }
+
+    /// A pressure summary records no guest root, so `update-observations`
+    /// refuses one for a `compat-pinned` cell, read as a current summary and as
+    /// a retained one, and leaves history unchanged
+    /// (<https://github.com/rrnewton/hermit/issues/3712>). Control: the same
+    /// rows for the unpinned `compat` twin are merged.
+    #[test]
+    fn update_observations_refuses_pressure_rows_for_a_pinned_bucket_cell() {
+        let _fixture_lock = history_fixture_lock();
+        let fixture = Fixture::new();
+        capture_empty_series(&fixture);
+        let newer = fixture.options.expected_head.clone();
+        let (compat_id, _) = stripped_row(&newer);
+        let pinned_id = CellId {
+            category: "compat-pinned".into(),
+            test: "compat-pinned/addr2line".into(),
+            ..compat_id.clone()
+        };
+        let cells = fixture.cells();
+        for id in [&compat_id, &pinned_id] {
+            assert!(
+                cells.cells.iter().any(|cell| &cell.id == id),
+                "the fixture does not track {}",
+                display_id(id)
+            );
+        }
+        let detcore_tree = git_rev_parse(&fixture.root, "HEAD:detcore").unwrap();
+        let invocation = review3655_canonical_pressure_invocation(&newer);
+        let report = review3655_typed_report(&verify_canonical_report(&newer));
+        let write = |id: &CellId, name: &str| {
+            let summary = review3655_pressure_passes(
+                id,
+                &newer,
+                &detcore_tree,
+                &invocation,
+                Some(report.clone()),
+            );
+            let path = fixture._directory.path().join(name);
+            fs::write(&path, serde_json::to_vec(&summary).unwrap()).unwrap();
+            path
+        };
+        let pinned = write(&pinned_id, "pinned-pressure.json");
+        let before = read_history_files(&fixture.root).unwrap();
+        for retained in [false, true] {
+            let error = update_observations(&fixture.root, std::slice::from_ref(&pinned), retained)
+                .expect_err("update-observations stored pressure rows for a pinned-bucket cell");
+            assert!(
+                error.contains("every one of the 2 offered row(s) was untrustworthy")
+                    && error.contains(
+                        "compat-pinned/addr2line/verify@ptrace is in bucket compat-pinned, which \
+                         requires guest_root pinned, and a pressure summary records no guest root"
+                    ),
+                "retained={retained}: {error}"
+            );
+            assert!(
+                read_history_files(&fixture.root).unwrap() == before,
+                "retained={retained}: the refusing update changed history"
+            );
+        }
+
+        let compat = write(&compat_id, "compat-pressure.json");
+        update_observations(&fixture.root, std::slice::from_ref(&compat), false)
+            .expect("the unpinned twin's rows are merged");
+        let cells = fixture.cells();
+        assert!(review3655_has_pressure_pass(tracked_cell(
+            &cells, &compat_id
+        )));
+        assert!(tracked_cell(&cells, &pinned_id).observations.is_empty());
     }
 
     // Expect FAIL at c900554692a6, PASS with the F2 storage/binding changes absent:
@@ -39567,6 +40428,7 @@ mod attempt_binding_tests {
             .comparison_attempt_bindings_v1 = None;
         let before = serde_json::to_vec(&without).unwrap();
         let error = apply_series_rows(
+            &GuestRootBuckets::none(),
             Path::new("/absent-host-results"),
             &mut without,
             &events,
@@ -39588,6 +40450,7 @@ mod attempt_binding_tests {
             .cloned()
             .collect::<Vec<_>>();
         apply_series_rows(
+            &GuestRootBuckets::none(),
             Path::new("/absent-host-results"),
             &mut fresh,
             &unrepresented,
@@ -40281,6 +41144,7 @@ mod retired_id_join_tests {
         late.run_id = "retired-late-run".into();
         let mut joined = tracked.clone();
         apply_series_rows(
+            &GuestRootBuckets::none(),
             Path::new("/absent-host-results"),
             &mut joined,
             &[fresh, late],
@@ -40304,6 +41168,91 @@ mod retired_id_join_tests {
                 .iter()
                 .any(|observation| observation.canonical_comparisons.len() == 2)
         );
+    }
+
+    /// A series event records no guest root, so the projection cannot let one
+    /// stand for a cell whose bucket requires one
+    /// (<https://github.com/rrnewton/hermit/issues/3712>): beside an event for
+    /// another bucket it is skipped and named, and a projection made only of
+    /// such events is refused and changes nothing. Control: with no bucket
+    /// requiring a root, the same event is projected into the cell.
+    #[test]
+    fn a_series_event_cannot_stand_for_a_pinned_bucket_cell() {
+        let (mut tracked, events) = super::attempt_binding_tests::fixture_for(successor());
+        let pinned_id = cell("compat-pinned", "compat-pinned/true");
+        let mut pinned_cell = tracked.cells[0].clone();
+        pinned_cell.id = pinned_id.clone();
+        pinned_cell.observations.clear();
+        tracked.cells.push(pinned_cell);
+        refresh_measurement(&mut tracked);
+        let mut other = events[0].clone();
+        other.event_id = "other-1".into();
+        other.run_id = "other-run".into();
+        let mut pinned = events[0].clone();
+        pinned.event_id = "pinned-1".into();
+        pinned.run_id = "pinned-run".into();
+        pinned.series.cell = series_cell_key(&pinned_id);
+        let buckets = GuestRootBuckets(BTreeMap::from([(
+            "compat-pinned".to_string(),
+            GuestRoot::Pinned,
+        )]));
+        let holds = |tracked: &TrackedCells, index: usize, event: &str| {
+            tracked.cells[index]
+                .observations
+                .iter()
+                .any(|observation| observation.event_ids.contains(event))
+        };
+
+        let mut mixed = tracked.clone();
+        let outcome = apply_series_rows(
+            &buckets,
+            Path::new("/absent-host-results"),
+            &mut mixed,
+            &[other, pinned.clone()],
+            Some("series"),
+        )
+        .unwrap();
+        assert!(holds(&mixed, 0, "other-1"));
+        assert!(mixed.cells[1].observations.is_empty());
+        assert_eq!(outcome.skipped.len(), 1, "{:?}", outcome.skipped);
+        assert!(
+            outcome.skipped[0].contains(
+                "compat-pinned/true/verify@ptrace is in bucket compat-pinned, which requires \
+                 guest_root pinned, and a series event records no guest root"
+            ),
+            "{:?}",
+            outcome.skipped
+        );
+
+        let mut only = tracked.clone();
+        let error = apply_series_rows(
+            &buckets,
+            Path::new("/absent-host-results"),
+            &mut only,
+            std::slice::from_ref(&pinned),
+            Some("series"),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("every one of the 1 readable series row(s)")
+                && error.contains("records no guest root"),
+            "{error}"
+        );
+        assert_eq!(
+            serde_json::to_vec(&only).unwrap(),
+            serde_json::to_vec(&tracked).unwrap()
+        );
+
+        let mut unpinned = tracked.clone();
+        apply_series_rows(
+            &GuestRootBuckets::none(),
+            Path::new("/absent-host-results"),
+            &mut unpinned,
+            &[pinned],
+            Some("series"),
+        )
+        .unwrap();
+        assert!(holds(&unpinned, 1, "pinned-1"));
     }
 
     #[test]
@@ -40886,6 +41835,428 @@ mod evidence_identity_tests {
         assert_ne!(changed.evidence_identity().unwrap(), ORDINARY);
     }
 
+    /// `ordinary()` moved into the `guest_root: pinned` bucket, passing, at
+    /// `commit`, recording `root` and `identity`.
+    fn pinned_bucket_row(
+        commit: &str,
+        root: Option<GuestRoot>,
+        identity: Option<&str>,
+    ) -> ResultRow {
+        let mut row = ordinary();
+        row.category = "compat-pinned".into();
+        row.outcome = "PASS".into();
+        row.hermit_sha = commit.into();
+        row.guest_root = root;
+        row.guest_root_identity = identity.map(str::to_string);
+        row
+    }
+
+    fn candidate_at(path: &str, row: ResultRow) -> ResultCandidate {
+        ResultCandidate {
+            evidence_identity: row.evidence_identity().unwrap(),
+            path: PathBuf::from(path),
+            row,
+            parity_history: false,
+        }
+    }
+
+    /// The harness's two guest-root fields survive the scorecard's reading
+    /// and rewriting of a row, an unknown root is refused rather than
+    /// discarded, and neither field changes the evidence identity, which the
+    /// parent's `_cell_result_evidence_sha256` recomputes from its own key
+    /// list (see `GuestRootPolicy`).
+    #[test]
+    fn the_recorded_guest_root_is_read_and_kept_but_not_bound_into_the_evidence_identity() {
+        let identity = format!("sha256:{}", "e".repeat(64));
+        let mut row = ordinary();
+        row.guest_root = Some(GuestRoot::Pinned);
+        row.guest_root_identity = Some(identity.clone());
+        assert_eq!(row.evidence_identity().unwrap(), ORDINARY);
+        let reread: ResultRow =
+            serde_json::from_value(serde_json::to_value(&row).unwrap()).unwrap();
+        assert_eq!(
+            reread.recorded_guest_root(),
+            (Some(GuestRoot::Pinned), Some(identity))
+        );
+        assert_eq!(reread.evidence_identity().unwrap(), ORDINARY);
+
+        let mut value = serde_json::to_value(ordinary()).unwrap();
+        assert!(value.get("guest_root").is_none());
+        assert!(value.get("guest_root_identity").is_none());
+        value["guest_root"] = JsonValue::Null;
+        value["guest_root_identity"] = JsonValue::Null;
+        let null: ResultRow = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(null.recorded_guest_root(), (None, None));
+        value["guest_root"] = "host".into();
+        let host: ResultRow = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(host.recorded_guest_root(), (Some(GuestRoot::Host), None));
+        assert_eq!(host.evidence_identity().unwrap(), ORDINARY);
+        value["guest_root"] = "elsewhere".into();
+        assert!(serde_json::from_value::<ResultRow>(value).is_err());
+    }
+
+    /// A row of the shipped `guest_root: pinned` bucket is admitted only when
+    /// it records the pinned root and the identity its own commit's listing
+    /// gives; an import-mode error row, which ran no guest, may record none.
+    /// A bucket that declares no root admits every recorded root.
+    #[test]
+    fn a_pinned_bucket_row_is_admitted_only_from_the_pinned_root_its_commit_records() {
+        let manifests = ManifestSet::load(manifest_tool_root().unwrap()).unwrap();
+        assert_eq!(
+            manifests.required_guest_root("compat-pinned"),
+            Some(GuestRoot::Pinned)
+        );
+        assert_eq!(manifests.required_guest_root("compat"), None);
+        let commit = "a".repeat(40);
+        let unreadable = "b".repeat(40);
+        let unloaded = "c".repeat(40);
+        let expected = format!("sha256:{}", "d".repeat(64));
+        let other = format!("sha256:{}", "f".repeat(64));
+        let policy = GuestRootPolicy {
+            manifests,
+            identities: BTreeMap::from([
+                (commit.clone(), Ok(expected.clone())),
+                (unreadable.clone(), Err("the listing is gone".to_string())),
+            ]),
+        };
+        let pinned = Some(GuestRoot::Pinned);
+        let refused = |row: ResultRow, needle: &str| {
+            let error = policy.check(&row).unwrap_err();
+            assert!(error.contains(needle), "{needle:?} not in {error:?}");
+        };
+
+        policy
+            .check(&pinned_bucket_row(&commit, pinned, Some(&expected)))
+            .unwrap();
+        refused(
+            pinned_bucket_row(&commit, Some(GuestRoot::Host), Some(&expected)),
+            "is in bucket compat-pinned, which requires guest_root pinned, but the row ran in host",
+        );
+        refused(
+            pinned_bucket_row(&commit, Some(GuestRoot::Remote), None),
+            "but the row ran in remote",
+        );
+        refused(
+            pinned_bucket_row(&commit, None, None),
+            "but the row ran in an unrecorded root",
+        );
+        refused(
+            pinned_bucket_row(&commit, pinned, None),
+            "but the row verified no identity",
+        );
+        refused(
+            pinned_bucket_row(&commit, pinned, Some(&other)),
+            &format!("(identity {expected}), but the row verified {other}"),
+        );
+        refused(
+            pinned_bucket_row(&unreadable, pinned, Some(&expected)),
+            "and that root cannot be read: the listing is gone",
+        );
+        refused(
+            pinned_bucket_row(&unloaded, pinned, Some(&expected)),
+            "commit's listing was not read",
+        );
+
+        // The import-mode error row's shape: ERROR, and nothing a guest made.
+        let mut error_row = pinned_bucket_row(&commit, None, None);
+        error_row.outcome = "ERROR".into();
+        error_row.result = None;
+        error_row.attempts.clear();
+        error_row.backend_parity = None;
+        error_row.effective_args.clear();
+        error_row.argv.clear();
+        error_row.guest_argv.clear();
+        error_row.shell_command.clear();
+        assert!(error_row.is_guestless_error());
+        policy.check(&error_row).unwrap();
+        let mut failed = error_row.clone();
+        failed.outcome = "FAIL".into();
+        refused(failed, "but the row ran in an unrecorded root");
+
+        // A rootless ERROR row that still carries guest or comparison
+        // evidence is refused: an attempt holds a canonical report that later
+        // readers turn into FAIL or Diverged, and each other field is
+        // evidence of the same kind.
+        let carrying = "records no root while carrying guest or comparison evidence";
+        let mut attempted = pinned_bucket_row(&commit, None, None);
+        attempted.outcome = "ERROR".into();
+        attempted.result = None;
+        assert!(!attempted.attempts.is_empty());
+        refused(attempted, carrying);
+        let attempts = ordinary().attempts;
+        let parity_report = parity().backend_parity;
+        assert!(parity_report.is_some());
+        let mutations: Vec<(&str, Box<dyn Fn(&mut ResultRow)>)> = vec![
+            ("attempts", Box::new(|row| row.attempts = attempts.clone())),
+            (
+                "backend_parity",
+                Box::new(|row| row.backend_parity = parity_report.clone()),
+            ),
+            (
+                "result",
+                Box::new(|row| row.result = Some(ObservedResult::DeterminismFailure)),
+            ),
+            (
+                "first_divergent_scheduler_turn",
+                Box::new(|row| row.first_divergent_scheduler_turn = Some(7)),
+            ),
+            (
+                "first_divergent_virtual_nanoseconds",
+                Box::new(|row| row.first_divergent_virtual_nanoseconds = Some(7)),
+            ),
+            (
+                "first_divergent_record",
+                Box::new(|row| row.first_divergent_record = Some(7)),
+            ),
+            (
+                "first_divergent_syscall",
+                Box::new(|row| row.first_divergent_syscall = Some(7)),
+            ),
+            (
+                "effective_args",
+                Box::new(|row| row.effective_args = vec!["--verify".into()]),
+            ),
+            ("argv", Box::new(|row| row.argv = vec!["hermit".into()])),
+            (
+                "guest_argv",
+                Box::new(|row| row.guest_argv = vec!["/bin/true".into()]),
+            ),
+            (
+                "shell_command",
+                Box::new(|row| row.shell_command = "hermit run".into()),
+            ),
+        ];
+        for (field, mutate) in &mutations {
+            let mut row = error_row.clone();
+            mutate(&mut row);
+            assert!(!row.is_guestless_error(), "{field} is guest evidence");
+            let error = policy.check(&row).unwrap_err();
+            assert!(error.contains(carrying), "{field}: {error:?}");
+        }
+        error_row.guest_root = Some(GuestRoot::Host);
+        refused(error_row, "but the row ran in host");
+
+        for root in [None, Some(GuestRoot::Host), Some(GuestRoot::Remote), pinned] {
+            let mut row = pinned_bucket_row(&unloaded, root, None);
+            row.category = "compat".into();
+            policy.check(&row).unwrap();
+        }
+    }
+
+    /// Each commit's pinned-root identity comes from that commit's own listing
+    /// and digest, read from the object store, so a repinned, unlisted or
+    /// absent commit yields a reason instead of an identity.
+    #[test]
+    fn the_pinned_root_identity_is_read_from_each_commits_own_listing() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        let git = |args: &[&str]| -> String {
+            let output = fixture_git()
+                .args([
+                    "-c",
+                    "maintenance.auto=false",
+                    "-c",
+                    "gc.auto=0",
+                    "-c",
+                    "user.name=fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                ])
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        let source = manifest_tool_root().unwrap();
+        assert_eq!(
+            pinned_root_identities_at(root, &BTreeSet::new()).unwrap(),
+            BTreeMap::new()
+        );
+        git(&["init", "--quiet"]);
+        fs::create_dir_all(root.join("ci/hermetic")).unwrap();
+        fs::copy(source.join(IMAGE_PATHS_FILE), root.join(IMAGE_PATHS_FILE)).unwrap();
+        fs::copy(source.join(IMAGE_DIGEST_FILE), root.join(IMAGE_DIGEST_FILE)).unwrap();
+        git(&["add", "ci"]);
+        git(&["commit", "--quiet", "-m", "pinned"]);
+        let pinned = git(&["rev-parse", "HEAD"]);
+        let repin = format!(
+            "localhost/hermit-hermetic-validate@sha256:{}\n",
+            "0".repeat(64)
+        );
+        fs::write(root.join(IMAGE_DIGEST_FILE), &repin).unwrap();
+        git(&["commit", "--quiet", "-am", "repinned"]);
+        let repinned = git(&["rev-parse", "HEAD"]);
+        git(&["rm", "--quiet", IMAGE_PATHS_FILE]);
+        git(&["commit", "--quiet", "-m", "unlisted"]);
+        let unlisted = git(&["rev-parse", "HEAD"]);
+        let absent = "0123456789abcdef0123456789abcdef01234567".to_string();
+        let commits = BTreeSet::from([
+            pinned.clone(),
+            repinned.clone(),
+            unlisted.clone(),
+            absent.clone(),
+            "HEAD".to_string(),
+        ]);
+        let identities = pinned_root_identities_at(root, &commits).unwrap();
+        assert_eq!(identities.len(), 5);
+        assert_eq!(
+            identities[&pinned],
+            Ok(ImagePaths::load(source).unwrap().identity())
+        );
+        let reason = |commit: &str| identities[commit].clone().unwrap_err();
+        assert!(
+            reason(&repinned).contains(&format!("pins {}", repin.trim())),
+            "{}",
+            reason(&repinned)
+        );
+        assert_eq!(
+            reason(&unlisted),
+            format!("{unlisted} has no {IMAGE_PATHS_FILE} in this clone")
+        );
+        assert_eq!(
+            reason(&absent),
+            format!("{absent} has no {IMAGE_PATHS_FILE} in this clone")
+        );
+        assert_eq!(reason("HEAD"), "`HEAD` is not a commit id");
+    }
+
+    /// End to end over this checkout: the reader admits a pinned-bucket row
+    /// that ran in the pinned root its own commit records, and refuses the
+    /// same row from the host with the file and cell named.
+    #[test]
+    fn the_result_readers_refuse_a_pinned_bucket_row_from_another_root() {
+        forget_inherited_repository_location();
+        let root = manifest_tool_root().unwrap();
+        let head = git_head(root).unwrap();
+        let identities = pinned_root_identities_at(root, &BTreeSet::from([head.clone()])).unwrap();
+        let identity = identities[&head].clone().unwrap();
+        let admitted = candidate_at(
+            "results.jsonl",
+            pinned_bucket_row(&head, Some(GuestRoot::Pinned), Some(&identity)),
+        );
+        require_recorded_guest_roots(root, [&admitted]).unwrap();
+        require_recorded_guest_roots(root, std::iter::empty()).unwrap();
+        let host = candidate_at(
+            "results.jsonl",
+            pinned_bucket_row(&head, Some(GuestRoot::Host), None),
+        );
+        let error = require_recorded_guest_roots(root, [&admitted, &host]).unwrap_err();
+        assert!(
+            error.starts_with(
+                "results.jsonl: the result for portable/compat-pinned/fixture/no-result/verify@ptrace is in bucket compat-pinned"
+            ),
+            "{error}"
+        );
+    }
+
+    /// Two rows that differ only in their recorded root are different evidence
+    /// to every duplicate and distinctness comparison that keys on the
+    /// evidence identity; identical rows are still one.
+    #[test]
+    fn rows_that_differ_only_in_their_guest_root_are_distinct_evidence() {
+        let host = |mut row: ResultRow| {
+            row.guest_root = Some(GuestRoot::Host);
+            row
+        };
+        let id = ordinary().id().unwrap();
+        let expected = BTreeSet::from([id.clone()]);
+        let verify = |rows: Vec<ResultRow>| {
+            let candidates = rows
+                .into_iter()
+                .enumerate()
+                .map(|(index, row)| candidate_at(&format!("{index}.jsonl"), row))
+                .collect::<Vec<_>>();
+            verify_candidate_set(&expected, BTreeMap::from([(id.clone(), candidates)])).err()
+        };
+        let error = verify(vec![ordinary(), host(ordinary())]).unwrap();
+        assert!(
+            error.starts_with("ambiguous distinct evidence for "),
+            "{error}"
+        );
+        let same = verify(vec![ordinary(), ordinary()]);
+        assert!(
+            same.as_ref()
+                .is_none_or(|error| !error.contains("ambiguous")),
+            "{same:?}"
+        );
+
+        let retained = |rows: Vec<ResultRow>| {
+            let candidates = rows
+                .into_iter()
+                .enumerate()
+                .map(|(index, row)| candidate_at(&format!("{index}.jsonl"), row))
+                .collect();
+            select_retained_ordinary_attempt(&id, "sha", candidates).err()
+        };
+        let error = retained(vec![ordinary(), host(ordinary())]).unwrap();
+        assert!(
+            error.starts_with("ambiguous retained evidence for "),
+            "{error}"
+        );
+        let same = retained(vec![ordinary(), ordinary()]);
+        assert!(
+            same.as_ref()
+                .is_none_or(|error| !error.contains("ambiguous")),
+            "{same:?}"
+        );
+
+        let parity_id = parity().id().unwrap();
+        let bind = |rows: Vec<ResultRow>| {
+            let candidates = rows
+                .into_iter()
+                .enumerate()
+                .map(|(index, row)| candidate_at(&format!("{index}.jsonl"), row))
+                .collect();
+            bind_parity_history(&parity_id, candidates, ResultInput::Current).err()
+        };
+        let error = bind(vec![parity(), host(parity())]).unwrap();
+        assert!(
+            error.starts_with("ambiguous parity evidence for "),
+            "{error}"
+        );
+        let same = bind(vec![parity(), parity()]);
+        assert!(
+            same.as_ref()
+                .is_none_or(|error| !error.contains("ambiguous")),
+            "{same:?}"
+        );
+    }
+
+    /// A pressure summary records no guest root, so it cannot stand for a cell
+    /// of a bucket that requires one; it can for any other cell. The bucket
+    /// map answers exactly as the manifest set does for every shipped bucket.
+    #[test]
+    fn a_pressure_summary_cannot_stand_for_a_pinned_bucket_cell() {
+        let manifests = ManifestSet::load(manifest_tool_root().unwrap()).unwrap();
+        let buckets = GuestRootBuckets::of(&manifests);
+        for document in &manifests.documents {
+            assert_eq!(
+                buckets.required(&document.bucket),
+                manifests.required_guest_root(&document.bucket),
+                "{}",
+                document.bucket
+            );
+        }
+        assert_eq!(buckets.required("compat-pinned"), Some(GuestRoot::Pinned));
+        assert_eq!(GuestRootBuckets::none().required("compat-pinned"), None);
+        let mut cell = ordinary().id().unwrap();
+        assert_eq!(pressure_guest_root_problem(&buckets, &cell), None);
+        cell.category = "compat".into();
+        assert_eq!(pressure_guest_root_problem(&buckets, &cell), None);
+        cell.category = "compat-pinned".into();
+        assert_eq!(
+            pressure_guest_root_problem(&buckets, &cell).unwrap(),
+            "portable/compat-pinned/fixture/no-result/verify@ptrace is in bucket compat-pinned, \
+             which requires guest_root pinned, and a pressure summary records no guest root"
+        );
+    }
+
     // Independently computed by the parent's `_cell_result_evidence_sha256`
     // over `ordinary()` plus each declaration below.
     const DECLARED_CODE_7: &str =
@@ -40913,7 +42284,8 @@ mod evidence_identity_tests {
     /// must agree on it, or scorecard reconciliation refuses the row.
     #[test]
     fn a_parity_operands_branch_counter_verdict_is_in_the_shared_evidence_identity() {
-        const BRANCH_COUNTER_PARITY_ROW: &str = "763763fee9e6daf7bfe2bd571ce4c6dfce703878665c1fe68c241280896c87c2";
+        const BRANCH_COUNTER_PARITY_ROW: &str =
+            "763763fee9e6daf7bfe2bd571ce4c6dfce703878665c1fe68c241280896c87c2";
         let fixture: JsonValue =
             serde_json::from_str(include_str!("testdata/branch-counter-parity-row.json")).unwrap();
         assert_eq!(
@@ -41659,9 +43031,13 @@ mod verify_results_exclusion_tests {
     use super::*;
 
     fn cell(lane: &str, test: &str, backend: &str) -> CellId {
+        cell_in(lane, "c-programs", test, backend)
+    }
+
+    fn cell_in(lane: &str, category: &str, test: &str, backend: &str) -> CellId {
         CellId {
             lane: lane.into(),
-            category: "c-programs".into(),
+            category: category.into(),
             test: test.into(),
             mode: "verify".into(),
             backend: backend.into(),
@@ -41672,6 +43048,20 @@ mod verify_results_exclusion_tests {
         names.iter().map(|name| name.to_string()).collect()
     }
 
+    fn backends(names: &[&str]) -> VerifyExclusions {
+        VerifyExclusions {
+            backends: lanes(names),
+            categories: BTreeSet::new(),
+        }
+    }
+
+    fn categories(names: &[&str]) -> VerifyExclusions {
+        VerifyExclusions {
+            backends: BTreeSet::new(),
+            categories: lanes(names),
+        }
+    }
+
     #[test]
     fn an_excluded_backend_is_omitted_and_counted_not_passed() {
         let selected = BTreeSet::from([
@@ -41680,29 +43070,113 @@ mod verify_results_exclusion_tests {
             cell("portable", "b", "kvm"),
             cell("privileged", "c", "kvm"),
         ]);
-        let (expected, omitted) =
-            select_verified_cells(&selected, &lanes(&["portable"]), &lanes(&["kvm"])).unwrap();
-        assert_eq!(expected, BTreeSet::from([cell("portable", "a", "ptrace")]));
-        assert_eq!(omitted, 2, "only the two portable kvm cells are omitted");
+        let selection =
+            select_verified_cells(&selected, &lanes(&["portable"]), &backends(&["kvm"])).unwrap();
+        assert_eq!(
+            selection.expected,
+            BTreeSet::from([cell("portable", "a", "ptrace")])
+        );
+        assert_eq!(
+            selection.omitted_by_backend, 2,
+            "only the two portable kvm cells are omitted"
+        );
+        assert_eq!(selection.omitted_by_category, 0);
 
-        let (unfiltered, none) =
-            select_verified_cells(&selected, &lanes(&["portable"]), &BTreeSet::new()).unwrap();
-        assert_eq!(unfiltered.len(), 3);
-        assert_eq!(none, 0);
+        let unfiltered = select_verified_cells(
+            &selected,
+            &lanes(&["portable"]),
+            &VerifyExclusions::default(),
+        )
+        .unwrap();
+        assert_eq!(unfiltered.expected.len(), 3);
+        assert_eq!(unfiltered.omitted_by_backend, 0);
+        assert_eq!(unfiltered.omitted_by_category, 0);
     }
 
     #[test]
     fn an_exclusion_that_matches_nothing_or_everything_is_refused() {
         let selected = BTreeSet::from([cell("portable", "a", "ptrace")]);
-        let stale =
-            select_verified_cells(&selected, &lanes(&["portable"]), &lanes(&["kvm"])).unwrap_err();
+        let stale = select_verified_cells(&selected, &lanes(&["portable"]), &backends(&["kvm"]))
+            .unwrap_err();
         assert_eq!(
             stale,
             "--exclude-backend kvm matches no selected cell in the named lanes"
         );
-        let empty = select_verified_cells(&selected, &lanes(&["portable"]), &lanes(&["ptrace"]))
+        let empty = select_verified_cells(&selected, &lanes(&["portable"]), &backends(&["ptrace"]))
             .unwrap_err();
         assert_eq!(empty, "selected lanes contain no regression cells");
+    }
+
+    /// The hosted portable scorecard omits the compat-pinned category because
+    /// its producers do not run it (<https://github.com/rrnewton/hermit/issues/3712>):
+    /// the omitted cells are counted apart, never as passed, and only the named
+    /// lanes' cells of that category are omitted.
+    #[test]
+    fn an_excluded_category_is_omitted_and_counted_not_passed() {
+        let selected = BTreeSet::from([
+            cell_in("portable", "compat-pinned", "bc", "ptrace"),
+            cell_in("portable", "compat-pinned", "bc", "sabre"),
+            cell_in("portable", "compat", "bc", "ptrace"),
+            cell_in("portable", "c-programs", "a", "kvm"),
+            cell_in("privileged", "compat-pinned", "x", "ptrace"),
+        ]);
+        let exclusions = VerifyExclusions {
+            backends: lanes(&["kvm"]),
+            categories: lanes(&["compat-pinned"]),
+        };
+        let selection =
+            select_verified_cells(&selected, &lanes(&["portable"]), &exclusions).unwrap();
+        assert_eq!(
+            selection.expected,
+            BTreeSet::from([cell_in("portable", "compat", "bc", "ptrace")])
+        );
+        assert_eq!(selection.omitted_by_category, 2);
+        assert_eq!(selection.omitted_by_backend, 1);
+        assert_eq!(
+            exclusion_summary(&exclusions, &selection),
+            vec![
+                "Omitted by --exclude-category compat-pinned: 2 selected cells were not required and are not counted as passed.".to_string(),
+                "Omitted by --exclude-backend kvm: 1 selected cells were not required and are not counted as passed.".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_category_exclusion_that_matches_nothing_or_everything_is_refused() {
+        let selected = BTreeSet::from([
+            cell_in("portable", "compat", "bc", "ptrace"),
+            cell_in("privileged", "compat-pinned", "x", "kvm"),
+        ]);
+        let stale = select_verified_cells(
+            &selected,
+            &lanes(&["portable"]),
+            &categories(&["compat-pinned"]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            stale,
+            "--exclude-category compat-pinned matches no selected cell in the named lanes"
+        );
+        let empty =
+            select_verified_cells(&selected, &lanes(&["portable"]), &categories(&["compat"]))
+                .unwrap_err();
+        assert_eq!(empty, "selected lanes contain no regression cells");
+
+        // A backend exclusion whose only cells the category exclusion already
+        // removed is stale too.
+        let shadowed = select_verified_cells(
+            &selected,
+            &lanes(&["privileged", "portable"]),
+            &VerifyExclusions {
+                backends: lanes(&["kvm"]),
+                categories: lanes(&["compat-pinned"]),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            shadowed,
+            "--exclude-backend kvm matches no selected cell in the named lanes"
+        );
     }
 }
 
@@ -41956,7 +43430,14 @@ mod parity_summary_tests {
     /// readable, so every run's coverage is unknown.
     fn summarize_rows(rows: &[ParityLedgerRow], tracked: &TrackedCells) -> ParitySummary {
         let lines = rows.iter().map(line).collect::<Vec<_>>();
-        summarize_parity(&store(&lines), tracked, &|_| None, &|_| None, &|_| Ok(None))
+        summarize_parity(
+            &store(&lines),
+            tracked,
+            &GuestRootBuckets::none(),
+            &|_| None,
+            &|_| None,
+            &|_| Ok(None),
+        )
     }
 
     /// A committed selection naming exactly `cells`.
@@ -42118,6 +43599,58 @@ mod parity_summary_tests {
             &rendered,
             &format!("| `c-programs/golden-4@kvm` | record-missing | — | {TIMED_OUT} |\n"),
         );
+    }
+
+    /// A parity row of a bucket that requires a guest root is refused and
+    /// earns no credit, because a `parity-ledger/v1` row records no root
+    /// (<https://github.com/rrnewton/hermit/issues/3712>). The same two rows
+    /// are both admitted when no bucket requires a root, so the refusal is what
+    /// keeps the pinned cell's match out of the tallies, and the `c-programs`
+    /// row beside it is unchanged.
+    #[test]
+    fn a_parity_row_of_a_guest_root_bucket_is_refused() {
+        let rows = [
+            row(matched("compat-pinned/true", SABRE, 10, true)),
+            row(matched(&golden(1), SABRE, 10, true)),
+        ];
+        let lines = rows.iter().map(line).collect::<Vec<_>>();
+        let summarize = |buckets: &GuestRootBuckets| {
+            summarize_parity(
+                &store(&lines),
+                &no_cells(),
+                buckets,
+                &|_| None,
+                &|_| None,
+                &|_| Ok(None),
+            )
+        };
+
+        let admitted = summarize(&GuestRootBuckets::none());
+        assert_eq!(admitted.refused_rows, 0, "{:#?}", admitted.refusals);
+        assert_eq!(only_run(&admitted).total.matched, 2);
+
+        let pinned = GuestRootBuckets(BTreeMap::from([(
+            "compat-pinned".to_string(),
+            GuestRoot::Pinned,
+        )]));
+        let summary = summarize(&pinned);
+        assert_eq!(summary.refused_rows, 1, "{:#?}", summary.refusals);
+        assert_eq!(summary.refusals.len(), 1, "{:#?}", summary.refusals);
+        assert_contains(
+            &summary.refusals[0].message,
+            "test compat-pinned/true is in bucket compat-pinned, which requires guest_root \
+             pinned, and a parity-ledger/v1 row records no guest root",
+        );
+        assert_eq!(summary.rows_read, 2);
+        let run = only_run(&summary);
+        assert_eq!(run.total.matched, 1);
+        assert_eq!(run.total.refused, 1);
+        let refused = cell(run, "compat-pinned/true@sabre");
+        assert_eq!(refused.verdict, "refused");
+        assert_eq!(refused.credit, None);
+        let kept = cell(run, &format!("{}@sabre", golden(1)));
+        assert_eq!(kept.verdict, "matched");
+        assert_eq!(kept.credit, Some(1.0));
     }
 
     /// dbt is compared like every backend: a measured dbt row is admitted,
@@ -42622,7 +44155,14 @@ mod parity_summary_tests {
             b"\n",
             &mut Sha256::new(),
         );
-        let summary = summarize_parity(&input, &no_cells(), &|_| None, &|_| None, &|_| Ok(None));
+        let summary = summarize_parity(
+            &input,
+            &no_cells(),
+            &GuestRootBuckets::none(),
+            &|_| None,
+            &|_| None,
+            &|_| Ok(None),
+        );
         let messages = summary
             .refusals
             .iter()
@@ -43171,6 +44711,7 @@ mod parity_summary_tests {
                 let mut summary = summarize_parity(
                     &store_of(layout),
                     &no_cells(),
+                    &GuestRootBuckets::none(),
                     &|_| None,
                     &|_| None,
                     &|sha| Ok((sha == SHA).then(|| selection.clone())),
@@ -43225,8 +44766,14 @@ mod parity_summary_tests {
                 (SHARD, twelve_diverged()),
                 (stray_shard, vec![stray.clone()]),
             ]);
-            let summary =
-                summarize_parity(&input, &no_cells(), &|_| None, &|_| None, &|_| Ok(None));
+            let summary = summarize_parity(
+                &input,
+                &no_cells(),
+                &GuestRootBuckets::none(),
+                &|_| None,
+                &|_| None,
+                &|_| Ok(None),
+            );
             assert_eq!(summary.refused_rows, 13, "{stray_shard}");
             let run = only_run(&summary);
             assert_eq!(run.hermit_sha, None);
@@ -43288,6 +44835,7 @@ mod parity_summary_tests {
             summarize_parity(
                 &store(&lines),
                 &no_cells(),
+                &GuestRootBuckets::none(),
                 &depth_of,
                 &|_| None,
                 &committed_of,
@@ -43376,6 +44924,7 @@ mod parity_summary_tests {
         let summary = summarize_parity(
             &store(&lines),
             &no_cells(),
+            &GuestRootBuckets::none(),
             &depth_of,
             &|_| None,
             &committed_of,
@@ -43432,6 +44981,7 @@ mod parity_summary_tests {
             summarize_parity(
                 &store(&lines),
                 &no_cells(),
+                &GuestRootBuckets::none(),
                 &depth_of,
                 on_main_of,
                 &committed_of,
@@ -43536,9 +45086,14 @@ mod parity_summary_tests {
             (&golden(1), SABRE),
         ]);
         let lines = rows.iter().map(line).collect::<Vec<_>>();
-        let summary = summarize_parity(&store(&lines), &no_cells(), &|_| None, &|_| None, &|sha| {
-            Ok((sha == SHA).then(|| selection.clone()))
-        });
+        let summary = summarize_parity(
+            &store(&lines),
+            &no_cells(),
+            &GuestRootBuckets::none(),
+            &|_| None,
+            &|_| None,
+            &|sha| Ok((sha == SHA).then(|| selection.clone())),
+        );
         let run = only_run(&summary);
         assert_eq!(
             run.line,
@@ -43588,6 +45143,7 @@ mod parity_summary_tests {
         let summary = summarize_parity(
             &store(&[line(&rows[0])]),
             &no_cells(),
+            &GuestRootBuckets::none(),
             &|_| None,
             &|_| None,
             &|_| Ok(Some(owed.clone())),
@@ -44008,7 +45564,14 @@ mod parity_summary_tests {
                 message: why.into(),
             };
             assert_eq!(input.refusals, [refusal.clone()]);
-            let summary = summarize_parity(&input, &cells, &|_| None, &|_| None, &|_| Ok(None));
+            let summary = summarize_parity(
+                &input,
+                &cells,
+                &GuestRootBuckets::none(),
+                &|_| None,
+                &|_| None,
+                &|_| Ok(None),
+            );
             assert!(summary.store_present);
             assert!(summary.producers.is_empty() && summary.runs.is_empty());
             assert_eq!((summary.rows_read, summary.refused_rows), (0, 0));
@@ -44089,9 +45652,14 @@ mod parity_summary_tests {
             committed_parity_cells(&fs::read_to_string(dir.join("committed-cells.json")).unwrap())
                 .unwrap();
         assert_eq!(committed_cells.len(), 192);
-        let summary = summarize_parity(&input, &no_cells(), &|_| None, &|_| None, &|sha| {
-            Ok((sha == fixture_sha).then(|| committed_cells.clone()))
-        });
+        let summary = summarize_parity(
+            &input,
+            &no_cells(),
+            &GuestRootBuckets::none(),
+            &|_| None,
+            &|_| None,
+            &|sha| Ok((sha == fixture_sha).then(|| committed_cells.clone())),
+        );
         assert_eq!((summary.refused_rows, summary.duplicate_rows), (0, 0));
         let run = only_run(&summary);
         // Every row of the run reports a clean source tree.
@@ -44375,9 +45943,14 @@ mod parity_summary_tests {
     /// The summary of `lines`, verbatim, in one shard, with no commit's parity
     /// selection readable.
     fn summarize_lines(lines: &[String]) -> ParitySummary {
-        summarize_parity(&store(lines), &no_cells(), &|_| None, &|_| None, &|_| {
-            Ok(None)
-        })
+        summarize_parity(
+            &store(lines),
+            &no_cells(),
+            &GuestRootBuckets::none(),
+            &|_| None,
+            &|_| None,
+            &|_| Ok(None),
+        )
     }
 
     /// The brief of a run whose commit this checkout cannot place.
@@ -45615,9 +47188,14 @@ mod series_comparison_tests {
         let project = |row: JsonValue| {
             let rows = read_snapshot(vec![row]).expect("readable snapshot");
             let mut tracked = tracked_fixture_cell();
-            let outcome =
-                apply_series_rows(Path::new("/absent-host-results"), &mut tracked, &rows, None)
-                    .expect("the row projects");
+            let outcome = apply_series_rows(
+                &GuestRootBuckets::none(),
+                Path::new("/absent-host-results"),
+                &mut tracked,
+                &rows,
+                None,
+            )
+            .expect("the row projects");
             refresh_measurement(&mut tracked);
             (tracked, outcome)
         };

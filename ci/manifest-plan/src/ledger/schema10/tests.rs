@@ -984,11 +984,28 @@ fn generated_plan_populations_preserve_command_policy() {
         .count();
     let hosted_cells = expected_cells
         .iter()
-        .filter(|cell| cell.lane == "portable" && cell.backend != "kvm")
+        .filter(|cell| {
+            cell.lane == "portable"
+                && cell.backend != "kvm"
+                && !crate::validation_dag::HOSTED_PORTABLE_EXCLUDED_CATEGORIES
+                    .contains(&cell.category.as_str())
+        })
         .cloned()
         .collect::<Vec<_>>();
     // The exclusion is exercised only while the plan has portable KVM cells.
     assert!(hosted_cells.len() < portable);
+    // No hosted plan ever owned a pinned-root-only category's cells: the one
+    // such category, compat-pinned, was created on 2026-10-05
+    // (https://github.com/rrnewton/hermit/issues/3712), after the KVM
+    // exclusion, so the pre-exclusion shapes rebuilt below own every other
+    // portable cell.
+    let hosted_reachable = |cell: &&CellIdentity| {
+        cell.lane == "portable"
+            && !crate::validation_dag::HOSTED_PORTABLE_EXCLUDED_CATEGORIES
+                .contains(&cell.category.as_str())
+    };
+    let pre_exclusion_hosted = expected_cells.iter().filter(hosted_reachable).count();
+    assert!(pre_exclusion_hosted < portable);
     assert_eq!(current_hosted.planned_cells().unwrap(), hosted_cells);
     assert_eq!(
         current_hosted.planned_backend_parity_relations().unwrap(),
@@ -1035,8 +1052,9 @@ fn generated_plan_populations_preserve_command_policy() {
             "hosted-portable",
             "e2e.manifest_backend_parity_c_on_host",
             LAST_LIVE_HOSTED_PARITY_SELECTOR,
-            // The pre-exclusion shape owns every portable cell, KVM included.
-            portable,
+            // The pre-exclusion shape owns every portable cell, KVM included,
+            // outside the pinned-root-only categories.
+            pre_exclusion_hosted,
         ),
     ] {
         let mut live = dagrun::select_steps_by_labels(&generated, &[label.to_owned()]).unwrap();
@@ -1053,7 +1071,7 @@ fn generated_plan_populations_preserve_command_policy() {
         }
         let live_selected = expected_cells
             .iter()
-            .filter(|cell| label == "full" || cell.lane == "portable")
+            .filter(|cell| label == "full" || hosted_reachable(cell))
             .cloned()
             .collect::<Vec<_>>();
         assert_eq!(live_selected.len(), cell_count);
@@ -1096,7 +1114,7 @@ fn generated_plan_populations_preserve_command_policy() {
         let selected = pre_fold_dag(&live, tag, retained_command);
         let expected_selected = pre_fold_cells
             .iter()
-            .filter(|cell| label == "full" || cell.lane == "portable")
+            .filter(|cell| label == "full" || hosted_reachable(cell))
             .cloned()
             .collect::<Vec<_>>();
         assert_eq!(expected_selected.len(), cell_count);

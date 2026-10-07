@@ -40,6 +40,7 @@ pub use crate::canonical_verdict::VerificationRuntime;
 use crate::ci_selection::CiDisabledReasonSpec;
 use crate::ci_selection::CiSelection;
 use crate::ci_selection::CiSelectionSpec;
+use crate::compat_guest_root::ImagePaths;
 use crate::cpu_evidence::CellCpuBinding;
 use crate::cpu_evidence::CellCpuObservationsV1;
 use crate::cpu_evidence::ChargeBasis;
@@ -364,7 +365,153 @@ pub struct ManifestDocument {
     pub bucket: String,
     pub timeout_seconds: Option<u64>,
     pub slow_reason: Option<String>,
+    /// Where every guest of this bucket must find its programs and libraries.
+    /// Only `pinned` may be declared: the harness refuses to run such a
+    /// bucket's cells anywhere but inside the pinned root image named by
+    /// `ci/hermetic/image.digest`, so a verdict cannot come from a host's own
+    /// `/usr/bin` and glibc. A document without it runs wherever it is
+    /// started.
+    #[serde(default)]
+    pub guest_root: Option<GuestRoot>,
     pub test: Vec<TestRecipe>,
+}
+
+/// Which root filesystem a cell's guest resolved its program and libc in.
+///
+/// A manifest document may require [`GuestRoot::Pinned`]; every result row
+/// records the root its cell actually ran in, so a host-binary verdict and a
+/// pinned-image verdict of the same program are never read as one series.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    Eq,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize
+)]
+#[serde(rename_all = "lowercase")]
+pub enum GuestRoot {
+    /// Inside the container image `ci/hermetic/image.digest` names, started by
+    /// `ci/hermetic/run-in-pinned-root.sh`.
+    Pinned,
+    /// On the machine the harness was started on, with its own `/usr/bin`.
+    Host,
+    /// On a Buck remote-execution worker, with that worker's own `/usr/bin`.
+    Remote,
+}
+
+impl GuestRoot {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pinned => "pinned",
+            Self::Host => "host",
+            Self::Remote => "remote",
+        }
+    }
+}
+
+/// The environment variable `ci/hermetic/run-in-pinned-root.sh` sets, inside
+/// the container only, to the exact image reference it started.
+pub const PINNED_ROOT_IMAGE_ENV: &str = "HERMIT_PINNED_ROOT_IMAGE";
+/// The file naming the pinned root image, below the repository root.
+pub const PINNED_ROOT_IMAGE_DIGEST_FILE: &str = "ci/hermetic/image.digest";
+
+/// The guest root this harness process runs its cells in, and, for
+/// [`GuestRoot::Pinned`], the identity of the root it verified.
+///
+/// Pinned needs the image reference the pinned-root wrapper exports to equal
+/// the repository's `ci/hermetic/image.digest`, and the root itself to be that
+/// image by content ([`pinned_root_identity`]): the variable alone could be
+/// inherited, set by hand, or set by a command the wrapper ran in another
+/// image. A Buck remote-execution cell (`HERMIT_E2E_ROUTE=re`) is
+/// [`GuestRoot::Remote`]; anything else is [`GuestRoot::Host`]. The identity
+/// is `Some` exactly when the root is Pinned.
+pub fn detect_guest_root(
+    root: &Path,
+    pinned_image: Option<&str>,
+    route: Option<&str>,
+) -> (GuestRoot, Option<String>) {
+    match pinned_root_identity(root, pinned_image) {
+        Ok(identity) => (GuestRoot::Pinned, Some(identity)),
+        Err(_) if route == Some("re") => (GuestRoot::Remote, None),
+        Err(_) => (GuestRoot::Host, None),
+    }
+}
+
+/// The [`ImagePaths::identity`] of the pinned root this process runs in, or
+/// why this process is not in it.
+///
+/// `pinned_image` is the wrapper's [`PINNED_ROOT_IMAGE_ENV`]. It must equal
+/// `ci/hermetic/image.digest`, and the running root must match
+/// `ci/hermetic/image-paths.txt`, which records that image's executables by
+/// their `/nix/store` targets, its loader and libc by their bytes, and the
+/// whole store by its content digest ([`ImagePaths::verify_root`]). Another
+/// image, even one with a `/nix/store` shell, resolves its programs to other
+/// store paths, and other bytes at an image file's own path change the
+/// store's digest.
+pub fn pinned_root_identity(root: &Path, pinned_image: Option<&str>) -> Result<String, String> {
+    let listing = ImagePaths::load(root)?;
+    match pinned_image {
+        Some(image) if image == listing.image => {}
+        Some(image) => {
+            return Err(format!(
+                "{PINNED_ROOT_IMAGE_ENV}={image} is not the pinned image {}",
+                listing.image
+            ));
+        }
+        None => {
+            return Err(format!(
+                "{PINNED_ROOT_IMAGE_ENV} is unset, so ci/hermetic/run-in-pinned-root.sh did not \
+                 start this process"
+            ));
+        }
+    }
+    listing.verify_root()?;
+    Ok(listing.identity())
+}
+
+/// Why a result row cannot count for a test of bucket `category`, which
+/// requires `required` ([`ManifestSet::required_guest_root`]), if it cannot.
+///
+/// The row must have run in that root, and a row from the pinned root must
+/// carry the identity this checkout records (`pinned_identity`, the
+/// [`ImagePaths::identity`] of `ci/hermetic/image-paths.txt`): a row that
+/// verified another image, or none, is not this checkout's pinned root. An
+/// unreadable listing (`pinned_identity` is `None`) refuses every pinned row.
+/// `subject` names the row in the reason. Importing rows
+/// (`imported_results`) and `test-harness parity compare` both apply it, so a
+/// row neither ran nor verified here cannot stand for a cell that requires a
+/// root.
+pub fn guest_root_refusal(
+    subject: &str,
+    category: &str,
+    required: Option<GuestRoot>,
+    row_root: Option<GuestRoot>,
+    row_identity: Option<&str>,
+    pinned_identity: Option<&str>,
+) -> Option<String> {
+    let required = required?;
+    if row_root != Some(required) {
+        return Some(format!(
+            "bucket {category} requires guest_root {}, {subject} ran in {}",
+            required.as_str(),
+            row_root.map_or("an unrecorded root", GuestRoot::as_str)
+        ));
+    }
+    if required == GuestRoot::Pinned
+        && (pinned_identity.is_none() || row_identity != pinned_identity)
+    {
+        return Some(format!(
+            "bucket {category} requires the pinned root this checkout records (identity {}), \
+             {subject} verified {}",
+            pinned_identity.unwrap_or("unknown: ci/hermetic/image-paths.txt is unreadable"),
+            row_identity.unwrap_or("no identity")
+        ));
+    }
+    None
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1550,6 +1697,19 @@ impl ManifestSet {
         Ok(Self { documents, tests })
     }
 
+    /// The bucket of the test `id`, or `None` when no manifest declares it.
+    pub fn test_category(&self, id: &str) -> Option<&str> {
+        self.tests.get(id).map(|(category, ..)| category.as_str())
+    }
+
+    /// The guest root the bucket named `category` requires, if it declares one.
+    pub fn required_guest_root(&self, category: &str) -> Option<GuestRoot> {
+        self.documents
+            .iter()
+            .find(|document| document.bucket == category)
+            .and_then(|document| document.guest_root)
+    }
+
     /// Is `id` a test this manifest set has ever heard of?
     ///
     /// ⚠️ THIS EXISTS TO SEPARATE "NO CELLS" FROM "NO SUCH TEST". `select` returns an
@@ -1775,6 +1935,15 @@ fn validate_document_with_cpu(
     }
     if document.test.is_empty() {
         return Err(format!("{stem}: test list must not be empty"));
+    }
+    match document.guest_root {
+        None | Some(GuestRoot::Pinned) => {}
+        Some(other) => {
+            return Err(format!(
+                "{stem}: guest_root may only be `pinned`; `{}` is what a run records, not a requirement",
+                other.as_str()
+            ));
+        }
     }
     match (document.timeout_seconds, document.slow_reason.as_deref()) {
         (Some(timeout), Some(reason)) if !reason.trim().is_empty() => {
@@ -2514,6 +2683,21 @@ pub struct CellResult {
     /// answer, and in a row written before this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exact_branch_counter: Option<CapabilityVerdict>,
+    /// The root filesystem this cell's guest resolved its program and libc
+    /// in: the pinned root image, the starting host's own `/usr/bin`, or a
+    /// Buck remote-execution worker's. Absent on rows written before it was
+    /// recorded, which ran on the host or a remote worker. Serialized even
+    /// when absent, so a row that did not establish it reads `null` rather
+    /// than looking like a row written before the field.
+    #[serde(default)]
+    pub guest_root: Option<GuestRoot>,
+    /// For a row whose `guest_root` is pinned, the
+    /// [`ImagePaths::identity`] of the root the harness verified before it
+    /// ran the cell: what the image's executables resolved to and the bytes
+    /// of its loader and libc. Absent for every other root, and on rows
+    /// written before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_root_identity: Option<String>,
     /// The cell attempt that produced this observation. A retry is a second
     /// observation, so it receives the next positive ordinal instead of
     /// replacing the earlier row.
@@ -2887,6 +3071,11 @@ pub struct RunContext {
     /// then refuses are HOST-INAPPLICABLE (see
     /// [`refused_on_an_inexact_branch_counter`]).
     pub exact_branch_counter: Option<CapabilityVerdict>,
+    /// The guest root this process runs its cells in; see [`detect_guest_root`].
+    pub guest_root: GuestRoot,
+    /// The identity of the pinned root this process verified, when
+    /// `guest_root` is pinned; see [`pinned_root_identity`].
+    pub guest_root_identity: Option<String>,
     pub attempt: u64,
     pub run_index: Option<u64>,
     /// One concrete CLI input shared by comparison operands and outer retries.
@@ -3018,6 +3207,11 @@ impl RunContext {
                 .map_err(|error| format!("cannot establish kernel_version: {error}"))?,
         };
         let host_capabilities = probe_host_capabilities();
+        let (guest_root, guest_root_identity) = detect_guest_root(
+            &root,
+            std::env::var(PINNED_ROOT_IMAGE_ENV).ok().as_deref(),
+            std::env::var("HERMIT_E2E_ROUTE").ok().as_deref(),
+        );
         let build_root = std::env::var_os("E2E_BUILD_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| result_root.join("build").join(&source_sha));
@@ -3072,6 +3266,8 @@ impl RunContext {
             kernel_version,
             host_capabilities,
             exact_branch_counter,
+            guest_root,
+            guest_root_identity,
             attempt: 1,
             run_index,
             epoch: resolve_run_epoch(std::env::var_os("HERMIT_EPOCH"), SystemTime::now)?,
@@ -6988,6 +7184,7 @@ fn run_cell_inner(
         timeouts.wall_seconds,
         observations,
     )?;
+    require_clean_cell_inputs(context, cell, &dir)?;
     // Fixture preparation keeps its scaled wall-clock guard above. Post-preparation
     // execution uses its separately measured bound as an aggregate CPU-second budget
     // across all attempts/seeds, so time spent descheduled by a busy host cannot
@@ -7312,6 +7509,8 @@ fn run_cell_inner(
         kernel_version: context.kernel_version.clone(),
         host_capabilities: context.host_capabilities.clone(),
         exact_branch_counter: context.exact_branch_counter.clone(),
+        guest_root: Some(context.guest_root),
+        guest_root_identity: context.guest_root_identity.clone(),
         attempt: context.attempt,
         run_index: context.run_index,
         hermit_sha: context.source_sha.clone(),
@@ -7397,6 +7596,8 @@ pub fn infrastructure_error_result(
         kernel_version: context.kernel_version.clone(),
         host_capabilities: context.host_capabilities.clone(),
         exact_branch_counter: context.exact_branch_counter.clone(),
+        guest_root: Some(context.guest_root),
+        guest_root_identity: context.guest_root_identity.clone(),
         attempt: context.attempt,
         run_index: context.run_index,
         hermit_sha: context.source_sha.clone(),
@@ -7474,6 +7675,8 @@ pub fn host_inapplicable_result(
         kernel_version: context.kernel_version.clone(),
         host_capabilities: context.host_capabilities.clone(),
         exact_branch_counter: context.exact_branch_counter.clone(),
+        guest_root: Some(context.guest_root),
+        guest_root_identity: context.guest_root_identity.clone(),
         attempt: context.attempt,
         run_index: context.run_index,
         hermit_sha: context.source_sha.clone(),
@@ -7896,6 +8099,49 @@ pub fn write_junit(path: &Path, results: &[CellResult]) -> Result<(), String> {
     fs::write(path, out).map_err(|e| e.to_string())
 }
 
+/// The repository's configuration tree, which [`prepare_dirs`] copies into
+/// every cell's `xdg-config` (`XDG_CONFIG_HOME`).
+const CHECKED_IN_XDG_CONFIG: &str = "tests/e2e/xdg-config";
+
+/// The cell directories [`cell_env`] names other than `xdg-config`, which
+/// [`require_clean_cell_inputs`] requires to be empty.
+const EMPTY_CELL_INPUTS: [&str; 3] = ["home", "fixtures", "tmp"];
+
+/// Refuse to start the guests of a compat-family cell in the pinned root
+/// unless the directories its environment names hold only what the
+/// repository put there: `home`, `fixtures` and `tmp` nothing, and
+/// `xdg-config` exactly [`CHECKED_IN_XDG_CONFIG`]
+/// ([`crate::compat_guest_root::verify_cell_inputs`] says why).
+///
+/// [`prepare_dirs`] creates these directories without clearing them, so a
+/// reused cell directory, or a host-side preparation step, could leave
+/// startup files there that the compat contract, which reads argv text, never
+/// sees and the pinned image does not contain. It runs after
+/// [`prepare_test_until`] and before any guest. Other buckets, and every cell
+/// outside the pinned root, are not checked: only the pinned compat corpus
+/// claims that its guests run nothing but verified bytes.
+fn require_clean_cell_inputs(
+    context: &RunContext,
+    cell: &SelectedCell,
+    dir: &Path,
+) -> Result<(), String> {
+    if context.guest_root != GuestRoot::Pinned
+        || !crate::compat_guest_root::is_compat_bucket(&cell.category)
+    {
+        return Ok(());
+    }
+    let empty: Vec<PathBuf> = EMPTY_CELL_INPUTS
+        .iter()
+        .map(|child| dir.join(child))
+        .collect();
+    crate::compat_guest_root::verify_cell_inputs(
+        &empty,
+        &dir.join("xdg-config"),
+        &context.root.join(CHECKED_IN_XDG_CONFIG),
+    )
+    .map_err(|reason| format!("{} cannot start in the pinned root: {reason}", cell.id.test))
+}
+
 fn prepare_dirs(root: &Path, dir: &Path) -> Result<(), String> {
     for child in [
         "home",
@@ -7907,7 +8153,7 @@ fn prepare_dirs(root: &Path, dir: &Path) -> Result<(), String> {
     ] {
         fs::create_dir_all(dir.join(child)).map_err(|e| e.to_string())?;
     }
-    let xdg = root.join("tests/e2e/xdg-config");
+    let xdg = root.join(CHECKED_IN_XDG_CONFIG);
     if xdg.is_dir() {
         copy_tree(&xdg, &dir.join("xdg-config"))?;
     }
@@ -8522,6 +8768,124 @@ fn execute_observed_until(
 mod tests {
     use super::*;
     use crate::ci_selection::BackendCiDisabledReason;
+
+    /// A repository root whose `ci/hermetic` describes a fake pinned image
+    /// made of this scratch directory's own files: `bin/sh` links to
+    /// `store/bash`, and `lib64/ld.so` links to `store/glibc/ld.so`, whose
+    /// bytes are recorded, and `store` is the recorded tree. Returns the
+    /// scratch root and the image reference.
+    fn fake_pinned_root(name: &str) -> (PathBuf, String) {
+        let root = std::env::temp_dir().join(format!(
+            "runner-guest-root-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        for directory in ["ci/hermetic", "bin", "lib64", "store/glibc"] {
+            fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        fs::write(root.join("store/bash"), "bash").unwrap();
+        fs::write(root.join("store/other-bash"), "bash").unwrap();
+        fs::write(root.join("store/glibc/ld.so"), "loader").unwrap();
+        std::os::unix::fs::symlink(root.join("store/bash"), root.join("bin/sh")).unwrap();
+        std::os::unix::fs::symlink(root.join("store/glibc/ld.so"), root.join("lib64/ld.so"))
+            .unwrap();
+        let image = "localhost/pinned@sha256:00".to_owned();
+        let show = |relative: &str| root.join(relative).display().to_string();
+        fs::write(
+            root.join(PINNED_ROOT_IMAGE_DIGEST_FILE),
+            format!("{image}\n"),
+        )
+        .unwrap();
+        let tree = crate::compat_guest_root::tree_digest(&root.join("store")).unwrap();
+        fs::write(
+            root.join(crate::compat_guest_root::IMAGE_PATHS_FILE),
+            format!(
+                "# fake\nimage: {image}\ntree: {} sha256:{tree}\nfile: {} {} sha256:{:x}\n{} {}\n",
+                show("store"),
+                show("lib64/ld.so"),
+                show("store/glibc/ld.so"),
+                <sha2::Sha256 as sha2::Digest>::digest(b"loader"),
+                show("bin/sh"),
+                show("store/bash"),
+            ),
+        )
+        .unwrap();
+        (root, image)
+    }
+
+    /// Pinned needs the wrapper's image reference to equal
+    /// `ci/hermetic/image.digest` AND the running root to match
+    /// `ci/hermetic/image-paths.txt` by content. A hand-set, inherited or
+    /// forged variable in another root, including another root whose shell
+    /// is in a store, is the host (or remote, on an RE route)
+    /// (https://github.com/rrnewton/hermit/issues/3712).
+    #[test]
+    fn the_pinned_guest_root_needs_the_marker_and_the_image_content() {
+        let (root, image) = fake_pinned_root("detect");
+        let identity = crate::compat_guest_root::ImagePaths::load(&root)
+            .unwrap()
+            .identity();
+        let detect =
+            |marker: Option<&str>, route: Option<&str>| detect_guest_root(&root, marker, route);
+        let pinned = (GuestRoot::Pinned, Some(identity.clone()));
+        assert_eq!(detect(Some(&image), None), pinned);
+        assert_eq!(detect(Some(&image), Some("re")), pinned);
+        assert_eq!(detect(Some(&image), Some("local")), pinned);
+        // The content matches, but nothing says the wrapper started us.
+        assert_eq!(detect(None, None), (GuestRoot::Host, None));
+        assert_eq!(detect(None, Some("re")), (GuestRoot::Remote, None));
+        assert_eq!(
+            detect(Some("localhost/pinned@sha256:01"), None),
+            (GuestRoot::Host, None)
+        );
+        let refusal = pinned_root_identity(&root, None).unwrap_err();
+        assert!(refusal.contains("is unset"), "{refusal}");
+
+        // The marker is forged in another root: its shell is in a store, but
+        // not the store path the pinned image records.
+        fs::remove_file(root.join("bin/sh")).unwrap();
+        std::os::unix::fs::symlink(root.join("store/other-bash"), root.join("bin/sh")).unwrap();
+        assert_eq!(detect(Some(&image), None), (GuestRoot::Host, None));
+        assert_eq!(detect(Some(&image), Some("re")), (GuestRoot::Remote, None));
+        let refusal = pinned_root_identity(&root, Some(&image)).unwrap_err();
+        assert!(refusal.contains("other-bash"), "{refusal}");
+        fs::remove_file(root.join("bin/sh")).unwrap();
+        std::os::unix::fs::symlink(root.join("store/bash"), root.join("bin/sh")).unwrap();
+        assert_eq!(detect(Some(&image), None), pinned);
+
+        // The same store paths with another loader's bytes.
+        fs::write(root.join("store/glibc/ld.so"), "another loader").unwrap();
+        assert_eq!(detect(Some(&image), None), (GuestRoot::Host, None));
+        let refusal = pinned_root_identity(&root, Some(&image)).unwrap_err();
+        assert!(refusal.contains("has sha256"), "{refusal}");
+        fs::write(root.join("store/glibc/ld.so"), "loader").unwrap();
+        assert_eq!(detect(Some(&image), None), pinned);
+
+        // The shell's path resolves to its recorded store file, which now
+        // holds other bytes: only the tree's content digest sees it.
+        fs::write(root.join("store/bash"), "a host bash").unwrap();
+        assert_eq!(detect(Some(&image), None), (GuestRoot::Host, None));
+        let refusal = pinned_root_identity(&root, Some(&image)).unwrap_err();
+        assert!(refusal.contains("content digest"), "{refusal}");
+        fs::write(root.join("store/bash"), "bash").unwrap();
+        assert_eq!(detect(Some(&image), None), pinned);
+
+        // A digest the listing does not describe, an empty digest, or no
+        // listing at all is never pinned.
+        let digest = root.join(PINNED_ROOT_IMAGE_DIGEST_FILE);
+        fs::write(&digest, "localhost/pinned@sha256:01\n").unwrap();
+        assert_eq!(
+            detect(Some("localhost/pinned@sha256:01"), None),
+            (GuestRoot::Host, None)
+        );
+        fs::write(&digest, "\n").unwrap();
+        assert_eq!(detect(Some(""), None), (GuestRoot::Host, None));
+        fs::write(&digest, format!("{image}\n")).unwrap();
+        fs::remove_file(root.join(crate::compat_guest_root::IMAGE_PATHS_FILE)).unwrap();
+        assert_eq!(detect(Some(&image), None), (GuestRoot::Host, None));
+        fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn source_sha_must_be_one_full_lowercase_commit() {
@@ -9224,6 +9588,7 @@ mod tests {
             bucket: "fixture".into(),
             timeout_seconds: None,
             slow_reason: None,
+            guest_root: None,
             test: vec![five_modes()],
         };
         validate_document_with_cpu(
@@ -9462,6 +9827,8 @@ mod tests {
             machine_shortname: "fixture-host".into(),
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
+            guest_root: GuestRoot::Host,
+            guest_root_identity: None,
             attempt: 1,
             run_index: None,
             epoch: "2026-01-01T00:00:00Z".into(),
@@ -9608,6 +9975,8 @@ mod tests {
             machine_shortname: "fixture-host".into(),
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
+            guest_root: GuestRoot::Host,
+            guest_root_identity: None,
             attempt: 1,
             run_index: None,
             epoch: "2026-01-01T00:00:00Z".into(),
@@ -10107,6 +10476,8 @@ mod tests {
             machine_shortname: "fixture-host".into(),
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
+            guest_root: GuestRoot::Host,
+            guest_root_identity: None,
             attempt: 1,
             run_index: None,
             epoch: "2026-01-01T00:00:00Z".into(),
@@ -10304,6 +10675,8 @@ mod tests {
             machine_shortname: "fixture-host".into(),
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
+            guest_root: GuestRoot::Host,
+            guest_root_identity: None,
             attempt: 1,
             run_index: None,
             epoch: "2026-01-01T00:00:00Z".into(),
@@ -10758,28 +11131,36 @@ mod tests {
         // bounded diagnostics, with CPU one second below each (a cell's CPU
         // budget must stay below its wall). These literals are the check; they
         // are not read back from compat.yaml.
+        //
+        // Since https://github.com/rrnewton/hermit/issues/3712 the gating
+        // copy of that corpus is compat-pinned.yaml, run from the pinned
+        // image: it holds the fold's 189 full-validation cells. compat.yaml
+        // is the non-gating host-portability copy, and every one of its 219
+        // rows has a full-validation cell, the 30 rows whose verify cell
+        // belongs to the SaBRe run type in compat-pinned included, with the
+        // same bounds.
+        let (compat_pinned, observed): (BTreeMap<_, _>, BTreeMap<_, _>) = observed
+            .into_iter()
+            .partition(|((test, _, _), _)| test.starts_with("compat-pinned/"));
         let (compat, observed): (BTreeMap<_, _>, BTreeMap<_, _>) = observed
             .into_iter()
             .partition(|((test, _, _), _)| test.starts_with("compat/"));
         assert_eq!(
-            compat.len(),
+            compat_pinned.len(),
             STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT
         );
-        for ((test, mode, backend), bounds) in &compat {
-            assert_eq!((*mode, *backend), ("verify", "ptrace"), "{test}");
-            let diagnostic = matches!(
-                *test,
-                "compat/df"
-                    | "compat/ranlib"
-                    | "compat/top"
-                    | "compat/zstd"
-                    | "compat/zstd-roundtrip"
-            );
-            assert_eq!(
-                *bounds,
-                if diagnostic { (19, 20) } else { (59, 60) },
-                "{test}"
-            );
+        assert_eq!(compat.len(), 219);
+        for (prefix, cells) in [("compat-pinned/", &compat_pinned), ("compat/", &compat)] {
+            for ((test, mode, backend), bounds) in cells {
+                assert_eq!((*mode, *backend), ("verify", "ptrace"), "{test}");
+                let row = test.strip_prefix(prefix).unwrap();
+                let diagnostic = matches!(row, "df" | "ranlib" | "top" | "zstd" | "zstd-roundtrip");
+                assert_eq!(
+                    *bounds,
+                    if diagnostic { (19, 20) } else { (59, 60) },
+                    "{test}"
+                );
+            }
         }
         let expected = EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()
@@ -10804,6 +11185,7 @@ mod tests {
             bucket: "fixture".into(),
             timeout_seconds: Some(20),
             slow_reason: Some("measured bucket-wide work needs more than 15 seconds".into()),
+            guest_root: None,
             test: vec![recipe(true)],
         };
         document.slow_reason = None;
@@ -13576,6 +13958,103 @@ mod tests {
         assert!(failures.is_empty(), "{failures:#?}");
     }
 
+    /// A compat-family cell in the pinned root starts only from clean inputs.
+    /// The directories `prepare_dirs` makes from this repository's own
+    /// `tests/e2e/xdg-config` pass; `prepare_dirs` never clears, so a reused
+    /// cell directory keeps a host-written `~/.bashrc`, which is refused, as
+    /// is an `xdg-config` entry the checked-in tree lacks. Neither a host root
+    /// nor another bucket is checked.
+    #[test]
+    fn a_pinned_compat_cell_starts_only_from_clean_inputs() {
+        let scratch = cpu_reader_test_root("clean-cell-inputs");
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut context = run_context(&repository);
+        context.guest_root = GuestRoot::Pinned;
+        let mut cell = ptrace_cell("verify");
+        cell.category = "compat-pinned".into();
+        let dir = scratch.join("cell");
+        prepare_dirs(&context.root, &dir).unwrap();
+        assert!(dir.join("xdg-config/git/config").is_file());
+        assert_eq!(require_clean_cell_inputs(&context, &cell, &dir), Ok(()));
+
+        fs::write(dir.join("home/.bashrc"), "echo host\n").unwrap();
+        prepare_dirs(&context.root, &dir).unwrap();
+        let error = require_clean_cell_inputs(&context, &cell, &dir).unwrap_err();
+        assert!(
+            error.starts_with(&format!(
+                "{} cannot start in the pinned root: ",
+                cell.id.test
+            )),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!("{} holds .bashrc,", dir.join("home").display())),
+            "{error}"
+        );
+        let mut host = context.clone();
+        host.guest_root = GuestRoot::Host;
+        assert_eq!(require_clean_cell_inputs(&host, &cell, &dir), Ok(()));
+        let mut other = cell.clone();
+        other.category = "applications".into();
+        assert_eq!(require_clean_cell_inputs(&context, &other, &dir), Ok(()));
+
+        fs::remove_file(dir.join("home/.bashrc")).unwrap();
+        fs::write(dir.join("xdg-config/git/attributes"), "").unwrap();
+        let error = require_clean_cell_inputs(&context, &cell, &dir).unwrap_err();
+        assert!(
+            error.contains(&format!(
+                "{} is not in {}",
+                dir.join("xdg-config/git/attributes").display(),
+                repository.join(CHECKED_IN_XDG_CONFIG).display()
+            )),
+            "{error}"
+        );
+        fs::remove_dir_all(scratch).unwrap();
+    }
+
+    /// `run_cell` refuses a pinned compat cell whose home already holds a
+    /// startup file before starting any guest: the cell is an infrastructure
+    /// ERROR with no attempt, and its program never ran. With the file gone,
+    /// the same cell in the same directory runs.
+    #[test]
+    fn a_pinned_compat_cell_with_a_host_written_startup_file_never_starts() {
+        let root = cpu_reader_test_root("pinned-compat-dirty-home");
+        let mut context = run_context(&root);
+        context.guest_root = GuestRoot::Pinned;
+        let marker = root.join("ran");
+        let program = root.join("record-run");
+        fs::write(
+            &program,
+            format!("#!/bin/sh\nprintf ran >> '{}'\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cell = native_cpu_cell("unused", 1);
+        cell.category = "compat-pinned".into();
+        cell.test.direct = Some(DirectCommand::Argv(vec![program.display().to_string()]));
+        let dir = cell_artifact_dir(&context, &cell);
+        fs::create_dir_all(dir.join("home")).unwrap();
+        fs::write(dir.join("home/.bashrc"), "echo host\n").unwrap();
+
+        let failure = run_cell(&context, &cell).expect_err("a dirty home must refuse the cell");
+        let reason = failure.to_string();
+        assert!(
+            reason.contains("cannot start in the pinned root")
+                && reason.contains(&format!("{} holds .bashrc,", dir.join("home").display())),
+            "{reason}"
+        );
+        let row = failure.into_result(&context, &cell);
+        assert_eq!(row.outcome, "ERROR");
+        assert!(row.attempts.is_empty(), "{row:?}");
+        assert!(!marker.exists(), "the guest ran before the refusal");
+
+        fs::remove_file(dir.join("home/.bashrc")).unwrap();
+        let row = run_cell(&context, &cell).unwrap();
+        assert_eq!(row.attempts.len(), 1, "{row:?}");
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "ran");
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn failed_later_launch_retains_prior_attempt_and_cpu_observations() {
         let root = cpu_reader_test_root("prior-work-before-spawn-failure");
@@ -14120,6 +14599,8 @@ int main(int argc, char **argv) {
             machine_shortname: "fixture-host".into(),
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
+            guest_root: GuestRoot::Host,
+            guest_root_identity: None,
             attempt: 1,
             run_index: None,
             epoch: "2026-01-01T00:00:00Z".into(),
@@ -14196,6 +14677,8 @@ int main(int argc, char **argv) {
             machine_shortname: "fixture-host".into(),
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
+            guest_root: GuestRoot::Host,
+            guest_root_identity: None,
             attempt: 1,
             run_index: None,
             epoch: "2026-01-01T00:00:00Z".into(),
@@ -14322,6 +14805,8 @@ int main(int argc, char **argv) {
             machine_shortname: "fixture-host".into(),
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
+            guest_root: GuestRoot::Host,
+            guest_root_identity: None,
             attempt: 1,
             run_index: None,
             epoch: "2026-01-01T00:00:00Z".into(),
@@ -14599,6 +15084,8 @@ backends_disabled:
                 machine_shortname: "fixture-host".into(),
                 kernel_version: "7.1.3-fixture".into(),
                 host_capabilities: fixture_host_capabilities(),
+                guest_root: GuestRoot::Host,
+                guest_root_identity: None,
                 attempt: 1,
                 run_index: None,
                 epoch: "2026-01-01T00:00:00Z".into(),
@@ -14676,6 +15163,8 @@ backends_disabled:
             machine_shortname: "fixture-host".into(),
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
+            guest_root: GuestRoot::Host,
+            guest_root_identity: None,
             attempt: 1,
             run_index: None,
             epoch: "2026-01-01T00:00:00Z".into(),
@@ -14735,6 +15224,8 @@ backends_disabled:
             machine_shortname: "fixture-host".into(),
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
+            guest_root: GuestRoot::Host,
+            guest_root_identity: None,
             attempt: 1,
             run_index: None,
             epoch: "2026-01-01T00:00:00Z".into(),
@@ -15041,6 +15532,8 @@ backends_disabled:
             machine_shortname: "fixture-host".into(),
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
+            guest_root: GuestRoot::Host,
+            guest_root_identity: None,
             attempt: 1,
             run_index: None,
             epoch: "2026-01-01T00:00:00Z".into(),
@@ -15401,6 +15894,8 @@ backends_disabled:
             machine_shortname: "acceptance".into(),
             kernel_version: command_text("uname", &["-r"]).unwrap(),
             host_capabilities: probe_host_capabilities(),
+            guest_root: GuestRoot::Host,
+            guest_root_identity: None,
             attempt: 1,
             run_index: None,
             epoch: resolve_run_epoch(std::env::var_os("HERMIT_EPOCH"), SystemTime::now).unwrap(),
@@ -15538,6 +16033,8 @@ backends_disabled:
             machine_shortname: "fixture-host".into(),
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
+            guest_root: GuestRoot::Host,
+            guest_root_identity: None,
             attempt: 1,
             run_index: None,
             epoch: "2026-01-01T00:00:00Z".into(),
@@ -15860,6 +16357,8 @@ backends_disabled:
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
             exact_branch_counter: None,
+            guest_root: None,
+            guest_root_identity: None,
             attempt: 1,
             run_index: None,
             hermit_sha: "sha".into(),
@@ -21275,6 +21774,8 @@ cp "{}" "$verdict"
             machine_shortname: "fixture-host".into(),
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
+            guest_root: GuestRoot::Host,
+            guest_root_identity: None,
             attempt: 1,
             run_index: None,
             epoch: "2026-01-01T00:00:00Z".into(),
@@ -21335,6 +21836,8 @@ cp "{}" "$verdict"
             machine_shortname: "fixture-host".into(),
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
+            guest_root: GuestRoot::Host,
+            guest_root_identity: None,
             attempt: 1,
             run_index: None,
             epoch: "2026-01-01T00:00:00Z".into(),
@@ -21518,6 +22021,8 @@ cp "{}" "$verdict"
             machine_shortname: "fixture-host".into(),
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
+            guest_root: GuestRoot::Host,
+            guest_root_identity: None,
             attempt: 1,
             run_index: None,
             epoch: "2026-01-01T00:00:00Z".into(),
