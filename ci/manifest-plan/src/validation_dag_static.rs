@@ -1626,7 +1626,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin leaves out the twelve
     // HOSTED_PORTABLE_UNIQUE_MOUNT_ID_DETCORE_TESTS by exact name
     // (https://github.com/rrnewton/hermit/pull/3255), so it executes twelve
-    // fewer than test.detcore_unit: 998 - 12 = 986.
+    // fewer than test.detcore_unit: 1098 - 12 = 1086.
     // Adds the same https://github.com/rrnewton/hermit/pull/3255 tests as
     // test.detcore_unit except the twelve
     // HOSTED_PORTABLE_UNIQUE_MOUNT_ID_DETCORE_TESTS, which this host twin leaves out by
