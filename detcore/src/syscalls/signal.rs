@@ -32,6 +32,7 @@ use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::syscalls::threads::KERNEL_SIGSET_SIZE;
 use crate::syscalls::threads::KernelSigaction;
 use crate::syscalls::threads::KernelSigset;
+use crate::syscalls::threads::read_kernel_signal_state;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::alarm_remaining;
 use crate::tool_global::notify_signal_pending;
@@ -413,18 +414,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::EFAULT.into());
         };
 
-        let temporary_mask = read_kernel_sigset(guest, mask_addr).await?;
-        let mut stack = guest.stack().await;
-        let pending_addr = stack.push(0_u64);
-        let pending_guard = stack.commit()?;
-        let pending_out = AddrMut::<libc::sigset_t>::from_raw(pending_addr.as_raw())
-            .expect("stack address must be non-null");
-        let pending_call = syscalls::RtSigpending::new()
-            .with_set(Some(pending_out))
-            .with_sigsetsize(KERNEL_SIGSET_SIZE);
-        guest.inject_with_retry(pending_call).await?;
-        let pending: u64 = guest.memory().read_value(pending_addr)?;
-        drop(pending_guard);
+        let temporary_mask = self.read_rt_sigsuspend_mask(guest, mask_addr).await?;
+        let pending = self.blocked_pending_signals(guest).await?;
 
         // The scheduler records the mask the call sleeps under, read here in
         // this thread's turn, to choose a SIGCHLD target while the thread is
@@ -441,6 +432,86 @@ impl<T: RecordOrReplay> Detcore<T> {
             self.record_or_replay_rt_sigsuspend(guest, call, installed_mask)
                 .await
         }
+    }
+
+    /// The temporary mask an `rt_sigsuspend` names, read without using up the
+    /// pending syscall where the backend allows it.
+    ///
+    /// `read_kernel_sigset` checks the pointer with an injected `rt_sigprocmask`
+    /// probe. As `blocked_pending_signals` explains for the `rt_sigpending`
+    /// injection, any injection turns the real `rt_sigsuspend` into a second
+    /// injection, and a signal that arrives early is then reported as
+    /// `ERESTARTSYS` in some runs and `ERESTARTNOHAND` in others. Where the
+    /// guest runs as real host threads
+    /// (`backend_supports_blocked_wait_signal_interruption`, set for ptrace),
+    /// `read_exact_with_user_access` is `process_vm_readv`, which, unlike a
+    /// ptrace peek, refuses a page the guest cannot read. The real call copies
+    /// the mask from the same pointer, so the kernel still decides whether the
+    /// guest gets `EFAULT`. A read that fails falls back to the probe, because
+    /// `process_vm_readv` also refuses some pages the guest can read, such as a
+    /// write-only mapping, and the probe is what reports `EFAULT` for a pointer
+    /// the guest cannot read.
+    async fn read_rt_sigsuspend_mask<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        address: Addr<'_, libc::sigset_t>,
+    ) -> Result<KernelSigset, Error> {
+        if self.cfg.backend_supports_blocked_wait_signal_interruption {
+            let mut mask = [0_u8; KERNEL_SIGSET_SIZE];
+            if guest
+                .memory()
+                .read_exact_with_user_access(address.cast::<u8>(), &mut mask)
+                .is_ok()
+            {
+                return Ok(KernelSigset::from_ne_bytes(mask));
+            }
+        }
+        read_kernel_sigset(guest, address).await
+    }
+
+    /// The signals pending for the calling thread or its process that the
+    /// thread blocks, as `rt_sigpending` reports them.
+    ///
+    /// Where the guest runs as real host threads
+    /// (`backend_supports_blocked_wait_signal_interruption`), this reads the
+    /// thread's `/proc` status (`read_kernel_signal_state`) while it is stopped
+    /// at the call's entry: `SigPnd | ShdPnd` under `SigBlk`, which is what
+    /// the kernel's `rt_sigpending` computes. An injected `rt_sigpending` would
+    /// use up the pending syscall, and `rt_sigsuspend` would then run as a
+    /// second injection. A signal sent after the thread left the runnable set
+    /// could stop it before that injection's `syscall` instruction ran, and
+    /// Reverie reported `ERESTARTSYS` for a call that never ran. Whether it did
+    /// depended on host timing, so the same guest logged `ERESTARTSYS` in one
+    /// run and the kernel's `ERESTARTNOHAND` in the next: a `--verify`
+    /// divergence (https://github.com/rrnewton/hermit/pull/3224). Resuming the
+    /// pending syscall lets the kernel see the signal and return
+    /// `ERESTARTNOHAND` either way. A stopped tracee's status is always
+    /// readable; if it is not, this falls back to asking the kernel and says
+    /// so in the compared log.
+    async fn blocked_pending_signals<G: Guest<Self>>(&self, guest: &mut G) -> Result<u64, Error> {
+        if self.cfg.backend_supports_blocked_wait_signal_interruption {
+            match read_kernel_signal_state(guest.pid(), guest.tid()) {
+                Ok(state) => return Ok(state.pending & state.blocked),
+                Err(errno) => tracing::warn!(
+                    "[dtid {}] could not read the pending signals of thread {} ({}); asking the kernel",
+                    guest.thread_state().dettid,
+                    guest.tid(),
+                    errno
+                ),
+            }
+        }
+        let mut stack = guest.stack().await;
+        let pending_addr = stack.push(0_u64);
+        let pending_guard = stack.commit()?;
+        let pending_out = AddrMut::<libc::sigset_t>::from_raw(pending_addr.as_raw())
+            .expect("stack address must be non-null");
+        let pending_call = syscalls::RtSigpending::new()
+            .with_set(Some(pending_out))
+            .with_sigsetsize(KERNEL_SIGSET_SIZE);
+        guest.inject_with_retry(pending_call).await?;
+        let pending: u64 = guest.memory().read_value(pending_addr)?;
+        drop(pending_guard);
+        Ok(pending)
     }
 
     /// rt_sigaction

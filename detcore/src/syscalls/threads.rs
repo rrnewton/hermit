@@ -3567,6 +3567,56 @@ mod tests {
         );
     }
 
+    /// For a live thread, the pending signals its `/proc` state shows under
+    /// its mask are exactly what `rt_sigpending` returns. `rt_sigsuspend`
+    /// reads them this way on a backend that runs the guest as real host
+    /// threads, instead of injecting an `rt_sigpending` probe
+    /// (https://github.com/rrnewton/hermit/pull/3224). The signal here is
+    /// thread-directed: a process-directed one could be taken by another
+    /// thread of the test binary, so the parser test above covers the shared
+    /// queue.
+    #[test]
+    fn kernel_signal_state_pending_under_the_mask_matches_rt_sigpending() {
+        std::thread::spawn(|| {
+            let urg = kernel_sigset_bit(libc::SIGURG);
+            let mut urg_set: libc::sigset_t = unsafe { std::mem::zeroed() };
+            unsafe {
+                libc::sigemptyset(&mut urg_set);
+                libc::sigaddset(&mut urg_set, libc::SIGURG);
+                assert_eq!(
+                    libc::pthread_sigmask(libc::SIG_BLOCK, &urg_set, std::ptr::null_mut()),
+                    0
+                );
+            }
+            let pid = Pid::from_raw(unsafe { libc::getpid() });
+            let tid = Pid::from_raw(unsafe { libc::gettid() });
+            let before = read_kernel_signal_state(pid, tid).unwrap();
+            assert_eq!(before.pending & urg, 0);
+            assert_ne!(before.blocked & urg, 0);
+
+            let sent = unsafe {
+                libc::syscall(libc::SYS_tgkill, pid.as_raw(), tid.as_raw(), libc::SIGURG)
+            };
+            assert_eq!(sent, 0);
+            let state = read_kernel_signal_state(pid, tid).unwrap();
+            let mut pending: libc::sigset_t = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::sigpending(&mut pending) }, 0);
+            let from_syscall: KernelSigset = (1..=KernelSigset::BITS as i32)
+                .filter(|&signal| unsafe { libc::sigismember(&pending, signal) } == 1)
+                .fold(0, |set, signal| set | kernel_sigset_bit(signal));
+            assert_ne!(from_syscall & urg, 0);
+            assert_eq!(state.thread_pending & urg, urg);
+            assert_eq!(state.pending & state.blocked, from_syscall);
+
+            // Take the signal, so it cannot outlive this thread's mask.
+            let mut taken = 0;
+            assert_eq!(unsafe { libc::sigwait(&urg_set, &mut taken) }, 0);
+            assert_eq!(taken, libc::SIGURG);
+        })
+        .join()
+        .unwrap();
+    }
+
     #[test]
     fn only_unblocked_caught_or_fatal_signals_interrupt_a_wait() {
         let state = KernelSignalState {
