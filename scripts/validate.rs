@@ -2729,7 +2729,17 @@ impl SubmoduleFixtureChild {
             // It must reach real rust-script, not a prepared executable.
             command
                 .env_remove("HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED")
-                .env_remove("HERMIT_RUST_SCRIPT_ARTIFACT_ROOT");
+                .env_remove("HERMIT_RUST_SCRIPT_ARTIFACT_ROOT")
+                // That compilation is the boundary under test, not the
+                // optimized code it produces, and the child only runs
+                // pre.submodules. Measured 2026-10-06 on three CPUs, a cold
+                // release build of this script's package took 147.71 s wall
+                // and 403.28 s user at opt-level 3, and 50.85 s and 107.15 s
+                // at opt-level 0. On GitHub's hosted runner the opt-level 3
+                // compile had used 266.96 of this child's 300 seconds when
+                // check.script_unit_tests reached its own wall bound
+                // (https://github.com/rrnewton/hermit/actions/runs/37543769782).
+                .env("CARGO_PROFILE_RELEASE_OPT_LEVEL", "0");
         }
         // The missing-rr case retains normal producer selection for the
         // original-root script. Its RUN entrypoint (never this process's
