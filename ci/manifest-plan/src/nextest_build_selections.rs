@@ -613,7 +613,7 @@ mod tests {
             // 287 listed, less the 25 external_signal_interrupt ptrace cases
             // that need the PMU timer, which privileged-test.pmu_integration_cases
             // runs.
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "262");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "264");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

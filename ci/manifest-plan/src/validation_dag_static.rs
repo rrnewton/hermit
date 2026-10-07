@@ -1364,7 +1364,48 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // syscalls::helpers::kernel_signal_wait_failures::a_sigchld_after_an_unidentified_stop_is_refused_before_it_replaces_it
     // retains all 1088: 1088 + 1 = 1089, measured with cargo nextest list
     // --profile ci -p hermit-detcore --lib --bins.
-    ("test.detcore_unit", 1089),
+    // https://github.com/rrnewton/hermit/pull/3224 adds 36 tests and retains all
+    // 1089 identities above (1125, measured with cargo nextest list --profile ci):
+    // scheduler::test, 31 tests:
+    //   a_kernel_sigsuspend_mask_is_compared_with_the_grant_apart_from_kill_and_stop,
+    //   a_second_expiry_before_the_first_copy_is_taken_is_merged_with_it,
+    //   a_second_expiry_while_the_first_may_be_pending_adds_no_copy_for_one_thread,
+    //   a_sibling_signal_arms_a_background_waiter_whose_recorded_mask_admits_it,
+    //   a_sibling_signal_leaves_a_waiter_it_cannot_wake_in_its_pool,
+    //   a_sibling_signaled_sigsuspend_waiter_is_requeued_before_a_deadlock_verdict,
+    //   a_signal_sent_before_the_rt_sigsuspend_grant_requeues_the_waiter_before_its_sibling,
+    //   a_sigsuspend_mask_that_differs_from_its_grant_is_recorded_at_info,
+    //   a_timer_copy_holder_that_exits_releases_the_next_expiry,
+    //   a_timer_signal_goes_past_a_thread_at_a_queued_exit_to_one_that_will_take_it,
+    //   a_timer_signal_keeps_the_process_directed_send_outside_the_capability,
+    //   a_timer_signal_leaves_an_external_io_blocker_it_cannot_wake_in_its_pool,
+    //   a_timer_signal_never_goes_to_a_thread_stopped_at_a_queued_request,
+    //   a_timer_signal_never_goes_to_an_rt_sigsuspend_waiter_whose_sleep_is_unconfirmed,
+    //   a_timer_signal_no_thread_is_known_to_admit_stays_pending_on_the_process,
+    //   a_timer_signal_passes_over_a_waiter_an_earlier_signal_released,
+    //   a_timer_signal_prefers_the_named_candidate_then_thread_id_order,
+    //   a_timer_signal_prefers_the_named_thread_then_thread_id_order,
+    //   an_alarm_goes_to_the_external_io_blocker_whose_mask_admits_it,
+    //   an_alarm_goes_to_the_rt_sigsuspend_waiter_whose_mask_admits_it,
+    //   an_rt_sigsuspend_entry_hold_ends_with_its_thread_and_ignores_stale_reports,
+    //   an_unconfirmed_rt_sigsuspend_entry_keeps_the_hold_and_records_one_refusal,
+    //   child_exit_signal_does_not_replace_a_posted_vfork_continuation,
+    //   child_exit_signal_leaves_vfork_parent_waiting_for_its_continuation,
+    //   no_thread_runs_before_a_released_rt_sigsuspend_waiter_is_seen_asleep,
+    //   only_a_gated_rt_sigsuspend_grant_holds_other_threads,
+    //   rt_sigsuspend_mask_uses_kernel_sigset_bits_and_cannot_block_kill_or_stop,
+    //   signal_blocked_by_the_rt_sigsuspend_mask_leaves_the_wait_in_its_pool,
+    //   signal_leaves_blocking_external_io_waiting_for_its_own_report,
+    //   signal_leaves_rt_sigsuspend_in_its_pool_on_a_backend_without_a_guaranteed_report,
+    //   signal_requeues_rt_sigsuspend_without_counterfeiting_its_report;
+    // syscalls::signal::tests, one test:
+    //   the_installed_mask_cannot_block_kill_or_stop;
+    // syscalls::threads::tests, four tests:
+    //   a_released_rt_sigsuspend_thread_is_asleep_only_inside_one_sleep_in_the_call,
+    //   a_thread_in_rt_sigsuspend_is_seen_asleep_under_its_temporary_mask,
+    //   kernel_signal_state_pending_under_the_mask_matches_rt_sigpending,
+    //   the_rt_sigsuspend_entry_watch_ends_asleep_unwanted_or_out_of_time.
+    ("test.detcore_unit", 1125),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1487,7 +1528,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 25 external_signal_interrupt ptrace cases that need the PMU timer
     // move to privileged-test.pmu_integration_cases: 287 - 25 = 262, listed
     // with this node's filter.
-    ("test.hermit_integration", 262),
+    // https://github.com/rrnewton/hermit/pull/3224 adds two signal_determinism
+    // tests, ptrace_sigsuspend_runs_without_probe_injections and
+    // sigsuspend_mask_fallback_is_recorded_in_the_compared_log, and all 262
+    // prior identities are retained (264, measured with cargo nextest list).
+    ("test.hermit_integration", 264),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -1918,7 +1963,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test and the two renamed iovecs tests: 1082 + 1 = 1083.
     // The host twin selects the same five fd.rs tests, re-listed: 1088.
     // And the same unidentified-stop SIGCHLD refusal test: 1088 + 1 = 1089.
-    ("test.detcore_unit_on_host", 1089),
+    // And the same 36 https://github.com/rrnewton/hermit/pull/3224 tests listed
+    // for test.detcore_unit (1125, measured).
+    ("test.detcore_unit_on_host", 1125),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -1943,7 +1990,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the three stdout-file tests (286).
     // And the minimal-environment test (287, measured).
     // The host twin skips the same 25 PMU-timer cases: 262.
-    ("test.hermit_integration_on_host", 262),
+    // And the two signal_determinism tests of
+    // https://github.com/rrnewton/hermit/pull/3224 (264, measured).
+    ("test.hermit_integration_on_host", 264),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
