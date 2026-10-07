@@ -2162,6 +2162,124 @@ fn other_process_pipe_and_socket_links_match_fstat() {
     assert_eq!(stdout, "proc-fd-links pipe=agrees socket=agrees\n");
 }
 
+/// Run one stdout mode of tests/c/fixtures/inode_identity_views.c natively and
+/// then on ptrace, each time with stdin /dev/null and the stdout `stdout`
+/// returns. Each run must exit 0 and print, among its stderr lines that begin
+/// with `prefix`, exactly `expected`.
+fn assert_stdout_alias_views(
+    guest: &Path,
+    args: &[&std::ffi::OsStr],
+    stdout: impl Fn() -> Stdio,
+    prefix: &str,
+    expected: &[&str],
+) {
+    let summary = |stderr: &[u8]| -> Vec<String> {
+        String::from_utf8_lossy(stderr)
+            .lines()
+            .filter(|line| line.starts_with(prefix))
+            .map(str::to_owned)
+            .collect()
+    };
+
+    // What the guest asserts holds on native Linux, on this host's
+    // filesystems.
+    let native = Command::new(guest)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(stdout())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run the guest natively");
+    assert!(
+        native.status.success() && summary(&native.stderr) == expected,
+        "native run: {}\nstderr:\n{}",
+        native.status,
+        String::from_utf8_lossy(&native.stderr)
+    );
+
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command.args([
+        "--log=error",
+        "run",
+        "--base-env=minimal",
+        "--no-virtualize-cpuid",
+        "--max-timeslice=disabled",
+        "--",
+    ]);
+    command.arg(guest).args(args);
+    hermit_test::configure_guest_execution(&mut command);
+    // After configure_guest_execution, which rebuilds the command.
+    command
+        .stdin(Stdio::null())
+        .stdout(stdout())
+        .stderr(Stdio::piped());
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    assert!(
+        output.status.success() && summary(&output.stderr) == expected,
+        "{rendered}\nstatus: {}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// Detcore reports a fixed inode for each inherited stdio descriptor, 1000 + the
+// descriptor number, on fstat and on its own /proc/self/fd link, while a dup of
+// it above descriptor 2 keeps the inode the deterministic pool gives the
+// object, which is also what stat of a path to the object reports. A mapping is
+// another view of the object, so it must report the inode an alias and a path
+// report, not descriptor 1's fixed inode
+// (https://github.com/rrnewton/hermit/pull/3255). Here stdin is /dev/null and
+// stdout a regular file opened for reading and writing: the guest maps a dup of
+// stdout and the file opened again by path, and compares each maps line, and
+// the dup's fdinfo, with fstat of the dup and stat and statx of the path.
+// ptrace backend.
+#[test]
+fn stdout_file_mappings_report_the_inode_its_alias_and_path_report() {
+    let _guard = hermit_run_lock();
+    let guest = inode_identity_views::compile_guest("stdout-alias-maps");
+    let mut file =
+        tempfile::NamedTempFile::new_in(env!("CARGO_TARGET_TMPDIR")).expect("stdout file to map");
+    file.write_all(&[b'x'; 4096]).expect("fill stdout file");
+    let open_stdout = || {
+        Stdio::from(
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(file.path())
+                .expect("open the stdout file for reading and writing"),
+        )
+    };
+    assert_stdout_alias_views(
+        &guest,
+        &["stdout-alias-maps".as_ref(), file.path().as_os_str()],
+        open_stdout,
+        "stdout-alias-maps ",
+        &["stdout-alias-maps alias=agrees reopened=agrees fdinfo=agrees"],
+    );
+}
+
+// The same for another process's /proc/<pid>/fd links: a link to an inherited
+// stdout pipe, through descriptor 1 or a dup of it, must name the inode fstat
+// of the dup reports and the dup's own /proc/self/fd link names, not descriptor
+// 1's fixed inode (https://github.com/rrnewton/hermit/pull/3255). Here stdin is
+// /dev/null and stdout a pipe; a forked child reads its parent's links.
+// ptrace backend.
+#[test]
+fn other_process_links_to_the_stdout_pipe_name_the_inode_an_alias_reports() {
+    let _guard = hermit_run_lock();
+    let guest = inode_identity_views::compile_guest("stdout-pipe-links");
+    assert_stdout_alias_views(
+        &guest,
+        &["stdout-pipe-links".as_ref()],
+        Stdio::piped,
+        "stdout-pipe-links ",
+        &["stdout-pipe-links own-alias=agrees parent-alias=agrees parent-stdout=agrees"],
+    );
+}
+
 /// Whether this kernel reports a unique mount id (STATX_MNT_ID_UNIQUE, Linux
 /// 6.8) for `path`. An older kernel ignores the request bit.
 #[cfg(feature = "dbt")]
@@ -2209,15 +2327,23 @@ fn kernel_reports_unique_mount_ids(path: &Path) -> bool {
 fn dbt_maps_lines_prove_their_device_with_a_full_descriptor_table() {
     let _guard = hermit_run_lock();
     let guest = inode_identity_views::compile_guest("dbt-maps-stat-full-table");
+    // This test needs a btrfs CARGO_TARGET_TMPDIR and STATX_MNT_ID_UNIQUE
+    // (Linux 6.8 or newer). It refuses without either instead of passing
+    // without its subject; test.hermit_integration_on_host, whose GitHub-hosted
+    // profile declares neither, leaves it out by exact name
+    // (docs/TESTING_ENVIRONMENTS.md).
     assert!(
         inode_identity_views::is_on_btrfs(&guest),
-        "{} is not on btrfs, so no maps line needs the superblock proof this test exercises",
+        "{} is not on btrfs, so no maps line needs the superblock proof this test exercises; \
+         run it with a btrfs temporary directory for the target (CARGO_TARGET_TMPDIR, under \
+         CARGO_TARGET_DIR), as docs/TESTING_ENVIRONMENTS.md says",
         guest.display()
     );
     assert!(
         kernel_reports_unique_mount_ids(&guest),
-        "this kernel reports no unique mount id (Linux 6.8), so Detcore proves a maps line's \
-         superblock from mountinfo, through a descriptor a full table cannot give"
+        "this kernel reports no unique mount id (STATX_MNT_ID_UNIQUE, Linux 6.8 or newer), so \
+         Detcore proves a maps line's superblock from mountinfo, through a descriptor a full \
+         table cannot give; run it on Linux 6.8 or newer, as docs/TESTING_ENVIRONMENTS.md says"
     );
     let stdout = run_inode_identity_views(
         &guest,

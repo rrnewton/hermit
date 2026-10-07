@@ -677,9 +677,10 @@ pub(crate) struct ProcfsSnapshotContext {
     pub(crate) virtual_ppid: i32,
     pub(crate) virtual_pty_count: usize,
     pub(crate) fdinfo_identity: Option<(u64, i32, u64, u64)>,
-    /// Raw mapping header (`MappingKey`: device, inode and pathname columns) ->
-    /// determinized `(device, inode)` for every backed mapping in a
-    /// `maps`/`smaps` snapshot.
+    /// Raw mapping line (`MappingLine`: its header's device, inode and
+    /// pathname columns, and the start address of its range) -> determinized
+    /// `(device, inode)` for every backed mapping in a `maps`/`smaps`
+    /// snapshot.
     ///
     /// ⚠️ BUILT BY THE CALLER, NEVER HERE. The sanitizers in this module are
     /// pure functions of content and have no guest handle, so they cannot reach
@@ -699,12 +700,15 @@ pub(crate) struct ProcfsSnapshotContext {
     /// determinizing the maps pair as-is gives the maps inode column a
     /// different value from `st_ino` for the same file, where Linux prints the
     /// same number in both. The caller therefore determinizes the inode from
-    /// the raw identity `stat` reports for the mapped file (see
-    /// `mapping_stat_identity` in `syscalls/files.rs`, and the limits it
-    /// documents), and only the DEVICE column from the maps device -- which
+    /// the raw identity of the file that line maps -- its own record, or else
+    /// the identity `stat` reports (see `mapping_recorded_identity` and
+    /// `mapping_stat_identity` in `syscalls/files.rs`, and the limits they
+    /// document) -- and only the DEVICE column from the maps device, which
     /// disagrees with `st_dev` on native Linux too. The pathname is part of
     /// the key because two btrfs subvolumes number their inodes independently,
-    /// so one maps `(device, inode)` pair can name two different files.
+    /// so one maps `(device, inode)` pair can name two different files, and
+    /// the start address is part of it because even the full header can name
+    /// two files (see [`MappingLine`]).
     pub(crate) mapping_identities: MappingIdentities,
     pub(crate) mountinfo: Option<MountInfoSnapshot>,
     pub(crate) random_uuid: Option<[u8; 16]>,
@@ -3304,13 +3308,30 @@ pub(crate) struct MappingKey {
     pub(crate) pathname: String,
 }
 
-/// Mapping header -> determinized `(device, inode)`; see
+/// One `maps`/`smaps` mapping line: its header and the start address of its
+/// range. Two lines of one snapshot never share a start address, so this
+/// names one line; `None` is a line whose range does not parse.
+///
+/// The header alone does not name one file. Two lines can print the same
+/// device, inode and pathname columns while the guest mapped two different
+/// files at them: btrfs prints the superblock's device in maps, so files of
+/// two subvolumes can share one header (a deleted file's pathname reads the
+/// same for both), and the escape that turns `\n` into `\012` can make two
+/// names print alike. The identity of each line is therefore resolved and
+/// keyed per line, by [`mint_mapping_identities`].
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct MappingLine {
+    pub(crate) key: MappingKey,
+    pub(crate) start: Option<usize>,
+}
+
+/// Mapping line -> determinized `(device, inode)`; see
 /// `ProcfsSnapshotContext::mapping_identities`.
 ///
 /// This is a LOOKUP table for rendering only. Its sorted iteration order is
-/// never used to mint: [`mint_mapping_identities`] visits the headers in
-/// [`mapping_keys_in_text_order`].
-pub(crate) type MappingIdentities = BTreeMap<MappingKey, (u64, u64)>;
+/// never used to mint: [`mint_mapping_identities`] visits the lines in
+/// [`mapping_lines_in_text_order`].
+pub(crate) type MappingIdentities = BTreeMap<MappingLine, (u64, u64)>;
 
 /// Parse the device, inode and pathname of a backed mapping header.
 ///
@@ -3332,9 +3353,19 @@ pub(crate) fn mapping_header_key(line: &str) -> Option<MappingKey> {
     })
 }
 
-/// Every distinct backed mapping header of one `maps`/`smaps` snapshot, in the
-/// order its FIRST line appears in the text, with the start address of every
-/// line that carries it (in text order too).
+/// Parse a backed mapping line: its header ([`mapping_header_key`]) and the
+/// start address of its range, which is `None` when the range does not parse.
+pub(crate) fn parse_mapping_line(line: &str) -> Option<MappingLine> {
+    let key = mapping_header_key(line)?;
+    let start = line
+        .split_whitespace()
+        .next()
+        .and_then(|range| range.split_once('-'))
+        .and_then(|(start, _)| usize::from_str_radix(start, 16).ok());
+    Some(MappingLine { key, start })
+}
+
+/// Every backed mapping line of one `maps`/`smaps` snapshot, in text order.
 ///
 /// This is the order in which [`mint_mapping_identities`] mints deterministic
 /// identities for files the run has not seen before, so it must be a function
@@ -3383,72 +3414,63 @@ pub(crate) fn mapping_header_key(line: &str) -> Option<MappingKey> {
 /// The raw numbers are not guest-controlled: Linux hands out shmem and memfd
 /// inodes from per-CPU batches, so two memfds created in the same guest order
 /// can get raw inodes in either numeric order, and raw device numbers are
-/// assigned in host mount order. Visiting the headers in their sorted order (a
-/// `BTreeMap` of keys, which sorts by raw device, then raw inode, then
+/// assigned in host mount order. Visiting the lines in their sorted order (a
+/// `BTreeMap` of lines, which sorts by raw device, then raw inode, then
 /// pathname) would let that host numbering decide which file got the lower
 /// deterministic inode, and which raw device got the lower deterministic
 /// device.
 ///
-/// Splits on `\n` exactly as `sanitize_maps`/`sanitize_smaps` do, so each key
-/// is the one `rewrite_mapping_header` will look up for the same line. A line
-/// whose address range does not parse still contributes its key, without a
-/// start address.
-pub(crate) fn mapping_keys_in_text_order(contents: &[u8]) -> Vec<(MappingKey, Vec<usize>)> {
-    let mut keys: Vec<(MappingKey, Vec<usize>)> = Vec::new();
-    // Position of each key in `keys`; consulted only to deduplicate, never
-    // iterated, so its order cannot reach the result.
-    let mut positions: HashMap<MappingKey, usize> = HashMap::new();
+/// Splits on `\n` exactly as `sanitize_maps`/`sanitize_smaps` do, so each
+/// entry is the one `rewrite_mapping_header` will look up for the same line. A
+/// line whose address range does not parse is still listed, without a start
+/// address.
+pub(crate) fn mapping_lines_in_text_order(contents: &[u8]) -> Vec<MappingLine> {
     let Ok(text) = std::str::from_utf8(contents) else {
-        // The sanitizers pass non-UTF-8 content through unchanged, so no key
-        // built from it would ever be looked up.
-        return keys;
+        // The sanitizers pass non-UTF-8 content through unchanged, so no line
+        // parsed from it would ever be looked up.
+        return Vec::new();
     };
-    for line in text.split('\n') {
-        let Some(key) = mapping_header_key(line) else {
-            continue;
-        };
-        let start = line
-            .split_whitespace()
-            .next()
-            .and_then(|range| range.split_once('-'))
-            .and_then(|(start, _)| usize::from_str_radix(start, 16).ok());
-        let position = match positions.get(&key) {
-            Some(&position) => position,
-            None => {
-                positions.insert(key.clone(), keys.len());
-                keys.push((key, Vec::new()));
-                keys.len() - 1
-            }
-        };
-        keys[position].1.extend(start);
-    }
-    keys
+    text.split('\n').filter_map(parse_mapping_line).collect()
 }
 
 /// The run-global identity pools a `maps`/`smaps` snapshot mints from, and the
-/// resolution of a mapping header to the file identity `stat` reports.
+/// resolution of a mapping line to its file's identity: the line's own record,
+/// or else the identity `stat` reports for the file its header names.
 ///
 /// Production implements this over the guest's RPCs to the global
 /// `InodePool`/`DevicePool` (the same pools `stat` uses) and over
-/// `mapping_stat_identity` in `syscalls/files.rs`; unit tests implement it
-/// over the pools directly. Both then run the one minting loop in
+/// `mapping_recorded_identity` and `mapping_stat_identity` in
+/// `syscalls/files.rs`; unit tests implement it over the pools directly. Both then run the one minting loop in
 /// [`mint_mapping_identities`], so the ORDER of the mint calls -- the thing
 /// that decides which file gets which deterministic number -- is tested as
 /// production executes it rather than through a copy.
 pub(crate) trait MappingIdentityMinter {
-    /// Why a header could not be resolved to a file identity.
+    /// Why a mapping line could not be resolved to a file identity.
     type Error;
-    /// The raw identity `stat` reports for the file `key` names. `starts`
-    /// are the start addresses of every snapshot line carrying `key`.
+    /// The raw identity that the snapshot subject's own record of the mapping
+    /// starting at `start` gives a line whose header is `key`, if it has one.
+    ///
+    /// A record is per-line provenance: it was made when that range was
+    /// mapped, so it names the file of that range and no other. Answering
+    /// this costs no RPC and no injected syscall.
+    fn recorded_identity(&mut self, key: &MappingKey, start: usize) -> Option<RawInode>;
+    /// The raw identity `stat` reports for the file `key` names, for a line
+    /// without a record of its own.
     ///
     /// This is not always the header's own `(device, inode)`: btrfs prints
     /// the superblock's device in maps and the subvolume's in `stat`, and
     /// overlayfs prints the lower file's device in maps.
-    async fn stat_identity(
+    async fn stat_identity(&mut self, key: &MappingKey) -> Result<RawInode, Self::Error>;
+    /// The refusal for an unrecorded `line` that resolved to `identity` while
+    /// another line with the same header is recorded as `recorded`: the
+    /// snapshot's own evidence says the header names at least two files, and
+    /// nothing says which one this line maps.
+    fn ambiguous_line(
         &mut self,
-        key: &MappingKey,
-        starts: &[usize],
-    ) -> Result<RawInode, Self::Error>;
+        line: &MappingLine,
+        identity: RawInode,
+        recorded: RawInode,
+    ) -> Self::Error;
     /// The deterministic inode of each of `raw_files`, in order, minting one
     /// on first sight, as ONE request. The pool consumes one number per entry
     /// whether or not it mints (`InodePool::add_inode` in `tool_global`).
@@ -3457,68 +3479,114 @@ pub(crate) trait MappingIdentityMinter {
     async fn device(&mut self, raw_device: u64) -> u64;
 }
 
-/// Mint the deterministic `(device, inode)` of every backed mapping in one
-/// `maps`/`smaps` snapshot, keyed by its header, for
+/// Mint the deterministic `(device, inode)` of every backed mapping line in
+/// one `maps`/`smaps` snapshot, keyed by the line, for
 /// `sanitize_maps`/`sanitize_smaps` to render.
 ///
-/// Headers are visited strictly in [`mapping_keys_in_text_order`], and each
-/// one first resolves the raw identity `stat` reports for its file. All
-/// resolution finishes before any number is requested.
+/// The header alone does not name one file (see [`MappingLine`]), so every
+/// line is resolved from its OWN provenance:
 ///
-/// Then ONE batched request asks for the inode of every backed LINE, in text
-/// order, keyed on its header's resolved identity: repeated headers and
-/// stdio-backed lines included. The pool consumes a number per request
-/// whether or not it mints, so the number a read consumes must be the number
-/// of backed lines, which the guest sees in the text. Requesting once per
-/// distinct file, or skipping a file that matches stdio, would let host
-/// identity decide it: two mapped names that are one host file (a hard link)
-/// are one file on one host and two on another
-/// (<https://github.com/rrnewton/hermit/issues/2897>). A file whose `stat`
-/// identity is listed in `stdio_by_raw_file` then reports that fixed stdio
-/// identity (the one fdinfo reports for the same fd): the stdio match chooses
-/// only the rendering.
+/// 1. A line with a record of its own (`recorded_identity` at its start)
+///    takes that record's identity.
+/// 2. Any other line takes the identity `stat_identity` resolves for its
+///    header, asked once per header.
 ///
-/// Last, each header asks for the device keyed on its own device column --
-/// which on btrfs and overlayfs differs from `st_dev` on native Linux as
-/// well, while the inode numbers agree. The device pool numbers first
-/// sightings only, so asking once per header consumes nothing a repeated
-/// request would not.
+/// A line of case 2 is REFUSED, through `ambiguous_line`, when another line
+/// with the same header is recorded as a different file. Its own resolution
+/// is then contradicted by the snapshot's own evidence that the header names
+/// more than one file, and choosing either identity would render an inode the
+/// guest's `stat` of that range need not report. All resolution, including
+/// that refusal, finishes before the first deterministic number is requested,
+/// so a refused snapshot consumes nothing from the shared pools.
+///
+/// Then ONE batched request asks for the inode of every backed line, in
+/// [`mapping_lines_in_text_order`], keyed on the line's resolved identity:
+/// repeated headers and stdio-backed lines included. The pool consumes a
+/// number per request whether or not it mints, so the number a read consumes
+/// must be the number of backed lines, which the guest sees in the text.
+/// Requesting once per distinct file, or skipping a file that matches stdio,
+/// would let host identity decide it: two mapped names that are one host file
+/// (a hard link) are one file on one host and two on another
+/// (<https://github.com/rrnewton/hermit/issues/2897>). A file whose identity
+/// is listed in `stdio_by_raw_file` then reports that fixed stdio identity
+/// (the one fdinfo reports for the same fd): the stdio match chooses only the
+/// rendering.
+///
+/// Last, each header asks, in text order, for the device keyed on its own
+/// device column -- which on btrfs and overlayfs differs from `st_dev` on
+/// native Linux as well, while the inode numbers agree. The device pool
+/// numbers first sightings only, so asking once per header consumes nothing
+/// a repeated request would not.
 pub(crate) async fn mint_mapping_identities<M: MappingIdentityMinter>(
     contents: &[u8],
     stdio_by_raw_file: &BTreeMap<RawInode, DetInode>,
     minter: &mut M,
 ) -> Result<MappingIdentities, M::Error> {
-    let headers = mapping_keys_in_text_order(contents);
-    // Consulted by lookup only, never iterated, so its order cannot reach the
-    // result.
-    let mut resolved: HashMap<&MappingKey, RawInode> = HashMap::new();
-    for (key, starts) in &headers {
-        let raw_file = minter.stat_identity(key, starts).await?;
-        resolved.insert(key, raw_file);
+    let lines = mapping_lines_in_text_order(contents);
+    // Each line's own record, in text order.
+    let records: Vec<Option<RawInode>> = lines
+        .iter()
+        .map(|line| {
+            line.start
+                .and_then(|start| minter.recorded_identity(&line.key, start))
+        })
+        .collect();
+    // The distinct records of every header, in text order. Consulted only by
+    // lookup, never iterated as a map, so its order cannot reach the result.
+    let mut header_records: HashMap<&MappingKey, Vec<RawInode>> = HashMap::new();
+    for (line, record) in lines.iter().zip(&records) {
+        if let Some(record) = record {
+            let recorded = header_records.entry(&line.key).or_default();
+            if !recorded.contains(record) {
+                recorded.push(*record);
+            }
+        }
     }
-    // Every backed line, in text order. `mapping_keys_in_text_order` split the
-    // same text the same way, so each line's header has been resolved.
-    let line_keys: Vec<MappingKey> = match std::str::from_utf8(contents) {
-        Ok(text) => text.split('\n').filter_map(mapping_header_key).collect(),
-        Err(_) => Vec::new(),
-    };
-    let line_files: Vec<RawInode> = line_keys.iter().map(|key| resolved[key]).collect();
-    let pooled = minter.inodes(line_files).await;
-    // The number of each header's first line. Every line of a header has the
-    // same resolved identity, so the pool gave each of them the same number.
-    let mut header_inodes: HashMap<&MappingKey, DetInode> = HashMap::new();
-    for (key, inode) in line_keys.iter().zip(pooled) {
-        header_inodes.entry(key).or_insert(inode);
+    // Resolve every line before requesting any number.
+    let mut resolved: Vec<RawInode> = Vec::with_capacity(lines.len());
+    let mut stat_identities: HashMap<&MappingKey, RawInode> = HashMap::new();
+    for (line, record) in lines.iter().zip(&records) {
+        if let Some(record) = record {
+            resolved.push(*record);
+            continue;
+        }
+        let identity = match stat_identities.get(&line.key) {
+            Some(identity) => *identity,
+            None => {
+                let identity = minter.stat_identity(&line.key).await?;
+                stat_identities.insert(&line.key, identity);
+                identity
+            }
+        };
+        if let Some(recorded) = header_records
+            .get(&line.key)
+            .and_then(|recorded| recorded.iter().find(|recorded| **recorded != identity))
+        {
+            return Err(minter.ambiguous_line(line, identity, *recorded));
+        }
+        resolved.push(identity);
     }
+    // One numbering request per backed line, in text order.
+    let pooled = minter.inodes(resolved.clone()).await;
+    // The device once per header, in text order. The device pool returns the
+    // same number for the same raw device, so this cache only spares repeated
+    // RPCs; it is consulted by lookup, never iterated.
     let mut identities = MappingIdentities::new();
-    for (key, _) in &headers {
-        let raw_file = resolved[key];
+    let mut devices: HashMap<&MappingKey, u64> = HashMap::new();
+    for ((line, raw_file), pooled_inode) in lines.iter().zip(resolved).zip(pooled) {
         let det_inode = match stdio_by_raw_file.get(&raw_file) {
             Some(inode) => *inode,
-            None => header_inodes[key],
+            None => pooled_inode,
         };
-        let det_dev = minter.device(key.device).await;
-        identities.insert(key.clone(), (det_dev, det_inode.as_raw()));
+        let det_dev = match devices.get(&line.key) {
+            Some(device) => *device,
+            None => {
+                let device = minter.device(line.key.device).await;
+                devices.insert(&line.key, device);
+                device
+            }
+        };
+        identities.insert(line.clone(), (det_dev, det_inode.as_raw()));
     }
     Ok(identities)
 }
@@ -3537,7 +3605,9 @@ pub(crate) async fn mint_mapping_identities<M: MappingIdentityMinter>(
 /// the inode `stat` returns is the inode this mapping reports, so a path that
 /// names some other file (renamed in between, or a literal ` (deleted)` name)
 /// is not used to borrow another file's identity. A file with no candidate is
-/// found, if at all, by where the guest mapped it (`mapping_stat_identity`).
+/// found, if at all, by the record of where the guest mapped it
+/// (`mapping_recorded_identity`) or by the executable link
+/// (`mapping_stat_identity`).
 pub(crate) fn mapping_path_candidates(pathname: &str) -> Vec<String> {
     if !pathname.starts_with('/') || pathname.ends_with(" (deleted)") {
         return Vec::new();
@@ -3579,7 +3649,7 @@ pub(crate) fn mapping_path_candidates(pathname: &str) -> Vec<String> {
 /// Padding to the column the RAW line used keeps this in step with the kernel
 /// rather than hard-coding 73, and that column does not depend on the inode.
 fn rewrite_mapping_header(line: &str, table: &MappingIdentities) -> String {
-    let Some(raw) = mapping_header_key(line) else {
+    let Some(raw) = parse_mapping_line(line) else {
         return line.to_string();
     };
     let Some((det_dev, det_inode)) = table.get(&raw).copied() else {
@@ -4798,7 +4868,10 @@ mod tests {
         let raw =
             b"7f0000000000-7f0000001000 r-xp 00000000 08:02 1234567 /lib/libc.so.6\n" as &[u8];
         let table = BTreeMap::from([(
-            mapping_key(libc::makedev(0x08, 0x02), 1_234_567, "/lib/libc.so.6"),
+            mapping_line(
+                0x7f00_0000_0000,
+                mapping_key(libc::makedev(0x08, 0x02), 1_234_567, "/lib/libc.so.6"),
+            ),
             (libc::makedev(0x00, 0x2a), 99u64),
         )]);
         let out = String::from_utf8(sanitize_maps(raw, &table)).unwrap();
@@ -4843,7 +4916,10 @@ mod tests {
         };
         let table = |inode: u64| {
             BTreeMap::from([(
-                mapping_key(libc::makedev(0x00, 0x06), inode, NAME),
+                mapping_line(
+                    0x70f8_0000,
+                    mapping_key(libc::makedev(0x00, 0x06), inode, NAME),
+                ),
                 (libc::makedev(0x00, 0x06), 8u64),
             )])
         };
@@ -4908,7 +4984,10 @@ mod tests {
 Size:                  4 kB\n\
 Rss:                   4 kB\n" as &[u8];
         let table = BTreeMap::from([(
-            mapping_key(libc::makedev(0x08, 0x02), 1_234_567, "/lib/libc.so.6"),
+            mapping_line(
+                0x7f00_0000_0000,
+                mapping_key(libc::makedev(0x08, 0x02), 1_234_567, "/lib/libc.so.6"),
+            ),
             (libc::makedev(0x00, 0x2a), 99u64),
         )]);
         let out = String::from_utf8(sanitize_smaps(raw, &table)).unwrap();
@@ -4924,6 +5003,13 @@ Rss:                   4 kB\n" as &[u8];
             device,
             inode,
             pathname: pathname.to_string(),
+        }
+    }
+
+    fn mapping_line(start: usize, key: MappingKey) -> MappingLine {
+        MappingLine {
+            key,
+            start: Some(start),
         }
     }
 
@@ -4959,16 +5045,23 @@ Rss:                   4 kB\n" as &[u8];
     #[test]
     fn maps_keeps_two_files_that_share_a_maps_device_and_inode_apart() {
         let raw = b"7f0000000000-7f0000001000 r-xp 00000000 00:20 257 /usr/lib/a.so\n\
-7f0000002000-7f0000003000 r-xp 00000000 00:20 257 /home/u/b.so\n" as &[u8];
-        let keys = mapping_keys_in_text_order(raw);
-        assert_eq!(keys.len(), 2, "both headers keyed separately: {keys:?}");
+7f0000002000-7f0000003000 r-xp 00000000 00:20 257 /home/user/b.so\n" as &[u8];
+        let lines = mapping_lines_in_text_order(raw);
+        assert_eq!(lines.len(), 2, "both headers keyed separately: {lines:?}");
+        assert_ne!(lines[0].key, lines[1].key, "{lines:?}");
         let table = BTreeMap::from([
             (
-                mapping_key(libc::makedev(0x00, 0x20), 257, "/usr/lib/a.so"),
+                mapping_line(
+                    0x7f00_0000_0000,
+                    mapping_key(libc::makedev(0x00, 0x20), 257, "/usr/lib/a.so"),
+                ),
                 (libc::makedev(0x00, 0x2a), 11u64),
             ),
             (
-                mapping_key(libc::makedev(0x00, 0x20), 257, "/home/u/b.so"),
+                mapping_line(
+                    0x7f00_0000_2000,
+                    mapping_key(libc::makedev(0x00, 0x20), 257, "/home/user/b.so"),
+                ),
                 (libc::makedev(0x00, 0x2a), 12u64),
             ),
         ]);
@@ -4980,79 +5073,124 @@ Rss:                   4 kB\n" as &[u8];
         assert_eq!(inodes, ["11", "12"], "{out}");
     }
 
-    /// The keys the caller builds must be exactly the keys the sanitizers look
-    /// up, smaps accounting lines and the trailing newline included.
+    /// The lines the caller resolves must be exactly the lines the sanitizers
+    /// look up, smaps accounting lines and the trailing newline included.
     #[test]
-    fn mapping_keys_are_the_keys_the_sanitizers_look_up() {
+    fn mapping_lines_are_the_lines_the_sanitizers_look_up() {
         let raw = b"7f0000000000-7f0000001000 r-xp 00000000 08:02 1234567 /lib/libc.so.6\n\
 Size:                  4 kB\n\
 VmFlags: rd ex mr mw me\n\
 7f0000001000-7f0000002000 rw-p 00000000 00:00 0 \n" as &[u8];
-        let keys = mapping_keys_in_text_order(raw);
+        let lines = mapping_lines_in_text_order(raw);
         assert_eq!(
-            keys,
-            [(
+            lines,
+            [mapping_line(
+                0x7f00_0000_0000,
                 mapping_key(libc::makedev(0x08, 0x02), 1_234_567, "/lib/libc.so.6"),
-                vec![0x7f00_0000_0000]
             )]
         );
-        assert!(mapping_keys_in_text_order(b"\xff\xfe not utf-8 08:02 1 /x\n").is_empty());
+        assert!(mapping_lines_in_text_order(b"\xff\xfe not utf-8 08:02 1 /x\n").is_empty());
     }
 
-    /// Each key carries the start address of every line with that header, so
-    /// the caller can look the file up by where it is mapped; a deleted file's
-    /// lines keep their own key.
+    /// Every line is listed with its own start address, so the caller can look
+    /// the file up by where it is mapped; two lines with one header stay two
+    /// entries, a deleted file's line keeps its own header, and a line whose
+    /// range does not parse is still listed, without a start.
     #[test]
-    fn mapping_keys_carry_the_start_of_every_line() {
+    fn mapping_lines_carry_the_start_of_every_line() {
         let raw = b"7f0000000000-7f0000001000 r--p 00000000 00:20 257 /d/x\n\
 7f0000001000-7f0000002000 r-xp 00001000 00:20 257 /d/x\n\
 7f0000005000-7f0000006000 r--p 00000000 00:20 258 /d/y (deleted)\n\
 not-a-range r--p 00000000 00:20 259 /d/z\n" as &[u8];
-        let keys = mapping_keys_in_text_order(raw);
+        let x = mapping_key(libc::makedev(0x00, 0x20), 257, "/d/x");
         assert_eq!(
-            keys,
+            mapping_lines_in_text_order(raw),
             [
-                (
-                    mapping_key(libc::makedev(0x00, 0x20), 257, "/d/x"),
-                    vec![0x7f00_0000_0000, 0x7f00_0000_1000]
-                ),
-                (
+                mapping_line(0x7f00_0000_0000, x.clone()),
+                mapping_line(0x7f00_0000_1000, x),
+                mapping_line(
+                    0x7f00_0000_5000,
                     mapping_key(libc::makedev(0x00, 0x20), 258, "/d/y (deleted)"),
-                    vec![0x7f00_0000_5000]
                 ),
-                (mapping_key(libc::makedev(0x00, 0x20), 259, "/d/z"), vec![]),
+                MappingLine {
+                    key: mapping_key(libc::makedev(0x00, 0x20), 259, "/d/z"),
+                    start: None,
+                },
             ]
         );
     }
 
-    /// Keys come out in the order their FIRST line appears, not in sorted key
-    /// order. Sorted order compares the raw device first, then the raw inode,
-    /// so here it would put `/a` (device `00:15`) before `/z` (device `00:2a`)
-    /// and `/m` (inode 1000) before `/a` (inode 8000). Both numbers are
-    /// host-assigned; the line order is what the guest reads.
+    /// Lines come out in the order they appear, not in sorted order. Sorted
+    /// order compares the raw device first, then the raw inode, so here it
+    /// would put `/a` (device `00:15`) before `/z` (device `00:2a`) and `/m`
+    /// (inode 1000) before `/a` (inode 8000). Both numbers are host-assigned;
+    /// the line order is what the guest reads.
     #[test]
-    fn mapping_keys_are_in_text_order_not_sorted_order() {
+    fn mapping_lines_are_in_text_order_not_sorted_order() {
         let raw = b"7f0000000000-7f0000001000 r--p 00000000 00:2a 9000 /z/lib.so\n\
 7f0000002000-7f0000003000 r--p 00000000 00:15 8000 /a/lib.so\n\
 7f0000004000-7f0000005000 r-xp 00001000 00:2a 9000 /z/lib.so\n\
 7f0000006000-7f0000007000 r--p 00000000 00:15 1000 /m/lib.so\n" as &[u8];
+        let z = mapping_key(libc::makedev(0x00, 0x2a), 9000, "/z/lib.so");
         assert_eq!(
-            mapping_keys_in_text_order(raw),
+            mapping_lines_in_text_order(raw),
             [
-                (
-                    mapping_key(libc::makedev(0x00, 0x2a), 9000, "/z/lib.so"),
-                    vec![0x7f00_0000_0000, 0x7f00_0000_4000]
-                ),
-                (
+                mapping_line(0x7f00_0000_0000, z.clone()),
+                mapping_line(
+                    0x7f00_0000_2000,
                     mapping_key(libc::makedev(0x00, 0x15), 8000, "/a/lib.so"),
-                    vec![0x7f00_0000_2000]
                 ),
-                (
+                mapping_line(0x7f00_0000_4000, z),
+                mapping_line(
+                    0x7f00_0000_6000,
                     mapping_key(libc::makedev(0x00, 0x15), 1000, "/m/lib.so"),
-                    vec![0x7f00_0000_6000]
                 ),
             ]
         );
+    }
+
+    /// ⚠️ ONE FULL HEADER CAN NAME TWO FILES. Two btrfs subvolumes can map
+    /// files that print the same device, inode and pathname (a deleted file's
+    /// name reads the same for both). Each line must render the identity the
+    /// caller resolved for that LINE, looked up by its start address, and a
+    /// line of the same header at a start the table does not hold is left
+    /// alone rather than given another line's identity.
+    #[test]
+    fn maps_renders_each_line_of_one_header_from_its_own_entry() {
+        let raw = b"7f0000000000-7f0000001000 r--p 00000000 00:20 257 /d/x (deleted)\n\
+7f0000004000-7f0000005000 r--p 00000000 00:20 257 /d/x (deleted)\n\
+7f0000008000-7f0000009000 r--p 00000000 00:20 257 /d/x (deleted)\n" as &[u8];
+        let x = mapping_key(libc::makedev(0x00, 0x20), 257, "/d/x (deleted)");
+        let table = BTreeMap::from([
+            (
+                mapping_line(0x7f00_0000_0000, x.clone()),
+                (libc::makedev(0x00, 0x2a), 11u64),
+            ),
+            (
+                mapping_line(0x7f00_0000_4000, x),
+                (libc::makedev(0x00, 0x2a), 12u64),
+            ),
+        ]);
+        let out = String::from_utf8(sanitize_maps(raw, &table)).unwrap();
+        let inodes: Vec<_> = out
+            .lines()
+            .map(|line| line.split_whitespace().nth(4).unwrap())
+            .collect();
+        assert_eq!(inodes, ["11", "12", "257"], "{out}");
+        // smaps renders its headers through the same lookup; it passes content
+        // without an accounting line through untouched, so give each one.
+        let raw_smaps: String = std::str::from_utf8(raw)
+            .unwrap()
+            .lines()
+            .map(|line| format!("{line}\nRss:                   4 kB\n"))
+            .collect();
+        let smaps = String::from_utf8(sanitize_smaps(raw_smaps.as_bytes(), &table)).unwrap();
+        let inodes: Vec<_> = smaps
+            .lines()
+            .filter(|line| !line.starts_with("Rss:"))
+            .map(|line| line.split_whitespace().nth(4).unwrap())
+            .collect();
+        assert_eq!(inodes, ["11", "12", "257"], "{smaps}");
     }
 
     /// Only a live absolute path is offered for resolution; the `\n` escape is

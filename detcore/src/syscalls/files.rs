@@ -1161,8 +1161,10 @@ fn mountinfo_superblock_device(mountinfo: &[u8], mount_id: u64) -> Result<Option
 
 /// The run-global identity pools, reached through this guest's RPCs to the
 /// global tool: the same `InodePool`/`DevicePool` that `stat` determinizes
-/// through, so a mapping line and a `stat` of the same file agree. A header is
-/// resolved to the file identity `stat` reports by `mapping_stat_identity`.
+/// through, so a mapping line and a `stat` of the same file agree. A line is
+/// resolved to its file's identity by its own record
+/// (`mapping_recorded_identity`) or else by the identity `stat` reports for
+/// its header (`mapping_stat_identity`).
 struct GuestMappingMinter<'a, G, T: RecordOrReplay> {
     detcore: &'a Detcore<T>,
     guest: &'a mut G,
@@ -1189,14 +1191,40 @@ where
 {
     type Error = Error;
 
-    async fn stat_identity(
+    fn recorded_identity(
         &mut self,
         key: &crate::procfs::MappingKey,
-        starts: &[usize],
-    ) -> Result<RawInode, Error> {
+        start: usize,
+    ) -> Option<RawInode> {
         self.detcore
-            .mapping_stat_identity(self.guest, key, starts, self.subject)
+            .mapping_recorded_identity(&*self.guest, key, start, self.subject)
+    }
+
+    async fn stat_identity(&mut self, key: &crate::procfs::MappingKey) -> Result<RawInode, Error> {
+        self.detcore
+            .mapping_stat_identity(self.guest, key, self.subject)
             .await
+    }
+
+    fn ambiguous_line(
+        &mut self,
+        line: &crate::procfs::MappingLine,
+        identity: RawInode,
+        recorded: RawInode,
+    ) -> Error {
+        let at = match line.start {
+            Some(start) => format!("at {start:#x}"),
+            None => "whose address range does not parse".to_owned(),
+        };
+        IdentityLookupRefused(format!(
+            "the maps line {at} naming {:?} is ambiguous: it has no mapping record \
+             of its own and resolves to the file {identity} (device:inode), while \
+             another line with the same device, inode and pathname columns is \
+             recorded as the file {recorded}; refusing rather than give the line \
+             either file's identity",
+            line.key.pathname
+        ))
+        .into_error()
     }
 
     async fn inodes(&mut self, raw_files: Vec<RawInode>) -> Vec<DetInode> {
@@ -1848,9 +1876,71 @@ impl<T: RecordOrReplay> Detcore<T> {
         statptr.read(&guest.memory())
     }
 
+    /// The raw identity the reader's own record gives the `maps`/`smaps` line
+    /// whose header is `key` and whose range starts at `start`, if it has
+    /// one; `subject` says whose address space the snapshot shows
+    /// (`ProcfsFile::mapping_subject`). The line is then keyed on it rather
+    /// than on `mapping_stat_identity`, and a line of the same header without
+    /// a record of its own that resolves to another file is refused
+    /// (`crate::procfs::mint_mapping_identities`).
+    ///
+    /// A file the reader mapped through a descriptor Detcore tracks has the
+    /// `fstat` identity `handle_mmap` recorded for that address range
+    /// (`MemoryMetadata::mapped_file_at`). That record needs no path, so it
+    /// still holds after the file is unlinked or replaced and its descriptor
+    /// closed, when the line reads ` (deleted)`. It is provenance for THAT
+    /// range only: two lines with one header can map two files (see
+    /// `crate::procfs::MappingLine`), so one line's record never keys
+    /// another line. It is consulted only for a snapshot of the reader's own
+    /// address space (`MappingSubject::Reader`): a file opened in that same
+    /// address space through `/proc/self`, `/proc/thread-self`, or the
+    /// opener's own thread-group id or thread id
+    /// (`ProcfsFile::bind_mapping_subject`); and only when metadata is
+    /// virtualized, for the reason `mapping_stat_identity` falls back to the
+    /// header's pair then.
+    ///
+    /// A record is accepted only if its inode is the one the header reports,
+    /// a guard against staleness: the record can outlive the mapping it
+    /// describes, because `handle_mmap`, `handle_munmap` and `handle_mremap`
+    /// update it only after a successful call, and only they (and `execve`,
+    /// which starts an empty record) change it. Unmodelled sources of a stale
+    /// record:
+    ///
+    /// - a range replaced by a call those handlers never see: `shmat` with
+    ///   `SHM_REMAP` (refused with `ENOSYS` today, so latent), or any mapping
+    ///   call that escapes interception on an in-guest backend;
+    /// - a failed `MAP_FIXED` mmap or `MREMAP_FIXED` mremap, which some
+    ///   kernels return after unmapping the target range, leaving a record
+    ///   for a hole that one of the calls above can then fill.
+    ///
+    /// A stale record names another file, which almost always has another
+    /// inode, so the check discards it and the line resolves as one without a
+    /// record. ⚠️ A STALE RECORD WITH THE NEW FILE'S INODE NUMBER STILL WINS
+    /// FOR ITS OWN LINE: the same inode number on another device passes. A
+    /// record is provenance, not a path, so there is no mount to prove, and
+    /// its device cannot be compared with the header's when the header's
+    /// device is not `stat`'s. Since a line without a record that resolves to
+    /// another file is refused, such a stale record can also refuse the
+    /// snapshot of a header it no longer describes.
+    fn mapping_recorded_identity<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        key: &crate::procfs::MappingKey,
+        start: usize,
+        subject: MappingSubject,
+    ) -> Option<RawInode> {
+        if !guest.config().virtualize_metadata || subject != MappingSubject::Reader {
+            return None;
+        }
+        guest
+            .thread_state()
+            .mapped_file_at(start)
+            .filter(|file| file.ino == key.inode)
+    }
+
     /// The raw identity `stat` reports for the file a `maps`/`smaps` header
-    /// names, which keys that mapping's deterministic inode. `starts` are the
-    /// start addresses of the snapshot's lines with this header, and
+    /// names, which keys the deterministic inode of every line with that
+    /// header that has no record of its own (`mapping_recorded_identity`).
     /// `subject` says whose address space the snapshot shows
     /// (`ProcfsFile::mapping_subject`).
     ///
@@ -1861,29 +1951,20 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// value from `st_ino` for the same file
     /// (<https://github.com/rrnewton/hermit/issues/3307>). In order:
     ///
-    /// 1. A file the reader mapped through a descriptor Detcore tracks is
-    ///    keyed on the `fstat` identity `handle_mmap` recorded for that
-    ///    address range (`MemoryMetadata::mapped_file_at`). That record needs
-    ///    no path, so it still holds after the file is unlinked or replaced
-    ///    and its descriptor closed, when the line reads ` (deleted)`. It is
-    ///    consulted only for a snapshot of the reader's own address space
-    ///    (`MappingSubject::Reader`): a file opened in that same address space
-    ///    through `/proc/self`, `/proc/thread-self`, or the opener's own
-    ///    thread-group id or thread id (`ProcfsFile::bind_mapping_subject`).
-    /// 2. Otherwise the pathname is resolved in the guest. This covers the
-    ///    executable and the ELF interpreter, which `execve` maps without a
-    ///    system call Detcore sees, and files mapped through a descriptor
-    ///    Detcore does not track, such as one received over `SCM_RIGHTS`.
-    ///    The file it names keys the line only with proof that it lies on
-    ///    the superblock the header names (`Self::proves_header_device`).
-    /// 3. Otherwise the guest `stat`s the executable link of the process
+    /// 1. The pathname is resolved in the guest. This covers the executable
+    ///    and the ELF interpreter, which `execve` maps without a system call
+    ///    Detcore sees, and files mapped through a descriptor Detcore does
+    ///    not track, such as one received over `SCM_RIGHTS`. The file it
+    ///    names keys the line only with proof that it lies on the superblock
+    ///    the header names (`Self::proves_header_device`).
+    /// 2. Otherwise the guest `stat`s the executable link of the process
     ///    whose address space the snapshot shows: `/proc/self/exe` for the
     ///    reader's own, `/proc/<pid>/exe` for a task the file names by
     ///    number (`MappingSubject::Process`), and none when that task is not
     ///    known. That link names the running
     ///    executable even after it is unlinked or replaced (the line then
     ///    reads ` (deleted)`, or its path names another inode), and `stat`
-    ///    follows it to the file, so this covers the executable where step 2
+    ///    follows it to the file, so this covers the executable where step 1
     ///    cannot. It keys the line only when the link reads as the line's
     ///    pathname (`Self::link_names_mapping`) and the executable lies on
     ///    the header's superblock (`Self::proves_header_device`): an
@@ -1897,31 +1978,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///    (`proc_map_files_get_link`), so it is not used.
     ///
     /// Each answer is accepted only if its inode is the one the header
-    /// reports, and a resolved path or executable link only with the
-    /// superblock proof as well: an inode number alone names no file, since
-    /// every filesystem, and every btrfs subvolume, numbers its own. For the
-    /// record the inode check is a guard against staleness: the
-    /// record can outlive the mapping it describes, because `handle_mmap`,
-    /// `handle_munmap` and `handle_mremap` update it only after a successful
-    /// call, and only they (and `execve`, which starts an empty record) change
-    /// it. Unmodelled sources of a stale record:
-    ///
-    /// - a range replaced by a call those handlers never see: `shmat` with
-    ///   `SHM_REMAP` (refused with `ENOSYS` today, so latent), or any mapping
-    ///   call that escapes interception on an in-guest backend;
-    /// - a failed `MAP_FIXED` mmap or `MREMAP_FIXED` mremap, which some
-    ///   kernels return after unmapping the target range, leaving a record
-    ///   for a hole that one of the calls above can then fill.
-    ///
-    /// A stale record names another file, which almost always has another
-    /// inode, so the check discards it and the path or the header decides.
-    /// ⚠️ A STALE RECORD WITH THE NEW FILE'S INODE NUMBER STILL WINS: the
-    /// same inode number on another device passes. A record is provenance,
-    /// not a path, so there is no mount to prove, and its device cannot be
-    /// compared with the header's when the header's device is not `stat`'s.
-    /// Steps 2 and 3 compare superblocks, which still passes two files with
+    /// reports and with the superblock proof as well: an inode number alone
+    /// names no file, since every filesystem, and every btrfs subvolume,
+    /// numbers its own. The superblock comparison still passes two files with
     /// one inode number on ONE superblock: two btrfs subvolumes of one
     /// filesystem, or two overlayfs layers of one overlay mount.
+    ///
+    /// ⚠️ ONE ANSWER SERVES EVERY UNRECORDED LINE OF THE HEADER. A path or an
+    /// executable link names one file, so two lines without records whose
+    /// header names two files (a deleted file's pathname on two btrfs
+    /// subvolumes) both get the identity of the one this resolves, or the
+    /// header's pair. Only a record tells such lines apart, and a record
+    /// contradicting this answer refuses the snapshot instead.
     ///
     /// Falls back to the header's pair -- which IS `stat`'s identity on every
     /// filesystem whose `st_dev` is its superblock device, such as ext4, xfs
@@ -1971,25 +2039,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         key: &crate::procfs::MappingKey,
-        starts: &[usize],
         subject: MappingSubject,
     ) -> Result<RawInode, Error> {
         let header = RawInode::new(key.device, key.inode);
         if !guest.config().virtualize_metadata {
             return Ok(header);
-        }
-        if subject == MappingSubject::Reader {
-            let recorded = {
-                let thread = guest.thread_state();
-                starts.iter().find_map(|&start| {
-                    thread
-                        .mapped_file_at(start)
-                        .filter(|file| file.ino == key.inode)
-                })
-            };
-            if let Some(file) = recorded {
-                return Ok(file);
-            }
         }
         for candidate in crate::procfs::mapping_path_candidates(&key.pathname) {
             let path = candidate.as_bytes();
@@ -2000,7 +2054,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return Ok(RawInode::new(stat.st_dev, stat.st_ino));
             }
         }
-        // Step 3: the executable link of the subject's process, resolved by
+        // Step 2: the executable link of the subject's process, resolved by
         // the guest's `fstatat`, so `/proc/self` is the reader.
         let executable_link = match subject {
             MappingSubject::Reader => Some(b"/proc/self/exe".to_vec()),
@@ -2022,8 +2076,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Whether the file a guest `stat` of `path` returned, whose inode is
     /// already the maps header's, lies on the superblock whose device that
     /// header reports. An inode number alone names no file: every filesystem
-    /// numbers its own inodes, and btrfs numbers each subvolume's. So steps 2
-    /// and 3 of [`Self::mapping_stat_identity`] accept an answer only with
+    /// numbers its own inodes, and btrfs numbers each subvolume's. So steps 1
+    /// and 2 of [`Self::mapping_stat_identity`] accept an answer only with
     /// this proof as well.
     ///
     /// Proven at once when `stat`'s device IS the header's, as on ext4, xfs
@@ -2078,7 +2132,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// ⚠️ THE SAME INODE NUMBER IN TWO BTRFS SUBVOLUMES OF ONE FILESYSTEM STILL
     /// PASSES, and so do two overlayfs layers on one overlay mount: both share
     /// the superblock device `maps` prints, which is all a maps line says
-    /// about where its file lives. For step 3, [`Self::link_names_mapping`]
+    /// about where its file lives. For step 2, [`Self::link_names_mapping`]
     /// also requires the executable link's text to be the line's pathname.
     async fn proves_header_device<G: Guest<Self>>(
         guest: &mut G,
@@ -2345,7 +2399,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// link would, with ` (deleted)` once it is unlinked, except that it
     /// spells a newline `\012`. A file that merely shares the executable's
     /// inode number -- a non-executable mapping, a file literally named
-    /// `x (deleted)` -- has another pathname, so step 3 of
+    /// `x (deleted)` -- has another pathname, so step 2 of
     /// [`Self::mapping_stat_identity`] does not borrow the executable's
     /// identity for it. `Ok(false)` when the guest's filesystem answers that
     /// the link names nothing; errors as in [`Self::proves_header_device`].
@@ -3875,14 +3929,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_needs_mapping_identities())?;
         let mapping_identities = if needs_mapping_identities {
-            // A mapping backed by stdio must report the SAME inode fdinfo
-            // reports for that fd, which is the fixed `deterministic_stdio_inode`
-            // value rather than a pooled one. Matching is by the raw device and
-            // inode of the stdio descriptor's own identity
-            // (`inherited_stdio_identity_stats`): its own `fstat`, not the
-            // stand-in `setup_stdio` caches for all three descriptors, which
-            // is stdin's file and matched a mapping of stdin's file as stdout
-            // as well even where stdout is another file.
+            // A mapping of the object behind an inherited stdio descriptor
+            // reports the fixed `deterministic_stdio_inode` value that
+            // descriptor's fdinfo reports, rather than a pooled one, only for
+            // the object those descriptors stand in for: the `fstat(0)`
+            // stand-in `setup_stdio` caches for all three, which is stdin's
+            // file (`fixed_stdio_identity_stats`). Matching is by the raw
+            // device and inode of each descriptor's own identity, so a
+            // mapping of stdin's file is not matched as stdout's when stdout
+            // is another file. That other file is not in the table at all:
+            // its mappings report the pooled inode an alias of stdout above
+            // descriptor 2 and a `stat` of its path report, not descriptor
+            // 1's fixed inode, which neither reports (round-11 review of
+            // https://github.com/rrnewton/hermit/pull/3255).
             //
             // The inode alone is not enough: an unrelated file on another
             // filesystem can share the stdio inode number (a fresh tmpfs
@@ -3899,8 +3958,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             // stderr's (1002). Without `virtualize_metadata` every
             // descriptor's identity is still the stand-in, so every mapping of
             // the stdin file matches all three. `namespace.rs`'s
-            // `deterministic_stdio_inode_for_raw` applies the same precedence.
-            let stdio_stats = self.inherited_stdio_identity_stats(guest).await?;
+            // `deterministic_stdio_inode_for_raw` applies the same precedence,
+            // to the same table.
+            let stdio_stats = self.fixed_stdio_identity_stats(guest).await?;
             let mut stdio_by_raw_file: BTreeMap<RawInode, DetInode> = BTreeMap::new();
             for fd in libc::STDIN_FILENO..=libc::STDERR_FILENO {
                 let inode = guest
@@ -3924,12 +3984,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             // The minting loop lives in `crate::procfs::mint_mapping_identities`
             // so the unit tests drive the same code: it mints in maps-TEXT
             // order, never in host raw-number order, because a file first
-            // seen here gets the next deterministic inode. For each header it
-            // keys the INODE on what `stat` reports for the file
-            // (`GuestMappingMinter::stat_identity`) and the DEVICE column on
-            // what maps printed: on btrfs and overlayfs the two devices differ
-            // on native Linux as well, while the inode numbers agree. See
-            // `ProcfsSnapshotContext::mapping_identities`.
+            // seen here gets the next deterministic inode. For each line it
+            // keys the INODE on that line's own record, or else on what `stat`
+            // reports for the file its header names
+            // (`GuestMappingMinter::stat_identity`), and refuses a line without
+            // a record that another line of its header contradicts; it keys
+            // the DEVICE column on what maps printed: on btrfs and overlayfs
+            // the two devices differ on native Linux as well, while the inode
+            // numbers agree. See `ProcfsSnapshotContext::mapping_identities`.
             crate::procfs::mint_mapping_identities(
                 &contents,
                 &stdio_by_raw_file,
@@ -7455,6 +7517,57 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(stats)
     }
 
+    /// The stdio identities that keep a fixed inode (1000 plus the descriptor
+    /// number) in the views that name an object rather than a descriptor: the
+    /// memory-map sanitizer's `stdio_by_raw_file` table and another process's
+    /// `/proc/<pid>/fd` link (`canonicalize_other_proc_fd_target`).
+    ///
+    /// This is [`Self::inherited_stdio_identity_stats`] with descriptor
+    /// `fd`'s entry kept only when its own identity is the stand-in
+    /// `setup_stdio` cached for it (`DetFd::stat`): the `fstat(0)` of the
+    /// process that runs Detcore (Hermit's on ptrace and KVM, the guest's on
+    /// DBT and LiteInst). Those views gave a fixed inode to that object and
+    /// to no other before each descriptor's own identity was asked, so the
+    /// fixed inode stays only where it was.
+    ///
+    /// A stdout or stderr that is another object -- a file or a pipe stdout
+    /// was redirected to while stdin is something else -- is left out, so
+    /// these views name it by its pooled inode. That is the inode an alias of
+    /// it above descriptor 2 reports through `fstat` and `fdinfo`, and the
+    /// one a `stat` of its path reports. Keeping its own identity in the
+    /// table gave its mappings, and other processes' links to it, descriptor
+    /// 1's fixed inode instead, which none of those views report (round-11
+    /// review of <https://github.com/rrnewton/hermit/pull/3255>). An `fstat`
+    /// of descriptor 1 itself, and its own `/proc/self/fd/1` link, still
+    /// report the fixed inode. That difference is older than this table:
+    /// removing it needs the inode pool to give such an object a single
+    /// identity, which is not done here.
+    ///
+    /// Asks nothing beyond [`Self::inherited_stdio_identity_stats`]: the
+    /// stand-in is already cached. Without `virtualize_metadata` every
+    /// identity is the stand-in itself, so nothing is dropped. On SaBRe,
+    /// `setup_stdio` caches each descriptor's own `fstat`, so nothing is
+    /// dropped there either, and a stdout that is another object keeps
+    /// descriptor 1's fixed inode in these views, as it did before.
+    pub(crate) async fn fixed_stdio_identity_stats<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Result<[Option<DetStat>; 3], Error> {
+        let mut stats = self.inherited_stdio_identity_stats(guest).await?;
+        for fd in libc::STDIN_FILENO..=libc::STDERR_FILENO {
+            let stand_in = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.stat().map(|stat| stat.raw_inode()))
+                .ok()
+                .flatten();
+            let slot = &mut stats[fd as usize];
+            if slot.is_some_and(|own| Some(own.raw_inode()) != stand_in) {
+                *slot = None;
+            }
+        }
+        Ok(stats)
+    }
+
     /// getdents system call.
     pub async fn handle_getdents<G: Guest<Self>>(
         &self,
@@ -8540,14 +8653,19 @@ mod procfs_wiring_guard {
                 }
             }
         }
-        // Parsing mapping headers, collecting their keys, or resolving their
-        // `stat` identities here would mean the order in which this body
-        // resolves and mints is no longer the order the unit tests drive.
-        // `mapping_keys` also matches `mapping_keys_in_text_order`.
+        // Parsing mapping headers or lines, collecting them, or resolving
+        // their recorded or `stat` identities here would mean the order in
+        // which this body resolves and mints, and the refusal of an ambiguous
+        // line, are no longer what the unit tests drive. `mapping_lines` also
+        // matches `mapping_lines_in_text_order`; `mapping_keys` is the
+        // header-keyed loop's old name.
         if [
             "mapping_header_identity",
             "mapping_header_key",
             "mapping_keys",
+            "mapping_lines",
+            "parse_mapping_line",
+            "mapping_recorded_identity",
             "mapping_stat_identity",
         ]
         .iter()
@@ -8607,7 +8725,7 @@ mod procfs_wiring_guard {
         // The keying commit's first draft: a local loop over the keys in
         // sorted order, resolving each one itself.
         let local_order = "for (key, starts) in crate::procfs::mapping_keys(&contents) {\n\
-                           let raw_file = self.mapping_stat_identity(guest, &key, &starts, subject).await?;";
+                           let raw_file = self.mapping_stat_identity(guest, &key, subject).await?;";
         assert_eq!(
             maps_minting_wiring_violations(local_order),
             [NO_CALL, LOCAL_PARSE]
@@ -8621,9 +8739,12 @@ mod procfs_wiring_guard {
                           )";
         for local_parse in [
             "let keys = crate::procfs::mapping_keys_in_text_order(&contents);",
+            "let lines = crate::procfs::mapping_lines_in_text_order(&contents);",
+            "let line = crate::procfs::parse_mapping_line(line);",
             "let key = crate::procfs::mapping_header_key(line);",
             "let pair = crate::procfs::mapping_header_identity(line);",
-            "let raw_file = self.mapping_stat_identity(guest, &key, &starts, subject).await?;",
+            "let record = self.mapping_recorded_identity(guest, &key, start, subject);",
+            "let raw_file = self.mapping_stat_identity(guest, &key, subject).await?;",
         ] {
             assert_eq!(
                 maps_minting_wiring_violations(&format!("{local_parse}\n{valid_call}")),
@@ -9942,12 +10063,18 @@ pub(crate) mod inject_fstat_scratch {
         /// a test that expects no RPC still fails on one.
         pub(crate) answers_determinize_inode: bool,
         /// Raw identity of each `DeterminizeInode` request, and of each entry
-        /// of a `DeterminizeMappingInodes` request, in order. Every request
-        /// for the `n`th DISTINCT identity (from 0) is answered with the same
-        /// deterministic inode, `FIRST_SCRIPTED_INODE + n`. Unlike the real
-        /// pool, a repeated request does not consume a number; the tests read
-        /// this log for which requests were sent, not for the pool's ordinals.
+        /// of a `DeterminizeMappingInodes` request, in order. As in the real
+        /// pool, every request consumes a number: an identity first requested
+        /// at position `n` of this log (from 0) is answered with
+        /// `FIRST_SCRIPTED_INODE + n`, then and on every later request.
         pub(crate) determinized: std::sync::Mutex<Vec<RawInode>>,
+        /// Whether `send_rpc` answers `DeterminizeDevice`. Off by default, so
+        /// a test that expects no RPC still fails on one.
+        pub(crate) answers_determinize_device: bool,
+        /// Raw device of each `DeterminizeDevice` request, in order. Every
+        /// request for the `n`th DISTINCT device (from 0) is answered with
+        /// the same deterministic device, `makedev(0, n + 1)`.
+        pub(crate) determinized_devices: std::sync::Mutex<Vec<u64>>,
         /// What `detlog_memory_regions` reports: `None`, as ptrace does, or
         /// the guest ranges a test wants the memory-map DETLOG to hash.
         detlog_regions: Option<Vec<reverie::DetlogMemoryRegion>>,
@@ -10007,6 +10134,8 @@ pub(crate) mod inject_fstat_scratch {
                 closed: Vec::new(),
                 answers_determinize_inode: false,
                 determinized: std::sync::Mutex::new(Vec::new()),
+                answers_determinize_device: false,
+                determinized_devices: std::sync::Mutex::new(Vec::new()),
                 detlog_regions: None,
                 fstat_answers: Vec::new(),
                 answers_touch_file: false,
@@ -10039,17 +10168,11 @@ pub(crate) mod inject_fstat_scratch {
         fn scripted_inode(&self, raw: RawInode) -> DetInode {
             let mut determinized = self.determinized.lock().unwrap();
             determinized.push(raw);
-            let mut distinct: Vec<RawInode> = Vec::new();
-            for seen in determinized.iter() {
-                if !distinct.contains(seen) {
-                    distinct.push(*seen);
-                }
-            }
-            let index = distinct
+            let first_request = determinized
                 .iter()
                 .position(|seen| *seen == raw)
                 .expect("the request was just recorded");
-            DetInode::mint(FIRST_SCRIPTED_INODE + index as u64)
+            DetInode::mint(FIRST_SCRIPTED_INODE + first_request as u64)
         }
     }
 
@@ -10072,6 +10195,25 @@ pub(crate) mod inject_fstat_scratch {
                                 .map(|raw| self.scripted_inode(raw))
                                 .collect(),
                         ),
+                    )
+                }
+                GlobalRequest::DeterminizeDevice(raw) if self.answers_determinize_device => {
+                    let mut devices = self.determinized_devices.lock().unwrap();
+                    devices.push(raw);
+                    let mut distinct: Vec<u64> = Vec::new();
+                    for seen in devices.iter() {
+                        if !distinct.contains(seen) {
+                            distinct.push(*seen);
+                        }
+                    }
+                    let index = distinct
+                        .iter()
+                        .position(|seen| *seen == raw)
+                        .expect("the request was just recorded");
+                    let minor = u32::try_from(index + 1).expect("few scripted devices");
+                    (
+                        None,
+                        GlobalResponse::DeterminizeDevice(libc::makedev(0, minor)),
                     )
                 }
                 GlobalRequest::TouchFile(raw) if self.answers_touch_file => {
@@ -11815,8 +11957,9 @@ pub(crate) mod inject_fstat_scratch {
         }
     }
 
-    // The table the maps and `/proc/<pid>/fd` views match stdio objects
-    // against: each inherited descriptor's own identity, here the test
+    // Each inherited descriptor's own identity, which
+    // `fixed_stdio_identity_stats` narrows to the table the maps and
+    // `/proc/<pid>/fd` views match stdio objects against: here the test
     // process's own descriptors 0 to 2, where the stand-in gave all three
     // the identity of its stdin.
     #[tokio::test]
@@ -11875,6 +12018,80 @@ pub(crate) mod inject_fstat_scratch {
         );
         let recorded = tool.inherited_stdio_identity_stats(&mut guest).await;
         assert_eq!(identities(recorded), stand_ins);
+        assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
+    }
+
+    // Only the object the stand-in describes keeps a fixed stdio inode in
+    // the maps and `/proc/<pid>/fd` views. Here stdin and stderr are that
+    // object, as with one terminal on both, and stdout is another, as with
+    // `prog > file`: its entry is dropped, so those views name it by the
+    // pooled inode its aliases and its path report rather than by
+    // descriptor 1's fixed inode (round-11 review of
+    // https://github.com/rrnewton/hermit/pull/3255). The descriptors' own
+    // identities are scripted, since the test process's descriptors 0 to 2
+    // are whatever the test runner gave it.
+    #[tokio::test]
+    async fn fixed_stdio_identities_keep_only_the_stand_in_object() {
+        let (tool, mut guest) = ScriptedGuest::new(true, false);
+        assert!(guest.config.virtualize_metadata);
+        let stand_ins: Vec<Option<RawInode>> = (libc::STDIN_FILENO..=libc::STDERR_FILENO)
+            .map(|fd| {
+                guest
+                    .thread
+                    .with_detfd(fd, |detfd| detfd.stat().map(|stat| stat.raw_inode()))
+                    .ok()
+                    .flatten()
+            })
+            .collect();
+        let stand_in =
+            stand_ins[0].expect("precondition: the scripted guest's stdin has a stand-in");
+        assert_eq!(
+            stand_ins,
+            [Some(stand_in); 3],
+            "precondition: one stand-in for all three descriptors"
+        );
+        let (file, _) = open_file();
+        let mut answer: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(file, &mut answer) }, 0);
+        assert_eq!(unsafe { libc::close(file) }, 0);
+        let other = RawInode::new(stand_in.dev ^ 1, stand_in.ino);
+        for (fd, identity) in [
+            (libc::STDIN_FILENO, stand_in),
+            (libc::STDOUT_FILENO, other),
+            (libc::STDERR_FILENO, stand_in),
+        ] {
+            answer.st_dev = identity.dev;
+            answer.st_ino = identity.ino;
+            guest.fstat_answers.push((fd, answer));
+        }
+
+        let fixed = tool
+            .fixed_stdio_identity_stats(&mut guest)
+            .await
+            .expect("the scripted descriptors can be asked")
+            .map(|stat| stat.map(|stat| stat.raw_inode()));
+
+        assert_eq!(
+            fixed,
+            [Some(stand_in), None, Some(stand_in)],
+            "stdout's own identity is not the stand-in, so it must not keep a fixed inode"
+        );
+        assert_eq!(
+            guest.injected,
+            [Sysno::fstat, Sysno::fstat, Sysno::fstat],
+            "nothing is asked beyond each inherited descriptor's own identity"
+        );
+
+        // Without virtualize_metadata every identity is the stand-in, so all
+        // three keep their fixed inodes, and nothing is asked.
+        let (tool, mut guest) = ScriptedGuest::new(true, false);
+        guest.config.virtualize_metadata = false;
+        let recorded = tool
+            .fixed_stdio_identity_stats(&mut guest)
+            .await
+            .expect("without virtualized metadata nothing is asked")
+            .map(|stat| stat.map(|stat| stat.raw_inode()));
+        assert_eq!(recorded, [Some(stand_in); 3]);
         assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
     }
 
@@ -12065,10 +12282,11 @@ pub(crate) mod inject_fstat_scratch {
     }
 
     // A record whose inode is not the header's describes another file -- it is
-    // stale (see `mapping_stat_identity`) -- so the path decides. Without the
-    // inode check the record would key the line on that other file.
+    // stale (see `mapping_recorded_identity`) -- so the line has no record and
+    // the path decides. Without the inode check the record would key the line
+    // on that other file.
     #[tokio::test]
-    async fn mapping_stat_identity_discards_a_record_with_another_inode() {
+    async fn mapping_recorded_identity_discards_a_record_with_another_inode() {
         let (file, identity, key) = mapped_path();
         let _mounts = ScriptedMountinfo::proving(file.path(), HEADER_DEVICE);
         let scratch = Pages::map(1, 1);
@@ -12076,8 +12294,15 @@ pub(crate) mod inject_fstat_scratch {
         let stale = RawInode::new(RECORD_DEVICE, identity.ino + 1);
         guest.thread.map_file(RECORDED_START, page_size(), stale);
 
+        assert_eq!(
+            tool.mapping_recorded_identity(&guest, &key, RECORDED_START, MappingSubject::Reader),
+            None,
+            "a record with inode {} must not key a line whose header has inode {}",
+            stale.ino,
+            key.inode
+        );
         let result = tool
-            .mapping_stat_identity(&mut guest, &key, &[RECORDED_START], MappingSubject::Reader)
+            .mapping_stat_identity(&mut guest, &key, MappingSubject::Reader)
             .await;
 
         assert_eq!(
@@ -12141,7 +12366,7 @@ pub(crate) mod inject_fstat_scratch {
                 guest.config.tool_opens_outside_guest_descriptor_table = true;
                 guest.statx_without_unique_mount_id = before_6_8;
                 let resolved = tool
-                    .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
+                    .mapping_stat_identity(&mut guest, &key, MappingSubject::Unknown)
                     .await;
                 assert_eq!(
                     resolved.expect("mapping_stat_identity failed"),
@@ -12205,7 +12430,7 @@ pub(crate) mod inject_fstat_scratch {
             guest.statmount_error = statmount_error;
             let reads = MOUNTINFO_READS.with(|reads| reads.get());
             let resolved = tool
-                .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
+                .mapping_stat_identity(&mut guest, &key, MappingSubject::Unknown)
                 .await;
             let reads = MOUNTINFO_READS.with(|reads| reads.get()) - reads;
             outcomes.push((
@@ -12273,7 +12498,7 @@ pub(crate) mod inject_fstat_scratch {
             let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
             guest.statmount_error = Some(errno);
             let resolved = tool
-                .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
+                .mapping_stat_identity(&mut guest, &key, MappingSubject::Unknown)
                 .await;
             assert_eq!(
                 resolved.expect("mapping_stat_identity failed"),
@@ -12295,7 +12520,7 @@ pub(crate) mod inject_fstat_scratch {
         guest.config.tool_opens_outside_guest_descriptor_table = true;
         guest.statmount_error = Some(Errno::ENOSYS);
         let resolved = tool
-            .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
+            .mapping_stat_identity(&mut guest, &key, MappingSubject::Unknown)
             .await;
         assert_eq!(resolved.expect("mapping_stat_identity failed"), identity);
         assert_eq!(
@@ -12312,7 +12537,7 @@ pub(crate) mod inject_fstat_scratch {
         guest.config.tool_opens_outside_guest_descriptor_table = true;
         guest.statmount_error = Some(Errno::ENOSYS);
         let resolved = tool
-            .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
+            .mapping_stat_identity(&mut guest, &key, MappingSubject::Unknown)
             .await;
         assert_eq!(
             resolved.expect("mapping_stat_identity failed"),
@@ -12331,7 +12556,7 @@ pub(crate) mod inject_fstat_scratch {
             guest.statmount_error = errno;
             guest.statmount_omits_superblock = omits;
             let refused = tool
-                .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
+                .mapping_stat_identity(&mut guest, &key, MappingSubject::Unknown)
                 .await;
             assert!(
                 matches!(&refused, Err(Error::Tool(error))
@@ -12351,7 +12576,7 @@ pub(crate) mod inject_fstat_scratch {
         let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
         guest.statmount_error = Some(Errno::ESRCH);
         let gone = tool
-            .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
+            .mapping_stat_identity(&mut guest, &key, MappingSubject::Unknown)
             .await;
         assert!(
             matches!(gone, Err(Error::Errno(Errno::ESRCH))),
@@ -12416,7 +12641,7 @@ pub(crate) mod inject_fstat_scratch {
         guest.mmap_fails = true;
 
         let refused = tool
-            .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
+            .mapping_stat_identity(&mut guest, &key, MappingSubject::Unknown)
             .await;
 
         assert!(
@@ -12482,7 +12707,7 @@ pub(crate) mod inject_fstat_scratch {
             guest.config.tool_opens_outside_guest_descriptor_table = true;
             guest.statx_without_unique_mount_id = before_6_8;
             let resolved = tool
-                .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
+                .mapping_stat_identity(&mut guest, &key, MappingSubject::Unknown)
                 .await;
             outcomes.push((before_6_8, resolved, guest.injected));
         }
@@ -12512,21 +12737,21 @@ pub(crate) mod inject_fstat_scratch {
         }
     }
 
-    // Control for the test above: a record with the header's inode keys the
-    // line, and no stat is made.
+    // Control for `mapping_recorded_identity_discards_a_record_with_another_inode`:
+    // a record with the header's inode is the line's identity, and no stat is
+    // made.
     #[tokio::test]
-    async fn mapping_stat_identity_uses_a_record_with_the_headers_inode() {
+    async fn mapping_recorded_identity_uses_a_record_with_the_headers_inode() {
         let (_file, identity, key) = mapped_path();
         let scratch = Pages::map(1, 1);
-        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        let (tool, guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
         let recorded = RawInode::new(RECORD_DEVICE, identity.ino);
         guest.thread.map_file(RECORDED_START, page_size(), recorded);
 
-        let result = tool
-            .mapping_stat_identity(&mut guest, &key, &[RECORDED_START], MappingSubject::Reader)
-            .await;
+        let result =
+            tool.mapping_recorded_identity(&guest, &key, RECORDED_START, MappingSubject::Reader);
 
-        assert_eq!(result.expect("mapping_stat_identity failed"), recorded);
+        assert_eq!(result, Some(recorded));
         assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
     }
 
@@ -12546,7 +12771,7 @@ pub(crate) mod inject_fstat_scratch {
         guest.mmap_fails = true;
 
         let refused = tool
-            .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Reader)
+            .mapping_stat_identity(&mut guest, &key, MappingSubject::Reader)
             .await;
 
         assert!(
@@ -12570,7 +12795,7 @@ pub(crate) mod inject_fstat_scratch {
         };
         let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
         let fallback = tool
-            .mapping_stat_identity(&mut guest, &missing, &[], MappingSubject::Unknown)
+            .mapping_stat_identity(&mut guest, &missing, MappingSubject::Unknown)
             .await;
         assert_eq!(
             fallback.expect("a missing path must not be an error"),
@@ -12867,11 +13092,12 @@ pub(crate) mod inject_fstat_scratch {
         );
     }
 
-    // Step 3 of `mapping_stat_identity`: the reader's own executable after it
+    // Step 2 of `mapping_stat_identity`: the reader's own executable after it
     // was unlinked -- ` (deleted)`, so no path candidate -- and with no record,
     // as `execve` maps it, is keyed on the guest's `stat` of `/proc/self/exe`,
-    // not on the header's device. For another address space (no recorded
-    // starts) `/proc/self` is not that process, and the header decides.
+    // not on the header's device. For an address space the reader cannot name
+    // (`MappingSubject::Unknown`) `/proc/self` is not that process, and the
+    // header decides.
     #[tokio::test]
     async fn mapping_stat_identity_keys_the_readers_deleted_executable_on_proc_self_exe() {
         let exe = std::fs::metadata("/proc/self/exe").unwrap();
@@ -12901,8 +13127,13 @@ pub(crate) mod inject_fstat_scratch {
         ]
         .concat();
 
+        assert_eq!(
+            tool.mapping_recorded_identity(&guest, &key, RECORDED_START, MappingSubject::Reader),
+            None,
+            "precondition: `execve` maps the executable without a record"
+        );
         let own = tool
-            .mapping_stat_identity(&mut guest, &key, &[RECORDED_START], MappingSubject::Reader)
+            .mapping_stat_identity(&mut guest, &key, MappingSubject::Reader)
             .await;
         assert_eq!(own.expect("mapping_stat_identity failed"), identity);
         assert_eq!(guest.injected, exe_proof);
@@ -12911,7 +13142,7 @@ pub(crate) mod inject_fstat_scratch {
         assert_eq!(guest.statx_paths, [b"/proc/self/exe".to_vec()]);
 
         let other = tool
-            .mapping_stat_identity(&mut guest, &key, &[RECORDED_START], MappingSubject::Unknown)
+            .mapping_stat_identity(&mut guest, &key, MappingSubject::Unknown)
             .await;
         assert_eq!(
             other.expect("mapping_stat_identity failed"),
@@ -12937,17 +13168,22 @@ pub(crate) mod inject_fstat_scratch {
         let path_proof = [&[Sysno::newfstatat][..], &proof_calls()].concat();
 
         let own = GuestMappingMinter::new(&tool, &mut guest, MappingSubject::Reader)
-            .stat_identity(&key, &[RECORDED_START])
-            .await;
+            .recorded_identity(&key, RECORDED_START);
         assert_eq!(
-            own.expect("stat_identity failed for the reader's own address space"),
-            recorded,
+            own,
+            Some(recorded),
             "control: the reader's own snapshot is keyed on its record"
         );
         assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
 
+        let other_record = GuestMappingMinter::new(&tool, &mut guest, MappingSubject::Unknown)
+            .recorded_identity(&key, RECORDED_START);
+        assert_eq!(
+            other_record, None,
+            "another address space's line must not take the reader's record"
+        );
         let other = GuestMappingMinter::new(&tool, &mut guest, MappingSubject::Unknown)
-            .stat_identity(&key, &[RECORDED_START])
+            .stat_identity(&key)
             .await;
         assert_eq!(
             other.expect("stat_identity failed for another address space"),
@@ -12957,8 +13193,15 @@ pub(crate) mod inject_fstat_scratch {
         assert_eq!(guest.injected, path_proof);
         assert_eq!(guest.fstatat_paths, [key.pathname.as_bytes().to_vec()]);
 
+        let numbered_record =
+            GuestMappingMinter::new(&tool, &mut guest, MappingSubject::Process(1))
+                .recorded_identity(&key, RECORDED_START);
+        assert_eq!(
+            numbered_record, None,
+            "a numbered task's line must not take the reader's record"
+        );
         let numbered = GuestMappingMinter::new(&tool, &mut guest, MappingSubject::Process(1))
-            .stat_identity(&key, &[RECORDED_START])
+            .stat_identity(&key)
             .await;
         assert_eq!(
             numbered.expect("stat_identity failed for a numbered address space"),
@@ -12966,6 +13209,297 @@ pub(crate) mod inject_fstat_scratch {
             "a numbered task's line must be keyed on the path's stat, not the reader's record"
         );
         assert_eq!(guest.injected, path_proof.repeat(2));
+    }
+
+    /// An inode number no file the tests below use has, shared by the
+    /// header of several scripted maps lines.
+    const SHARED_INODE: u64 = 0x5ea1;
+
+    /// A device number no test filesystem has, standing in for a second
+    /// filesystem on which a file's inode number coincides with another's, or
+    /// for the device of an overlayfs layer.
+    const OTHER_DEVICE: u64 = 0x7e57_0f05;
+
+    /// A one-page `maps` line at `start` with `key`'s header.
+    fn scripted_maps_line(start: usize, key: &crate::procfs::MappingKey) -> String {
+        let line = format!(
+            "{:x}-{:x} r--p 00000000 {:02x}:{:02x} {} {}",
+            start,
+            start + page_size(),
+            libc::major(key.device),
+            libc::minor(key.device),
+            key.inode,
+            key.pathname
+        );
+        assert_eq!(
+            crate::procfs::mapping_header_key(&line),
+            Some(key.clone()),
+            "precondition: the scripted maps line names the file"
+        );
+        line
+    }
+
+    /// The inode column of each line of the `maps` snapshot `raw`, minted and
+    /// rendered as the read handler mints and renders it.
+    async fn minted_maps_inodes(
+        tool: &Detcore,
+        guest: &mut ScriptedGuest,
+        raw: &str,
+        subject: MappingSubject,
+    ) -> Result<Vec<String>, Error> {
+        let table = crate::procfs::mint_mapping_identities(
+            raw.as_bytes(),
+            &BTreeMap::new(),
+            &mut GuestMappingMinter::new(tool, guest, subject),
+        )
+        .await?;
+        let rendered = String::from_utf8(crate::procfs::sanitize_maps(raw.as_bytes(), &table))
+            .expect("the rendered snapshot is text");
+        Ok(rendered
+            .lines()
+            .map(|line| line.split_whitespace().nth(4).unwrap().to_owned())
+            .collect())
+    }
+
+    // Codex review of https://github.com/rrnewton/hermit/pull/3255, round 10,
+    // F3: "resolve identity per range using its own provenance". Two lines can
+    // share one header -- device, inode and pathname -- and still map two
+    // files: here two deleted files whose inode numbers coincide on two
+    // devices, each mapped through a descriptor Detcore tracks. Each line is
+    // keyed on its own range's record. Keying the header on the first record
+    // found gave the second file the first one's inode.
+    #[tokio::test]
+    async fn maps_lines_of_one_header_keep_their_own_records() {
+        let key = crate::procfs::MappingKey {
+            device: HEADER_DEVICE,
+            inode: SHARED_INODE,
+            pathname: "/scripted/shared (deleted)".to_owned(),
+        };
+        let second_start = RECORDED_START + 2 * page_size();
+        let raw = format!(
+            "{}\n{}\n",
+            scripted_maps_line(RECORDED_START, &key),
+            scripted_maps_line(second_start, &key)
+        );
+        let first = RawInode::new(RECORD_DEVICE, SHARED_INODE);
+        let second = RawInode::new(OTHER_DEVICE, SHARED_INODE);
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        guest.answers_determinize_inode = true;
+        guest.answers_determinize_device = true;
+        guest.thread.map_file(RECORDED_START, page_size(), first);
+        guest.thread.map_file(second_start, page_size(), second);
+
+        let inodes = minted_maps_inodes(&tool, &mut guest, &raw, MappingSubject::Reader)
+            .await
+            .expect("both lines are recorded, so nothing is ambiguous");
+
+        assert_eq!(
+            *guest.determinized.lock().unwrap(),
+            [first, second],
+            "each line's own record keys its inode, in text order"
+        );
+        assert_eq!(
+            inodes,
+            [
+                FIRST_SCRIPTED_INODE.to_string(),
+                (FIRST_SCRIPTED_INODE + 1).to_string()
+            ]
+        );
+        assert!(
+            guest.injected.is_empty(),
+            "a recorded line needs no lookup: {:?}",
+            guest.injected
+        );
+        assert_eq!(
+            *guest.determinized_devices.lock().unwrap(),
+            [HEADER_DEVICE],
+            "the device column is keyed on the header's device, once"
+        );
+    }
+
+    /// Asserts that `result` is the typed refusal of the ambiguous maps line
+    /// at `start`.
+    fn assert_ambiguous_line_refused(result: &Result<Vec<String>, Error>, start: usize) {
+        let refused = result
+            .as_ref()
+            .err()
+            .and_then(IdentityLookupRefused::carried_by);
+        assert!(
+            refused.is_some_and(|refused| {
+                let message = refused.to_string();
+                message.contains(&format!("{start:#x}")) && message.contains("ambiguous")
+            }),
+            "the maps line at {start:#x} must be refused as ambiguous, typed so that it \
+             stops the reading process: {result:?}"
+        );
+    }
+
+    // The same F3, "and refuse ambiguous evidence". A line with no record of
+    // its own shares its header with a recorded line, and the file that
+    // record names is not the file the line resolves to. The header cannot
+    // say which file the unrecorded line maps, so the snapshot is refused,
+    // typed so that it stops the reading process, before any identity is
+    // minted. Three shapes: no step names the file, so the header's pair
+    // stands; the line's path is proven to name another file than the
+    // record's; and two lines recorded with two files, one of which is the
+    // unrecorded line's.
+    #[tokio::test]
+    async fn an_unrecorded_maps_line_contradicted_by_its_headers_record_is_refused() {
+        let second_start = RECORDED_START + 2 * page_size();
+        let third_start = RECORDED_START + 4 * page_size();
+        let exe = std::fs::metadata("/proc/self/exe").unwrap();
+        assert_ne!(
+            exe.ino(),
+            SHARED_INODE,
+            "precondition: step 2 names no file"
+        );
+        let deleted = crate::procfs::MappingKey {
+            device: HEADER_DEVICE,
+            inode: SHARED_INODE,
+            pathname: "/scripted/shared (deleted)".to_owned(),
+        };
+        let header = RawInode::new(HEADER_DEVICE, SHARED_INODE);
+
+        // No step names the file: the line's identity is the header's pair.
+        let raw = format!(
+            "{}\n{}\n",
+            scripted_maps_line(RECORDED_START, &deleted),
+            scripted_maps_line(second_start, &deleted)
+        );
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        guest.answers_determinize_inode = true;
+        guest.answers_determinize_device = true;
+        guest.thread.map_file(
+            RECORDED_START,
+            page_size(),
+            RawInode::new(RECORD_DEVICE, SHARED_INODE),
+        );
+        let result = minted_maps_inodes(&tool, &mut guest, &raw, MappingSubject::Reader).await;
+        assert_ambiguous_line_refused(&result, second_start);
+        assert!(
+            guest.determinized.lock().unwrap().is_empty(),
+            "nothing minted"
+        );
+        assert!(guest.determinized_devices.lock().unwrap().is_empty());
+        assert_eq!(guest.fstatat_paths, [b"/proc/self/exe".to_vec()]);
+
+        // The path is proven to name a file other than the record's.
+        let (file, identity, key) = mapped_path();
+        let _mounts = ScriptedMountinfo::proving(file.path(), HEADER_DEVICE);
+        let raw = format!(
+            "{}\n{}\n",
+            scripted_maps_line(RECORDED_START, &key),
+            scripted_maps_line(second_start, &key)
+        );
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        guest.answers_determinize_inode = true;
+        guest.answers_determinize_device = true;
+        guest.thread.map_file(
+            RECORDED_START,
+            page_size(),
+            RawInode::new(RECORD_DEVICE, identity.ino),
+        );
+        let result = minted_maps_inodes(&tool, &mut guest, &raw, MappingSubject::Reader).await;
+        assert_ambiguous_line_refused(&result, second_start);
+        assert!(
+            guest.determinized.lock().unwrap().is_empty(),
+            "nothing minted"
+        );
+        assert_eq!(guest.fstatat_paths, [key.pathname.as_bytes().to_vec()]);
+
+        // Two records name two files, and the unrecorded line's identity, the
+        // header's pair, is one of them: the other still contradicts it.
+        let raw = format!(
+            "{}\n{}\n{}\n",
+            scripted_maps_line(RECORDED_START, &deleted),
+            scripted_maps_line(second_start, &deleted),
+            scripted_maps_line(third_start, &deleted)
+        );
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        guest.answers_determinize_inode = true;
+        guest.answers_determinize_device = true;
+        guest.thread.map_file(RECORDED_START, page_size(), header);
+        guest.thread.map_file(
+            second_start,
+            page_size(),
+            RawInode::new(OTHER_DEVICE, SHARED_INODE),
+        );
+        let result = minted_maps_inodes(&tool, &mut guest, &raw, MappingSubject::Reader).await;
+        assert_ambiguous_line_refused(&result, third_start);
+        assert!(
+            guest.determinized.lock().unwrap().is_empty(),
+            "nothing minted"
+        );
+    }
+
+    // Controls for the refusal above, so that it cannot pass by refusing every
+    // snapshot with a recorded line: a line with no record of its own is keyed
+    // as before when the file its header's record names is the file the line
+    // resolves to, and no record is consulted when the snapshot shows another
+    // address space or metadata is not virtualized.
+    #[tokio::test]
+    async fn an_unrecorded_maps_line_that_agrees_with_its_headers_record_is_keyed() {
+        let second_start = RECORDED_START + 2 * page_size();
+        let (file, identity, key) = mapped_path();
+        let _mounts = ScriptedMountinfo::proving(file.path(), HEADER_DEVICE);
+        let raw = format!(
+            "{}\n{}\n",
+            scripted_maps_line(RECORDED_START, &key),
+            scripted_maps_line(second_start, &key)
+        );
+        let scratch = Pages::map(1, 1);
+        let first_inode = vec![FIRST_SCRIPTED_INODE.to_string(); 2];
+        // Each of the two lines sends its own numbering request, as the
+        // request-counting pool requires, and both name one file.
+
+        // The record names the file the path is proven to name.
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        guest.answers_determinize_inode = true;
+        guest.answers_determinize_device = true;
+        guest.thread.map_file(RECORDED_START, page_size(), identity);
+        let inodes = minted_maps_inodes(&tool, &mut guest, &raw, MappingSubject::Reader).await;
+        assert_eq!(inodes.expect("the record agrees"), first_inode);
+        assert_eq!(*guest.determinized.lock().unwrap(), [identity; 2]);
+
+        // Another address space: the reader's record, which names another
+        // file, is not consulted, so nothing contradicts the path.
+        for subject in [MappingSubject::Unknown, MappingSubject::Process(1)] {
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.answers_determinize_inode = true;
+            guest.answers_determinize_device = true;
+            guest.thread.map_file(
+                RECORDED_START,
+                page_size(),
+                RawInode::new(RECORD_DEVICE, identity.ino),
+            );
+            let inodes = minted_maps_inodes(&tool, &mut guest, &raw, subject).await;
+            assert_eq!(inodes.expect("no record is consulted"), first_inode);
+            assert_eq!(
+                *guest.determinized.lock().unwrap(),
+                [identity; 2],
+                "{subject:?}"
+            );
+        }
+
+        // Metadata not virtualized: the header's pair keys every line.
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        guest.config.virtualize_metadata = false;
+        guest.answers_determinize_inode = true;
+        guest.answers_determinize_device = true;
+        guest.thread.map_file(
+            RECORDED_START,
+            page_size(),
+            RawInode::new(RECORD_DEVICE, identity.ino),
+        );
+        let inodes = minted_maps_inodes(&tool, &mut guest, &raw, MappingSubject::Reader).await;
+        assert_eq!(inodes.expect("no record is consulted"), first_inode);
+        assert_eq!(
+            *guest.determinized.lock().unwrap(),
+            [RawInode::new(HEADER_DEVICE, identity.ino); 2]
+        );
+        assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
     }
 
     /// A running process other than the test's, whose executable stands in
@@ -13052,7 +13586,7 @@ pub(crate) mod inject_fstat_scratch {
         }
     }
 
-    // Step 3 for a task the maps file names by number: its executable after
+    // Step 2 for a task the maps file names by number: its executable after
     // it was unlinked -- ` (deleted)`, so no path candidate -- is keyed on the
     // guest's `stat` of `/proc/<pid>/exe`, not on the header's device. Before
     // https://github.com/rrnewton/hermit/pull/3255's fifth round no number
@@ -13076,7 +13610,6 @@ pub(crate) mod inject_fstat_scratch {
             .mapping_stat_identity(
                 &mut guest,
                 &key,
-                &[RECORDED_START],
                 MappingSubject::Process(other.process.pid()),
             )
             .await;
@@ -13103,14 +13636,14 @@ pub(crate) mod inject_fstat_scratch {
         assert_eq!(guest.statx_paths, [link.into_bytes()]);
     }
 
-    // Step 3 borrows the executable's identity only with proof that the
+    // Step 2 borrows the executable's identity only with proof that the
     // line's file IS the executable: the link must read as the line's
     // pathname, and the executable must lie on the header's superblock. An
     // equal inode number alone -- on another filesystem, in a non-executable
     // mapping, or for a live file literally named `x (deleted)` -- keeps the
     // header's pair.
     #[tokio::test]
-    async fn step_three_needs_the_executables_pathname_and_superblock() {
+    async fn step_two_needs_the_executables_pathname_and_superblock() {
         let other = DeletedExecutable::spawn();
         let identity = other.process.executable();
         let link = other.link();
@@ -13157,7 +13690,6 @@ pub(crate) mod inject_fstat_scratch {
                 .mapping_stat_identity(
                     &mut guest,
                     &key,
-                    &[],
                     MappingSubject::Process(other.process.pid()),
                 )
                 .await;
@@ -13210,11 +13742,10 @@ pub(crate) mod inject_fstat_scratch {
             assert_eq!(subject, MappingSubject::Reader, "{path}");
             guest.injected.clear();
             let resolved = GuestMappingMinter::new(&tool, &mut guest, subject)
-                .stat_identity(&key, &[RECORDED_START])
-                .await;
+                .recorded_identity(&key, RECORDED_START);
             assert_eq!(
-                resolved.expect("stat_identity failed"),
-                recorded,
+                resolved,
+                Some(recorded),
                 "{path}: the reader's own deleted file must be keyed on its record"
             );
             assert!(guest.injected.is_empty(), "{path}: {:?}", guest.injected);
@@ -13242,8 +13773,14 @@ pub(crate) mod inject_fstat_scratch {
         );
         guest.injected.clear();
         guest.fstatat_paths.clear();
+        assert_eq!(
+            GuestMappingMinter::new(&tool, &mut guest, subject)
+                .recorded_identity(&other_key, RECORDED_START),
+            None,
+            "{path}: another task's line must not take the reader's record"
+        );
         let resolved = GuestMappingMinter::new(&tool, &mut guest, subject)
-            .stat_identity(&other_key, &[RECORDED_START])
+            .stat_identity(&other_key)
             .await;
         assert_eq!(
             resolved.expect("stat_identity failed"),

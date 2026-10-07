@@ -2331,8 +2331,8 @@ fn liteinst_in_guest_user_address_limit_queries_keep_the_guest_errno() {
 // and a descriptor received over SCM_RIGHTS is one Detcore does not track, so
 // it has no cached stat to read that device from. This guards that getdents on
 // such a descriptor still succeeds and lists every entry with the inode number
-// `stat` reports for it. It runs in-guest without `--verify`, which in-guest
-// LiteInst refuses (see the module documentation).
+// `stat` reports for it. It is one in-guest run that checks the inodes; it
+// does not repeat the run under `--verify` (see the module documentation).
 #[test]
 fn liteinst_in_guest_untracked_directory_descriptor_lists_stat_inodes() {
     let _guard = hermit_run_guard();
@@ -2353,8 +2353,8 @@ fn liteinst_in_guest_untracked_directory_descriptor_lists_stat_inodes() {
 // descriptor is still open, the other closed) keep the inode fstat reports.
 // The unlinked files go in a host directory rather than the guest's tmpfs
 // working directory, so that on a btrfs host they are the two-device case. It
-// runs in-guest without `--verify`, which in-guest LiteInst refuses (see the
-// module documentation).
+// is one in-guest run that checks the inodes; it does not repeat the run under
+// `--verify` (see the module documentation).
 #[test]
 fn liteinst_in_guest_maps_inodes_equal_stat_inodes() {
     let _guard = hermit_run_guard();

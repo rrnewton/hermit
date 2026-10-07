@@ -9989,28 +9989,42 @@ mod tests {
         assert_eq!(mtime, LogicalTime::from_secs(1));
     }
 
-    /// One request a [`PoolMinter`] received. In production `Stat` is
+    /// One request a [`PoolMinter`] received. In production `Record` is
+    /// `mapping_recorded_identity` (a lookup in the reader's own mapping
+    /// records, with no RPC and no injected syscall), `Stat` is
     /// `mapping_stat_identity` (which may inject a guest `fstatat`),
     /// `Inodes` is one `determinize_mapping_inodes` RPC to the global tool
     /// carrying every backed line's identity, and `Device` is one
     /// `determinize_device` RPC.
-    #[derive(Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     enum MintCall {
-        Stat(crate::procfs::MappingKey, Vec<usize>),
+        Record(crate::procfs::MappingKey, usize),
+        Stat(crate::procfs::MappingKey),
         Inodes(Vec<crate::types::RawInode>),
         Device(u64),
+    }
+
+    /// The refusal a [`PoolMinter`] returns for an ambiguous maps line
+    /// (`MappingIdentityMinter::ambiguous_line`).
+    #[derive(Debug, PartialEq, Eq)]
+    struct AmbiguousLine {
+        start: Option<usize>,
+        identity: crate::types::RawInode,
+        recorded: crate::types::RawInode,
     }
 
     /// Fresh run-global identity pools, driven directly rather than over the
     /// guest RPC that production's minter uses. Every request is recorded in
     /// `calls`, in the order it was made.
     ///
+    /// A line has a record of its own when `records` lists its start address.
     /// A header resolves to its own `(device, inode)` pair, as on a filesystem
     /// whose `st_dev` is its superblock device, unless `stat_identities` maps
     /// that pair to the identity `stat` reports, as on btrfs.
     struct PoolMinter {
         inodes: super::InodePool,
         devices: super::DevicePool,
+        records: std::collections::BTreeMap<usize, crate::types::RawInode>,
         stat_identities: std::collections::BTreeMap<(u64, u64), crate::types::RawInode>,
         calls: Vec<MintCall>,
     }
@@ -10022,28 +10036,59 @@ mod tests {
             Self {
                 inodes: super::InodePool::new(),
                 devices: super::DevicePool::new(),
+                records: std::collections::BTreeMap::new(),
                 stat_identities,
                 calls: Vec::new(),
             }
         }
+
+        /// This minter, with a record of its own for the line starting at
+        /// each address `records` lists.
+        fn with_records(
+            mut self,
+            records: std::collections::BTreeMap<usize, crate::types::RawInode>,
+        ) -> Self {
+            self.records = records;
+            self
+        }
     }
 
     impl crate::procfs::MappingIdentityMinter for PoolMinter {
-        type Error = std::convert::Infallible;
+        type Error = AmbiguousLine;
+
+        fn recorded_identity(
+            &mut self,
+            key: &crate::procfs::MappingKey,
+            start: usize,
+        ) -> Option<crate::types::RawInode> {
+            self.calls.push(MintCall::Record(key.clone(), start));
+            self.records.get(&start).copied()
+        }
 
         async fn stat_identity(
             &mut self,
             key: &crate::procfs::MappingKey,
-            starts: &[usize],
         ) -> Result<crate::types::RawInode, Self::Error> {
-            self.calls
-                .push(MintCall::Stat(key.clone(), starts.to_vec()));
+            self.calls.push(MintCall::Stat(key.clone()));
             let header = (key.device, key.inode);
             Ok(self
                 .stat_identities
                 .get(&header)
                 .copied()
                 .unwrap_or(crate::types::RawInode::new(key.device, key.inode)))
+        }
+
+        fn ambiguous_line(
+            &mut self,
+            line: &crate::procfs::MappingLine,
+            identity: crate::types::RawInode,
+            recorded: crate::types::RawInode,
+        ) -> Self::Error {
+            AmbiguousLine {
+                start: line.start,
+                identity,
+                recorded,
+            }
         }
 
         async fn inodes(
@@ -10098,25 +10143,38 @@ mod tests {
     }
 
     /// Render `raw` through the production minting loop with `minter`, and
-    /// return the minter afterwards.
+    /// return the minter afterwards. Panics if the snapshot is refused.
     fn render_maps_with_minter(
         raw: &str,
         stdio_by_raw_file: &std::collections::BTreeMap<
             crate::types::RawInode,
             crate::types::DetInode,
         >,
-        mut minter: PoolMinter,
+        minter: PoolMinter,
     ) -> (String, PoolMinter) {
-        let table = match futures::executor::block_on(crate::procfs::mint_mapping_identities(
+        let (rendered, minter) = try_render_maps_with_minter(raw, stdio_by_raw_file, minter);
+        let rendered =
+            rendered.unwrap_or_else(|refusal| panic!("the snapshot was refused: {refusal:?}"));
+        (rendered, minter)
+    }
+
+    /// [`render_maps_with_minter`], returning a refusal rather than panicking.
+    fn try_render_maps_with_minter(
+        raw: &str,
+        stdio_by_raw_file: &std::collections::BTreeMap<
+            crate::types::RawInode,
+            crate::types::DetInode,
+        >,
+        mut minter: PoolMinter,
+    ) -> (Result<String, AmbiguousLine>, PoolMinter) {
+        let table = futures::executor::block_on(crate::procfs::mint_mapping_identities(
             raw.as_bytes(),
             stdio_by_raw_file,
             &mut minter,
-        )) {
-            Ok(table) => table,
-            Err(never) => match never {},
-        };
-        let rendered =
-            String::from_utf8(crate::procfs::sanitize_maps(raw.as_bytes(), &table)).unwrap();
+        ));
+        let rendered = table.map(|table| {
+            String::from_utf8(crate::procfs::sanitize_maps(raw.as_bytes(), &table)).unwrap()
+        });
         (rendered, minter)
     }
 
@@ -10169,25 +10227,31 @@ mod tests {
             "{run_a}"
         );
 
-        // The exact request sequence. Each distinct header first resolves the
-        // identity `stat` reports for its file, in text order; the repeated
-        // `/memfd:first` line is deduplicated for that step, and its start
-        // address travels with the first line's key instead. Then ONE request
-        // asks for the inode of every backed LINE, in text order, repeat
-        // included, keyed on its header's resolved identity: the pool consumes
-        // a number per entry whether or not it mints, so the read consumes as
-        // many numbers as the guest sees backed lines, whatever the host
-        // identities are (<https://github.com/rrnewton/hermit/issues/2897>).
-        // Last, each header asks for its device. In production the inode and
-        // each device request are one RPC to the global tool, and a stat
-        // resolution can inject a guest `fstatat`.
+        // The exact request sequence, in passes over the lines in text order.
+        // First every line's own record is asked for. Then every header with a
+        // line that has no record resolves the identity `stat` reports for its
+        // file, once, so the repeated `/memfd:first` line asks for no second
+        // resolution. Only after every line is resolved -- so that a refused
+        // snapshot requests nothing -- does ONE request ask for the inode of
+        // every backed LINE, in text order, repeat included, keyed on its
+        // resolved identity: the pool consumes a number per entry whether or
+        // not it mints, so the read consumes as many numbers as the guest sees
+        // backed lines, whatever the host identities are
+        // (<https://github.com/rrnewton/hermit/issues/2897>). Last, each newly
+        // seen header asks for its device; the repeated line reuses it. In
+        // production a record is the reader's own bookkeeping, the inode
+        // request and each device request are one RPC to the global tool, and
+        // a stat resolution can inject a guest `fstatat`.
         let memfd_dev = libc::makedev(0, 1);
         let lines: Vec<&str> = raw_a.lines().collect();
         assert_eq!(
             minter_a.calls,
             [
-                MintCall::Stat(header_key(lines[0]), vec![0x1000_0000, 0x3000_0000]),
-                MintCall::Stat(header_key(lines[1]), vec![0x2000_0000]),
+                MintCall::Record(header_key(lines[0]), 0x1000_0000),
+                MintCall::Record(header_key(lines[1]), 0x2000_0000),
+                MintCall::Record(header_key(lines[2]), 0x3000_0000),
+                MintCall::Stat(header_key(lines[0])),
+                MintCall::Stat(header_key(lines[1])),
                 MintCall::Inodes(vec![
                     crate::types::RawInode::new(memfd_dev, low),
                     crate::types::RawInode::new(memfd_dev, high),
@@ -10294,9 +10358,13 @@ mod tests {
         assert_eq!(
             minter.calls,
             [
-                MintCall::Stat(header_key(lines[0]), vec![0x1000_0000, 0x3000_0000]),
-                MintCall::Stat(header_key(lines[1]), vec![0x2000_0000]),
-                MintCall::Stat(header_key(lines[3]), vec![0x4000_0000]),
+                MintCall::Record(header_key(lines[0]), 0x1000_0000),
+                MintCall::Record(header_key(lines[1]), 0x2000_0000),
+                MintCall::Record(header_key(lines[2]), 0x3000_0000),
+                MintCall::Record(header_key(lines[3]), 0x4000_0000),
+                MintCall::Stat(header_key(lines[0])),
+                MintCall::Stat(header_key(lines[1])),
+                MintCall::Stat(header_key(lines[3])),
                 MintCall::Inodes(vec![
                     z_stat,
                     RawInode::new(other_dev, 8000),
@@ -10326,6 +10394,151 @@ mod tests {
                 .add_inode(RawInode::new(maps_dev, 9000), stat, t)
                 .0,
             DetInode::mint(9005)
+        );
+    }
+
+    /// Two lines can print one header -- device, inode and pathname -- and
+    /// still map two files (`crate::procfs::MappingLine`): here two deleted
+    /// files whose inode numbers coincide on two devices, as files of two
+    /// btrfs subvolumes can. Each line with a record of its own is keyed on
+    /// that record, in text order, and asks for no `stat` resolution; the
+    /// device column is the header's. A header keyed on one line's record
+    /// would give both lines one inode.
+    #[test]
+    fn maps_lines_of_one_header_are_minted_from_their_own_records() {
+        use crate::types::RawInode;
+
+        let raw = "10000000-10001000 r--p 00000000 00:2a 9000                       /z/gone (deleted)\n\
+                   20000000-20001000 r--p 00000000 00:15 1000                       /m/lib.so\n\
+                   30000000-30001000 r--p 00000000 00:2a 9000                       /z/gone (deleted)\n";
+        let maps_dev = libc::makedev(0, 0x2a);
+        let other_dev = libc::makedev(0, 0x15);
+        let first = RawInode::new(libc::makedev(0, 0x2b), 9000);
+        let second = RawInode::new(libc::makedev(0, 0x2c), 9000);
+        let minter =
+            PoolMinter::new(Default::default()).with_records(std::collections::BTreeMap::from([
+                (0x1000_0000, first),
+                (0x3000_0000, second),
+            ]));
+        let (rendered, minter) =
+            render_maps_with_minter(raw, &std::collections::BTreeMap::new(), minter);
+        assert_eq!(
+            maps_column(&rendered, 4),
+            ["9000", "9001", "9002"],
+            "{rendered}"
+        );
+        assert_eq!(
+            maps_column(&rendered, 3),
+            ["00:01", "00:02", "00:01"],
+            "{rendered}"
+        );
+
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(
+            minter.calls,
+            [
+                MintCall::Record(header_key(lines[0]), 0x1000_0000),
+                MintCall::Record(header_key(lines[1]), 0x2000_0000),
+                MintCall::Record(header_key(lines[2]), 0x3000_0000),
+                MintCall::Stat(header_key(lines[1])),
+                MintCall::Inodes(vec![first, RawInode::new(other_dev, 1000), second]),
+                MintCall::Device(maps_dev),
+                MintCall::Device(other_dev),
+            ],
+            "{rendered}"
+        );
+    }
+
+    /// A line with no record of its own whose header another line records as
+    /// a different file is refused, and the refusal comes before the first
+    /// pool request: a refused snapshot must not consume deterministic
+    /// numbers, or the next file the run sees would get a number that depends
+    /// on the refused read. The unrelated `/m/lib.so` line comes first in the
+    /// text, so a loop that minted line by line would have minted it.
+    ///
+    /// The control below differs only in the identity `stat` reports for the
+    /// header: when it is the recorded file, the line is keyed on it.
+    #[test]
+    fn a_refused_maps_snapshot_mints_nothing() {
+        use crate::types::RawInode;
+
+        let raw = "10000000-10001000 r--p 00000000 00:15 1000                       /m/lib.so\n\
+                   20000000-20001000 r--p 00000000 00:2a 9000                       /z/lib.so\n\
+                   30000000-30001000 r--p 00000000 00:2a 9000                       /z/lib.so\n";
+        let maps_dev = libc::makedev(0, 0x2a);
+        let other_dev = libc::makedev(0, 0x15);
+        let header = RawInode::new(maps_dev, 9000);
+        let z_stat = RawInode::new(libc::makedev(0, 0x2b), 9000);
+        let records = std::collections::BTreeMap::from([(0x2000_0000, z_stat)]);
+        let lines: Vec<&str> = raw.lines().collect();
+        let resolution = [
+            MintCall::Record(header_key(lines[0]), 0x1000_0000),
+            MintCall::Record(header_key(lines[1]), 0x2000_0000),
+            MintCall::Record(header_key(lines[2]), 0x3000_0000),
+            MintCall::Stat(header_key(lines[0])),
+            MintCall::Stat(header_key(lines[2])),
+        ];
+
+        // `stat` reports the header's own pair, which is not the file the
+        // other line's record names.
+        let minter = PoolMinter::new(Default::default()).with_records(records.clone());
+        let (refused, mut minter) =
+            try_render_maps_with_minter(raw, &std::collections::BTreeMap::new(), minter);
+        assert_eq!(
+            refused,
+            Err(AmbiguousLine {
+                start: Some(0x3000_0000),
+                identity: header,
+                recorded: z_stat,
+            })
+        );
+        assert_eq!(minter.calls, resolution, "no pool request after a refusal");
+        let t = LogicalTime::from_nanos(0);
+        let unobserved = super::ObservedMtime::Unobserved;
+        assert_eq!(
+            minter
+                .inodes
+                .add_inode(RawInode::new(other_dev, 1000), unobserved, t)
+                .0,
+            crate::consts::DET_INODE_OFFSET,
+            "the refused snapshot consumed a pooled inode"
+        );
+        assert_eq!(
+            minter.devices.determinize(other_dev),
+            1,
+            "the refused snapshot consumed a pooled device"
+        );
+
+        // Control: `stat` reports the recorded file, so nothing is ambiguous.
+        let minter = PoolMinter::new(std::collections::BTreeMap::from([(
+            (maps_dev, 9000),
+            z_stat,
+        )]))
+        .with_records(records);
+        let (rendered, minter) =
+            render_maps_with_minter(raw, &std::collections::BTreeMap::new(), minter);
+        assert_eq!(
+            maps_column(&rendered, 4),
+            ["9000", "9001", "9001"],
+            "{rendered}"
+        );
+        assert_eq!(
+            maps_column(&rendered, 3),
+            ["00:01", "00:02", "00:02"],
+            "{rendered}"
+        );
+        assert_eq!(
+            minter.calls,
+            [
+                &resolution[..],
+                &[
+                    MintCall::Inodes(vec![RawInode::new(other_dev, 1000), z_stat, z_stat]),
+                    MintCall::Device(other_dev),
+                    MintCall::Device(maps_dev),
+                ],
+            ]
+            .concat(),
+            "{rendered}"
         );
     }
 

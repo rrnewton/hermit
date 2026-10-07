@@ -191,7 +191,12 @@ pub use shared_open_files::OpenFileControlTransport;
 /// the file on another source: the lookup the guest makes for it (`stat`,
 /// `statx`, `readlink`, `fstat`) failed for a reason that is not the file's
 /// own answer, or what that answer is checked against (the guest's
-/// mountinfo, the pipefs and sockfs devices) could not be read.
+/// mountinfo, the pipefs and sockfs devices) could not be read. A
+/// `/proc/*/maps` or `smaps` snapshot is also refused when its own evidence
+/// is ambiguous: a line without a mapping record of its own resolves to one
+/// file while another line with the same device, inode and pathname columns
+/// is recorded as a different one (`mint_mapping_identities` in
+/// `procfs.rs`).
 ///
 /// It travels inside [`Error::Tool`], never as an errno, and the process
 /// that made the call must not run on past it: the call may have changed the

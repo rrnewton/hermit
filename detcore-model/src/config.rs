@@ -1937,6 +1937,9 @@ mod legacy_backend_json {
         "replaying",
     ];
 
+    /// A test of whether a configuration holds one field's serde default.
+    type HoldsItsDefault = fn(&Config) -> bool;
+
     /// The fields `Config` gained after the bytes the legacy form preserves,
     /// each with a test of whether a configuration holds the field's serde
     /// default. DBT's launcher leaves each at that default.
@@ -1951,7 +1954,7 @@ mod legacy_backend_json {
     /// Only this encoder may leave a field out. `Config` itself never skips
     /// one, because it also crosses positional bincode, which has no field
     /// names and would misread every field after a skipped one.
-    pub(super) const FIELDS_LEFT_OUT_AT_THEIR_DEFAULTS: [(&str, fn(&Config) -> bool); 3] = [
+    pub(super) const FIELDS_LEFT_OUT_AT_THEIR_DEFAULTS: [(&str, HoldsItsDefault); 3] = [
         ("anonymous_object_devices", |config| {
             config.anonymous_object_devices.is_none()
         }),

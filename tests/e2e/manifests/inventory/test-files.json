@@ -448,7 +448,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/fixtures/inode_identity_views.c",
       "runner": "hermit-cli/tests/procfs_determinism.rs",
-      "why": "tests/c/fixtures/inode_identity_views.c is owned by hermit-cli/tests/procfs_determinism.rs: The procfs integration suite compiles this guest and runs its scm-getdents, maps-stat and proc-fd-links modes under ptrace (and proc-fd-links under the DBT backend), feeding a mapped file on standard input and lowering the host RLIMIT_NOFILE before Hermit starts; hermit-cli/tests/cli.rs runs the scm-getdents and maps-stat modes under in-guest LiteInst (hermit-cli/tests/common/liteinst_in_guest_programs.rs, without --verify, which in-guest LiteInst refuses) and hermit-cli/tests/sabre_examples.rs runs proc-fd-links under SaBRe. The descriptor setup and host limits are not something a generic manifest cell expresses."
+      "why": "tests/c/fixtures/inode_identity_views.c is owned by hermit-cli/tests/procfs_determinism.rs: The procfs integration suite compiles this guest and runs its scm-getdents, maps-stat and proc-fd-links modes under ptrace (and proc-fd-links under the DBT backend), feeding a mapped file on standard input and lowering the host RLIMIT_NOFILE before Hermit starts; hermit-cli/tests/cli.rs runs the scm-getdents and maps-stat modes under in-guest LiteInst (hermit-cli/tests/common/liteinst_in_guest_programs.rs, as single runs that are not repeated under --verify) and hermit-cli/tests/sabre_examples.rs runs proc-fd-links under SaBRe. The descriptor setup and host limits are not something a generic manifest cell expresses."
     },
     {
       "disposition": "guest-fixture",
