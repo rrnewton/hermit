@@ -1411,7 +1411,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 2, syscalls::namespace::tests: 2,
     // syscalls::namespace::tests::other_proc_fd_target: 14, tool_global::tests: 10,
     // dirents::test: 2) retain all 1097: 1204, listed the same way.
-    ("test.detcore_unit", 1204),
+    // tool_global::tests::a_non_utf8_maps_snapshot_still_consumes_one_number_per_backed_line
+    // (the same pull request) retains all 1204: 1205, listed the same way.
+    ("test.detcore_unit", 1205),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1993,7 +1995,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests except the twelve HOSTED_PORTABLE_UNIQUE_MOUNT_ID_DETCORE_TESTS, which
     // it leaves out by exact name: 1204 - 12 = 1192, listed with this node's
     // arguments.
-    ("test.detcore_unit_on_host", 1192),
+    // And the non-UTF-8 maps numbering test (1193).
+    ("test.detcore_unit_on_host", 1193),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
