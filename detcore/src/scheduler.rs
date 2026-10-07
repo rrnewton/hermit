@@ -4128,6 +4128,21 @@ impl Scheduler {
             self.arm_signaled_background(dettid, signal);
             return;
         }
+        // A scheduler that does not model signal targets (in-guest LiteInst,
+        // DBT, KVM) has nothing to arm, and the thread still runs its call
+        // outside the scheduler. Its request was consumed when it was
+        // backgrounded, so nothing may be counterfeited for it either: it
+        // rejoins through its own continuation (`BlockedExternalContinue`),
+        // and the physical signal has already reached it. Before, a debug
+        // build asserted below and a release build counterfeited a request
+        // for a thread still in its pool, as
+        // https://github.com/rrnewton/hermit/issues/3146 found for the traced
+        // backend. In-guest LiteInst reached this when a vfork child's exit
+        // signalled its parent, which the child had just killed, before the
+        // parent's death was retired; host load widens that window.
+        if has_external_blocker {
+            return;
+        }
         if cfg!(debug_assertions) && !await_external_continuation {
             let nxtturn = self
                 .next_turns
@@ -10084,6 +10099,53 @@ mod test {
                 .is_ok()
         );
         assert!(scheduler.blocked.sigchld_deferred.is_empty());
+    }
+
+    /// On a scheduler that does not model signal targets (in-guest LiteInst,
+    /// DBT, KVM), a committed signal to a thread asleep in a call outside the
+    /// scheduler (a blocking external call, or a vfork parent waiting for its
+    /// child) neither arms the thread nor counterfeits a request: the thread
+    /// stays in its pool, awaiting its own continuation. Before, a debug build
+    /// panicked here ("thread should be parked in the scheduler"). In-guest
+    /// LiteInst hit it when a vfork child's exit signalled the parent it had
+    /// just killed, and the panic poisoned the scheduler and hung the run.
+    #[test]
+    fn a_signal_to_a_backgrounded_thread_on_a_scheduler_without_signal_targets_waits_for_its_continuation()
+     {
+        for vfork in [false, true] {
+            let (mut scheduler, parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+            scheduler.models_signal_targets = false;
+            assert!(!scheduler.backend.signal_interrupts_external_syscalls);
+            let op = ExternalOpId::new(creator, 1);
+            let rid = if vfork {
+                ResourceID::BlockingVfork(op)
+            } else {
+                ResourceID::BlockingExternalIO(op)
+            };
+            commit_out_of_scheduler_call(&mut scheduler, creator, rid, None);
+            scheduler.runqueue_push_back(parent);
+
+            scheduler.wake_signaled_guest(creator, Signal::SIGCHLD);
+            let case = format!("vfork={vfork}");
+            assert!(scheduler.blocked.signaled_background.is_empty(), "{case}");
+            assert!(
+                scheduler
+                    .next_turns
+                    .get(&creator)
+                    .unwrap()
+                    .req
+                    .try_read()
+                    .is_none(),
+                "{case}: a request was counterfeited"
+            );
+            assert_eq!(
+                scheduler.blocked.external_io_blockers.get(&creator),
+                Some(&op),
+                "{case}"
+            );
+            assert!(!scheduler.run_queue.contains_tid(creator), "{case}");
+            assert!(scheduler.run_queue.contains_tid(parent), "{case}");
+        }
     }
 
     /// When the release barrier's watchdog expires with an armed thread that
