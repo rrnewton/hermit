@@ -1160,7 +1160,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_run_config_carries_the_held_answer_until_its_guard_is_dropped,
     // an_answer_held_by_overlapping_guards_is_forgotten_with_the_last) retain
     // all 982: 984, listed the same way.
-    ("test.hermit_unit", 984),
+    // The three per-thread held-answer and probe-bound tests of the same pull
+    // request (hermit tests:
+    // a_held_answer_is_not_used_by_another_thread_filtered_unlike_the_asker,
+    // a_held_answer_applies_only_to_an_unchanged_comparable_thread_state,
+    // a_probe_whose_listener_never_answers_is_killed_and_reaped_at_its_bound)
+    // retain all 984: 987, listed the same way.
+    ("test.hermit_unit", 987),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1448,7 +1454,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (the same pull request) retain all 1207: 1209, listed the same way.
     // syscalls::files::inject_fstat_scratch::getdents_keys_a_mount_root_alike_before_and_after_an_overlay_settles_layer_devices
     // (the same pull request) retains all 1209: 1210, listed the same way.
-    ("test.detcore_unit", 1210),
+    // syscalls::files::inject_fstat_scratch::getdents_keys_a_settled_layer_overlays_mount_root_as_stat_and_every_do
+    // and ::getdents_keys_a_listing_as_every_does_when_its_mount_root_question_is_refused
+    // (the same pull request) retain all 1210: 1212, listed the same way.
+    ("test.detcore_unit", 1212),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1802,7 +1811,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // liteinst_in_guest_programs::liteinst_in_guest_untracked_directory_descriptor_lists_stat_inodes,
     // max_log_bytes_verify_reports_the_cap_status_when_run1_crosses_it) retain all
     // 211: 214, re-listed.
-    ("test.cli", 214),
+    // run_timeout_bounds_a_seccomp_probe_whose_supervisor_never_answers (the
+    // same pull request) retains all 214: 215, re-listed.
+    ("test.cli", 215),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -1950,7 +1961,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // so they join the exact-name filterset (42 names); the third,
     // max_log_bytes_verify_reports_the_cap_status_when_run1_crosses_it, retains
     // all 171: 214 - 42 = 172, listed with this node's arguments.
-    ("test.cli_on_host", 172),
+    // run_timeout_bounds_a_seccomp_probe_whose_supervisor_never_answers starts
+    // no in-guest LiteInst guest, so the filterset is unchanged: 215 - 42 =
+    // 173, listed with this node's arguments.
+    ("test.cli_on_host", 173),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 54),
@@ -2035,7 +2049,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the overlay read-order getdents test (1195).
     // And the two overlay mount-root getdents tests (1197).
     // And the layer-device mount-root getdents test (1198).
-    ("test.detcore_unit_on_host", 1198),
+    // And the settled-overlay and refused-question mount-root getdents tests
+    // (1200).
+    ("test.detcore_unit_on_host", 1200),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -2127,7 +2143,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same twelve seccomp-probe tests in place of four: 980.
     // And the same two probe-preparation tests: 982.
     // And the same two held-answer tests: 984.
-    ("test.hermit_unit_on_host", 984),
+    // And the same three per-thread held-answer and probe-bound tests: 987.
+    ("test.hermit_unit_on_host", 987),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
