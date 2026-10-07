@@ -5860,6 +5860,8 @@ mod tests {
             "virtualizes_cpuid": kvm,
             "supports_madvise": !kvm,
             "supports_madv_dontneed": true,
+            "reports_child_exit_publication":
+                matches!(backend, Backend::Ptrace | Backend::E9patch),
             "provides_process_signal_control": kvm,
             "emulates_child_waits": kvm,
             "failed_gettimeofday_may_store_host_time": !kvm,

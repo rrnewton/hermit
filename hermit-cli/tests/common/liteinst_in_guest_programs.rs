@@ -1480,28 +1480,48 @@ fn c_guest(cell: &'static OnceLock<PathBuf>, name: &str) -> &'static Path {
 /// "Evidence planned"), under strict verification on ptrace and on in-guest
 /// LiteInst, whose exits hold the schedule until they are physically
 /// complete. The parent blocks SIGCHLD and learns of each exit from EOF on a
-/// pipe the child held. Every run matches, and both backends print the same
-/// lines:
+/// pipe the child held. Every run is checked against Linux's output, per
+/// backend; the two backends print the same lines in the first two modes and
+/// differ, by one named LiteInst deviation, in the third:
 ///
 /// - SA_NOCLDWAIT: wait reports ECHILD (auto-reaped) and SIGCHLD is pending,
-///   as on Linux.
+///   as on Linux, on both backends.
 /// - a raw exit system call: SIGCHLD is pending and wait returns status 7, as
-///   on Linux.
-/// - SIGCHLD ignored: wait reports ECHILD, as on Linux. The pending bit is
-///   compared only between the backends: Linux sends no SIGCHLD to a parent
-///   that ignores it (`do_notify_parent`), but both Hermit backends leave one
-///   pending today, a Detcore defect outside exit completion.
+///   on Linux, on both backends.
+/// - SIGCHLD ignored: wait reports ECHILD, as on Linux. Linux sends no
+///   SIGCHLD to a parent that ignores it (`do_notify_parent`), so nothing is
+///   pending. ptrace prints that since SIGCHLD Phase A; in-guest LiteInst
+///   still leaves SIGCHLD pending, a known deviation pinned at its current
+///   value (dev-hermit
+///   ignored/parity-green-issues/liteinst-sigign-sigchld-pending.md). This
+///   mode is not a parity check; the name predates it.
 #[test]
 fn liteinst_in_guest_exit_reaping_matches_ptrace() {
     let _guard = hermit_run_guard();
     let guest = c_guest(&EXIT_REAPING_GUEST, "exit_reaping_probe");
-    for (mode, pending, wait, status) in [
-        ("sigign", None, "ECHILD", -1),
-        ("nocldwait", Some("1"), "ECHILD", -1),
-        ("rawexit", Some("1"), "child", 7),
+    // Each backend's expected SIGCHLD-pending value, which is Linux's (the
+    // fixture's header) except where a backend's deviation is named.
+    //
+    // sigign: Linux sends no SIGCHLD when the parent explicitly ignores it,
+    // even while it is blocked (do_notify_parent sets sig = 0), so nothing is
+    // pending. ptrace matches Linux since SIGCHLD Phase A stopped its
+    // scheduler sending a synthetic SIGCHLD there. In-guest LiteInst still
+    // leaves SIGCHLD pending: a known deviation, dev-hermit
+    // ignored/parity-green-issues/liteinst-sigign-sigchld-pending.md. It is
+    // pinned at its current value, which is what this test enforced before
+    // through ptrace's (then equally wrong) output.
+    for (mode, ptrace_pending, liteinst_pending, wait, status) in [
+        ("sigign", "0", "1", "ECHILD", -1),
+        ("nocldwait", "1", "1", "ECHILD", -1),
+        ("rawexit", "1", "1", "child", 7),
     ] {
         let mut outputs = Vec::new();
         for backend in ["ptrace", "liteinst"] {
+            let pending = if backend == "ptrace" {
+                ptrace_pending
+            } else {
+                liteinst_pending
+            };
             let mut command = Command::new(hermit_binary());
             command.args(["--log=info", "--backend", backend, "run"]);
             if backend == "liteinst" {
@@ -1534,20 +1554,20 @@ fn liteinst_in_guest_exit_reaping_matches_ptrace() {
                     line.starts_with(&prefix) && line.ends_with(&suffix),
                     "{backend} {mode}: {line}"
                 );
-                if let Some(pending) = pending {
-                    assert_eq!(
-                        *line,
-                        format!("{prefix}{pending}{suffix}"),
-                        "{backend} {mode}"
-                    );
-                }
+                assert_eq!(
+                    *line,
+                    format!("{prefix}{pending}{suffix}"),
+                    "{backend} {mode}"
+                );
             }
             outputs.push(stdout);
         }
-        assert_eq!(
-            outputs[0], outputs[1],
-            "{mode}: ptrace and in-guest LiteInst differ"
-        );
+        if ptrace_pending == liteinst_pending {
+            assert_eq!(
+                outputs[0], outputs[1],
+                "{mode}: ptrace and in-guest LiteInst differ"
+            );
+        }
     }
 }
 

@@ -1253,7 +1253,20 @@ impl GlobalTool for GlobalState {
     /// A backend whose process exits complete asynchronously reports each
     /// physical exit here; see [`GlobalState::complete_physical_process_exit`].
     fn on_backend_process_exited(&self, pid: i32) {
-        self.complete_physical_process_exit(pid);
+        if self.cfg.backend.reports_child_exit_publication {
+            // The kernel has published this process's exit to its parent. It
+            // is not a physical-exit barrier report on this backend.
+            let released = self
+                .sched
+                .lock()
+                .unwrap()
+                .complete_child_exit_publication(DetPid::from_raw(pid));
+            if released {
+                trace!("[detcore, dpid {}] backend published the child exit", pid);
+            }
+        } else {
+            self.complete_physical_process_exit(pid);
+        }
     }
 
     /// The processes held between their exit grant and their physical exit,
@@ -1891,6 +1904,17 @@ impl GlobalTool for GlobalState {
             }
             GlobalRequest::DeregisterThread(deregistration) => {
                 R::DeregisterThread(self.recv_deregister_thread(from, deregistration).await)
+            }
+            GlobalRequest::SetSavedGuestSigmask(mask) => {
+                let updated = self
+                    .lock_rpc_scheduler(false)
+                    .await
+                    .set_saved_guest_sigmask(dtid, mask);
+                if updated {
+                    R::SetSavedGuestSigmask(())
+                } else {
+                    R::ThreadExited
+                }
             }
             GlobalRequest::SetChildTidAddress(address) => {
                 let updated = self
@@ -3414,6 +3438,11 @@ pub enum GlobalRequest {
     /// A zero address disables the exit-time store and wake.
     SetChildTidAddress(usize),
 
+    /// Record (`Some`) or clear (`None`) the calling thread's own signal mask
+    /// while Detcore holds it under a private blocking mask, so the scheduler's
+    /// child-exit classification reads the guest's mask, not Detcore's.
+    SetSavedGuestSigmask(Option<u64>),
+
     /// Notify scheduler before/after futex action.
     /// The last two arguments are the initial contents of the memory word, and the mask.
     FutexAction(DetTid, FutexAction, FutexID, i32, u32),
@@ -3581,6 +3610,7 @@ pub enum GlobalResponse {
     StartNewThread(Option<ThreadHistory>),
     DeregisterThread(()),
     SetChildTidAddress(()),
+    SetSavedGuestSigmask(()),
     FutexAction(Option<SchedValue>),
     /// Return the mtime as well:
     DeterminizeInode((DetInode, LogicalTime)),
@@ -3765,6 +3795,25 @@ where
 }
 
 /// Mirrors a successful `set_tid_address(2)` into scheduler-owned exit state.
+/// Tells the scheduler the calling thread's own signal mask while Detcore holds
+/// it under a private blocking mask (`Some`), or that the guest's mask is back
+/// (`None`).
+pub(crate) async fn set_saved_guest_sigmask<G, T>(guest: &mut G, mask: Option<u64>)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) =
+        send_and_update_time(guest, GlobalRequest::SetSavedGuestSigmask(mask)).await;
+    assert!(
+        matches!(
+            response,
+            GlobalResponse::SetSavedGuestSigmask(()) | GlobalResponse::ThreadExited
+        ),
+        "unexpected response to SetSavedGuestSigmask: {response:?}"
+    );
+}
+
 pub(crate) async fn set_child_tid_address<G, T>(guest: &mut G, address: usize)
 where
     G: Guest<Detcore<T>>,

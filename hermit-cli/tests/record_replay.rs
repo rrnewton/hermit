@@ -2602,6 +2602,112 @@ fn record_pipe_read_after_clearing_nonblocking_waits_for_its_writer() {
     );
 }
 
+/// The scheduler records that place a guest's SIGCHLD in a ptrace log: every
+/// committed turn, the delivery of each inbound SIGCHLD, and the synthetic
+/// "Alarm fired" send.
+fn sigchld_boundary_records(log: &Path) -> Vec<String> {
+    let text = fs::read_to_string(log)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", log.display()));
+    text.lines()
+        .filter_map(|line| {
+            if let Some(start) = line.find("COMMIT turn ") {
+                let record = &line[start..];
+                // "COMMIT turn N, dettid D using ...": keep the turn and thread.
+                let end = record
+                    .match_indices(", dettid ")
+                    .next()
+                    .and_then(|(at, separator)| {
+                        record[at + separator.len()..]
+                            .find(|c: char| !c.is_ascii_digit())
+                            .map(|digits| at + separator.len() + digits)
+                    })
+                    .unwrap_or(record.len());
+                Some(record[..end].to_string())
+            } else if line.contains("signal (#") && line.ends_with(" SIGCHLD") {
+                line.find("[dtid ").map(|start| line[start..].to_string())
+            } else {
+                line.find("Alarm fired")
+                    .map(|start| line[start..].to_string())
+            }
+        })
+        .collect()
+}
+
+/// SIGCHLD Phase A on the recorded path. A child exits while its parent leaves
+/// SIGCHLD at SIG_DFL and unblocked, once while the parent is blocked in a
+/// recorded pipe read and once while it waits in waitpid. Linux discards that
+/// notification, so ptrace Hermit sends no synthetic SIGCHLD ("Alarm fired")
+/// and instead holds turns until the kernel publishes the exit; the kernel's
+/// own SIGCHLD then reaches Detcore as an inbound signal. Recorded reads
+/// inject directly, while replay supplies their recorded results, so the
+/// delivery point cannot be inferred from the recording alone: the replay
+/// must receive each SIGCHLD between the same committed turns, on the same
+/// thread, with no extra turn.
+#[test]
+fn replay_receives_an_ignored_sigchld_at_the_recorded_boundary() {
+    let _guard = hermit_record_lock();
+    let program = &workload("c_record_replay_sigchld_ignored_boundary").path;
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let logs = tempfile::tempdir().expect("failed to create log directory");
+    let record_log = logs.path().join("record.log");
+    let replay_log = logs.path().join("replay.log");
+
+    let mut record = Command::new("timeout");
+    record
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=info", "--backend=ptrace"])
+        .arg(format!("--log-file={}", record_log.display()))
+        .args(["record", "start", "--strict", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg("--")
+        .arg(program);
+    let recorded = command_output(record, "recording of the ignored-SIGCHLD workload");
+
+    let mut replay = Command::new("timeout");
+    replay
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg("--log=info")
+        .arg(format!("--log-file={}", replay_log.display()))
+        .args(["replay", "--autopilot"])
+        .arg(format!("--data-dir={}", data_dir.path().display()));
+    let replayed = command_output(replay, "replay of the ignored-SIGCHLD workload");
+
+    // Linux's output: the read returns the writer's byte after the reap, with
+    // no EINTR, and nothing is ever pending.
+    let expected = "read=1 byte=w errno=- reaped_before_return=1 sigchld_pending=0\n\
+                    waitpid=child status=3 sigchld_pending=0\n";
+    assert_eq!(String::from_utf8_lossy(&recorded.stdout), expected);
+    assert_eq!(String::from_utf8_lossy(&replayed.stdout), expected);
+
+    let recorded_boundaries = sigchld_boundary_records(&record_log);
+    let replayed_boundaries = sigchld_boundary_records(&replay_log);
+    for (label, records) in [
+        ("recording", &recorded_boundaries),
+        ("replay", &replayed_boundaries),
+    ] {
+        let inbound = records
+            .iter()
+            .filter(|record| record.contains("handling inbound signal"))
+            .count();
+        assert_eq!(
+            inbound, 2,
+            "the {label} must receive the kernel's SIGCHLD once per child: {records:#?}"
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.starts_with("Alarm fired")),
+            "the {label} sent a synthetic SIGCHLD for an ignored notification: {records:#?}"
+        );
+    }
+    assert_eq!(
+        recorded_boundaries, replayed_boundaries,
+        "the replay received SIGCHLD at a different scheduler boundary"
+    );
+}
+
 macro_rules! record_replay_tests {
     ($($test_name:ident => $workload_name:literal),+ $(,)?) => {
         $(

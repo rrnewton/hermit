@@ -885,6 +885,36 @@ pub struct Scheduler {
     /// Reporting-backend children whose final physical exit has been observed.
     completed_physical_process_exits: BTreeSet<DetPid>,
 
+    /// Child processes whose exit notification to the parent the scheduler
+    /// classified None or Discard (`ChildExitNotification`), on a backend that
+    /// reports child-exit publication: no synthetic SIGCHLD is sent, and no
+    /// guest turn runs until the backend reports that the kernel has published
+    /// the exit to the parent (`complete_child_exit_publication`). The
+    /// kernel's own notification is then generated at that fixed point in the
+    /// schedule, as KVM's controlled publication queues its SIGCHLD.
+    child_exit_publications_pending: BTreeSet<DetPid>,
+
+    /// Process leaders whose exit publication the backend reported before any
+    /// hold existed for them: a process killed before its Exit request was
+    /// granted is consumed, and reported, by the tracer while that request is
+    /// still queued. A later grant of the stale request finds the publication
+    /// already done and installs no hold (it could never be released). An
+    /// entry leaves when it is consumed by that grant or when the leader is
+    /// logically retired.
+    child_exit_publications_completed: BTreeSet<DetPid>,
+
+    /// The guest's own signal mask for each thread Detcore currently holds
+    /// under a private blocking mask (`block_signals_for_disposition`). The
+    /// child-exit classification reads it instead of the kernel's mask.
+    saved_guest_sigmasks: BTreeMap<DetTid, u64>,
+
+    /// Test-only stand-in for the /proc signal-mask fields, keyed by
+    /// (process, thread, field). Unit tests use small fake pids that can name
+    /// real host processes, so tests never read /proc: an absent entry reads
+    /// as unavailable, which classifies a notification Undecided.
+    #[cfg(test)]
+    test_signal_masks: BTreeMap<(DetPid, Option<DetTid>, &'static str), u64>,
+
     /// Ac table of "locks held": which action is using which resources.
     /// A given resource can be held by at most one action at a given time.
     #[allow(dead_code)]
@@ -1519,6 +1549,60 @@ enum SchedLoopPoint {
     AfterEmptyQueue,
 }
 
+/// What the scheduler does with a child process's exit notification to its
+/// parent, decided at the child's exit grant
+/// (`Scheduler::classify_child_exit_notification`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChildExitNotification {
+    /// Linux sends nothing: the parent explicitly ignores SIGCHLD, whether or
+    /// not it blocks it.
+    None,
+    /// Linux discards the signal at generation: SIGCHLD is default-ignored and
+    /// the receiving task does not block it.
+    Discard,
+    /// Linux delivers the signal: the parent catches it, or the receiving task
+    /// blocks it (a blocked signal stays pending).
+    Deliver,
+    /// Hermit cannot classify the notification; the synthetic SIGCHLD path
+    /// applies as before.
+    Undecided,
+}
+
+/// Linux's `do_notify_parent` order for an effective SIGCHLD: explicit SIG_IGN
+/// suppresses it regardless of blocking; a blocked signal stays pending; a
+/// caught one is delivered; a default-ignored, unblocked one is discarded.
+pub(crate) fn classify_sigchld_notification(
+    ignored: bool,
+    caught: bool,
+    blocked: bool,
+) -> ChildExitNotification {
+    if ignored {
+        ChildExitNotification::None
+    } else if blocked || caught {
+        ChildExitNotification::Deliver
+    } else {
+        ChildExitNotification::Discard
+    }
+}
+
+/// A hex signal mask field (`SigIgn`, `SigCgt`, `SigBlk`) of
+/// `/proc/<pid>/status`, or of `/proc/<pid>/task/<tid>/status` for a thread.
+#[cfg_attr(test, allow(dead_code))]
+fn proc_status_signal_mask(pid: DetPid, tid: Option<DetTid>, field: &str) -> Option<u64> {
+    let path = match tid {
+        Some(tid) => format!("/proc/{}/task/{}/status", pid.as_raw(), tid.as_raw()),
+        None => format!("/proc/{}/status", pid.as_raw()),
+    };
+    parse_proc_status_signal_mask(&std::fs::read_to_string(path).ok()?, field)
+}
+
+fn parse_proc_status_signal_mask(status: &str, field: &str) -> Option<u64> {
+    status.lines().find_map(|line| {
+        let value = line.strip_prefix(field)?.strip_prefix(':')?;
+        u64::from_str_radix(value.trim(), 16).ok()
+    })
+}
+
 /// Not an error, but simply a turn that cannot do productive work.
 #[derive(Debug, Clone)]
 pub struct SkipTurn;
@@ -2038,6 +2122,11 @@ impl Scheduler {
             pending_physical_process_exits: Default::default(),
             logically_exited_processes: Default::default(),
             completed_physical_process_exits: Default::default(),
+            child_exit_publications_pending: Default::default(),
+            child_exit_publications_completed: Default::default(),
+            saved_guest_sigmasks: Default::default(),
+            #[cfg(test)]
+            test_signal_masks: Default::default(),
             resources: Default::default(),
             started_up: Default::default(),
             thread_tree: Default::default(),
@@ -2545,6 +2634,10 @@ impl Scheduler {
         self.remove_blocking_entries(dtid);
         self.remove_physical_thread(dtid, mm);
         self.vfork_registration_origins.remove(dtid);
+        self.saved_guest_sigmasks.remove(dtid);
+        if dtid.as_raw() == detpid.as_raw() {
+            self.child_exit_publications_completed.remove(detpid);
+        }
         self.real_timers.retire_task(*detpid, *dtid);
         self.retire_parked_requests(*dtid);
 
@@ -2930,6 +3023,125 @@ impl Scheduler {
 
     /// Release the exact process barrier when the ptrace supervisor receives its final `Exited`
     /// or `Signaled` wait status. At that lifecycle point the process is physically waitable.
+    /// The backend reports that the kernel has published `detpid`'s exit to
+    /// its parent (`BackendCapabilities::reports_child_exit_publication`).
+    /// Releases the hold the exit grant placed for a None or Discard
+    /// notification; any other process is ignored. Returns whether a hold was
+    /// released.
+    pub(crate) fn complete_child_exit_publication(&mut self, detpid: DetPid) -> bool {
+        let released = self.child_exit_publications_pending.remove(&detpid);
+        if !released {
+            // No hold yet: the process was consumed before its Exit request
+            // was granted (or has none). Remember it, so a stale grant does
+            // not install a hold this report can no longer release.
+            self.child_exit_publications_completed.insert(detpid);
+        }
+        released
+    }
+
+    /// Record (`Some`) or clear (`None`) the guest's own signal mask while
+    /// Detcore holds `dettid` under a private blocking mask. Returns false for
+    /// a thread the scheduler no longer knows.
+    pub(crate) fn set_saved_guest_sigmask(&mut self, dettid: DetTid, mask: Option<u64>) -> bool {
+        if !self.next_turns.contains_key(&dettid) {
+            return false;
+        }
+        match mask {
+            Some(mask) => self.saved_guest_sigmasks.insert(dettid, mask),
+            None => self.saved_guest_sigmasks.remove(&dettid),
+        };
+        true
+    }
+
+    /// Classify `child`'s exit notification to `parent` at its exit grant, by
+    /// Linux's `do_notify_parent` rules (design: dev-hermit
+    /// ignored/parity-green-sigchld/design-r7.md, design-r8.md).
+    ///
+    /// Only an effective SIGCHLD is classified: the child's clone exit signal
+    /// must be SIGCHLD (a child created with another signal that later execs is
+    /// left Undecided, conservatively). The receiving task is the creating
+    /// thread Linux notifies (`wait_owner`); it must still belong to `parent`
+    /// and be parked at the scheduler on an internal polling probe or a child
+    /// wait, outside rt_sigsuspend and the temporary-mask syscalls (ppoll,
+    /// pselect6, epoll_pwait), so its mask is stable and the guest's own. The parent's SIGCHLD disposition comes from
+    /// /proc (ptrace guests are host processes whose dispositions Detcore
+    /// passes through unchanged); the mask from the saved guest mask when
+    /// Detcore holds a private one, else /proc. Anything unreadable is
+    /// Undecided.
+    pub(crate) fn classify_child_exit_notification(
+        &self,
+        child: DetPid,
+        parent: DetPid,
+    ) -> ChildExitNotification {
+        let Some(wait) = self.thread_tree.process_wait.get(&child) else {
+            return ChildExitNotification::Undecided;
+        };
+        if wait.exit_signal != libc::SIGCHLD {
+            return ChildExitNotification::Undecided;
+        }
+        let receiving = wait.wait_owner;
+        if self.thread_tree.thread_to_leader.get(&receiving) != Some(&parent) {
+            return ChildExitNotification::Undecided;
+        }
+        // Only the states the design covers (design-r8.md section 2): an
+        // internal polling probe or a child wait, outside the temporary-mask
+        // syscalls. Every other request (rt_sigsuspend, a signal in flight,
+        // futexes, sleeps, external operations) and an unparked task stay
+        // Undecided, with the synthetic SIGCHLD path as before.
+        let covered = !self.blocked.rt_sigsuspend_blockers.contains_key(&receiving)
+            && self
+                .next_turns
+                .get(&receiving)
+                .and_then(|turn| turn.req.try_read())
+                .and_then(Result::ok)
+                .is_some_and(|request| {
+                    !request.resources.is_empty()
+                        && request.resources.keys().all(|resource| {
+                            matches!(
+                                resource,
+                                ResourceID::InternalIOPolling | ResourceID::WaitChild { .. }
+                            )
+                        })
+                        && !matches!(request.fyi.as_str(), "ppoll" | "pselect6" | "epoll_pwait")
+                });
+        if !covered {
+            return ChildExitNotification::Undecided;
+        }
+        let Some(ignored) = self.signal_mask_field(parent, None, "SigIgn") else {
+            return ChildExitNotification::Undecided;
+        };
+        let Some(caught) = self.signal_mask_field(parent, None, "SigCgt") else {
+            return ChildExitNotification::Undecided;
+        };
+        let blocked = match self.saved_guest_sigmasks.get(&receiving) {
+            Some(mask) => *mask,
+            None => match self.signal_mask_field(parent, Some(receiving), "SigBlk") {
+                Some(mask) => mask,
+                None => return ChildExitNotification::Undecided,
+            },
+        };
+        let bit = 1_u64 << (libc::SIGCHLD - 1);
+        classify_sigchld_notification(ignored & bit != 0, caught & bit != 0, blocked & bit != 0)
+    }
+
+    /// A /proc signal-mask field of a guest process or thread (the test-only
+    /// table under `cfg(test)`).
+    fn signal_mask_field(
+        &self,
+        pid: DetPid,
+        tid: Option<DetTid>,
+        field: &'static str,
+    ) -> Option<u64> {
+        #[cfg(test)]
+        {
+            self.test_signal_masks.get(&(pid, tid, field)).copied()
+        }
+        #[cfg(not(test))]
+        {
+            proc_status_signal_mask(pid, tid, field)
+        }
+    }
+
     pub(crate) fn complete_physical_process_exit(&mut self, detpid: DetPid) -> bool {
         let removed = self.pending_physical_process_exits.remove(&detpid);
         if removed {
@@ -3025,6 +3237,9 @@ impl Scheduler {
 
     /// Release every physical-exit barrier after the backend supervisor has drained all tracees.
     pub(crate) fn release_all_physical_process_exits(&mut self) -> usize {
+        // Nothing can report a publication once every tracee is drained.
+        self.child_exit_publications_pending.clear();
+        self.child_exit_publications_completed.clear();
         let children = std::mem::take(&mut self.pending_physical_process_exits);
         let released = children.len();
         for child in children {
@@ -3280,6 +3495,14 @@ impl Scheduler {
             // process may still hold descriptors a peer would observe. Select
             // no turn until the backend reports it gone; the completion's host
             // timing decides only how long this lasts, never which turn is next.
+            std::thread::yield_now();
+            return Err(SkipTurn);
+        }
+        if !self.child_exit_publications_pending.is_empty() {
+            // A child's exit grant left its notification to the kernel (None
+            // or Discard). Select no turn until the backend reports the kernel
+            // has published the exit to the parent; the report's host timing
+            // decides only how long this lasts, never which turn is next.
             std::thread::yield_now();
             return Err(SkipTurn);
         }
@@ -5454,33 +5677,76 @@ impl Scheduler {
                     && let Some(parent) = self.thread_tree.parent_process(process)
                     && self.should_synthesize_child_exit_signal(parent)
                 {
-                    // Fire strictly after the current committed time so the event
-                    // is dispatched on a subsequent scheduler pass.
-                    //
-                    // Linux sends the child's exit signal to its parent thread,
-                    // the one that created it, and prefers that thread when it
-                    // picks which thread of the process takes the signal
-                    // (`do_notify_parent` -> `complete_signal`). Where gated
-                    // waits model interruption, the timer carries that thread
-                    // (https://github.com/rrnewton/hermit/issues/3146), so a
-                    // creator that does not block `SIGCHLD` takes it and the
-                    // leader's wait is left alone. Elsewhere it keeps naming
-                    // the leader (DetTid == DetPid for a group leader).
-                    let deadline = self.committed_time + LogicalTime::from_nanos(1);
-                    let parent_thread = if self.models_signal_targets {
-                        self.thread_tree
-                            .process_wait
-                            .get(process)
-                            .map_or(parent, |metadata| metadata.wait_owner)
-                    } else {
-                        parent
-                    };
-                    self.blocked.timed_waiters.insert_child_exit(
-                        deadline,
-                        *process,
-                        parent,
-                        parent_thread,
-                    );
+                    // The hold waits for the backend's report that `process`
+                    // is consumed, so it is sound only if this grant ends that
+                    // process: the exiting thread must belong to it in the
+                    // thread tree. A backend can name another process here: a
+                    // raw clone child with a non-SIGCHLD exit signal is its own
+                    // process in the tree, but ptrace reports it with its
+                    // creator's pid, so its exit_group names the creator, which
+                    // keeps running and is never reported. Such a grant keeps
+                    // the synthetic timer it had before Phase A.
+                    let ends_named_process =
+                        if self.thread_tree.thread_group_leaders.contains(&dettid) {
+                            dettid == *process
+                        } else {
+                            self.registered_process(dettid) == Some(*process)
+                        };
+                    let notification =
+                        if self.backend.reports_child_exit_publication && ends_named_process {
+                            self.classify_child_exit_notification(*process, parent)
+                        } else {
+                            ChildExitNotification::Undecided
+                        };
+                    match notification {
+                        // Linux generates nothing (explicit SIG_IGN) or discards
+                        // the signal at generation (default-ignored, unblocked),
+                        // so the guest observes no SIGCHLD from Linux. Send no
+                        // synthetic one: no alarm, no physical send, no wake of
+                        // the parent. The traced parent still receives the
+                        // kernel's own notification, which this hold places at
+                        // the first scheduling pass after the backend reports its
+                        // publication.
+                        ChildExitNotification::None | ChildExitNotification::Discard => {
+                            // A publication already reported (the process was
+                            // consumed before this grant) needs no hold: the
+                            // kernel has already notified the parent.
+                            if !self.child_exit_publications_completed.remove(process) {
+                                self.child_exit_publications_pending.insert(*process);
+                            }
+                        }
+                        // Caught, blocked, other exit signals and every state
+                        // Hermit cannot classify keep the synthetic SIGCHLD.
+                        ChildExitNotification::Deliver | ChildExitNotification::Undecided => {
+                            // Fire strictly after the current committed time so the event
+                            // is dispatched on a subsequent scheduler pass.
+                            //
+                            // Linux sends the child's exit signal to its parent thread,
+                            // the one that created it, and prefers that thread when it
+                            // picks which thread of the process takes the signal
+                            // (`do_notify_parent` -> `complete_signal`). Where gated
+                            // waits model interruption, the timer carries that thread
+                            // (https://github.com/rrnewton/hermit/issues/3146), so a
+                            // creator that does not block `SIGCHLD` takes it and the
+                            // leader's wait is left alone. Elsewhere it keeps naming
+                            // the leader (DetTid == DetPid for a group leader).
+                            let deadline = self.committed_time + LogicalTime::from_nanos(1);
+                            let parent_thread = if self.models_signal_targets {
+                                self.thread_tree
+                                    .process_wait
+                                    .get(process)
+                                    .map_or(parent, |metadata| metadata.wait_owner)
+                            } else {
+                                parent
+                            };
+                            self.blocked.timed_waiters.insert_child_exit(
+                                deadline,
+                                *process,
+                                parent,
+                                parent_thread,
+                            );
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -11104,7 +11370,7 @@ mod test {
                 ChildWaitSpec {
                     selector: ChildWaitSelector::ProcessGroup(DetPid::from_raw(78)),
                     owner: Some(owner_a),
-                    exit_class: ChildWaitExitClass::Sigchld,
+                    exit_class: crate::types::ChildWaitExitClass::Sigchld,
                 },
             ),
             None,
@@ -11116,7 +11382,7 @@ mod test {
                 ChildWaitSpec {
                     selector: ChildWaitSelector::Exact(normal),
                     owner: Some(owner_b),
-                    exit_class: ChildWaitExitClass::Sigchld,
+                    exit_class: crate::types::ChildWaitExitClass::Sigchld,
                 },
             ),
             None,
@@ -11128,7 +11394,7 @@ mod test {
                 ChildWaitSpec {
                     selector: ChildWaitSelector::Exact(clone_child),
                     owner: Some(owner_b),
-                    exit_class: ChildWaitExitClass::Sigchld,
+                    exit_class: crate::types::ChildWaitExitClass::Sigchld,
                 },
             ),
             None,
@@ -11151,7 +11417,7 @@ mod test {
                 ChildWaitSpec {
                     selector: ChildWaitSelector::Any,
                     owner: Some(owner_a),
-                    exit_class: ChildWaitExitClass::Sigchld,
+                    exit_class: crate::types::ChildWaitExitClass::Sigchld,
                 },
             ),
             Some(normal)
@@ -11704,6 +11970,374 @@ mod test {
         );
         assert!(scheduler.complete_physical_process_exit(child));
         assert!(scheduler.pending_physical_process_exits.is_empty());
+    }
+
+    /// Linux's `do_notify_parent` order: explicit SIG_IGN wins over blocking,
+    /// blocking over default-ignore, and only a default-ignored, unblocked
+    /// SIGCHLD is discarded.
+    #[test]
+    fn sigchld_notification_classification_follows_do_notify_parent() {
+        use ChildExitNotification::*;
+        for (ignored, caught, blocked, expected) in [
+            (true, false, false, None),
+            (true, false, true, None),
+            (false, false, false, Discard),
+            (false, false, true, Deliver),
+            (false, true, false, Deliver),
+            (false, true, true, Deliver),
+        ] {
+            assert_eq!(
+                classify_sigchld_notification(ignored, caught, blocked),
+                expected,
+                "ignored {ignored}, caught {caught}, blocked {blocked}"
+            );
+        }
+    }
+
+    #[test]
+    fn proc_status_signal_masks_parse_as_hex() {
+        let status = "Name:\tcat\nSigBlk:\t0000000000010000\nSigIgn:\t0000000000001000\nSigCgt:\tfffffffe7ffbfeff\n";
+        assert_eq!(
+            parse_proc_status_signal_mask(status, "SigBlk"),
+            Some(0x1_0000)
+        );
+        assert_eq!(
+            parse_proc_status_signal_mask(status, "SigIgn"),
+            Some(0x1000)
+        );
+        assert_eq!(
+            parse_proc_status_signal_mask(status, "SigCgt"),
+            Some(0xffff_fffe_7ffb_feff)
+        );
+        assert_eq!(
+            parse_proc_status_signal_mask(status, "SigPnd"),
+            Option::None
+        );
+    }
+
+    const SIGCHLD_BIT: u64 = 1 << (libc::SIGCHLD - 1);
+
+    /// A parent process 100 and its child 200 (exit signal `exit_signal`),
+    /// the parent parked on a request labelled `fyi`, with /proc reporting
+    /// `ignored`, `caught` and `blocked` as SIGCHLD's state for the parent.
+    fn child_exit_fixture(
+        reports_publication: bool,
+        exit_signal: libc::c_int,
+        fyi: Option<&str>,
+        masks: Option<(bool, bool, bool)>,
+    ) -> (Scheduler, DetPid, DetPid) {
+        let config = Config::default().with_backend(|backend| {
+            backend.reports_child_exit_publication = reports_publication;
+        });
+        let mut scheduler = Scheduler::new(&config);
+        let parent = DetPid::from_raw(100);
+        let child = DetPid::from_raw(200);
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler
+            .thread_tree
+            .add_child_with_wait_metadata(parent, child, true, false, exit_signal);
+        let req = match fyi {
+            Some(label) => {
+                let mut request = Resources::new(parent);
+                request.insert(ResourceID::InternalIOPolling, Permission::W);
+                request.fyi(label);
+                Ivar::full(Ok(request))
+            }
+            Option::None => Ivar::new(),
+        };
+        for tid in [parent, child] {
+            scheduler.next_turns.insert(
+                tid,
+                ThreadNextTurn {
+                    dettid: tid,
+                    child_tid_addr: 0,
+                    req: if tid == parent {
+                        req.clone()
+                    } else {
+                        Ivar::new()
+                    },
+                    resp: Ivar::new(),
+                    protocol: Default::default(),
+                },
+            );
+            scheduler.priorities.insert(tid, DEFAULT_PRIORITY);
+        }
+        if let Some((ignored, caught, blocked)) = masks {
+            let bit = |set: bool| if set { SIGCHLD_BIT } else { 0 };
+            scheduler
+                .test_signal_masks
+                .insert((parent, Option::None, "SigIgn"), bit(ignored));
+            scheduler
+                .test_signal_masks
+                .insert((parent, Option::None, "SigCgt"), bit(caught));
+            scheduler
+                .test_signal_masks
+                .insert((parent, Some(parent), "SigBlk"), bit(blocked));
+        }
+        (scheduler, parent, child)
+    }
+
+    #[test]
+    fn child_exit_notification_is_classified_only_when_every_input_is_known() {
+        use ChildExitNotification::*;
+        let classify = |exit_signal, fyi, masks| {
+            let (scheduler, parent, child) = child_exit_fixture(true, exit_signal, fyi, masks);
+            scheduler.classify_child_exit_notification(child, parent)
+        };
+        let read = Some("read");
+        assert_eq!(
+            classify(libc::SIGCHLD, read, Some((true, false, true))),
+            None
+        );
+        assert_eq!(
+            classify(libc::SIGCHLD, read, Some((false, false, false))),
+            Discard
+        );
+        assert_eq!(
+            classify(libc::SIGCHLD, read, Some((false, true, false))),
+            Deliver
+        );
+        assert_eq!(
+            classify(libc::SIGCHLD, read, Some((false, false, true))),
+            Deliver
+        );
+        // Not an effective SIGCHLD, the receiving task not parked, a
+        // temporary-mask syscall, or /proc unreadable: Undecided.
+        assert_eq!(
+            classify(libc::SIGUSR1, read, Some((false, false, false))),
+            Undecided
+        );
+        assert_eq!(classify(0, read, Some((false, false, false))), Undecided);
+        assert_eq!(
+            classify(libc::SIGCHLD, Option::None, Some((false, false, false))),
+            Undecided
+        );
+        for label in ["ppoll", "pselect6", "epoll_pwait"] {
+            assert_eq!(
+                classify(libc::SIGCHLD, Some(label), Some((false, false, false))),
+                Undecided,
+                "{label}"
+            );
+        }
+        assert_eq!(classify(libc::SIGCHLD, read, Option::None), Undecided);
+    }
+
+    /// A managed wait installs Detcore's private blocking mask, which /proc
+    /// then reports; the saved guest mask decides instead.
+    #[test]
+    fn child_exit_notification_reads_the_saved_guest_mask() {
+        let (mut scheduler, parent, child) = child_exit_fixture(
+            true,
+            libc::SIGCHLD,
+            Some("wait-child-lifecycle"),
+            Some((false, false, true)),
+        );
+        assert_eq!(
+            scheduler.classify_child_exit_notification(child, parent),
+            ChildExitNotification::Deliver
+        );
+        assert!(scheduler.set_saved_guest_sigmask(parent, Some(0)));
+        assert_eq!(
+            scheduler.classify_child_exit_notification(child, parent),
+            ChildExitNotification::Discard
+        );
+        assert!(scheduler.set_saved_guest_sigmask(parent, Some(SIGCHLD_BIT)));
+        assert_eq!(
+            scheduler.classify_child_exit_notification(child, parent),
+            ChildExitNotification::Deliver
+        );
+        assert!(scheduler.set_saved_guest_sigmask(parent, Option::None));
+        assert!(!scheduler.set_saved_guest_sigmask(DetPid::from_raw(999), Some(0)));
+    }
+
+    fn child_exit_timer_armed(scheduler: &Scheduler, child: DetPid) -> bool {
+        scheduler.blocked.timed_waiters.iter().any(|(_, event)| {
+            matches!(
+                event,
+                TimedEvent::SignalEvt(timed_waiters::SignalTimerId::ChildExit { child: exited, .. }, ..)
+                    if exited == child
+            )
+        })
+    }
+
+    fn grant_group_exit(scheduler: &mut Scheduler, child: DetPid) {
+        grant_group_exit_from(scheduler, child, child);
+    }
+
+    /// Grants `thread` an exit_group request that names `child` as its process.
+    fn grant_group_exit_from(scheduler: &mut Scheduler, thread: DetTid, child: DetPid) {
+        assert!(
+            scheduler
+                .block_for_one_resource(
+                    thread,
+                    &ResourceID::Exit {
+                        group: true,
+                        process: child,
+                        mm: MmId::initial(child),
+                    },
+                    &Permission::RW,
+                    Option::None,
+                    Option::None,
+                    &Ivar::new(),
+                )
+                .is_ok()
+        );
+    }
+
+    /// For an ignored notification the exit grant arms no synthetic SIGCHLD
+    /// and holds every turn until the backend reports the kernel published
+    /// the exit; caught, blocked and unclassifiable notifications keep the
+    /// timer, as does a backend that makes no publication report.
+    #[test]
+    fn ignored_child_exit_holds_turns_instead_of_arming_the_timer() {
+        for masks in [(true, false, false), (false, false, false)] {
+            let (mut scheduler, _parent, child) =
+                child_exit_fixture(true, libc::SIGCHLD, Some("read"), Some(masks));
+            grant_group_exit(&mut scheduler, child);
+            assert!(!child_exit_timer_armed(&scheduler, child), "{masks:?}");
+            assert!(scheduler.step2_drain_prefix().is_err(), "{masks:?}");
+            assert!(!scheduler.complete_child_exit_publication(DetPid::from_raw(999)));
+            assert!(scheduler.step2_drain_prefix().is_err(), "{masks:?}");
+            assert!(scheduler.complete_child_exit_publication(child));
+            assert!(scheduler.step2_drain_prefix().is_ok(), "{masks:?}");
+        }
+        for (reports, masks) in [
+            (true, Some((false, true, false))),
+            (true, Some((false, false, true))),
+            (true, Option::None),
+            (false, Some((false, false, false))),
+        ] {
+            let (mut scheduler, _parent, child) =
+                child_exit_fixture(reports, libc::SIGCHLD, Some("read"), masks);
+            grant_group_exit(&mut scheduler, child);
+            assert!(
+                child_exit_timer_armed(&scheduler, child),
+                "{reports} {masks:?}"
+            );
+            assert!(scheduler.child_exit_publications_pending.is_empty());
+        }
+    }
+
+    /// An exit_group from a thread that, in the thread tree, leads its own
+    /// process but names another process (ptrace names a raw clone child with a
+    /// non-SIGCHLD exit signal by its creator's pid) does not end the named
+    /// process, which is never reported consumed. It must keep the synthetic
+    /// timer and install no hold, which would stop every turn for good.
+    #[test]
+    fn an_exit_that_names_another_process_installs_no_hold() {
+        let (mut scheduler, _parent, child) = child_exit_fixture(
+            true,
+            libc::SIGCHLD,
+            Some("read"),
+            Some((false, false, false)),
+        );
+        let clone_child = DetPid::from_raw(300);
+        scheduler.thread_tree.add_child_with_wait_metadata(
+            child,
+            clone_child,
+            true,
+            false,
+            libc::SIGUSR1,
+        );
+        scheduler.next_turns.insert(
+            clone_child,
+            ThreadNextTurn {
+                dettid: clone_child,
+                child_tid_addr: 0,
+                req: Ivar::new(),
+                resp: Ivar::new(),
+                protocol: Default::default(),
+            },
+        );
+        scheduler.priorities.insert(clone_child, DEFAULT_PRIORITY);
+        grant_group_exit_from(&mut scheduler, clone_child, child);
+        assert!(scheduler.child_exit_publications_pending.is_empty());
+        assert!(child_exit_timer_armed(&scheduler, child));
+        assert!(scheduler.step2_drain_prefix().is_ok());
+    }
+
+    /// A process consumed before its Exit request is granted (killed while
+    /// the request is queued) is reported first. The stale grant must install
+    /// no hold, since no report is left to release it; a retired leader's
+    /// early report is forgotten.
+    #[test]
+    fn a_publication_reported_before_the_grant_installs_no_hold() {
+        let (mut scheduler, _parent, child) = child_exit_fixture(
+            true,
+            libc::SIGCHLD,
+            Some("read"),
+            Some((false, false, false)),
+        );
+        assert!(!scheduler.complete_child_exit_publication(child));
+        grant_group_exit(&mut scheduler, child);
+        assert!(!child_exit_timer_armed(&scheduler, child));
+        assert!(scheduler.child_exit_publications_pending.is_empty());
+        assert!(scheduler.child_exit_publications_completed.is_empty());
+        assert!(scheduler.step2_drain_prefix().is_ok());
+
+        let (mut scheduler, _parent, child) = child_exit_fixture(
+            true,
+            libc::SIGCHLD,
+            Some("read"),
+            Some((false, false, false)),
+        );
+        assert!(!scheduler.complete_child_exit_publication(child));
+        scheduler.logically_kill_thread(&child, &child, MmId::initial(child));
+        assert!(scheduler.child_exit_publications_completed.is_empty());
+    }
+
+    /// Only an internal polling probe or a child wait is classified; a parent
+    /// in rt_sigsuspend, with a signal in flight, or in any other wait is
+    /// Undecided and keeps the synthetic SIGCHLD.
+    #[test]
+    fn child_exit_notification_is_classified_only_in_covered_parent_states() {
+        let classify_with = |resource: ResourceID, fyi: &str, sigsuspend: bool| {
+            let (mut scheduler, parent, child) = child_exit_fixture(
+                true,
+                libc::SIGCHLD,
+                Some("read"),
+                Some((false, false, false)),
+            );
+            let mut request = Resources::new(parent);
+            request.insert(resource, Permission::W);
+            request.fyi(fyi);
+            scheduler.next_turns.get_mut(&parent).unwrap().req = Ivar::full(Ok(request));
+            if sigsuspend {
+                scheduler
+                    .blocked
+                    .rt_sigsuspend_blockers
+                    .insert(parent, crate::resources::ExternalOpId::new(parent, 1));
+            }
+            scheduler.classify_child_exit_notification(child, parent)
+        };
+        let wait = ResourceID::WaitChild {
+            parent: DetPid::from_raw(100),
+            spec: crate::types::ChildWaitSpec {
+                selector: crate::types::ChildWaitSelector::Exact(DetPid::from_raw(200)),
+                owner: Option::None,
+                exit_class: crate::types::ChildWaitExitClass::Sigchld,
+            },
+        };
+        assert_eq!(
+            classify_with(wait, "wait-child-lifecycle", false),
+            ChildExitNotification::Discard
+        );
+        assert_eq!(
+            classify_with(ResourceID::InternalIOPolling, "read", true),
+            ChildExitNotification::Undecided
+        );
+        assert_eq!(
+            classify_with(
+                ResourceID::InboundSignal(SigWrapper::from(Signal::SIGCHLD)),
+                "",
+                false
+            ),
+            ChildExitNotification::Undecided
+        );
+        assert_eq!(
+            classify_with(ResourceID::FutexWait, "futex_wait", false),
+            ChildExitNotification::Undecided
+        );
     }
 
     #[test]

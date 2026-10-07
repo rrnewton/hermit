@@ -1098,7 +1098,14 @@ where
         .with_oldset(Some(old_mask_addr.cast()))
         .with_sigsetsize(KERNEL_SIGSET_SIZE);
     guest.inject_with_retry(block_signals).await?;
-    Ok(guest.memory().read_value(old_mask_addr)?)
+    let guest_mask: KernelSigset = guest.memory().read_value(old_mask_addr)?;
+    if guest.config().backend.reports_child_exit_publication {
+        // While the private mask is installed, the kernel reports Detcore's
+        // mask for this thread; the scheduler's child-exit classification must
+        // read the guest's own.
+        crate::tool_global::set_saved_guest_sigmask(guest, Some(guest_mask)).await;
+    }
+    Ok(guest_mask)
 }
 
 pub(super) async fn restore_signals_after_disposition<G, T>(
@@ -1121,6 +1128,9 @@ where
             .with_oldset(None)
             .with_sigsetsize(KERNEL_SIGSET_SIZE);
         guest.inject_with_retry(restore_signals).await?;
+    }
+    if guest.config().backend.reports_child_exit_publication {
+        crate::tool_global::set_saved_guest_sigmask(guest, None).await;
     }
     Ok(())
 }

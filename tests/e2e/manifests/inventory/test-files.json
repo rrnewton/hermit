@@ -1399,6 +1399,12 @@
       "why": "tests/c/record_replay_setsockopt.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_sigchld_ignored_boundary.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_sigchld_ignored_boundary.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration suite compiles this workload and checks that a replay receives the kernel's SIGCHLD for a child exit its parent ignores (SIG_DFL, unblocked) at the same scheduler boundary as the recording, with no synthetic SIGCHLD send."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/recvmsg_scm_rights_mmap.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
