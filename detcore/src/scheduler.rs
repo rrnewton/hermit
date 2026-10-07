@@ -275,6 +275,19 @@ fn kernel_signal_bit(raw_signal: i32) -> u64 {
     }
 }
 
+/// How a signal the scheduler sends reaches the host thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostSignalSend {
+    /// `kill(2)` naming the thread, unless the backend registered a pidfd for
+    /// it (`Scheduler::signal_guest`). `kill(2)` is process-directed: the
+    /// kernel may give the signal to any thread of the group that does not
+    /// block it.
+    ProcessDirected,
+    /// `tgkill(2)` naming the thread and its thread group, or the registered
+    /// pidfd: only that thread can take the signal.
+    ThreadDirected,
+}
+
 /// Every signal Linux sends because of a terminal, as a kernel sigset. Once a
 /// guest process may have the terminal as its controlling terminal, or be in
 /// the terminal's foreground process group, each can arrive at a moment set
@@ -847,6 +860,11 @@ pub struct Scheduler {
     signaled_background_refusal: Option<SignaledBackgroundRefusal>,
     #[cfg(test)]
     host_signal_attempts: u64,
+    /// When set, a signal the scheduler would send to a guest thread is
+    /// recorded here instead and counts as sent (`send_signal_to_guest`), so a
+    /// unit test can follow a send without signalling a real host thread.
+    #[cfg(test)]
+    test_host_signal_sends: Option<Vec<(DetTid, Signal, HostSignalSend)>>,
     /// Turns that `do_a_turn_blocking` ran through the controlled loop.
     #[cfg(test)]
     controlled_turn_entries: u64,
@@ -2110,6 +2128,8 @@ impl Scheduler {
             signaled_background_refusal: None,
             #[cfg(test)]
             host_signal_attempts: 0,
+            #[cfg(test)]
+            test_host_signal_sends: None,
             #[cfg(test)]
             controlled_turn_entries: 0,
             real_timers: Default::default(),
@@ -3786,6 +3806,116 @@ impl Scheduler {
         self.signal_guest(target, sig);
     }
 
+    /// `fire_alarm` for the signal of an expired `alarm`, `setitimer` or POSIX
+    /// timer of `dpid`, where the scheduler models signal targets
+    /// (`models_signal_targets`); `dtid` is the thread the timer names.
+    ///
+    /// `fire_alarm` sends with `kill(2)`, which queues the signal on the
+    /// process. The kernel gives it to the named thread only if that thread
+    /// can take it now, otherwise to another thread that can, and otherwise
+    /// leaves it queued. A thread held in a ptrace stop never qualifies, so
+    /// under the ptrace backend the kernel gives the signal to a thread
+    /// sleeping in `rt_sigsuspend` or another blocking call, and that thread
+    /// was never armed to be woken: the run then stops as a deadlock
+    /// (https://github.com/rrnewton/hermit/pull/3224). Here the scheduler
+    /// chooses the thread itself (`timer_signal_recipient`) and sends to that
+    /// thread alone (`HostSignalSend::ThreadDirected`), so the kernel cannot
+    /// give the signal to another; `send_signal_to_guest` then wakes or arms
+    /// the chosen thread as it would for `fire_alarm`.
+    ///
+    /// When no thread is known to admit the signal, it is sent with `kill(2)`
+    /// exactly as `fire_alarm` sends it, and it stays pending on the process
+    /// in the kernel's shared queue until a thread unblocks it in that
+    /// thread's own turn. That happens when every live thread's mask blocks
+    /// the signal, or when the only threads that admit it are vfork parents,
+    /// threads an earlier signal already released from their wait, or
+    /// threads whose mask is unknown (`timer_signal_recipient`).
+    ///
+    /// Known differences from Linux:
+    /// * The guest sees `si_code` `SI_TKILL` for a signal sent to one thread.
+    ///   This is a PRE-EXISTING GAP rather than a new one: `fire_alarm` gives
+    ///   `SI_USER`, and Linux gives `SI_KERNEL` for `ITIMER_REAL`, which no
+    ///   process can send to another, and `SI_TIMER` for a POSIX timer.
+    /// * A `SIGEV_THREAD_ID` timer is still treated as directed at the
+    ///   process (`timer_create` in `syscalls/time.rs`).
+    fn fire_timer_signal(&mut self, dpid: DetPid, dtid: DetTid, sig: Signal) {
+        #[cfg(test)]
+        {
+            self.host_signal_attempts += 1;
+        }
+        let Some(preferred) = self.select_signal_target(dpid, Some(dtid)) else {
+            info!(
+                "[dpid {}] Alarm expired after its target exited; ignoring.",
+                dpid
+            );
+            return;
+        };
+        match self.timer_signal_recipient(dpid, preferred, sig) {
+            Some(recipient) => {
+                info!(
+                    "[dtid {}] Alarm fired, delivering signal {} to guest thread {} alone: its mask admits the signal.",
+                    preferred, sig, recipient
+                );
+                self.signal_guest_thread_directed(recipient, sig);
+            }
+            None => {
+                info!(
+                    "[dtid {}] Alarm fired, delivering signal {} to guest process: no thread is known to admit it, so it stays pending on the process.",
+                    preferred, sig
+                );
+                self.signal_guest(preferred, sig);
+            }
+        }
+    }
+
+    /// The thread of `process` that a timer's signal is sent to
+    /// (`fire_timer_signal`): `preferred` if it admits the signal, otherwise
+    /// the first thread in thread-ID order that does. `None` when no thread is
+    /// known to admit it.
+    ///
+    /// The masks are those `kernel_sigchld_target` uses, read at the same
+    /// kind of point (a step2b timed pop or the step2d empty-queue time skip,
+    /// where no guest thread holds the turn), so the choice is a function of
+    /// the schedule. POSIX lets any thread that does not block a
+    /// process-directed signal take it; preferring `preferred` follows Linux,
+    /// which tries the thread the timer names first, and thread-ID order
+    /// stands in for the kernel's round-robin `curr_target`.
+    ///
+    /// Three kinds of thread are never chosen:
+    /// * A vfork parent: it sleeps killable until the child execs or exits,
+    ///   so a non-fatal signal sent to it alone would wait for that.
+    /// * A thread that an earlier signal already released from its wait
+    ///   (`BlockedPool::signaled_background`). The kernel has woken it, and
+    ///   from a host-timed moment on it runs under the mask the kernel
+    ///   restores when the call returns, not the one recorded when the call
+    ///   was committed. Another thread that admits the signal can take it, as
+    ///   Linux allows.
+    /// * A thread whose mask is unknown. Its mask cannot be read only once it
+    ///   no longer exists, which for a thread the guest did not kill means it
+    ///   was killed from outside the container (`kernel_sigchld_target`); the
+    ///   kernel skips an exiting thread too (`wants_signal` and
+    ///   `PF_EXITING`). If no other thread admits the signal, it is sent to
+    ///   the process, where such a thread is in the same position as for any
+    ///   signal sent from outside.
+    fn timer_signal_recipient(
+        &self,
+        process: DetPid,
+        preferred: DetTid,
+        signal: Signal,
+    ) -> Option<DetTid> {
+        let bit = kernel_signal_bit(signal as i32);
+        let mut threads = self.process_signal_targets(process);
+        // Stable, so the rest stay in thread-ID order.
+        threads.sort_by_key(|thread| *thread != preferred);
+        threads.into_iter().find(|thread| {
+            !self.vfork_barriers.contains_key(thread)
+                && !self.blocked.signaled_background.contains(thread)
+                && self
+                    .thread_signal_mask(*thread)
+                    .is_some_and(|mask| mask & bit == 0)
+        })
+    }
+
     // Follow Linux semantics for delivering a signal to a thread within a process group.
     // Optionally take a hint on which tid detcore would *like* to deliver to, if it is available.
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -3994,10 +4124,32 @@ impl Scheduler {
     /// external syscalls remain blocked until the signal interrupts them and their real
     /// continuation RPC becomes visible; other backends retain their existing immediate requeue.
     fn signal_guest(&mut self, dettid: DetTid, signal: Signal) {
+        self.send_signal_to_guest(dettid, signal, HostSignalSend::ProcessDirected);
+    }
+
+    /// `signal_guest`, sending `signal` so that only `dettid` can take it
+    /// (`HostSignalSend::ThreadDirected`).
+    fn signal_guest_thread_directed(&mut self, dettid: DetTid, signal: Signal) {
+        self.send_signal_to_guest(dettid, signal, HostSignalSend::ThreadDirected);
+    }
+
+    /// The body of `signal_guest`: send `signal` to `dettid` as `send` says,
+    /// then make it visible to the scheduler (`wake_signaled_guest`).
+    ///
+    /// A backend that registered a pidfd for the thread is sent through it
+    /// either way, and that send is thread-directed already. A backend that
+    /// requires one and has none is refused either way.
+    fn send_signal_to_guest(&mut self, dettid: DetTid, signal: Signal, send: HostSignalSend) {
         debug!(
-            "[dtid {}] deliver signal {} physically to guest thread.",
-            dettid, signal
+            "[dtid {}] deliver signal {} physically to guest thread ({:?}).",
+            dettid, signal, send
         );
+        #[cfg(test)]
+        if let Some(sends) = self.test_host_signal_sends.as_mut() {
+            sends.push((dettid, signal, send));
+            self.wake_signaled_guest(dettid, signal);
+            return;
+        }
         let result = if let Some((_, _, _, pidfd)) = self.physical_thread_pidfds.get(&dettid) {
             let rc = unsafe {
                 libc::syscall(
@@ -4022,8 +4174,31 @@ impl Scheduler {
             });
             return;
         } else {
-            let pid = Pid::from_raw(dettid.as_raw()); // TODO(T78538674): virtualize pid/tid:
-            signal::kill(pid, signal)
+            match send {
+                HostSignalSend::ProcessDirected => {
+                    let pid = Pid::from_raw(dettid.as_raw()); // TODO(T78538674): virtualize pid/tid:
+                    signal::kill(pid, signal)
+                }
+                HostSignalSend::ThreadDirected => {
+                    // `tgkill(2)` names the thread group too, so a thread ID
+                    // that was reused in another group is refused (ESRCH)
+                    // rather than signalled.
+                    let process = self.registered_process(dettid).unwrap_or(dettid);
+                    let rc = unsafe {
+                        libc::syscall(
+                            libc::SYS_tgkill,
+                            process.as_raw(),
+                            dettid.as_raw(),
+                            signal as libc::c_int,
+                        )
+                    };
+                    if rc < 0 {
+                        Err(nix::errno::Errno::last())
+                    } else {
+                        Ok(())
+                    }
+                }
+            }
         };
         match result {
             Ok(()) => {}
@@ -4056,7 +4231,7 @@ impl Scheduler {
                 );
                 return;
             }
-            Err(errno) => panic!("signal::kill to go through, got {errno}"),
+            Err(errno) => panic!("signal::kill to go through ({send:?}), got {errno}"),
         }
         self.wake_signaled_guest(dettid, signal);
     }
@@ -10603,6 +10778,323 @@ mod test {
         assert!(scheduler.blocked.sigchld_deferred.is_empty());
         assert!(scheduler.blocked.sigchld_ready.contains(&creator));
         assert!(scheduler.run_queue.contains_tid(creator));
+    }
+
+    /// Park `thread` in a futex wait that admits exactly `unblocked` and
+    /// catches `SIGALRM`, so a `SIGALRM` it admits ends the wait.
+    fn park_admitting(scheduler: &mut Scheduler, thread: DetTid, unblocked: u64) {
+        let futex = FutexID::private(MmId::initial(DetPid::from_raw(100)), 0x404110);
+        scheduler.sleep_futex_waiter(
+            &thread,
+            futex,
+            None,
+            u32::MAX,
+            Some(signal_watch(unblocked)),
+        );
+        scheduler.test_kernel_signal_states.insert(
+            thread,
+            KernelSignalState {
+                blocked: !unblocked,
+                ..signal_state(kernel_signal_bit(libc::SIGALRM), 0)
+            },
+        );
+    }
+
+    /// Commit `thread`'s `rt_sigsuspend` with `mask` its temporary mask.
+    fn suspend_with_mask(scheduler: &mut Scheduler, thread: DetTid, mask: u64) {
+        commit_out_of_scheduler_call(
+            scheduler,
+            thread,
+            ResourceID::BlockingRtSigsuspend(ExternalOpId::new(thread, 1)),
+            Some(mask),
+        );
+    }
+
+    /// Process 100, whose leader is parked in a futex wait that admits only
+    /// `leader_unblocked`, with `workers` registered in it and not yet in any
+    /// call. A second process, 300, has a thread asleep in `rt_sigsuspend`
+    /// admitting every signal, which no timer of process 100 may choose. Every
+    /// signal the scheduler sends is recorded instead of sent
+    /// (`test_host_signal_sends`).
+    fn timer_family(
+        scheduler: &mut Scheduler,
+        leader_unblocked: u64,
+        workers: &[i32],
+    ) -> (DetTid, Vec<DetTid>, DetTid) {
+        let leader = DetTid::from_raw(100);
+        scheduler.thread_tree.add_child(leader, leader, true);
+        register_known_thread(scheduler, leader);
+        park_admitting(scheduler, leader, leader_unblocked);
+        let workers = workers
+            .iter()
+            .map(|raw| {
+                let worker = DetTid::from_raw(*raw);
+                scheduler.thread_tree.add_child(leader, worker, false);
+                register_known_thread(scheduler, worker);
+                worker
+            })
+            .collect();
+        let stranger = DetTid::from_raw(300);
+        scheduler.thread_tree.add_child(stranger, stranger, true);
+        register_known_thread(scheduler, stranger);
+        suspend_with_mask(scheduler, stranger, 0);
+        scheduler.test_host_signal_sends = Some(Vec::new());
+        (leader, workers, stranger)
+    }
+
+    fn host_signal_sends(scheduler: &Scheduler) -> Vec<(DetTid, Signal, HostSignalSend)> {
+        scheduler.test_host_signal_sends.clone().unwrap()
+    }
+
+    /// An alarm whose leader blocks `SIGALRM` while a worker sleeps in
+    /// `rt_sigsuspend` with a mask that admits it: the signal is sent to the
+    /// worker alone, and the worker is armed to be woken by it. Before, it was
+    /// sent with `kill(2)` naming the leader; the kernel cannot give it to a
+    /// thread held in a ptrace stop, so it went to the worker, which was never
+    /// armed, and the run stopped as a deadlock
+    /// (https://github.com/rrnewton/hermit/pull/3224). The same holds at the
+    /// empty-queue time skip (`normal_due` false), and a thread of another
+    /// process is never chosen.
+    #[test]
+    fn an_alarm_goes_to_the_rt_sigsuspend_waiter_whose_mask_admits_it() {
+        let alrm = kernel_signal_bit(libc::SIGALRM);
+        for normal_due in [true, false] {
+            let mut scheduler = gated_scheduler();
+            let (leader, workers, stranger) = timer_family(&mut scheduler, !alrm, &[101]);
+            let worker = workers[0];
+            suspend_with_mask(&mut scheduler, worker, 0);
+
+            scheduler.dispatch_timed_signal(
+                LogicalTime::from_nanos(1),
+                timed_waiters::SignalTimerId::Alarm(leader),
+                leader,
+                Signal::SIGALRM,
+                normal_due,
+            );
+            let case = format!("normal_due={normal_due}");
+            assert_eq!(
+                host_signal_sends(&scheduler),
+                vec![(worker, Signal::SIGALRM, HostSignalSend::ThreadDirected)],
+                "{case}"
+            );
+            assert!(
+                scheduler.blocked.signaled_background.contains(&worker),
+                "{case}"
+            );
+            assert!(
+                !scheduler.blocked.signaled_background.contains(&stranger),
+                "{case}"
+            );
+            assert!(scheduler.is_parked_futex_waiter(leader), "{case}");
+            assert!(scheduler.terminal_deadlock.is_none(), "{case}");
+        }
+    }
+
+    /// The thread a timer names takes its signal when it admits it, and
+    /// otherwise the first thread in thread-ID order that does. A thread whose
+    /// mask blocks the signal is passed over, and a POSIX timer is treated as
+    /// an alarm is.
+    #[test]
+    fn a_timer_signal_prefers_the_named_thread_then_thread_id_order() {
+        let alrm = kernel_signal_bit(libc::SIGALRM);
+        let posix = |leader| timed_waiters::SignalTimerId::Posix(leader, 0);
+
+        // The leader admits the alarm: it takes it, its wait ends, and the
+        // worker that also admits it is left asleep.
+        let mut scheduler = gated_scheduler();
+        let (leader, workers, _) = timer_family(&mut scheduler, alrm, &[101]);
+        suspend_with_mask(&mut scheduler, workers[0], 0);
+        scheduler.dispatch_timed_signal(
+            LogicalTime::from_nanos(1),
+            timed_waiters::SignalTimerId::Alarm(leader),
+            leader,
+            Signal::SIGALRM,
+            true,
+        );
+        assert_eq!(
+            host_signal_sends(&scheduler),
+            vec![(leader, Signal::SIGALRM, HostSignalSend::ThreadDirected)]
+        );
+        assert!(!scheduler.is_parked_futex_waiter(leader));
+        assert!(scheduler.run_queue.contains_tid(leader));
+        assert!(scheduler.blocked.signaled_background.is_empty());
+
+        // The leader blocks it, 101 blocks it, and 102 and 103 admit it: 102
+        // takes it.
+        let mut scheduler = gated_scheduler();
+        let (leader, workers, _) = timer_family(&mut scheduler, !alrm, &[101, 102, 103]);
+        suspend_with_mask(&mut scheduler, workers[0], alrm);
+        suspend_with_mask(&mut scheduler, workers[1], 0);
+        suspend_with_mask(&mut scheduler, workers[2], 0);
+        scheduler.dispatch_timed_signal(
+            LogicalTime::from_nanos(1),
+            posix(leader),
+            leader,
+            Signal::SIGALRM,
+            true,
+        );
+        assert_eq!(
+            host_signal_sends(&scheduler),
+            vec![(workers[1], Signal::SIGALRM, HostSignalSend::ThreadDirected)]
+        );
+        assert_eq!(
+            scheduler
+                .blocked
+                .signaled_background
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![workers[1]]
+        );
+
+        // The same, but the timer names 103: 103 takes it.
+        let mut scheduler = gated_scheduler();
+        let (leader, workers, _) = timer_family(&mut scheduler, !alrm, &[101, 102, 103]);
+        suspend_with_mask(&mut scheduler, workers[0], alrm);
+        suspend_with_mask(&mut scheduler, workers[1], 0);
+        suspend_with_mask(&mut scheduler, workers[2], 0);
+        scheduler.dispatch_timed_signal(
+            LogicalTime::from_nanos(1),
+            posix(leader),
+            workers[2],
+            Signal::SIGALRM,
+            true,
+        );
+        assert_eq!(
+            host_signal_sends(&scheduler),
+            vec![(workers[2], Signal::SIGALRM, HostSignalSend::ThreadDirected)]
+        );
+    }
+
+    /// When no thread is known to admit a timer's signal, it is sent with
+    /// `kill(2)` naming the thread the timer names, as before, and stays
+    /// pending on the process until a thread unblocks it in its own turn;
+    /// nothing is armed. That covers every thread blocking it, and the only
+    /// admitting threads being a vfork parent (it sleeps killable) or a thread
+    /// whose mask is unknown.
+    #[test]
+    fn a_timer_signal_no_thread_is_known_to_admit_stays_pending_on_the_process() {
+        let alrm = kernel_signal_bit(libc::SIGALRM);
+        for case in ["every thread blocks it", "vfork parent", "unknown mask"] {
+            let mut scheduler = gated_scheduler();
+            let (leader, workers, _) = timer_family(&mut scheduler, !alrm, &[101]);
+            let worker = workers[0];
+            match case {
+                "every thread blocks it" => suspend_with_mask(&mut scheduler, worker, alrm),
+                "vfork parent" => {
+                    suspend_with_mask(&mut scheduler, worker, 0);
+                    scheduler.vfork_barriers.insert(worker, None);
+                }
+                _ => {
+                    suspend_with_mask(&mut scheduler, worker, 0);
+                    scheduler
+                        .blocked
+                        .out_of_scheduler_masks
+                        .insert(worker, None);
+                }
+            }
+            scheduler.dispatch_timed_signal(
+                LogicalTime::from_nanos(1),
+                timed_waiters::SignalTimerId::Alarm(leader),
+                leader,
+                Signal::SIGALRM,
+                true,
+            );
+            assert_eq!(
+                host_signal_sends(&scheduler),
+                vec![(leader, Signal::SIGALRM, HostSignalSend::ProcessDirected)],
+                "{case}"
+            );
+            assert!(scheduler.blocked.signaled_background.is_empty(), "{case}");
+            assert!(scheduler.is_parked_futex_waiter(leader), "{case}");
+        }
+    }
+
+    /// A waiter that an earlier signal already released from `rt_sigsuspend`
+    /// is never sent a timer's signal: from a host-timed moment on it runs
+    /// under the mask the kernel restores, not the recorded one. Another
+    /// waiter that admits the signal takes it; when there is none, the signal
+    /// is sent to the process.
+    #[test]
+    fn a_timer_signal_passes_over_a_waiter_an_earlier_signal_released() {
+        let alrm = kernel_signal_bit(libc::SIGALRM);
+        for second_admits in [true, false] {
+            let mut scheduler = gated_scheduler();
+            let (leader, workers, _) = timer_family(&mut scheduler, !alrm, &[101, 102]);
+            suspend_with_mask(&mut scheduler, workers[0], 0);
+            suspend_with_mask(
+                &mut scheduler,
+                workers[1],
+                if second_admits { 0 } else { alrm },
+            );
+            // A sibling's signal, sent at an earlier committed point, released
+            // 101.
+            scheduler.wake_signaled_guest(workers[0], Signal::SIGUSR1);
+            assert!(scheduler.blocked.signaled_background.contains(&workers[0]));
+
+            scheduler.dispatch_timed_signal(
+                LogicalTime::from_nanos(1),
+                timed_waiters::SignalTimerId::Alarm(leader),
+                leader,
+                Signal::SIGALRM,
+                true,
+            );
+            let expected = if second_admits {
+                (workers[1], Signal::SIGALRM, HostSignalSend::ThreadDirected)
+            } else {
+                (leader, Signal::SIGALRM, HostSignalSend::ProcessDirected)
+            };
+            assert_eq!(
+                host_signal_sends(&scheduler),
+                vec![expected],
+                "second_admits={second_admits}"
+            );
+        }
+    }
+
+    /// A scheduler that does not model signal targets sends a timer's signal
+    /// with `kill(2)` naming the thread the timer names, as before, whichever
+    /// thread admits it; and on one that does, a child-exit `SIGCHLD` keeps
+    /// that send too, to the thread `kernel_sigchld_target` names.
+    #[test]
+    fn a_timer_signal_keeps_the_process_directed_send_outside_the_capability() {
+        let alrm = kernel_signal_bit(libc::SIGALRM);
+        let mut scheduler = Scheduler::new(&Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        });
+        assert!(!scheduler.models_signal_targets);
+        let (leader, workers, _) = timer_family(&mut scheduler, !alrm, &[101]);
+        suspend_with_mask(&mut scheduler, workers[0], 0);
+        scheduler.dispatch_timed_signal(
+            LogicalTime::from_nanos(1),
+            timed_waiters::SignalTimerId::Alarm(leader),
+            leader,
+            Signal::SIGALRM,
+            true,
+        );
+        assert_eq!(
+            host_signal_sends(&scheduler),
+            vec![(leader, Signal::SIGALRM, HostSignalSend::ProcessDirected)]
+        );
+        assert!(scheduler.blocked.signaled_background.is_empty());
+
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        let (mut scheduler, parent, creator, child) = sigchld_family(libc::SIGCHLD);
+        park_for_sigchld(&mut scheduler, parent, chld);
+        park_for_sigchld(&mut scheduler, creator, 0);
+        scheduler.test_host_signal_sends = Some(Vec::new());
+        scheduler.dispatch_timed_signal(
+            LogicalTime::from_nanos(1),
+            timed_waiters::SignalTimerId::ChildExit { child, parent },
+            creator,
+            Signal::SIGCHLD,
+            true,
+        );
+        assert_eq!(
+            host_signal_sends(&scheduler),
+            vec![(parent, Signal::SIGCHLD, HostSignalSend::ProcessDirected)]
+        );
     }
 
     /// The barrier runs before anything else in a pass: while an armed thread

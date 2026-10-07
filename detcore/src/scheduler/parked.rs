@@ -680,6 +680,13 @@ impl Scheduler {
                 };
                 self.fire_alarm(parent, target, signal);
             }
+        } else if self.models_signal_targets && !matches!(id, SignalTimerId::ChildExit { .. }) {
+            // An `alarm`, `setitimer` or POSIX timer signal goes to a thread
+            // whose mask admits it, chosen by the scheduler, and to that
+            // thread alone (`fire_timer_signal`). A child-exit `SIGCHLD` keeps
+            // its sends: the branch above when it is due, `fire_alarm` below
+            // otherwise.
+            self.fire_timer_signal(id.process(), tid, signal);
         } else {
             self.fire_alarm(id.process(), tid, signal);
         }
