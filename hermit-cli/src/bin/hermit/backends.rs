@@ -359,12 +359,20 @@ fn write_dbt_engagement(path: &Path, snapshot: &DbtBackendStatsSnapshot) -> Resu
     })
 }
 
+/// The exit code with which the DBT native client ends a process on a backend
+/// or Tool failure (`exit_runtime_tree(101)` in reverie-dbt's client).
+#[cfg(feature = "dbt")]
+const DBT_BACKEND_FAILURE_EXIT_CODE: i32 = 101;
+
+/// Prints and records a single run's statistics as requested, and returns them
+/// when they could be read. A run always captures them: they are also how a
+/// backend failure in a guest child is found (see [`fail_on_dbt_backend_failure`]).
 #[cfg(feature = "dbt")]
 fn finish_single_run_dbt_stats(
     capture: DbtStatsCapture,
     summary: bool,
     engagement_json: Option<&Path>,
-) -> Result<(), Error> {
+) -> Result<Option<DbtBackendStatsSnapshot>, Error> {
     match capture.finish() {
         Ok(stats) => {
             if summary {
@@ -373,14 +381,46 @@ fn finish_single_run_dbt_stats(
             if let Some(path) = engagement_json {
                 write_dbt_engagement(path, &stats)?;
             }
-            Ok(())
+            Ok(Some(stats))
         }
         Err(error) if engagement_json.is_some() => Err(error),
         Err(error) => {
-            eprintln!(":: DBT summary unavailable: {error}");
-            Ok(())
+            if summary {
+                eprintln!(":: DBT summary unavailable: {error}");
+            }
+            eprintln!(
+                ":: WARNING: the DBT process records are unavailable, so a backend failure in a \
+                 guest child cannot be ruled out: {error}"
+            );
+            Ok(None)
         }
     }
+}
+
+/// `status`, or a failed status when any process image of the run ended on a
+/// backend or Tool failure.
+///
+/// The native client ends such a process with exit code 101. When the guest
+/// tree has no isolated process group (`--allow-unsupported-syscalls` without
+/// `--verify`), that ends only the failing process, and a parent that ignores
+/// its child's status can still finish the run with any status, 0 included.
+/// The failing image flags its stats record, so the run fails here instead.
+#[cfg(feature = "dbt")]
+fn fail_on_dbt_backend_failure(
+    status: ExitStatus,
+    stats: Option<&DbtBackendStatsSnapshot>,
+) -> ExitStatus {
+    let failures = stats.map_or(0, DbtBackendStatsSnapshot::backend_failures);
+    if failures == 0 || status == ExitStatus::Exited(DBT_BACKEND_FAILURE_EXIT_CODE) {
+        return status;
+    }
+    eprintln!(
+        "hermit: [dbt backend] {failures} guest process(es) ended on a DBT backend or Tool \
+         failure (exit {DBT_BACKEND_FAILURE_EXIT_CODE}), but the guest tree finished with \
+         {status:?}; failing the run with exit {DBT_BACKEND_FAILURE_EXIT_CODE}. The failing \
+         process's diagnostic is above."
+    );
+    ExitStatus::Exited(DBT_BACKEND_FAILURE_EXIT_CODE)
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -974,9 +1014,25 @@ pub(super) fn run_dbt(
             "failed to prepare the Detcore DynamoRIO client: {error}"
         ))
     })?;
-    let single_run_stats = (!verify && (summary || backend_engagement_json.is_some()))
-        .then(|| execution.stats_capture())
-        .transpose()?;
+    // Every single run captures the per-image records, not only a run that
+    // prints or exports them: a child's backend failure is found there. Only a
+    // run that asked for them fails when they cannot be set up; any other run
+    // warns, as it does when they cannot be read afterwards.
+    let single_run_stats = if verify {
+        None
+    } else {
+        match execution.stats_capture() {
+            Ok(capture) => Some(capture),
+            Err(error) if summary || backend_engagement_json.is_some() => return Err(error),
+            Err(error) => {
+                eprintln!(
+                    ":: WARNING: the DBT process records cannot be set up, so a backend failure \
+                     in a guest child cannot be ruled out: {error}"
+                );
+                None
+            }
+        }
+    };
     let mut runner = DbtRunner::new(&drrun, &client)
         .map_err(|error| {
             Error::msg(format!(
@@ -1013,10 +1069,16 @@ pub(super) fn run_dbt(
     if !verify {
         if stdin_is_terminal {
             let status = run_status(&execution, &runner, &guest, &drrun, config)?;
-            if let Some(capture) = single_run_stats {
-                finish_single_run_dbt_stats(capture, summary, backend_engagement_json)?;
-            }
-            return Ok(process_status(status));
+            let stats = match single_run_stats {
+                Some(capture) => {
+                    finish_single_run_dbt_stats(capture, summary, backend_engagement_json)?
+                }
+                None => None,
+            };
+            return Ok(fail_on_dbt_backend_failure(
+                process_status(status),
+                stats.as_ref(),
+            ));
         }
         let output = run_once(
             &execution,
@@ -1027,10 +1089,16 @@ pub(super) fn run_dbt(
             std::io::stdin(),
         )?;
         write_output(&output)?;
-        if let Some(capture) = single_run_stats {
-            finish_single_run_dbt_stats(capture, summary, backend_engagement_json)?;
-        }
-        return Ok(output_status(&output));
+        let stats = match single_run_stats {
+            Some(capture) => {
+                finish_single_run_dbt_stats(capture, summary, backend_engagement_json)?
+            }
+            None => None,
+        };
+        return Ok(fail_on_dbt_backend_failure(
+            output_status(&output),
+            stats.as_ref(),
+        ));
     }
 
     // The capture names are READ BY THE HARNESS, so they are not a local choice.
@@ -1570,6 +1638,15 @@ async fn clean_up_dbt_global(status: &std::process::ExitStatus, mut global: detc
 #[cfg(feature = "dbt")]
 fn dbt_run_error(drrun: &Path, error: std::io::Error) -> Error {
     use std::io::ErrorKind;
+    // A run that failed after its tree was reaped (protected evidence reporting
+    // a backend failure, for one) still carries what it captured. Its stderr
+    // usually holds the line that says why, so show it before the error.
+    if let Some(output) = reverie_dbt::failed_run_output(&error)
+        && !output.stderr.is_empty()
+    {
+        eprintln!(":: stderr captured from the failed DBT run:");
+        let _ = std::io::stderr().write_all(&output.stderr);
+    }
     match error.kind() {
         ErrorKind::NotFound | ErrorKind::PermissionDenied | ErrorKind::ExecutableFileBusy => {
             Error::msg(format!(
