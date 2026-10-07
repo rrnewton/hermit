@@ -1418,7 +1418,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tool_global::tests::a_snapshot_lookup_does_not_scan_the_inodes_history
     // (codex re-check of https://github.com/rrnewton/hermit/pull/3849) retains
     // all 1104: 1105.
-    ("test.detcore_unit", 1105),
+    // procfs_inode::tests::{dot_entries_name_the_directory_and_its_parent,
+    // only_anonymous_devices_with_1024_byte_blocks_may_be_procfs,
+    // other_directories_keep_host_keys, path_keys_cannot_equal_procfs_inodes,
+    // procfs_entry_key_ignores_the_host_inode} and
+    // tool_global::tests::a_rebuilt_procfs_entry_keeps_its_number_when_keyed_by_path
+    // (procfs inodes keyed by path) retain all 1105: 1111.
+    ("test.detcore_unit", 1111),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1983,7 +1989,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same unidentified-stop SIGCHLD refusal test: 1088 + 1 = 1089.
     // The host twin selects the same background-signal test, re-listed: 1090.
     // The host twin selects the same seven B5a tests, re-listed: 1096.
-    ("test.detcore_unit_on_host", 1105),
+    // The host twin selects the same six procfs path-key tests: 1105 + 6 = 1111.
+    ("test.detcore_unit_on_host", 1111),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
