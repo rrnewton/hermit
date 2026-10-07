@@ -1787,11 +1787,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         // runtime state, not part of that namespace; exclude the class at
         // capture so snapshot identity assignment and every later read agree
         // on the same membership.
+        //
+        // `/proc/<pid>/mounts` lists the same mounts in another grammar, so its
+        // capture drops the same class
+        // (https://github.com/rrnewton/hermit/issues/3719).
+        let needs_mounts_rewrites = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_needs_mounts_rewrites())?;
         let contents = if guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_needs_mountinfo_identities())?
         {
             crate::procfs::exclude_ephemeral_host_seed_mounts(&raw_contents)
+        } else if needs_mounts_rewrites {
+            crate::procfs::exclude_ephemeral_host_seed_rows_from_mounts_file(&raw_contents)
         } else {
             raw_contents
         };
@@ -2077,12 +2086,38 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
+        // The mount points of a `mounts` snapshot take the proven prefix
+        // rewrites mountinfo applies to its field 5, from the same
+        // configuration and with the same duplicate and malformed-pair
+        // refusals, so both files name a mount below Hermit's private `/tmp`
+        // by its guest path rather than by the per-run staging directory.
+        let mounts_mountpoint_rewrites = if needs_mounts_rewrites {
+            let mut by_mount_id = BTreeMap::new();
+            for rewrite in &guest.config().mountinfo_root_rewrites {
+                if by_mount_id.insert(rewrite.raw_mount_id, rewrite).is_some() {
+                    return Err(Error::Tool(anyhow::anyhow!(
+                        "duplicate proven mountinfo root rewrite for mount ID {}",
+                        rewrite.raw_mount_id
+                    )));
+                }
+            }
+            crate::procfs::proven_mountpoint_prefix_rewrites(by_mount_id.into_values()).ok_or_else(
+                || {
+                    Error::Tool(anyhow::anyhow!(
+                        "a proven mount-point prefix rewrite is malformed"
+                    ))
+                },
+            )?
+        } else {
+            Vec::new()
+        };
         guest.thread_state().with_detfd(call.fd(), |detfd| {
             detfd.initialize_procfs(
                 contents.clone(),
                 ProcfsSnapshotContext {
                     mapping_identities: mapping_identities.clone(),
                     mountinfo: mountinfo.clone(),
+                    mounts_mountpoint_rewrites: mounts_mountpoint_rewrites.clone(),
                     virtual_uptime_seconds,
                     virtual_boot_time_seconds,
                     virtual_realtime_seconds,
@@ -6169,6 +6204,23 @@ mod procfs_wiring_guard {
             "MISSING MECHANISM: the guest capture's seed filter must apply exactly to \
              the files that carry mountinfo identities (`let contents = if ... \
              procfs_needs_mountinfo_identities()`); found {gate:?}"
+        );
+        let mounts_capture = body
+            .find("exclude_ephemeral_host_seed_rows_from_mounts_file(&raw_contents)")
+            .expect(
+                "MISSING MECHANISM: the guest read's `/proc/<pid>/mounts` capture is no \
+                 longer filtered for host seed rows \
+                 (https://github.com/rrnewton/hermit/issues/3719)",
+            );
+        let mounts_gate = body[guest_capture..mounts_capture]
+            .rfind("else if")
+            .map(|start| &body[guest_capture + start..mounts_capture])
+            .unwrap_or_default();
+        assert!(
+            mounts_gate.contains("needs_mounts_rewrites"),
+            "MISSING MECHANISM: the mounts seed filter must apply exactly to the \
+             `/proc/<pid>/mounts` files (`else if needs_mounts_rewrites`); found \
+             {mounts_gate:?}"
         );
         let fdinfo_capture = body
             .find("exclude_ephemeral_host_seed_mounts(&mountinfo_contents)")

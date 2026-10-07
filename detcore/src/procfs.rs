@@ -19,6 +19,7 @@ use detcore_model::config::MountInfoRootRewrite;
 use detcore_model::procfs::MOUNT_PEER_PREFIXES;
 use detcore_model::procfs::MountInfoRow;
 pub(crate) use detcore_model::procfs::exclude_ephemeral_host_seed_mounts;
+pub(crate) use detcore_model::procfs::exclude_ephemeral_host_seed_rows_from_mounts_file;
 use detcore_model::procfs::mount_ids_are_ordered_subset;
 pub(crate) use detcore_model::procfs::parse_mountinfo;
 use serde::Deserialize;
@@ -99,6 +100,10 @@ enum ProcfsKind {
     Rtc,
     DentryState,
     Mountinfo,
+    /// `/proc/mounts` and `/proc/<pid>/mounts`: the same mounts as
+    /// mountinfo, shown with mountinfo's host seed exclusion and mount-point
+    /// prefix rewrites (<https://github.com/rrnewton/hermit/issues/3719>).
+    Mounts,
     RandomUuid,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-945): Review host swap-usage normalization.
@@ -564,15 +569,7 @@ impl MountInfoSnapshot {
             })
             .collect::<Vec<_>>();
         root_prefix_rewrites.sort_by_key(|(raw, _)| std::cmp::Reverse(raw.len()));
-        let mut mountpoint_prefix_rewrites = rewrites
-            .into_values()
-            .filter_map(|rewrite| {
-                rewrite
-                    .raw_mountpoint_prefix
-                    .zip(rewrite.deterministic_mountpoint_prefix)
-            })
-            .collect::<Vec<_>>();
-        mountpoint_prefix_rewrites.sort_by_key(|(raw, _)| std::cmp::Reverse(raw.len()));
+        let mountpoint_prefix_rewrites = proven_mountpoint_prefix_rewrites(rewrites.values())?;
 
         Some(Self {
             rows,
@@ -663,6 +660,60 @@ fn mountinfo_observation_order(rows: &[MountInfoRow]) -> Vec<u64> {
     order
 }
 
+/// The proven mount-point prefix rewrites, longest raw prefix first so a
+/// nested prefix wins over its parent; equal lengths keep the input order.
+///
+/// Mountinfo field 5 and the mount-point field of `/proc/<pid>/mounts` both
+/// take exactly these pairs, so the two files name a mount below a Hermit-
+/// created `/tmp` by the same guest path. `None` refuses the configuration
+/// when a rewrite carries only one half of a pair, or a half that is not an
+/// absolute path free of spaces and control bytes: the kernel escapes both in
+/// these files, so such a prefix could never match a row.
+pub(crate) fn proven_mountpoint_prefix_rewrites<'a>(
+    rewrites: impl IntoIterator<Item = &'a MountInfoRootRewrite>,
+) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+    fn is_encoded_absolute_path(path: &[u8]) -> bool {
+        path.first() == Some(&b'/')
+            && !path
+                .iter()
+                .any(|byte| *byte == b' ' || byte.is_ascii_control())
+    }
+    let mut pairs = Vec::new();
+    for rewrite in rewrites {
+        match (
+            &rewrite.raw_mountpoint_prefix,
+            &rewrite.deterministic_mountpoint_prefix,
+        ) {
+            (None, None) => {}
+            (Some(raw), Some(deterministic))
+                if is_encoded_absolute_path(raw) && is_encoded_absolute_path(deterministic) =>
+            {
+                pairs.push((raw.clone(), deterministic.clone()));
+            }
+            _ => return None,
+        }
+    }
+    pairs.sort_by_key(|(raw, _)| std::cmp::Reverse(raw.len()));
+    Some(pairs)
+}
+
+/// Replace a proven raw prefix of one escaped path field with its guest
+/// path. A prefix matches only at a path-component boundary: the whole field,
+/// or a field continuing with `/`.
+fn rewrite_path_prefix(field: &[u8], rewrites: &[(Vec<u8>, Vec<u8>)]) -> Option<Vec<u8>> {
+    for (raw, deterministic) in rewrites {
+        let Some(suffix) = field.strip_prefix(raw.as_slice()) else {
+            continue;
+        };
+        if suffix.is_empty() || suffix.first() == Some(&b'/') {
+            let mut rewritten = deterministic.clone();
+            rewritten.extend_from_slice(suffix);
+            return Some(rewritten);
+        }
+    }
+    None
+}
+
 /// Guest-visible values used to normalize one procfs snapshot.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ProcfsSnapshotContext {
@@ -690,6 +741,10 @@ pub(crate) struct ProcfsSnapshotContext {
     /// lookup for rendering.
     pub(crate) mapping_identities: BTreeMap<(u64, u64), (u64, u64)>,
     pub(crate) mountinfo: Option<MountInfoSnapshot>,
+    /// Proven mount-point prefix rewrites for a `mounts` snapshot, longest
+    /// raw prefix first: the pairs mountinfo applies to its field 5, built by
+    /// [`proven_mountpoint_prefix_rewrites`] from the same configuration.
+    pub(crate) mounts_mountpoint_rewrites: Vec<(Vec<u8>, Vec<u8>)>,
     pub(crate) random_uuid: Option<[u8; 16]>,
 }
 
@@ -733,6 +788,10 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-873): Review deterministic kernel pseudo-file snapshots.
             other if is_process_file_path(other, "mountinfo") => ProcfsKind::Mountinfo,
+            // `/proc/mounts` is the kernel's `self/mounts` symlink; path
+            // recognition is lexical, so it is named here.
+            "/proc/mounts" => ProcfsKind::Mounts,
+            other if is_process_file_path(other, "mounts") => ProcfsKind::Mounts,
             "/proc/sys/kernel/random/uuid" => ProcfsKind::RandomUuid,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-933): Review host-global AIO count normalization.
@@ -895,6 +954,13 @@ impl ProcfsFile {
         self.kind == ProcfsKind::Mountinfo
     }
 
+    /// True for `/proc/<pid>/mounts`, whose capture drops the host seed rows
+    /// mountinfo drops and whose mount points take mountinfo's proven prefix
+    /// rewrites.
+    pub(crate) fn needs_mounts_rewrites(&self) -> bool {
+        self.kind == ProcfsKind::Mounts
+    }
+
     pub(crate) fn needs_snapshot(&self) -> bool {
         !matches!(self.kind, ProcfsKind::TimerSlack(_)) && self.contents.is_none()
     }
@@ -951,6 +1017,7 @@ impl ProcfsFile {
             random_uuid,
             mapping_identities,
             mountinfo,
+            mounts_mountpoint_rewrites,
         } = context;
         let mapping_identities = &mapping_identities;
         self.contents = Some(match &self.kind {
@@ -1049,6 +1116,7 @@ impl ProcfsFile {
                     .as_ref()
                     .expect("mountinfo identities were not prepared"),
             ),
+            ProcfsKind::Mounts => sanitize_mounts(&contents, &mounts_mountpoint_rewrites),
             ProcfsKind::RandomUuid => sanitize_random_uuid(
                 &contents,
                 random_uuid.expect("random UUID snapshot omitted deterministic bytes"),
@@ -3482,20 +3550,6 @@ fn mount_peer_group(field: &[u8]) -> Result<Option<(&'static [u8], u64)>, ()> {
 }
 
 fn sanitize_mountinfo(contents: &[u8], snapshot: &MountInfoSnapshot) -> Vec<u8> {
-    fn rewrite_root_prefix(field: &[u8], rewrites: &[(Vec<u8>, Vec<u8>)]) -> Option<Vec<u8>> {
-        for (raw, deterministic) in rewrites {
-            let Some(suffix) = field.strip_prefix(raw.as_slice()) else {
-                continue;
-            };
-            if suffix.is_empty() || suffix.first() == Some(&b'/') {
-                let mut rewritten = deterministic.clone();
-                rewritten.extend_from_slice(suffix);
-                return Some(rewritten);
-            }
-        }
-        None
-    }
-
     let mut normalized = Vec::with_capacity(contents.len());
     let mut rows = snapshot.rows.iter();
     let mut rewritten_roots = 0;
@@ -3531,11 +3585,11 @@ fn sanitize_mountinfo(contents: &[u8], snapshot: &MountInfoSnapshot) -> Vec<u8> 
                     normalized.extend_from_slice(&snapshot.root_rewrites[&row.raw_mount_id]);
                     rewritten_roots += 1;
                 }
-                3 => match rewrite_root_prefix(field, &snapshot.root_prefix_rewrites) {
+                3 => match rewrite_path_prefix(field, &snapshot.root_prefix_rewrites) {
                     Some(rewritten) => normalized.extend_from_slice(&rewritten),
                     None => normalized.extend_from_slice(field),
                 },
-                4 => match rewrite_root_prefix(field, &snapshot.mountpoint_prefix_rewrites) {
+                4 => match rewrite_path_prefix(field, &snapshot.mountpoint_prefix_rewrites) {
                     Some(rewritten) => normalized.extend_from_slice(&rewritten),
                     None => normalized.extend_from_slice(field),
                 },
@@ -3565,6 +3619,44 @@ fn sanitize_mountinfo(contents: &[u8], snapshot: &MountInfoSnapshot) -> Vec<u8> 
         snapshot.root_rewrites.len(),
         "a proven mountinfo root rewrite did not identify exactly one row"
     );
+    normalized
+}
+
+/// `/proc/<pid>/mounts`, one row per mount: `<source> <mount point> <type>
+/// <options> <dump> <pass>`. The mount point takes the proven prefix rewrites
+/// mountinfo applies to its field 5, so a mount Hermit installed below its
+/// randomly named private `/tmp` staging directory reads as the guest path
+/// under `/tmp`, as it does in mountinfo, instead of a name that differs on
+/// every run (<https://github.com/rrnewton/hermit/issues/3719>). Every other
+/// byte, row order and newlines included, is kept; a row without a mount-point
+/// field is kept unchanged.
+fn sanitize_mounts(contents: &[u8], rewrites: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(contents.len());
+    for line in contents.split_inclusive(|byte| *byte == b'\n') {
+        let (body, has_newline) = match line.strip_suffix(b"\n") {
+            Some(body) => (body, true),
+            None => (line, false),
+        };
+        let mut fields = body.splitn(3, |byte| *byte == b' ');
+        match (fields.next(), fields.next(), fields.next()) {
+            (Some(source), Some(mount_point), rest) => {
+                normalized.extend_from_slice(source);
+                normalized.push(b' ');
+                match rewrite_path_prefix(mount_point, rewrites) {
+                    Some(rewritten) => normalized.extend_from_slice(&rewritten),
+                    None => normalized.extend_from_slice(mount_point),
+                }
+                if let Some(rest) = rest {
+                    normalized.push(b' ');
+                    normalized.extend_from_slice(rest);
+                }
+            }
+            _ => normalized.extend_from_slice(body),
+        }
+        if has_newline {
+            normalized.push(b'\n');
+        }
+    }
     normalized
 }
 
@@ -4582,6 +4674,12 @@ Rss:                   4 kB\n" as &[u8];
             ("/proc/37/mountinfo", ProcfsKind::Mountinfo),
             ("/proc/self/task/38/mountinfo", ProcfsKind::Mountinfo),
             ("/proc/37/task/38/mountinfo", ProcfsKind::Mountinfo),
+            ("/proc/mounts", ProcfsKind::Mounts),
+            ("/proc/self/mounts", ProcfsKind::Mounts),
+            ("/proc/thread-self/mounts", ProcfsKind::Mounts),
+            ("/proc/37/mounts", ProcfsKind::Mounts),
+            ("/proc/self/task/38/mounts", ProcfsKind::Mounts),
+            ("/proc/37/task/38/mounts", ProcfsKind::Mounts),
             ("/proc/sys/kernel/random/uuid", ProcfsKind::RandomUuid),
         ] {
             assert_eq!(ProcfsFile::from_path(Path::new(path)).unwrap().kind, kind);
@@ -4590,11 +4688,11 @@ Rss:                   4 kB\n" as &[u8];
             "/proc/task/mountinfo",
             "/proc/37/task/self/mountinfo",
             "/proc/37/task/38/mountinfo/extra",
-            // `mounts` stays raw passthrough until it shares mountinfo's
-            // seed exclusion and prefix rewrites:
-            // https://github.com/rrnewton/hermit/issues/3719.
-            "/proc/mounts",
-            "/proc/self/mounts",
+            "/proc/task/mounts",
+            "/proc/37/task/self/mounts",
+            "/proc/mounts/extra",
+            // `mountstats` is not a `mounts` view and stays unrecognized.
+            "/proc/self/mountstats",
         ] {
             assert!(ProcfsFile::from_path(Path::new(path)).is_none());
         }
@@ -4686,6 +4784,159 @@ Rss:                   4 kB\n" as &[u8];
 3 5 0:3 / /host/.tmpABC123-lookalike rw - tmpfs tmpfs rw\n\
 4 1 0:4 /tmpvol/.hermit/tmp/child /data rw - tmpfs tmpfs rw\n"
         );
+    }
+
+    fn private_tmp_rewrite(staging: &[u8]) -> MountInfoRootRewrite {
+        MountInfoRootRewrite {
+            raw_mount_id: 37,
+            deterministic_root: b"/tmpvol/.hermit/tmp".to_vec(),
+            raw_root_prefix: Some(staging.to_vec()),
+            deterministic_root_prefix: Some(b"/tmpvol/.hermit/tmp".to_vec()),
+            raw_mountpoint_prefix: Some(staging.to_vec()),
+            deterministic_mountpoint_prefix: Some(b"/tmp".to_vec()),
+        }
+    }
+
+    /// `/proc/<pid>/mounts` names a mount Hermit installed below its private
+    /// `/tmp` staging directory by the guest path, exactly as mountinfo field
+    /// 5 does, and leaves a look-alike sibling and every other byte alone
+    /// (https://github.com/rrnewton/hermit/issues/3719).
+    #[test]
+    fn mounts_mount_points_take_the_mountinfo_prefix_rewrites() {
+        let rewrite = private_tmp_rewrite(b"/host/.tmpABC123");
+        let mountinfo = b"37 29 0:31 /host/.tmpABC123 /tmp rw - tmpfs tmpfs rw\n\
+38 37 0:32 / /host/.tmpABC123/user-mount rw - tmpfs tmpfs rw\n\
+39 29 0:33 / /host/.tmpABC123-lookalike rw - tmpfs tmpfs rw\n";
+        let mounts = b"tmpfs /tmp tmpfs rw 0 0\n\
+tmpfs /host/.tmpABC123/user-mount tmpfs rw 0 0\n\
+tmpfs /host/.tmpABC123-lookalike tmpfs rw 0 0\n\
+/dev/md0 /host/.tmpABC123 btrfs rw,relatime 0 0";
+        let rewrites = proven_mountpoint_prefix_rewrites([&rewrite]).unwrap();
+        assert_eq!(
+            sanitize_mounts(mounts, &rewrites),
+            b"tmpfs /tmp tmpfs rw 0 0\n\
+tmpfs /tmp/user-mount tmpfs rw 0 0\n\
+tmpfs /host/.tmpABC123-lookalike tmpfs rw 0 0\n\
+/dev/md0 /tmp btrfs rw,relatime 0 0"
+        );
+        let snapshot = mountinfo_snapshot_with_policy(
+            mountinfo,
+            true,
+            BTreeMap::from([
+                (libc::makedev(0, 31), 1),
+                (libc::makedev(0, 32), 2),
+                (libc::makedev(0, 33), 3),
+            ]),
+            BTreeMap::from([(37, rewrite)]),
+        );
+        let mountinfo_points = sanitize_mountinfo(mountinfo, &snapshot)
+            .split(|byte| *byte == b'\n')
+            .filter(|row| !row.is_empty())
+            .map(|row| row.split(|byte| *byte == b' ').nth(4).unwrap().to_vec())
+            .collect::<Vec<_>>();
+        let mounts_points = sanitize_mounts(mounts, &rewrites)
+            .split(|byte| *byte == b'\n')
+            .take(3)
+            .map(|row| row.split(|byte| *byte == b' ').nth(1).unwrap().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(mounts_points, mountinfo_points);
+    }
+
+    /// Two runs differ only in the random name of the private `/tmp` staging
+    /// directory. Their guest `/proc/self/mounts` reads must be identical:
+    /// before the rewrite the name reached the guest, so a program that reads
+    /// the mount table (coreutils `nproc`, `sort` and `find` do) saw different
+    /// bytes in two `--verify` runs.
+    #[test]
+    fn mounts_reads_do_not_depend_on_the_private_tmp_name() {
+        let render = |staging: &str| {
+            let rewrite = private_tmp_rewrite(staging.as_bytes());
+            let raw = format!(
+                "overlay / overlay rw 0 0\n\
+                 tmpfs {staging}/e2e/home tmpfs rw 0 0\n\
+                 tmpfs {staging}/e2e/xdg-config tmpfs rw 0 0\n\
+                 cgroup2 /sys/fs/cgroup cgroup2 ro 0 0\n"
+            );
+            let mut file = ProcfsFile::from_path(Path::new("/proc/self/mounts")).unwrap();
+            assert!(file.needs_mounts_rewrites());
+            assert!(!file.needs_mountinfo_identities());
+            file.initialize(
+                exclude_ephemeral_host_seed_rows_from_mounts_file(raw.as_bytes()),
+                ProcfsSnapshotContext {
+                    mounts_mountpoint_rewrites: proven_mountpoint_prefix_rewrites([&rewrite])
+                        .unwrap(),
+                    ..ProcfsSnapshotContext::default()
+                },
+            );
+            file.take(usize::MAX).unwrap()
+        };
+        let first = render("/tmp/.tmpAb12Z9");
+        assert_eq!(first, render("/tmp/.tmpQx7RmP"));
+        assert_eq!(
+            first,
+            b"overlay / overlay rw 0 0\n\
+tmpfs /tmp/e2e/home tmpfs rw 0 0\n\
+tmpfs /tmp/e2e/xdg-config tmpfs rw 0 0\n\
+cgroup2 /sys/fs/cgroup cgroup2 ro 0 0\n"
+        );
+    }
+
+    /// The longest proven prefix wins, and a configuration naming half a pair
+    /// or an unescaped path is refused, as `MountInfoSnapshot::new` refuses it.
+    #[test]
+    fn proven_mountpoint_prefix_rewrites_order_and_refusals() {
+        let outer = private_tmp_rewrite(b"/host/.tmpABC123");
+        let inner = MountInfoRootRewrite {
+            raw_mount_id: 38,
+            raw_mountpoint_prefix: Some(b"/host/.tmpABC123/staging".to_vec()),
+            deterministic_mountpoint_prefix: Some(b"/tmp/inner".to_vec()),
+            ..private_tmp_rewrite(b"/host/.tmpABC123")
+        };
+        let rewrites = proven_mountpoint_prefix_rewrites([&outer, &inner]).unwrap();
+        assert_eq!(rewrites[0].0, b"/host/.tmpABC123/staging");
+        assert_eq!(
+            sanitize_mounts(
+                b"tmpfs /host/.tmpABC123/staging/x tmpfs rw 0 0\n",
+                &rewrites
+            ),
+            b"tmpfs /tmp/inner/x tmpfs rw 0 0\n"
+        );
+        assert_eq!(proven_mountpoint_prefix_rewrites([]), Some(Vec::new()));
+        for (raw, deterministic) in [
+            (Some(b"/host/.tmpABC123".to_vec()), None),
+            (None, Some(b"/tmp".to_vec())),
+            (Some(b"relative".to_vec()), Some(b"/tmp".to_vec())),
+            (Some(b"/host/with space".to_vec()), Some(b"/tmp".to_vec())),
+            (Some(b"/host/.tmpABC123".to_vec()), Some(b"/tmp\n".to_vec())),
+        ] {
+            let malformed = MountInfoRootRewrite {
+                raw_mountpoint_prefix: raw,
+                deterministic_mountpoint_prefix: deterministic,
+                ..private_tmp_rewrite(b"/host/.tmpABC123")
+            };
+            assert_eq!(proven_mountpoint_prefix_rewrites([&malformed]), None);
+        }
+    }
+
+    /// The capture drops host seed rows from `mounts` as it does from
+    /// mountinfo, so host seed churn does not change the guest's mounts view.
+    #[test]
+    fn seed_churn_does_not_change_guest_mounts() {
+        let base = b"proc /proc proc rw 0 0\ntmpfs /test tmpfs rw 0 0\n".to_vec();
+        let churned = [
+            b"proc /proc proc rw 0 0\n".as_slice(),
+            b"squashfuse_ll /mnt/xarfuse/uid-0/06178150-seed-chef-ns-4026531832 fuse.squashfuse_ll rw 0 0\n",
+            b"tmpfs /test tmpfs rw 0 0\n",
+        ]
+        .concat();
+        for contents in [&base, &churned] {
+            let mut file = ProcfsFile::from_path(Path::new("/proc/mounts")).unwrap();
+            file.initialize(
+                exclude_ephemeral_host_seed_rows_from_mounts_file(contents),
+                ProcfsSnapshotContext::default(),
+            );
+            assert_eq!(file.take(usize::MAX).unwrap(), base);
+        }
     }
 
     #[test]

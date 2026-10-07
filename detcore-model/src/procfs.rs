@@ -57,8 +57,9 @@ pub const MOUNT_PEER_PREFIXES: [&[u8]; 3] = [b"shared:", b"master:", b"propagate
 /// capture excluded. Other host mount churn, such as logind's
 /// `/run/user/<uid>` tmpfs mounts, is not in this class and stays visible.
 ///
-/// Only mountinfo rows are classified. `/proc/<pid>/mounts` is passed through
-/// unchanged: <https://github.com/rrnewton/hermit/issues/3719>.
+/// `/proc/<pid>/mounts` lists the same mounts in another grammar;
+/// [`is_ephemeral_host_seed_mounts_file_row`] applies this one class to it
+/// (<https://github.com/rrnewton/hermit/issues/3719>).
 pub fn is_ephemeral_host_seed_mount(line: &[u8]) -> bool {
     let fields: Vec<&[u8]> = line.split(|byte| *byte == b' ').collect();
     let Some(separator) = fields.iter().position(|field| *field == b"-") else {
@@ -66,6 +67,25 @@ pub fn is_ephemeral_host_seed_mount(line: &[u8]) -> bool {
     };
     let mount_point = fields.get(4).copied().unwrap_or_default();
     let fs_type = fields.get(separator + 1).copied().unwrap_or_default();
+    is_host_seed_mount(mount_point, fs_type)
+}
+
+/// The same class as [`is_ephemeral_host_seed_mount`], for one row of
+/// `/proc/<pid>/mounts`: `<source> <mount point> <type> <options> <dump>
+/// <pass>`. The kernel prints the mount point with the same octal escaping
+/// and the type with the same `type.subtype` spelling in both files, so one
+/// mount is classified identically whichever file a guest reads.
+pub fn is_ephemeral_host_seed_mounts_file_row(line: &[u8]) -> bool {
+    let mut fields = line.split(|byte| *byte == b' ');
+    let (Some(_source), Some(mount_point), Some(fs_type)) =
+        (fields.next(), fields.next(), fields.next())
+    else {
+        return false;
+    };
+    is_host_seed_mount(mount_point, fs_type)
+}
+
+fn is_host_seed_mount(mount_point: &[u8], fs_type: &[u8]) -> bool {
     let name = mount_point
         .rsplit(|byte| *byte == b'/')
         .next()
@@ -79,10 +99,22 @@ pub fn is_ephemeral_host_seed_mount(line: &[u8]) -> bool {
 /// hermit-cli's launch-time identity capture all use this one filter, so they
 /// agree on the guest mount membership.
 pub fn exclude_ephemeral_host_seed_mounts(contents: &[u8]) -> Vec<u8> {
+    exclude_rows(contents, is_ephemeral_host_seed_mount)
+}
+
+/// Drop the rows `is_ephemeral_host_seed_mounts_file_row` classifies from raw
+/// `/proc/<pid>/mounts` contents, keeping every other row, newline included,
+/// in its original order, so the guest's mounts and mountinfo views list the
+/// same mounts.
+pub fn exclude_ephemeral_host_seed_rows_from_mounts_file(contents: &[u8]) -> Vec<u8> {
+    exclude_rows(contents, is_ephemeral_host_seed_mounts_file_row)
+}
+
+fn exclude_rows(contents: &[u8], excluded: fn(&[u8]) -> bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(contents.len());
     for line in contents.split_inclusive(|byte| *byte == b'\n') {
         let body = line.strip_suffix(b"\n").unwrap_or(line);
-        if !is_ephemeral_host_seed_mount(body) {
+        if !excluded(body) {
             out.extend_from_slice(line);
         }
     }
@@ -237,7 +269,9 @@ pub fn parse_fdinfo_mount_id(contents: &[u8]) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::exclude_ephemeral_host_seed_mounts;
+    use super::exclude_ephemeral_host_seed_rows_from_mounts_file;
     use super::is_ephemeral_host_seed_mount;
+    use super::is_ephemeral_host_seed_mounts_file_row;
     use super::mount_ids_are_ordered_subset;
     use super::parse_fdinfo_mount_id;
     use super::parse_mountinfo;
@@ -366,6 +400,43 @@ mod tests {
         assert_eq!(
             exclude_ephemeral_host_seed_mounts(&contents),
             b"18 1 0:21 / /proc rw - proc proc rw\n100 1 0:70 / /test rw - tmpfs none rw\n77 1 0:51 / /mnt/xarfuse/stable-release rw - fuse.squashfuse_ll squashfuse_ll rw"
+        );
+    }
+
+    /// The mounts file carries the same class in its own grammar: a seed row
+    /// there is excluded, a long-lived SquashFUSE mount and a seed-named mount
+    /// of another type stay, and a mountinfo row (whose third field is a
+    /// device number, not a type) is not misread as a mounts row.
+    #[test]
+    fn mounts_file_rows_use_the_same_seed_class() {
+        for seed in [
+            b"squashfuse_ll /mnt/xarfuse/uid-1000/e62a203d-seed-nspid4026531836_cgpid16161-ns-4026531832 fuse.squashfuse_ll rw,nosuid,nodev,relatime,user_id=1000,group_id=100,allow_other 0 0".as_slice(),
+            b"squashfuse_ll /mnt/xarfuse/uid-0/06178150-seed-chef-ns-4026531832 fuse.squashfuse_ll rw,nosuid,nodev,relatime,user_id=0,group_id=0,allow_other 0 0".as_slice(),
+            b"squashfuse_ll /xarfuse/uid-1/e62a203d-seed-nspid4026531836_cgpid16161-ns-4026531832 fuse.squashfuse_ll rw 0 0".as_slice(),
+        ] {
+            assert!(is_ephemeral_host_seed_mounts_file_row(seed), "{seed:?}");
+        }
+        for kept in [
+            b"squashfuse_ll /mnt/xarfuse/stable-release fuse.squashfuse_ll rw,relatime 0 0".as_slice(),
+            b"tmpfs /mnt/xarfuse/uid-0/06178150-seed-chef-ns-4026531832 tmpfs rw 0 0".as_slice(),
+            b"squashfuse_ll /mnt/xarfuse/uid-1/e62a203d-seed-chef-ns-3/sub fuse.squashfuse_ll rw 0 0".as_slice(),
+            b"proc /proc proc rw,nosuid 0 0".as_slice(),
+            b"squashfuse_ll /mnt/xarfuse/uid-1/e62a203d-seed-chef-ns-3".as_slice(),
+            SEED,
+        ] {
+            assert!(!is_ephemeral_host_seed_mounts_file_row(kept), "{kept:?}");
+        }
+    }
+
+    #[test]
+    fn mounts_file_seed_filter_drops_only_seed_rows_and_keeps_order() {
+        let contents = b"proc /proc proc rw 0 0\n\
+squashfuse_ll /mnt/xarfuse/uid-0/06178150-seed-chef-ns-4026531832 fuse.squashfuse_ll rw 0 0\n\
+tmpfs /test tmpfs rw 0 0\n\
+squashfuse_ll /mnt/xarfuse/stable-release fuse.squashfuse_ll rw 0 0";
+        assert_eq!(
+            exclude_ephemeral_host_seed_rows_from_mounts_file(contents),
+            b"proc /proc proc rw 0 0\ntmpfs /test tmpfs rw 0 0\nsquashfuse_ll /mnt/xarfuse/stable-release fuse.squashfuse_ll rw 0 0"
         );
     }
 }

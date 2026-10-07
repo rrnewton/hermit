@@ -502,6 +502,13 @@ impl DetFd {
             .is_some_and(ProcfsFile::needs_mountinfo_identities)
     }
 
+    pub(crate) fn procfs_needs_mounts_rewrites(&self) -> bool {
+        self.description()
+            .procfs
+            .as_ref()
+            .is_some_and(ProcfsFile::needs_mounts_rewrites)
+    }
+
     pub(crate) fn procfs_needs_random_uuid(&self) -> bool {
         self.description()
             .procfs

@@ -126,6 +126,12 @@ the same exclusion and mountinfo's mount-point prefix rewrites is
 <https://github.com/rrnewton/hermit/issues/3719>. KVM reverie-kvm proc_mounts
 capture is pre-existing and unmeasured.
 
+Update 2026-10-06: `/proc/mounts` and `/proc/<pid>/mounts` now have a Detcore
+snapshot kind (`ProcfsKind::Mounts`) that drops the same seed class at capture
+and rewrites mount points through the prefixes mountinfo field 5 uses
+(`proven_mountpoint_prefix_rewrites`). `/proc/<pid>/mountstats` and the
+`/etc/mtab` symlink (path recognition is lexical) remain raw passthrough.
+
 The procfs snapshot capture writes raw kernel bytes into the guest's buffer
 before sanitizing, so excluded rows can be visible in buffer bytes past the
 returned length. That predates this change and affects every snapshotted
