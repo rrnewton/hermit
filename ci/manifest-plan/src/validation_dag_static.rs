@@ -1389,7 +1389,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // same issue) retains all 79 (measured 80).
     // readdir_order's stdin_alias_does_not_renumber_a_later_listing (the same
     // issue) retains all 80 (measured 81).
-    ("test.detcore_misc", 81),
+    // readdir_order's mapped_stdin_does_not_renumber_a_later_listing,
+    // mapped_stdin_reports_the_inode_fdinfo_reports and
+    // another_process_stdin_pipe_reads_as_the_readers_own (stdio identities
+    // resolve to fd 0's inode) retain all 81 (measured 84).
+    ("test.detcore_misc", 84),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -1834,8 +1838,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.app_strict_verify_on_host", 8),
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
-    // The host node carries the identical 81-test tests_misc selection.
-    ("test.detcore_misc_on_host", 81),
+    // The host node carries the identical 84-test tests_misc selection.
+    ("test.detcore_misc_on_host", 84),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).

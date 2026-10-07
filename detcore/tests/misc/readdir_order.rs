@@ -2661,3 +2661,229 @@ fn stdin_alias_does_not_renumber_a_later_listing() {
         true,
     );
 }
+
+/// A fresh `memfd` holding one page. A mapping of a memfd names the same
+/// device in `/proc/self/maps` as `fstat` reports, unlike a file on btrfs or
+/// overlayfs, so Detcore's stdio identities match its maps line on every host.
+fn one_page_memfd(name: &CStr) -> File {
+    use std::os::fd::FromRawFd;
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), 0) };
+    assert!(fd >= 0);
+    assert_eq!(unsafe { libc::ftruncate(fd, 4096) }, 0);
+    unsafe { File::from_raw_fd(fd) }
+}
+
+/// The test process's stdin, replaced by a memfd for one run and restored
+/// when the run's value is dropped. Detcore takes the guest's stdio identities
+/// from that descriptor.
+struct StdinMemfdSetup {
+    root: tempfile::TempDir,
+    /// The memfd the guest maps, held by the test process above fd 2.
+    mapped: File,
+    /// The memfd now on fd 0: `mapped` on even runs, another on odd.
+    _stdin: File,
+    saved_stdin: std::os::fd::OwnedFd,
+    /// The test process, which holds `mapped` outside the guest.
+    test_pid: u32,
+}
+
+impl Drop for StdinMemfdSetup {
+    fn drop(&mut self) {
+        assert_eq!(
+            unsafe { libc::dup2(self.saved_stdin.as_raw_fd(), libc::STDIN_FILENO) },
+            libc::STDIN_FILENO
+        );
+    }
+}
+
+/// Put a memfd on the test process's fd 0: `mapped` itself on even runs
+/// (counted by `runs`), another memfd on odd runs.
+fn stdin_memfd_setup(runs: &std::sync::atomic::AtomicUsize) -> StdinMemfdSetup {
+    let root = tempfile::tempdir().unwrap();
+    let listed = root.path().join("listed");
+    std::fs::create_dir(&listed).unwrap();
+    for name in ["x", "y", "z"] {
+        File::create(listed.join(name)).unwrap();
+    }
+    let saved_stdin = std::io::stdin().as_fd().try_clone_to_owned().unwrap();
+    let mapped = one_page_memfd(c"mapped");
+    let stdin = if runs
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .is_multiple_of(2)
+    {
+        mapped.try_clone().unwrap()
+    } else {
+        one_page_memfd(c"other")
+    };
+    assert_eq!(
+        unsafe { libc::dup2(stdin.as_raw_fd(), libc::STDIN_FILENO) },
+        libc::STDIN_FILENO
+    );
+    StdinMemfdSetup {
+        root,
+        mapped,
+        _stdin: stdin,
+        saved_stdin,
+        test_pid: std::process::id(),
+    }
+}
+
+/// Map one page of `fd` read-only.
+fn map_page(fd: i32) -> *mut libc::c_void {
+    let addr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            4096,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            fd,
+            0,
+        )
+    };
+    assert_ne!(addr, libc::MAP_FAILED);
+    addr
+}
+
+/// A `/proc/self/maps` line backed by the reader's stdin renders the fixed
+/// stdio inode, but its numbering request is still made. The guest maps the
+/// memfd `mapped`, reads its maps and lists a third
+/// directory. On even runs `mapped` is also the guest's stdin, so its maps
+/// line takes the stdio inode; on odd runs it is numbered by the pool. The
+/// listing's `d_ino` values must not tell the runs apart: whether a mapped
+/// file is the reader's stdin must not decide how many numbering requests a
+/// maps read makes (https://github.com/rrnewton/hermit/issues/2897).
+fn mapped_stdin_guest(setup: &StdinMemfdSetup) {
+    // Detcore's descriptor table admits only fds 0-2 from the tool, so the
+    // guest opens the memfd through the test process's procfs entry to get a
+    // descriptor it tracks.
+    let reopened = File::open(format!(
+        "/proc/{}/fd/{}",
+        setup.test_pid,
+        setup.mapped.as_raw_fd()
+    ))
+    .unwrap();
+    let addr = map_page(reopened.as_raw_fd());
+    let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+    assert!(maps.contains("/memfd:mapped"));
+    let dir = open_dir(&setup.root.path().join("listed"));
+    let listing = read_listing(dir);
+    unsafe { libc::closedir(dir) };
+    assert_eq!(unsafe { libc::munmap(addr, 4096) }, 0);
+    assert_eq!(listing.names, [".", "..", "x", "y", "z"]);
+    println!("listed {:016x}", listing.digest);
+}
+
+#[test]
+fn mapped_stdin_does_not_renumber_a_later_listing() {
+    let runs = std::sync::atomic::AtomicUsize::new(0);
+    run_five_times_on(|| stdin_memfd_setup(&runs), mapped_stdin_guest, true);
+}
+
+/// A mapping of the guest's stdin reports, in `/proc/self/maps`, the inode
+/// that `/proc/self/fdinfo/0` and `fstat(0)` report for that descriptor.
+/// Detcore gives fds 0, 1 and 2 the stat of its own stdin, so all three share
+/// one host identity; the maps line must take fd 0's number, not the number
+/// of whichever descriptor came last.
+fn mapped_stdin_identity_guest(_setup: &StdinMemfdSetup) {
+    let addr = map_page(libc::STDIN_FILENO);
+    let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+    let line = maps
+        .lines()
+        .find(|line| line.contains("/memfd:mapped"))
+        .unwrap_or_else(|| panic!("no maps line for the stdin memfd in:\n{maps}"));
+    let maps_inode: u64 = line.split_whitespace().nth(4).unwrap().parse().unwrap();
+    let fdinfo = std::fs::read_to_string("/proc/self/fdinfo/0").unwrap();
+    let fdinfo_inode: u64 = fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("ino:"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    assert_eq!(unsafe { libc::fstat(libc::STDIN_FILENO, &mut stat) }, 0);
+    assert_eq!(unsafe { libc::munmap(addr, 4096) }, 0);
+    assert_eq!(
+        (maps_inode, stat.st_ino),
+        (fdinfo_inode, fdinfo_inode),
+        "maps, fstat and fdinfo disagree on stdin's inode"
+    );
+    println!("stdin inode {fdinfo_inode}");
+}
+
+#[test]
+fn mapped_stdin_reports_the_inode_fdinfo_reports() {
+    // Every run maps the memfd that is its stdin, so count the runs as even.
+    let runs = std::sync::atomic::AtomicUsize::new(0);
+    run_five_times_on(
+        || {
+            runs.store(0, std::sync::atomic::Ordering::Relaxed);
+            stdin_memfd_setup(&runs)
+        },
+        mapped_stdin_identity_guest,
+        true,
+    );
+}
+
+/// The test process's stdin, replaced by a pipe for one run and restored
+/// when the run's value is dropped.
+struct StdinPipeSetup {
+    _stdin_pipe: [std::os::fd::OwnedFd; 2],
+    saved_stdin: std::os::fd::OwnedFd,
+}
+
+impl Drop for StdinPipeSetup {
+    fn drop(&mut self) {
+        assert_eq!(
+            unsafe { libc::dup2(self.saved_stdin.as_raw_fd(), libc::STDIN_FILENO) },
+            libc::STDIN_FILENO
+        );
+    }
+}
+
+/// Another process's inherited stdin pipe reads as the same `pipe:[N]` link
+/// as the reader's own: the guest forks a child that keeps its stdin, and
+/// reads both `/proc/self/fd/0` and the child's `/proc/<pid>/fd/0`.
+fn stdin_pipe_link_guest(_setup: &StdinPipeSetup) {
+    let mut sync = [0; 2];
+    assert_eq!(unsafe { libc::pipe(sync.as_mut_ptr()) }, 0);
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0, "fork failed");
+    if child == 0 {
+        unsafe {
+            libc::close(sync[1]);
+            let mut byte = 0_u8;
+            let n = libc::read(sync[0], (&raw mut byte).cast(), 1);
+            libc::_exit(if n == 0 { 0 } else { 1 });
+        }
+    }
+    unsafe { libc::close(sync[0]) };
+    let own = std::fs::read_link("/proc/self/fd/0").unwrap();
+    let childs = std::fs::read_link(format!("/proc/{child}/fd/0")).unwrap();
+    unsafe { libc::close(sync[1]) };
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+    assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+    assert_eq!(own, childs, "one stdin pipe, two links");
+    println!("stdin link {own:?}");
+}
+
+#[test]
+fn another_process_stdin_pipe_reads_as_the_readers_own() {
+    run_five_times_on(
+        || {
+            let saved_stdin = std::io::stdin().as_fd().try_clone_to_owned().unwrap();
+            let (read, write) = host_pipe();
+            assert_eq!(
+                unsafe { libc::dup2(read.as_raw_fd(), libc::STDIN_FILENO) },
+                libc::STDIN_FILENO
+            );
+            StdinPipeSetup {
+                _stdin_pipe: [read, write],
+                saved_stdin,
+            }
+        },
+        stdin_pipe_link_guest,
+        true,
+    );
+}

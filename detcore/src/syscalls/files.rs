@@ -2347,6 +2347,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             // from the cached stat only: injecting an fstat here would add
             // syscalls to every maps read and perturb the very traces this
             // change is meant to keep consistent.
+            //
+            // The lowest descriptor wins a shared identity, as in
+            // `deterministic_stdio_inode_for_raw`. Detcore gives all three
+            // inherited descriptors the stat of its own stdin (`setup_stdio`),
+            // so they share one until the guest replaces them; a mapping of
+            // that file is a mapping of fd 0, and must report the 1000 that
+            // fd 0's fdinfo reports, not stderr's 1002.
             let mut stdio_by_raw_inode: BTreeMap<RawInode, DetInode> = BTreeMap::new();
             for fd in libc::STDIN_FILENO..=libc::STDERR_FILENO {
                 let cached = guest
@@ -2358,7 +2365,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .ok()
                     .flatten();
                 if let Some((raw, det)) = cached {
-                    stdio_by_raw_inode.insert(raw, det);
+                    stdio_by_raw_inode.entry(raw).or_insert(det);
                 }
             }
             // One numbering request per file-backed line, in line order

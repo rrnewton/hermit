@@ -250,19 +250,19 @@ fn anonymous_proc_fd_identity(target: &[u8]) -> Option<AnonymousProcFdIdentity> 
 /// Match a raw identity against cached current-process inherited-stdio identities.
 /// Callers exclude ordinary replacement objects before filling this array.
 ///
-/// Iterating in fd order deliberately matches the last-insert-wins behavior of
-/// the maps sanitizer's `stdio_by_raw_inode` table when stdio descriptors alias.
+/// When stdio descriptors alias, the lowest one wins, as in the maps
+/// sanitizer's `stdio_by_raw_inode` table. Detcore gives all three inherited
+/// descriptors the stat of its own stdin, so they alias until the guest
+/// replaces them: a link to that object is a link to fd 0, and must read as
+/// the `pipe:[1000]` a readlink of fd 0 returns.
 fn deterministic_stdio_inode_for_raw(
     raw_inode: RawInode,
     stdio_raw_inodes: &[Option<RawInode>; 3],
 ) -> Option<DetInode> {
-    let mut matched = None;
-    for (fd, cached) in stdio_raw_inodes.iter().enumerate() {
-        if *cached == Some(raw_inode) {
-            matched = deterministic_stdio_inode(fd as i32);
-        }
-    }
-    matched
+    let fd = stdio_raw_inodes
+        .iter()
+        .position(|cached| *cached == Some(raw_inode))?;
+    deterministic_stdio_inode(fd as i32)
 }
 
 fn canonical_anonymous_proc_fd_target(
@@ -770,7 +770,13 @@ mod tests {
         let aliased = [None, Some(raw(55)), Some(raw(55))];
         assert_eq!(
             deterministic_stdio_inode_for_raw(raw(55), &aliased),
-            Some(DetInode::mint(1002))
+            Some(DetInode::mint(1001))
+        );
+        // What `setup_stdio` caches: stdin's identity on all three.
+        let inherited = [Some(raw(66)); 3];
+        assert_eq!(
+            deterministic_stdio_inode_for_raw(raw(66), &inherited),
+            Some(DetInode::mint(1000))
         );
     }
 
