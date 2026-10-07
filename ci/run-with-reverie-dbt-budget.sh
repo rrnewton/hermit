@@ -1137,7 +1137,13 @@ fi
 # or rust-toolchain.toml changes, so the four budget inputs are unchanged.
 # Carry, not recalibration: no new timing sample or >=5-sample replacement
 # claim is made.
-expected_pin=689d7f0bafa7c315450eaa75518274e65b8a13d3
+# CARRY TO 2c86fe0fa14d987d8bf8befb0c3a9ca297814202 (2026-10-07): from
+# 689d7f0bafa7c315450eaa75518274e65b8a13d3. The one commit makes the KVM backend
+# name the execve filename in AT_EXECFN (reverie-kvm only); no file under
+# reverie-dbt, the root Cargo.toml, third-party or rust-toolchain.toml
+# changes, so the four budget inputs are unchanged. Carry, not recalibration:
+# no new timing sample or >=5-sample replacement claim is made.
+expected_pin=2c86fe0fa14d987d8bf8befb0c3a9ca297814202
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
