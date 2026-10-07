@@ -139,9 +139,12 @@ pub struct Config {
     /// filter that traps or kills one signals or kills the guest for a call the program never
     /// made. Detcore then avoids injected syscalls that only make it cheaper (the `fstatfs` that
     /// picks which directory entries are `lstat`ed). False, the default, means no such filter
-    /// can exist. The launcher sets it from the `Seccomp:` line of its own `/proc/self/status`,
-    /// read before any guest exists, and sets it whenever it cannot tell; Detcore never infers
-    /// it.
+    /// can exist. The launcher sets it when the `Seccomp:` line of any of its threads'
+    /// `/proc/self/task/<tid>/status` is not 0 (a filter belongs to the thread that installed it
+    /// unless synchronized, and any thread may start the guest), read before any guest exists,
+    /// and whenever it cannot tell; Detcore never infers it. A caller whose command installs a
+    /// filter in the child itself (a `pre_exec` callback) sets it, and the launcher never clears
+    /// a true.
     #[serde(default)]
     #[clap(skip)]
     pub seccomp_filter_inherited: bool,
