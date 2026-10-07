@@ -2341,8 +2341,8 @@ fn census_activity_bracket(sandbox: &Path) -> Result<Duration, String> {
     let peer = BurnerPeer::spawn(plan)?;
     // The record names the child and this process holds its flock, so the census
     // proves liveness exactly as for a real peer and then measures the child's tree.
-    let record = File::create(dir.join(format!("{}.run", peer.pid)))
-        .map_err(|e| format!("registry: burner record: {e}"))?;
+    let record_path = dir.join(format!("{}.run", peer.pid));
+    let record = File::create(&record_path).map_err(|e| format!("registry: burner record: {e}"))?;
     if !flock_nb(record.as_raw_fd()) {
         return Err("registry: cannot lock the burner peer's record".into());
     }
@@ -2393,6 +2393,18 @@ fn census_activity_bracket(sandbox: &Path) -> Result<Duration, String> {
     // Answers count only from a peer that was alive for all of them: one that died
     // after its last answer would otherwise still pass.
     peer.finish()?;
+    // Removing its record ends a peer, as when a real validation exits.
+    std::fs::remove_file(&record_path).map_err(|e| format!("registry: burner record: {e}"))?;
+    let c = census_peers(&dir, self_pid, &mut prev);
+    if c != (PeerCensus {
+        live: 0,
+        cpu_active: 0,
+        stale_reaped: 0,
+    }) {
+        return Err(format!(
+            "registry: a removed record must not count as a peer, got {c:?}"
+        ));
+    }
     drop(record);
     Ok(window)
 }
@@ -2554,7 +2566,48 @@ impl BurnerPeer {
                 ));
             }
         }
-        // The peer exits right after acknowledging, so this wait is short.
+        // The peer exits right after acknowledging. Its pidfd turns readable when it
+        // does, so this wait has the same deadline as an answer: a peer stopped or
+        // looping after its acknowledgement fails the self-test instead of hanging it.
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, self.pid, 0) };
+        if pidfd < 0 {
+            return Err(format!(
+                "registry: cannot watch the burner peer's exit: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        let pidfd =
+            unsafe { <File as std::os::unix::io::FromRawFd>::from_raw_fd(pidfd as libc::c_int) };
+        let deadline = std::time::Instant::now() + ANSWER_LIMIT;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Err(format!(
+                    "registry: the burner peer acknowledged its stop command but did not \
+                     exit within {ANSWER_LIMIT:?}"
+                ));
+            }
+            let mut exited = libc::pollfd {
+                fd: pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ms = left.as_millis() as libc::c_int + 1;
+            match unsafe { libc::poll(&mut exited, 1, ms) } {
+                0 => continue,
+                n if n < 0 => {
+                    let e = io::Error::last_os_error();
+                    if e.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(format!(
+                        "registry: cannot wait for the burner peer's exit: {e}"
+                    ));
+                }
+                _ => break,
+            }
+        }
+        // It has exited, so this returns at once.
         let mut status = 0;
         while unsafe { libc::waitpid(self.pid, &mut status, 0) } < 0 {
             let e = io::Error::last_os_error();
