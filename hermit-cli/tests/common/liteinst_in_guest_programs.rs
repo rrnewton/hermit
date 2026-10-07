@@ -66,6 +66,7 @@ static EXIT_REAPING_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static UNSCHEDULED_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DUP_ALIAS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLOSE_RANGE_PORT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static IOV_OVERWRITTEN_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_COMPAT_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_SEMANTIC_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_COMPRESSED_FIXTURES: OnceLock<[PathBuf; 2]> = OnceLock::new();
@@ -1725,4 +1726,90 @@ fn liteinst_in_guest_close_range_releases_ports_like_ptrace() {
         outputs[0], outputs[1],
         "in-guest LiteInst differs from ptrace"
     );
+}
+
+/// Under `--verify` a recvmsg whose buffers cannot be observed after the call
+/// still returns the kernel's result to the guest: the buffer digest records
+/// an explicit, compared `unobserved` entry instead of hashing, and the verify
+/// report counts it. A plain receive is hashed as before. In the overwritten
+/// mode the guest's iovec array is its own receive buffer, so the payload
+/// overwrites the iovec with one byte at an unmapped address; before the
+/// entry, the failed read turned the guest's completed recvmsg into EFAULT
+/// under --verify.
+#[test]
+fn verify_digest_records_an_unobservable_recvmsg_and_keeps_the_kernel_result() {
+    let _guard = hermit_run_guard();
+    let guest = c_guest(&IOV_OVERWRITTEN_GUEST, "recvmsg_iov_overwritten_by_payload");
+    let logs = tempfile::tempdir().expect("failed to create the verify-log directory");
+    for (mode, unobservable) in [("plain", false), ("overwritten", true)] {
+        let log_dir = logs.path().join(mode);
+        fs::create_dir(&log_dir).expect("failed to create a verify-log directory");
+        let output = Command::new(hermit_binary())
+            .args([
+                "--log",
+                "info",
+                "--backend",
+                "ptrace",
+                "run",
+                "--strict",
+                "--verify",
+            ])
+            .arg(format!("--epoch={VIRTUAL_TIME_EPOCH}"))
+            .arg("--keep-logs")
+            .arg("--verify-log-dir")
+            .arg(&log_dir)
+            .arg("--")
+            .arg(guest)
+            .arg(mode)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run Hermit");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{mode}: {output:?}");
+        assert!(stderr.contains("Determinism verified"), "{mode}: {stderr}");
+        let buffer = stdout
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("buffer="))
+            .unwrap_or_else(|| panic!("{mode}: {stdout}"));
+        let expected_stdout = format!(
+            "buffer={buffer} received=16 overwritten={}\n",
+            u8::from(unobservable)
+        );
+        assert_eq!(stdout, expected_stdout, "{mode}");
+        let hashed = format!("recvmsg in fd=4 {buffer}+16->");
+        let marker = "recvmsg in fd=4 unobserved ret=16 reason=iovec-short covered=1";
+        let counted = "unobservable after the call (compared as 'unobserved' buffer-digest entries): run1=1, run2=1";
+        let golden: Vec<PathBuf> = fs::read_dir(&log_dir)
+            .expect("failed to read the retained verify logs")
+            .map(|entry| entry.expect("failed to read a retained log").path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("run1_log_"))
+            })
+            .collect();
+        assert_eq!(golden.len(), 1, "{mode}: {golden:?}");
+        let log = fs::read_to_string(&golden[0]).expect("failed to read the retained log");
+        let digests: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("[iobuf]") && line.contains("recvmsg in"))
+            .collect();
+        if unobservable {
+            assert!(
+                digests.len() == 1 && digests[0].contains(marker),
+                "{mode}: expected one {marker:?} entry: {digests:?}"
+            );
+            assert!(stderr.contains(counted), "{mode}: {stderr}");
+        } else {
+            assert!(
+                digests.len() == 1 && digests[0].contains(&hashed),
+                "{mode}: expected {hashed:?}: {digests:?}"
+            );
+            assert!(
+                !stderr.contains("unobservable after the call"),
+                "{mode}: {stderr}"
+            );
+        }
+    }
 }

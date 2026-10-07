@@ -129,6 +129,25 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
+/// The number of `unobserved` recvmsg buffer-digest entries in a verify log,
+/// or `None` if the log cannot be read.
+fn unobserved_receive_entries(path: &Path) -> Option<usize> {
+    use std::io::BufRead;
+    let log = std::io::BufReader::new(fs::File::open(path).ok()?);
+    let mut count = 0;
+    for line in log.split(b'\n') {
+        let line = line.ok()?;
+        let line = String::from_utf8_lossy(&line);
+        if line.contains("[iobuf]")
+            && line.contains(" recvmsg in ")
+            && line.contains(" unobserved ret=")
+        {
+            count += 1;
+        }
+    }
+    Some(count)
+}
+
 fn read_verify_summary(path: &Path) -> Option<RunSummary> {
     match fs::read(path)
         .with_context(|| format!("reading verification run summary {}", path.display()))
@@ -6475,6 +6494,19 @@ impl RunOpts {
         }
 
         signal_reports.prepare("run 2", out2.status, &log2_path);
+
+        // A recvmsg whose buffers could not be observed after the call is
+        // logged as an `unobserved` buffer-digest entry and compared like any
+        // other; name how many there were, so the gap is never silent.
+        let unobserved = [&log1_path, &log2_path].map(|path| unobserved_receive_entries(path));
+        if unobserved.iter().any(|count| *count != Some(0)) {
+            let shown =
+                unobserved.map(|count| count.map_or("unreadable".to_string(), |n| n.to_string()));
+            eprintln!(
+                ":: recvmsg calls whose buffers were unobservable after the call (compared as 'unobserved' buffer-digest entries): run1={}, run2={}",
+                shown[0], shown[1]
+            );
+        }
 
         // Say what was actually established. Buffer hashing is ON BY DEFAULT, so
         // this qualification is now reachable only when the caller has asked for

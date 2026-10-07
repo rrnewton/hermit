@@ -1340,7 +1340,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retain all 1068: 1075, measured with cargo nextest list --profile ci.
     // an_exit_that_names_another_process_installs_no_hold retains all 1075:
     // 1076, measured with cargo nextest list --profile ci.
-    ("test.detcore_unit", 1076),
+    // The four recvmsg unobserved-digest tests (header, short iovec, unreadable buffer, other calls still fail) retain all 1076: 1080, re-listed.
+    ("test.detcore_unit", 1080),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1668,7 +1669,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run_dbt_fails_when_a_forked_child_ends_on_a_backend_failure_before_exec and
     // run_dbt_verify_keeps_the_diagnostic_of_a_backend_failure retain all 205:
     // 209.
-    ("test.cli", 209),
+    // verify_digest_records_an_unobservable_recvmsg_and_keeps_the_kernel_result retains all 209: 210, re-listed. It starts no LiteInst guest, so test.cli_on_host selects it too.
+    ("test.cli", 210),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -1801,7 +1803,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // filterset is unchanged: 205 - 39 = 166, listed the same way.
     // The same four unreadable-page and DBT backend-failure tests start no
     // in-guest LiteInst guest, so the filterset is unchanged: 209 - 39 = 170.
-    ("test.cli_on_host", 170),
+    // The host twin selects the unobserved-digest verify test too: 171.
+    ("test.cli_on_host", 171),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 54),
@@ -1866,7 +1869,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the seven SIGCHLD Phase A scheduler tests listed for
     // test.detcore_unit, re-listed with the host twin's selection: 1075.
     // And an_exit_that_names_another_process_installs_no_hold, re-listed: 1076.
-    ("test.detcore_unit_on_host", 1076),
+    // The host twin selects the four unobserved-digest tests too: 1080.
+    ("test.detcore_unit_on_host", 1080),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

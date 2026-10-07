@@ -694,20 +694,67 @@ where
         Some(fd) => fd.to_string(),
         None => "-".to_string(),
     };
+    // A recvmsg's buffers are found by re-reading its msghdr after the call,
+    // and Linux lets the receive's own output overwrite that header. When the
+    // re-read, a buffer read, or the re-read iovec's coverage of the returned
+    // length fails, the call's bytes cannot be observed. That is recorded as
+    // an explicit, compared `unobserved` entry, and the guest still gets the
+    // kernel's result: the instrumentation must never change the guest's
+    // execution. Other calls keep failing on an observation error.
+    let unobserved = |reason: String| {
+        crate::detlog!(
+            "[iobuf][dtid {}] {} {} fd={} unobserved ret={} reason={}",
+            dettid,
+            name,
+            dir,
+            fd,
+            ret,
+            reason
+        );
+    };
+    let receive = match call {
+        Syscall::Recvmsg(receive) => Some(*receive),
+        _ => None,
+    };
     let moved_extents = {
         let memory = guest.memory();
-        observed_extents(&memory, call, ret, rng_output)?
+        match observed_extents(&memory, call, ret, rng_output) {
+            Ok(extents) => extents,
+            Err(_) if receive.is_some() => {
+                unobserved("header-or-iovec-unreadable".to_string());
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
     };
+    if let Some(receive) = receive {
+        // Without MSG_TRUNC, Linux returns at most what the iovec it
+        // imported holds. A re-read iovec that holds less was overwritten.
+        // With MSG_TRUNC a datagram returns its full length, so the check
+        // cannot be made.
+        let covered: u64 = moved_extents.iter().map(|extent| extent.len).sum();
+        if receive.flags() & libc::MSG_TRUNC == 0 && covered < ret as u64 {
+            unobserved(format!("iovec-short covered={covered}"));
+            return Ok(());
+        }
+    }
     let records = matches!(call, Syscall::Getdents64(_));
     for extent in moved_extents {
-        let (whole, chunk, chunks, unread) = extent_digests(
+        let digests = extent_digests(
             guest,
             extent.addr,
             extent.len,
             rng_output.is_some(),
             records,
-        )
-        .map_err(|error| {
+        );
+        if digests.is_err() && receive.is_some() {
+            unobserved(format!(
+                "buffer-unreadable at={:#x}+{}",
+                extent.addr, extent.len
+            ));
+            return Ok(());
+        }
+        let (whole, chunk, chunks, unread) = digests.map_err(|error| {
             if rng_output.is_some() {
                 Error::Tool(anyhow::Error::new(error).context(format!(
                     "RNG vector observation after output commit: digest read at {:#x}+{}",
@@ -2146,6 +2193,118 @@ mod event_tests {
             assert_eq!(guest.injected_zero_reads, usize::from(fd == FD));
             assert!(guest.memory.1.lock().unwrap().observer_reads.is_empty());
         }
+    }
+
+    /// The guest's msghdr for the recvmsg digest tests: one iovec array at
+    /// `iov` with `count` entries.
+    const MSG: usize = 0x3800;
+    /// Outside the event arena, so a read there fails.
+    const UNMAPPED: usize = 0x9000;
+
+    fn recvmsg_with_iov(memory: &EventMemory, iov: usize, count: usize, flags: i32) -> Syscall {
+        let mut bytes = memory.0.lock().unwrap();
+        bytes[MSG..MSG + 56].fill(0);
+        bytes[MSG + 16..MSG + 24].copy_from_slice(&iov.to_ne_bytes());
+        bytes[MSG + 24..MSG + 32].copy_from_slice(&count.to_ne_bytes());
+        drop(bytes);
+        reverie::syscalls::Recvmsg::new()
+            .with_sockfd(FD)
+            .with_msg(AddrMut::from_raw(MSG))
+            .with_flags(flags)
+            .into()
+    }
+
+    fn digest(guest: &mut EventGuest, call: &Syscall, ret: i64) -> Result<(), Error> {
+        detlog_io_buffers::<EventGuest, Detcore>(guest, call, ret, DetTid::from_raw(1), None)
+    }
+
+    fn assert_unobserved(message: &str, ret: i64, reason: &str) {
+        let expected =
+            format!("[iobuf][dtid 1] recvmsg in fd={FD} unobserved ret={ret} reason={reason}");
+        assert!(
+            message.contains(&expected),
+            "expected {expected}, got {message}"
+        );
+    }
+
+    /// A recvmsg whose header (here its iovec array) cannot be re-read after
+    /// the call records an `unobserved` entry and does not fail: the guest
+    /// keeps the kernel's result.
+    #[test]
+    fn an_unreadable_recvmsg_header_is_recorded_as_unobserved() {
+        let logs = BufferLog::default();
+        let _subscriber = tracing::subscriber::set_default(logs.clone());
+        let (_tool, mut guest) = event_guest(FdType::Socket, None);
+        let memory = guest.memory.clone();
+        let call = recvmsg_with_iov(&memory, UNMAPPED, 1, 0);
+        digest(&mut guest, &call, 4).unwrap();
+        let messages = logs.0.lock().unwrap();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert_unobserved(&messages[0], 4, "header-or-iovec-unreadable");
+    }
+
+    /// Without MSG_TRUNC, a re-read iovec that holds fewer bytes than the
+    /// call returned was overwritten, so the call is unobserved. With
+    /// MSG_TRUNC a datagram returns its full length, so the copied prefix is
+    /// hashed as before.
+    #[test]
+    fn a_recvmsg_iovec_short_of_the_return_is_unobserved_unless_msg_trunc() {
+        let logs = BufferLog::default();
+        let _subscriber = tracing::subscriber::set_default(logs.clone());
+        let (_tool, mut guest) = event_guest(FdType::Socket, None);
+        let memory = guest.memory.clone();
+        memory.put_iovec(0, FIRST_DEST, 1);
+        let call = recvmsg_with_iov(&memory, IOV, 1, 0);
+        digest(&mut guest, &call, 16).unwrap();
+        {
+            let messages = logs.0.lock().unwrap();
+            assert_eq!(messages.len(), 1, "{messages:?}");
+            assert_unobserved(&messages[0], 16, "iovec-short covered=1");
+        }
+        logs.0.lock().unwrap().clear();
+        let call = recvmsg_with_iov(&memory, IOV, 1, libc::MSG_TRUNC);
+        digest(&mut guest, &call, 16).unwrap();
+        let messages = logs.0.lock().unwrap();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert_named_extent(&messages[0], "recvmsg", FIRST_DEST, &[CANARY; 1]);
+    }
+
+    /// A buffer that cannot be read keeps the lines hashed before it and ends
+    /// with an `unobserved` entry naming it.
+    #[test]
+    fn an_unreadable_recvmsg_buffer_ends_its_digest_with_unobserved() {
+        let logs = BufferLog::default();
+        let _subscriber = tracing::subscriber::set_default(logs.clone());
+        let (_tool, mut guest) = event_guest(FdType::Socket, None);
+        let memory = guest.memory.clone();
+        memory.put_iovec(0, FIRST_DEST, 2);
+        memory.put_iovec(1, UNMAPPED, 8);
+        let call = recvmsg_with_iov(&memory, IOV, 2, 0);
+        digest(&mut guest, &call, 6).unwrap();
+        let messages = logs.0.lock().unwrap();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_named_extent(&messages[0], "recvmsg", FIRST_DEST, &[CANARY; 2]);
+        assert_unobserved(
+            &messages[1],
+            6,
+            &format!("buffer-unreadable at={UNMAPPED:#x}+4"),
+        );
+    }
+
+    /// Only recvmsg is recorded as unobserved; another call's observation
+    /// error still fails, as before.
+    #[test]
+    fn other_observation_errors_still_fail() {
+        let logs = BufferLog::default();
+        let _subscriber = tracing::subscriber::set_default(logs.clone());
+        let (_tool, mut guest) = event_guest(FdType::Socket, None);
+        let call: Syscall = reverie::syscalls::Readv::new()
+            .with_fd(FD)
+            .with_iov(Addr::from_raw(UNMAPPED))
+            .with_len(1)
+            .into();
+        assert!(digest(&mut guest, &call, 4).is_err());
+        assert!(logs.0.lock().unwrap().is_empty());
     }
 }
 

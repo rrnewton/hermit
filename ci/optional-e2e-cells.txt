@@ -58,7 +58,6 @@ c-programs/sched-yield-progress verify sabre
 c-programs/sigmask-preemption verify sabre
 c-programs/signal-waitstatus-identity verify dbt
 c-programs/sigtimedwait-timeout-0s verify sabre
-c-programs/socket-timestamp-edge-cases verify ptrace
 c-programs/splice-enosys verify dbt
 c-programs/statmount-enosys verify dbt
 c-programs/syscall-file-metadata verify kvm
