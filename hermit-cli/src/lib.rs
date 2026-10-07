@@ -2610,8 +2610,18 @@ async fn run_kvm(
     backend
         .set_ids_per_task(reverie::task_ids::HERMIT_PTRACE_IDS_PER_TASK)
         .map_err(|error| anyhow!("failed to configure KVM task IDs: {error}"))?;
+    // The ptrace launcher execs the path `find_program` resolved, so that is
+    // the filename Linux records in AT_EXECFN and copies to the top of the
+    // stack, including for a `#!` script whose argv now starts with the
+    // interpreter.
     backend
-        .install_static_elf_with_context(&image, &argv, &envp, &cwd)
+        .install_static_elf_with_exec_context(
+            &image,
+            resolved_program.as_os_str(),
+            &argv,
+            &envp,
+            &cwd,
+        )
         .map_err(|error| anyhow!("failed to load KVM guest executable {program:?}: {error}"))?;
     backend
         .set_random_seed(random_seed)

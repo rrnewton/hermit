@@ -4343,6 +4343,77 @@ fn run_kvm_numbers_guest_tasks_as_the_ptrace_backend() {
     }
 }
 
+/// KVM names the filename execve was given in AT_EXECFN, as Linux does
+/// under ptrace: a `#!` script's own path even though its argv now starts with
+/// the interpreter, the PATH-resolved name `env` execs, and a relative script
+/// name exactly as written. Linux copies that filename to the top of the
+/// stack, so naming argv[0] instead also moves every stack address the guest
+/// sees; AT_RANDOM, which lies just below the strings, shows it.
+#[test]
+fn run_kvm_names_the_execve_filename_in_at_execfn_as_ptrace_does() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping KVM AT_EXECFN: /dev/kvm is unavailable");
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let root = process_build_root("kvm-at-execfn");
+    fs::create_dir_all(root.join("sub")).expect("failed to create the AT_EXECFN scripts");
+    let write_script = |path: &Path, body: &str| {
+        fs::write(path, body).expect("failed to write an AT_EXECFN script");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+            .expect("failed to make an AT_EXECFN script executable");
+    };
+    // ld.so prints the auxiliary vector under LD_SHOW_AUXV.
+    write_script(&root.join("sub/inner.sh"), "#!/bin/true\n");
+    let outer = root.join("outer.sh");
+    write_script(
+        &outer,
+        &format!(
+            "#!/bin/bash\ncd {}\n\
+             LD_SHOW_AUXV=1 env true | grep -E 'AT_EXECFN|AT_RANDOM'\n\
+             LD_SHOW_AUXV=1 ./sub/inner.sh | grep -E 'AT_EXECFN|AT_RANDOM'\n",
+            root.display()
+        ),
+    );
+    let inner = root.join("sub/inner.sh");
+    let inner = inner.to_str().expect("script path should be UTF-8");
+    let outer = outer.to_str().expect("script path should be UTF-8");
+
+    // The initial launch of a script, then a script's in-guest execs.
+    let mut execfns = Vec::new();
+    for launch in [vec!["--env=LD_SHOW_AUXV=1", "--", inner], vec!["--", outer]] {
+        let mut outputs = Vec::new();
+        for backend in ["--backend=ptrace", "--backend=kvm"] {
+            let mut args = vec![backend, "run", "--strict"];
+            args.extend(&launch);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            outputs.push(stdout(&output));
+        }
+        assert_eq!(
+            outputs[1], outputs[0],
+            "KVM vs ptrace auxiliary vectors of {launch:?}"
+        );
+        execfns.extend(
+            outputs[1]
+                .lines()
+                .filter_map(|line| line.strip_prefix("AT_EXECFN:"))
+                .map(|execfn| execfn.trim().to_owned()),
+        );
+    }
+    assert_eq!(execfns.len(), 4, "AT_EXECFN entries: {execfns:?}");
+    assert_eq!(execfns[0], inner);
+    assert!(
+        execfns[1].starts_with('/') && execfns[1].ends_with("/env"),
+        "{execfns:?}"
+    );
+    assert!(
+        execfns[2].starts_with('/') && execfns[2].ends_with("/true"),
+        "{execfns:?}"
+    );
+    assert_eq!(execfns[3], "./sub/inner.sh");
+}
+
 #[test]
 fn run_kvm_executes_dynamic_guest() {
     if !Path::new("/dev/kvm").exists() {

@@ -18548,7 +18548,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // retirement and six-mode reparenting tests each count as one
         // selected test. run_kvm_numbers_guest_tasks_as_the_ptrace_backend
         // makes 53 declarations, 54 selected.
-        ("privileged-only-test.cli_kvm", 54usize),
+        ("privileged-only-test.cli_kvm", 55usize),
     ] {
         let step = privileged
             .steps
