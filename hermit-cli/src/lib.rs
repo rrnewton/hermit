@@ -3532,11 +3532,75 @@ pub fn run_with_backend_timeout(
     backend: Backend,
     timeout: Option<Duration>,
 ) -> Result<ExitStatus, Error> {
+    run_with_backend_deadline(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+        timeout.map(RunDeadline::starting_now),
+    )
+}
+
+/// When a run's wall-clock bound ends: the instant it was measured to, and
+/// the bound as the caller spelled it, which [`GuestTimedOut`] reports. The
+/// CLI measures it before it asks the launcher's seccomp question
+/// ([`LauncherSeccompAnswer::ask_within`]), so that the question's probe
+/// child counts against the bound and cannot make a run outlive it (Codex
+/// review round 11 of https://github.com/rrnewton/hermit/pull/3255). Like the
+/// bound it carries, it is not part of `DetConfig`.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunDeadline {
+    at: Instant,
+    limit: Duration,
+}
+
+impl RunDeadline {
+    /// A bound of `limit` measured from now. A bound past what an `Instant`
+    /// can hold ends 30 years from now, as a Tokio timeout does.
+    pub fn starting_now(limit: Duration) -> Self {
+        let now = Instant::now();
+        let at = now
+            .checked_add(limit)
+            .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365 * 30));
+        Self { at, limit }
+    }
+
+    /// The bound as the caller spelled it.
+    pub fn limit(self) -> Duration {
+        self.limit
+    }
+
+    /// The instant the bound ends.
+    pub fn at(self) -> Instant {
+        self.at
+    }
+
+    /// Whether the bound has ended.
+    pub fn has_passed(self) -> bool {
+        Instant::now() >= self.at
+    }
+}
+
+/// [`run_with_backend_timeout`] with the bound measured to `deadline`, which
+/// the caller may have started before calling this: the CLI starts it before
+/// it asks the launcher's seccomp question, whose probe child counts against
+/// the bound.
+#[doc(hidden)]
+pub fn run_with_backend_deadline(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+    deadline: Option<RunDeadline>,
+) -> Result<ExitStatus, Error> {
     if backend == Backend::Ptrace {
         let summary_path = print_summary_to_json_file.clone();
-        return ptrace_completion::run(timeout, move |control| async move {
+        return ptrace_completion::run_until(deadline, move |control| async move {
             let report = SkidOvershootReport::begin(true);
-            let config = prepare_run_config(config, backend);
+            let config = prepare_run_config(config, backend, deadline);
             let result = dispatch_backend(
                 command,
                 config,
@@ -3553,14 +3617,14 @@ pub fn run_with_backend_timeout(
     if backend == Backend::Kvm {
         ensure_kvm_stdin_reserved()?;
     }
-    let config = prepare_run_config(config, backend);
+    let config = prepare_run_config(config, backend, deadline);
     let result = run_with_backend_inner(
         command,
         config,
         print_summary,
         print_summary_to_json_file,
         backend,
-        timeout,
+        deadline,
     );
     skid_overshoot_report.finish(result)
 }
@@ -3694,8 +3758,13 @@ fn parse_controlling_terminal_device(stat: &str) -> Option<i64> {
 /// [`prepare_backend_config`] plus what only the launching process can observe
 /// about itself. Every run entry point prepares its config here; the DBT config
 /// tests call `prepare_backend_config` directly, so their bytes do not depend
-/// on the host that runs them.
-fn prepare_run_config(config: DetConfig, backend: Backend) -> DetConfig {
+/// on the host that runs them. A probe child forked to ask the seccomp
+/// question is waited for no later than `deadline`, the run's bound.
+fn prepare_run_config(
+    config: DetConfig,
+    backend: Backend,
+    deadline: Option<RunDeadline>,
+) -> DetConfig {
     let mut config = prepare_backend_config(config, backend);
     // A seccomp filter is inherited across fork and exec and can never be
     // removed, so a filter on the thread that starts a guest is on that guest,
@@ -3706,8 +3775,8 @@ fn prepare_run_config(config: DetConfig, backend: Backend) -> DetConfig {
     // asked before the container this runs in was cloned from this thread, is
     // used instead of asking here (see `held_launcher_seccomp_answer`).
     if !config.seccomp_may_refuse_entry_lookup_syscalls {
-        config.seccomp_may_refuse_entry_lookup_syscalls =
-            held_launcher_seccomp_answer().unwrap_or_else(seccomp_may_refuse_entry_lookup_syscalls);
+        config.seccomp_may_refuse_entry_lookup_syscalls = held_launcher_seccomp_answer()
+            .unwrap_or_else(|| seccomp_may_refuse_entry_lookup_syscalls(deadline));
     }
     config
 }
@@ -3819,20 +3888,29 @@ impl HeldSeccompAnswer {
 #[doc(hidden)]
 #[must_use = "the answer is held only while the guard lives"]
 pub struct LauncherSeccompAnswer {
-    /// Only [`LauncherSeccompAnswer::ask`] makes a guard, so every drop
+    /// Only [`LauncherSeccompAnswer::ask_within`] (which
+    /// [`LauncherSeccompAnswer::ask`] calls) makes a guard, so every drop
     /// releases a hold; the raw pointer type keeps the guard on its thread.
     _held: std::marker::PhantomData<*const ()>,
 }
 
 impl LauncherSeccompAnswer {
     /// Ask now and hold the answer on this thread until the guard is
-    /// dropped.
+    /// dropped. A probe child is waited for at most
+    /// [`ENTRY_LOOKUP_PROBE_BOUND`].
     pub fn ask() -> Self {
+        Self::ask_within(None)
+    }
+
+    /// [`LauncherSeccompAnswer::ask`] for a run bounded by `deadline`: a
+    /// probe child is waited for no later than the deadline, so that asking
+    /// cannot make the run outlive its bound.
+    pub fn ask_within(deadline: Option<RunDeadline>) -> Self {
         // Read before asking: a filter that another thread synchronizes onto
         // this one meanwhile (`SECCOMP_FILTER_FLAG_TSYNC`) then makes the state
         // at use differ from the one recorded, which sets the answer aside.
         let asked_under = this_thread_seccomp_status();
-        let answer = seccomp_may_refuse_entry_lookup_syscalls();
+        let answer = seccomp_may_refuse_entry_lookup_syscalls(deadline);
         HELD_LAUNCHER_SECCOMP_ANSWER.with(|held| {
             held.answer.hold(answer);
             // The latest state: filters are only added, and a true held from
@@ -3923,22 +4001,45 @@ fn held_answer_applies(asked_under: Option<SeccompStatus>, now: Option<SeccompSt
 /// 3. Otherwise a child forked from this thread, which inherits exactly this
 ///    thread's filters, makes the calls themselves
 ///    ([`entry_lookup_probe_child`]); false only when it exits normally with
-///    status 0. A child that a filter killed or trapped, a call that failed
-///    (the child's own preparation included), a fork that failed, and a
-///    child that cannot be waited for all answer true.
+///    status 0 within [`entry_lookup_probe_bound`]. A child that a filter
+///    killed or trapped, a call that failed (the child's own preparation
+///    included), a fork that failed, a child that cannot be waited for, and a
+///    child still running at the bound, which is killed and reaped, all
+///    answer true.
 ///
 /// A thread that exits while its status is listed is skipped; any other
 /// failure to read answers true: the answer only lets Detcore make calls it
 /// could otherwise do without, so not knowing must mean not making them. What
 /// this cannot see is named on the field.
-fn seccomp_may_refuse_entry_lookup_syscalls() -> bool {
+fn seccomp_may_refuse_entry_lookup_syscalls(deadline: Option<RunDeadline>) -> bool {
     may_refuse_entry_lookup_syscalls(
         launcher_seccomp(
             Path::new("/proc/self/task"),
             Path::new("/proc/thread-self/status"),
         ),
-        entry_lookup_syscalls_succeed_in_a_child,
+        || entry_lookup_syscalls_succeed_in_a_child(entry_lookup_probe_bound(deadline)),
     )
+}
+
+/// How long the launcher waits for its probe child when no run bound ends
+/// sooner. The child makes seven system calls on `/`, which take
+/// microseconds; even on a host whose load average is in the hundreds a fork,
+/// those calls and an exit take milliseconds. A child still running after 10
+/// seconds is waiting for something that may never come: a
+/// `SECCOMP_RET_USER_NOTIF` filter whose supervisor does not answer holds a
+/// call until it does (Codex review round 11 of
+/// https://github.com/rrnewton/hermit/pull/3255). Ten seconds keeps such a
+/// run's delay short enough to notice beside its warning, and well inside a
+/// test harness's per-test limit.
+const ENTRY_LOOKUP_PROBE_BOUND: Duration = Duration::from_secs(10);
+
+/// How long a probe child asked now may run: [`ENTRY_LOOKUP_PROBE_BOUND`], or
+/// what remains of the run's bound `deadline` when that is less.
+fn entry_lookup_probe_bound(deadline: Option<RunDeadline>) -> Duration {
+    let remaining = deadline.map_or(ENTRY_LOOKUP_PROBE_BOUND, |deadline| {
+        deadline.at().saturating_duration_since(Instant::now())
+    });
+    remaining.min(ENTRY_LOOKUP_PROBE_BOUND)
 }
 
 /// [`seccomp_may_refuse_entry_lookup_syscalls`] given what the threads report,
@@ -4045,21 +4146,29 @@ fn launcher_seccomp(tasks: &Path, own_status: &Path) -> LauncherSeccomp {
 }
 
 /// Whether a child of the calling thread made the calls of
-/// [`entry_lookup_probe_child`] and exited normally with status 0.
-fn entry_lookup_syscalls_succeed_in_a_child() -> bool {
+/// [`entry_lookup_probe_child`] and exited normally with status 0 within
+/// `bound`.
+fn entry_lookup_syscalls_succeed_in_a_child(bound: Duration) -> bool {
     matches!(
-        entry_lookup_probe_status(),
+        entry_lookup_probe_status(bound),
         Some(status) if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
     )
 }
 
 /// Fork a child of the calling thread that runs [`entry_lookup_probe_child`]
-/// on a descriptor of `/`, and return its wait status. `None` when the
-/// descriptor cannot be opened, the fork fails, or the child cannot be waited
-/// for, as when this process ignores `SIGCHLD` (Hermit never changes that
-/// disposition, so it is the one Hermit inherited) and the kernel reaps the
-/// child itself (`ECHILD`).
-fn entry_lookup_probe_status() -> Option<libc::c_int> {
+/// on a descriptor of `/`, and return its wait status if it ends within
+/// `bound`. `None` when `bound` is zero (nothing is forked), the descriptor
+/// cannot be opened, the fork fails, the child cannot be waited for, as when
+/// this process ignores `SIGCHLD` (Hermit never changes that disposition, so
+/// it is the one Hermit inherited) and the kernel reaps the child itself
+/// (`ECHILD`), or the child is still running at `bound`: then it is killed
+/// with `SIGKILL`, which ends a call a seccomp supervisor holds, reaped, and
+/// named in a warning (see [`wait_for_probe_child`]).
+fn entry_lookup_probe_status(bound: Duration) -> Option<libc::c_int> {
+    if bound.is_zero() {
+        return None;
+    }
+    let deadline = Instant::now() + bound;
     // SAFETY: sysconf has no preconditions.
     let page_len = match usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }) {
         Ok(len) if len >= PROBE_STATX_OFFSET + std::mem::size_of::<libc::statx>() => len,
@@ -4087,24 +4196,78 @@ fn entry_lookup_probe_status() -> Option<libc::c_int> {
     let status = if pid < 0 {
         None
     } else {
-        let mut status = 0;
-        loop {
-            // SAFETY: waits for the child forked above into a valid out
-            // pointer.
-            let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-            if waited == pid {
-                break Some(status);
-            }
-            if waited == -1 && std::io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
-            {
-                continue;
-            }
-            break None;
-        }
+        wait_for_probe_child(pid, bound, deadline)
     };
     // SAFETY: closes the descriptor opened above, which nothing else uses.
     unsafe { libc::close(dirfd) };
     status
+}
+
+/// Wait for the probe child `pid` until `deadline`, `bound` after it was
+/// forked, polling with `WNOHANG` at intervals that grow from 100
+/// microseconds to 10 milliseconds. Its wait status, or `None` when it cannot
+/// be waited for or is still running at the deadline. A child still running
+/// is killed with `SIGKILL` and reaped, so that no child outlives the
+/// question, and a warning names the filters this thread carries, which every
+/// guest of this thread inherits.
+fn wait_for_probe_child(
+    pid: libc::pid_t,
+    bound: Duration,
+    deadline: Instant,
+) -> Option<libc::c_int> {
+    let mut pause = Duration::from_micros(100);
+    loop {
+        let mut status = 0;
+        // SAFETY: polls the child forked by the caller into a valid out
+        // pointer.
+        let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if waited == pid {
+            return Some(status);
+        }
+        if waited == -1 {
+            if std::io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return None;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        std::thread::sleep(pause.min(deadline - now));
+        pause = (pause * 2).min(Duration::from_millis(10));
+    }
+    // SAFETY: the child has not been reaped (the last wait returned 0), so
+    // `pid` still names it.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    loop {
+        let mut status = 0;
+        // SAFETY: reaps the child killed above into a valid out pointer.
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if waited == -1 && std::io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        break;
+    }
+    let filters = match this_thread_seccomp_status() {
+        Some(SeccompStatus {
+            mode: Some(mode),
+            filters: Some(filters),
+        }) => format!("Seccomp: {mode}, Seccomp_filters: {filters}"),
+        Some(SeccompStatus {
+            mode: Some(mode), ..
+        }) => format!("Seccomp: {mode}"),
+        _ => "unreadable".to_string(),
+    };
+    proc_mount::write_warning(&format!(
+        "hermit: warning: the seccomp probe child did not exit within {} ms and was killed. \
+         A seccomp filter of this thread ({filters}), which every guest it starts inherits, \
+         kept one of the child's system calls waiting, as a SECCOMP_RET_USER_NOTIF filter \
+         does when its supervisor does not answer; Detcore will not inject fstatfs, mmap, \
+         statx or munmap while it lists a directory in this run.\n",
+        bound.as_millis()
+    ));
+    None
 }
 
 /// Where [`entry_lookup_probe_child`] puts the `statx` buffer in its page,
@@ -4375,16 +4538,22 @@ impl std::error::Error for GuestTimedOut {}
 /// synchronous stalls must own external supervision; the CLI arms its own
 /// separate init-process fallback before invoking the library. Ordinary ptrace
 /// uses the retained whole-operation driver instead of cancelling this future.
-async fn with_run_deadline<F>(timeout: Option<Duration>, guest: F) -> Result<ExitStatus, Error>
+async fn with_run_deadline<F>(deadline: Option<RunDeadline>, guest: F) -> Result<ExitStatus, Error>
 where
     F: std::future::Future<Output = Result<ExitStatus, Error>>,
 {
-    match timeout {
+    match deadline {
         None => guest.await,
-        Some(limit) => match tokio::time::timeout(limit, guest).await {
-            Ok(result) => result,
-            Err(_) => Err(Error::new(GuestTimedOut { limit })),
-        },
+        Some(deadline) => {
+            match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline.at()), guest)
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(Error::new(GuestTimedOut {
+                    limit: deadline.limit(),
+                })),
+            }
+        }
     }
 }
 
@@ -4395,9 +4564,9 @@ async fn run_with_backend_inner(
     print_summary: bool,
     print_summary_to_json_file: &Option<PathBuf>,
     backend: Backend,
-    timeout: Option<Duration>,
+    deadline: Option<RunDeadline>,
 ) -> Result<ExitStatus, Error> {
-    refuse_in_guest_liteinst_timeout(backend, timeout)?;
+    refuse_in_guest_liteinst_timeout(backend, deadline.map(RunDeadline::limit))?;
     // Keep the large backend future off the container supervisor's stack
     // before the deadline and Tokio wrappers capture it. Polling and dropping
     // stay inline, including the backend teardown on timeout.
@@ -4409,7 +4578,7 @@ async fn run_with_backend_inner(
         backend,
         None,
     ));
-    with_run_deadline(timeout, guest).await
+    with_run_deadline(deadline, guest).await
 }
 
 async fn dispatch_backend(
@@ -4595,13 +4764,34 @@ pub fn run_with_output_backend_timeout(
     backend: Backend,
     timeout: Option<Duration>,
 ) -> Result<Output, Error> {
+    run_with_output_backend_deadline(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+        timeout.map(RunDeadline::starting_now),
+    )
+}
+
+/// [`run_with_output_backend_timeout`] with the bound measured to `deadline`,
+/// as [`run_with_backend_deadline`] is.
+#[doc(hidden)]
+pub fn run_with_output_backend_deadline(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+    deadline: Option<RunDeadline>,
+) -> Result<Output, Error> {
     if backend == Backend::Ptrace {
         let summary_path = print_summary_to_json_file.clone();
-        return ptrace_completion::run(timeout, move |control| async move {
+        return ptrace_completion::run_until(deadline, move |control| async move {
             let report = SkidOvershootReport::begin(true);
             let result = dispatch_output_backend(
                 command,
-                prepare_run_config(config, backend),
+                prepare_run_config(config, backend, deadline),
                 print_summary,
                 &summary_path,
                 backend,
@@ -4611,13 +4801,13 @@ pub fn run_with_output_backend_timeout(
             report.finish(result)
         });
     }
-    let (output, skid_overshoots) = run_with_output_backend_timeout_and_skid_overshoots(
+    let (output, skid_overshoots) = run_with_output_backend_deadline_and_skid_overshoots(
         command,
         config,
         print_summary,
         print_summary_to_json_file,
         backend,
-        timeout,
+        deadline,
     )?;
     if skid_overshoots > 0 {
         return Err(Error::new(SkidOvershootError::new(skid_overshoots)));
@@ -4638,13 +4828,31 @@ pub fn run_with_output_backend_timeout_and_skid_overshoots(
     backend: Backend,
     timeout: Option<Duration>,
 ) -> Result<(Output, u64), Error> {
+    run_with_output_backend_deadline_and_skid_overshoots(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+        timeout.map(RunDeadline::starting_now),
+    )
+}
+
+fn run_with_output_backend_deadline_and_skid_overshoots(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+    deadline: Option<RunDeadline>,
+) -> Result<(Output, u64), Error> {
     if backend == Backend::Ptrace {
         let summary_path = print_summary_to_json_file.clone();
-        return ptrace_completion::run(timeout, move |control| async move {
+        return ptrace_completion::run_until(deadline, move |control| async move {
             let report = SkidOvershootReport::begin(true);
             let result = dispatch_output_backend(
                 command,
-                prepare_run_config(config, backend),
+                prepare_run_config(config, backend, deadline),
                 print_summary,
                 &summary_path,
                 backend,
@@ -4661,14 +4869,14 @@ pub fn run_with_output_backend_timeout_and_skid_overshoots(
         // public output-capture callers without one retain this reservation.
         ensure_kvm_stdin_reserved()?;
     }
-    let config = prepare_run_config(config, backend);
+    let config = prepare_run_config(config, backend, deadline);
     let result = run_with_output_backend_inner(
         command,
         config,
         print_summary,
         print_summary_to_json_file,
         backend,
-        timeout,
+        deadline,
     );
     skid_overshoot_report.finish_with_count(result)
 }
@@ -4680,10 +4888,10 @@ async fn run_with_output_backend_inner(
     print_summary: bool,
     print_summary_to_json_file: &Option<PathBuf>,
     backend: Backend,
-    timeout: Option<Duration>,
+    deadline: Option<RunDeadline>,
 ) -> Result<Output, Error> {
-    refuse_in_guest_liteinst_timeout(backend, timeout)?;
-    let Some(limit) = timeout else {
+    refuse_in_guest_liteinst_timeout(backend, deadline.map(RunDeadline::limit))?;
+    let Some(deadline) = deadline else {
         return dispatch_output_backend(
             command,
             config,
@@ -4694,8 +4902,8 @@ async fn run_with_output_backend_inner(
         )
         .await;
     };
-    match tokio::time::timeout(
-        limit,
+    match tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline.at()),
         dispatch_output_backend(
             command,
             config,
@@ -4708,7 +4916,9 @@ async fn run_with_output_backend_inner(
     .await
     {
         Ok(result) => result,
-        Err(_elapsed) => Err(Error::new(GuestTimedOut { limit })),
+        Err(_elapsed) => Err(Error::new(GuestTimedOut {
+            limit: deadline.limit(),
+        })),
     }
 }
 
@@ -6957,9 +7167,10 @@ mod tests {
     fn probe_under(program: &[libc::sock_filter], child: impl FnOnce(libc::c_int)) -> bool {
         install_seccomp(program, true);
         assert_eq!(this_launcher_seccomp(), super::LauncherSeccomp::Uniform);
-        let status = super::entry_lookup_probe_status().expect("the probe child is waited for");
+        let status = super::entry_lookup_probe_status(super::ENTRY_LOOKUP_PROBE_BOUND)
+            .expect("the probe child is waited for");
         child(status);
-        super::seccomp_may_refuse_entry_lookup_syscalls()
+        super::seccomp_may_refuse_entry_lookup_syscalls(None)
     }
 
     fn exited_with(status: libc::c_int, code: libc::c_int) {
@@ -6993,7 +7204,7 @@ mod tests {
             super::LauncherSeccomp::Unfiltered,
             "this test needs a process that runs under no seccomp filter"
         );
-        assert!(!super::seccomp_may_refuse_entry_lookup_syscalls());
+        assert!(!super::seccomp_may_refuse_entry_lookup_syscalls(None));
     }
 
     /// A filter that refuses another call (`swapon`) lets every lookup call
@@ -7060,6 +7271,117 @@ mod tests {
         }
         let program = seccomp_program(libc::SYS_fstatfs, libc::SECCOMP_RET_TRACE);
         assert!(probe_under(&program, |status| exited_with(status, 1)));
+    }
+
+    /// `SECCOMP_RET_USER_NOTIF` on `fstatfs`, on every thread, with a listener
+    /// this process holds and never answers, as a container supervisor that
+    /// has stopped answering would: the probe child waits in `fstatfs` until
+    /// it is killed. The launcher kills and reaps it at its bound, answers
+    /// true, and leaves no child behind; with a run's bound, the probe waits
+    /// at most what remains of it, and nothing once it has ended (Codex review
+    /// round 11 of https://github.com/rrnewton/hermit/pull/3255, finding 3).
+    #[test]
+    fn a_probe_whose_listener_never_answers_is_killed_and_reaped_at_its_bound() {
+        use std::time::Duration;
+        use std::time::Instant;
+        let name = "a_probe_whose_listener_never_answers_is_killed_and_reaped_at_its_bound";
+        if !in_seccomp_scenario(name) {
+            return run_seccomp_scenario(name);
+        }
+        let _listener = install_unanswered_user_notif_on_every_thread(libc::SYS_fstatfs);
+        assert_eq!(this_launcher_seccomp(), super::LauncherSeccomp::Uniform);
+        let no_child_is_left = |after: &str| {
+            // SAFETY: polls for any child of this process, with no status
+            // pointer.
+            let waited = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+            let error = std::io::Error::last_os_error().raw_os_error();
+            assert_eq!(
+                (waited, error),
+                (-1, Some(libc::ECHILD)),
+                "a child of this process is left after {after}"
+            );
+        };
+        let bound = Duration::from_millis(500);
+        // Generous for a loaded host; the old blocking wait never returned.
+        let slack = Duration::from_secs(5);
+
+        let started = Instant::now();
+        assert_eq!(super::entry_lookup_probe_status(bound), None);
+        let waited = started.elapsed();
+        assert!(
+            waited >= bound && waited < bound + slack,
+            "the probe returned after {waited:?}, bound {bound:?}"
+        );
+        no_child_is_left("the probe at its own bound");
+
+        let started = Instant::now();
+        assert!(super::seccomp_may_refuse_entry_lookup_syscalls(Some(
+            super::RunDeadline::starting_now(bound)
+        )));
+        let waited = started.elapsed();
+        assert!(
+            waited < bound + slack,
+            "the question returned after {waited:?}, the run's bound {bound:?}"
+        );
+        no_child_is_left("the question within a run's bound");
+
+        let ended = super::RunDeadline::starting_now(Duration::ZERO);
+        assert_eq!(super::entry_lookup_probe_bound(Some(ended)), Duration::ZERO);
+        assert_eq!(super::entry_lookup_probe_status(Duration::ZERO), None);
+        assert!(super::seccomp_may_refuse_entry_lookup_syscalls(Some(ended)));
+        no_child_is_left("the question after a run's bound ended");
+        assert_eq!(
+            super::entry_lookup_probe_bound(None),
+            super::ENTRY_LOOKUP_PROBE_BOUND
+        );
+    }
+
+    /// Install a `SECCOMP_RET_USER_NOTIF` filter for system call `nr` on every
+    /// thread of this process, after no_new_privs, and return its listener,
+    /// which the caller holds open and never answers. Panics if that fails.
+    fn install_unanswered_user_notif_on_every_thread(nr: libc::c_long) -> std::os::fd::OwnedFd {
+        use std::os::fd::FromRawFd;
+        const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
+        const SECCOMP_FILTER_FLAG_NEW_LISTENER: libc::c_long = 1 << 3;
+        // A listener and TSYNC together need this flag (Linux 5.7): a failed
+        // synchronization then reports ESRCH, not the thread it failed on.
+        const SECCOMP_FILTER_FLAG_TSYNC_ESRCH: libc::c_long = 1 << 4;
+        let program = seccomp_program(nr, SECCOMP_RET_USER_NOTIF);
+        let fprog = libc::sock_fprog {
+            len: u16::try_from(program.len()).unwrap(),
+            filter: program.as_ptr() as *mut libc::sock_filter,
+        };
+        // SAFETY: the program outlives the call, which copies it; each
+        // argument is passed as the full register the kernel reads.
+        let listener = unsafe {
+            assert_eq!(
+                libc::prctl(
+                    libc::PR_SET_NO_NEW_PRIVS,
+                    1 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                ),
+                0,
+                "precondition: no_new_privs is set"
+            );
+            libc::syscall(
+                libc::SYS_seccomp,
+                libc::SECCOMP_SET_MODE_FILTER as libc::c_long,
+                libc::SECCOMP_FILTER_FLAG_TSYNC as libc::c_long
+                    | SECCOMP_FILTER_FLAG_NEW_LISTENER
+                    | SECCOMP_FILTER_FLAG_TSYNC_ESRCH,
+                &fprog as *const libc::sock_fprog as libc::c_long,
+            )
+        };
+        assert!(
+            listener >= 0,
+            "precondition: the seccomp filter and its listener are installed: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: the kernel returned this descriptor to this call, and
+        // nothing else owns it.
+        unsafe { std::os::fd::OwnedFd::from_raw_fd(listener as libc::c_int) }
     }
 
     /// A filter that allows `fstatfs` but fails `statx` with `EPERM`, as
@@ -7240,7 +7562,7 @@ mod tests {
     /// caller's true is kept.
     #[test]
     fn the_run_config_carries_the_launchers_seccomp_answer() {
-        let own = super::seccomp_may_refuse_entry_lookup_syscalls();
+        let own = super::seccomp_may_refuse_entry_lookup_syscalls(None);
         for backend in [
             Backend::Ptrace,
             Backend::Dbt,
@@ -7254,14 +7576,15 @@ mod tests {
                 ..super::DetConfig::default()
             };
             assert_eq!(
-                super::prepare_run_config(config.clone(), backend)
+                super::prepare_run_config(config.clone(), backend, None)
                     .seccomp_may_refuse_entry_lookup_syscalls,
                 own,
                 "{backend:?}"
             );
             config.seccomp_may_refuse_entry_lookup_syscalls = true;
             assert!(
-                super::prepare_run_config(config, backend).seccomp_may_refuse_entry_lookup_syscalls,
+                super::prepare_run_config(config, backend, None)
+                    .seccomp_may_refuse_entry_lookup_syscalls,
                 "{backend:?}"
             );
         }
@@ -7291,7 +7614,7 @@ mod tests {
             ..super::DetConfig::default()
         };
         let carried = || {
-            super::prepare_run_config(config.clone(), Backend::Ptrace)
+            super::prepare_run_config(config.clone(), Backend::Ptrace, None)
                 .seccomp_may_refuse_entry_lookup_syscalls
         };
         let fails_fstatfs = seccomp_program(
@@ -7299,7 +7622,7 @@ mod tests {
             libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
         );
         assert!(
-            !super::seccomp_may_refuse_entry_lookup_syscalls(),
+            !super::seccomp_may_refuse_entry_lookup_syscalls(None),
             "this test needs a process whose own answer is false"
         );
         let held = super::LauncherSeccompAnswer::ask();
@@ -7312,7 +7635,7 @@ mod tests {
         });
         installed_rx.recv().unwrap();
         assert!(
-            super::seccomp_may_refuse_entry_lookup_syscalls(),
+            super::seccomp_may_refuse_entry_lookup_syscalls(None),
             "precondition: with another thread filtered, a fresh answer is true"
         );
         assert!(
@@ -7404,6 +7727,7 @@ mod tests {
                     ..super::DetConfig::default()
                 },
                 Backend::Ptrace,
+                None,
             )
             .seccomp_may_refuse_entry_lookup_syscalls
         }

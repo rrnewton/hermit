@@ -930,6 +930,14 @@ pub struct RunOpts {
     #[clap(skip)]
     fatal_core_owner: String,
 
+    /// Runtime-only: when this run's `--timeout` ends, measured in the
+    /// launcher before it asks its seccomp question, so that the question's
+    /// probe child and the container setup count against the bound and the
+    /// guest gets what remains (see `run_with_guest_capture`). Never a CLI
+    /// argument and never serialized, like `host_input_log`.
+    #[clap(skip)]
+    run_deadline: Option<hermit::RunDeadline>,
+
     /// Whether this invocation's epoch was captured from the host clock because
     /// neither `--epoch` nor `HERMIT_EPOCH` supplied an explicit input.
     ///
@@ -6459,12 +6467,29 @@ impl RunOpts {
             .map(GuestRunCaptureSession::try_clone_for_child)
             .transpose()?;
         let timeout = self.run_timeout();
+        // The run's bound starts before the question below, whose probe child
+        // may wait as long as the bound allows, so that the probe cannot make
+        // the run outlive its `--timeout`; the guest gets what remains.
+        let deadline = timeout.map(hermit::RunDeadline::starting_now);
         // Asked here, on the thread the container is cloned from, before it is
         // cloned, and held while it runs: asking can fork a probe child, which
         // inside the container would take a process ID in the guest's PID
         // namespace and shift every guest process ID by one (see
         // `hermit::LauncherSeccompAnswer`).
-        let _launcher_seccomp = hermit::LauncherSeccompAnswer::ask();
+        let _launcher_seccomp = hermit::LauncherSeccompAnswer::ask_within(deadline);
+        if let Some(deadline) = deadline.filter(|deadline| deadline.has_passed()) {
+            // The probe used the whole bound: report it as the bound firing
+            // (exit 124, `class=run-timeout`), as for a guest that outlived
+            // it, without starting one. The message says no guest ran, which
+            // `hermit::GuestTimedOut` would not.
+            return Err(anyhow::anyhow!(
+                "the --timeout bound of {} seconds ended while the launcher's seccomp probe \
+                 child was running, so no guest was started",
+                deadline.limit().as_secs()
+            )
+            .context(super::container::RunTimeoutMarker));
+        }
+        options.run_deadline = deadline;
         if self.no_namespace {
             let mut process = Container::new();
             apply_affinity(&mut process, self.pin_threads);
@@ -7571,7 +7596,12 @@ impl RunOpts {
         config.mount_id_assignment_order.clear();
         self.save_config_to_disk()?;
 
-        let timeout = self.run_timeout();
+        // Measured by the launcher before it asked its seccomp question (see
+        // `run_with_guest_capture`); a caller that did not measure it starts
+        // the bound here.
+        let deadline = self
+            .run_deadline
+            .or_else(|| self.run_timeout().map(hermit::RunDeadline::starting_now));
         super::staged_summary::with_published_summary(
             summary_output,
             self.summary_json.as_deref(),
@@ -7579,13 +7609,13 @@ impl RunOpts {
             |summary_json| {
                 let result =
                     if capture_output || (guest_capture.is_some() && backend == Backend::Kvm) {
-                        let out = hermit::run_with_output_backend_timeout(
+                        let out = hermit::run_with_output_backend_deadline(
                             command,
                             config,
                             self.summary,
                             summary_json,
                             backend,
-                            timeout,
+                            deadline,
                         )?;
                         if let Some(capture) = guest_capture {
                             capture.write_kvm_virtual_console(&out.stdout, &out.stderr)?;
@@ -7594,13 +7624,13 @@ impl RunOpts {
                             (out.status, Some(out))
                         }
                     } else {
-                        let status = hermit::run_with_backend_timeout(
+                        let status = hermit::run_with_backend_deadline(
                             command,
                             config,
                             self.summary,
                             summary_json,
                             backend,
-                            timeout,
+                            deadline,
                         )?;
                         (status, None)
                     };
