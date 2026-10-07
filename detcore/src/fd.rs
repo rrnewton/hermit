@@ -322,10 +322,10 @@ struct OpenFileDescription {
     /// Which entries of this directory `getdents` `lstat`s for the device
     /// their inode number is on, learned from the first `fstatfs` that
     /// answered (see `Detcore::directory_entry_lookup`), and on overlayfs
-    /// narrowed by the first entry that shows how the overlay numbers its
-    /// files (see `EntryLookup::learn`). The filesystem an open file is on,
-    /// and how an overlay numbers its files, never change, so every alias
-    /// shares it.
+    /// replaced by how the overlay numbers its files once that is settled for
+    /// the whole run (see `Detcore::settle_overlay_entry_lookup`). The
+    /// filesystem an open file is on, and how an overlay numbers its files,
+    /// never change, so every alias shares it.
     #[serde(default)]
     directory_entry_lookup: Option<EntryLookup>,
     /// Held across a whole `getdents` or `lseek` on this open file

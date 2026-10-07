@@ -383,10 +383,12 @@ const OVERLAY_UNFOLDABLE_INODE_FLOOR: u64 = 1 << 32;
 
 /// Which entries of a directory Detcore `lstat`s to learn the device an
 /// entry's inode number is on, chosen once per open directory from the type
-/// of its filesystem (`fstatfs`'s `f_type`), and on overlayfs refined once by
-/// the first entry that shows how the overlay numbers its files (see
-/// [`EntryLookup::learn`]). An entry that is not asked is keyed on the
-/// directory's own device (see `Detcore::directory_entry_identity`).
+/// of its filesystem (`fstatfs`'s `f_type`), and on overlayfs settled once per
+/// overlay, before any of its entries is keyed, by the first file that shows
+/// how the overlay numbers its files (see [`EntryLookup::learn`] and
+/// `Detcore::settle_overlay_entry_lookup`). An entry that is not asked is
+/// keyed on the directory's own device (see
+/// `Detcore::directory_entry_identity`).
 ///
 /// Linux reports a `d_ino` that is the entry's `st_ino` on a device other than
 /// the directory's in these places, among the filesystems checked (see the
@@ -400,8 +402,8 @@ const OVERLAY_UNFOLDABLE_INODE_FLOOR: u64 = 1 << 32;
 ///   overlay with every layer on one filesystem reports its own device for
 ///   everything, and directories always report the overlay's device
 ///   (`ovl_map_dev_ino` in `fs/overlayfs/inode.c`). `fstatfs` does not say
-///   which an overlay does, so each entry but `.` is asked until one tells
-///   (see [`EntryLookup::Overlay`]);
+///   which an overlay does, so a file of the overlay is asked first (see
+///   [`EntryLookup::Overlay`]);
 /// - CephFS, where a snapshot's files report a device of their snapshot's
 ///   own but the same inode numbers as the live files, so each entry of a
 ///   `.snap` directory carries its `st_ino` on its snapshot's device rather
@@ -417,14 +419,20 @@ const OVERLAY_UNFOLDABLE_INODE_FLOOR: u64 = 1 << 32;
 ///   (two ext4 roots are both inode 2).
 ///
 /// `.` is the open directory itself, whose device is the directory's.
+///
+/// Public only because the overlay's settled answer travels in a
+/// `GlobalRequest`; the module is private to Detcore.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum EntryLookup {
-    /// Every entry: CephFS, an overlay that reports a layer's device for its
-    /// non-directories (see [`EntryLookup::Overlay`]), or a directory whose
-    /// filesystem type Detcore could not learn.
+pub enum EntryLookup {
+    /// Every entry: CephFS, or a directory whose filesystem type Detcore
+    /// did not or could not learn (see `Detcore::directory_entry_lookup`).
     Every,
-    /// Every entry other than `.`: overlayfs, until an entry tells which of
-    /// two kinds the overlay is.
+    /// Overlayfs, before Detcore knows which of two kinds the overlay is. No
+    /// entry is keyed under this answer: before the first entry of a listing
+    /// is keyed, it is settled to [`EntryLookup::OverlayOwnDevice`] or
+    /// [`EntryLookup::OverlayLayerDevices`] (see
+    /// `Detcore::settle_overlay_entry_lookup`). It asks every entry other
+    /// than `.`, as the second of those does.
     ///
     /// An overlay whose layers are all on one filesystem reports its own
     /// device for every file. One that folds its layers' inode numbers into
@@ -439,7 +447,7 @@ pub(crate) enum EntryLookup {
     /// [`EntryLookup::OverlayOwnDevice`]. An overlay of the third kind,
     /// whose layers are on more than one filesystem and which does not fold,
     /// reports a layer's device for every non-directory, whatever its number;
-    /// that is [`EntryLookup::Every`].
+    /// that is [`EntryLookup::OverlayLayerDevices`].
     ///
     /// A non-directory entry whose `d_ino` is below 2^32 and whose `lstat`
     /// reports that same number tells them apart: on the first two kinds it
@@ -455,6 +463,12 @@ pub(crate) enum EntryLookup {
     BtrfsSubvolumes,
     /// `..` only: every other filesystem.
     ParentOnly,
+    /// Every entry other than `.`: an overlay that reports a layer's device
+    /// for its non-directories (see [`EntryLookup::Overlay`]). `.` is the
+    /// open directory, which reports the overlay's device on every overlay.
+    /// Last, so that adding it left every earlier variant's encoded tag
+    /// unchanged.
+    OverlayLayerDevices,
 }
 
 impl EntryLookup {
@@ -477,7 +491,7 @@ impl EntryLookup {
         let own = entry.name == b".";
         match self {
             EntryLookup::Every => true,
-            EntryLookup::Overlay => !own,
+            EntryLookup::Overlay | EntryLookup::OverlayLayerDevices => !own,
             EntryLookup::OverlayOwnDevice => {
                 parent || (entry.ino >= OVERLAY_UNFOLDABLE_INODE_FLOOR && !own)
             }
@@ -488,26 +502,45 @@ impl EntryLookup {
         }
     }
 
-    /// The entries to ask after `entry`, read from a directory on device
-    /// `directory_device`, was asked and its `lstat` reported `stat`.
+    /// Whether `entry`'s `lstat` can tell which kind an overlay is (see
+    /// [`EntryLookup::learn`]), judged from the entry alone: an entry other
+    /// than `.` and `..` whose `d_ino` is below 2^32 and whose `d_type` is not
+    /// a directory's. Its `lstat` still decides only if it reports that
+    /// `d_ino` and a non-directory.
+    pub(crate) fn may_tell_the_overlay_kind(entry: &DirEntry) -> bool {
+        entry.name != b"."
+            && entry.name != b".."
+            && entry.ino < OVERLAY_UNFOLDABLE_INODE_FLOOR
+            && entry.ty != libc::DT_DIR
+    }
+
+    /// What `entry`, read from a directory on device `directory_device` and
+    /// `lstat`ed as `stat`, shows about the overlay it is on.
     ///
     /// Only [`EntryLookup::Overlay`] learns, and only from a non-directory
     /// entry other than `.` and `..` whose `d_ino` is below 2^32 and whose
     /// `lstat` reports that `d_ino`: it becomes
     /// [`EntryLookup::OverlayOwnDevice`] if that `lstat` reports the
-    /// directory's device, and [`EntryLookup::Every`] otherwise. Any other
-    /// entry leaves it as it was. An entry replaced after the read usually
-    /// reports another inode, and then decides nothing; a replacement that
-    /// reuses the number is a file of the same overlay, which reports its
-    /// device by the same rule, unless it is a mount. A file bind-mounted
-    /// over the entry, whose source has the covered entry's inode number, can
-    /// mislead it only toward [`EntryLookup::Every`], since on an overlay of
-    /// the third kind no non-directory reports the overlay's device. Once
-    /// [`EntryLookup::OverlayOwnDevice`] is learned, such a mount over a
-    /// later entry, including that entry's own backing file bound over its
-    /// path, is not asked: the first class of the second known gap at
-    /// `Detcore::directory_entry_identity`, as on every filesystem that does
-    /// not ask each entry.
+    /// directory's device, and [`EntryLookup::OverlayLayerDevices`]
+    /// otherwise. Any other entry leaves it as it was. An entry replaced
+    /// after the read usually reports another inode, and then decides
+    /// nothing; a replacement that reuses the number is a file of the same
+    /// overlay, which reports its device by the same rule, unless it is a
+    /// mount. A file bind-mounted over the entry, whose source has the
+    /// covered entry's inode number, can mislead it only toward
+    /// [`EntryLookup::OverlayLayerDevices`], since on an overlay of the third
+    /// kind no non-directory reports the overlay's device.
+    ///
+    /// Detcore asks this of the first files of a listing in sorted order,
+    /// before any entry is keyed, and keeps the first answer that decides for
+    /// the whole overlay (see `Detcore::settle_overlay_entry_lookup`), so the
+    /// entries the guest reads first, and where it seeks, do not change it.
+    /// Once [`EntryLookup::OverlayOwnDevice`] is settled, a mount over an
+    /// entry that is not asked, including that entry's own backing file bound
+    /// over its path, is keyed on the directory's device: the first class of
+    /// the second known gap at `Detcore::directory_entry_identity`, as on
+    /// every filesystem that does not ask each entry, and the same in every
+    /// read.
     pub(crate) fn learn(self, entry: &DirEntry, stat: &libc::stat, directory_device: u64) -> Self {
         let decides = self == EntryLookup::Overlay
             && entry.name != b"."
@@ -520,7 +553,7 @@ impl EntryLookup {
         } else if stat.st_dev == directory_device {
             EntryLookup::OverlayOwnDevice
         } else {
-            EntryLookup::Every
+            EntryLookup::OverlayLayerDevices
         }
     }
 }
@@ -596,6 +629,11 @@ impl DirectoryStream {
 
     pub(crate) fn needs_snapshot(&self) -> bool {
         self.entries.is_none()
+    }
+
+    /// The whole snapshot, sorted, whatever the position; empty without one.
+    pub(crate) fn entries(&self) -> &[DirEntry] {
+        self.entries.as_deref().unwrap_or_default()
     }
 
     /// Install the entries of a whole directory, read from the kernel in host
@@ -1452,10 +1490,10 @@ mod test {
     // https://github.com/rrnewton/hermit/pull/3255 asked every entry's
     // `lstat`, which cost a 3000-entry directory test 5.9 GiB under the test
     // allocator. Only CephFS asks every entry from the start now; overlayfs
-    // asks every entry but `.` until one tells how the overlay numbers its
-    // files, and then either every entry or `..` and the entries whose
-    // `d_ino` is at least 2^32; btrfs asks `..` and an entry whose `d_ino` is
-    // 256 (the first subvolume); any other filesystem asks `..` alone.
+    // asks, once one file has told how the overlay numbers its files, either
+    // every entry but `.` or `..` and the entries whose `d_ino` is at least
+    // 2^32; btrfs asks `..` and an entry whose `d_ino` is 256 (the first
+    // subvolume); any other filesystem asks `..` alone.
     #[test]
     fn entry_lookup_asks_only_where_the_filesystem_can_differ() {
         let overlay = EntryLookup::of_filesystem(0x794c_7630);
@@ -1502,6 +1540,7 @@ mod test {
         assert_eq!(asked(ceph), all);
         assert_eq!(asked(EntryLookup::Every), all);
         assert_eq!(asked(overlay), all[1..]);
+        assert_eq!(asked(EntryLookup::OverlayLayerDevices), all[1..]);
         assert_eq!(
             asked(EntryLookup::OverlayOwnDevice),
             ["..", "unfoldable", "folded_lower"]
@@ -1515,6 +1554,7 @@ mod test {
         for lookup in [
             EntryLookup::Overlay,
             EntryLookup::OverlayOwnDevice,
+            EntryLookup::OverlayLayerDevices,
             EntryLookup::BtrfsSubvolumes,
             EntryLookup::ParentOnly,
         ] {
@@ -1528,8 +1568,10 @@ mod test {
     // directory's device the overlay keeps every such file on its own device
     // (one filesystem, or folded inode numbers), and on another it reports a
     // layer's device for every non-directory (`xino` off over several
-    // filesystems), so every entry is asked from then on. Nothing else
-    // decides, and nothing is learned outside overlayfs.
+    // filesystems), so every entry but `.` is asked. Nothing else decides,
+    // and nothing is learned outside overlayfs. Which entries can decide is
+    // also judged from the entry alone, before any `lstat`, so that Detcore
+    // can ask them first (see `Detcore::settle_overlay_entry_lookup`).
     #[test]
     fn entry_lookup_learns_the_overlay_kind_from_one_file() {
         const DIRECTORY: u64 = 0x2a;
@@ -1555,13 +1597,13 @@ mod test {
         );
         assert_eq!(
             learned(EntryLookup::Overlay, &file, &layer_file),
-            EntryLookup::Every
+            EntryLookup::OverlayLayerDevices
         );
         // Symbolic links, devices and sockets are non-directories too.
         for mode in [libc::S_IFLNK, libc::S_IFCHR, libc::S_IFSOCK, libc::S_IFIFO] {
             assert_eq!(
                 learned(EntryLookup::Overlay, &file, &stat_of(LAYER, 300, mode)),
-                EntryLookup::Every,
+                EntryLookup::OverlayLayerDevices,
                 "mode {mode:o}"
             );
         }
@@ -1597,11 +1639,37 @@ mod test {
         for lookup in [
             EntryLookup::Every,
             EntryLookup::OverlayOwnDevice,
+            EntryLookup::OverlayLayerDevices,
             EntryLookup::BtrfsSubvolumes,
             EntryLookup::ParentOnly,
         ] {
             assert_eq!(learned(lookup, &file, &own_file), lookup);
             assert_eq!(learned(lookup, &file, &layer_file), lookup);
+        }
+
+        // Judged from the entry alone: every entry the `undecided` list above
+        // rules out by its name or number is ruled out here too, and so is a
+        // directory by its `d_type`; a file, a symbolic link and an entry
+        // whose type the filesystem did not report may tell.
+        let typed = |name: &str, ino: u64, ty: u8| DirEntry {
+            ino,
+            ty,
+            ..entry(name)
+        };
+        for (candidate, may_tell) in [
+            (typed("file", 300, libc::DT_REG), true),
+            (typed("link", 300, libc::DT_LNK), true),
+            (typed("unknown", 300, libc::DT_UNKNOWN), true),
+            (typed("directory", 300, libc::DT_DIR), false),
+            (typed("unfoldable", 1 << 32, libc::DT_REG), false),
+            (typed(".", 300, libc::DT_REG), false),
+            (typed("..", 300, libc::DT_REG), false),
+        ] {
+            assert_eq!(
+                EntryLookup::may_tell_the_overlay_kind(&candidate),
+                may_tell,
+                "{candidate:?}"
+            );
         }
     }
 }

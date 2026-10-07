@@ -7888,12 +7888,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             Ok(batch) => {
                 let mut records = Vec::new();
                 let mut names = Vec::with_capacity(batch.len());
+                // On overlayfs, settled from the whole sorted snapshot, so
+                // that where the stream stands, and which entries the guest
+                // read before, do not change which entries are asked.
+                let told = if batch.is_empty() {
+                    Vec::new()
+                } else {
+                    self.settle_overlay_entry_lookup(guest, &mut call, None)
+                        .await?
+                };
                 // Every entry's identity is resolved before the first
                 // numbering request, so a refused entry lookup consumes no
                 // number: how many a call consumes must not depend on which
                 // host lookup fails (see `Self::directory_entry_identities`).
                 let identities = self
-                    .directory_entry_identities(guest, &mut call, &batch)
+                    .directory_entry_identities(guest, &mut call, &batch, &told)
                     .await?;
                 for (index, (entry, identity)) in batch.iter().zip(identities).enumerate() {
                     let (d_ino, _) = determinize_listed_inode(guest, identity, retirements).await;
@@ -7953,9 +7962,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// search, whose `stat` reports it on another device; then the two views
     /// key different identities. This is a known gap.
     ///
-    /// On overlayfs, an asked entry's `lstat` can also narrow which later
-    /// entries `call.lookup` asks (see [`EntryLookup::learn`]); a descriptor
-    /// Detcore tracks keeps the narrowed answer on its open file description.
+    /// On overlayfs, `call.lookup` was settled before the first entry was
+    /// keyed (see [`Self::settle_overlay_entry_lookup`]), and an entry whose
+    /// `lstat` was asked for that, which is in `told` by name, is not asked
+    /// again: its answer keys it as a fresh one would.
     ///
     /// An entry that `call.lookup` does not ask is keyed on `call.device`
     /// without a `stat`. Where its `lstat` would have reported its `d_ino` on
@@ -7985,9 +7995,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// that backing file, or a hard link to it, bound over the entry's own
     /// path reports the same number on the layers' device. This class is open
     /// wherever an entry is not asked: on btrfs, on an overlay once it has
-    /// learned [`EntryLookup::OverlayOwnDevice`], and on every filesystem that
-    /// asks only `..`; CephFS, and an overlay that reports a layer's device
-    /// for its files, ask every entry and close it. (2) A filesystem other than overlayfs, CephFS
+    /// settled as [`EntryLookup::OverlayOwnDevice`], and on every filesystem
+    /// that asks only `..`; CephFS, and an overlay that reports a layer's
+    /// device for its files, ask every entry but `.` and close it. (2) A filesystem other than overlayfs, CephFS
     /// and btrfs whose `stat` reports a device per entry rather than its
     /// superblock's, or an overlayfs whose devices do not follow the rules of
     /// mainline's `ovl_map_dev_ino` that [`EntryLookup::Overlay`] relies on.
@@ -8005,21 +8015,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: &mut GetdentsCall<'_>,
         entry: &DirEntry,
+        told: &[(Vec<u8>, Option<libc::stat>)],
     ) -> Result<RawInode, Error> {
         if !call.lookup.asks(entry) {
             return Ok(RawInode::new(call.device, entry.ino));
         }
-        let stat = Self::stat_guest_path_at(guest, StatAt::entry_of(call.fd), &entry.name).await?;
-        if let Some(stat) = &stat {
-            let learned = call.lookup.learn(entry, stat, call.device);
-            if learned != call.lookup {
-                call.lookup = learned;
-                // A descriptor Detcore does not track has nowhere to keep it.
-                let _ = guest
-                    .thread_state()
-                    .with_detfd(call.fd, |detfd| detfd.set_directory_entry_lookup(learned));
-            }
-        }
+        let stat = match told.iter().find(|(name, _)| *name == entry.name) {
+            Some((_, stat)) => *stat,
+            None => Self::stat_guest_path_at(guest, StatAt::entry_of(call.fd), &entry.name).await?,
+        };
         Ok(match stat {
             Some(stat) if stat.st_ino == entry.ino => RawInode::new(stat.st_dev, entry.ino),
             _ => RawInode::new(call.device, entry.ino),
@@ -8040,22 +8044,128 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: &mut GetdentsCall<'_>,
         entries: &[DirEntry],
+        told: &[(Vec<u8>, Option<libc::stat>)],
     ) -> Result<Vec<RawInode>, Error> {
         let mut identities = Vec::with_capacity(entries.len());
         for entry in entries {
-            identities.push(self.directory_entry_identity(guest, call, entry).await?);
+            identities.push(
+                self.directory_entry_identity(guest, call, entry, told)
+                    .await?,
+            );
         }
         Ok(identities)
+    }
+
+    /// On overlayfs, settle which of two kinds the overlay `call` lists is
+    /// (see [`EntryLookup::Overlay`]) before any entry of the listing is
+    /// keyed, and return the `lstat` of each entry asked for that, by name,
+    /// for [`Self::directory_entry_identity`] to use. Any other
+    /// `call.lookup` is left as it is, and nothing is asked.
+    ///
+    /// The kind is a property of the overlay, so the first answer for an
+    /// overlay is kept for the whole run (see
+    /// [`GlobalRequest::SettleOverlayEntryLookup`]), and every descriptor,
+    /// tracked or not, every later open and every alias keys the overlay's
+    /// entries alike. Until it is settled, the entries that may tell (see
+    /// [`EntryLookup::may_tell_the_overlay_kind`]) are asked in sorted order
+    /// until one tells (see [`EntryLookup::learn`]). For a stream served from
+    /// its snapshot (`buffer` `None`), they are those of the whole sorted
+    /// snapshot, not of the guest's batch, so neither the stream's position
+    /// nor which entries the guest read before changes the answer, nor which
+    /// entries are asked. Before this was settled ahead of keying, the first
+    /// such entry the guest's reads reached decided, and an entry was keyed
+    /// on one device or another depending on the read
+    /// (https://github.com/rrnewton/hermit/pull/3255).
+    ///
+    /// A read with no snapshot, of a descriptor Detcore does not track or of
+    /// a directory read in host order, asks the entries of the one kernel
+    /// `buffer` it sorted. Where such a read is the first of an overlay in
+    /// the run, the answer can come from another file than a snapshot's
+    /// first, chosen by the host's order of the directory; the two answers
+    /// differ only where that file is a mount, the first class of the second
+    /// known gap at [`Self::directory_entry_identity`], and either one is
+    /// then kept for the rest of the run. That is a known gap.
+    ///
+    /// A listing none of whose entries tells is keyed as
+    /// [`EntryLookup::OverlayOwnDevice`], and nothing is settled, so a later
+    /// listing asks again. The entries that kind leaves unasked are then
+    /// directories, which report the overlay's device on every kind, and
+    /// files whose `lstat` did not report their `d_ino`, which are keyed on
+    /// the directory's device either way, so the key is the one either kind
+    /// gives, but for a directory that is a mount point: the first class of
+    /// the second known gap again.
+    ///
+    /// The overlay is known by the raw device its directories report, which
+    /// Linux gives no other mounted filesystem while it is mounted; a device
+    /// number reused by another overlay after an unmount within one run
+    /// would inherit the first one's answer.
+    ///
+    /// A failed `lstat` that [`Self::directory_entry_identity`] would refuse
+    /// is the same refusal here, before any numbering request.
+    async fn settle_overlay_entry_lookup<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &mut GetdentsCall<'_>,
+        buffer: Option<&[DirEntry]>,
+    ) -> Result<Vec<(Vec<u8>, Option<libc::stat>)>, Error> {
+        let mut told = Vec::new();
+        if call.lookup != EntryLookup::Overlay {
+            return Ok(told);
+        }
+        let mut settled = settle_overlay_entry_lookup(guest, call.device, None).await;
+        if settled.is_none() {
+            let candidates: Vec<DirEntry> = match buffer {
+                Some(buffer) => buffer
+                    .iter()
+                    .filter(|entry| EntryLookup::may_tell_the_overlay_kind(entry))
+                    .cloned()
+                    .collect(),
+                None => guest.thread_state().with_detfd(call.fd, |detfd| {
+                    detfd.with_directory_stream(|stream| {
+                        stream
+                            .entries()
+                            .iter()
+                            .filter(|entry| EntryLookup::may_tell_the_overlay_kind(entry))
+                            .cloned()
+                            .collect()
+                    })
+                })??,
+            };
+            for entry in candidates {
+                let stat =
+                    Self::stat_guest_path_at(guest, StatAt::entry_of(call.fd), &entry.name).await?;
+                let shown = stat
+                    .as_ref()
+                    .map(|stat| EntryLookup::Overlay.learn(&entry, stat, call.device))
+                    .filter(|shown| *shown != EntryLookup::Overlay);
+                told.push((entry.name, stat));
+                if let Some(shown) = shown {
+                    settled = settle_overlay_entry_lookup(guest, call.device, Some(shown)).await;
+                    break;
+                }
+            }
+        }
+        match settled {
+            Some(lookup) => {
+                call.lookup = lookup;
+                // A descriptor Detcore does not track has nowhere to keep it.
+                let _ = guest
+                    .thread_state()
+                    .with_detfd(call.fd, |detfd| detfd.set_directory_entry_lookup(lookup));
+            }
+            None => call.lookup = EntryLookup::OverlayOwnDevice,
+        }
+        Ok(told)
     }
 
     /// Which entries of the directory open as `fd` are `lstat`ed for the
     /// device their inode number is on (see [`EntryLookup`]), from the type
     /// of the directory's filesystem. A descriptor Detcore tracks keeps the
     /// answer on its open file description, so it is asked once per open
-    /// directory, along with what an overlay's entries later teach (see
-    /// [`Self::directory_entry_identity`]); for any other descriptor, each
+    /// directory, along with an overlay's settled kind (see
+    /// [`Self::settle_overlay_entry_lookup`]); for any other descriptor, each
     /// getdents asks an injected `fstatfs` (see
-    /// [`Self::inject_fstatfs_type`]) and learns afresh.
+    /// [`Self::inject_fstatfs_type`]) and the overlay's settled kind afresh.
     ///
     /// Asking every entry is never less faithful than asking fewer: an entry
     /// whose `lstat` does not report its `d_ino` is keyed on the directory's
@@ -8208,8 +8318,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut entries = read_records(&guest.memory(), call.buf, len, call.format)?;
         sort_dir_entries(&mut entries);
         let mut records = Vec::with_capacity(len);
+        let told = self
+            .settle_overlay_entry_lookup(guest, &mut call, Some(&entries))
+            .await?;
         let identities = self
-            .directory_entry_identities(guest, &mut call, &entries)
+            .directory_entry_identities(guest, &mut call, &entries, &told)
             .await?;
         for (entry, identity) in entries.iter().zip(identities) {
             let (d_ino, _) = determinize_named_inode(guest, identity).await;
@@ -8716,8 +8829,8 @@ struct GetdentsCall<'a> {
     device: u64,
     /// Which entries are `lstat`ed for that device at all; the others are
     /// keyed on `device` (see `Detcore::directory_entry_lookup`). On
-    /// overlayfs an asked entry can narrow it during the call (see
-    /// `EntryLookup::learn`).
+    /// overlayfs it is settled before the first entry is keyed (see
+    /// `Detcore::settle_overlay_entry_lookup`).
     lookup: EntryLookup,
     buf: AddrMut<'a, u8>,
     /// The guest's buffer size.
@@ -10415,6 +10528,14 @@ pub(crate) mod inject_fstat_scratch {
         /// `d_ino` of the entry `name`, for an inode number the test cannot
         /// give a file, such as a btrfs subvolume's.
         getdents_inode_answers: Vec<(Vec<u8>, u64)>,
+        /// (raw device, kind) of each overlay settled through
+        /// `SettleOverlayEntryLookup`, the first answer for a device kept, as
+        /// `GlobalState` keeps it. `send_rpc` answers that request always:
+        /// only a listing on overlayfs sends it.
+        settled_overlays: std::sync::Mutex<Vec<(u64, EntryLookup)>>,
+        /// (raw device, proposal) of each `SettleOverlayEntryLookup` request,
+        /// in order.
+        settle_requests: std::sync::Mutex<Vec<(u64, Option<EntryLookup>)>>,
     }
 
     /// The deterministic inode `send_rpc` gives the first `DeterminizeInode`
@@ -10476,6 +10597,8 @@ pub(crate) mod inject_fstat_scratch {
                 fstatfs_traps: false,
                 sigsys_queued: 0,
                 getdents_inode_answers: Vec::new(),
+                settled_overlays: std::sync::Mutex::new(Vec::new()),
+                settle_requests: std::sync::Mutex::new(Vec::new()),
             };
             (tool, guest)
         }
@@ -10558,6 +10681,26 @@ pub(crate) mod inject_fstat_scratch {
                 GlobalRequest::TouchFile(raw) if self.answers_touch_file => {
                     self.touched.lock().unwrap().push(raw);
                     (None, GlobalResponse::TouchFile(()))
+                }
+                GlobalRequest::SettleOverlayEntryLookup(device, proposal) => {
+                    self.settle_requests
+                        .lock()
+                        .unwrap()
+                        .push((device, proposal));
+                    let mut settled = self.settled_overlays.lock().unwrap();
+                    let known = settled
+                        .iter()
+                        .find(|(seen, _)| *seen == device)
+                        .map(|(_, lookup)| *lookup);
+                    let answer = match (known, proposal) {
+                        (Some(known), _) => Some(known),
+                        (None, Some(proposal)) => {
+                            settled.push((device, proposal));
+                            Some(proposal)
+                        }
+                        (None, None) => None,
+                    };
+                    (None, GlobalResponse::SettleOverlayEntryLookup(answer))
                 }
                 request => panic!("fd registration must not send an RPC: {request:?}"),
             }
@@ -13372,10 +13515,12 @@ pub(crate) mod inject_fstat_scratch {
     // `plain` is asked for real. Both getdents paths: a descriptor Detcore
     // does not track sorts one kernel buffer, and a tracked one is served
     // from its directory stream. `.` is the open directory, which reports
-    // the overlay's device on every overlay, so it is not asked; and
-    // `lower`, a file below 2^32 on its layer's device, shows that this
-    // overlay reports a layer's device for every non-directory, so every
-    // later entry is asked too, and a tracked descriptor keeps that.
+    // the overlay's device on every overlay, so it is not asked. `lower`,
+    // the first file below 2^32 in sorted order, is asked before any entry
+    // is keyed, and on its layer's device shows that this overlay reports a
+    // layer's device for every non-directory, so every entry but `.` is
+    // asked, `lower` keyed on the answer it already gave rather than asked
+    // twice, and a tracked descriptor keeps that.
     #[tokio::test]
     async fn getdents_keys_each_entry_on_the_device_its_own_lstat_reports() {
         for tracked in [false, true] {
@@ -13445,12 +13590,13 @@ pub(crate) mod inject_fstat_scratch {
                 .collect();
             assert_eq!(
                 asked,
-                [&b".."[..], b"covered", b"lower", b"plain", b"vanished"]
+                [&b"lower"[..], b"..", b"covered", b"plain", b"vanished"]
                     .map(|name| (name, entry_lstat)),
-                "tracked {tracked}: one lstat of each entry but ., relative to the descriptor"
+                "tracked {tracked}: one lstat of each entry but ., relative to the descriptor, \
+                 lower first to settle the overlay"
             );
             let expected_cache = if tracked {
-                Ok(Some(EntryLookup::Every))
+                Ok(Some(EntryLookup::OverlayLayerDevices))
             } else {
                 Err(Errno::EBADF)
             };
@@ -13470,18 +13616,24 @@ pub(crate) mod inject_fstat_scratch {
     // over the validation node's 4 GiB cap. An overlay with every layer on
     // one filesystem, or one that folds its layers' inode numbers, reports
     // its own device for each non-directory below 2^32. The first file whose
-    // `lstat` shows that (`lower`, after the directory `covered`, which
-    // decides nothing) leaves only `..` and the entries whose `d_ino` is at
-    // least 2^32 asked: `plain`, whose `lstat` would report another device,
-    // is not asked and keeps the directory's, while `vanished`, carrying a
-    // folded lower-layer number, is asked and keyed on the device its
-    // `lstat` reports. `plain` answers as a file bind-mounted from another
-    // filesystem with a coinciding number would, the first class of the
-    // second known gap at `Detcore::directory_entry_identity`: keeping the
-    // directory's device shows both that it is not asked and that the gap
-    // stays as documented. A tracked descriptor keeps what it learned, and a
-    // second read after a rewind uses it, even where `lower` would now
-    // teach otherwise. Both getdents paths.
+    // `lstat` shows that (`lower`; the directory `covered`, which could not,
+    // is not asked for it) is asked before any entry is keyed, and leaves
+    // only `..` and the entries whose `d_ino` is at least 2^32 asked for
+    // their keys. `covered`, a mount point whose `lstat` reports another
+    // device with its `d_ino`, is keyed on the directory's device in every
+    // read of this overlay; when it was read before `lower` had decided
+    // anything, it was keyed on the other device, unlike in the rewound read
+    // below (https://github.com/rrnewton/hermit/pull/3255). `plain`, whose
+    // `lstat` would report another device, is not asked and keeps the
+    // directory's, while `vanished`, carrying a folded lower-layer number, is
+    // asked and keyed on the device its `lstat` reports. `covered` and
+    // `plain` answer as a mount from another filesystem with a coinciding
+    // number would, the first class of the second known gap at
+    // `Detcore::directory_entry_identity`: keeping the directory's device
+    // shows both that they are not asked and that the gap stays as
+    // documented, the same in every read. A tracked descriptor keeps what
+    // was settled, and a second read after a rewind uses it, even where
+    // `lower` would now tell otherwise. Both getdents paths.
     #[tokio::test]
     async fn getdents_on_an_overlay_that_keeps_its_files_asks_only_wide_entries_after_one() {
         const FOLDED_LOWER_INODE: u64 = (1 << 33) | 302;
@@ -13592,23 +13744,23 @@ pub(crate) mod inject_fstat_scratch {
             );
             let keyed =
                 guest.determinized.lock().unwrap()[keyed_before..keyed_after_first].to_vec();
+            let first_keys = [
+                RawInode::new(OTHER_DEVICE, SCRIPTED_PARENT_INODE),
+                RawInode::new(device, COVERED_INODE),
+                RawInode::new(device, SCRIPTED_FILE_INODE),
+                RawInode::new(device, SCRIPTED_FILE_INODE + 1),
+                RawInode::new(OTHER_DEVICE, FOLDED_LOWER_INODE),
+            ];
             assert_eq!(
                 keyed.get(1..),
-                Some(
-                    &[
-                        RawInode::new(OTHER_DEVICE, SCRIPTED_PARENT_INODE),
-                        RawInode::new(OTHER_DEVICE, COVERED_INODE),
-                        RawInode::new(device, SCRIPTED_FILE_INODE),
-                        RawInode::new(device, SCRIPTED_FILE_INODE + 1),
-                        RawInode::new(OTHER_DEVICE, FOLDED_LOWER_INODE),
-                    ][..]
-                ),
+                Some(&first_keys[..]),
                 "tracked {tracked}: .., covered, lower, plain and vanished, after ."
             );
             assert_eq!(
                 entries_asked(&guest, fd, asked_before)[..asked_after_first - asked_before],
-                ["..", "covered", "lower", "vanished"],
-                "tracked {tracked}: after lower, only entries at or above 2^32 are asked"
+                ["lower", "..", "vanished"],
+                "tracked {tracked}: lower settles the overlay, then only .. and the entries \
+                 at or above 2^32 are asked"
             );
             let expected_cache = if tracked {
                 Ok(Some(EntryLookup::OverlayOwnDevice))
@@ -13640,7 +13792,262 @@ pub(crate) mod inject_fstat_scratch {
                     ),
                     "the second read keys covered and lower on the directory's device, unasked"
                 );
+                assert_eq!(
+                    keyed.get(1..),
+                    Some(&first_keys[..]),
+                    "the rewound read keys every entry as the first read did"
+                );
             }
+        }
+    }
+
+    /// The guest's `getdents64` of `fd` into a fresh buffer of `count` bytes.
+    async fn getdents64_sized(
+        tool: &Detcore,
+        guest: &mut ScriptedGuest,
+        fd: RawFd,
+        count: usize,
+    ) -> Result<i64, Error> {
+        let mut buffer = vec![0u8; count];
+        tool.handle_getdents64(
+            guest,
+            syscalls::Getdents64::new()
+                .with_fd(u32::try_from(fd).unwrap())
+                .with_dirent(AddrMut::from_raw(buffer.as_mut_ptr() as usize))
+                .with_count(u32::try_from(count).unwrap()),
+        )
+        .await
+    }
+
+    /// A scripted guest over [`directory_with_entries`] that reads it as a
+    /// single-filesystem overlay with a file bind-mounted over `plain` (see
+    /// [`getdents_keys_an_overlay_entry_alike_whatever_was_read_before`]).
+    fn overlay_with_a_bound_file(device: u64) -> (Detcore, ScriptedGuest, Pages) {
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        guest.answers_determinize_inode = true;
+        guest.fstatfs_answer = Some(Ok(libc::OVERLAYFS_SUPER_MAGIC));
+        // Every number below 2^32, whatever the host's, so that only `..`
+        // is asked for its key on an overlay that keeps its files.
+        guest.getdents_inode_answers = vec![
+            (b"..".to_vec(), SCRIPTED_PARENT_INODE),
+            (b"covered".to_vec(), SCRIPTED_FILE_INODE - 1),
+            (b"lower".to_vec(), SCRIPTED_FILE_INODE),
+            (b"plain".to_vec(), BOUND_FILE_INODE),
+            (b"vanished".to_vec(), SCRIPTED_FILE_INODE + 2),
+        ];
+        guest.fstatat_answers = vec![
+            (
+                b"..".to_vec(),
+                Ok(stat_answer(
+                    OTHER_DEVICE,
+                    SCRIPTED_PARENT_INODE,
+                    libc::S_IFDIR | 0o755,
+                )),
+            ),
+            (
+                b"covered".to_vec(),
+                Ok(stat_answer(
+                    device,
+                    SCRIPTED_FILE_INODE - 1,
+                    libc::S_IFDIR | 0o755,
+                )),
+            ),
+            (
+                b"lower".to_vec(),
+                Ok(stat_answer(
+                    device,
+                    SCRIPTED_FILE_INODE,
+                    libc::S_IFREG | 0o644,
+                )),
+            ),
+            (
+                b"plain".to_vec(),
+                Ok(stat_answer(
+                    OTHER_DEVICE,
+                    BOUND_FILE_INODE,
+                    libc::S_IFREG | 0o644,
+                )),
+            ),
+            (
+                b"vanished".to_vec(),
+                Ok(stat_answer(
+                    device,
+                    SCRIPTED_FILE_INODE + 2,
+                    libc::S_IFREG | 0o644,
+                )),
+            ),
+        ];
+        (tool, guest, scratch)
+    }
+
+    /// The `d_ino` of `plain` in [`overlay_with_a_bound_file`]: the number of
+    /// the file bound over it, on the layers' filesystem.
+    const BOUND_FILE_INODE: u64 = SCRIPTED_FILE_INODE + 1;
+
+    /// The keys of `plain` among the inode requests after the first `from`.
+    fn bound_file_keys(guest: &ScriptedGuest, from: usize) -> Vec<RawInode> {
+        guest.determinized.lock().unwrap()[from..]
+            .iter()
+            .copied()
+            .filter(|raw| raw.ino == BOUND_FILE_INODE)
+            .collect()
+    }
+
+    // Codex review of https://github.com/rrnewton/hermit/pull/3255, F1. On an
+    // overlay whose layers share one filesystem, every file reports the
+    // overlay's device, but a file bind-mounted over a merged entry reports
+    // the bind's source, here `plain` on `OTHER_DEVICE` with its `d_ino`.
+    // Such a file is keyed on the directory's device wherever it is not
+    // asked: the first class of the second known gap at
+    // `Detcore::directory_entry_identity`, which may stay but must be the
+    // same in every read. When the first file to reach keying decided how
+    // the overlay numbers its files, a read that reached `plain` before
+    // `lower` let `plain` decide, and keyed it on `OTHER_DEVICE`, where a
+    // sequential read keyed it on the directory's device: a read that seeks
+    // past `lower` after a buffer holding only `.` and `..`, the same
+    // through a duplicate of the descriptor, and a descriptor Detcore does
+    // not track read in buffers of one entry each. Now the overlay is
+    // settled before any entry is keyed, from its first file in sorted
+    // order, once per run, so all five reads key `plain` alike. A descriptor
+    // Detcore does not track read in such buffers before any other read of
+    // the overlay is the remaining gap, documented at
+    // `Detcore::settle_overlay_entry_lookup`: it is settled from whichever
+    // file the host returns first.
+    #[tokio::test]
+    async fn getdents_keys_an_overlay_entry_alike_whatever_was_read_before() {
+        // Room for `.` and `..` (24 bytes each), not for `covered` too.
+        const DOTS_ONLY: usize = 48;
+        // Room for one record of any of these names, never for two.
+        const ONE_ENTRY: usize = 32;
+        // The stream position just after `lower`: `.`, `..`, `covered` and
+        // `lower` come before it.
+        const AFTER_LOWER: i64 = 4;
+        let mut keys: Vec<(&str, u64, Vec<RawInode>)> = Vec::new();
+
+        // 1. One sequential read of a tracked descriptor.
+        let (_dir, fd, _, device) = directory_with_entries();
+        let (tool, mut guest, _scratch) = overlay_with_a_bound_file(device);
+        tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
+            .await
+            .expect("precondition: Detcore tracks the directory");
+        let read = getdents64_of(&tool, &mut guest, fd).await;
+        assert!(
+            read.as_ref().is_ok_and(|len| *len > 0),
+            "sequential: {read:?}"
+        );
+        keys.push(("sequential", device, bound_file_keys(&guest, 0)));
+        close_unless_detcore_did(&guest, fd);
+
+        // 2. `.` and `..`, then a seek past `lower`, then the rest.
+        let (_dir, fd, _, device) = directory_with_entries();
+        let (tool, mut guest, _scratch) = overlay_with_a_bound_file(device);
+        tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
+            .await
+            .expect("precondition: Detcore tracks the directory");
+        let dots = getdents64_sized(&tool, &mut guest, fd, DOTS_ONLY).await;
+        assert_eq!(dots.ok(), Some(DOTS_ONLY as i64), "seek: . and .. only");
+        let seek = tool
+            .handle_lseek(
+                &mut guest,
+                syscalls::Lseek::new()
+                    .with_fd(fd)
+                    .with_offset(AFTER_LOWER)
+                    .with_whence(Whence::SEEK_SET),
+            )
+            .await;
+        assert_eq!(
+            seek.ok(),
+            Some(AFTER_LOWER),
+            "seek: the stream moves past lower"
+        );
+        let read = getdents64_of(&tool, &mut guest, fd).await;
+        assert!(read.as_ref().is_ok_and(|len| *len > 0), "seek: {read:?}");
+        keys.push(("seek past lower", device, bound_file_keys(&guest, 0)));
+        close_unless_detcore_did(&guest, fd);
+
+        // 3. As 2, through a duplicate of the descriptor.
+        let (_dir, fd, _, device) = directory_with_entries();
+        let (tool, mut guest, _scratch) = overlay_with_a_bound_file(device);
+        tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
+            .await
+            .expect("precondition: Detcore tracks the directory");
+        let dup = unsafe { libc::dup(fd) };
+        assert!(dup >= 0, "dup: {}", Errno::last());
+        guest
+            .thread_state_mut()
+            .dup_fd(fd, dup, OFlag::empty())
+            .expect("precondition: Detcore tracks the duplicate");
+        let dots = getdents64_sized(&tool, &mut guest, fd, DOTS_ONLY).await;
+        assert_eq!(dots.ok(), Some(DOTS_ONLY as i64), "dup: . and .. only");
+        let seek = tool
+            .handle_lseek(
+                &mut guest,
+                syscalls::Lseek::new()
+                    .with_fd(dup)
+                    .with_offset(AFTER_LOWER)
+                    .with_whence(Whence::SEEK_SET),
+            )
+            .await;
+        assert_eq!(seek.ok(), Some(AFTER_LOWER), "dup: the shared stream moves");
+        let read = getdents64_of(&tool, &mut guest, dup).await;
+        assert!(read.as_ref().is_ok_and(|len| *len > 0), "dup: {read:?}");
+        keys.push(("duplicate", device, bound_file_keys(&guest, 0)));
+        close_unless_detcore_did(&guest, dup);
+        close_unless_detcore_did(&guest, fd);
+
+        // 4. A tracked read, then another descriptor of the same directory
+        // that Detcore does not track, read one entry at a time.
+        let (dir, fd, _, device) = directory_with_entries();
+        // Opened while `fd` is, so that it does not take a number Detcore
+        // tracks.
+        let untracked = std::fs::File::open(dir.path()).unwrap().into_raw_fd();
+        let (tool, mut guest, _scratch) = overlay_with_a_bound_file(device);
+        tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
+            .await
+            .expect("precondition: Detcore tracks the directory");
+        let read = getdents64_of(&tool, &mut guest, fd).await;
+        assert!(
+            read.as_ref().is_ok_and(|len| *len > 0),
+            "tracked first: {read:?}"
+        );
+        let keyed_before = guest.determinized.lock().unwrap().len();
+        let mut reads = 0;
+        loop {
+            let read = getdents64_sized(&tool, &mut guest, untracked, ONE_ENTRY).await;
+            match read {
+                Ok(0) => break,
+                Ok(_) => reads += 1,
+                Err(error) => panic!("untracked small: {error:?}"),
+            }
+            assert!(reads <= 6, "untracked small: more reads than entries");
+        }
+        assert_eq!(reads, 6, "untracked small: one entry per read");
+        keys.push((
+            "untracked, one entry per read, after a tracked read",
+            device,
+            bound_file_keys(&guest, keyed_before),
+        ));
+        close_unless_detcore_did(&guest, untracked);
+        close_unless_detcore_did(&guest, fd);
+
+        // 5. A descriptor Detcore does not track, read whole, in a fresh run.
+        let (_dir, fd, _, device) = directory_with_entries();
+        let (tool, mut guest, _scratch) = overlay_with_a_bound_file(device);
+        let read = getdents64_of(&tool, &mut guest, fd).await;
+        assert!(
+            read.as_ref().is_ok_and(|len| *len > 0),
+            "untracked whole: {read:?}"
+        );
+        keys.push(("untracked, whole", device, bound_file_keys(&guest, 0)));
+        close_unless_detcore_did(&guest, fd);
+
+        for (read, device, keyed) in keys {
+            assert_eq!(
+                keyed,
+                [RawInode::new(device, BOUND_FILE_INODE)],
+                "{read}: plain is keyed once, on the directory's device, as in every read"
+            );
         }
     }
 
