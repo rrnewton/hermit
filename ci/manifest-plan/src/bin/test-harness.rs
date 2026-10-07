@@ -719,8 +719,8 @@ fn accumulate_cell_cpu_usage(
 
 /// [`host_inapplicable_reason`] for `cell`. The hermit binary's
 /// `exact_branch_counter` verdict counts only for a cell the binary refuses on
-/// an inexact counter (see [`refused_on_an_inexact_branch_counter`]); a replay
-/// cell or a custom cell without `--strict` still runs.
+/// an inexact counter (see [`refused_on_an_inexact_branch_counter`]); a custom
+/// cell without `--strict` still runs.
 fn cell_host_inapplicable_reason(
     cell: &SelectedCell,
     verdicts: &HostCapabilities,
@@ -7838,11 +7838,12 @@ sys.exit(1 if failed else 0)
     }
 
     /// Where the hermit binary reports an inexact branch counter it refuses
-    /// `hermit run --strict` on ptrace and e9patch, so exactly the cells that
-    /// run that are withheld, with the binary's evidence. A replay cell runs
-    /// `record start` and a custom cell without `--strict` runs plain `run`;
-    /// the binary runs both, so they still run here. An unprobed binary
-    /// withholds nothing.
+    /// `hermit run --strict` and `hermit record start --strict` on ptrace and
+    /// e9patch, so exactly the cells that run those are withheld, with the
+    /// binary's evidence. A replay cell runs `record start --strict`
+    /// (https://github.com/rrnewton/hermit/issues/3810). A custom cell without
+    /// `--strict` runs plain `run`, which the binary runs, so it still runs
+    /// here. An unprobed binary withholds nothing.
     #[test]
     fn strict_run_pmu_clock_cells_are_withheld_where_the_binary_reports_an_inexact_counter() {
         let manifests = ManifestSet::load(&super::root(None)).unwrap();
@@ -7877,6 +7878,7 @@ sys.exit(1 if failed else 0)
             cell("c-programs/random-readv-stream", "verify"),
             cell("c-programs/ipc-determinism", "chaos"),
             cell("c-programs/environment-and-workdir", "custom"),
+            cell("c-programs/random-readv-stream", "replay"),
         ];
         for mut strict_run in strict_runs {
             for backend in ["ptrace", "e9patch"] {
@@ -7906,7 +7908,6 @@ sys.exit(1 if failed else 0)
             }
         }
 
-        let replay = cell("c-programs/random-readv-stream", "replay");
         let custom = cell("system-utils/clock-determinism", "custom");
         assert!(
             !custom.test.modes["custom"]
@@ -7924,9 +7925,7 @@ sys.exit(1 if failed else 0)
             args.push(flag.into());
             assert!(withheld(&namespace_only).is_none(), "{flag}");
         }
-        for runs in [replay, custom] {
-            assert!(withheld(&runs).is_none(), "{:?}", runs.id);
-        }
+        assert!(withheld(&custom).is_none(), "{:?}", custom.id);
     }
 
     const GUARDED_WORKFLOW: &str = r#"    # --allow-cgroup-failure is documented here but not executed.

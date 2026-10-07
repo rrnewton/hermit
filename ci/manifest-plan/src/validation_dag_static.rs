@@ -1032,7 +1032,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // metadata::tests::record_version_rejects_pre_request_ordinal_inode_streams
     // and replay::tests::replay_refuses_a_recording_from_before_inode_request_ordinals
     // (https://github.com/rrnewton/hermit/issues/2897) retain all 923: 925.
-    ("test.hermit_unit", 925),
+    // The --strict inexact-branch-counter refusal in analyze, bisect and record
+    // start (https://github.com/rrnewton/hermit/issues/3810):
+    // analyze::rundata::tests::{strict_trials_refuse_an_inexact_branch_counter,
+    // strict_analyze_refuses_an_inexact_branch_counter_before_its_workspace},
+    // bisect::tests::strict_bisect_refuses_an_inexact_branch_counter_before_reading_schedules
+    // and record_start::tests::{strict_record_refuses_an_inexact_branch_counter_before_it_records,
+    // record_refusal_needs_strict_and_an_inexact_counter} retain all 925: 930
+    // (measured with cargo nextest list).
+    ("test.hermit_unit", 930),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1723,7 +1731,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same two auto-reap tests: 920.
     // The host twin selects the same three tests: 923.
     // And the same two record-version tests (925).
-    ("test.hermit_unit_on_host", 925),
+    ("test.hermit_unit_on_host", 930),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

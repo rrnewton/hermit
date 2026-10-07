@@ -742,8 +742,10 @@ impl AnalyzeOpts {
 
     pub fn main(&mut self, global: &GlobalOpts) -> anyhow::Result<ExitStatus> {
         self.apply_global(global);
-        // Before phase 0 creates the workspace: a refused cap starts nothing.
+        // Before phase 0 creates the workspace: a refused cap or counter
+        // starts nothing.
         self.refuse_unsupervised_log_cap()?;
+        self.refuse_strict_with_inexact_branch_counter()?;
         // Not implemented yet:
         if self.run1_schedule.is_some() {
             unimplemented!()

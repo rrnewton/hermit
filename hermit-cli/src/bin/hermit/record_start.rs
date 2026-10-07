@@ -187,8 +187,12 @@ pub struct StartOpts {
     #[clap(value_name = "PROGRAM", required = true)]
     program: Option<PathBuf>,
 
-    /// Accepted and ignored, for command-line compatibility with `hermit run --strict`.
-    /// Recording does NOT run under `run --strict`'s configuration: see
+    /// Refuse to record (exit 122) on a host whose retired-conditional-branch counter
+    /// fails Reverie's performance-counter validation, as `hermit run --strict` does: the
+    /// ptrace record runtime reads its virtual clock and preemption points from that
+    /// counter, so a replay could diverge from its recording for a hardware reason
+    /// (https://github.com/rrnewton/hermit/issues/3810). That refusal is the flag's only
+    /// effect. Recording does NOT run under `run --strict`'s configuration: see
     /// `hermit_cli::metadata::record_or_replay_config`, which deliberately sets
     /// `virtualize_time: false`, `deterministic_io: false`, `passthru_opt: true` and
     /// `panic_on_unsupported_syscalls: true`. A recorded guest therefore reads the REAL
@@ -196,7 +200,7 @@ pub struct StartOpts {
     /// times. What `--verify` establishes is that a recording REPLAYS faithfully, not that
     /// two independent recordings agree.
     #[clap(long = "strict")]
-    _strict: bool,
+    strict: bool,
 
     /// Arguments for the program.
     #[clap(value_name = "ARGS")]
@@ -307,6 +311,12 @@ pub struct StartOpts {
     /// The recording is deleted if the replay was successful.
     #[clap(long = "verify-with-gdbex", value_delimiter = ';')]
     gdbex: Vec<String>,
+
+    /// Why this host's retired-branch counter is inexact, if it is. Only the
+    /// `--strict` refusal consults it; tests replace it to reach that refusal
+    /// on a host whose counters pass.
+    #[clap(skip = crate::host_capabilities::host_inexact_branch_counter as fn() -> Option<String>)]
+    inexact_branch_counter: fn() -> Option<String>,
 }
 
 impl StartOpts {
@@ -478,13 +488,30 @@ impl StartOpts {
         self.verify.then_some(self.verify_json.as_deref()).flatten()
     }
 
+    /// `--strict` on a host whose retired-branch counter is inexact: refused,
+    /// with `hermit run --strict`'s message. Every recording runs on the ptrace
+    /// record runtime, with or without e9patch preprocessing, and both read the
+    /// virtual clock from that counter, so unlike `run` there is no backend to
+    /// exempt.
+    fn refuse_strict_with_inexact_branch_counter(&self, global: &GlobalOpts) -> Result<(), Error> {
+        if !self.strict {
+            return Ok(());
+        }
+        crate::run::refuse_an_inexact_branch_counter(
+            global.backend.unwrap_or_default(),
+            self.inexact_branch_counter,
+        )
+    }
+
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         if self.verify {
             validate_log_level(global)?;
             self.record_verify(global)
         } else if !self.gdbex.is_empty() {
+            self.refuse_strict_with_inexact_branch_counter(global)?;
             self.record_verify_debug(global)
         } else {
+            self.refuse_strict_with_inexact_branch_counter(global)?;
             let hermit = HermitData::from(self.data_dir.as_ref());
             let record_timeout = self.record_timeout();
             let local_networking = self.network() == NetworkingMode::Local;
@@ -562,6 +589,9 @@ impl StartOpts {
         if let Some(path) = &self.verify_json {
             write_pending_verification_json(path)?;
         }
+        // After the pending report carries the counter verdict, so that a
+        // refused recording still says which counter it would have read.
+        self.refuse_strict_with_inexact_branch_counter(global)?;
         let strictness = if self.verify_strict {
             LogCompareStrictness::Canonical
         } else {
@@ -903,7 +933,7 @@ mod tests {
     fn start_options(env: Vec<(String, Option<String>)>) -> StartOpts {
         StartOpts {
             program: Some(PathBuf::from("/bin/true")),
-            _strict: false,
+            strict: false,
             args: Vec::new(),
             env,
             base_env: BaseEnv::Host,
@@ -916,7 +946,89 @@ mod tests {
             verify_json: None,
             verify_strict: false,
             gdbex: Vec::new(),
+            inexact_branch_counter: || None,
         }
+    }
+
+    /// `record start --strict` refuses an inexact retired-branch counter
+    /// before it records anything, on each of `main`'s three recording paths
+    /// (https://github.com/rrnewton/hermit/issues/3810). The recordings would
+    /// go to a fresh data directory, which must stay empty.
+    #[test]
+    fn strict_record_refuses_an_inexact_branch_counter_before_it_records() {
+        let global = <GlobalOpts as clap::Parser>::parse_from(["hermit"]);
+        let data_dir = tempfile::tempdir().unwrap();
+        for path in ["record", "verify", "verify-with-gdbex"] {
+            let mut options = start_options(Vec::new());
+            options.strict = true;
+            options.data_dir = Some(data_dir.path().to_path_buf());
+            match path {
+                "verify" => options.verify = true,
+                "verify-with-gdbex" => options.gdbex = vec!["continue".to_string()],
+                _ => {}
+            }
+            options.inexact_branch_counter = || Some("SpecLockMap is enabled".to_string());
+            let error = options.main(&global).expect_err(path);
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{path}: {error:#}"
+            );
+            let message = error.to_string();
+            for expected in [
+                "--strict",
+                "`ptrace` backend",
+                "SpecLockMap is enabled",
+                "CPU ",
+                "issues/3794",
+            ] {
+                assert!(
+                    message.contains(expected),
+                    "{path}: {expected:?}: {message}"
+                );
+            }
+        }
+        assert_eq!(
+            fs::read_dir(data_dir.path()).unwrap().count(),
+            0,
+            "a refused recording leaves nothing behind"
+        );
+    }
+
+    /// The refusal needs `--strict` and an inexact counter, and covers e9patch
+    /// preprocessing, which records on the same ptrace runtime and counter.
+    #[test]
+    fn record_refusal_needs_strict_and_an_inexact_counter() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[clap(flatten)]
+            start: StartOpts,
+        }
+        let parse = |args: &[&str]| <Cli as clap::Parser>::try_parse_from(args).unwrap().start;
+        let ptrace = <GlobalOpts as clap::Parser>::parse_from(["hermit"]);
+        let unreachable = || -> Option<String> { panic!("the counter is not consulted") };
+
+        let mut options = parse(&["start", "/bin/true"]);
+        assert!(!options.strict);
+        options.inexact_branch_counter = unreachable;
+        options
+            .refuse_strict_with_inexact_branch_counter(&ptrace)
+            .unwrap();
+
+        let mut options = parse(&["start", "--strict", "/bin/true"]);
+        assert!(options.strict);
+        options.inexact_branch_counter = || None;
+        options
+            .refuse_strict_with_inexact_branch_counter(&ptrace)
+            .unwrap();
+
+        let e9patch = <GlobalOpts as clap::Parser>::parse_from(["hermit", "--backend=e9patch"]);
+        options.inexact_branch_counter = || Some("SpecLockMap is enabled".to_string());
+        let error = options
+            .refuse_strict_with_inexact_branch_counter(&e9patch)
+            .unwrap_err();
+        assert!(error.to_string().contains("`e9patch` backend"), "{error:#}");
     }
 
     /// `record start` takes `run`'s networking contract, local by default,
@@ -1103,7 +1215,7 @@ mod tests {
     fn e9patch_record_target_rejects_proc_magic_links() {
         let options = StartOpts {
             program: Some(PathBuf::from("/proc/self/exe")),
-            _strict: false,
+            strict: false,
             args: Vec::new(),
             env: Vec::new(),
             base_env: BaseEnv::Host,
@@ -1116,6 +1228,7 @@ mod tests {
             verify_json: None,
             verify_strict: false,
             gdbex: Vec::new(),
+            inexact_branch_counter: || None,
         };
         let error = options.resolve_e9patch_record_target().unwrap_err();
         assert!(

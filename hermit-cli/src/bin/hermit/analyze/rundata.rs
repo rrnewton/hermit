@@ -434,6 +434,7 @@ impl RunData {
         // options, so backend-specific validation sees the backend the trials
         // will run on.
         runopts.set_backend(aopts.backend);
+        runopts.set_inexact_branch_counter(aopts.inexact_branch_counter);
         runopts
     }
 
@@ -579,6 +580,18 @@ impl AnalyzeOpts {
         let trial = RunData::get_raw_runopts(self);
         trial.refuse_unsupervised_log_cap(self.max_log_bytes)
     }
+
+    /// Refuses `--strict` in the run arguments (exit 122) where the trials'
+    /// backend reads its virtual clock from a retired-branch counter that
+    /// fails Reverie's validation, as `hermit run --strict` does in
+    /// `RunOpts::main`. Trials go straight to `RunOpts::run`, so `analyze` and
+    /// `bisect` make the check here, before any workspace or trial exists.
+    /// Without it a trial on a miscounting counter can disagree with another
+    /// for a hardware reason and be reported as a race
+    /// (https://github.com/rrnewton/hermit/issues/3810).
+    pub fn refuse_strict_with_inexact_branch_counter(&self) -> anyhow::Result<()> {
+        RunData::get_raw_runopts(self).refuse_strict_with_inexact_branch_counter()
+    }
 }
 
 #[cfg(test)]
@@ -698,6 +711,111 @@ mod tests {
                 .refuse_unsupervised_log_cap()
                 .unwrap_or_else(|error| panic!("{accepted:?}: {error:#}"));
         }
+    }
+
+    /// https://github.com/rrnewton/hermit/issues/3810: `hermit run --strict`
+    /// refuses an inexact retired-branch counter in `RunOpts::main`, which
+    /// analyze and bisect trials never reach, so the trial options make the
+    /// same refusal, with the same conditions: `--strict` in either spelling of
+    /// the run arguments, a backend that reads that counter, and a failed
+    /// validation.
+    #[test]
+    fn strict_trials_refuse_an_inexact_branch_counter() {
+        let options = |argv: &[&str], probe: fn() -> Option<String>| {
+            let args = crate::Args::try_parse_from(argv)
+                .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            options.apply_global(&args.global);
+            options.inexact_branch_counter = probe;
+            options
+        };
+        let inexact = || Some("SpecLockMap is enabled".to_string());
+        for refused in [
+            &["hermit", "analyze", "--run-arg=--strict", "--", "/bin/true"][..],
+            &["hermit", "analyze", "--", "--strict", "/bin/true"][..],
+            &[
+                "hermit",
+                "--backend=ptrace",
+                "analyze",
+                "--",
+                "--strict",
+                "/bin/true",
+            ][..],
+        ] {
+            let error = options(refused, inexact)
+                .refuse_strict_with_inexact_branch_counter()
+                .expect_err("a strict trial on an inexact counter");
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{refused:?}: {error:#}"
+            );
+            let message = error.to_string();
+            for expected in ["--strict", "`ptrace` backend", "SpecLockMap is enabled"] {
+                assert!(
+                    message.contains(expected),
+                    "{refused:?}: {expected:?}: {message}"
+                );
+            }
+        }
+        let unreachable: fn() -> Option<String> = || panic!("the counter is not consulted");
+        for (accepted, probe) in [
+            (&["hermit", "analyze", "--", "/bin/true"][..], unreachable),
+            (
+                &[
+                    "hermit",
+                    "--backend=kvm",
+                    "analyze",
+                    "--",
+                    "--strict",
+                    "/bin/true",
+                ][..],
+                unreachable,
+            ),
+            (
+                &["hermit", "analyze", "--", "--strict", "/bin/true"][..],
+                || None,
+            ),
+        ] {
+            options(accepted, probe)
+                .refuse_strict_with_inexact_branch_counter()
+                .unwrap_or_else(|error| panic!("{accepted:?}: {error:#}"));
+        }
+    }
+
+    /// Through `main`: the refusal must be wired into analyze's preflight,
+    /// ahead of the workspace and every trial. `--run1-schedule` is not
+    /// implemented and `main` panics on it right after that preflight, so an
+    /// analyze that passed the refusal panics instead of starting anything.
+    #[test]
+    fn strict_analyze_refuses_an_inexact_branch_counter_before_its_workspace() {
+        let argv = [
+            "hermit",
+            "analyze",
+            "--run1-schedule=/nonexistent/schedule.json",
+            "--",
+            "--strict",
+            "/bin/true",
+        ];
+        let args = crate::Args::try_parse_from(argv).unwrap();
+        let crate::Subcommand::Analyze(mut options) = args.command else {
+            panic!("{argv:?} is not analyze")
+        };
+        options.inexact_branch_counter = || Some("SpecLockMap is enabled".to_string());
+        let error = options.main(&args.global).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::container::PolicyRefusal>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert!(
+            error.to_string().contains("SpecLockMap is enabled"),
+            "{error:#}"
+        );
     }
 
     /// `run` has no `--backend`, so `hermit --backend <BACKEND> analyze` is the

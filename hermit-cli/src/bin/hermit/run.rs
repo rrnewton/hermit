@@ -352,6 +352,31 @@ fn place_host_input_change(
     Some((difference, positions))
 }
 
+/// The `--strict` refusal on a `backend` whose virtual clock is the host's
+/// retired-conditional-branch counter (see
+/// `RunOpts::refuse_strict_with_inexact_branch_counter`): `Ok` when
+/// `inexact_branch_counter` finds the counter exact, else a `PolicyRefusal`
+/// that names the backend, Reverie's reason and the CPU. `hermit run`,
+/// `hermit analyze`, `hermit bisect` and `hermit record start` share it, so
+/// all four refuse with the same message.
+pub(crate) fn refuse_an_inexact_branch_counter(
+    backend: Backend,
+    inexact_branch_counter: fn() -> Option<String>,
+) -> Result<(), Error> {
+    let Some(reason) = inexact_branch_counter() else {
+        return Ok(());
+    };
+    Err(Error::new(PolicyRefusal).context(format!(
+        "--strict refuses the `{}` backend on this host: its retired-conditional-branch \
+         counter failed Reverie's performance-counter validation ({reason}; {}). That counter \
+         is the virtual clock on this backend, so two runs of one program could diverge. Run \
+         on a host whose counters pass the validation, or drop --strict to run without the \
+         determinism guarantee (see https://github.com/rrnewton/hermit/issues/3794).",
+        backend.as_str(),
+        cpu_identity()
+    )))
+}
+
 /// `hermit host-capabilities`'s own `exact_branch_counter` verdict, for a
 /// verification report (`VerificationReport::exact_branch_counter`).
 pub(crate) fn branch_counter_verdict() -> hermit::canonical_verdict::BranchCounterVerdict {
@@ -6848,22 +6873,22 @@ impl RunOpts {
     /// Refuse rather than run a strict guest on a clock that is not exact.
     /// Runs without `--strict` go ahead, and Reverie logs the failed
     /// validation.
-    fn refuse_strict_with_inexact_branch_counter(&self) -> Result<(), Error> {
+    ///
+    /// `hermit analyze` and `hermit bisect` call this on their trial options
+    /// (`AnalyzeOpts::refuse_strict_with_inexact_branch_counter`), because
+    /// their trials start through `RunOpts::run` and never pass through `main`
+    /// (https://github.com/rrnewton/hermit/issues/3810).
+    pub(crate) fn refuse_strict_with_inexact_branch_counter(&self) -> Result<(), Error> {
         if !self.strict || !self.arms_reverie_ptrace_pmu_timer() {
             return Ok(());
         }
-        let Some(reason) = (self.inexact_branch_counter)() else {
-            return Ok(());
-        };
-        Err(Error::new(PolicyRefusal).context(format!(
-            "--strict refuses the `{}` backend on this host: its retired-conditional-branch \
-             counter failed Reverie's performance-counter validation ({reason}; {}). That counter \
-             is the virtual clock on this backend, so two runs of one program could diverge. Run \
-             on a host whose counters pass the validation, or drop --strict to run without the \
-             determinism guarantee (see https://github.com/rrnewton/hermit/issues/3794).",
-            self.selected_backend().as_str(),
-            cpu_identity()
-        )))
+        refuse_an_inexact_branch_counter(self.selected_backend(), self.inexact_branch_counter)
+    }
+
+    /// Replace the host's retired-branch-counter probe, for a `RunOpts` built
+    /// outside clap's parse of `run`, such as `hermit analyze`'s trial options.
+    pub(crate) fn set_inexact_branch_counter(&mut self, probe: fn() -> Option<String>) {
+        self.inexact_branch_counter = probe;
     }
 
     /// Refuse `--timeout` on a backend where it has not been shown to bound the

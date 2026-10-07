@@ -76,6 +76,11 @@ pub struct BisectOpts {
     /// Arguments for the underlying `hermit run`, followed by the program and its arguments.
     #[clap(value_name = "RUN_ARGS", required = true)]
     run_args: Vec<String>,
+
+    /// Why this host's retired-branch counter is inexact, if it is (see
+    /// `AnalyzeOpts::inexact_branch_counter`).
+    #[clap(skip = crate::host_capabilities::host_inexact_branch_counter as fn() -> Option<String>)]
+    inexact_branch_counter: fn() -> Option<String>,
 }
 
 impl BisectOpts {
@@ -111,9 +116,12 @@ impl BisectOpts {
             backend: global.backend,
             max_log_bytes: global.max_log_bytes,
             log_budget: global.log_budget(),
+            inexact_branch_counter: self.inexact_branch_counter,
         };
-        // Before the schedules are read: a refused cap reads and starts nothing.
+        // Before the schedules are read: a refused cap or counter reads and
+        // starts nothing.
         analyzer.refuse_unsupervised_log_cap()?;
+        analyzer.refuse_strict_with_inexact_branch_counter()?;
 
         let good = read_schedule(&self.good, "good")?;
         let bad = read_schedule(&self.bad, "bad")?;
@@ -146,6 +154,46 @@ fn read_schedule(path: &Path, label: &str) -> anyhow::Result<Vec<SchedEvent>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Through `main`: bisect refuses `--strict` in its run arguments on an
+    /// inexact retired-branch counter before it reads either schedule
+    /// (https://github.com/rrnewton/hermit/issues/3810). The schedules do not
+    /// exist, so a bisect that passed the refusal fails on reading them.
+    #[test]
+    fn strict_bisect_refuses_an_inexact_branch_counter_before_reading_schedules() {
+        let argv = [
+            "hermit",
+            "bisect",
+            "--good=/nonexistent/good.json",
+            "--bad=/nonexistent/bad.json",
+            "--",
+            "--strict",
+            "/bin/true",
+        ];
+        let args = crate::Args::try_parse_from(argv).unwrap();
+        let crate::Subcommand::Bisect(mut options) = args.command else {
+            panic!("{argv:?} is not bisect")
+        };
+        options.inexact_branch_counter = || Some("SpecLockMap is enabled".to_string());
+        let error = options.main(&args.global).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::container::PolicyRefusal>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert!(
+            error.to_string().contains("SpecLockMap is enabled"),
+            "{error:#}"
+        );
+
+        options.inexact_branch_counter = || None;
+        let error = options.main(&args.global).unwrap_err();
+        assert!(
+            error.to_string().contains("failed to read --good schedule"),
+            "{error:#}"
+        );
+    }
 
     #[test]
     fn schedule_fixture_contains_events() {

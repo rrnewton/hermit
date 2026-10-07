@@ -307,15 +307,17 @@ pub fn pmu_clock_backend(backend: &str) -> bool {
 }
 
 /// Whether the hermit binary refuses `cell` where it reports no
-/// `exact_branch_counter`: the cell runs `hermit run --strict` on a
-/// [`pmu_clock_backend`]. Verify and chaos cells always pass `--strict` to
-/// `run`, and a custom cell does when its arguments say so, unless they also
-/// select `--namespace-only` (alias `--lite`), which arms no branch counter. A
-/// replay cell runs `record start`, which does not refuse, and a naked cell
-/// runs no hermit.
+/// `exact_branch_counter`: the cell runs `hermit run --strict` or `hermit
+/// record start --strict` on a [`pmu_clock_backend`]. Verify and chaos cells
+/// always pass `--strict` to `run`, and replay cells to `record start`, which
+/// refuses in the same way
+/// (<https://github.com/rrnewton/hermit/issues/3810>). A custom cell passes it
+/// when its arguments say so, unless they also select `--namespace-only`
+/// (alias `--lite`), which arms no branch counter. A naked cell runs no
+/// hermit.
 pub fn refused_on_an_inexact_branch_counter(cell: &SelectedCell) -> bool {
     let strict_run = match cell.id.mode.as_str() {
-        "verify" | "chaos" => true,
+        "verify" | "chaos" | "replay" => true,
         "custom" => {
             let args = &cell.test.modes["custom"].args;
             let has = |flag: &str| args.iter().any(|arg| arg == flag);
