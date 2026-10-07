@@ -379,6 +379,7 @@ PYEOF
             NEXTEST_RUN_ID=self-test-nextest NEXTEST_ATTEMPT=1 \
             HERMIT_NEXTEST_CPU_CONTROL_CWD="$PWD" \
             HERMIT_NEXTEST_CPU_CONTROL_SENTINEL=preserved \
+            LD_LIBRARY_PATH="$PWD/deps" \
             setsid "$cpu_wrapper" "$fixture_binary" --exact failure --nocapture \
             >/dev/null 2>/dev/null || wrapper_status=$?
         [[ $wrapper_status == 23 ]] || return 99

@@ -77,6 +77,12 @@ const CONTROL_SIGNAL_FILE_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_SIGNAL_FILE";
 const CONTROL_WAIT4_RESUME_FILE_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_WAIT4_RESUME_FILE";
 const CONTROL_WAIT4_STORED_FILE_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_WAIT4_STORED_FILE";
 const CONTROL_SENTINEL_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_SENTINEL";
+// Nextest points this at the build's own `deps` and build-script output
+// directories, which other validation nodes keep writing into. No test binary
+// needs it to start, and a guest that inherits it has its dynamic loader stat
+// those directories, so two runs of one verification can see different sizes
+// (https://github.com/rrnewton/hermit/issues/3846).
+const DYNAMIC_LIBRARY_PATH_ENV: &str = "LD_LIBRARY_PATH";
 const INFRASTRUCTURE_EXIT: u8 = 70;
 const CPU_TIMEOUT_EXIT: u8 = 124;
 const NON_SIGNAL_CAUSE_RESERVED: i32 = -1;
@@ -1497,6 +1503,7 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
     command.env_remove(CONTROL_RESUME_FILE_ENV);
     command.env_remove(CONTROL_WAIT4_RESUME_FILE_ENV);
     command.env_remove(CONTROL_WAIT4_STORED_FILE_ENV);
+    command.env_remove(DYNAMIC_LIBRARY_PATH_ENV);
     if let Some(control) = &entry_control {
         command.env(
             CONTROL_ENTRY_DEADLINE_NS_ENV,
@@ -1977,6 +1984,9 @@ fn control_child(mode: &str, args: &[OsString]) -> Result<ExitCode, String> {
                     "measurement-only configuration leaked into the test environment".into(),
                 );
             }
+            if env::var_os(DYNAMIC_LIBRARY_PATH_ENV).is_some() {
+                return Err("the build directories in LD_LIBRARY_PATH reached the test".into());
+            }
             println!("stdout-exact");
             eprintln!("stderr-exact");
             Ok(ExitCode::from(if mode == "success" { 0 } else { 23 }))
@@ -2261,6 +2271,7 @@ fn control_command_with_limits(
         .env_remove(CONTROL_ENTRY_RESUME_FILE_ENV)
         .env(CONTROL_CWD_ENV, scratch)
         .env(CONTROL_SENTINEL_ENV, "preserved")
+        .env(DYNAMIC_LIBRARY_PATH_ENV, scratch.join("deps"))
         .env(CONTROL_PROC_ROOT_ENV, "/proc")
         .env(CPU_WRAPPER_ENV, executable)
         .stdout(Stdio::piped())
@@ -2293,6 +2304,7 @@ fn measurement_control_command(
         .env_remove(CONTROL_ENTRY_RESUME_FILE_ENV)
         .env(CONTROL_CWD_ENV, scratch)
         .env(CONTROL_SENTINEL_ENV, "preserved")
+        .env(DYNAMIC_LIBRARY_PATH_ENV, scratch.join("deps"))
         .env(TEST_CPU_TIMEOUT_MULTIPLIER_ENV, "99")
         .env(CPU_WRAPPER_ENV, executable)
         .stdout(Stdio::piped())
