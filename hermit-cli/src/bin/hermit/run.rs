@@ -99,6 +99,7 @@ use super::verify::retain_logs_after_verification_error;
 use super::verify::retain_verification_error;
 use super::verify::retain_verification_logs;
 use super::verify::run_verification_execution;
+use super::verify::signal_termination_report;
 use super::verify::temp_log_files_in;
 use super::verify::validate_log_level;
 use super::verify::verification_log_level;
@@ -6310,6 +6311,9 @@ impl RunOpts {
                 String::from_utf8_lossy(&out1.stdout),
                 String::from_utf8_lossy(&out1.stderr),
             );
+            if let Some(report) = signal_termination_report("run 1", out1.status, &log1_path) {
+                eprint!("{report}");
+            }
             // ⚠️ RECORD THE DISPOSITION HERE, WHERE IT IS KNOWN. `out1.status`
             // is in hand, yet the pre-stamped `no_result` record was previously
             // left untouched on this path -- so the artifact reported
@@ -6462,6 +6466,14 @@ impl RunOpts {
             eprintln!(
                 ":: {backend} syscall DETLOG records included: run1={forwarded_syscalls1}, run2={forwarded_syscalls2}"
             );
+        }
+
+        // A run 2 whose exit status is not allowed is reported as run 1 is
+        // above, before the comparison below consumes its log.
+        if !self.verify_allow.satisfies(out2.status)
+            && let Some(report) = signal_termination_report("run 2", out2.status, &log2_path)
+        {
+            eprint!("{report}");
         }
 
         // Say what was actually established. Buffer hashing is ON BY DEFAULT, so

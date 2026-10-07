@@ -1177,6 +1177,127 @@ pub(crate) fn retain_verification_logs<const N: usize>(
     Ok(retained)
 }
 
+/// How many of a run's last INFO DETLOG records [`signal_termination_report`]
+/// shows.
+const SIGNAL_REPORT_RECORDS: usize = 20;
+/// How much of the end of a run's log [`signal_termination_report`] reads.
+const SIGNAL_REPORT_TAIL_BYTES: u64 = 4 << 20;
+/// The longest record [`signal_termination_report`] shows before cutting it.
+const SIGNAL_REPORT_LINE_BYTES: usize = 400;
+
+/// What the guest of a run was doing when a signal terminated it: the last
+/// INFO DETLOG records of its log, the records `--verify` compares, for
+/// printing to stderr. `None` unless `status` is a termination by a signal.
+/// The DEBUG records a verification log also holds (register dumps, scheduler
+/// steps) would otherwise push the guest's last system calls out of the
+/// report.
+///
+/// A verify log lives where `--verify-log-dir` put it, which for a test is
+/// usually inside a disposable checkout, and `--keep-logs` keeps it only as
+/// long as that checkout. Stderr is what a test runner keeps, so a crash
+/// under `--verify` that the caller never reproduces is still diagnosable
+/// from these records; see https://github.com/rrnewton/hermit/issues/3833,
+/// where it was not.
+///
+/// The wait status carries only the signal and whether a core was dumped, not
+/// the faulting address or thread, so the records are the evidence of where.
+/// Each is shown without its machine-readable suffix and cut at
+/// [`SIGNAL_REPORT_LINE_BYTES`], so the report stays a few kilobytes.
+pub(crate) fn signal_termination_report(
+    label: &str,
+    status: ExitStatus,
+    log: &Path,
+) -> Option<String> {
+    let ExitStatus::Signaled(signal, core_dumped) = status else {
+        return None;
+    };
+    let core = if core_dumped { ", core dumped" } else { "" };
+    let heading = format!(
+        ":: The {label} guest was terminated by signal {} ({signal:?}{core}).",
+        signal as i32
+    );
+    let tail = match read_log_tail(log, SIGNAL_REPORT_TAIL_BYTES) {
+        Ok(tail) => tail,
+        Err(error) => {
+            return Some(format!(
+                "{heading} Its log {} could not be read: {error}\n",
+                log.display()
+            ));
+        }
+    };
+    let records: Vec<&str> = tail
+        .lines()
+        .filter(|line| is_info_detlog(line))
+        .map(|line| {
+            line.split_once(detcore::detlog::RECORD_SEPARATOR)
+                .map_or(line, |(human, _)| human)
+        })
+        .collect();
+    if records.is_empty() {
+        return Some(format!(
+            "{heading} The last {} bytes of its log {} hold no INFO DETLOG record.\n",
+            SIGNAL_REPORT_TAIL_BYTES,
+            log.display()
+        ));
+    }
+    let shown = &records[records.len().saturating_sub(SIGNAL_REPORT_RECORDS)..];
+    let mut report = format!(
+        "{heading} Its last {} INFO DETLOG records, from {}:\n",
+        shown.len(),
+        log.display()
+    );
+    for record in shown {
+        report.push_str("::   ");
+        report.push_str(cut_at_char_boundary(record, SIGNAL_REPORT_LINE_BYTES));
+        if record.len() > SIGNAL_REPORT_LINE_BYTES {
+            report.push_str(" [cut]");
+        }
+        report.push('\n');
+    }
+    Some(report)
+}
+
+/// Whether `line` is an INFO DETLOG record. A record starts with its level,
+/// after the timestamp a log file gives it.
+fn is_info_detlog(line: &str) -> bool {
+    let mut words = line.split_whitespace();
+    let info = match words.next() {
+        Some("INFO") => true,
+        Some(_) => words.next() == Some("INFO"),
+        None => false,
+    };
+    info && line.contains(" DETLOG ")
+}
+
+/// The last `max` bytes of `path`, from the first line that starts within
+/// them, with invalid UTF-8 replaced.
+fn read_log_tail(path: &Path, max: u64) -> io::Result<String> {
+    use std::io::Read;
+    use std::io::Seek;
+    use std::io::SeekFrom;
+
+    let mut file = File::open(path)?;
+    let start = file.metadata()?.len().saturating_sub(max);
+    // From one byte earlier, which tells whether `start` begins a line.
+    file.seek(SeekFrom::Start(start.saturating_sub(1)))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    if start > 0 {
+        // Drop that byte, and the rest of the line it ends or is part of.
+        let first_line_end = bytes.iter().position(|&byte| byte == b'\n');
+        bytes.drain(..first_line_end.map_or(bytes.len(), |end| end + 1));
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn cut_at_char_boundary(text: &str, max: usize) -> &str {
+    let mut end = max.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 fn retain_verification_log(label: &str, log: TempPath) -> Result<PathBuf, Error> {
     let path = log.keep()?;
     eprintln!("::   {label}: {}", path.display());
@@ -1991,6 +2112,109 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    #[test]
+    fn signal_termination_report_shows_the_last_detlog_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("run1_log");
+        let mut text = String::new();
+        for record in 0..25 {
+            text.push_str(&format!(
+                "2026-10-07T00:00:00.000000Z INFO detcore: [dtid 3] DETLOG [syscall] record {record}{}{{\"schema\":1}}\n",
+                detcore::detlog::RECORD_SEPARATOR
+            ));
+            text.push_str("2026-10-07T00:00:00.000000Z INFO detcore::scheduler: COMMIT turn\n");
+            text.push_str(
+                "2026-10-07T00:00:00.000000Z DEBUG detcore: DETLOG (post) registers [dtid 3]\n",
+            );
+        }
+        fs::write(&log, text).unwrap();
+
+        let status = ExitStatus::Signaled(reverie::process::Signal::SIGSEGV, true);
+        let report = signal_termination_report("run 1", status, &log).unwrap();
+        let lines: Vec<&str> = report.lines().collect();
+        assert_eq!(
+            lines[0],
+            format!(
+                ":: The run 1 guest was terminated by signal 11 (SIGSEGV, core dumped). \
+                 Its last 20 INFO DETLOG records, from {}:",
+                log.display()
+            )
+        );
+        assert_eq!(lines.len(), 21, "{report}");
+        assert!(lines[1].ends_with("DETLOG [syscall] record 5"), "{report}");
+        assert!(
+            lines[20].ends_with("DETLOG [syscall] record 24"),
+            "{report}"
+        );
+        assert!(!report.contains("COMMIT") && !report.contains("DETLOG_RECORD"));
+        assert!(!report.contains("registers"), "{report}");
+    }
+
+    #[test]
+    fn signal_termination_report_is_only_for_a_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("run1_log");
+        fs::write(&log, "INFO detcore: DETLOG [syscall] exit_group\n").unwrap();
+        for code in [0, 1, 139] {
+            assert_eq!(
+                signal_termination_report("run 1", ExitStatus::Exited(code), &log),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn signal_termination_report_names_a_log_it_cannot_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = ExitStatus::Signaled(reverie::process::Signal::SIGKILL, false);
+
+        let missing = dir.path().join("absent");
+        let report = signal_termination_report("run 2", status, &missing).unwrap();
+        assert!(
+            report.starts_with(":: The run 2 guest was terminated by signal 9 (SIGKILL). Its log ")
+                && report.contains("could not be read"),
+            "{report}"
+        );
+
+        let empty = dir.path().join("empty");
+        fs::write(&empty, "INFO detcore::scheduler: COMMIT turn\n").unwrap();
+        let report = signal_termination_report("run 2", status, &empty).unwrap();
+        assert!(report.contains("hold no INFO DETLOG record"), "{report}");
+    }
+
+    #[test]
+    fn signal_termination_report_cuts_long_records_on_a_character() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("run1_log");
+        // "é" is two bytes, so the cut falls inside one unless it is moved.
+        let line = format!(
+            "INFO detcore: DETLOG x{}",
+            "é".repeat(SIGNAL_REPORT_LINE_BYTES)
+        );
+        fs::write(&log, format!("{line}\n")).unwrap();
+        let status = ExitStatus::Signaled(reverie::process::Signal::SIGABRT, false);
+        let report = signal_termination_report("run 1", status, &log).unwrap();
+        let shown = report.lines().nth(1).unwrap();
+        assert!(shown.ends_with(" [cut]"), "{shown}");
+        assert!(shown.len() <= "::   ".len() + SIGNAL_REPORT_LINE_BYTES + " [cut]".len());
+    }
+
+    #[test]
+    fn a_log_tail_starts_at_a_whole_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        fs::write(&log, "first line\nsecond line\nthird\n").unwrap();
+        // 29 bytes; "second line" starts 18 bytes from the end.
+        assert_eq!(read_log_tail(&log, 15).unwrap(), "third\n");
+        assert_eq!(read_log_tail(&log, 17).unwrap(), "third\n");
+        assert_eq!(read_log_tail(&log, 18).unwrap(), "second line\nthird\n");
+        assert_eq!(read_log_tail(&log, 19).unwrap(), "second line\nthird\n");
+        assert_eq!(
+            read_log_tail(&log, 1 << 20).unwrap(),
+            "first line\nsecond line\nthird\n"
+        );
+    }
 
     #[test]
     fn a_recorded_branch_counter_verdict_is_stamped_on_every_report_once() {

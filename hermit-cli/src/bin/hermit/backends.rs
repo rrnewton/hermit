@@ -1221,6 +1221,11 @@ pub(super) fn run_dbt(
             String::from_utf8_lossy(&first.stdout),
             String::from_utf8_lossy(&first.stderr),
         );
+        if let Some(report) =
+            super::verify::signal_termination_report("run 1", first.status, &log1_path)
+        {
+            eprint!("{report}");
+        }
         // Record the rejected first run where its disposition is known, as the
         // ptrace path does. Left alone, the pre-stamped `not_run` record keeps
         // `guest_exit_code: null`, so the runner cannot tell this completed

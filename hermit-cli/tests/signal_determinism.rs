@@ -411,3 +411,87 @@ fn pending_signal_and_mask_survive_exec() {
         "exec mask=blocked pending=preserved consumed=SIGUSR1\n",
     );
 }
+
+/// Runs `script` under `hermit run --verify`, which must exit with `status`,
+/// and returns its stderr, which must report `run` terminated by SIGUSR1 and end that report with the guest's
+/// last system call, its `kill`.
+fn verify_signal_report(script: &str, run: &str, status: i32) -> String {
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command.args([
+        "run",
+        "--verify",
+        "--base-env=minimal",
+        "--",
+        "/bin/sh",
+        "-c",
+        script,
+    ]);
+    hermit_test::configure_guest_execution(&mut command);
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start hermit: {error}"));
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(
+        output.status.code(),
+        Some(status),
+        "unexpected status\nstderr:\n{stderr}"
+    );
+    let heading = format!(":: The {run} guest was terminated by signal 10 (SIGUSR1).");
+    let report = stderr
+        .split_once(&heading)
+        .unwrap_or_else(|| panic!("no {heading:?} report\nstderr:\n{stderr}"))
+        .1;
+    let records: Vec<&str> = report
+        .lines()
+        .skip(1)
+        .take_while(|line| line.starts_with("::   "))
+        .collect();
+    assert!(
+        records.iter().all(|record| record.contains(" INFO ")
+            && record.contains(" DETLOG ")
+            && !record.contains("DETLOG_RECORD")),
+        "the report holds a record that is not a bare INFO DETLOG line\nstderr:\n{stderr}"
+    );
+    assert!(
+        records
+            .last()
+            .is_some_and(|record| record.contains("kill(")),
+        "the report does not end at the guest's kill\nstderr:\n{stderr}"
+    );
+    stderr
+}
+
+#[test]
+fn verify_reports_the_last_records_of_a_run_1_killed_by_a_signal() {
+    let _guard = hermit_signal_lock();
+    let stderr = verify_signal_report(
+        "echo before; kill -USR1 $$",
+        "run 1",
+        HERMIT_INTERNAL_FAILURE_EXIT,
+    );
+    assert!(
+        stderr.contains("First run errored during --verify"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn verify_reports_the_last_records_of_a_run_2_killed_by_a_signal() {
+    let _guard = hermit_signal_lock();
+    let directory = Path::new(env!("CARGO_TARGET_TMPDIR")).join("verify-signal-report");
+    fs::create_dir_all(&directory).expect("failed to create the marker directory");
+    let marker = directory.join("run-1-finished");
+    match fs::remove_file(&marker) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("failed to remove {}: {error}", marker.display()),
+    }
+    // Run 1 leaves the marker and succeeds; run 2 finds it and is killed.
+    let script = format!(
+        "if [ -e '{0}' ]; then kill -USR1 $$; else : > '{0}'; fi",
+        marker.display()
+    );
+    // The comparison then reports the runs as nondeterministic.
+    let stderr = verify_signal_report(&script, "run 2", 1);
+    assert!(!stderr.contains("The run 1 guest"), "{stderr}");
+}
