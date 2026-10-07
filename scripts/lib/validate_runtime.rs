@@ -2339,6 +2339,7 @@ fn census_activity_bracket(sandbox: &Path) -> Result<Duration, String> {
     let dir = sandbox.join("burner-peer-runs");
     std::fs::create_dir_all(&dir).map_err(|e| format!("registry: burner bracket: {e}"))?;
     require_fair_policy()?;
+    require_child_reaping()?;
     let peer = BurnerPeer::spawn(plan)?;
     // The record names the child and this process holds its flock, so the census
     // proves liveness exactly as for a real peer and then measures the child's tree.
@@ -2579,7 +2580,12 @@ impl BurnerPeer {
                      exit within {ANSWER_LIMIT:?}"
                 ));
             }
-            Err(e) => return Err(format!("registry: cannot reap the burner peer: {e}")),
+            Err(e) => {
+                // ECHILD: the peer is no longer this process's child, so its PID
+                // may already name another process. Never signal it.
+                self.reaped = e.raw_os_error() == Some(libc::ECHILD);
+                return Err(format!("registry: cannot reap the burner peer: {e}"));
+            }
         };
         self.reaped = true;
         if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
@@ -2596,6 +2602,13 @@ impl Drop for BurnerPeer {
     // Error paths only: the bracket ends the peer with `finish`.
     fn drop(&mut self) {
         if self.reaped {
+            return;
+        }
+        // Signal the peer only while it is this process's unreaped child, whose PID
+        // cannot name another process: not once it has been reaped here, and not if
+        // it is no longer a child at all.
+        let mut status = 0;
+        if unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) } != 0 {
             return;
         }
         unsafe { libc::kill(self.pid, libc::SIGKILL) };
@@ -2838,10 +2851,12 @@ fn set_fair_slice(ns: u64) -> bool {
     unsafe { libc::syscall(libc::SYS_sched_setattr, 0, &attr as *const SchedAttr, 0) == 0 }
 }
 
-/// Refuse a realtime or deadline scheduling policy before the bracket starts its
-/// peer and spinning threads, which inherit this thread's policy. Under SCHED_FIFO
-/// the first spinning thread would never yield its CPU, so the others could never
-/// report that they are pinned and the peer would never run.
+/// Refuse every scheduling policy but SCHED_OTHER and SCHED_BATCH before the
+/// bracket starts its peer and spinning threads, which inherit this thread's
+/// policy. Those two are the only policies whose slice `set_fair_slice` can set:
+/// under SCHED_IDLE an inherited long slice would stay and let the peer escape the
+/// starvation, and under SCHED_FIFO the first spinning thread would never yield
+/// its CPU, so the others could never report that they are pinned.
 fn require_fair_policy() -> Result<(), String> {
     const SCHED_RESET_ON_FORK: libc::c_int = 0x4000_0000;
     let policy = unsafe { libc::sched_getscheduler(0) };
@@ -2852,12 +2867,33 @@ fn require_fair_policy() -> Result<(), String> {
         ));
     }
     match policy & !SCHED_RESET_ON_FORK {
-        libc::SCHED_OTHER | libc::SCHED_BATCH | libc::SCHED_IDLE => Ok(()),
+        libc::SCHED_OTHER | libc::SCHED_BATCH => Ok(()),
         p => Err(format!(
-            "registry: the starvation bracket needs a fair scheduling policy (SCHED_OTHER, \
-             SCHED_BATCH or SCHED_IDLE), but this thread's policy is {p}"
+            "registry: the starvation bracket needs the SCHED_OTHER or SCHED_BATCH \
+             scheduling policy, whose slice it sets, but this thread's policy is {p}"
         )),
     }
+}
+
+/// Refuse to fork the peer while SIGCHLD is ignored or carries SA_NOCLDWAIT. The
+/// kernel would then reap the peer itself when it exits, and its PID could name
+/// another process by the time this process signals it.
+fn require_child_reaping() -> Result<(), String> {
+    let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut current) } != 0 {
+        return Err(format!(
+            "registry: cannot read the SIGCHLD disposition: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    if current.sa_sigaction == libc::SIG_IGN || current.sa_flags & libc::SA_NOCLDWAIT != 0 {
+        return Err(
+            "registry: the burner peer needs SIGCHLD neither ignored nor marked \
+                    SA_NOCLDWAIT, or the kernel reaps it on exit and its PID can be reused"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 /// Threads that each pin themselves to one CPU and spin there, so a peer pinned
