@@ -1517,7 +1517,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 202: 203, re-listed. It starts an in-guest LiteInst guest, so it joins
     // the hosted CPUID-faulting exact-name filterset and test.cli_on_host
     // stays 169.
-    ("test.cli", 203),
+    // liteinst_replay_with_a_conflicting_epoch_is_refused_in_every_build and
+    // liteinst_verify_with_a_quiet_log_level_is_refused_in_every_build retain
+    // all 203: 205, re-listed.
+    ("test.cli", 205),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -1646,7 +1649,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // running: 203 - 39 = 164. Listed with the build.workspace_on_host
     // features and this node's arguments: 169 before, 164 after, and the
     // removed set is exactly those five.
-    ("test.cli_on_host", 164),
+    // The two LiteInst refusal tests added to test.cli start no guest, so the
+    // filterset is unchanged: 205 - 39 = 166, listed the same way.
+    ("test.cli_on_host", 166),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 54),

@@ -4411,10 +4411,12 @@ impl RunOpts {
     /// for the missing feature ("this build was compiled without the liteinst
     /// backend"), in place of the in-guest maximum-timeslice advice above.
     ///
-    /// `main` calls it after the policy refusals that hold in every build, so
-    /// an unqualified `--timeout` or an unenforceable `--max-log-bytes` is
-    /// still refused with 122 whatever the build, and before `--verify` reads
-    /// stdin, so this refusal does not
+    /// `main` calls it after every refusal that holds in every build: the
+    /// in-guest option refusals, the `--max-log-bytes` refusal, the `--verify`
+    /// log-level check, argument validation and replay-epoch reconciliation.
+    /// So an unqualified `--timeout`, an unenforceable `--max-log-bytes` or a
+    /// conflicting `--epoch` gets the same verdict whatever the build. It is
+    /// also before `--verify` reads stdin, so this refusal does not
     /// wait for input either. Builds with the feature are unchanged: they
     /// check whether the LiteInst runtime is installed later, with the other
     /// backends.
@@ -4676,11 +4678,23 @@ impl RunOpts {
         // reason: a refused run must not consume its input. It is also above the
         // DBT arm below, which returns without reaching `RunOpts::run`.
         self.refuse_unsupervised_log_cap(global.max_log_bytes)?;
-        // After the refusals that hold in every build, and before stdin is read.
-        self.refuse_liteinst_without_the_feature()?;
         if self.verify {
             validate_log_level(global)?;
         }
+
+        // TODO(T124429978): temporarily disabling this because it inexplicably clobbers our
+        // subsequent tracing_subscriber::fmt::init() call.
+        // tracing::subscriber::with_default(super::tracing::stderr_subscriber(global.log), || {
+
+        // Argument validation and epoch reconciliation also come before stdin
+        // is read: neither needs the input, and a run they refuse must not wait
+        // for it.
+        self.validate_args()?;
+        self.adopt_replayed_schedule_epoch()?;
+        // After every refusal above, which holds in every build, so a build
+        // without the feature refuses those runs the way a feature build does;
+        // and before stdin is read.
+        self.refuse_liteinst_without_the_feature()?;
         let dbt_verification_stdin = if self.verify && self.selected_backend() == Backend::Dbt {
             // DBT owns its two-run adapter and replays this descriptor there.
             // The common output-capturing backends reserve the same input in
@@ -4701,11 +4715,6 @@ impl RunOpts {
             None
         };
 
-        // TODO(T124429978): temporarily disabling this because it inexplicably clobbers our
-        // subsequent tracing_subscriber::fmt::init() call.
-        // tracing::subscriber::with_default(super::tracing::stderr_subscriber(global.log), || {
-        self.validate_args()?;
-        self.adopt_replayed_schedule_epoch()?;
         if self.uses_virtual_time_determinization() {
             let epoch = self.epoch_rfc3339();
             let source = if self.epoch_captured_from_host {

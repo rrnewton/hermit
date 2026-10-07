@@ -14669,6 +14669,120 @@ fn liteinst_in_guest_refuses_verify_without_reading_stdin() {
     assert!(!stdout.contains("unreachable"), "the guest must not run");
 }
 
+/// A `--backend=liteinst` replay whose explicit `--epoch` disagrees with the
+/// epoch its recording was made under is refused by policy (122) in every
+/// build. Replay-epoch reconciliation does not depend on the backend being
+/// compiled in, so a build without the `liteinst` feature must not answer
+/// "backend unavailable" (125) instead.
+#[test]
+fn liteinst_replay_with_a_conflicting_epoch_is_refused_in_every_build() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create a directory for the preemption record");
+    let record = directory.path().join("record.json");
+    fs::write(
+        &record,
+        r#"{"per_thread":{},"global":[],"epoch":"2000-12-31T23:59:59.123456789Z"}"#,
+    )
+    .expect("failed to write the preemption record");
+    let replay = format!("--replay-preemptions-from={}", record.display());
+
+    let output = hermit_command(&[
+        "--backend",
+        "liteinst",
+        "run",
+        "--max-timeslice=disabled",
+        "--epoch=2001-01-01T00:00:00Z",
+        &replay,
+        "--",
+        "/bin/echo",
+        "unreachable",
+    ])
+    .stdin(Stdio::null())
+    .output()
+    .expect("failed to run hermit");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    // EXIT-CLASS: hermit
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "a conflicting replay epoch must be refused by policy in every build. Got {:?}. \
+         stderr:\n{stderr}",
+        output.status
+    );
+    assert!(
+        stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("the explicit virtual-time epoch 2001-01-01T00:00:00+00:00"),
+        "the refusal must name the conflicting epoch. stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("pass --epoch=2000-12-31T23:59:59.123456789+00:00"),
+        "the refusal must name the recorded epoch. stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("compiled without the liteinst backend"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("unreachable"),
+        "the guest must not run"
+    );
+}
+
+/// `--verify` with an explicit log level that would hide the events it
+/// compares is a command-line error in every build, `--backend=liteinst`
+/// included. A build without the `liteinst` feature must report that error,
+/// not the missing feature.
+#[test]
+fn liteinst_verify_with_a_quiet_log_level_is_refused_in_every_build() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let output = hermit_command(&[
+        "--log=warn",
+        "--backend",
+        "liteinst",
+        "run",
+        "--max-timeslice=disabled",
+        "--verify",
+        "--",
+        "/bin/echo",
+        "unreachable",
+    ])
+    .stdin(Stdio::null())
+    .output()
+    .expect("failed to run hermit");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    // EXIT-CLASS: hermit
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
+        "status {:?}, stderr:\n{stderr}",
+        output.status
+    );
+    assert!(
+        stderr.contains("HERMIT_INTERNAL_FAILURE class=cli-error"),
+        "the run must be refused as a command-line error. stderr:\n{stderr}"
+    );
+    assert!(
+        stderr
+            .contains("--verify requires --log=info or a more verbose level; received --log=warn"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("compiled without the liteinst backend"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("unreachable"),
+        "the guest must not run"
+    );
+}
+
 /// What one in-guest LiteInst `--verify` run reported about its forwarded
 /// DETLOG records.
 #[cfg(feature = "liteinst")]
