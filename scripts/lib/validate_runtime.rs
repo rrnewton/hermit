@@ -2338,6 +2338,7 @@ fn census_activity_bracket(sandbox: &Path) -> Result<Duration, String> {
     };
     let dir = sandbox.join("burner-peer-runs");
     std::fs::create_dir_all(&dir).map_err(|e| format!("registry: burner bracket: {e}"))?;
+    require_fair_policy()?;
     let peer = BurnerPeer::spawn(plan)?;
     // The record names the child and this process holds its flock, so the census
     // proves liveness exactly as for a real peer and then measures the child's tree.
@@ -2566,55 +2567,20 @@ impl BurnerPeer {
                 ));
             }
         }
-        // The peer exits right after acknowledging. Its pidfd turns readable when it
-        // does, so this wait has the same deadline as an answer: a peer stopped or
-        // looping after its acknowledgement fails the self-test instead of hanging it.
-        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, self.pid, 0) };
-        if pidfd < 0 {
-            return Err(format!(
-                "registry: cannot watch the burner peer's exit: {}",
-                io::Error::last_os_error()
-            ));
-        }
-        let pidfd =
-            unsafe { <File as std::os::unix::io::FromRawFd>::from_raw_fd(pidfd as libc::c_int) };
-        let deadline = std::time::Instant::now() + ANSWER_LIMIT;
-        loop {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            if left.is_zero() {
+        // The peer exits right after acknowledging, and reaping it has the same
+        // deadline as an answer: a peer stopped or looping after its acknowledgement,
+        // or a traced one whose exit its tracer has not consumed, fails the self-test
+        // instead of hanging it.
+        let status = match reap_within(self.pid, ANSWER_LIMIT) {
+            Ok(Some(status)) => status,
+            Ok(None) => {
                 return Err(format!(
                     "registry: the burner peer acknowledged its stop command but did not \
                      exit within {ANSWER_LIMIT:?}"
                 ));
             }
-            let mut exited = libc::pollfd {
-                fd: pidfd.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let ms = left.as_millis() as libc::c_int + 1;
-            match unsafe { libc::poll(&mut exited, 1, ms) } {
-                0 => continue,
-                n if n < 0 => {
-                    let e = io::Error::last_os_error();
-                    if e.kind() == io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    return Err(format!(
-                        "registry: cannot wait for the burner peer's exit: {e}"
-                    ));
-                }
-                _ => break,
-            }
-        }
-        // It has exited, so this returns at once.
-        let mut status = 0;
-        while unsafe { libc::waitpid(self.pid, &mut status, 0) } < 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() != io::ErrorKind::Interrupted {
-                return Err(format!("registry: cannot reap the burner peer: {e}"));
-            }
-        }
+            Err(e) => return Err(format!("registry: cannot reap the burner peer: {e}")),
+        };
         self.reaped = true;
         if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
             Ok(())
@@ -2633,10 +2599,38 @@ impl Drop for BurnerPeer {
             return;
         }
         unsafe { libc::kill(self.pid, libc::SIGKILL) };
+        // SIGKILL ends an ordinary peer at once. A traced one is reported only once
+        // its tracer consumes its exit, so this wait is bounded too; a peer still
+        // unreaped after it is left for init to reap when this process exits.
+        let _ = reap_within(self.pid, REAP_AFTER_KILL_LIMIT);
+    }
+}
+
+/// How long `Drop` waits to reap a peer it has killed.
+const REAP_AFTER_KILL_LIMIT: Duration = Duration::from_secs(5);
+
+/// Reap the child `pid` if it is reported exited within `limit`, without ever
+/// blocking: a readable pidfd or a dead process does not mean `waitpid` can
+/// report it, because a tracer consumes a traced child's exit first. Returns its
+/// wait status, or `None` when it was not reported in time.
+fn reap_within(pid: libc::pid_t, limit: Duration) -> io::Result<Option<libc::c_int>> {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
         let mut status = 0;
-        while unsafe { libc::waitpid(self.pid, &mut status, 0) } < 0
-            && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
-        {}
+        match unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } {
+            0 => {}
+            r if r < 0 => {
+                let e = io::Error::last_os_error();
+                if e.kind() != io::ErrorKind::Interrupted {
+                    return Err(e);
+                }
+            }
+            _ => return Ok(Some(status)),
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -2844,6 +2838,28 @@ fn set_fair_slice(ns: u64) -> bool {
     unsafe { libc::syscall(libc::SYS_sched_setattr, 0, &attr as *const SchedAttr, 0) == 0 }
 }
 
+/// Refuse a realtime or deadline scheduling policy before the bracket starts its
+/// peer and spinning threads, which inherit this thread's policy. Under SCHED_FIFO
+/// the first spinning thread would never yield its CPU, so the others could never
+/// report that they are pinned and the peer would never run.
+fn require_fair_policy() -> Result<(), String> {
+    const SCHED_RESET_ON_FORK: libc::c_int = 0x4000_0000;
+    let policy = unsafe { libc::sched_getscheduler(0) };
+    if policy < 0 {
+        return Err(format!(
+            "registry: cannot read this thread's scheduling policy: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    match policy & !SCHED_RESET_ON_FORK {
+        libc::SCHED_OTHER | libc::SCHED_BATCH | libc::SCHED_IDLE => Ok(()),
+        p => Err(format!(
+            "registry: the starvation bracket needs a fair scheduling policy (SCHED_OTHER, \
+             SCHED_BATCH or SCHED_IDLE), but this thread's policy is {p}"
+        )),
+    }
+}
+
 /// Threads that each pin themselves to one CPU and spin there, so a peer pinned
 /// to the same CPU gets only its fair share of it: a deterministic starved peer,
 /// with no sleep and no dependence on the host's load.
@@ -2876,10 +2892,15 @@ impl CpuHogs {
         }
         // A hog answers only after pinning itself, and spins from then on.
         for _ in 0..count {
-            match rx.recv() {
+            match rx.recv_timeout(ANSWER_LIMIT) {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     return Err(format!("registry: a CPU hog cannot pin to CPU {cpu}: {e}"));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(format!(
+                        "registry: a CPU hog did not report pinning within {ANSWER_LIMIT:?}"
+                    ));
                 }
                 Err(e) => return Err(format!("registry: a CPU hog stopped before pinning: {e}")),
             }
