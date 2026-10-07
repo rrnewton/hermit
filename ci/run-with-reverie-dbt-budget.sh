@@ -1086,7 +1086,14 @@ fi
 # changes reverie-ptrace (a child-exit publication report) and
 # reverie/src/capabilities.rs and tool.rs. Carry, not recalibration: no new
 # timing sample or >=5-sample replacement claim is made.
-expected_pin=9cb6f7b7db6549e373ae57fa7035f09aca7d508f
+# CARRY TO 74a1c338f9b5110321053931bc2f1469f16758c2 (2026-10-07): from
+# 9cb6f7b7db6549e373ae57fa7035f09aca7d508f. The one commit changes reverie/src (typed
+# unsupported-operation refusals and one removed BackendCapabilities field)
+# and reverie-kvm; no file under reverie-dbt, the root Cargo.toml,
+# third-party or rust-toolchain.toml changes, so the four budget inputs are
+# unchanged. Carry, not recalibration: no new timing sample or >=5-sample
+# replacement claim is made.
+expected_pin=74a1c338f9b5110321053931bc2f1469f16758c2
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

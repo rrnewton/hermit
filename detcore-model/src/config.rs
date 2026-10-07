@@ -1559,8 +1559,10 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// - `backend_reports_physical_process_exits` supplies
 ///   `reports_physical_process_exits` and
 ///   `signal_interrupts_external_syscalls`;
-/// - `backend_is_kvm` supplies the five behaviours it selected, including the
-///   x86-64 four-level user address limit;
+/// - `backend_is_kvm` supplies the four behaviours it selected that remain
+///   capabilities, including the x86-64 four-level user address limit (the
+///   fifth, refusing a non-leader exec, is a typed refusal the backend
+///   reports per exec);
 /// - every other key supplies the one capability of the same meaning.
 ///
 /// This inverts [`to_legacy_backend_json`] for every capability value the keys
@@ -1725,7 +1727,6 @@ impl LegacyBackendKeys {
         backend.provides_process_signal_control = self.backend_is_kvm;
         backend.emulates_child_waits = self.backend_is_kvm;
         backend.failed_gettimeofday_may_store_host_time = !self.backend_is_kvm;
-        backend.refuses_nonleader_exec_with_enosys = self.backend_is_kvm;
         backend.user_address_limit = self
             .backend_is_kvm
             .then_some(reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT);
@@ -2492,7 +2493,6 @@ mod tests {
                     expected.provides_process_signal_control = true;
                     expected.emulates_child_waits = true;
                     expected.failed_gettimeofday_may_store_host_time = false;
-                    expected.refuses_nonleader_exec_with_enosys = true;
                     expected.user_address_limit =
                         Some(reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT);
                 }
