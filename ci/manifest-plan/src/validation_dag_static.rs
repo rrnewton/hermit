@@ -1183,7 +1183,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // rt_sigsuspend_with_a_pending_waker_owes_nothing_when_its_return_is_not_certain)
     // and tool_global::tests::supervisor_death_report_discharges_an_owed_rt_sigsuspend_wake
     // retain all 996: 996 + 6 = 1002, measured the same way.
-    ("test.detcore_unit", 1002),
+    // Four scheduler::parked_tests SIGKILL-edge and publication tests
+    // (rt_sigsuspend_pending_waker_is_owed_only_when_sole_at_publication,
+    // sigkill_edge_retires_a_suspended_child_identically_in_every_report_order,
+    // sigkill_edge_retires_only_another_live_process_once,
+    // sigkill_edge_retires_every_thread_of_the_target_process) and two
+    // tool_global::tests SIGKILL RPC tests
+    // (sigkill_rpc_retires_a_sabre_child_at_its_edge_in_either_report_order,
+    // sigkill_before_exec_reconnect_refuses_to_resurrect_the_caller)
+    // retain all 1002: 1002 + 6 = 1008, measured the same way.
+    ("test.detcore_unit", 1008),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1566,7 +1575,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two rt_sigsuspend tests retain all 991: 993.
     // The same three exec-edge tests retain all 993: 996.
     // The same six rt_sigsuspend death and pending-waker tests retain all 996: 1002.
-    ("test.detcore_unit_on_host", 1002),
+    // The same six SIGKILL-edge and publication tests retain all 1002: 1008.
+    ("test.detcore_unit_on_host", 1008),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

@@ -1709,6 +1709,15 @@ impl GlobalTool for GlobalState {
                         (pending, post_exec_mm)
                     };
                     assert_eq!(pending.process, parent_detpid);
+                    // A SIGKILL edge (`Scheduler::note_sigkill_sent`) may
+                    // already have retired the whole process while this exec
+                    // was in flight. Its caller then has no registration to
+                    // reconnect, and a replacement must not resurrect it.
+                    if sched.thread_is_logically_killed(pending.caller)
+                        || !sched.next_turns.contains_key(&pending.caller)
+                    {
+                        return (None, R::ThreadExited);
+                    }
                     // Consuming the preparation authenticates the successful
                     // exec. The startup grant can admit other tasks before
                     // this image's post-exec callback runs, so commit the
@@ -1965,10 +1974,12 @@ impl GlobalTool for GlobalState {
             GlobalRequest::NotifySignalPending(dettid, SigWrapper(signal), target_process) => {
                 let mut scheduler = self.lock_rpc_scheduler(false).await;
                 scheduler.notify_signal_pending(dettid, SigWrapper(signal));
-                if signal == libc::SIGKILL
-                    && let Some(detpid) = target_process
-                {
-                    scheduler.note_process_sigkill(dettid, detpid);
+                if signal == libc::SIGKILL {
+                    // `dtid` is the authenticated sender. This RPC is sent
+                    // from the sender's own turn after its kill syscall
+                    // succeeded, so the backend-specific SIGKILL edge below
+                    // is a deterministic point in the run.
+                    scheduler.note_sigkill_sent(dtid, dettid, target_process);
                 }
                 R::NotifySignalPending(())
             }
@@ -2351,6 +2362,7 @@ impl GlobalState {
             // The supervisor reports a dead thread before it resumes the
             // clone that reuses its raw TID, so the report names the old one.
             sched.forget_physical_thread_exit(child_dettid);
+            sched.note_thread_registration(child_dettid, child_mm);
 
             // Don't fill in the request, as the child will do it:
             let _entry = sched
@@ -6933,6 +6945,218 @@ mod tests {
             );
             assert!(scheduler.next_turns.contains_key(&waiter));
         }
+    }
+
+    /// SaBRe's whole capability profile.
+    fn sabre_profile(config: Config) -> Config {
+        config.with_backend(|backend| {
+            backend.needs_killed_thread_rpc_cancellation = true;
+            backend.reports_physical_process_exits = true;
+            backend.signal_interrupts_external_syscalls = true;
+        })
+    }
+
+    /// Drive the production RPCs: a SaBRe parent registers a child process and
+    /// then kills it with `SIGKILL`. The guest's notification after its
+    /// successful `kill` is the deterministic edge: it retires the child there,
+    /// whether the supervisor's report of the death reached Detcore before the
+    /// edge or arrives after it. Either way the child's exit completes exactly
+    /// once and its parent is owed one `SIGCHLD` wakeup. A non-fatal signal
+    /// retires nothing. Before the fix the notification retired nothing, and
+    /// the dead child stayed registered for the rest of the run.
+    #[tokio::test]
+    async fn sigkill_rpc_retires_a_sabre_child_at_its_edge_in_either_report_order() {
+        for report_first in [false, true] {
+            let config = sabre_profile(Config {
+                sequentialize_threads: false,
+                ..Config::default()
+            });
+            let state = GlobalState::initialize(&config, false);
+            let parent = DetTid::from_raw(17);
+            let parent_pid = DetPid::from_raw(17);
+            let child = DetTid::from_raw(18);
+            let child_pid = DetPid::from_raw(18);
+            state
+                .sched
+                .lock()
+                .unwrap()
+                .thread_tree
+                .add_child(parent, parent, true);
+            install_test_registration(&state, parent, Ivar::new());
+            let rpc = |request| (DetTime::new(&config), MmId::initial(parent_pid), request);
+            let created = state
+                .receive_rpc(
+                    reverie::Tid::from_raw(parent.as_raw()),
+                    rpc(GlobalRequest::CreateChildThread(
+                        child,
+                        parent_pid,
+                        0,
+                        Some(CloneFlags::empty()),
+                        libc::SIGCHLD,
+                        None,
+                        Some(DEFAULT_PRIORITY),
+                    )),
+                )
+                .await;
+            assert_eq!(created.1, GlobalResponse::CreateChildThread(None));
+            let terminated = state
+                .receive_rpc(
+                    reverie::Tid::from_raw(parent.as_raw()),
+                    rpc(GlobalRequest::NotifySignalPending(
+                        child,
+                        SigWrapper(libc::SIGTERM),
+                        Some(child_pid),
+                    )),
+                )
+                .await;
+            assert_eq!(terminated.1, GlobalResponse::NotifySignalPending(()));
+            {
+                let sched = state.sched.lock().unwrap();
+                assert!(sched.next_turns.contains_key(&child));
+                assert!(!sched.thread_is_logically_killed(child));
+            }
+            if report_first {
+                state.complete_physical_process_exit(child.as_raw());
+            }
+
+            let killed = state
+                .receive_rpc(
+                    reverie::Tid::from_raw(parent.as_raw()),
+                    rpc(GlobalRequest::NotifySignalPending(
+                        child,
+                        SigWrapper(libc::SIGKILL),
+                        Some(child_pid),
+                    )),
+                )
+                .await;
+            assert_eq!(killed.1, GlobalResponse::NotifySignalPending(()));
+            {
+                let mut sched = state.sched.lock().unwrap();
+                assert!(sched.thread_is_logically_killed(child), "{report_first}");
+                assert!(!sched.next_turns.contains_key(&child), "{report_first}");
+                assert!(sched.process_signal_targets(child_pid).is_empty());
+                let expected = if report_first {
+                    (false, true, Some(parent_pid))
+                } else {
+                    (true, false, Some(parent_pid))
+                };
+                assert_eq!(
+                    sched.test_process_exit_state(child_pid),
+                    expected,
+                    "report first: {report_first}"
+                );
+            }
+            if !report_first {
+                state.complete_physical_process_exit(child.as_raw());
+            }
+            assert_eq!(
+                state
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .test_process_exit_state(child_pid),
+                (false, true, Some(parent_pid)),
+                "report first: {report_first}"
+            );
+        }
+    }
+
+    /// A SaBRe child's successful exec is in flight (its preparation is
+    /// recorded) when its parent's `SIGKILL` edge retires the child. The new
+    /// image's reconnect must not resurrect the retired caller: it is refused,
+    /// consumes the preparation, and commits neither the exec's exit-signal
+    /// reset nor its generation change.
+    #[tokio::test]
+    async fn sigkill_before_exec_reconnect_refuses_to_resurrect_the_caller() {
+        let config = sabre_profile(Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        });
+        let state = GlobalState::initialize(&config, false);
+        let parent = DetTid::from_raw(17);
+        let parent_pid = DetPid::from_raw(17);
+        let child = DetTid::from_raw(18);
+        let child_pid = DetPid::from_raw(18);
+        let old_mm = MmId::initial(child_pid).for_exec(child_pid);
+        {
+            let mut sched = state.sched.lock().unwrap();
+            sched.thread_tree.add_child(parent, parent, true);
+            sched.thread_tree.add_child_with_wait_metadata(
+                parent,
+                child,
+                true,
+                false,
+                libc::SIGUSR1,
+            );
+        }
+        install_test_registration(&state, parent, Ivar::new());
+        install_test_registration(&state, child, Ivar::new());
+        {
+            let mut sched = state.sched.lock().unwrap();
+            sched.note_thread_registration(child, old_mm);
+            sched.install_test_exec_incarnation(child, old_mm);
+        }
+        state.pending_exec_states.lock().unwrap().insert(
+            child_pid,
+            PendingExecState {
+                caller: child,
+                process: child_pid,
+                mm: old_mm,
+                fd_blocking: Default::default(),
+            },
+        );
+
+        let killed = state
+            .receive_rpc(
+                reverie::Tid::from_raw(parent.as_raw()),
+                (
+                    DetTime::new(&config),
+                    MmId::initial(parent_pid),
+                    GlobalRequest::NotifySignalPending(
+                        child,
+                        SigWrapper(libc::SIGKILL),
+                        Some(child_pid),
+                    ),
+                ),
+            )
+            .await;
+        assert_eq!(killed.1, GlobalResponse::NotifySignalPending(()));
+        assert!(
+            state
+                .sched
+                .lock()
+                .unwrap()
+                .thread_is_logically_killed(child)
+        );
+
+        let reconnected = state
+            .receive_rpc(
+                reverie::Tid::from_raw(child.as_raw()),
+                (
+                    DetTime::new(&config),
+                    MmId::initial(child),
+                    GlobalRequest::CreateChildThread(
+                        child,
+                        child_pid,
+                        0,
+                        None,
+                        libc::SIGCHLD,
+                        None,
+                        Some(DEFAULT_PRIORITY),
+                    ),
+                ),
+            )
+            .await;
+        assert_eq!(reconnected.1, GlobalResponse::ThreadExited);
+        assert!(state.pending_exec_states.lock().unwrap().is_empty());
+        let sched = state.sched.lock().unwrap();
+        assert!(!sched.next_turns.contains_key(&child));
+        assert!(sched.thread_is_logically_killed(child));
+        assert_eq!(sched.thread_tree.exec_generation(child_pid), Some(0));
+        assert_eq!(
+            sched.thread_tree.child_exit_notification_signal(child_pid),
+            Some(libc::SIGUSR1)
+        );
     }
 
     /// A reloading backend (SaBRe) consumes the exec preparation when the new

@@ -314,6 +314,20 @@ pub struct BlockedPool {
     /// leaves the blocked set.
     pub rt_sigsuspend_wake_owed: BTreeSet<DetTid>,
 
+    /// `rt_sigsuspend` requests that carried a pending waker and were published
+    /// by the only live thread of their process, keyed by thread and naming the
+    /// request's operation.
+    ///
+    /// A process-pending signal can be consumed by any thread of the process,
+    /// for example by a sibling's `rt_sigtimedwait`, and the consumer may then
+    /// exit. Being alone at the grant therefore proves nothing about a signal
+    /// captured earlier. Being alone at publication does: the publisher holds
+    /// its turn while it publishes, it is the only thread that could create
+    /// another thread, and it is blocked until the grant, so no other thread
+    /// of the process can exist to consume the signal before the real call
+    /// starts. The grant owes the pending waker only with this proof.
+    pub rt_sigsuspend_sole_pending: BTreeMap<DetTid, ExternalOpId>,
+
     /// Parents parked awaiting deterministic delivery of a host-async `SIGCHLD`.
     ///
     /// When a guest child process exits, the kernel raises `SIGCHLD` on the
@@ -725,6 +739,20 @@ pub struct Scheduler {
     /// `step2_deliver_owed_child_exit_signals` makes the parent observe it at
     /// the first scheduling pass after the reap and sends no signal of its own.
     child_exit_signals_owed: BTreeMap<DetPid, DetPid>,
+
+    /// Address space of each registered thread, recorded at authenticated
+    /// registration and updated by a successful exec. Retiring a process at a
+    /// guest `SIGKILL` (see `retire_sigkilled_process`) needs it, because the
+    /// killed threads post no exit hook that would carry it.
+    registered_mms: BTreeMap<DetTid, MmId>,
+
+    /// Reporting-backend process leaders whose final physical exit was
+    /// reported while they were still registered. A process killed outright
+    /// runs no exit hook, so the report can arrive before the guest `SIGKILL`
+    /// that retires it; the retirement then completes the exit at once instead
+    /// of installing a barrier that no later report would release. Cleared
+    /// when the raw TID is registered again.
+    physically_completed_live_processes: BTreeSet<DetPid>,
 
     /// Ac table of "locks held": which action is using which resources.
     /// A given resource can be held by at most one action at a given time.
@@ -1920,6 +1948,8 @@ impl Scheduler {
             logically_exited_processes: Default::default(),
             completed_physical_process_exits: Default::default(),
             child_exit_signals_owed: Default::default(),
+            registered_mms: Default::default(),
+            physically_completed_live_processes: Default::default(),
             resources: Default::default(),
             started_up: Default::default(),
             thread_tree: Default::default(),
@@ -2020,6 +2050,118 @@ impl Scheduler {
         };
         let mm = *mm;
         self.logically_kill_thread(&dettid, &detpid, mm);
+    }
+
+    /// Record the address space of a thread at an authenticated registration
+    /// (child registration or a successful exec). A new
+    /// registration under a raw TID also means any earlier physical report for
+    /// that TID named the thread that held it before.
+    pub(crate) fn note_thread_registration(&mut self, dettid: DetTid, mm: MmId) {
+        self.registered_mms.insert(dettid, mm);
+        self.physically_completed_live_processes.remove(&dettid);
+    }
+
+    /// A guest thread `sender` has just successfully sent `SIGKILL` to
+    /// `target`, a thread of `target_process` when the call named a process.
+    ///
+    /// This is the deterministic edge at which the target dies: the sender
+    /// reports it from its own turn, after the kernel accepted the signal. DBT
+    /// keeps its thread-directed handling (`note_process_sigkill`). A backend
+    /// that reports physical process exits and tombstones killed threads
+    /// (SaBRe) retires the whole target process here, because a thread killed
+    /// outright there runs no exit hook and would otherwise stay registered
+    /// until the end of the run, with its blockers and owed state deciding
+    /// later admissions according to host-timed death reports.
+    pub(crate) fn note_sigkill_sent(
+        &mut self,
+        sender: DetTid,
+        target: DetTid,
+        target_process: Option<DetPid>,
+    ) {
+        if self.backend.requires_thread_directed_process_signals {
+            if let Some(detpid) = target_process {
+                self.note_process_sigkill(target, detpid);
+            }
+            return;
+        }
+        if self.backend.reports_physical_process_exits
+            && self.backend.needs_killed_thread_rpc_cancellation
+        {
+            self.retire_sigkilled_process(sender, target, target_process);
+        }
+    }
+
+    /// Retire every live thread of the process that a guest `SIGKILL` from
+    /// another process has just killed, exactly as an exit-group would.
+    ///
+    /// Each thread is removed from the run queue and every blocked pool, its
+    /// pending or posted request is cancelled, and it is tombstoned, so that a
+    /// request or continuation it posted before dying is never granted and a
+    /// late RPC from it is rejected. Its owed `rt_sigsuspend` wake goes with
+    /// it. The process keeps the ordinary physical-exit barrier: a parent's
+    /// physical wait still waits for the supervisor's report, and the parent
+    /// is owed the `SIGCHLD` wakeup an `Exit` grant would owe it. If that
+    /// report already arrived, the exit completes here.
+    ///
+    /// A `SIGKILL` the sender sends to its own process kills the sender too
+    /// and is left to the existing paths, as is any death this edge does not
+    /// see (a process-group or external kill, or another fatal signal).
+    fn retire_sigkilled_process(
+        &mut self,
+        sender: DetTid,
+        target: DetTid,
+        target_process: Option<DetPid>,
+    ) {
+        let Some(process) = target_process.or_else(|| self.registered_process(target)) else {
+            return;
+        };
+        if self.registered_process(sender) == Some(process) {
+            return;
+        }
+        let live = self.process_signal_targets(process);
+        if live.is_empty() {
+            return;
+        }
+        let mut mms = Vec::with_capacity(live.len());
+        for tid in &live {
+            let Some(mm) = self.registered_mms.get(tid).copied() else {
+                self.terminal_deadlock.get_or_insert_with(|| {
+                    format!(
+                        "HERMIT_DEADLOCK: scheduler cannot retire SIGKILLed dettid {} without its address-space identity",
+                        tid,
+                    )
+                });
+                return;
+            };
+            mms.push((*tid, mm));
+        }
+        debug!(
+            "[dtid {}] SIGKILL to process {} retires its thread(s) {:?}",
+            sender, process, live
+        );
+        let completed_early = self.physically_completed_live_processes.remove(&process);
+        for (tid, mm) in mms {
+            self.logically_kill_thread(&tid, &process, mm);
+            self.timeslices.remove(&tid);
+            self.pending_cross_task_signals.remove(&tid);
+        }
+        self.remove_exec_vfork_barriers(&live);
+        // No exec of the killed process can complete now; the exec reconnect
+        // handler refuses a caller that is no longer registered.
+        self.exec_teardowns.remove(&process);
+        if completed_early {
+            let completed = self.complete_physical_process_exit(process);
+            debug_assert!(
+                completed,
+                "retirement must install the physical exit barrier"
+            );
+        }
+        if self.parked.control.is_none()
+            && let Some(parent) = self.thread_tree.parent_process(&process)
+            && self.should_synthesize_child_exit_signal(parent)
+        {
+            self.child_exit_signals_owed.insert(process, parent);
+        }
     }
 
     fn should_synthesize_child_exit_signal(&self, parent: DetTid) -> bool {
@@ -2140,6 +2282,19 @@ impl Scheduler {
         // restarts and re-issues a fresh request on the next turn. Any other
         // double-put still panics, preserving the write-once Ivar invariant.
         // Mirrors the `try_put` guard in `logically_kill_thread` (PR-845).
+        //
+        // A published `rt_sigsuspend` that carries a pending waker records here
+        // whether its publisher is the only live thread of its process; see
+        // `BlockedPool::rt_sigsuspend_sole_pending` for why the grant needs
+        // this proof from publication rather than from the grant itself.
+        let tid = rs.tid;
+        let sole_pending_candidate = rs.resources.keys().find_map(|resource| match resource {
+            ResourceID::BlockingRtSigsuspend(op_id, _, pending_wakers) if pending_wakers.0 != 0 => {
+                Some(*op_id)
+            }
+            _ => None,
+        });
+        self.blocked.rt_sigsuspend_sole_pending.remove(&tid);
         if let Some(dropped) = req.try_put(Ok(rs)) {
             let tolerated = matches!(
                 req.try_read(),
@@ -2165,6 +2320,11 @@ impl Scheduler {
                     dropped, req
                 );
             }
+        } else if let Some(op_id) = sole_pending_candidate
+            && self.backend.signal_interrupts_external_syscalls
+            && self.is_sole_live_thread(tid)
+        {
+            self.blocked.rt_sigsuspend_sole_pending.insert(tid, op_id);
         }
     }
 
@@ -2418,6 +2578,7 @@ impl Scheduler {
             self.logically_killed_threads.insert(*dtid);
         }
         self.physically_exited_threads.remove(dtid);
+        self.registered_mms.remove(dtid);
         // Remove from the runnable queue at the next deterministic drain. This
         // is safe even if an asynchronous exec reconnect races a live
         // tentative_pop: the handler never reaches the run queue's mutation
@@ -2475,6 +2636,9 @@ impl Scheduler {
             .into_iter()
             .any(|tid| self.next_turns.contains_key(&tid));
         if !live_process_thread {
+            // Only `retire_sigkilled_process` acts on an early physical report,
+            // and it reads the report before retiring any thread.
+            self.physically_completed_live_processes.remove(detpid);
             let _ = self.begin_physical_process_exit(*detpid);
             self.logically_exited_processes.insert(*detpid);
             if let Some(parent) = self.thread_tree.parent_process(detpid) {
@@ -2564,6 +2728,7 @@ impl Scheduler {
                 .get_mut(&caller)
                 .expect("exec caller must retain a scheduler registration")
                 .child_tid_addr = child_tid_addr;
+            self.note_thread_registration(caller, post_exec_mm);
 
             self.remove_exec_vfork_barriers(&siblings);
             return siblings;
@@ -2606,6 +2771,7 @@ impl Scheduler {
                 .is_none(),
             "retired exec leader still had a scheduler registration"
         );
+        self.note_thread_registration(new_leader, post_exec_mm);
         self.priorities.insert(new_leader, survivor_priority);
         if let Some((next_tid, timeslice)) = replay_resume
             && next_tid == new_leader
@@ -2685,6 +2851,17 @@ impl Scheduler {
         &mut self,
     ) -> Option<(DetTid, Ivar<SchedRequest>, Ivar<SchedResponse>)> {
         self.step3_peek()
+    }
+
+    /// Whether `detpid`'s physical exit is pending and whether it completed,
+    /// and the parent owed its child-exit wakeup, if any.
+    #[cfg(test)]
+    pub(crate) fn test_process_exit_state(&self, detpid: DetPid) -> (bool, bool, Option<DetPid>) {
+        (
+            self.pending_physical_process_exits.contains(&detpid),
+            self.completed_physical_process_exits.contains(&detpid),
+            self.child_exit_signals_owed.get(&detpid).copied(),
+        )
     }
 
     // TODO-HUMAN-REVIEW(PR-1023): Review fail-closed SaBRe thread tombstones.
@@ -2808,11 +2985,21 @@ impl Scheduler {
 
     /// Release the exact process barrier when the ptrace supervisor receives its final `Exited`
     /// or `Signaled` wait status. At that lifecycle point the process is physically waitable.
+    ///
+    /// A leader's report means its whole thread group is dead. If the process
+    /// is still registered, it was killed without exit hooks; the report is
+    /// remembered so that a later retirement at the guest's `SIGKILL` edge
+    /// (`retire_sigkilled_process`) can complete the exit it would otherwise
+    /// wait for. Nothing else changes at the report.
     pub(crate) fn complete_physical_process_exit(&mut self, detpid: DetPid) -> bool {
         let removed = self.pending_physical_process_exits.remove(&detpid);
         if removed {
             self.completed_physical_process_exits.insert(detpid);
             self.wake_physical_child_waiters(detpid);
+        } else if self.backend.reports_physical_process_exits
+            && !self.process_signal_targets(detpid).is_empty()
+        {
+            self.physically_completed_live_processes.insert(detpid);
         }
         removed
     }
@@ -2835,6 +3022,7 @@ impl Scheduler {
         let _ = self.blocked.rt_sigsuspend_blockers.remove(dtid);
         let _ = self.blocked.rt_sigsuspend_wakers.remove(dtid);
         self.blocked.rt_sigsuspend_wake_owed.remove(dtid);
+        self.blocked.rt_sigsuspend_sole_pending.remove(dtid);
         self.blocked.timed_out_futex_waiters.remove(dtid);
         self.blocked.sigchld_deferred.remove(dtid);
         self.blocked.sigchld_ready.remove(dtid);
@@ -4853,12 +5041,21 @@ impl Scheduler {
 
                 // Only once the ivars are cleared and the guest is ready to issue
                 // BlockedExternalContinue do we record which blocked pool owns it.
+                // Whether the request was published by the only live thread of
+                // its process (see `BlockedPool::rt_sigsuspend_sole_pending`).
+                let sole_at_publication = matches!(rid, ResourceID::BlockingRtSigsuspend(..))
+                    && self.blocked.rt_sigsuspend_sole_pending.remove(&dettid) == Some(*op_id);
                 let old = match rid {
                     ResourceID::BlockingRtSigsuspend(_, _, pending_wakers)
-                        if pending_wakers.0 != 0 && !self.is_sole_live_thread(dettid) =>
+                        if pending_wakers.0 != 0
+                            && (!self.is_sole_live_thread(dettid)
+                                || (self.may_owe_rt_sigsuspend_wake(dettid)
+                                    && !sole_at_publication)) =>
                     {
                         // Another live thread of the process may take the
-                        // pending signal first, so the call's return is not
+                        // pending signal first, or, where the grant would owe
+                        // the wake, may already have taken it and exited since
+                        // the publication, so the call's return is not
                         // certain: it waits as external IO, as before.
                         self.blocked.external_io_blockers.insert(dettid, *op_id)
                     }

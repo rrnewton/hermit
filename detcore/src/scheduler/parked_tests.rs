@@ -250,6 +250,7 @@ fn add_with_mm(
             protocol: Default::default(),
         },
     );
+    s.note_thread_registration(tid, mm);
     let identity = task(pid.as_raw(), tid.as_raw());
     s.real_timers.bind(pid, tid, mm, identity).unwrap();
     (
@@ -285,6 +286,7 @@ fn add_process_child(
             protocol: Default::default(),
         },
     );
+    s.note_thread_registration(child, mm);
     let identity = task(child.as_raw(), child.as_raw());
     s.real_timers.bind(child, child, mm, identity).unwrap();
     (
@@ -2424,7 +2426,8 @@ fn post_rt_sigsuspend_request(
 
 /// As `post_rt_sigsuspend_request`, for a call that found `pending_wakers`
 /// (a subset of `wakers`) already pending in the kernel when it classified
-/// its temporary mask.
+/// its temporary mask. The request is published through `request_put`, as
+/// the guest's RPC is, so the publication-time facts it records are present.
 fn post_rt_sigsuspend_request_with_pending(
     s: &mut Scheduler,
     waiter: DetTid,
@@ -2435,7 +2438,10 @@ fn post_rt_sigsuspend_request_with_pending(
         ResourceID::BlockingRtSigsuspend(ExternalOpId::new(waiter, 7), wakers, pending_wakers);
     let mut request = Resources::new(waiter);
     request.insert(rid.clone(), Permission::RW);
-    s.next_turns.get_mut(&waiter).unwrap().req = Ivar::full(Ok(request));
+    let req = Ivar::new();
+    s.next_turns.get_mut(&waiter).unwrap().req = req.clone();
+    let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+    s.request_put(&req, request, &global_time);
     s.runqueue_push_back(waiter);
     rid
 }
@@ -2906,12 +2912,14 @@ fn killed_waiter_fixture(
     (parent, waiter, op_id, grandchild, grandchild_mm, sleeper)
 }
 
-/// Must not hang, and must decide the same way on every run: the parent kills
-/// a SaBRe child suspended for SIGCHLD, and the child's own child then exits.
-/// SaBRe runs no exit hook for a thread killed outright, so the dead waiter
-/// stays registered and the grandchild's exit owes it a wake it will never
-/// take: before the fix the scheduler held every turn for a continuation that
-/// could not come, forever. The supervisor's report of the death releases the
+/// Must not hang, and must decide the same way on every run: a SaBRe child
+/// suspended for SIGCHLD is killed by a death the scheduler sees no guest
+/// `SIGKILL` edge for (a process-group or external kill; the edge itself is
+/// covered by the `sigkill_edge_*` tests), and the child's own child then
+/// exits. SaBRe runs no exit hook for a thread killed outright, so the dead
+/// waiter stays registered and the grandchild's exit owes it a wake it will
+/// never take: before the fix the scheduler held every turn for a continuation
+/// that could not come, forever. The supervisor's report of the death releases the
 /// hold, whether it reaches the scheduler before the wake is owed (no hold at
 /// all) or only after several held passes. Both orders end in the same run
 /// queue, with the surviving parent's work and the sleeper admitted, and the
@@ -2925,7 +2933,8 @@ fn killed_rt_sigsuspend_waiter_releases_the_hold_in_either_report_order() {
         let time = global_time.lock().unwrap().as_nanos();
         let (parent, waiter, op_id, grandchild, grandchild_mm, sleeper) =
             killed_waiter_fixture(&mut s);
-        // SIGKILL: SaBRe never retires the waiter logically.
+        // A death with no guest SIGKILL edge: nothing retires the waiter
+        // logically (the thread-directed hook is DBT's alone).
         s.note_process_sigkill(waiter, DetPid::from_raw(200));
         assert!(s.next_turns.contains_key(&waiter));
 
@@ -2959,9 +2968,10 @@ fn killed_rt_sigsuspend_waiter_releases_the_hold_in_either_report_order() {
     assert_eq!(outcomes[0], outcomes[1]);
 }
 
-/// Must wake: a waiter whose continuation was already posted when it died has
-/// taken the owed signal, so the death report leaves its wake alone and the
-/// first pass harvests the continuation exactly as if no report had come.
+/// Must wake: a waiter whose continuation was already posted when it died
+/// (with no guest `SIGKILL` edge, as above) has taken the owed signal, so the
+/// death report leaves its wake alone and the first pass harvests the
+/// continuation exactly as if no report had come.
 #[test]
 fn killed_rt_sigsuspend_waiter_keeps_a_wake_whose_continuation_was_posted() {
     let mut outcomes = Vec::new();
@@ -3121,6 +3131,353 @@ fn rt_sigsuspend_with_a_pending_waker_owes_nothing_when_its_return_is_not_certai
     let rid = post_rt_sigsuspend_request_with_pending(&mut s, waiter, sigchld, sigchld);
     grant_posted_rt_sigsuspend(&mut s, waiter, &rid);
     assert!(s.blocked.rt_sigsuspend_wake_owed.is_empty());
+}
+
+/// Must not owe a wake: a sibling may take a process-pending waker (for
+/// example with a zero-timeout `rt_sigtimedwait`) and then exit between the
+/// waiter's publication of its `rt_sigsuspend` and the grant. The waiter is
+/// then the only live thread at the grant, but the signal it saw pending is
+/// gone, so its real call sleeps; owing the wake would hold every turn and
+/// timer forever. Only a waiter that was already alone when it published may
+/// be owed the pending waker. Before the fix the grant tested membership only
+/// at the grant and owed the wake in both cases.
+#[test]
+fn rt_sigsuspend_pending_waker_is_owed_only_when_sole_at_publication() {
+    let sigchld = rt_sigsuspend_wakers(&[libc::SIGCHLD]);
+    for sibling_exits_before_publication in [false, true] {
+        let case = format!("sibling exits before publication: {sibling_exits_before_publication}");
+        let mut s = physical_exit_reporting_scheduler();
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        let time = global_time.lock().unwrap().as_nanos();
+        let (waiter, waiter_mm, _) = add(&mut s, 100, 100);
+        let (sibling, _, _) = add(&mut s, 100, 101);
+        let (worker, _, _) = add(&mut s, 300, 300);
+        let (sleeper, _, _) = add(&mut s, 400, 400);
+        let waiter_process = DetPid::from_raw(100);
+        if sibling_exits_before_publication {
+            s.logically_kill_thread(&sibling, &waiter_process, waiter_mm);
+        }
+        let rid = post_rt_sigsuspend_request_with_pending(&mut s, waiter, sigchld, sigchld);
+        let ResourceID::BlockingRtSigsuspend(op_id, ..) = rid else {
+            unreachable!()
+        };
+        assert_eq!(
+            s.blocked.rt_sigsuspend_sole_pending.get(&waiter),
+            sibling_exits_before_publication.then_some(&op_id),
+            "{case}"
+        );
+        if !sibling_exits_before_publication {
+            // The sibling takes the pending SIGCHLD and exits.
+            s.logically_kill_thread(&sibling, &waiter_process, waiter_mm);
+        }
+        queue_ordinary_work(&mut s, worker);
+        let due = s.committed_time;
+        s.blocked.timed_waiters.insert(due, sleeper);
+
+        assert_eq!(s.run_queue.tentative_pop_next(), Some(waiter), "{case}");
+        assert!(
+            s.block_for_one_resource(waiter, &rid, &Permission::RW, None, &Ivar::new())
+                .is_err(),
+            "{case}"
+        );
+        assert!(s.blocked.rt_sigsuspend_sole_pending.is_empty(), "{case}");
+        if sibling_exits_before_publication {
+            assert_eq!(
+                s.blocked.rt_sigsuspend_blockers.get(&waiter),
+                Some(&op_id),
+                "{case}"
+            );
+            assert!(
+                s.blocked.rt_sigsuspend_wake_owed.contains(&waiter),
+                "{case}"
+            );
+            let queue = settle_owed_rt_sigsuspend_wake(&mut s, &global_time, waiter, op_id, false);
+            assert_eq!(queue, vec![waiter, sleeper, worker], "{case}");
+        } else {
+            assert_eq!(
+                s.blocked.external_io_blockers.get(&waiter),
+                Some(&op_id),
+                "{case}"
+            );
+            assert!(
+                !s.blocked.rt_sigsuspend_blockers.contains_key(&waiter),
+                "{case}"
+            );
+            assert!(s.blocked.rt_sigsuspend_wake_owed.is_empty(), "{case}");
+            assert!(s.step2_process_blocked(&global_time).is_ok(), "{case}");
+            assert!(s.take_terminal_deadlock().is_none(), "{case}");
+            assert_eq!(
+                s.run_queue.tids().copied().collect::<Vec<_>>(),
+                vec![sleeper, worker],
+                "{case}"
+            );
+        }
+        assert_eq!(global_time.lock().unwrap().as_nanos(), time, "{case}");
+    }
+}
+
+/// A scheduler with SaBRe's whole capability profile: the supervisor reports
+/// physical exits, a signal interrupts the real blocking call, and a killed
+/// thread is tombstoned with its posted request cancelled.
+fn sabre_scheduler() -> Scheduler {
+    Scheduler::new(&Config::default().with_backend(|backend| {
+        backend.reports_physical_process_exits = true;
+        backend.signal_interrupts_external_syscalls = true;
+        backend.needs_killed_thread_rpc_cancellation = true;
+    }))
+}
+
+/// When the supervisor's report of a killed process's death reaches the
+/// scheduler, relative to the killer's `SIGKILL` edge. The kernel kills the
+/// target inside the killer's `kill` call, and the killer notifies the
+/// scheduler only after that call returns, so the report can come first.
+#[derive(Clone, Copy, Debug)]
+enum DeathReport {
+    BeforeEdge,
+    AfterEdge,
+    AfterHeldPasses,
+}
+
+/// The supervisor reports the death of `leader`, the only thread of its
+/// process: first the thread, then the process's final exit. Returns whether
+/// that released the process's physical-exit barrier.
+fn report_process_death(s: &mut Scheduler, leader: DetTid) -> bool {
+    s.note_physical_thread_exit(leader);
+    s.complete_physical_process_exit(DetPid::from_raw(leader.as_raw()))
+}
+
+/// Must not hang or diverge: a SaBRe child `Q` suspended for a caught SIGCHLD
+/// is killed by its parent `P` with `SIGKILL`, and `Q`'s own child `A` exits
+/// afterwards. In one variant `Q`'s real call was first interrupted by a signal
+/// outside its waking set (SaBRe's central handler catches even a default or
+/// ignored one), so `Q` had posted its continuation, which waits behind `P`'s
+/// work. The supervisor's report of `Q`'s death is host-timed: before the
+/// edge, right after it, or after several held passes. In every order the
+/// edge retires `Q` exactly as an exit-group would: its posted request is
+/// cancelled and never granted, no wake is owed to it, and its parent gets one
+/// SIGCHLD wakeup once the reap is reported. All orders end in the same run
+/// queue and the same first turn, which belongs to a survivor. Before the fix
+/// nothing retired `Q`: `A`'s exit owed it a wake whenever `A` was reported
+/// before `Q`'s death, and the posted continuation of the dead thread was then
+/// granted ahead of `P`'s work on some runs and not on others.
+#[test]
+fn sigkill_edge_retires_a_suspended_child_identically_in_every_report_order() {
+    for continuation_posted in [true, false] {
+        let mut outcomes = Vec::new();
+        for order in [
+            DeathReport::BeforeEdge,
+            DeathReport::AfterEdge,
+            DeathReport::AfterHeldPasses,
+        ] {
+            let case = format!("continuation posted: {continuation_posted}, report {order:?}");
+            let mut s = sabre_scheduler();
+            let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+            let time = global_time.lock().unwrap().as_nanos();
+            let (parent, waiter, op_id, grandchild, grandchild_mm, sleeper) =
+                killed_waiter_fixture(&mut s);
+            let waiter_process = DetPid::from_raw(200);
+            if continuation_posted {
+                s.notify_signal_pending(waiter, SigWrapper::from(Signal::SIGWINCH));
+                assert!(s.blocked.rt_sigsuspend_wake_owed.is_empty(), "{case}");
+                post_rt_sigsuspend_continuation(&mut s, waiter, op_id);
+            }
+            let response = s.next_turns[&waiter].resp.clone();
+            if matches!(order, DeathReport::BeforeEdge) {
+                assert!(!report_process_death(&mut s, waiter), "{case}");
+            }
+
+            s.note_sigkill_sent(parent, waiter, Some(waiter_process));
+            assert!(!s.next_turns.contains_key(&waiter), "{case}");
+            assert!(s.thread_is_logically_killed(waiter), "{case}");
+            if continuation_posted {
+                assert!(
+                    matches!(response.try_read(), Some(SchedResponse::Signaled(None))),
+                    "{case}"
+                );
+            }
+            assert!(
+                !s.blocked.rt_sigsuspend_blockers.contains_key(&waiter),
+                "{case}"
+            );
+            assert!(
+                !s.blocked.rt_sigsuspend_wakers.contains_key(&waiter),
+                "{case}"
+            );
+            assert!(s.blocked.rt_sigsuspend_wake_owed.is_empty(), "{case}");
+            assert!(
+                s.logically_exited_processes.contains(&waiter_process),
+                "{case}"
+            );
+            assert_eq!(
+                s.child_exit_signals_owed.get(&waiter_process),
+                Some(&DetPid::from_raw(100)),
+                "{case}"
+            );
+
+            // A exits after the edge and is reaped at once. Its parent is
+            // dead, so no wake can be owed to Q's suspend.
+            grant_child_exit_and_remove_thread(&mut s, grandchild, grandchild_mm);
+            assert!(
+                s.complete_physical_process_exit(DetPid::from_raw(300)),
+                "{case}"
+            );
+            assert!(s.blocked.rt_sigsuspend_wake_owed.is_empty(), "{case}");
+            match order {
+                DeathReport::BeforeEdge => {}
+                DeathReport::AfterEdge => {
+                    assert!(report_process_death(&mut s, waiter), "{case}");
+                }
+                DeathReport::AfterHeldPasses => {
+                    // Until the reap is reported, P's SIGCHLD may not have been
+                    // sent yet, so no turn or timer may run.
+                    assert!(s.step2_process_blocked(&global_time).is_err(), "{case}");
+                    let queued: Vec<DetTid> = s.run_queue.tids().copied().collect();
+                    assert!(!queued.contains(&waiter), "{case}");
+                    for _ in 0..2 {
+                        assert!(s.step2_process_blocked(&global_time).is_err(), "{case}");
+                        assert!(s.take_terminal_deadlock().is_none(), "{case}");
+                    }
+                    assert_eq!(
+                        s.run_queue.tids().copied().collect::<Vec<_>>(),
+                        queued,
+                        "{case}"
+                    );
+                    assert!(
+                        s.blocked.timed_waiters.thread_deadline(sleeper).is_some(),
+                        "{case}"
+                    );
+                    assert_eq!(global_time.lock().unwrap().as_nanos(), time, "{case}");
+                    assert!(report_process_death(&mut s, waiter), "{case}");
+                }
+            }
+            assert!(
+                s.completed_physical_process_exits.contains(&waiter_process),
+                "{case}"
+            );
+            assert!(s.step2_process_blocked(&global_time).is_ok(), "{case}");
+            assert!(s.take_terminal_deadlock().is_none(), "{case}");
+            assert!(s.child_exit_signals_owed.is_empty(), "{case}");
+            assert_eq!(global_time.lock().unwrap().as_nanos(), time, "{case}");
+            let queue: Vec<DetTid> = s.run_queue.tids().copied().collect();
+            assert!(
+                queue.contains(&parent) && queue.contains(&sleeper) && !queue.contains(&waiter),
+                "{case}: {queue:?}"
+            );
+            let (first, _, _) = s.select_test_turn().expect("a survivor is runnable");
+            assert_ne!(first, waiter, "{case}");
+            outcomes.push((queue, first, s.owed_child_exit_wakeups));
+        }
+        assert!(
+            outcomes.iter().all(|outcome| *outcome == outcomes[0]),
+            "continuation posted: {continuation_posted}: {outcomes:?}"
+        );
+    }
+}
+
+/// The `SIGKILL` edge retires only what it can prove dead, and only once. A
+/// kill sent to the sender's own process kills the sender too and is left to
+/// the existing paths; a backend without SaBRe's whole profile keeps its own
+/// handling; a second kill of a retired process finds nothing to do; and a
+/// live thread without a recorded address space fails the run closed rather
+/// than being retired with a guessed one.
+#[test]
+fn sigkill_edge_retires_only_another_live_process_once() {
+    let child_process = DetPid::from_raw(200);
+
+    let mut s = sabre_scheduler();
+    add(&mut s, 100, 100);
+    let (child, _, _) = add_process_child(&mut s, 100, 200);
+    let (child_sibling, _, _) = add(&mut s, 200, 201);
+    s.note_sigkill_sent(child_sibling, child, Some(child_process));
+    assert!(s.next_turns.contains_key(&child) && s.next_turns.contains_key(&child_sibling));
+    assert!(!s.thread_is_logically_killed(child));
+    assert!(s.child_exit_signals_owed.is_empty());
+
+    for mut s in [
+        physical_exit_reporting_scheduler(),
+        Scheduler::new(&Config::default().with_backend(|backend| {
+            backend.needs_killed_thread_rpc_cancellation = true;
+        })),
+    ] {
+        let (parent, _, _) = add(&mut s, 100, 100);
+        let (child, _, _) = add_process_child(&mut s, 100, 200);
+        s.note_sigkill_sent(parent, child, Some(child_process));
+        assert!(s.next_turns.contains_key(&child));
+        assert!(!s.logically_exited_processes.contains(&child_process));
+        assert!(s.child_exit_signals_owed.is_empty());
+    }
+
+    let mut s = sabre_scheduler();
+    let (parent, _, _) = add(&mut s, 100, 100);
+    let (child, _, _) = add_process_child(&mut s, 100, 200);
+    queue_ordinary_work(&mut s, parent);
+    s.note_sigkill_sent(parent, child, Some(child_process));
+    assert!(s.thread_is_logically_killed(child));
+    assert!(s.pending_physical_process_exits.contains(&child_process));
+    assert!(s.complete_physical_process_exit(child_process));
+    assert!(s.step2_drain_prefix().is_ok());
+    assert_eq!(s.owed_child_exit_wakeups, 1);
+    s.note_sigkill_sent(parent, child, Some(child_process));
+    assert!(s.child_exit_signals_owed.is_empty());
+    assert!(!s.pending_physical_process_exits.contains(&child_process));
+    assert!(s.step2_drain_prefix().is_ok());
+    assert_eq!(s.owed_child_exit_wakeups, 1);
+    assert!(s.take_terminal_deadlock().is_none());
+
+    let mut s = sabre_scheduler();
+    let (parent, _, _) = add(&mut s, 100, 100);
+    let (child, _, _) = add_process_child(&mut s, 100, 200);
+    s.registered_mms.remove(&child);
+    s.note_sigkill_sent(parent, child, Some(child_process));
+    assert!(
+        s.take_terminal_deadlock()
+            .is_some_and(|message| message.contains("address-space identity"))
+    );
+    assert!(s.next_turns.contains_key(&child));
+    assert!(!s.thread_is_logically_killed(child));
+    assert!(s.child_exit_signals_owed.is_empty());
+}
+
+/// Must not leave a thread behind: a `SIGKILL` sent with `tgkill` to one
+/// worker thread kills its whole process. The edge resolves the process from
+/// the thread and retires every live thread of it, cancelling the worker's
+/// posted request so that it is never granted. Until the supervisor reports
+/// the reap no turn runs; then the parent gets its one wakeup.
+#[test]
+fn sigkill_edge_retires_every_thread_of_the_target_process() {
+    let mut s = sabre_scheduler();
+    let (parent, _, _) = add(&mut s, 100, 100);
+    let (leader, _, _) = add_process_child(&mut s, 100, 200);
+    let (worker, _, _) = add(&mut s, 200, 201);
+    let child_process = DetPid::from_raw(200);
+    queue_ordinary_work(&mut s, parent);
+    queue_ordinary_work(&mut s, worker);
+    let worker_response = s.next_turns[&worker].resp.clone();
+
+    s.note_sigkill_sent(parent, worker, None);
+    for tid in [leader, worker] {
+        assert!(!s.next_turns.contains_key(&tid));
+        assert!(s.thread_is_logically_killed(tid));
+    }
+    assert!(matches!(
+        worker_response.try_read(),
+        Some(SchedResponse::Signaled(None))
+    ));
+    assert!(s.pending_physical_process_exits.contains(&child_process));
+    assert_eq!(
+        s.child_exit_signals_owed.get(&child_process),
+        Some(&DetPid::from_raw(100))
+    );
+    assert!(s.step2_drain_prefix().is_err());
+    assert!(!s.run_queue.tids().any(|tid| *tid == worker));
+    assert!(s.complete_physical_process_exit(child_process));
+    assert!(s.step2_drain_prefix().is_ok());
+    assert!(s.take_terminal_deadlock().is_none());
+    assert_eq!(s.owed_child_exit_wakeups, 1);
+    assert_eq!(
+        s.run_queue.tids().copied().collect::<Vec<_>>(),
+        vec![parent]
+    );
 }
 
 #[test]
