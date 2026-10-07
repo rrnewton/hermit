@@ -5794,7 +5794,6 @@ mod tests {
             "supports_madvise": !kvm,
             "provides_process_signal_control": kvm,
             "emulates_child_waits": kvm,
-            "failed_gettimeofday_may_store_host_time": !kvm,
             "user_address_limit":
                 kvm.then_some(reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT),
         })

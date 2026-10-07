@@ -1169,7 +1169,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Eleven C3.5 exit-hold tests (scheduler and tool_global) retain all 976: 987.
     // Six exit_dependencies tests (rulings A and D.1) retain all 987: 993.
     // The completion-before-registration test (C3.5 fix-forward) retains all 993: 994.
-    ("test.detcore_unit", 994),
+    // syscalls::time::tests::failed_gettimeofday_repair_is_skipped_only_for_kvm
+    // is deleted with the capability it tested, which reverie-kvm's time(2)
+    // and Guest::storable_memory_ranges replace: 994 - 1 = 993, measured with
+    // cargo nextest list --profile ci -p hermit-detcore --lib --bins.
+    ("test.detcore_unit", 993),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1565,8 +1569,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the host-independent /proc/modules test (976).
     // The host twin selects the same eleven exit-hold tests: 987.
     // The host twin selects the same six exit_dependencies tests: 993.
-    // The host twin selects the same test: 994.
-    ("test.detcore_unit_on_host", 994),
+    // The host twin selects the same tests: 993.
+    ("test.detcore_unit_on_host", 993),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
