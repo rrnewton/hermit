@@ -1629,6 +1629,14 @@ pub async fn nanos_duration_to_absolute_timeout<G: Guest<Detcore<T>>, T: RecordO
     }
 }
 
+/// The number of `pollfd` entries `poll` and `ppoll` read. Linux declares
+/// their `nfds` parameter `unsigned int`, so only the low 32 bits of the
+/// register count; a guest may leave the high word set. Every reader of a
+/// guest's pollfd array sizes it from this, never from `nfds` itself.
+pub fn poll_nfds(nfds: libc::nfds_t) -> u32 {
+    nfds as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

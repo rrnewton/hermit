@@ -109,6 +109,7 @@ use crate::resources::Resources;
 use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::get_fd;
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
+use crate::syscalls::helpers::poll_nfds;
 use crate::syscalls::helpers::record_retry_event;
 use crate::tool_global::GlobalRequest;
 use crate::tool_global::GlobalResponse;
@@ -1838,20 +1839,34 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// The pollfd array at `address` and, for each entry, its channel and
     /// receive low-water mark. `None` when the array names no channel, so the
-    /// call takes its ordinary path.
+    /// call takes its ordinary path. Also `None`, before anything is read,
+    /// when `nfds` (counted by [`poll_nfds`]) exceeds the process's
+    /// RLIMIT_NOFILE: Linux refuses that count with EINVAL before it reads the
+    /// array, and the ordinary path checks the rest of the call in Linux's
+    /// order and gets that refusal.
     fn network_pollfds<G: Guest<Self>>(
         guest: &mut G,
         address: Option<AddrMut<'_, libc::pollfd>>,
-        nfds: usize,
+        nfds: u32,
     ) -> Option<(Vec<libc::pollfd>, Vec<Option<PolledChannel>>)> {
         let address = address?;
+        let open_file_limit = guest
+            .thread_state()
+            .resource_limits
+            .lock()
+            .expect("resource limits mutex poisoned")
+            .get(libc::RLIMIT_NOFILE)
+            .map_or(libc::RLIM64_INFINITY, |limit| limit.current);
+        if u64::from(nfds) > open_file_limit {
+            return None;
+        }
         let mut pollfds = vec![
             libc::pollfd {
                 fd: -1,
                 events: 0,
                 revents: 0,
             };
-            nfds
+            nfds as usize
         ];
         guest
             .memory()
@@ -1901,7 +1916,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Poll,
     ) -> Result<i64, Error> {
         let address = call.fds().map(|fds| fds.cast::<libc::pollfd>());
-        let Some((pollfds, channels)) = Self::network_pollfds(guest, address, call.nfds() as usize)
+        let Some((pollfds, channels)) =
+            Self::network_pollfds(guest, address, poll_nfds(call.nfds()))
         else {
             return self.handle_poll(guest, call).await;
         };
@@ -1930,7 +1946,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Ppoll,
     ) -> Result<i64, Error> {
         let Some((pollfds, channels)) =
-            Self::network_pollfds(guest, call.fds(), call.nfds() as usize)
+            Self::network_pollfds(guest, call.fds(), poll_nfds(call.nfds()))
         else {
             return self.handle_ppoll(guest, call).await;
         };
