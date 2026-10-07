@@ -3551,52 +3551,38 @@ fn self_test() -> Result<(), String> {
 
     // ---- the shipped portable-diagnostic table, not a planted substitute ----
     //
-    // RUN 1622 established the exact boundary this table must express: ranlib's
-    // functional assertion completed, while its below-L2 directory-payload
-    // verification diverged. That one row is diagnostic under PortableStrict;
-    // its neighboring ordinary corpus row remains blocking. Pin the full table
-    // so this exception cannot silently broaden.
+    // RUN 1622 made ranlib a nonblocking PortableStrict diagnostic. Since the
+    // compat corpus became strict (2026-10-07) the table is empty: ranlib and
+    // the other four former diagnostics passed --verify-strict 4 of 4 and block
+    // like every other row, with the ordinary 60 s budget. Pin it empty so a
+    // nonblocking exception cannot silently return.
     {
         use validate_plan::CompatDisposition as D;
         use validate_plan::classify_compat_outcome as classify;
 
         let diagnostic = validate_corpus::portable_diagnostic();
-        let labels: BTreeSet<&str> = diagnostic.keys().copied().collect();
-        let expected = BTreeSet::from(["df", "ranlib", "top", "zstd", "zstd-roundtrip"]);
-        if labels != expected {
+        if !diagnostic.is_empty() {
             return Err(format!(
-                "portable compatibility diagnostic set changed: got {labels:?}, expected {expected:?}"
+                "portable compatibility diagnostic set must stay empty: got {:?}",
+                diagnostic.keys().collect::<Vec<_>>()
             ));
         }
-        let ranlib = classify(
-            CompatMode::PortableStrict,
-            false,
-            false,
-            diagnostic.contains_key("ranlib"),
-        );
-        if ranlib != D::PortableDiagnostic
-            || ranlib.is_blocking()
-            || CompatMode::PortableStrict.timeout_for("ranlib") != 20
-        {
-            return Err(format!(
-                "compat.ranlib must remain a bounded nonblocking PortableStrict diagnostic: disposition={ranlib:?}, timeout={}s",
-                CompatMode::PortableStrict.timeout_for("ranlib")
-            ));
-        }
-        let ordinary = classify(
-            CompatMode::PortableStrict,
-            false,
-            false,
-            diagnostic.contains_key("readelf"),
-        );
-        if ordinary != D::Blocking
-            || !ordinary.is_blocking()
-            || CompatMode::PortableStrict.timeout_for("readelf") != 60
-        {
-            return Err(format!(
-                "ordinary compat.readelf failure stopped blocking: disposition={ordinary:?}, timeout={}s",
-                CompatMode::PortableStrict.timeout_for("readelf")
-            ));
+        for label in ["df", "ranlib", "top", "zstd", "zstd-roundtrip", "readelf"] {
+            let disposition = classify(
+                CompatMode::PortableStrict,
+                false,
+                false,
+                diagnostic.contains_key(label),
+            );
+            if disposition != D::Blocking
+                || !disposition.is_blocking()
+                || CompatMode::PortableStrict.timeout_for(label) != 60
+            {
+                return Err(format!(
+                    "compat.{label} failure must block with the 60 s budget: disposition={disposition:?}, timeout={}s",
+                    CompatMode::PortableStrict.timeout_for(label)
+                ));
+            }
         }
     }
 

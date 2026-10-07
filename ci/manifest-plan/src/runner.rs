@@ -9573,8 +9573,9 @@ mod tests {
     /// https://github.com/rrnewton/hermit/issues/3448 moved it into
     /// compat.yaml; the shipped row, built the way the runner builds it under
     /// e2e.manifest_compat's HERMIT_E2E_EMPTY_WORKDIR=/test, still carries
-    /// every one of those flags, the stripped comparator, and the guest argv
-    /// with its run-owned fixture path.
+    /// every one of those flags, now with the strict comparator
+    /// (--verify-strict, since 2026-10-07), and the guest argv with its
+    /// run-owned fixture path.
     #[test]
     fn a_shipped_compat_row_keeps_the_strict_compatibility_probe_flags() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -9656,6 +9657,7 @@ mod tests {
             at(&["run"]),
             at(&["--base-env=minimal"]),
             at(&["--strict"]),
+            at(&["--verify-strict"]),
             at(&["--no-virtualize-cpuid"]),
             at(&["--max-timeslice=disabled"]),
             at(&["--verify"]),
@@ -9665,9 +9667,10 @@ mod tests {
             separator,
         ];
         assert!(ordered.is_sorted(), "{ordered:?} in {argv:?}");
-        assert!(!argv.iter().any(|arg| arg == "--verify-strict"), "{argv:?}");
         assert_eq!(argv[separator + 1..], guest[..]);
-        assert_eq!(spec.comparator, Comparator::Stripped);
+        // The corpus is strict (2026-10-07), so a compat row is an L2
+        // reference for the parity post-pass.
+        assert_eq!(spec.comparator, Comparator::Strict);
         assert_eq!((cell.timeout_seconds, cell.cpu_timeout_seconds), (60, 59));
         // One attempt, as the generated node had; an ordinary cell retries.
         assert!(!retries_product_failures(cell));
@@ -10764,11 +10767,12 @@ mod tests {
             })
             .collect::<BTreeMap<_, _>>();
         // The strict compatibility corpus (fold 1 of
-        // https://github.com/rrnewton/hermit/issues/3448) keeps the wall bounds
-        // its generated validation nodes carried, 60 s and 20 s for its five
-        // bounded diagnostics, with CPU one second below each (a cell's CPU
-        // budget must stay below its wall). These literals are the check; they
-        // are not read back from compat.yaml.
+        // https://github.com/rrnewton/hermit/issues/3448) keeps the 60 s wall
+        // bound its generated validation nodes carried, with CPU one second
+        // below it (a cell's CPU budget must stay below its wall). Its five
+        // former 20-second diagnostics are ordinary cells since the corpus
+        // became strict (2026-10-07). These literals are the check; they are
+        // not read back from compat.yaml.
         let (compat, observed): (BTreeMap<_, _>, BTreeMap<_, _>) = observed
             .into_iter()
             .partition(|((test, _, _), _)| test.starts_with("compat/"));
@@ -10778,19 +10782,7 @@ mod tests {
         );
         for ((test, mode, backend), bounds) in &compat {
             assert_eq!((*mode, *backend), ("verify", "ptrace"), "{test}");
-            let diagnostic = matches!(
-                *test,
-                "compat/df"
-                    | "compat/ranlib"
-                    | "compat/top"
-                    | "compat/zstd"
-                    | "compat/zstd-roundtrip"
-            );
-            assert_eq!(
-                *bounds,
-                if diagnostic { (19, 20) } else { (59, 60) },
-                "{test}"
-            );
+            assert_eq!(*bounds, (59, 60), "{test}");
         }
         let expected = EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()

@@ -14097,8 +14097,8 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "diagnostic",
-      "cpu_timeout_seconds": 19,
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
       "requires": [
@@ -14108,7 +14108,7 @@
         "ptrace"
       ],
       "test": "compat/df",
-      "timeout_seconds": 20
+      "timeout_seconds": 60
     },
     {
       "backend": "ptrace",
@@ -15505,8 +15505,8 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "diagnostic",
-      "cpu_timeout_seconds": 19,
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
       "requires": [
@@ -15516,7 +15516,7 @@
         "ptrace"
       ],
       "test": "compat/ranlib",
-      "timeout_seconds": 20
+      "timeout_seconds": 60
     },
     {
       "backend": "ptrace",
@@ -16113,8 +16113,8 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "diagnostic",
-      "cpu_timeout_seconds": 19,
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
       "requires": [
@@ -16124,7 +16124,7 @@
         "ptrace"
       ],
       "test": "compat/top",
-      "timeout_seconds": 20
+      "timeout_seconds": 60
     },
     {
       "backend": "ptrace",
@@ -16497,8 +16497,8 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "diagnostic",
-      "cpu_timeout_seconds": 19,
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
       "requires": [
@@ -16508,13 +16508,13 @@
         "ptrace"
       ],
       "test": "compat/zstd",
-      "timeout_seconds": 20
+      "timeout_seconds": 60
     },
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "diagnostic",
-      "cpu_timeout_seconds": 19,
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
       "requires": [
@@ -16524,7 +16524,7 @@
         "ptrace"
       ],
       "test": "compat/zstd-roundtrip",
-      "timeout_seconds": 20
+      "timeout_seconds": 60
     },
     {
       "backend": "ptrace",

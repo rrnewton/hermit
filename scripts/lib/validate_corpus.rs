@@ -151,31 +151,12 @@ pub fn known_failclosed() -> BTreeMap<&'static str, &'static str> {
 /// `PORTABLE_STRICT_DIAGNOSTIC_FAILURES` (validate.sh:1147). Bounded diagnostics
 /// on the GitHub-managed portable runner: a failure here is nonblocking and the
 /// probe is given a shortened 20s budget.
+///
+/// Empty since 2026-10-07, when the compat corpus became strict (--verify-strict):
+/// its five rows (df, ranlib, top, zstd, zstd-roundtrip) passed strict in 4 of 4
+/// full runs at Hermit 0d25b6f7 and are ordinary blocking cells.
 pub fn portable_diagnostic() -> BTreeMap<&'static str, &'static str> {
-    BTreeMap::from([
-        // TODO(#2801): remove once mountinfo source paths are deterministic.
-        (
-            "df",
-            "tracked in #2801: mountinfo exposes Hermit's host-TMPDIR backing paths",
-        ),
-        // TODO(#2897): remove once the temporary-directory getdents64 payload is deterministic.
-        (
-            "ranlib",
-            "tracked in #2897: ranlib's temporary-directory getdents64 payload diverges",
-        ),
-        (
-            "top",
-            "live process-table reads differ on the GitHub-managed portable runner",
-        ),
-        (
-            "zstd",
-            "timed out on the GitHub-managed portable no-PMU runner",
-        ),
-        (
-            "zstd-roundtrip",
-            "timed out on the GitHub-managed portable no-PMU runner",
-        ),
-    ])
+    BTreeMap::new()
 }
 
 /// `PORTABLE_STRICT_SUPER_ONLY` (validate.sh:1152). Heavy runtime/compiler

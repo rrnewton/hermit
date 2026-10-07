@@ -9792,8 +9792,8 @@ sys.exit(1 if failed else 0)
             "mtime_sec": 1_700_000_000_i64, "mtime_nsec": 0})
         };
         // The comparisons Hermit records: compat/cat's verify cell selects the
-        // stripped comparator, so a host-input report of it records a stripped
-        // comparison of non-vacuous logs; the canonical one is another
+        // strict comparator, so a host-input report of it records a canonical
+        // comparison of non-vacuous logs; the stripped one is another
         // comparator's.
         let stripped = serde_json::json!({"strictness": "stripped", "display_name": "Stripped",
             "compare_logs": true, "compare_io_buffers": true, "log_scope": "deterministic",
@@ -9829,7 +9829,7 @@ sys.exit(1 if failed else 0)
             }))
             .unwrap()
         };
-        let bytes = report_of(&stripped, 2);
+        let bytes = report_of(&canonical, 2);
         let parsed =
             hermit_manifest_plan::canonical_verdict::VerificationReport::from_current_json_slice(
                 bytes.as_bytes(),
@@ -9912,7 +9912,7 @@ sys.exit(1 if failed else 0)
         // input change either: the classifier calls such an attempt
         // incomplete verification evidence, so a row it did not classify must
         // not claim the retry by its labels.
-        for report in [report_of(&stripped, 0), report_of(&canonical, 2)] {
+        for report in [report_of(&canonical, 0), report_of(&stripped, 2)] {
             let incomplete = row(&reason, &report);
             assert!(
                 !super::host_input_change_only(&incomplete),

@@ -29,11 +29,6 @@ corpus:
       (PORTABLE_STRICT_PROBE_ARGS in validate.sh), so it runs on hosts
       without CPUID faulting or a usable PMU
     env: {TMPDIR: /tmp}
-    comparator: stripped
-    comparator_reason: >-
-      The corpus verdict is Hermit's default --verify comparison
-      (exit status, streams and stripped logs); it is below L2 and is
-      never counted as bitwise parity
     no_retry_reason: >-
       Each program ran once per validation as its own compat.<program> node,
       and a failure of that one run failed the validation; a second attempt
@@ -47,23 +42,6 @@ corpus:
       cell's CPU budget must stay below its wall bound, so it is 59. Measured
       at Hermit 76980bac (validation of 2026-10-01): the slowest of these
       programs used 3.0 s wall and 2.9 s CPU
-  diagnostic:
-    timeout_seconds: 20
-    cpu_timeout_seconds: 19
-    slow_reason: >-
-      A bounded diagnostic gets a shortened 20-second wall budget
-      (PORTABLE_STRICT_DIAGNOSTIC_FAILURES in validate.sh); its CPU budget
-      stays one second below it
-    rows:
-      df: >-
-        tracked in https://github.com/rrnewton/hermit/issues/2801: mountinfo
-        exposes Hermit's host-TMPDIR backing paths
-      ranlib: >-
-        tracked in https://github.com/rrnewton/hermit/issues/2897: ranlib's
-        temporary-directory getdents64 payload diverges
-      top: live process-table reads differ on the GitHub-managed portable runner
-      zstd: timed out on the GitHub-managed portable no-PMU runner
-      zstd-roundtrip: timed out on the GitHub-managed portable no-PMU runner
   heavy:
     timeout_seconds: 600
     cpu_timeout_seconds: 599
@@ -294,7 +272,7 @@ corpus:
           ]
   # The strict run type (scripts/validate.rs --strict-compat-only): every row
   # of ci/compat/corpus-strict.json once more on ptrace, under --strict and
-  # Hermit's stripped --verify with none of the corpus's relaxations, so
+  # Hermit's strict --verify with none of the corpus's relaxations, so
   # CPUID virtualization and the preemption timeslice stay on. Until
   # 2026-10-02 these were 193 separate strictcompat.<program> validation
   # nodes running the same argv.
