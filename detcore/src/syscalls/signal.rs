@@ -481,18 +481,42 @@ impl<T: RecordOrReplay> Detcore<T> {
         let pending: u64 = guest.memory().read_value(pending_addr)?;
         drop(pending_guard);
 
-        if pending & !temporary_mask != 0 {
+        let immediately_pending = pending & !temporary_mask != 0;
+        if guest.config().backend.signal_interrupts_external_syscalls {
+            let wakers = rt_sigsuspend_wakers(guest, temporary_mask).await?;
+            let pending_wakers = RtSigsuspendWakers(pending & wakers.0);
+            if immediately_pending && pending_wakers.0 == 0 {
+                // A pending signal outside the temporary mask that is not
+                // certain to end the call (a default or ignored action) keeps
+                // the external-wait path below.
+                self.record_or_replay_blocking(guest, call.into()).await
+            } else {
+                // Includes a waker that is already pending: the real call
+                // takes it the moment it installs the temporary mask, so its
+                // return is certain and the scheduler can wait for it.
+                self.rt_sigsuspend_with_held_wakers(
+                    guest,
+                    call,
+                    temporary_mask,
+                    wakers,
+                    pending_wakers,
+                )
+                .await
+            }
+        } else if immediately_pending {
             // The kernel will consume an already-pending signal as soon as it
             // atomically installs the temporary mask. Keep this immediate case
             // out of the terminal-wait classification; the real syscall still
             // performs delivery and restores the old mask.
             self.record_or_replay_blocking(guest, call.into()).await
-        } else if guest.config().backend.signal_interrupts_external_syscalls {
-            self.rt_sigsuspend_with_held_wakers(guest, call, temporary_mask)
-                .await
         } else {
-            self.record_or_replay_rt_sigsuspend(guest, call, RtSigsuspendWakers::default())
-                .await
+            self.record_or_replay_rt_sigsuspend(
+                guest,
+                call,
+                RtSigsuspendWakers::default(),
+                RtSigsuspendWakers::default(),
+            )
+            .await
         }
     }
 
@@ -519,6 +543,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// so the kernel delivers it at once and returns `EINTR`. The original mask
     /// is restored once the call has returned, as Linux restores it.
     ///
+    /// `wakers` is the set `rt_sigsuspend_wakers` computed for this temporary
+    /// mask, and `pending_wakers` those of them the kernel already held pending
+    /// when the call was classified. The scheduler treats a call with a pending
+    /// waker as certain to return at once (see `Scheduler`'s grant of
+    /// `BlockingRtSigsuspend`).
+    ///
     /// SaBRe is the only backend that sets `signal_interrupts_external_syscalls`.
     /// Its `guest.stack()` is a private heap arena, not the guest stack, so the
     /// signal frame the kernel pushes for the interrupting signal cannot
@@ -530,8 +560,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::RtSigsuspend,
         temporary_mask: KernelSigset,
+        wakers: RtSigsuspendWakers,
+        pending_wakers: RtSigsuspendWakers,
     ) -> Result<i64, Error> {
-        let wakers = rt_sigsuspend_wakers(guest, temporary_mask).await?;
         let mut stack = guest.stack().await;
         let mask_copy = stack.push(temporary_mask);
         let block_set = stack.push(wakers.0);
@@ -547,7 +578,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest.inject_with_retry(block).await?;
         }
         let result = self
-            .record_or_replay_rt_sigsuspend(guest, call.with_mask(Some(mask_copy.cast())), wakers)
+            .record_or_replay_rt_sigsuspend(
+                guest,
+                call.with_mask(Some(mask_copy.cast())),
+                wakers,
+                pending_wakers,
+            )
             .await;
         if holds_wakers {
             let old_mask: Addr<'_, KernelSigset> = old_mask.into();

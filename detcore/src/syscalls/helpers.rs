@@ -122,19 +122,21 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Execute the real `rt_sigsuspend` outside the runnable set while preserving
     /// its signal-only completion condition for the scheduler. `wakers` names
-    /// the signals that certainly end the call.
+    /// the signals that certainly end the call, and `pending_wakers` those of
+    /// them already pending, which end it at once.
     pub async fn record_or_replay_rt_sigsuspend<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::RtSigsuspend,
         wakers: RtSigsuspendWakers,
+        pending_wakers: RtSigsuspendWakers,
     ) -> Result<i64, Error> {
         let dettid = guest.thread_state().dettid;
         let op_id = ExternalOpId::new(dettid, guest.thread_state().stats.syscall_count);
         self.record_or_replay_blocking_resource(
             guest,
             call.into(),
-            ResourceID::BlockingRtSigsuspend(op_id, wakers),
+            ResourceID::BlockingRtSigsuspend(op_id, wakers, pending_wakers),
         )
         .await
     }
@@ -147,7 +149,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let dettid = guest.thread_state().dettid;
         let op_id = match &blocking_resource {
-            ResourceID::BlockingExternalIO(op_id) | ResourceID::BlockingRtSigsuspend(op_id, _) => {
+            ResourceID::BlockingExternalIO(op_id) | ResourceID::BlockingRtSigsuspend(op_id, ..) => {
                 *op_id
             }
             _ => unreachable!("blocking syscall helper requires a blocking resource"),

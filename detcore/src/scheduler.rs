@@ -684,6 +684,13 @@ pub struct Scheduler {
     /// scheduler: accepting Linux TID reuse would let delayed backend RPCs bind to a new thread.
     logically_killed_threads: BTreeSet<DetTid>,
 
+    /// Registered threads the backend supervisor has reported dead (SaBRe).
+    /// A thread killed outright, by `SIGKILL` or another fatal signal, runs no
+    /// exit hook there, so it stays registered, but it can post no further
+    /// request. A thread leaves this set when it is logically retired or its
+    /// raw TID is registered again.
+    physically_exited_threads: BTreeSet<DetTid>,
+
     /// Accepted address-space incarnation for raw TIDs explicitly reused by exec.
     exec_incarnations: BTreeMap<DetTid, MmId>,
 
@@ -1904,6 +1911,7 @@ impl Scheduler {
             real_timers: Default::default(),
             parked: Default::default(),
             logically_killed_threads: Default::default(),
+            physically_exited_threads: Default::default(),
             exec_incarnations: Default::default(),
             retired_transferred_exec_callers: Default::default(),
             exec_teardowns: Default::default(),
@@ -2409,6 +2417,7 @@ impl Scheduler {
         if self.backend.needs_killed_thread_rpc_cancellation {
             self.logically_killed_threads.insert(*dtid);
         }
+        self.physically_exited_threads.remove(dtid);
         // Remove from the runnable queue at the next deterministic drain. This
         // is safe even if an asynchronous exec reconnect races a live
         // tentative_pop: the handler never reaches the run queue's mutation
@@ -2579,6 +2588,7 @@ impl Scheduler {
         // part of this exec. This is the one intentional exception to permanent
         // raw-TID tombstones: the pending exec record proves why Linux reused it.
         self.logically_killed_threads.remove(&new_leader);
+        self.physically_exited_threads.remove(&new_leader);
         self.deregistration_accounted.remove(&new_leader);
         self.pending_physical_process_exits.remove(&detpid);
         assert!(
@@ -3088,8 +3098,12 @@ impl Scheduler {
     /// The wait cannot be endless. The signal was sent before the mark was
     /// made; its membership in the waking set and the waiter being its
     /// process's only live thread make the call's return certain; this path
-    /// releases the scheduler lock so the continuation can be posted; and a
-    /// waiter that dies instead leaves the owed set with its blocking entries.
+    /// releases the scheduler lock so the continuation can be posted. A waiter
+    /// killed outright instead posts nothing: the supervisor's report of its
+    /// death ends the wait (`note_physical_thread_exit`). No turn, timer or
+    /// harvest runs while this holds, so the pass that report releases is the
+    /// same on every run, and the state it leaves is the one a death reported
+    /// before the signal leaves.
     fn step2_await_owed_rt_sigsuspend_wakes(&self) -> Result<(), SkipTurn> {
         if self.rt_sigsuspend_wake_unconsumed() {
             std::thread::yield_now();
@@ -3773,7 +3787,7 @@ impl Scheduler {
             .resources
             .keys()
             .find_map(|resource| match resource {
-                ResourceID::BlockingRtSigsuspend(_, wakers) => Some(*wakers),
+                ResourceID::BlockingRtSigsuspend(_, wakers, _) => Some(*wakers),
                 _ => None,
             })
     }
@@ -3791,7 +3805,7 @@ impl Scheduler {
     /// continuation instead of judging the program deadlocked, or advancing
     /// virtual time to a timer, while that continuation is in flight.
     fn note_rt_sigsuspend_wake_owed(&mut self, dettid: DetTid, signal: i32) {
-        if !self.backend.signal_interrupts_external_syscalls {
+        if !self.may_owe_rt_sigsuspend_wake(dettid) {
             return;
         }
         let wakers = match self.blocked.rt_sigsuspend_wakers.get(&dettid) {
@@ -3808,6 +3822,51 @@ impl Scheduler {
             );
             self.blocked.rt_sigsuspend_wake_owed.insert(dettid);
         }
+    }
+
+    /// Whether a wake may be owed to `dettid`'s `rt_sigsuspend` at all: the
+    /// backend lets a signal interrupt the real call, and the supervisor has
+    /// not reported the thread dead (see `note_physical_thread_exit`).
+    fn may_owe_rt_sigsuspend_wake(&self, dettid: DetTid) -> bool {
+        self.backend.signal_interrupts_external_syscalls
+            && !self.physically_exited_threads.contains(&dettid)
+    }
+
+    /// Record the backend supervisor's report that registered thread `dettid`
+    /// is dead, on a backend where a signal interrupts the real blocking call.
+    ///
+    /// A thread killed in a real `rt_sigsuspend` never posts the continuation
+    /// an owed wake waits for, so the wake is discharged here unless that
+    /// continuation was already posted. Nothing else changes: the thread keeps
+    /// its blocking entries, exactly as when the report precedes the signal
+    /// and `note_rt_sigsuspend_wake_owed` refuses the mark. Removing them at
+    /// the report would let the host-timed death change a later deadlock or
+    /// timer decision. A dead thread posts nothing, so the posted check here
+    /// reads a final value.
+    pub(crate) fn note_physical_thread_exit(&mut self, dettid: DetTid) {
+        if !self.backend.signal_interrupts_external_syscalls
+            || !self.next_turns.contains_key(&dettid)
+        {
+            return;
+        }
+        self.physically_exited_threads.insert(dettid);
+        let posted = self
+            .blocked
+            .rt_sigsuspend_blockers
+            .get(&dettid)
+            .is_some_and(|op_id| self.blocker_continuation_posted(dettid, *op_id, true));
+        if !posted && self.blocked.rt_sigsuspend_wake_owed.remove(&dettid) {
+            debug!(
+                "[dtid {}] died in rt_sigsuspend before its continuation; its owed wake is discharged.",
+                dettid
+            );
+        }
+    }
+
+    /// A new thread is being registered under `dettid`'s raw TID, so an
+    /// earlier death report names the thread that held it before.
+    pub(crate) fn forget_physical_thread_exit(&mut self, dettid: DetTid) {
+        self.physically_exited_threads.remove(&dettid);
     }
 
     /// True if a thread owed an `rt_sigsuspend` wake is still executing the
@@ -4753,7 +4812,7 @@ impl Scheduler {
             // Thread BEGINS a blocking syscall outside the runnable set.
             ResourceID::BlockingExternalIO(op_id)
             | ResourceID::BlockingVfork(op_id)
-            | ResourceID::BlockingRtSigsuspend(op_id, _) => {
+            | ResourceID::BlockingRtSigsuspend(op_id, ..) => {
                 if matches!(rid, ResourceID::BlockingVfork(_)) {
                     assert!(self.vfork_barriers.insert(dettid, None).is_none());
                     if let Some(origin) = self.next_turns[&dettid].protocol.origin {
@@ -4794,14 +4853,32 @@ impl Scheduler {
 
                 // Only once the ivars are cleared and the guest is ready to issue
                 // BlockedExternalContinue do we record which blocked pool owns it.
-                let old = if let ResourceID::BlockingRtSigsuspend(_, wakers) = rid {
-                    // A wake owed from before this grant (the signal was sent
-                    // while the request waited) stays owed: the backend holds
-                    // that signal pending, so the real call returns at once.
-                    self.blocked.rt_sigsuspend_wakers.insert(dettid, *wakers);
-                    self.blocked.rt_sigsuspend_blockers.insert(dettid, *op_id)
-                } else {
-                    self.blocked.external_io_blockers.insert(dettid, *op_id)
+                let old = match rid {
+                    ResourceID::BlockingRtSigsuspend(_, _, pending_wakers)
+                        if pending_wakers.0 != 0 && !self.is_sole_live_thread(dettid) =>
+                    {
+                        // Another live thread of the process may take the
+                        // pending signal first, so the call's return is not
+                        // certain: it waits as external IO, as before.
+                        self.blocked.external_io_blockers.insert(dettid, *op_id)
+                    }
+                    ResourceID::BlockingRtSigsuspend(_, wakers, pending_wakers) => {
+                        // A wake owed from before this grant (the signal was
+                        // sent while the request waited) stays owed: the
+                        // backend holds that signal pending, so the real call
+                        // returns at once. A waker that was already pending
+                        // when the call was classified is owed the same way.
+                        self.blocked.rt_sigsuspend_wakers.insert(dettid, *wakers);
+                        if pending_wakers.0 != 0 && self.may_owe_rt_sigsuspend_wake(dettid) {
+                            debug!(
+                                "[dtid {}] rt_sigsuspend starts with waker(s) {:#x} pending; awaiting its continuation.",
+                                dettid, pending_wakers.0
+                            );
+                            self.blocked.rt_sigsuspend_wake_owed.insert(dettid);
+                        }
+                        self.blocked.rt_sigsuspend_blockers.insert(dettid, *op_id)
+                    }
+                    _ => self.blocked.external_io_blockers.insert(dettid, *op_id),
                 };
                 assert!(old.is_none(), "thread started a second external operation");
                 Err(SkipTurn)

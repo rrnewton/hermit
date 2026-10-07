@@ -359,8 +359,10 @@ pub enum ResourceID {
     /// A real `rt_sigsuspend` executing outside the runnable set while the kernel
     /// atomically installs its temporary signal mask. Unlike arbitrary external
     /// IO, this operation cannot complete without a signal. The second field
-    /// names the signals that certainly end it.
-    BlockingRtSigsuspend(ExternalOpId, RtSigsuspendWakers),
+    /// names the signals that certainly end it. The third names those of them
+    /// already pending in the kernel when the call was classified, which end it
+    /// the moment the real call installs its temporary mask.
+    BlockingRtSigsuspend(ExternalOpId, RtSigsuspendWakers, RtSigsuspendWakers),
 }
 
 /// Permission to a device, which behaves like a predefined "inode".
@@ -584,6 +586,7 @@ mod tests {
             ResourceID::BlockingExternalIO(ExternalOpId::new(tid1, 7)),
             ResourceID::BlockingRtSigsuspend(
                 ExternalOpId::new(tid1, 7),
+                RtSigsuspendWakers::default(),
                 RtSigsuspendWakers::default()
             )
         );

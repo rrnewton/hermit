@@ -868,6 +868,10 @@ impl GlobalState {
     /// This only records a barrier observation when the backend advertises physical-exit
     /// reporting; it is therefore a no-op for ptrace, DBT, KVM, and LiteInst execution. The
     /// exact process's barrier is released at this physical-waitability boundary.
+    ///
+    /// The supervisor reports every traced thread, so `raw_pid` is also the raw TID of a
+    /// thread that is now dead and may still be registered (see
+    /// `Scheduler::note_physical_thread_exit`).
     pub fn complete_physical_process_exit(&self, raw_pid: i32) {
         let detpid = DetPid::from_raw(raw_pid);
         self.pending_exec_states.lock().unwrap().remove(&detpid);
@@ -876,12 +880,12 @@ impl GlobalState {
             .unwrap()
             .remove(&detpid);
         self.post_exec_fd_blocking.lock().unwrap().remove(&detpid);
-        if self
-            .sched
-            .lock()
-            .unwrap()
-            .complete_physical_process_exit(detpid)
-        {
+        let completed = {
+            let mut sched = self.sched.lock().unwrap();
+            sched.note_physical_thread_exit(DetTid::from_raw(raw_pid));
+            sched.complete_physical_process_exit(detpid)
+        };
+        if completed {
             trace!(
                 "[detcore, dpid {}] backend completed final physical process exit",
                 detpid
@@ -2344,6 +2348,9 @@ impl GlobalState {
                 flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_VM)),
             );
             sched.register_reused_transferred_exec_tid(child_dettid, child_mm);
+            // The supervisor reports a dead thread before it resumes the
+            // clone that reuses its raw TID, so the report names the old one.
+            sched.forget_physical_thread_exit(child_dettid);
 
             // Don't fill in the request, as the child will do it:
             let _entry = sched
@@ -4960,6 +4967,7 @@ mod tests {
     use crate::resources::Permission;
     use crate::resources::ResourceID;
     use crate::resources::Resources;
+    use crate::resources::RtSigsuspendWakers;
     use crate::scheduler::DEFAULT_PRIORITY;
     use crate::scheduler::SchedRequest;
     use crate::scheduler::SchedResponse;
@@ -6861,6 +6869,70 @@ mod tests {
             GlobalResponse::MarkPastFirstExecve(Default::default())
         );
         assert_eq!(observe(&state), (Some(libc::SIGCHLD), false, true));
+    }
+
+    /// The SaBRe supervisor reports each dead traced thread through
+    /// `complete_physical_process_exit`, and a thread killed outright is still
+    /// registered. Must not hang: that report discharges the wake owed to the
+    /// thread's `rt_sigsuspend`, whose continuation can never be posted, and
+    /// leaves its blocking entries in place. A report for a thread that has
+    /// posted its continuation leaves the wake for the harvest.
+    #[test]
+    fn supervisor_death_report_discharges_an_owed_rt_sigsuspend_wake() {
+        for posted in [false, true] {
+            let config = Config {
+                sequentialize_threads: true,
+                ..Config::default()
+            }
+            .with_backend(|backend| {
+                backend.needs_killed_thread_rpc_cancellation = true;
+                backend.reports_physical_process_exits = true;
+                backend.signal_interrupts_external_syscalls = true;
+            });
+            let state = GlobalState::initialize(&config, false);
+            let waiter = DetTid::from_raw(17);
+            state
+                .sched
+                .lock()
+                .unwrap()
+                .thread_tree
+                .add_child(waiter, waiter, true);
+            let op_id = ExternalOpId::new(waiter, 7);
+            let request = Ivar::new();
+            if posted {
+                let mut continuation = Resources::new(waiter);
+                continuation.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
+                request.put(Ok(continuation));
+            }
+            install_test_registration(&state, waiter, request);
+            {
+                let mut scheduler = state.sched.lock().unwrap();
+                assert!(scheduler.run_queue.remove_tid(waiter));
+                scheduler
+                    .blocked
+                    .rt_sigsuspend_blockers
+                    .insert(waiter, op_id);
+                scheduler
+                    .blocked
+                    .rt_sigsuspend_wakers
+                    .insert(waiter, RtSigsuspendWakers(1 << (libc::SIGCHLD - 1)));
+                scheduler.blocked.rt_sigsuspend_wake_owed.insert(waiter);
+            }
+
+            state.complete_physical_process_exit(waiter.as_raw());
+
+            let scheduler = state.sched.lock().unwrap();
+            assert_eq!(
+                scheduler.blocked.rt_sigsuspend_wake_owed.contains(&waiter),
+                posted,
+                "posted continuation: {posted}"
+            );
+            assert_eq!(
+                scheduler.blocked.rt_sigsuspend_blockers.get(&waiter),
+                Some(&op_id)
+            );
+            assert!(scheduler.next_turns.contains_key(&waiter));
+        }
     }
 
     /// A reloading backend (SaBRe) consumes the exec preparation when the new

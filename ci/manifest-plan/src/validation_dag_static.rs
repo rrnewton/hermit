@@ -1175,7 +1175,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (transferred_exec_commits_its_exit_signal_before_the_replacement_is_admitted,
     // exec_death_before_its_callback_still_commits_the_exec_once)
     // retain all 993: 993 + 3 = 996, measured the same way.
-    ("test.detcore_unit", 996),
+    // Five scheduler::parked_tests rt_sigsuspend tests
+    // (killed_rt_sigsuspend_waiter_releases_the_hold_in_either_report_order,
+    // killed_rt_sigsuspend_waiter_keeps_a_wake_whose_continuation_was_posted,
+    // rt_sigsuspend_wake_is_never_owed_to_a_thread_reported_dead,
+    // rt_sigsuspend_with_a_pending_waker_holds_turns_and_timers_until_its_continuation,
+    // rt_sigsuspend_with_a_pending_waker_owes_nothing_when_its_return_is_not_certain)
+    // and tool_global::tests::supervisor_death_report_discharges_an_owed_rt_sigsuspend_wake
+    // retain all 996: 996 + 6 = 1002, measured the same way.
+    ("test.detcore_unit", 1002),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1557,7 +1565,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same five exec exit-signal tests retain all 986: 991.
     // The same two rt_sigsuspend tests retain all 991: 993.
     // The same three exec-edge tests retain all 993: 996.
-    ("test.detcore_unit_on_host", 996),
+    // The same six rt_sigsuspend death and pending-waker tests retain all 996: 1002.
+    ("test.detcore_unit_on_host", 1002),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
