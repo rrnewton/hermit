@@ -1676,6 +1676,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/sigsuspend_sibling_signal_wake.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
+      "why": "tests/c/sigsuspend_sibling_signal_wake.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and runs in blocking GitHub CI; it asserts that an rt_sigsuspend wait that an ignored SIGALRM or a default-ignored SIGCHLD reaches first ends only with a sibling thread's tgkill, with -1 and EINTR and one handler run on the waiting thread, so the scheduler must requeue a waiter that another guest's signal released and await that waiter's own report"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/sigtimedwait-no-timeout.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/sigtimedwait-no-timeout.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
