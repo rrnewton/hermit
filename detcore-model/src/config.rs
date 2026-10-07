@@ -162,9 +162,13 @@ pub struct Config {
     /// record a `SECCOMP_RET_LOG` filter writes for each call, the child's and the guest's; two
     /// threads whose filter counts are equal but whose filters differ; a filter a caller's
     /// `pre_exec` installs, which the caller reports as above; and a filter installed after the
-    /// launcher asked. Made under every filter whatever this holds: the `lstat` of each entry
-    /// asked, the `fstat` of a directory Detcore does not track, and the `statx` and
-    /// `statmount` with which a `/proc/<pid>/maps` rewrite proves a superblock.
+    /// run's configuration was prepared. An answer asked before a container is cloned and held
+    /// for the runs prepared in it is used only on the thread that asked, or in a container
+    /// cloned from it, and only while that thread's `Seccomp:` mode and `Seccomp_filters:`
+    /// count are unchanged; otherwise the flag is true. Made under every filter whatever this
+    /// holds: the `lstat` of each entry asked, the `fstat` of a directory Detcore does not
+    /// track, and the `statx` and `statmount` with which a `/proc/<pid>/maps` rewrite proves a
+    /// superblock.
     #[serde(default)]
     #[clap(skip)]
     pub seccomp_may_refuse_entry_lookup_syscalls: bool,
