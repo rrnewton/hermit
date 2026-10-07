@@ -1038,7 +1038,14 @@ fi
 # reverie-dbt, the root Cargo.toml, third-party or rust-toolchain.toml
 # changes, so the four budget inputs are unchanged. Carry, not recalibration:
 # no new timing sample or >=5-sample replacement claim is made.
-expected_pin=c683c24288e462b2658444da52eaeadfea1802d7
+# CARRY TO c496dd8e91ec8c318633460a07353b9f83b36cb4 (2026-10-07): from
+# c683c24288e462b2658444da52eaeadfea1802d7. The three commits change only reverie-kvm (madvise
+# MADV_DONTNEED and its allocation guard, brk) and add one field to
+# reverie/src/capabilities.rs; no file under reverie-dbt, the root Cargo.toml,
+# third-party or rust-toolchain.toml changes, so the four budget inputs are
+# unchanged. Carry, not recalibration: no new timing sample or >=5-sample
+# replacement claim is made.
+expected_pin=c496dd8e91ec8c318633460a07353b9f83b36cb4
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

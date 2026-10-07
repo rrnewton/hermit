@@ -172,6 +172,59 @@ static int check_semantic_advice(
   return 0;
 }
 
+/* KVM implements MADV_DONTNEED for anonymous memory: private pages read back
+ * as zeros and shared ones keep their contents. It refuses the advice with
+ * ENOSYS, changing nothing, for a private file copy it cannot read again, and
+ * still refuses the other guest-visible advice. */
+static int check_kvm_advice(
+    const char* path,
+    unsigned char* anonymous,
+    size_t page_size) {
+  anonymous[0] = 0x5a;
+  if (madvise(anonymous, page_size, MADV_DONTNEED) != 0 || anonymous[0] != 0) {
+    fprintf(stderr, "KVM anonymous MADV_DONTNEED kept %d\n", anonymous[0]);
+    return 1;
+  }
+  unsigned char* shared = mmap(
+      NULL,
+      page_size,
+      PROT_READ | PROT_WRITE,
+      MAP_SHARED | MAP_ANONYMOUS,
+      -1,
+      0);
+  if (shared == MAP_FAILED) {
+    return 2;
+  }
+  shared[0] = 0x6b;
+  if (madvise(shared, page_size, MADV_DONTNEED) != 0 || shared[0] != 0x6b) {
+    fprintf(stderr, "KVM shared anonymous MADV_DONTNEED read %d\n", shared[0]);
+    return 3;
+  }
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) {
+    return 4;
+  }
+  unsigned char* file_mapping =
+      mmap(NULL, page_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+  if (file_mapping == MAP_FAILED) {
+    return 5;
+  }
+  const unsigned char changed = file_mapping[1] ^ 0xff;
+  file_mapping[1] = changed;
+  if (expect_errno(file_mapping, page_size, MADV_DONTNEED, ENOSYS) ||
+      file_mapping[1] != changed) {
+    return 6;
+  }
+  if (expect_errno(anonymous, page_size, MADV_DONTFORK, ENOSYS)) {
+    return 7;
+  }
+  if (munmap(file_mapping, page_size) != 0 || munmap(shared, page_size) != 0 ||
+      close(fd) != 0) {
+    return 8;
+  }
+  return 0;
+}
+
 int main(int argc, char** argv) {
   const bool kvm = argc == 2 && strcmp(argv[1], "--kvm") == 0;
   const long page_size_raw = sysconf(_SC_PAGESIZE);
@@ -203,7 +256,7 @@ int main(int argc, char** argv) {
   }
 
   if (kvm) {
-    if (expect_errno(anonymous, page_size, MADV_DONTNEED, ENOSYS)) {
+    if (check_kvm_advice(argv[0], anonymous, page_size)) {
       return 14;
     }
   } else if (check_semantic_advice(argv[0], anonymous, page_size)) {
