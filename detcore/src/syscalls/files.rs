@@ -1108,6 +1108,26 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    map_transient_page(guest, len).await.map_err(|errno| {
+        warn!(
+            "[detcore] could not map a transient page for a {what} of {:?} ({errno}); \
+             refusing rather than keying on another identity",
+            String::from_utf8_lossy(path)
+        );
+        match errno {
+            Errno::ESRCH => Error::Errno(errno),
+            errno => identity_lookup_refused(what, path, errno),
+        }
+    })
+}
+
+/// A private anonymous mapping of `len` bytes in the guest, or the errno its
+/// injected `mmap` failed with; [`map_identity_page`] without its refusal.
+async fn map_transient_page<'a, G, T>(guest: &mut G, len: usize) -> Result<AddrMut<'a, u8>, Errno>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
     let mapped = guest
         .inject_with_retry(Syscall::Mmap(
             syscalls::Mmap::new()
@@ -1118,18 +1138,7 @@ where
                 .with_fd(-1)
                 .with_offset(0),
         ))
-        .await
-        .map_err(|errno| {
-            warn!(
-                "[detcore] could not map a transient page for a {what} of {:?} ({errno}); \
-                 refusing rather than keying on another identity",
-                String::from_utf8_lossy(path)
-            );
-            match errno {
-                Errno::ESRCH => Error::Errno(errno),
-                errno => identity_lookup_refused(what, path, errno),
-            }
-        })?;
+        .await?;
     Ok(usize::try_from(mapped)
         .ok()
         .and_then(AddrMut::<u8>::from_raw)
@@ -1143,19 +1152,33 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    if let Err(errno) = guest
+    if let Err(errno) = unmap_transient_page(guest, page, len).await {
+        warn!(
+            "[detcore] could not unmap the transient identity page for {:?}: {errno}",
+            String::from_utf8_lossy(path)
+        );
+    }
+}
+
+/// Unmaps a page [`map_transient_page`] made, or returns the errno its
+/// injected `munmap` failed with, the page then still mapped.
+async fn unmap_transient_page<G, T>(
+    guest: &mut G,
+    page: AddrMut<'_, u8>,
+    len: usize,
+) -> Result<(), Errno>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    guest
         .inject_with_retry(Syscall::Munmap(
             syscalls::Munmap::new()
                 .with_addr(Some(page.cast::<libc::c_void>().into()))
                 .with_len(len),
         ))
         .await
-    {
-        warn!(
-            "[detcore] could not unmap the transient identity page for {:?}: {errno}",
-            String::from_utf8_lossy(path)
-        );
-    }
+        .map(drop)
 }
 
 /// The guest's `/proc/<pid>/mountinfo`, read on the tool's side as the
@@ -8098,15 +8121,24 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// `statx` does not report `STATX_ATTR_MOUNT_ROOT` (Linux 5.8; `fs/stat.c`
     /// sets it for the root of every mount, a file bind mount included).
     ///
-    /// `false` when the entry is a mount root, and when the guest's filesystem
-    /// answers that the name now reaches nothing or another file than `stat`
+    /// `Some(false)` when the entry is a mount root, and when the guest's
+    /// filesystem answers that the name now reaches another file than `stat`
     /// described (the entry changed between the two calls), since then this
-    /// `lstat` says nothing about the directory's mount. `true` when the
-    /// kernel does not report the attribute (`stx_attributes_mask` without
-    /// it, before Linux 5.8): it cannot tell, and the answer is taken as it
-    /// was before this was asked. A `statx` that cannot be asked is a refusal,
-    /// and `ESRCH` that errno, as for the `lstat` (see
-    /// [`Self::stat_guest_path_at`]).
+    /// `lstat` says nothing about the directory's mount. `Some(true)` when
+    /// the kernel does not report the attribute (`stx_attributes_mask`
+    /// without it, before Linux 5.8): it cannot tell, and the answer is taken
+    /// as it was before this was asked.
+    ///
+    /// `None` when the question cannot be asked: the guest's `mmap` of the
+    /// page, its `statx` or its `munmap` fails with any errno but `ESRCH`, as
+    /// under a seccomp filter the launcher did not see (one that refuses
+    /// `statx` only in the container's mount namespace, Codex review round 11
+    /// of https://github.com/rrnewton/hermit/pull/3255, F4). A `statx` that
+    /// reports no file at a name whose `lstat` just answered is such a
+    /// failure too: a filter can return `ENOENT` or `EACCES` as well as
+    /// `EPERM`. The caller then keys the listing as [`EntryLookup::Every`]
+    /// does, which asks no such question. `ESRCH`, the thread being gone, is
+    /// that errno, as for the `lstat` (see [`Self::stat_guest_path_at`]).
     ///
     /// Asked only by [`Self::settle_overlay_entry_lookup`], for a candidate
     /// whose `lstat` would settle an overlay as
@@ -8117,14 +8149,26 @@ impl<T: RecordOrReplay> Detcore<T> {
         dirfd: RawFd,
         name: &[u8],
         stat: &libc::stat,
-    ) -> Result<bool, Error> {
+    ) -> Result<Option<bool>, Error> {
         if name.contains(&0) {
-            return Ok(false);
+            return Ok(Some(false));
         }
+        let cannot_ask = |step: &str, errno: Option<Errno>| {
+            info!(
+                "could not ask whether directory entry {:?} is a mount root ({step}: {errno:?}); \
+                 the listing is keyed as Every keys it",
+                String::from_utf8_lossy(name)
+            );
+            Ok(None)
+        };
         let statx_offset = (name.len() + 1).next_multiple_of(8);
         let len =
             (statx_offset + std::mem::size_of::<libc::statx>()).next_multiple_of(host_page_size());
-        let page = map_identity_page(guest, len, "statx the directory entry", name).await?;
+        let page = match map_transient_page(guest, len).await {
+            Ok(page) => page,
+            Err(Errno::ESRCH) => return Err(Error::Errno(Errno::ESRCH)),
+            Err(errno) => return cannot_ask("mmap", Some(errno)),
+        };
         // SAFETY: the offset is within the `len` bytes just mapped.
         let statxptr = StatxPtr(unsafe { page.add(statx_offset) }.cast::<libc::statx>());
         let asked = Self::statx_in_page(
@@ -8136,32 +8180,31 @@ impl<T: RecordOrReplay> Detcore<T> {
             StatxMask::STATX_INO,
         )
         .await;
-        unmap_identity_page(guest, page, len, name).await;
+        let unmapped = unmap_transient_page(guest, page, len).await;
         let statx = match asked {
             Ok(Some(statx)) => statx,
-            Ok(None) => return Ok(false),
             Err(Errno::ESRCH) => return Err(Error::Errno(Errno::ESRCH)),
-            Err(errno) => {
-                return Err(identity_lookup_refused(
-                    "statx the directory entry",
-                    name,
-                    errno,
-                ));
-            }
+            Ok(None) => return cannot_ask("statx reported no file", None),
+            Err(errno) => return cannot_ask("statx", Some(errno)),
         };
+        match unmapped {
+            Ok(()) => {}
+            Err(Errno::ESRCH) => return Err(Error::Errno(Errno::ESRCH)),
+            Err(errno) => return cannot_ask("munmap", Some(errno)),
+        }
         let device = libc::makedev(statx.stx_dev_major, statx.stx_dev_minor);
         if (device, statx.stx_ino) != (stat.st_dev, stat.st_ino) {
             trace!(
                 "directory entry {:?} names another file than its lstat did",
                 String::from_utf8_lossy(name)
             );
-            return Ok(false);
+            return Ok(Some(false));
         }
         let mount_root = libc::STATX_ATTR_MOUNT_ROOT as u64;
         if statx.stx_attributes_mask & mount_root == 0 {
-            return Ok(true);
+            return Ok(Some(true));
         }
-        Ok(statx.stx_attributes & mount_root == 0)
+        Ok(Some(statx.stx_attributes & mount_root == 0))
     }
 
     /// On overlayfs, settle which of two kinds the overlay `call` lists is
@@ -8234,6 +8277,20 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// number reused by another overlay after an unmount within one run
     /// would inherit the first one's answer.
     ///
+    /// A mount-root question that cannot be asked (see
+    /// [`Self::entry_is_on_the_listed_mount`]) keys the listing as
+    /// [`EntryLookup::Every`] keys it, which asks every entry's `lstat` and no
+    /// mount-root question: the narrow policies are an optimization of
+    /// `Every`, so a refusal of a question only they ask gives the guest
+    /// exactly `Every`'s identities and the guest continues (Codex review
+    /// round 11 of https://github.com/rrnewton/hermit/pull/3255, F4), where
+    /// the refusal used to end the guest. The refusal is no evidence of the
+    /// overlay's kind, so nothing is settled and nothing is kept on the
+    /// descriptor: the same refusal at the same point of a later listing
+    /// gives the same keys. The `lstat`s asked before it are reused, and the
+    /// listing asks for the same numbers, in the same order, as under
+    /// `Every`, so no inode number is spent that `Every` does not spend.
+    ///
     /// A failed `lstat` that [`Self::directory_entry_identity`] would refuse
     /// is the same refusal here, before any numbering request.
     async fn settle_overlay_entry_lookup<G: Guest<Self>>(
@@ -8276,16 +8333,28 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // mount over the entry (a file bind-mounted over it) can show
                 // another device with the entry's number on either kind, but
                 // never the overlay's own, so only that answer is checked.
-                if let (Some(EntryLookup::OverlayLayerDevices), Some(lstat)) = (shown, &stat)
-                    && !Self::entry_is_on_the_listed_mount(guest, call.fd, &entry.name, lstat)
+                let mut refused = false;
+                if let (Some(EntryLookup::OverlayLayerDevices), Some(lstat)) = (shown, &stat) {
+                    match Self::entry_is_on_the_listed_mount(guest, call.fd, &entry.name, lstat)
                         .await?
-                {
-                    shown = None;
+                    {
+                        Some(true) => {}
+                        Some(false) => shown = None,
+                        None => refused = true,
+                    }
                 }
                 told.push(ToldEntry {
                     name: entry.name,
                     stat,
                 });
+                if refused {
+                    // The question this policy asks beyond `Every`'s was
+                    // refused: this listing is keyed as `Every` keys it, and
+                    // nothing is settled or kept, so a later listing asks
+                    // again.
+                    call.lookup = EntryLookup::Every;
+                    return Ok(told);
+                }
                 if let Some(shown) = shown {
                     settled = settle_overlay_entry_lookup(guest, call.device, Some(shown)).await;
                     break;
@@ -8344,8 +8413,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// starts inherits, may refuse one of those calls, or when it cannot tell
     /// (that field says how it asks, and what its answer cannot show). Then
     /// every entry is asked, none of those calls is injected, and nothing is
-    /// cached. The backend's own filter, such as the ptrace backend's, lets
-    /// Detcore's injections through. The `fstatat` of each asked entry and the
+    /// cached. A filter the launcher could not see that refuses one of them
+    /// with an errno anyway (one that answers differently in the container's
+    /// mount namespace, for example) costs only the narrowing: a refused
+    /// `fstatfs` asks every entry, as above, and a refused mount-root
+    /// question keys that listing as `Every` keys it (see
+    /// [`Self::settle_overlay_entry_lookup`]). The backend's own filter, such
+    /// as the ptrace backend's, lets Detcore's injections through. The
+    /// `fstatat` of each asked entry and the
     /// `fstat` of a directory Detcore does not track (see
     /// [`Self::directory_device`]) are injected regardless, and a filter that
     /// traps or kills those still signals or kills the guest; Detcore injects
@@ -10581,6 +10656,17 @@ pub(crate) mod inject_fstat_scratch {
         /// The errno every injected `fstatat` fails with instead of running,
         /// when set: a failure the test process cannot provoke on demand.
         fstatat_error: Option<Errno>,
+        /// The errno an injected anonymous `mmap` of this many bytes fails
+        /// with instead of running, when set: one transient page refused, as
+        /// by a seccomp filter, while the guest's other mappings succeed.
+        mmap_error_of_len: Option<(usize, Errno)>,
+        /// The errno an injected `munmap` of this many bytes fails with
+        /// instead of running, when set; the mapping then stays.
+        munmap_error_of_len: Option<(usize, Errno)>,
+        /// The errno every injected `statx` of a directory entry (relative to
+        /// an open directory) fails with instead of running, when set: the
+        /// mount-root question refused, as by a seccomp filter.
+        entry_statx_error: Option<Errno>,
         arena: Box<[u64; ARENA_WORDS]>,
         guard_live: Arc<AtomicBool>,
         /// How many times a stack scratch was committed, successfully or not.
@@ -10722,6 +10808,9 @@ pub(crate) mod inject_fstat_scratch {
                 write_error: None,
                 mmap_fails,
                 fstatat_error: None,
+                mmap_error_of_len: None,
+                munmap_error_of_len: None,
+                entry_statx_error: None,
                 arena: Box::new([u64::MAX; ARENA_WORDS]),
                 guard_live: Arc::new(AtomicBool::new(false)),
                 commits: Arc::new(AtomicUsize::new(0)),
@@ -10964,6 +11053,11 @@ pub(crate) mod inject_fstat_scratch {
                     if self.mmap_fails {
                         return Err(Errno::ENOMEM);
                     }
+                    if let Some((len, errno)) = self.mmap_error_of_len
+                        && len == call.len()
+                    {
+                        return Err(errno);
+                    }
                     let address = unsafe {
                         libc::mmap(
                             std::ptr::null_mut(),
@@ -11063,6 +11157,11 @@ pub(crate) mod inject_fstat_scratch {
                         .into_vec();
                     self.statx_starts.push(start);
                     self.statx_paths.push(named.clone());
+                    if let Some(errno) = self.entry_statx_error
+                        && entry
+                    {
+                        return Err(errno);
+                    }
                     // An entry whose lstat is scripted is reported by its
                     // statx alike: the same file, device and number.
                     let scripted = entry
@@ -11214,6 +11313,11 @@ pub(crate) mod inject_fstat_scratch {
                 }
                 Syscall::Munmap(call) => {
                     let address = call.addr().expect("munmap without an address").as_raw();
+                    if let Some((len, errno)) = self.munmap_error_of_len
+                        && len == call.len()
+                    {
+                        return Err(errno);
+                    }
                     let raw = i64::from(unsafe { libc::munmap(address as *mut _, call.len()) });
                     if raw == 0 {
                         self.unmapped.push((address, call.len()));
@@ -14841,6 +14945,141 @@ pub(crate) mod inject_fstat_scratch {
             "listing A on the settled overlay makes the same transient mappings as under Every, \
              so a later guest mmap lands alike on the KVM backend"
         );
+    }
+
+    // Codex review of https://github.com/rrnewton/hermit/pull/3255, round
+    // 11, F4. The launcher asks, in its own mount namespace, whether an
+    // inherited seccomp filter may refuse the questions the narrow policies
+    // ask beyond `Every`'s. A supervisor that answers `statx` there but
+    // refuses it with `EPERM` in the container's namespace passes that
+    // question and then refuses the settle pass's mount-root question, and
+    // the refusal ended the guest; at the base, which asked inside the
+    // container, the run used `Every`, which asks no such question. The
+    // narrow policies are an optimization of `Every`, so a refused extra
+    // question (the `statx`, whatever its errno, or the `mmap` or `munmap`
+    // of its page) now keys the listing exactly as `Every` keys it and the
+    // guest continues. The refusal is no evidence of the overlay's kind and
+    // is not kept, so the next read asks again and gets the same keys, and
+    // no inode number is spent that `Every` does not spend.
+    #[tokio::test]
+    async fn getdents_keys_a_listing_as_every_does_when_its_mount_root_question_is_refused() {
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Refused {
+            /// The reference run: `Every`, which asks no mount-root question.
+            NothingUnderEvery,
+            Statx(Errno),
+            Mmap(Errno),
+            Munmap(Errno),
+        }
+        // The page `Detcore::entry_is_on_the_listed_mount` maps for a short
+        // name; the listing's snapshot is a larger mapping.
+        let page = host_page_size();
+        let mut runs = Vec::new();
+        for refused in [
+            Refused::NothingUnderEvery,
+            Refused::Statx(Errno::EPERM),
+            Refused::Statx(Errno::EACCES),
+            Refused::Mmap(Errno::EPERM),
+            Refused::Munmap(Errno::EPERM),
+        ] {
+            let every = refused == Refused::NothingUnderEvery;
+            let (_dir, fd, _, device) = directory_with_entries();
+            let scratch = Pages::map(1, 1);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.answers_determinize_inode = true;
+            guest.fstatfs_answer = Some(Ok(libc::OVERLAYFS_SUPER_MAGIC));
+            guest.config.seccomp_may_refuse_entry_lookup_syscalls = every;
+            match refused {
+                Refused::NothingUnderEvery => {}
+                Refused::Statx(errno) => guest.entry_statx_error = Some(errno),
+                Refused::Mmap(errno) => guest.mmap_error_of_len = Some((page, errno)),
+                Refused::Munmap(errno) => guest.munmap_error_of_len = Some((page, errno)),
+            }
+            tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
+                .await
+                .expect("precondition: Detcore tracks the directory");
+            // `B`: `lower`, the first candidate, would settle the overlay as
+            // one that reports a layer's device, once it is known not to be
+            // a mount root.
+            read_as_layered_overlay_directory(&mut guest, false, device);
+            let mut reads = Vec::new();
+            for read in 0..2 {
+                if read > 0 {
+                    let rewound = tool
+                        .handle_lseek(
+                            &mut guest,
+                            syscalls::Lseek::new()
+                                .with_fd(fd)
+                                .with_offset(0)
+                                .with_whence(Whence::SEEK_SET),
+                        )
+                        .await;
+                    assert_eq!(rewound.ok(), Some(0), "{refused:?}: the stream rewinds");
+                }
+                let keyed_before = guest.determinized.lock().unwrap().len();
+                let statx_before = guest.statx_paths.len();
+                let (len, records) = getdents64_records_of(&tool, &mut guest, fd).await;
+                assert!(
+                    len.as_ref().is_ok_and(|len| *len > 0),
+                    "{refused:?}, read {read}: the guest's getdents64 succeeds rather than \
+                     the refused question ending the guest: {len:?}"
+                );
+                let keyed = guest.determinized.lock().unwrap()[keyed_before..].to_vec();
+                let asked_whether_mounts = guest.statx_paths[statx_before..].to_vec();
+                assert_eq!(
+                    asked_whether_mounts,
+                    match refused {
+                        Refused::NothingUnderEvery | Refused::Mmap(_) => Vec::<Vec<u8>>::new(),
+                        Refused::Statx(_) | Refused::Munmap(_) => vec![b"lower".to_vec()],
+                    },
+                    "{refused:?}, read {read}: only the first candidate is asked whether it \
+                     is a mount, in every read, since a refusal is not kept"
+                );
+                assert!(
+                    keyed.contains(&RawInode::new(OTHER_DEVICE, 400)),
+                    "{refused:?}, read {read}: B's lower is keyed on the device its lstat \
+                     reports, as Every keys it: {keyed:?}"
+                );
+                // Each entry is keyed once, in the order listed. `.` is each
+                // run's own temporary directory, so its raw key differs
+                // between the runs; no other entry's may.
+                assert_eq!(keyed.len(), records.len(), "{refused:?}: {keyed:?}");
+                let keyed: Vec<(Vec<u8>, RawInode)> = records
+                    .iter()
+                    .map(|(name, _)| name.clone())
+                    .zip(keyed)
+                    .filter(|(name, _)| name != b".")
+                    .collect();
+                reads.push((records, keyed));
+            }
+            let proposals: Vec<_> = guest
+                .settle_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, proposal)| proposal.is_some())
+                .copied()
+                .collect();
+            assert!(
+                proposals.is_empty(),
+                "{refused:?}: a refused question is no evidence of the overlay's kind: \
+                 {proposals:?}"
+            );
+            assert!(
+                guest.settled_overlays.lock().unwrap().is_empty(),
+                "{refused:?}: nothing is settled"
+            );
+            close_unless_detcore_did(&guest, fd);
+            runs.push((refused, reads));
+        }
+        let (_, every_reads) = &runs[0];
+        for (refused, reads) in &runs[1..] {
+            assert_eq!(
+                reads, every_reads,
+                "{refused:?}: each read lists the same records of B, with the same keys, as \
+                 under Every"
+            );
+        }
     }
 
     // The same F5: an entry whose `lstat` cannot be asked (here a scripted
