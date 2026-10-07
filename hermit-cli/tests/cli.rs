@@ -9521,6 +9521,68 @@ fn max_log_bytes_verify_exits_promptly_when_stderr_fills_after_run1() {
     capped_verify_keeps_the_cap_status(StderrAfterRun1::FillsUp);
 }
 
+/// Round-11 review of https://github.com/rrnewton/hermit/pull/3255: when the
+/// first run of `run --verify` crosses `--max-log-bytes`, hermit still ends
+/// with the cap's own status, 123, and reports it through `main`'s typed
+/// report.
+///
+/// Run 1 logs at debug level into its per-run log, so the 16M cap is crossed
+/// inside run 1's container child, which exits 123. The parent classifies that
+/// status as `LogCapExceeded` and returns it from the first run's error arm in
+/// `verify`, before `finish_first_verify_run` is reached (that function only
+/// sees a first run that ended normally), and `main` maps it to 123.
+///
+/// Unlike the two tests above, nothing disturbs stderr here, so `main` reaches
+/// its report at once. If the typed error were lost on the way, for example
+/// turned into a plain message, `main` would print `HERMIT_INTERNAL_FAILURE`
+/// and exit 125 well before the 750 ms exit timer of `bound_log_cap_exit`
+/// could exit 123 on its own, and this test would fail. The class line alone
+/// proves nothing: the crossing child and that timer print it too.
+#[test]
+fn max_log_bytes_verify_reports_the_cap_status_when_run1_crosses_it() {
+    let _lock = hermit_run_guard();
+    let mut args = vec![
+        "--log=debug",
+        "--max-log-bytes=16M",
+        "run",
+        "--verify",
+        "--timeout",
+        "120",
+        "--",
+    ];
+    args.extend(LOG_CAP_NOISY_GUEST);
+    let output = hermit(&args);
+    let stderr = stderr(&output);
+    let tail: String = stderr
+        .chars()
+        .rev()
+        .take(2000)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_LOG_CAP_EXIT),
+        "a first run that crosses the cap must end `run --verify` with the cap's \
+         status; stderr tail:\n{tail}"
+    );
+    assert!(stderr.contains("HERMIT_LOG_CAP class=log-cap"), "{tail}");
+    assert!(!stderr.contains("HERMIT_INTERNAL_FAILURE"), "{tail}");
+    assert!(stderr.contains("Run1..."), "{tail}");
+    // The crossing ends the verification: no second run, and neither the
+    // rejected-first-run report nor its forwarded-records warning.
+    assert!(!stderr.contains("Run2..."), "{tail}");
+    assert!(
+        !stderr.contains("First run errored during --verify"),
+        "{tail}"
+    );
+    assert!(
+        !stderr.contains("forwarded DETLOG records are unusable"),
+        "{tail}"
+    );
+}
+
 /// Where the cap could end hermit and leave the guest running, hermit refuses
 /// the flag instead, with 122 (round-2 review of
 /// https://github.com/rrnewton/hermit/pull/3686, finding 2). LiteInst, which

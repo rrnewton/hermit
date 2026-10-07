@@ -4520,6 +4520,153 @@ impl RunOpts {
         extract_forwarded_detlogs(log, stderr, limit, false).map(Some)
     }
 
+    /// Finishes the first run of a verification, before anything is compared:
+    /// refuses an accepted run whose latches are set
+    /// ([`RunLatches::refuse_comparison`]), moves the DETLOG records its
+    /// in-guest Tool forwarded into its log ([`Self::take_forwarded_detlogs`]),
+    /// echoes that log for `--print-verify-logs`, and refuses a run whose exit
+    /// status `--verify` does not accept, recording the rejection in
+    /// `--verify-json`. Returns the forwarded syscall-record count, the run's
+    /// log, which the comparison reads, and the [`SignalTerminationReports`]
+    /// of the verification, holding run 1's report, prepared once the
+    /// forwarded records are in its log. A rejected first run's report is
+    /// queued here.
+    fn finish_first_verify_run(
+        &self,
+        out1: &mut Output,
+        log1_path: tempfile::TempPath,
+        latches1: &RunLatches,
+        forwarded1: bool,
+        skid_overshoots_run1: u64,
+        summary1_path: &Path,
+    ) -> Result<(Option<usize>, tempfile::TempPath, SignalTerminationReports), Error> {
+        // The latches first: a determinism loss is named as one, even when its
+        // loss notice also reached the forwarded records. Like a fault in those
+        // records, a latch matters only to the comparison, so a first run
+        // `--verify` rejects is still reported as rejected below. On in-guest
+        // LiteInst every loss notice the coordinator writes into the log also
+        // sets the determinism-loss latch (`detcore::detlog::emit`).
+        if let Err(error) = latches1.refuse_comparison("run 1") {
+            if self.verify_allow.satisfies(out1.status) {
+                if self.keep_logs {
+                    retain_verification_logs([("run 1", log1_path)])?;
+                }
+                return Err(error);
+            }
+            eprintln!(
+                "WARNING: the rejected first run's records are untrustworthy as well: {error:#}"
+            );
+        }
+        let forwarded_syscalls1 = match self.take_forwarded_detlogs(
+            &log1_path,
+            &mut out1.stderr,
+            forwarded1,
+        ) {
+            Ok(count) => count,
+            // A first run `--verify` rejects is reported as rejected below,
+            // with its own exit status and standard error -- where a typed
+            // refusal (exit code 125) gives its reason -- never as a fault
+            // found afterwards in its forwarded records. The records matter
+            // only to the comparison, which a rejected first run never
+            // reaches.
+            Err(error) if !self.verify_allow.satisfies(out1.status) => {
+                eprintln!(
+                    "WARNING: the rejected first run's forwarded DETLOG records are unusable as well: {error:#}"
+                );
+                None
+            }
+            Err(error) => {
+                if self.keep_logs {
+                    retain_verification_logs([("run 1", log1_path)])?;
+                }
+                return Err(error);
+            }
+        };
+        // Prepared now, with the forwarded records in place: the comparison
+        // consumes the log. Written if the verification ends unverified.
+        let mut signal_reports = SignalTerminationReports::default();
+        signal_reports.prepare("run 1", out1.status, &log1_path);
+
+        // With --verify the first run's `--log` output was diverted to a
+        // temporary file for later comparison rather than shown to the user.
+        // When --print-verify-logs is set, echo that first run's log to stderr so the
+        // user still sees `--log` output, matching a normal (non-verify) run.
+        // The log file is fully flushed here because run_verify runs each
+        // execution in a child process that has already exited.
+        //
+        // Run 2 has not started yet, so under --max-log-bytes this echo must not
+        // wait on stderr: the log goes through `DroppingStderr`, which waits for
+        // a full pipe only within `RetryingStderr`'s bounded deadline and drops
+        // what it then cannot deliver. Without the cap it is written exactly as
+        // before, and a failed write is still an error.
+        if self.print_verify_logs {
+            match fs::read(&log1_path) {
+                Ok(bytes) if hermit::nonwaiting_write::diagnostics_must_not_wait() => {
+                    let _ = detcore::util::DroppingStderr.write_all(&bytes);
+                }
+                Ok(bytes) => std::io::stderr().write_all(&bytes)?,
+                Err(err) => crate::tracing::diagnostic_eprintln!(
+                    "WARNING: --print-verify-logs could not read first-run log {}: {}",
+                    log1_path.display(),
+                    err
+                ),
+            }
+        }
+
+        if !self.verify_allow.satisfies(out1.status) {
+            if skid_overshoots_run1 > 0 {
+                if let Some(path) = &self.verify_json {
+                    let summary1 = read_verify_summary(summary1_path);
+                    write_skid_overshoot_without_comparison_json(
+                        path,
+                        skid_overshoots_run1,
+                        verification_runtime_from_summaries(summary1.as_ref(), None),
+                        Some(out1.status),
+                    )?;
+                }
+                if self.keep_logs {
+                    retain_verification_logs([("run 1", log1_path)])?;
+                }
+                return Err(Error::new(SkidOvershootError::new(skid_overshoots_run1)));
+            }
+            let status = describe_exit_status(out1.status);
+            eprintln!(
+                "First run errored during --verify, not continuing to a second.\nExit status: {status}\nStdout:\n{}\nStderr:\n{}",
+                String::from_utf8_lossy(&out1.stdout),
+                String::from_utf8_lossy(&out1.stderr),
+            );
+            // Queued here; `main` writes it after everything else.
+            drop(signal_reports);
+            // ⚠️ RECORD THE DISPOSITION HERE, WHERE IT IS KNOWN. `out1.status`
+            // is in hand, yet the pre-stamped `no_result` record was previously
+            // left untouched on this path -- so the artifact reported
+            // `guest_exit_code: null` for a guest whose exit code we had. That
+            // made this refusal byte-identical to a container that never ran the
+            // guest, and 14 rotating e2e failures were undiagnosable as a direct
+            // result. A best-effort write: an unwritable artifact must not
+            // convert a rejected first run into a different error.
+            if let Some(path) = &self.verify_json {
+                let summary1 = read_verify_summary(summary1_path);
+                let report = first_run_rejected_report(
+                    out1,
+                    verification_runtime_from_summaries(summary1.as_ref(), None),
+                );
+                if let Err(error) = write_report_json(path, &report) {
+                    eprintln!(
+                        "WARNING: could not record the rejected first run in {}: {}",
+                        path.display(),
+                        error
+                    );
+                }
+            }
+            if self.keep_logs {
+                retain_verification_logs([("run 1", log1_path)])?;
+            }
+            return Err(Error::msg(format!("First run during --verify {status}")));
+        }
+        Ok((forwarded_syscalls1, log1_path, signal_reports))
+    }
+
     /// Whether this run hosts Detcore inside the guest through LiteInst.
     /// `--namespace-only` runs no backend, so it never does.
     fn uses_in_guest_liteinst(&self) -> bool {
@@ -6536,106 +6683,14 @@ impl RunOpts {
             }
         };
         let mut out1 = out1;
-        // The latches first: a determinism loss is named as one, even when its
-        // loss notice also reached the forwarded records.
-        if let Err(error) = latches1.refuse_comparison("run 1") {
-            if self.keep_logs {
-                retain_verification_logs([("run 1", log1_path)])?;
-            }
-            return Err(error);
-        }
-        let forwarded_syscalls1 =
-            match self.take_forwarded_detlogs(&log1_path, &mut out1.stderr, forwarded1) {
-                Ok(count) => count,
-                Err(error) => {
-                    if self.keep_logs {
-                        retain_verification_logs([("run 1", log1_path)])?;
-                    }
-                    return Err(error);
-                }
-            };
-        // Prepared now, with the forwarded records in place: the comparison
-        // consumes the log. Written if the verification ends unverified.
-        let mut signal_reports = SignalTerminationReports::default();
-        signal_reports.prepare("run 1", out1.status, &log1_path);
-
-        // With --verify the first run's `--log` output was diverted to a
-        // temporary file for later comparison rather than shown to the user.
-        // When --print-verify-logs is set, echo that first run's log to stderr so the
-        // user still sees `--log` output, matching a normal (non-verify) run.
-        // The log file is fully flushed here because run_verify runs each
-        // execution in a child process that has already exited.
-        //
-        // Run 2 has not started yet, so under --max-log-bytes this echo must not
-        // wait on stderr: the log goes through `DroppingStderr`, which waits for
-        // a full pipe only within `RetryingStderr`'s bounded deadline and drops
-        // what it then cannot deliver. Without the cap it is written exactly as
-        // before, and a failed write is still an error.
-        if self.print_verify_logs {
-            match fs::read(&log1_path) {
-                Ok(bytes) if hermit::nonwaiting_write::diagnostics_must_not_wait() => {
-                    let _ = detcore::util::DroppingStderr.write_all(&bytes);
-                }
-                Ok(bytes) => std::io::stderr().write_all(&bytes)?,
-                Err(err) => crate::tracing::diagnostic_eprintln!(
-                    "WARNING: --print-verify-logs could not read first-run log {}: {}",
-                    log1_path.display(),
-                    err
-                ),
-            }
-        }
-
-        if !self.verify_allow.satisfies(out1.status) {
-            if skid_overshoots_run1 > 0 {
-                if let Some(path) = &self.verify_json {
-                    let summary1 = read_verify_summary(&summary1_path);
-                    write_skid_overshoot_without_comparison_json(
-                        path,
-                        skid_overshoots_run1,
-                        verification_runtime_from_summaries(summary1.as_ref(), None),
-                        Some(out1.status),
-                    )?;
-                }
-                if self.keep_logs {
-                    retain_verification_logs([("run 1", log1_path)])?;
-                }
-                return Err(Error::new(SkidOvershootError::new(skid_overshoots_run1)));
-            }
-            let status = describe_exit_status(out1.status);
-            eprintln!(
-                "First run errored during --verify, not continuing to a second.\nExit status: {status}\nStdout:\n{}\nStderr:\n{}",
-                String::from_utf8_lossy(&out1.stdout),
-                String::from_utf8_lossy(&out1.stderr),
-            );
-            // Queued here; `main` writes it after everything else.
-            drop(signal_reports);
-            // ⚠️ RECORD THE DISPOSITION HERE, WHERE IT IS KNOWN. `out1.status`
-            // is in hand, yet the pre-stamped `no_result` record was previously
-            // left untouched on this path -- so the artifact reported
-            // `guest_exit_code: null` for a guest whose exit code we had. That
-            // made this refusal byte-identical to a container that never ran the
-            // guest, and 14 rotating e2e failures were undiagnosable as a direct
-            // result. A best-effort write: an unwritable artifact must not
-            // convert a rejected first run into a different error.
-            if let Some(path) = &self.verify_json {
-                let summary1 = read_verify_summary(&summary1_path);
-                let report = first_run_rejected_report(
-                    &out1,
-                    verification_runtime_from_summaries(summary1.as_ref(), None),
-                );
-                if let Err(error) = write_report_json(path, &report) {
-                    eprintln!(
-                        "WARNING: could not record the rejected first run in {}: {}",
-                        path.display(),
-                        error
-                    );
-                }
-            }
-            if self.keep_logs {
-                retain_verification_logs([("run 1", log1_path)])?;
-            }
-            return Err(Error::msg(format!("First run during --verify {status}")));
-        }
+        let (forwarded_syscalls1, log1_path, mut signal_reports) = self.finish_first_verify_run(
+            &mut out1,
+            log1_path,
+            &latches1,
+            forwarded1,
+            skid_overshoots_run1,
+            &summary1_path,
+        )?;
 
         let summary1 = take_verify_summary_before_next_run(&summary1_path)?;
         let host_inputs1 = read_host_inputs(&host_inputs_path);
@@ -7887,6 +7942,144 @@ mod tests {
                 stderr_bytes: 5,
             })
         );
+    }
+
+    /// A first run that `--verify` rejects -- a typed refusal is Detcore's exit
+    /// code 125 with its reason on standard error -- is reported as rejected
+    /// even when its forwarded DETLOG records are unusable as well: on in-guest
+    /// LiteInst a log holding a loss notice where records belong, on SaBRe a log
+    /// the records cannot be appended to. An accepted first run with the same
+    /// unusable records still stops on them, before anything is compared.
+    ///
+    /// The LiteInst case runs once for each loss notice the coordinator's record
+    /// sink can write behind [`FORWARDING_REFUSED_MARKER`]: the runtime's
+    /// retirement of its socket, and the order rule's notices for an untagged
+    /// record and for more than one root (`detcore::detlog::set_forwarded_source`).
+    ///
+    /// Every case runs again with the run's determinism-loss latch set, as
+    /// writing a loss notice sets it in a real run: a rejected first run is
+    /// still reported as rejected, and an accepted one stops on the latch
+    /// ([`RunLatches::refuse_comparison`]) before its records.
+    #[test]
+    fn rejected_first_run_is_reported_before_unusable_forwarded_records() {
+        for (backend, notice) in [
+            (
+                Backend::Liteinst,
+                Some(detcore::detlog::FORWARDING_RETIRED_NOTICE),
+            ),
+            (
+                Backend::Liteinst,
+                Some(detcore::detlog::FORWARDING_UNTAGGED_RECORD_NOTICE),
+            ),
+            (
+                Backend::Liteinst,
+                Some(detcore::detlog::FORWARDING_AMBIGUOUS_ORDER_NOTICE),
+            ),
+            (Backend::Sabre, None),
+        ] {
+            let socket = notice.is_some();
+            let loss = notice.map_or_else(
+                || "test: a record was lost".to_string(),
+                |notice| String::from_utf8_lossy(notice).trim_end().to_string(),
+            );
+            for ((status, rejected), latched) in [
+                (ExitStatus::Exited(125), true),
+                (ExitStatus::SUCCESS, false),
+            ]
+            .into_iter()
+            .flat_map(|outcome| [(outcome, false), (outcome, true)])
+            {
+                let latches = RunLatches {
+                    determinism_loss: latched.then(|| loss.clone()),
+                    log_sink_failure: None,
+                };
+                let directory = tempfile::tempdir().unwrap();
+                let verify_json = directory.path().join("verify.json");
+                let mut options = RunOpts::parse_from([
+                    "run",
+                    "--verify",
+                    "--verify-json",
+                    verify_json.to_str().unwrap(),
+                    "--",
+                    "/bin/true",
+                ]);
+                options.set_backend(Some(backend));
+                assert!(options.forwards_in_guest_detlogs(), "{backend:?}");
+                assert_eq!(options.verify_allow.satisfies(status), !rejected);
+                write_pending_verification_json(&verify_json).unwrap();
+                let log = tempfile::NamedTempFile::new_in(directory.path())
+                    .unwrap()
+                    .into_temp_path();
+                if let Some(notice) = notice {
+                    let mut line = format!("{FORWARDING_REFUSED_MARKER} ").into_bytes();
+                    line.extend_from_slice(notice);
+                    fs::write(&log, line).unwrap();
+                } else {
+                    fs::remove_file(&log).unwrap();
+                }
+                let mut out1 = Output {
+                    status,
+                    stdout: Vec::new(),
+                    stderr: b"detcore: refusing the guest's identity lookup\n".to_vec(),
+                };
+
+                let error = match options.finish_first_verify_run(
+                    &mut out1,
+                    log,
+                    &latches,
+                    socket,
+                    0,
+                    &directory.path().join("summary.json"),
+                ) {
+                    Ok(_) => panic!("{backend:?} {status:?} {latched}: the first run was accepted"),
+                    Err(error) => error,
+                };
+                let report =
+                    VerificationReport::from_current_json_slice(&fs::read(&verify_json).unwrap())
+                        .unwrap();
+                if rejected {
+                    assert_eq!(
+                        error.to_string(),
+                        "First run during --verify exited with code 125",
+                        "{backend:?}: {error:#}"
+                    );
+                    assert_eq!(report.guest_exit_code, Some(125), "{backend:?}");
+                    assert!(
+                        matches!(
+                            report.no_result_reason,
+                            Some(NoResultReason::FirstRunRejected {
+                                exit_code: Some(125),
+                                ..
+                            })
+                        ),
+                        "{backend:?}: {:?}",
+                        report.no_result_reason
+                    );
+                } else if latched {
+                    assert_eq!(
+                        error.to_string(),
+                        format!("run 1: determinism loss recorded: {loss}"),
+                        "{backend:?}: {error:#}"
+                    );
+                    assert_eq!(report.guest_exit_code, None, "{backend:?}");
+                } else if socket {
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("could not forward every DETLOG record"),
+                        "{backend:?}: {error:#}"
+                    );
+                    assert_eq!(report.guest_exit_code, None, "{backend:?}");
+                } else {
+                    assert_eq!(
+                        error.downcast_ref::<std::io::Error>().map(|e| e.kind()),
+                        Some(std::io::ErrorKind::NotFound),
+                        "{backend:?}: {error:#}"
+                    );
+                    assert_eq!(report.guest_exit_code, None, "{backend:?}");
+                }
+            }
+        }
     }
 
     #[test]
