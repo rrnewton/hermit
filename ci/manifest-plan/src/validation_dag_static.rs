@@ -815,10 +815,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // detcore-model's config::tests::
     // blocked_wait_signal_interruption_never_enters_the_legacy_form and
     // guest_may_inherit_a_terminal_never_enters_the_legacy_form
-    // (https://github.com/rrnewton/hermit/pull/3361) retain all 979 (981, measured with
-    // cargo nextest list --profile ci).
-    // The 986 pinned before https://github.com/rrnewton/hermit/pull/3361 and its two tests above,
-    // re-listed together: 988 (measured with cargo nextest list --profile ci).
+    // (https://github.com/rrnewton/hermit/pull/3361) retain all 988: 990
+    // (measured with cargo nextest list --profile ci).
     ("test.regular_crates", 990),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
@@ -1972,8 +1970,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The hosted script unit-test twin test listed there retains all 983: 984.
     // The two detcore-dbt handler-error tests listed there retain all 984: 986.
     // The two framework-retry ledger tests listed there retain all 986: 988.
-    // The two detcore-model legacy-form tests listed there retain all 979: 981.
-    // The host twin selects the same tests, re-listed together: 988.
+    // The two detcore-model legacy-form tests of
+    // https://github.com/rrnewton/hermit/pull/3361 listed there retain all 988: 990.
     ("test.regular_crates_on_host", 990),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
