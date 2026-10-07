@@ -56,10 +56,12 @@ use hermit_manifest_plan::parity::ParityBackend;
 use hermit_manifest_plan::parity::ParityLedgerRow;
 use hermit_manifest_plan::parity::ParityOperand;
 use hermit_manifest_plan::parity::ParityProducer;
+use hermit_manifest_plan::parity::PopulationStanding;
 use hermit_manifest_plan::parity::UnavailableClass;
 use hermit_manifest_plan::parity::UnavailableGroup;
 use hermit_manifest_plan::parity::UtcInstant;
 use hermit_manifest_plan::parity::parse_utc_timestamp;
+use hermit_manifest_plan::parity::population_standing;
 use hermit_manifest_plan::retired_ids::RetiredIds;
 use hermit_manifest_plan::runner::ExpectedGuestExit;
 use hermit_manifest_plan::runner::ExpectedOutputFailureReason;
@@ -115,7 +117,17 @@ const TEST_LEDGER_REPOSITORY: &str = "https://github.com/rrnewton/hermit_test_le
 /// in `retracted_rows`: section 9 of the parity summary format, version 4
 /// (dev-hermit `ai_docs/parity-summary-format-v4.md`, sha256
 /// 426e58d84924a83f96d07888bb20b56b024c7e96372f4e48179d81d4c0f80899).
-const PARITY_SUMMARY_SCHEMA: &str = "parity-summary/v4";
+/// Version 5 makes the population the verify matrix: every tally counts
+/// its population (cells whose reference left a golden), the mean over all
+/// of it with every unmeasured candidate as 0, the full, partial and zero
+/// cells, and the cells excluded because the reference left no golden, by
+/// class (`population`, `population_mean_credit`, `full`, `partial`, `zero`,
+/// `measured_zero`, `zero_by_class`, `reference_excluded`,
+/// `reference_excluded_by_class`, `candidate_not_run` and its classes), and
+/// drops `floor_cells` and `floor_credit`, which the population mean
+/// replaces. dev-hermit's renderer and format document still describe
+/// version 4.
+const PARITY_SUMMARY_SCHEMA: &str = "parity-summary/v5";
 /// The event that withdraws published parity events (format v4 section 9).
 const PARITY_RETRACTION_EVENT_TYPE: &str = "parity.retraction";
 /// A retraction's reason is at most this many characters, as a refusal's
@@ -6532,32 +6544,66 @@ fn credit_text(value: Option<f64>) -> String {
     }
 }
 
+/// The population or measured MEAN as the scorecard prints it:
+/// [`credit_text`], except that it reads as full credit (`1.000`) only when
+/// every one of the `over` cells it averages is full (`full == over`). The
+/// floating-point mean of credits that are not all 1 can round to exactly 1
+/// (one full cell beside 9007199254740991/9007199254740992 averages to 1.0),
+/// so whether such a mean is full is decided from the counts, never from the
+/// mean itself. This is
+/// section 4 of dev-hermit's `ai_docs/parity-summary-format-v5.md`, whose
+/// renderer must print the same line. The two means of the inputs marker keep
+/// version 3's rule ([`credit_text`] of the mean): the tally carries no
+/// per-basis full count.
+fn mean_text(value: Option<f64>, full: usize, over: usize) -> String {
+    let text = credit_text(value);
+    if text == "1.000" && full < over {
+        "0.999".to_string()
+    } else {
+        text
+    }
+}
+
 /// Counts and credit over one set of cells.
 ///
-/// `selected = measured + no_golden + not_compared + unmeasured +
-/// record_missing + refused`, and `measured = matched + diverged`. A cell
-/// that was not measured counts under the [`UnavailableGroup`] of its typed
-/// class, never of its reason text. A no-golden cell (an operand's own
-/// outcome left no deterministic golden log) and a not-compared cell (the
-/// backend's inputs cannot be equalized) enter neither the mean nor the
-/// floor; an unmeasured, record-missing or refused cell is in the floor as 0.
+/// THE POPULATION. Every reported cell is in the parity population unless
+/// its ptrace reference left no usable golden (`reference_excluded`: a
+/// `reference-missing` verdict, or any class whose operand is the
+/// reference) or it is historical `inputs-not-equalized` (`not_compared`).
+/// A candidate full validation runs but a sampled run (the pressure test) did
+/// not plan is outside that run's population too (`not_sampled`). So
+/// `selected = population + reference_excluded + not_compared + not_sampled`,
+/// and
+/// `population = full + partial + zero`. A population cell scores its
+/// measured credit (clean or not), and every other population cell scores 0
+/// and is counted: a candidate that is not enabled or not selected, that
+/// left no row or no readable log, timed out, crashed, failed or diverged
+/// between its own two runs, a comparison the parity tool could not make, a
+/// record-missing row and a refused row
+/// ([`hermit_manifest_plan::parity::population_standing`], the one function
+/// that applies the 0; a record keeps `credit: null`).
+/// `population_mean_credit` is the population's credit sum over all
+/// `population` cells, zeros included; `None` over no cell, never 0.
 ///
-/// `mean_credit` divides the credit sum by the measured cells, so a measured
-/// cell without credit counts as 0, and `floor_credit` divides it by the
-/// `floor_cells`. Every backend's record-missing and refused cells are in
-/// the floor as 0, dbt's included now that dbt is compared like the others.
-/// A mean or floor over no cells is `None`, never 0.
+/// The group counts (`measured = matched + diverged`, `no_golden`,
+/// `candidate_not_run`, `not_compared`, `unmeasured`, `record_missing`,
+/// `refused`) partition `selected` by the typed class of each cell, never
+/// by its reason text, whatever its operand. `zero_by_class` and
+/// `reference_excluded_by_class` split the same cells by population
+/// standing.
 ///
-/// The pooled means mix clean credit (equal inputs) with unequalized credit
-/// only under a marker that says so, and `clean_mean_credit` and
-/// `unequalized_mean_credit` keep the two apart the way the post-pass's own
-/// summary line does, so an unequalized credit never reads as a clean one.
+/// `mean_credit` divides the credit sum by the measured cells only, so a
+/// measured cell without credit counts as 0. The measured means mix clean
+/// credit (equal inputs) with unequalized credit only under a marker that
+/// says so, and `clean_mean_credit` and `unequalized_mean_credit` keep the
+/// two apart the way the post-pass's own summary line does.
 ///
-/// `committed` is how many cells of this set the run's own commit selects in
-/// [`PARITY_CELLS_PATH`], `committed_selected` how many of those the run
-/// reported, and `outside_committed` how many it reported that the selection
-/// does not name. All three are `None` when that selection is unknown.
-/// `line` is [`ParityTally::render_line`] of the finished tally.
+/// `committed` is how many cells of this set the run's own commit's
+/// [`PARITY_CELLS_PATH`] puts in the population, `committed_selected` how
+/// many of those the run reported, and `outside_committed` how many it
+/// reported that the population does not name. All three are `None` when
+/// that population is unknown. `line` is [`ParityTally::render_line`] of the
+/// finished tally.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 struct ParityTally {
     selected: usize,
@@ -6565,11 +6611,17 @@ struct ParityTally {
     matched: usize,
     diverged: usize,
     no_golden: usize,
-    /// Every no-golden class, zeros included.
+    /// Every no-golden class, zeros included, whatever the operand.
     no_golden_by_class: BTreeMap<UnavailableClass, usize>,
+    candidate_not_run: usize,
+    /// Every candidate-not-run class, zeros included.
+    candidate_not_run_by_class: BTreeMap<UnavailableClass, usize>,
     not_compared: usize,
+    /// Enabled and selected candidates a sampled run (the pressure test) did
+    /// not plan: outside that run's population, counted apart.
+    not_sampled: usize,
     unmeasured: usize,
-    /// Every unmeasured class, zeros included.
+    /// Every unmeasured class, zeros included, whatever the operand.
     unmeasured_by_class: BTreeMap<UnavailableClass, usize>,
     record_missing: usize,
     refused: usize,
@@ -6579,12 +6631,32 @@ struct ParityTally {
     credit_sum: f64,
     clean_credit_sum: f64,
     unequalized_credit_sum: f64,
-    /// The floor's denominator.
-    floor_cells: usize,
+    /// N: the cells whose reference left a golden.
+    population: usize,
+    /// M: population cells with credit 1.
+    full: usize,
+    /// K: population cells with credit strictly between 0 and 1.
+    partial: usize,
+    /// Z: population cells with credit 0, measured or not.
+    zero: usize,
+    /// The zero cells that were measured (a divergence at the first message,
+    /// or a measured verdict without a credit).
+    measured_zero: usize,
+    /// The unmeasured zero cells by class, zeros included; record-missing and
+    /// refused cells are counted in their own fields.
+    zero_by_class: BTreeMap<UnavailableClass, usize>,
+    /// Cells outside the population because the ptrace reference left no
+    /// usable golden.
+    reference_excluded: usize,
+    /// The same cells by class, zeros included.
+    reference_excluded_by_class: BTreeMap<UnavailableClass, usize>,
+    /// The population's credit sum, zeros included.
+    population_credit_sum: f64,
     mean_credit: Option<f64>,
     clean_mean_credit: Option<f64>,
     unequalized_mean_credit: Option<f64>,
-    floor_credit: Option<f64>,
+    /// The mean credit over all N population cells, zeros included.
+    population_mean_credit: Option<f64>,
     committed: Option<usize>,
     committed_selected: Option<usize>,
     outside_committed: Option<usize>,
@@ -6592,12 +6664,31 @@ struct ParityTally {
     line: String,
 }
 
+/// The classes a population zero can carry: every class but the historical
+/// `inputs-not-equalized` (outside the population) and `record-missing`
+/// (counted on its own).
+fn zero_classes() -> impl Iterator<Item = UnavailableClass> {
+    UnavailableClass::ALL.into_iter().filter(|class| {
+        !matches!(
+            class,
+            UnavailableClass::InputsNotEqualized
+                | UnavailableClass::RecordMissing
+                | UnavailableClass::CandidateNotSampled
+        )
+    })
+}
+
+/// The classes that can name the reference operand.
+fn reference_classes() -> impl Iterator<Item = UnavailableClass> {
+    UnavailableClass::ALL
+        .into_iter()
+        .filter(|class| class.operands().contains(&Some(ParityOperand::Reference)))
+}
+
 impl ParityTally {
     fn over<'a>(cells: impl IntoIterator<Item = &'a ParityCellSummary>) -> Self {
-        let zeros = |group: UnavailableGroup| {
-            classes_of(group)
-                .map(|class| (class, 0))
-                .collect::<BTreeMap<_, _>>()
+        let zeros = |classes: &mut dyn Iterator<Item = UnavailableClass>| {
+            classes.map(|class| (class, 0)).collect::<BTreeMap<_, _>>()
         };
         let mut tally = Self {
             selected: 0,
@@ -6605,10 +6696,13 @@ impl ParityTally {
             matched: 0,
             diverged: 0,
             no_golden: 0,
-            no_golden_by_class: zeros(UnavailableGroup::NoGolden),
+            no_golden_by_class: zeros(&mut classes_of(UnavailableGroup::NoGolden)),
+            candidate_not_run: 0,
+            candidate_not_run_by_class: zeros(&mut classes_of(UnavailableGroup::CandidateNotRun)),
             not_compared: 0,
+            not_sampled: 0,
             unmeasured: 0,
-            unmeasured_by_class: zeros(UnavailableGroup::Unmeasured),
+            unmeasured_by_class: zeros(&mut classes_of(UnavailableGroup::Unmeasured)),
             record_missing: 0,
             refused: 0,
             credited: 0,
@@ -6617,11 +6711,19 @@ impl ParityTally {
             credit_sum: 0.0,
             clean_credit_sum: 0.0,
             unequalized_credit_sum: 0.0,
-            floor_cells: 0,
+            population: 0,
+            full: 0,
+            partial: 0,
+            zero: 0,
+            measured_zero: 0,
+            zero_by_class: zeros(&mut zero_classes()),
+            reference_excluded: 0,
+            reference_excluded_by_class: zeros(&mut reference_classes()),
+            population_credit_sum: 0.0,
             mean_credit: None,
             clean_mean_credit: None,
             unequalized_mean_credit: None,
-            floor_credit: None,
+            population_mean_credit: None,
             committed: None,
             committed_selected: None,
             outside_committed: None,
@@ -6634,10 +6736,14 @@ impl ParityTally {
         > = BTreeMap::new();
         for cell in cells {
             tally.selected += 1;
-            // A no-golden or not-compared cell is in no floor.
-            let mut in_floor = true;
+            // Whether the cell is counted as refused: such a cell has no
+            // trustworthy class or operand, so it scores 0.
+            let mut refused = false;
             match cell.kind {
-                None => tally.refused += 1,
+                None => {
+                    tally.refused += 1;
+                    refused = true;
+                }
                 Some(LedgerVerdict::RecordMissing) => tally.record_missing += 1,
                 Some(LedgerVerdict::Matched) => {
                     tally.measured += 1;
@@ -6658,19 +6764,23 @@ impl ParityTally {
                 Some(_) => match cell.unavailable_class {
                     // A validated row always names its class
                     // (`ParityLedgerRow::validate`). A cell without one is
-                    // counted as refused, in the floor as 0, rather than
-                    // stopping the scorecard: parity never gates it.
-                    None => tally.refused += 1,
+                    // counted as refused, as 0, rather than stopping the
+                    // scorecard: parity never gates it.
+                    None => {
+                        tally.refused += 1;
+                        refused = true;
+                    }
                     Some(class) => match class.group() {
                         UnavailableGroup::NoGolden => {
-                            in_floor = false;
                             tally.no_golden += 1;
                             *tally.no_golden_by_class.entry(class).or_default() += 1;
                         }
-                        UnavailableGroup::NotCompared => {
-                            in_floor = false;
-                            tally.not_compared += 1;
+                        UnavailableGroup::CandidateNotRun => {
+                            tally.candidate_not_run += 1;
+                            *tally.candidate_not_run_by_class.entry(class).or_default() += 1;
                         }
+                        UnavailableGroup::NotCompared => tally.not_compared += 1,
+                        UnavailableGroup::NotSampled => tally.not_sampled += 1,
                         UnavailableGroup::Unmeasured => {
                             tally.unmeasured += 1;
                             *tally.unmeasured_by_class.entry(class).or_default() += 1;
@@ -6679,8 +6789,41 @@ impl ParityTally {
                     },
                 },
             }
-            if in_floor {
-                tally.floor_cells += 1;
+            let standing = match cell.kind {
+                Some(verdict) if !refused => {
+                    population_standing(verdict, cell.unavailable_class, cell.operand, cell.credit)
+                }
+                _ => PopulationStanding::Scored(0.0),
+            };
+            match standing {
+                PopulationStanding::Scored(credit) => {
+                    tally.population += 1;
+                    tally.population_credit_sum += credit;
+                    if credit >= 1.0 {
+                        tally.full += 1;
+                    } else if credit > 0.0 {
+                        tally.partial += 1;
+                    } else {
+                        tally.zero += 1;
+                        if cell.kind.is_some_and(LedgerVerdict::is_measured) {
+                            tally.measured_zero += 1;
+                        } else if let Some(class) = cell
+                            .unavailable_class
+                            .filter(|class| !refused && *class != UnavailableClass::RecordMissing)
+                        {
+                            *tally.zero_by_class.entry(class).or_default() += 1;
+                        }
+                    }
+                }
+                PopulationStanding::ReferenceExcluded => {
+                    tally.reference_excluded += 1;
+                    if let Some(class) = cell.unavailable_class {
+                        *tally.reference_excluded_by_class.entry(class).or_default() += 1;
+                    }
+                }
+                // Counted in `not_compared` above.
+                // Counted in `not_compared` and `not_sampled` above.
+                PopulationStanding::NotCompared | PopulationStanding::NotSampled => {}
             }
             if let Some(credit) = cell.credit {
                 tally.credited += 1;
@@ -6699,7 +6842,7 @@ impl ParityTally {
         tally.clean_mean_credit = mean(tally.clean_credit_sum, tally.clean_credited);
         tally.unequalized_mean_credit =
             mean(tally.unequalized_credit_sum, tally.unequalized_credited);
-        tally.floor_credit = mean(tally.credit_sum, tally.floor_cells);
+        tally.population_mean_credit = mean(tally.population_credit_sum, tally.population);
         let mut best: Option<(
             &(Option<usize>, Option<u64>, Option<String>),
             &Vec<&ParityCellSummary>,
@@ -6726,7 +6869,7 @@ impl ParityTally {
         tally
     }
 
-    /// Fill the coverage fields from the run's committed selection, counting
+    /// Fill the coverage fields from the run's committed population, counting
     /// only `backend`'s cells when one is given. Unknown coverage stays `None`.
     fn cover(
         mut self,
@@ -6759,7 +6902,7 @@ impl ParityTally {
         self
     }
 
-    /// True when the run reported every cell its commit's selection owes.
+    /// True when the run reported every cell its commit's population owes.
     fn complete(&self) -> bool {
         matches!(
             (self.committed, self.committed_selected),
@@ -6768,7 +6911,7 @@ impl ParityTally {
     }
 
     /// `selected W of C committed`, marked `(partial)` when the run reported
-    /// fewer cells than its commit's selection owes, or `committed selection
+    /// fewer cells than its commit's population owes, or `committed selection
     /// unknown`.
     fn coverage(&self) -> String {
         match (
@@ -6787,6 +6930,19 @@ impl ParityTally {
             }
             _ => "committed selection unknown".to_string(),
         }
+    }
+
+    /// The population mean, full only when every population cell is
+    /// (`full == population`).
+    fn population_mean_text(&self) -> String {
+        mean_text(self.population_mean_credit, self.full, self.population)
+    }
+
+    /// The measured mean, full only when every measured cell matched: a
+    /// `matched` verdict is exactly full credit, and a `diverged` one never
+    /// is.
+    fn measured_mean_text(&self) -> String {
+        mean_text(self.mean_credit, self.matched, self.measured)
     }
 
     /// Which inputs the credited cells were measured with, never pooling an
@@ -6833,22 +6989,19 @@ impl ParityTally {
 
     /// The one-line parity summary, which prints each figure beside its
     /// denominator, for example `parity: 0/77 matched; selected 77 of 77
-    /// committed; mean 0.101 over 76 measured; floor 0.100 over 77 of 77
-    /// selected (counted as 0: 1 unmeasured: no-result-row 1; excluded: 0 no
-    /// golden; 0 not compared) [inputs not equalized]`. The floor is over the
-    /// measured cells and those counted as 0; the cells listed as excluded
-    /// are the rest of the selection. The nonzero classes are listed in print
-    /// order. A tally whose every cell was not compared says only that, with
+    /// committed; population 77: mean 0.100 over 77 (0 full, 76 partial, 1
+    /// zero: no-result-row 1); excluded: 0 reference without golden; 0 not
+    /// compared; measured mean 0.101 over 76 [inputs not equalized]`.
+    ///
+    /// The population segment is N (the cells whose reference left a
+    /// golden), the mean credit over all N with every zero counted, and M
+    /// full, K partial and Z zero, the zeros split by why: measured zeros,
+    /// each nonzero class in print order, record-missing and refused. The
+    /// excluded segment counts the cells whose ptrace reference left no
+    /// golden, with their nonzero classes, and the historical not-compared
+    /// cells. A tally whose every cell was not compared says only that, with
     /// its coverage.
     ///
-    /// A record-missing or refused cell is counted as 0 unless its backend's
-    /// inputs cannot be equalized, which excludes it. Such a backend has no
-    /// measured or unmeasured cell (`check_class` in
-    /// `ci/manifest-plan/src/parity.rs`), so `selected - no_golden -
-    /// not_compared - floor_cells` counts exactly the excluded record-missing
-    /// and refused cells. When the cells of both kinds are all on one side
-    /// the line names each kind; otherwise, which only a total over several
-    /// backends can be, it gives the two kinds' sum on each side.
     /// The line reads nothing but the tally's own fields: dev-hermit's
     /// `ci-hub/compatibility-website/parity_summary.py`, added by slice D5 of
     /// <https://github.com/rrnewton/hermit/issues/3301>, renders it again
@@ -6868,71 +7021,55 @@ impl ParityTally {
                 .filter(|(_, count)| **count > 0)
                 .map(|(class, count)| format!("{class} {count}"))
                 .collect::<Vec<_>>()
-                .join(", ")
         };
-        // Counted as 0 in the floor.
-        let mut counted_as_zero = Vec::new();
-        if self.unmeasured > 0 {
-            counted_as_zero.push(format!(
-                "{} unmeasured: {}",
-                self.unmeasured,
-                classes(&self.unmeasured_by_class)
-            ));
+        let mut why_zero = Vec::new();
+        if self.measured_zero > 0 {
+            why_zero.push(format!("measured 0 {}", self.measured_zero));
         }
-        // Excluded from every floor.
-        let mut no_golden = format!("{} no golden", self.no_golden);
-        if self.no_golden > 0 {
-            no_golden.push_str(&format!(": {}", classes(&self.no_golden_by_class)));
-        }
-        let mut excluded = vec![no_golden, format!("{} not compared", self.not_compared)];
-        let mut kinds = Vec::new();
+        why_zero.extend(classes(&self.zero_by_class));
         if self.record_missing > 0 {
-            kinds.push(format!("{} record-missing", self.record_missing));
+            why_zero.push(format!("record-missing {}", self.record_missing));
         }
         if self.refused > 0 {
-            kinds.push(format!("{} refused", self.refused));
+            why_zero.push(format!("refused {}", self.refused));
         }
-        // The record-missing and refused cells of a backend whose inputs
-        // cannot be equalized are excluded; the rest are counted as 0.
-        let unequalizable = self
-            .selected
-            .saturating_sub(self.no_golden + self.not_compared + self.floor_cells);
-        let missing_or_refused = self.record_missing + self.refused;
-        if unequalizable == 0 {
-            counted_as_zero.extend(kinds);
-        } else if unequalizable == missing_or_refused {
-            let kinds = kinds.join(" and ");
-            excluded.push(format!("{kinds} whose inputs cannot be equalized"));
+        let why_zero = if why_zero.is_empty() {
+            String::new()
         } else {
-            // The tally's fields do not say which kind each side's cells are.
-            let in_floor = missing_or_refused.saturating_sub(unequalizable);
-            counted_as_zero.push(format!("{in_floor} record-missing or refused"));
-            excluded.push(format!(
-                "{unequalizable} record-missing or refused whose inputs cannot be equalized"
-            ));
+            format!(": {}", why_zero.join(", "))
+        };
+        let mut excluded = format!("{} reference without golden", self.reference_excluded);
+        let reference = classes(&self.reference_excluded_by_class);
+        if !reference.is_empty() {
+            excluded.push_str(&format!(": {}", reference.join(", ")));
         }
-        let mut groups = Vec::new();
-        if !counted_as_zero.is_empty() {
-            groups.push(format!("counted as 0: {}", counted_as_zero.join("; ")));
-        }
-        groups.push(format!("excluded: {}", excluded.join("; ")));
         let credited = if self.credited != self.measured {
             format!(" ({} credited)", self.credited)
         } else {
             String::new()
         };
+        // Only a sampled run has such cells, so the segment is absent otherwise.
+        let not_sampled = if self.not_sampled > 0 {
+            format!("; {} not sampled", self.not_sampled)
+        } else {
+            String::new()
+        };
         format!(
-            "parity: {}/{} matched; {}; mean {} over {} measured{credited}; floor {} over {} of {} selected ({}){}",
+            "parity: {}/{} matched; {}; population {n}: mean {} over {n} ({} full, {} partial, {} \
+             zero{why_zero}); excluded: {excluded}; {} not compared{not_sampled}; measured mean \
+             {} over {}{credited}{}",
             self.matched,
             self.selected,
             self.coverage(),
-            credit_text(self.mean_credit),
+            self.population_mean_text(),
+            self.full,
+            self.partial,
+            self.zero,
+            self.not_compared,
+            self.measured_mean_text(),
             self.measured,
-            credit_text(self.floor_credit),
-            self.floor_cells,
-            self.selected,
-            groups.join("; "),
-            self.inputs_marker()
+            self.inputs_marker(),
+            n = self.population,
         )
     }
 }
@@ -7952,16 +8089,16 @@ fn render_parity_tally_row(label: &str, tally: &ParityTally) -> String {
     };
     format!(
         "| {label} | {selected} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+        tally.population,
+        tally.population_mean_text(),
+        tally.full,
+        tally.partial,
+        tally.zero,
+        tally.reference_excluded,
+        tally.not_compared,
         tally.measured,
         tally.matched,
-        tally.diverged,
-        tally.no_golden,
-        tally.not_compared,
-        tally.unmeasured,
-        tally.record_missing,
-        tally.refused,
-        credit_text(tally.mean_credit),
-        credit_text(tally.floor_credit),
+        tally.measured_mean_text(),
         markdown_cell(&tally.credit_inputs()),
     )
 }
@@ -7977,17 +8114,22 @@ beside determinism, never folded into it: no count, measurement or colour above 
 `c-programs` nodes, which perform ordinary same-backend verification, supply those logs; no validation \
 runs a ptrace rerun any more (https://github.com/rrnewton/hermit/issues/3301).\n\n\
 A measured cell earns credit in [0, 1]: its matched prefix of compared records over the longer log, and \
-1 only for a full match. **Mean credit** divides the credit sum by the measured (matched plus diverged) \
-cells, so a measured cell without credit counts as 0. **Floor credit** divides it by every selected cell \
-except two kinds that could not be compared: a **no golden** cell, where an operand's own outcome (a \
-determinism mismatch, a timeout, a crash and the like) left no deterministic golden log, and a **not \
-compared** cell, whose backend cannot be given the reference's inputs. So an **unmeasured** cell (a golden \
-log could exist, but the harness or the parity tool made no comparison), a record-missing cell and a \
-refused cell each count as 0. No cell of a backend whose inputs cannot be equalized enters any mean or \
-floor, and a mean or floor over no cells reads n/a, never 0.000. **Selected** reads `W of C` when the run's own Hermit commit's `{PARITY_CELLS_PATH}` \
-is known: the run reported W of the C cells that selection owes, and a run that reported fewer is marked \
-partial. Mean credit pools clean credit (inputs equalized) with unequalized credit only under a marker that \
-says so; **Credit inputs** shows which it is. The `{LEGACY_RERUN_LABEL}` history at the end is the retired \
+1 only for a full match. The **population** is every test whose ptrace `verify` cell full validation \
+selects, crossed with every candidate backend, so it is the verify matrix itself. Every population cell \
+is scored: a measured cell earns its credit, and a candidate that is not enabled, not selected, left no \
+row or log, timed out, crashed, failed or diverged between its own two runs, a comparison the parity tool \
+could not make, a record-missing cell and a refused cell each score 0 and are counted. **Population \
+mean** divides the credit sum by every population cell (N), zeros included; **Full**, **Partial** and \
+**Zero** count the cells with credit 1, between 0 and 1, and 0. A cell whose ptrace reference left no \
+usable golden log has nothing to compare against: it is outside the population, counted under **Excluded \
+(reference)**, and so is a historical **not compared** dbt cell. In a pressure-test run, which executes a \
+sample, a candidate full validation runs but the sample did not plan is **not sampled**: outside that run's \
+population, counted on its line apart, never 0. **Mean credit (measured)** divides the \
+credit sum by the measured (matched plus diverged) cells only. A mean over no cells reads n/a, never \
+0.000. **Selected** reads `W of C` when the run's own Hermit commit's `{PARITY_CELLS_PATH}` is known: the \
+run reported W of the C population cells it owes, and a run that reported fewer is marked partial. \
+Credit pools clean credit (inputs equalized) with unequalized credit only under a marker that says so; \
+**Credit inputs** shows which it is. The `{LEGACY_RERUN_LABEL}` history at the end is the retired \
 ptrace rerun's last verdicts; it is not current parity and enters no count here.\n\n"
     );
     if !summary.store_present {
@@ -8039,7 +8181,7 @@ ptrace rerun's last verdicts; it is not current parity and enters no count here.
         };
         out.push_str(&format!(
             "\n### {} run `{}` {sha}{partial}\n\n`{}`\n\n\
-| Candidate backend | Selected | Measured | Matched | Diverged | No golden | Not compared | Unmeasured | Record-missing | Refused | Mean credit (measured) | Floor credit | Credit inputs |\n\
+| Candidate backend | Selected | Population | Population mean | Full | Partial | Zero | Excluded (reference) | Not compared | Measured | Matched | Mean credit (measured) | Credit inputs |\n\
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n",
             run.producer, run.run_id, run.line
         ));
@@ -8084,16 +8226,27 @@ ptrace rerun's last verdicts; it is not current parity and enters no count here.
             }
             out.push_str(".\n");
         }
-        let class_count = |tally: &ParityTally, class: UnavailableClass| match class.group() {
-            UnavailableGroup::NoGolden => tally.no_golden_by_class[&class],
-            UnavailableGroup::Unmeasured => tally.unmeasured_by_class[&class],
-            UnavailableGroup::NotCompared | UnavailableGroup::RecordMissing => 0,
+        // A class's cells by population standing: scored 0, or excluded
+        // because the reference left no golden.
+        let class_count = |tally: &ParityTally, class: UnavailableClass| {
+            (
+                tally.zero_by_class.get(&class).copied().unwrap_or(0),
+                tally
+                    .reference_excluded_by_class
+                    .get(&class)
+                    .copied()
+                    .unwrap_or(0),
+            )
         };
-        let classes = [UnavailableGroup::NoGolden, UnavailableGroup::Unmeasured]
-            .into_iter()
-            .flat_map(classes_of)
-            .filter(|class| class_count(&run.total, *class) > 0)
-            .collect::<Vec<_>>();
+        let classes = [
+            UnavailableGroup::NoGolden,
+            UnavailableGroup::CandidateNotRun,
+            UnavailableGroup::Unmeasured,
+        ]
+        .into_iter()
+        .flat_map(classes_of)
+        .filter(|class| class_count(&run.total, *class) != (0, 0))
+        .collect::<Vec<_>>();
         if !classes.is_empty() {
             let backends = run
                 .per_backend
@@ -8101,27 +8254,35 @@ ptrace rerun's last verdicts; it is not current parity and enters no count here.
                 .filter(|(_, tally)| shown(tally))
                 .collect::<Vec<_>>();
             out.push_str(
-                "\nCells that were not measured, by class: a no-golden cell is outside the mean and the floor, and an unmeasured cell counts 0 in the floor.\n\n| Class | Group |",
+                "\nCells that were not measured, by class: a cell whose ptrace reference left no golden is excluded from the population; every other one scores 0 and is counted.\n\n| Class | Group | Counts as |",
             );
             for (backend, _) in &backends {
                 out.push_str(&format!(" `{backend}` |"));
             }
-            out.push_str(" **TOTAL** |\n| --- | --- |");
+            out.push_str(" **TOTAL** |\n| --- | --- | --- |");
             for _ in &backends {
                 out.push_str(" ---: |");
             }
             out.push_str(" ---: |\n");
             for class in classes {
-                let group = if class.group() == UnavailableGroup::NoGolden {
-                    "no golden"
-                } else {
-                    "unmeasured"
+                let group = match class.group() {
+                    UnavailableGroup::NoGolden => "no golden",
+                    UnavailableGroup::CandidateNotRun => "candidate not run",
+                    _ => "unmeasured",
                 };
-                out.push_str(&format!("| `{class}` | {group} |"));
-                for (_, tally) in &backends {
-                    out.push_str(&format!(" {} |", class_count(tally, class)));
+                for (standing, pick) in [
+                    ("0", (|(zero, _)| zero) as fn((usize, usize)) -> usize),
+                    ("excluded (reference)", |(_, excluded)| excluded),
+                ] {
+                    if pick(class_count(&run.total, class)) == 0 {
+                        continue;
+                    }
+                    out.push_str(&format!("| `{class}` | {group} | {standing} |"));
+                    for (_, tally) in &backends {
+                        out.push_str(&format!(" {} |", pick(class_count(tally, class))));
+                    }
+                    out.push_str(&format!(" {} |\n", pick(class_count(&run.total, class))));
                 }
-                out.push_str(&format!(" {} |\n", class_count(&run.total, class)));
             }
         }
         if let Some(group) = &run.total.first_divergence {
@@ -43426,47 +43587,53 @@ mod parity_summary_tests {
     }
 
     #[test]
-    fn twelve_diverged_cells_render_zero_of_twelve_with_a_floor_credit() {
+    fn twelve_diverged_cells_render_zero_of_twelve_with_a_population_mean() {
         let summary = summarize_rows(&twelve_diverged(), &no_cells());
         let run = only_run(&summary);
         assert_eq!(
             run.line,
-            "parity: 0/12 matched; committed selection unknown; mean 0.117 over 12 measured; \
-             floor 0.117 over 12 of 12 selected (excluded: 0 no golden; 0 not compared) \
-             [inputs not equalized]"
+            "parity: 0/12 matched; committed selection unknown; population 12: mean 0.117 over 12 \
+             (0 full, 12 partial, 0 zero); excluded: 0 reference without golden; 0 not compared; \
+             measured mean 0.117 over 12 [inputs not equalized]"
         );
         assert_eq!(
             run.per_backend[&KVM].line,
-            "parity: 0/4 matched; committed selection unknown; mean 0.100 over 4 measured; \
-             floor 0.100 over 4 of 4 selected (excluded: 0 no golden; 0 not compared) \
-             [inputs not equalized]"
+            "parity: 0/4 matched; committed selection unknown; population 4: mean 0.100 over 4 \
+             (0 full, 4 partial, 0 zero); excluded: 0 reference without golden; 0 not compared; \
+             measured mean 0.100 over 4 [inputs not equalized]"
         );
         assert_eq!(run.per_backend[&DBT].selected, 0);
-        assert_eq!(run.per_backend[&DBT].floor_credit, None);
+        assert_eq!(run.per_backend[&DBT].population_mean_credit, None);
         assert_eq!(run.total.credited, 12);
         assert_eq!(run.total.clean_credited, 0);
         let rendered = render_parity_section(&summary);
         assert_contains(
             &rendered,
-            "\n`parity: 0/12 matched; committed selection unknown; mean 0.117 over 12 measured; \
-             floor 0.117 over 12 of 12 selected (excluded: 0 no golden; 0 not compared) \
-             [inputs not equalized]`\n",
+            &format!(
+                "\n`{}`\n",
+                "parity: 0/12 matched; committed selection unknown; population 12: mean 0.117 over 12 \
+             (0 full, 12 partial, 0 zero); excluded: 0 reference without golden; 0 not compared; \
+             measured mean 0.117 over 12 [inputs not equalized]"
+            ),
+        );
+        // | backend | selected | population | population mean | full | partial
+        // | zero | excluded (reference) | not compared | measured | matched |
+        // mean (measured) | credit inputs |
+        assert_contains(
+            &rendered,
+            "| `kvm` | 4 | 4 | 0.100 | 0 | 4 | 0 | 0 | 0 | 4 | 0 | 0.100 | not equalized |\n",
         );
         assert_contains(
             &rendered,
-            "| `kvm` | 4 | 4 | 0 | 4 | 0 | 0 | 0 | 0 | 0 | 0.100 | 0.100 | not equalized |\n",
+            "| `liteinst` | 4 | 4 | 0.050 | 0 | 4 | 0 | 0 | 0 | 4 | 0 | 0.050 | not equalized |\n",
         );
         assert_contains(
             &rendered,
-            "| `liteinst` | 4 | 4 | 0 | 4 | 0 | 0 | 0 | 0 | 0 | 0.050 | 0.050 | not equalized |\n",
+            "| `sabre` | 4 | 4 | 0.200 | 0 | 4 | 0 | 0 | 0 | 4 | 0 | 0.200 | not equalized |\n",
         );
         assert_contains(
             &rendered,
-            "| `sabre` | 4 | 4 | 0 | 4 | 0 | 0 | 0 | 0 | 0 | 0.200 | 0.200 | not equalized |\n",
-        );
-        assert_contains(
-            &rendered,
-            "| **TOTAL** | 12 | 12 | 0 | 12 | 0 | 0 | 0 | 0 | 0 | 0.117 | 0.117 | not equalized |\n",
+            "| **TOTAL** | 12 | 12 | 0.117 | 0 | 12 | 0 | 0 | 0 | 12 | 0 | 0.117 | not equalized |\n",
         );
         assert_contains(
             &rendered,
@@ -43495,7 +43662,7 @@ mod parity_summary_tests {
     }
 
     #[test]
-    fn record_missing_cells_stay_in_the_denominator_and_lower_the_floor() {
+    fn record_missing_cells_stay_in_the_population_and_lower_its_mean() {
         let mut rows = twelve_diverged();
         for backend in [KVM, LITEINST, SABRE] {
             let at = rows
@@ -43508,12 +43675,14 @@ mod parity_summary_tests {
         let run = only_run(&summary);
         assert_eq!(
             run.line,
-            "parity: 0/12 matched; committed selection unknown; mean 0.117 over 9 measured; \
-             floor 0.088 over 12 of 12 selected (counted as 0: 3 record-missing; excluded: \
-             0 no golden; 0 not compared) [inputs not equalized]"
+            "parity: 0/12 matched; committed selection unknown; population 12: mean 0.088 over 12 \
+             (0 full, 9 partial, 3 zero: record-missing 3); excluded: 0 reference without \
+             golden; 0 not compared; measured mean 0.117 over 9 [inputs not equalized]"
         );
         let all_diverged = summarize_rows(&twelve_diverged(), &no_cells());
-        assert!(run.total.floor_credit < only_run(&all_diverged).total.floor_credit);
+        assert!(
+            run.total.population_mean_credit < only_run(&all_diverged).total.population_mean_credit
+        );
         assert_eq!(
             run.total.mean_credit.map(|v| format!("{v:.3}")),
             Some("0.117".into())
@@ -43521,19 +43690,19 @@ mod parity_summary_tests {
         let rendered = render_parity_section(&summary);
         assert_contains(
             &rendered,
-            "| `kvm` | 4 | 3 | 0 | 3 | 0 | 0 | 0 | 1 | 0 | 0.100 | 0.075 | not equalized |\n",
+            "| `kvm` | 4 | 4 | 0.075 | 0 | 3 | 1 | 0 | 0 | 3 | 0 | 0.100 | not equalized |\n",
         );
         assert_contains(
             &rendered,
-            "| `liteinst` | 4 | 3 | 0 | 3 | 0 | 0 | 0 | 1 | 0 | 0.050 | 0.038 | not equalized |\n",
+            "| `liteinst` | 4 | 4 | 0.038 | 0 | 3 | 1 | 0 | 0 | 3 | 0 | 0.050 | not equalized |\n",
         );
         assert_contains(
             &rendered,
-            "| `sabre` | 4 | 3 | 0 | 3 | 0 | 0 | 0 | 1 | 0 | 0.200 | 0.150 | not equalized |\n",
+            "| `sabre` | 4 | 4 | 0.150 | 0 | 3 | 1 | 0 | 0 | 3 | 0 | 0.200 | not equalized |\n",
         );
         assert_contains(
             &rendered,
-            "| **TOTAL** | 12 | 9 | 0 | 9 | 0 | 0 | 0 | 3 | 0 | 0.117 | 0.088 | not equalized |\n",
+            "| **TOTAL** | 12 | 12 | 0.088 | 0 | 9 | 3 | 0 | 0 | 9 | 0 | 0.117 | not equalized |\n",
         );
         assert_contains(
             &rendered,
@@ -43542,10 +43711,10 @@ mod parity_summary_tests {
     }
 
     /// dbt is compared like every backend: a measured dbt row is admitted,
-    /// and dbt's record-missing cells are counted as 0 in the floor like any
+    /// and dbt's record-missing cells are in the population as 0 like any
     /// other backend's.
     #[test]
-    fn dbt_cells_are_measured_and_floored_like_every_backend() {
+    fn dbt_cells_are_measured_and_counted_like_every_backend() {
         let rows = [
             row(diverged(&golden(1), KVM, 10, 100, 11, 12, false)),
             missing(&golden(2), KVM),
@@ -43557,20 +43726,20 @@ mod parity_summary_tests {
         assert_eq!(summary.refused_rows, 0);
         let run = only_run(&summary);
         assert_eq!(counts(&run.total), [4, 2, 0, 2, 0, 0, 0, 2, 0]);
-        assert_eq!(run.total.floor_cells, 4);
+        assert_eq!(run.total.population, 4);
         assert_eq!(counts(&run.per_backend[&DBT]), [2, 1, 0, 1, 0, 0, 0, 1, 0]);
-        assert_eq!(run.per_backend[&DBT].floor_cells, 2);
+        assert_eq!(run.per_backend[&DBT].population, 2);
         assert_eq!(
             run.line,
-            "parity: 0/4 matched; committed selection unknown; mean 0.100 over 2 measured; \
-             floor 0.050 over 4 of 4 selected (counted as 0: 2 record-missing; excluded: \
-             0 no golden; 0 not compared) [inputs not equalized]"
+            "parity: 0/4 matched; committed selection unknown; population 4: mean 0.050 over 4 \
+             (0 full, 2 partial, 2 zero: record-missing 2); excluded: 0 reference without \
+             golden; 0 not compared; measured mean 0.100 over 2 [inputs not equalized]"
         );
         assert_eq!(
             run.per_backend[&DBT].line,
-            "parity: 0/2 matched; committed selection unknown; mean 0.100 over 1 measured; \
-             floor 0.050 over 2 of 2 selected (counted as 0: 1 record-missing; excluded: \
-             0 no golden; 0 not compared) [inputs not equalized]"
+            "parity: 0/2 matched; committed selection unknown; population 2: mean 0.050 over 2 \
+             (0 full, 1 partial, 1 zero: record-missing 1); excluded: 0 reference without \
+             golden; 0 not compared; measured mean 0.100 over 1 [inputs not equalized]"
         );
     }
 
@@ -43616,13 +43785,14 @@ mod parity_summary_tests {
             "{:?}",
             run.total.unmeasured_by_class
         );
-        // A no-golden cell is outside the floor, so the floor is the diverged
-        // cell's own credit.
+        // A candidate whose own two runs diverged left no log, so it scores
+        // 0 and stays in the population: the mean is the diverged cell's
+        // credit over both cells.
         assert_eq!(
             run.line,
-            "parity: 0/2 matched; committed selection unknown; mean 0.100 over 1 measured; \
-             floor 0.100 over 1 of 2 selected (excluded: 1 no golden: determinism-mismatch 1; \
-             0 not compared) [inputs not equalized]"
+            "parity: 0/2 matched; committed selection unknown; population 2: mean 0.050 over 2 \
+             (0 full, 1 partial, 1 zero: determinism-mismatch 1); excluded: 0 reference without \
+             golden; 0 not compared; measured mean 0.100 over 1 [inputs not equalized]"
         );
         let rendered = render_parity_section(&summary);
         assert_contains(
@@ -43634,7 +43804,270 @@ mod parity_summary_tests {
         );
         assert_contains(
             &rendered,
-            "| `determinism-mismatch` | no golden | 1 | 1 |\n",
+            "| `determinism-mismatch` | no golden | 0 | 1 | 1 |\n",
+        );
+    }
+
+    /// A pressure-test row whose enabled and selected candidate the sample did
+    /// not plan is outside the run's population and counted apart, never a
+    /// 0; a candidate full validation never runs is still a counted 0. The
+    /// class is the pressure test's alone: a validate row carrying it is
+    /// refused, and so counts as a refused 0 rather than leaving its cell.
+    #[test]
+    fn an_unsampled_candidate_is_counted_apart_and_never_zero() {
+        const PRESSURE_RUN: &str = "pressure-run";
+        let pressure = |record: ParityRecord| {
+            let (test, backend) = (record.test_id.clone(), record.backend);
+            let verdict = LedgerVerdict::from(record.verdict);
+            let reason = record.reason.clone();
+            envelope(
+                ParityProducer::PressureTest,
+                PRESSURE_RUN,
+                "2026-09-29T05:00:00Z",
+                &test,
+                backend,
+                verdict,
+                reason.as_deref(),
+                origin(LedgerPostPassState::Complete, "post-pass"),
+                Some(ParityRecord {
+                    run_id: PRESSURE_RUN.into(),
+                    ..record
+                }),
+            )
+        };
+        let not_sampled = || {
+            unmeasured(
+                &golden(1),
+                SABRE,
+                ParityVerdict::CandidateMissing,
+                UnavailableClass::CandidateNotSampled,
+                Some(ParityOperand::Candidate),
+                "the sabre candidate was not sampled",
+            )
+        };
+        let rows = [
+            pressure(diverged(&golden(1), KVM, 5, 10, 6, 1, true)),
+            pressure(not_sampled()),
+            pressure(unmeasured(
+                &golden(1),
+                DBT,
+                ParityVerdict::CandidateMissing,
+                UnavailableClass::CandidateNotEnabled,
+                Some(ParityOperand::Candidate),
+                "the dbt candidate is not enabled",
+            )),
+        ];
+        let summary = summarize_rows(&rows, &no_cells());
+        assert_eq!(summary.refusals, []);
+        let total = &only_run(&summary).total;
+        assert_eq!(
+            (
+                total.selected,
+                total.population,
+                total.zero,
+                total.not_sampled
+            ),
+            (3, 2, 1, 1)
+        );
+        assert_eq!(total.population_mean_credit, Some(0.25));
+        assert_eq!(
+            total.line,
+            "parity: 0/3 matched; committed selection unknown; population 2: mean 0.250 over 2 \
+             (0 full, 1 partial, 1 zero: candidate-not-enabled 1); excluded: 0 reference without \
+             golden; 0 not compared; 1 not sampled; measured mean 0.500 over 1"
+        );
+
+        // The same row from validate is refused: validate plans every
+        // candidate full validation enables and selects.
+        let summary = summarize_rows(&[row(not_sampled())], &no_cells());
+        assert_eq!(summary.refused_rows, 1);
+        assert!(
+            summary.refusals[0].message.contains(
+                "unavailable_class candidate-not-sampled is only for a pressure-test run"
+            ),
+            "{:?}",
+            summary.refusals
+        );
+        // A run of refused rows only has no clean headline, so its brief
+        // line carries its figures: a refused 0, nothing outside.
+        assert_eq!(summary.runs.len(), 1, "{:#?}", summary.runs);
+        assert_eq!(
+            summary.runs[0].line,
+            "parity: 0/1 matched; committed selection unknown; population 1: mean 0.000 over 1 \
+             (0 full, 0 partial, 1 zero: refused 1); excluded: 0 reference without golden; 0 not \
+             compared; measured mean n/a over 0"
+        );
+    }
+
+    /// The population and measured means read as full credit only when every
+    /// cell they average is full. One full cell beside one whose credit is
+    /// 9007199254740991 / 9007199254740992 averages, in floating point, to
+    /// exactly 1.0; the line and the table still print 0.999 for both means
+    /// over those cells, and 1.000 only for cells that are all full (format
+    /// v5 section 4).
+    #[test]
+    fn a_mean_reads_as_full_only_when_every_cell_it_averages_is_full() {
+        let nearly = 9_007_199_254_740_991_usize;
+        let longest = 9_007_199_254_740_992_usize;
+        let partial = row(diverged(&golden(2), KVM, nearly, longest, 7, 1, true));
+        let rows = [row(matched(&golden(1), KVM, 10, true)), partial];
+        let summary = summarize_rows(&rows, &no_cells());
+        let run = only_run(&summary);
+        let total = &run.total;
+        assert!(cell(run, "c-programs/golden-2@kvm").credit.unwrap() < 1.0);
+        // The trap itself: both means are exactly 1.0 in floating point.
+        assert_eq!(total.population_mean_credit, Some(1.0));
+        assert_eq!(total.mean_credit, Some(1.0));
+        assert_eq!(total.clean_mean_credit, Some(1.0));
+        assert_eq!((total.full, total.partial, total.population), (1, 1, 2));
+        assert_eq!(
+            total.line,
+            "parity: 1/2 matched; committed selection unknown; population 2: mean 0.999 over 2 \
+             (1 full, 1 partial, 0 zero); excluded: 0 reference without golden; 0 not compared; \
+             measured mean 0.999 over 2"
+        );
+        let rendered = render_parity_section(&summary);
+        assert_contains(
+            &rendered,
+            "| **TOTAL** | 2 | 2 | 0.999 | 1 | 1 | 0 | 0 | 0 | 2 | 1 | 0.999 | equalized |\n",
+        );
+        // Cells that are all full read 1.000 everywhere.
+        let summary = summarize_rows(
+            &[
+                row(matched(&golden(1), KVM, 10, true)),
+                row(matched(&golden(2), KVM, 10, true)),
+            ],
+            &no_cells(),
+        );
+        assert_eq!(
+            only_run(&summary).total.line,
+            "parity: 2/2 matched; committed selection unknown; population 2: mean 1.000 over 2 \
+             (2 full, 0 partial, 0 zero); excluded: 0 reference without golden; 0 not compared; \
+             measured mean 1.000 over 2"
+        );
+    }
+
+    /// Only a cell whose ptrace reference left no golden is outside the
+    /// population; a candidate that is not enabled, not selected, left no
+    /// row or crashed scores 0 and is counted, and so does a comparison the
+    /// parity tool could not make. The excluded cells are counted apart, by
+    /// class.
+    #[test]
+    fn only_a_reference_without_golden_is_outside_the_population() {
+        use ParityOperand::Candidate;
+        use ParityOperand::Reference;
+        use ParityVerdict as V;
+        use UnavailableClass as C;
+        let reason = "fixture reason";
+        let rows = [
+            row(matched(&golden(1), KVM, 10, true)),
+            row(diverged(&golden(2), KVM, 5, 10, 6, 1, true)),
+            row(unmeasured(
+                &golden(3),
+                KVM,
+                V::CandidateMissing,
+                C::CandidateNotEnabled,
+                Some(Candidate),
+                reason,
+            )),
+            row(unmeasured(
+                &golden(3),
+                SABRE,
+                V::CandidateMissing,
+                C::CandidateNotSelected,
+                Some(Candidate),
+                reason,
+            )),
+            row(unmeasured(
+                &golden(4),
+                KVM,
+                V::CandidateMissing,
+                C::NoResultRow,
+                Some(Candidate),
+                reason,
+            )),
+            row(unmeasured(
+                &golden(5),
+                KVM,
+                V::Unavailable,
+                C::Crash,
+                Some(Candidate),
+                reason,
+            )),
+            row(unmeasured(
+                &golden(6),
+                KVM,
+                V::Unavailable,
+                C::LogDiffFailed,
+                None,
+                reason,
+            )),
+            // The reference side: excluded, whatever the class's group.
+            row(unmeasured(
+                &golden(7),
+                KVM,
+                V::Nondeterministic,
+                C::DeterminismMismatch,
+                Some(Reference),
+                reason,
+            )),
+            row(unmeasured(
+                &golden(8),
+                KVM,
+                V::ReferenceMissing,
+                C::NoResultRow,
+                Some(Reference),
+                reason,
+            )),
+        ];
+        let summary = summarize_rows(&rows, &no_cells());
+        assert_eq!(summary.refusals, []);
+        let run = only_run(&summary);
+        let total = &run.total;
+        assert_eq!(
+            (
+                total.selected,
+                total.population,
+                total.full,
+                total.partial,
+                total.zero,
+                total.reference_excluded,
+                total.not_compared
+            ),
+            (9, 7, 1, 1, 5, 2, 0)
+        );
+        // (1 + 0.5 + 5 x 0) / 7: the zeros are counted, the excluded are not.
+        assert_eq!(total.population_mean_credit, Some(1.5 / 7.0));
+        assert_eq!(
+            run.line,
+            "parity: 1/9 matched; committed selection unknown; population 7: mean 0.214 over 7 \
+             (1 full, 1 partial, 5 zero: crash 1, candidate-not-enabled 1, \
+             candidate-not-selected 1, no-result-row 1, log-diff-failed 1); excluded: 2 \
+             reference without golden: determinism-mismatch 1, no-result-row 1; 0 not compared; \
+             measured mean 0.750 over 2"
+        );
+        assert_eq!(
+            run.per_backend[&SABRE].line,
+            "parity: 0/1 matched; committed selection unknown; population 1: mean 0.000 over 1 \
+             (0 full, 0 partial, 1 zero: candidate-not-selected 1); excluded: 0 reference \
+             without golden; 0 not compared; measured mean n/a over 0"
+        );
+        let rendered = render_parity_section(&summary);
+        assert_contains(
+            &rendered,
+            "| `candidate-not-enabled` | candidate not run | 0 | 1 | 0 | 1 |\n",
+        );
+        assert_contains(
+            &rendered,
+            "| `determinism-mismatch` | no golden | excluded (reference) | 1 | 0 | 1 |\n",
+        );
+        assert_contains(
+            &rendered,
+            "| `no-result-row` | unmeasured | 0 | 1 | 0 | 1 |\n",
+        );
+        assert_contains(
+            &rendered,
+            "| `no-result-row` | unmeasured | excluded (reference) | 1 | 0 | 1 |\n",
         );
     }
 
@@ -44076,7 +44509,7 @@ mod parity_summary_tests {
         );
         assert_eq!(only_run(&after).line, only_run(&before).line);
         let value = serde_json::to_value(&after).unwrap();
-        assert_eq!(value["schema"], "parity-summary/v4");
+        assert_eq!(value["schema"], "parity-summary/v5");
         assert_eq!(value["retracted_rows"], 2);
         assert!(render_parity_section(&after).contains(
             "2 parity row(s) were withdrawn by a `parity.retraction` in the ledger and are in no figure."
@@ -44193,15 +44626,15 @@ mod parity_summary_tests {
         );
         assert_eq!(
             run.line,
-            "parity: 0/2 matched; committed selection unknown; mean 0.100 over 1 measured; \
-             floor 0.050 over 2 of 2 selected (counted as 0: 1 refused; excluded: 0 no golden; \
-             0 not compared) [inputs not equalized]"
+            "parity: 0/2 matched; committed selection unknown; population 2: mean 0.050 over 2 \
+             (0 full, 1 partial, 1 zero: refused 1); excluded: 0 reference without golden; 0 not \
+             compared; measured mean 0.100 over 1 [inputs not equalized]"
         );
         let rendered = render_parity_section(&summary);
         assert_contains(&rendered, "### Refused parity rows");
         assert_contains(
             &rendered,
-            "| **TOTAL** | 2 | 1 | 0 | 1 | 0 | 0 | 0 | 0 | 1 | 0.100 | 0.050 | not equalized |\n",
+            "| **TOTAL** | 2 | 2 | 0.050 | 0 | 1 | 1 | 0 | 0 | 1 | 0 | 0.100 | not equalized |\n",
         );
     }
 
@@ -44305,9 +44738,9 @@ mod parity_summary_tests {
         assert_eq!(run.hermit_sha.as_deref(), Some(SHA));
         assert_eq!(
             run.line,
-            "parity: 1/2 matched; committed selection unknown; mean 1.000 over 1 measured; \
-             floor 0.500 over 2 of 2 selected (counted as 0: 1 refused; excluded: 0 no golden; \
-             0 not compared) [inputs not equalized]"
+            "parity: 1/2 matched; committed selection unknown; population 2: mean 0.500 over 2 \
+             (1 full, 0 partial, 1 zero: refused 1); excluded: 0 reference without golden; 0 not \
+             compared; measured mean 1.000 over 1 [inputs not equalized]"
         );
     }
 
@@ -44411,16 +44844,18 @@ mod parity_summary_tests {
         let run = &summary.producers[0];
         // Credited: golden-1@kvm 1.0 and golden-2@kvm 0.3 with equal inputs
         // (mean 0.650); golden-1@liteinst 0.5 and golden-1@sabre 1.0 without
-        // (mean 0.750). Pooled: 2.8 over 4 measured, and over the floor's 7
-        // cells: the 9 selected less golden-3@kvm (no golden) and
-        // golden-1@dbt (not compared).
+        // (mean 0.750). Pooled: 2.8 over 4 measured, and over the population's
+        // 8 cells: the 9 selected less golden-1@dbt (not compared). The
+        // nondeterministic candidate golden-3@kvm, the missing candidate
+        // golden-2@liteinst, the refused golden-3@liteinst and the
+        // record-missing golden-4@kvm are its 4 zeros.
         assert_eq!(
             run.line,
-            "parity: 2/9 matched; committed selection unknown; mean 0.700 over 4 measured; \
-             floor 0.400 over 7 of 9 selected (counted as 0: 1 unmeasured: no-result-row 1; \
-             1 record-missing; 1 refused; excluded: 1 no golden: determinism-mismatch 1; \
-             1 not compared) [inputs equalized for 2 of 4 credited: mean 0.650 over 2 with \
-             equal inputs; mean 0.750 over 2 with unequal inputs]"
+            "parity: 2/9 matched; committed selection unknown; population 8: mean 0.350 over 8 \
+             (2 full, 2 partial, 4 zero: determinism-mismatch 1, no-result-row 1, \
+             record-missing 1, refused 1); excluded: 0 reference without golden; 1 not \
+             compared; measured mean 0.700 over 4 [inputs equalized for 2 of 4 credited: mean \
+             0.650 over 2 with equal inputs; mean 0.750 over 2 with unequal inputs]"
         );
         assert_eq!(
             (
@@ -44432,17 +44867,17 @@ mod parity_summary_tests {
         assert_eq!(cell(run, "c-programs/golden-2@kvm").credit, Some(0.3));
         let rendered = render_parity_section(&summary);
         for expected in [
-            "| `dbt` | 1 | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 0 | n/a | n/a | \
+            "| `dbt` | 1 | 0 | n/a | 0 | 0 | 0 | 0 | 1 | 0 | 0 | n/a | \
              not compared (inputs cannot be equalized) |\n",
-            "| `kvm` | 4 | 2 | 1 | 1 | 1 | 0 | 0 | 1 | 0 | 0.650 | 0.433 | equalized |\n",
-            "| `liteinst` | 3 | 1 | 0 | 1 | 0 | 0 | 1 | 0 | 1 | 0.500 | 0.167 | not equalized |\n",
-            "| `sabre` | 1 | 1 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 1.000 | 1.000 | not equalized |\n",
-            "| **TOTAL** | 9 | 4 | 2 | 2 | 1 | 1 | 1 | 1 | 1 | 0.700 | 0.400 | \
+            "| `kvm` | 4 | 4 | 0.325 | 1 | 1 | 2 | 0 | 0 | 2 | 1 | 0.650 | equalized |\n",
+            "| `liteinst` | 3 | 3 | 0.167 | 0 | 1 | 2 | 0 | 0 | 1 | 0 | 0.500 | not equalized |\n",
+            "| `sabre` | 1 | 1 | 1.000 | 1 | 0 | 0 | 0 | 0 | 1 | 1 | 1.000 | not equalized |\n",
+            "| **TOTAL** | 9 | 8 | 0.350 | 2 | 2 | 4 | 0 | 1 | 4 | 2 | 0.700 | \
              equalized for 2 of 4 (mean 0.650 equal; 0.750 unequal) |\n",
             // The cells that were not measured, by class and backend.
-            "| Class | Group | `dbt` | `kvm` | `liteinst` | `sabre` | **TOTAL** |\n",
-            "| `determinism-mismatch` | no golden | 0 | 1 | 0 | 0 | 1 |\n",
-            "| `no-result-row` | unmeasured | 0 | 0 | 1 | 0 | 1 |\n",
+            "| Class | Group | Counts as | `dbt` | `kvm` | `liteinst` | `sabre` | **TOTAL** |\n",
+            "| `determinism-mismatch` | no golden | 0 | 0 | 1 | 0 | 0 | 1 |\n",
+            "| `no-result-row` | unmeasured | 0 | 0 | 0 | 1 | 0 | 1 |\n",
             "| `c-programs/golden-1@liteinst` | diverged | 0.500 (unequalized) | record 51, syscall 7: token 3: `a51` vs `b51` |\n",
             "| `c-programs/golden-2@kvm` | diverged | 0.300 | record 31, syscall 4: token 3: `a31` vs `b31` |\n",
             "| `c-programs/golden-3@kvm` | nondeterministic[determinism-mismatch] | — |",
@@ -44463,12 +44898,12 @@ mod parity_summary_tests {
         let encoded =
             String::from_utf8(encoded_parity_summary(&summary).unwrap().unwrap()).unwrap();
         let value: JsonValue = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(value["schema"], "parity-summary/v4");
+        assert_eq!(value["schema"], "parity-summary/v5");
         assert_eq!(
-            value["producers"][0]["total"]["floor_credit"]
+            value["producers"][0]["total"]["population_mean_credit"]
                 .as_f64()
                 .map(|v| format!("{v:.3}")),
-            Some("0.400".into())
+            Some("0.350".into())
         );
         assert_eq!(
             value["producers"][0]["per_backend"]["kvm"]["record_missing"],
@@ -44553,7 +44988,7 @@ mod parity_summary_tests {
         contradicted.verdict = LedgerVerdict::Diverged;
         // A full match beside a more adverse report of the same cell from
         // another node: (more adverse, kept verdict, kept credit, counts,
-        // floor).
+        // population mean).
         let cases = [
             (
                 from_node(row(diverged(&golden(1), KVM, 10, 100, 11, 12, true)), OTHER),
@@ -44576,8 +45011,8 @@ mod parity_summary_tests {
                 [1, 0, 0, 0, 0, 0, 0, 0, 1],
                 Some(0.0),
             ),
-            // A timed-out operand leaves no golden log, so the kept cell is
-            // outside the floor, which is then over no cell.
+            // A timed-out candidate leaves no log, so the kept cell scores 0
+            // and stays in the population.
             (
                 from_node(
                     row(unmeasured(
@@ -44593,10 +45028,10 @@ mod parity_summary_tests {
                 "unavailable",
                 None,
                 [1, 0, 0, 0, 1, 0, 0, 0, 0],
-                None,
+                Some(0.0),
             ),
         ];
-        for (adverse, verdict, credit, expected, floor) in cases {
+        for (adverse, verdict, credit, expected, population_mean) in cases {
             for rows in [[full(), adverse.clone()], [adverse.clone(), full()]] {
                 let order = rows.iter().map(|row| row.verdict).collect::<Vec<_>>();
                 let summary = summarize_rows(&rows, &no_cells());
@@ -44610,7 +45045,11 @@ mod parity_summary_tests {
                 let kept = cell(run, "c-programs/golden-1@kvm");
                 assert_eq!((kept.verdict, kept.credit), (verdict, credit), "{order:?}");
                 assert_eq!(counts(&run.total), expected, "{order:?}");
-                assert_eq!(run.total.floor_credit, floor, "{order:?}");
+                assert_eq!(run.total.population, 1, "{order:?}");
+                assert_eq!(
+                    run.total.population_mean_credit, population_mean,
+                    "{order:?}"
+                );
             }
         }
         // Equal rank and equal credit: the kept report is still the same in
@@ -44838,9 +45277,9 @@ mod parity_summary_tests {
             );
             assert_eq!(
                 run.line,
-                "parity: 0/13 matched; committed selection unknown; mean n/a over 0 measured; \
-                 floor 0.000 over 13 of 13 selected (counted as 0: 13 refused; excluded: \
-                 0 no golden; 0 not compared)"
+                "parity: 0/13 matched; committed selection unknown; population 13: mean 0.000 \
+                 over 13 (0 full, 0 partial, 13 zero: refused 13); excluded: 0 reference without \
+                 golden; 0 not compared; measured mean n/a over 0"
             );
             let messages = summary
                 .refusals
@@ -44894,12 +45333,14 @@ mod parity_summary_tests {
                 &committed_of,
             )
         };
-        let complete_line = "parity: 0/3 matched; selected 3 of 3 committed; mean 0.100 over 3 \
-                             measured; floor 0.100 over 3 of 3 selected (excluded: 0 no golden; \
-                             0 not compared) [inputs not equalized]";
-        let partial_line = "parity: 1/1 matched; selected 1 of 3 committed (partial); mean 1.000 \
-                            over 1 measured; floor 1.000 over 1 of 1 selected (excluded: 0 no \
-                            golden; 0 not compared) [inputs not equalized]";
+        let complete_line = "parity: 0/3 matched; selected 3 of 3 committed; population 3: mean \
+                             0.100 over 3 (0 full, 3 partial, 0 zero); excluded: 0 reference \
+                             without golden; 0 not compared; measured mean 0.100 over 3 [inputs \
+                             not equalized]";
+        let partial_line = "parity: 1/1 matched; selected 1 of 3 committed (partial); population \
+                            1: mean 1.000 over 1 (1 full, 0 partial, 0 zero); excluded: 0 \
+                            reference without golden; 0 not compared; measured mean 1.000 over 1 \
+                            [inputs not equalized]";
         // A later partial run at the same commit, and a partial run at a
         // deeper commit.
         for (run_id, sha, emitted_at) in [
@@ -45144,8 +45585,9 @@ mod parity_summary_tests {
         assert_eq!(
             run.line,
             "parity: 0/3 matched; selected 2 of 4 committed (partial); 1 outside the committed \
-             selection; mean 0.083 over 3 measured; floor 0.083 over 3 of 3 selected \
-             (excluded: 0 no golden; 0 not compared) [inputs not equalized]"
+             selection; population 3: mean 0.083 over 3 (0 full, 3 partial, 0 zero); excluded: \
+             0 reference without golden; 0 not compared; measured mean 0.083 over 3 [inputs not \
+             equalized]"
         );
         assert_eq!(
             run.committed_cells_without_row,
@@ -45166,12 +45608,12 @@ mod parity_summary_tests {
         for expected in [
             "\n### validate run `validate-golden-run` at `0123456789ab` (partial: selected 2 of 4 \
              committed)\n",
-            "| `kvm` | 2 of 3 | 2 | 0 | 2 | 0 | 0 | 0 | 0 | 0 | 0.100 | 0.100 | not equalized |\n",
-            "| `liteinst` | 0 of 0 +1 outside | 1 | 0 | 1 | 0 | 0 | 0 | 0 | 0 | 0.050 | 0.050 | \
+            "| `kvm` | 2 of 3 | 2 | 0.100 | 0 | 2 | 0 | 0 | 0 | 2 | 0 | 0.100 | not equalized |\n",
+            "| `liteinst` | 0 of 0 +1 outside | 1 | 0.050 | 0 | 1 | 0 | 0 | 0 | 1 | 0 | 0.050 | \
              not equalized |\n",
             // Owed a cell, reported none: still shown.
-            "| `sabre` | 0 of 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | n/a | n/a | — |\n",
-            "| **TOTAL** | 2 of 4 +1 outside | 3 | 0 | 3 | 0 | 0 | 0 | 0 | 0 | 0.083 | 0.083 | \
+            "| `sabre` | 0 of 1 | 0 | n/a | 0 | 0 | 0 | 0 | 0 | 0 | 0 | n/a | — |\n",
+            "| **TOTAL** | 2 of 4 +1 outside | 3 | 0.083 | 0 | 3 | 0 | 0 | 0 | 3 | 0 | 0.083 | \
              not equalized |\n",
             "\n2 cell(s) its commit selects have no row in this run: `c-programs/golden-1@sabre`, \
              `c-programs/golden-3@kvm`.\n",
@@ -45651,16 +46093,41 @@ mod parity_summary_tests {
             )),
             &golden(1),
         );
-        // Control: with its class, it is a no-golden cell outside the floor.
+        // Control: with its class, it is a no-golden candidate, in the
+        // population as a timeout zero.
         let tally = ParityTally::over([&cell]);
         assert_eq!(counts(&tally), [1, 0, 0, 0, 1, 0, 0, 0, 0]);
-        assert_eq!((tally.floor_cells, tally.floor_credit), (0, None));
-        // Without it (validation never admits such a row), it is refused and
-        // counts as 0 in the floor.
-        cell.unavailable_class = None;
-        let tally = ParityTally::over([&cell]);
-        assert_eq!(counts(&tally), [1, 0, 0, 0, 0, 0, 0, 0, 1]);
-        assert_eq!((tally.floor_cells, tally.floor_credit), (1, Some(0.0)));
+        assert_eq!(
+            (tally.population, tally.population_mean_credit),
+            (1, Some(0.0))
+        );
+        assert_eq!(tally.zero_by_class[&UnavailableClass::Timeout], 1);
+        // The same class on the reference side is outside the population.
+        let mut reference = cell.clone();
+        reference.operand = Some(ParityOperand::Reference);
+        let tally = ParityTally::over([&reference]);
+        assert_eq!((tally.population, tally.reference_excluded), (0, 1));
+        assert_eq!(
+            tally.reference_excluded_by_class[&UnavailableClass::Timeout],
+            1
+        );
+        assert_eq!(tally.population_mean_credit, None);
+        // Without a class (validation never admits such a row), it is refused
+        // and counts as 0 whatever its operand.
+        for operand in [
+            Some(ParityOperand::Candidate),
+            Some(ParityOperand::Reference),
+        ] {
+            cell.unavailable_class = None;
+            cell.operand = operand;
+            let tally = ParityTally::over([&cell]);
+            assert_eq!(counts(&tally), [1, 0, 0, 0, 0, 0, 0, 0, 1]);
+            assert_eq!(
+                (tally.population, tally.population_mean_credit),
+                (1, Some(0.0))
+            );
+            assert!(tally.zero_by_class.values().all(|count| *count == 0));
+        }
     }
 
     fn fixture_dir() -> PathBuf {
@@ -45711,9 +46178,10 @@ mod parity_summary_tests {
         assert_eq!(run.hermit_sha.as_deref(), Some(fixture_sha));
         assert_eq!(
             run.line,
-            "parity: 0/192 matched; selected 192 of 192 committed; mean 0.052 over 175 measured; \
-             floor 0.051 over 178 of 192 selected (counted as 0: 3 unmeasured: no-result-row 3; \
-             excluded: 0 no golden; 14 not compared) [inputs not equalized]"
+            "parity: 0/192 matched; selected 192 of 192 committed; population 178: mean 0.051 \
+             over 178 (0 full, 175 partial, 3 zero: no-result-row 3); excluded: 0 reference \
+             without golden; 14 not compared; measured mean 0.052 over 175 [inputs not \
+             equalized]"
         );
         assert!(run.committed_cells_without_row.is_empty());
         assert!(run.cells_outside_committed.is_empty());
@@ -45728,15 +46196,18 @@ mod parity_summary_tests {
             [
                 "dbt: parity: not compared: 0 measured of 14 selected (inputs cannot be \
                  equalized); selected 14 of 14 committed",
-                "kvm: parity: 0/77 matched; selected 77 of 77 committed; mean 0.101 over 76 \
-                 measured; floor 0.100 over 77 of 77 selected (counted as 0: 1 unmeasured: \
-                 no-result-row 1; excluded: 0 no golden; 0 not compared) [inputs not equalized]",
-                "liteinst: parity: 0/99 matched; selected 99 of 99 committed; mean 0.014 over 98 \
-                 measured; floor 0.014 over 99 of 99 selected (counted as 0: 1 unmeasured: \
-                 no-result-row 1; excluded: 0 no golden; 0 not compared) [inputs not equalized]",
-                "sabre: parity: 0/2 matched; selected 2 of 2 committed; mean 0.020 over 1 \
-                 measured; floor 0.010 over 2 of 2 selected (counted as 0: 1 unmeasured: \
-                 no-result-row 1; excluded: 0 no golden; 0 not compared) [inputs not equalized]",
+                "kvm: parity: 0/77 matched; selected 77 of 77 committed; population 77: mean \
+                 0.100 over 77 (0 full, 76 partial, 1 zero: no-result-row 1); excluded: 0 \
+                 reference without golden; 0 not compared; measured mean 0.101 over 76 [inputs \
+                 not equalized]",
+                "liteinst: parity: 0/99 matched; selected 99 of 99 committed; population 99: \
+                 mean 0.014 over 99 (0 full, 98 partial, 1 zero: no-result-row 1); excluded: 0 \
+                 reference without golden; 0 not compared; measured mean 0.014 over 98 [inputs \
+                 not equalized]",
+                "sabre: parity: 0/2 matched; selected 2 of 2 committed; population 2: mean 0.010 \
+                 over 2 (0 full, 1 partial, 1 zero: no-result-row 1); excluded: 0 reference \
+                 without golden; 0 not compared; measured mean 0.020 over 1 [inputs not \
+                 equalized]",
             ]
         );
         assert_eq!(run.total.not_compared, 14);
@@ -45925,13 +46396,14 @@ mod parity_summary_tests {
 
     const OTHER_SHA: &str = "6be37a833df89f7836c2aa5dbe47a95569aada62";
     /// The line of a run of one equalized match, its selection unknown.
-    const ONE_MATCH: &str = "parity: 1/1 matched; committed selection unknown; mean 1.000 over 1 \
-                             measured; floor 1.000 over 1 of 1 selected (excluded: 0 no golden; 0 \
-                             not compared)";
+    const ONE_MATCH: &str = "parity: 1/1 matched; committed selection unknown; population 1: mean \
+                             1.000 over 1 (1 full, 0 partial, 0 zero); excluded: 0 reference \
+                             without golden; 0 not compared; measured mean 1.000 over 1";
     /// The line of a run whose one row was refused.
-    const REFUSED_ONE: &str = "parity: 0/1 matched; committed selection unknown; mean n/a over 0 \
-                               measured; floor 0.000 over 1 of 1 selected (counted as 0: 1 \
-                               refused; excluded: 0 no golden; 0 not compared)";
+    const REFUSED_ONE: &str = "parity: 0/1 matched; committed selection unknown; population 1: \
+                               mean 0.000 over 1 (0 full, 0 partial, 1 zero: refused 1); \
+                               excluded: 0 reference without golden; 0 not compared; measured \
+                               mean n/a over 0";
     /// The paragraph under the title of the other runs.
     const OTHER_RUNS_TEXT: &str = "Only a run from a clean source tree can be its producer's \
         headline: at least one of its rows says `\"source_tree_dirty\": false`, and none says \
@@ -46112,7 +46584,7 @@ mod parity_summary_tests {
             BRIEF_KEYS
         );
         let value: JsonValue = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value["schema"], "parity-summary/v4");
+        assert_eq!(value["schema"], "parity-summary/v5");
         assert_eq!(value["producers"][0]["source_tree_dirty"], false);
         assert_eq!(value["runs"][0]["source_tree_dirty"], false);
         assert_eq!(value["runs"][0]["headline"], true);
@@ -46446,15 +46918,15 @@ mod parity_summary_tests {
                 ),
             ]
         );
-        let one_of_two = "parity: 1/2 matched; committed selection unknown; mean 1.000 over 1 \
-                          measured; floor 0.500 over 2 of 2 selected (counted as 0: 1 refused; \
-                          excluded: 0 no golden; 0 not compared)";
-        let two_refused = "parity: 0/2 matched; committed selection unknown; mean n/a over 0 \
-                           measured; floor 0.000 over 2 of 2 selected (counted as 0: 2 refused; \
-                           excluded: 0 no golden; 0 not compared)";
-        let two_matched = "parity: 2/2 matched; committed selection unknown; mean 1.000 over 2 \
-                           measured; floor 1.000 over 2 of 2 selected (excluded: 0 no golden; 0 \
-                           not compared)";
+        let one_of_two = "parity: 1/2 matched; committed selection unknown; population 2: mean \
+                          0.500 over 2 (1 full, 0 partial, 1 zero: refused 1); excluded: 0 \
+                          reference without golden; 0 not compared; measured mean 1.000 over 1";
+        let two_refused = "parity: 0/2 matched; committed selection unknown; population 2: mean \
+                           0.000 over 2 (0 full, 0 partial, 2 zero: refused 2); excluded: 0 \
+                           reference without golden; 0 not compared; measured mean n/a over 0";
+        let two_matched = "parity: 2/2 matched; committed selection unknown; population 2: mean \
+                           1.000 over 2 (2 full, 0 partial, 0 zero); excluded: 0 reference \
+                           without golden; 0 not compared; measured mean 1.000 over 2";
         assert_eq!(
             summary.runs,
             [
@@ -46605,9 +47077,9 @@ mod parity_summary_tests {
             ),
             (192, 0)
         );
-        let all = "parity: 192/192 matched; committed selection unknown; mean 1.000 over 192 \
-                   measured; floor 1.000 over 192 of 192 selected (excluded: 0 no golden; 0 not \
-                   compared)";
+        let all = "parity: 192/192 matched; committed selection unknown; population 192: mean \
+                   1.000 over 192 (192 full, 0 partial, 0 zero); excluded: 0 reference without \
+                   golden; 0 not compared; measured mean 1.000 over 192";
         assert_eq!(
             summary.runs,
             [

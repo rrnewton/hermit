@@ -415,7 +415,7 @@ Selection and bounded-batch options (run and plan):
                            throttled to the KVM-safe width.
   --parity-select CELLS    Also measure these parity cells (comma-separated
                            <test-id>@<backend>) after the series, besides the
-                           tests/e2e/parity-selection.yaml cells. A cell is
+                           parity population's cells. A cell is
                            reported when the series ran its ptrace or its
                            candidate verify cell; the missing side is
                            reference-missing or candidate-missing. A cell with
@@ -426,12 +426,19 @@ Parity post-pass (run and summarize):
   Once DIR/summary.json is written, the same post-pass as test-harness compares
   each parity cell's candidate verify log with the ptrace verify log of the same
   series (first repetition of each) and writes one line per cell to
-  DIR/parity.jsonl. Its cells are those of tests/e2e/parity-selection.yaml,
-  --parity-select, and a sample's own parity candidates, each scored against
-  the ptrace reference the sample holds or runs beside it. A verify cell whose
-  first repetition the summary refused makes its parity cells unavailable,
-  with the summary's reason; a reference that left no result row makes its
-  pair reference-missing. Every cell of a series is launched with one
+  DIR/parity.jsonl. Its cells are those of the parity population (every test
+  whose ptrace verify cell full validation selects, on every candidate
+  backend), --parity-select, and a sample's own parity candidates, each scored
+  against the ptrace reference the sample holds or runs beside it. A candidate
+  that full validation enables and selects but this sample did not plan is
+  excluded from the series' population and counted separately
+  (candidate-not-sampled). A candidate that is not enabled or not selected by
+  full validation, that left no result row, or whose cell failed on any
+  repetition scores 0. A verify cell whose first repetition the summary
+  refused makes its parity cells unavailable, with the summary's reason; a
+  reference that left no result row makes its pair reference-missing, and a
+  reference whose cell failed on any repetition leaves its pairs outside the
+  population, counted apart. Every cell of a series is launched with one
   HERMIT_EPOCH, recorded in run.json. The post-pass never changes summary.json
   or the exit status.
 
@@ -958,7 +965,7 @@ struct CellSelection {
     #[serde(default)]
     cells_file: Option<PathBuf>,
     /// `--parity-select`: parity cells (`<test-id>@<backend>`) measured after
-    /// the series in addition to the committed selection, canonical and
+    /// the series in addition to the parity population, canonical and
     /// sorted. They add no cell to the plan.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     parity_select: Vec<String>,
@@ -2008,8 +2015,8 @@ struct RunMetadata {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     unsampleable_cells: Vec<UnsampleableCell>,
     /// The parity cells (`<test-id>@<backend>`) of the sampled candidates, in
-    /// canonical order. The post-pass reports them besides the committed
-    /// selection and `--parity-select`.
+    /// canonical order. The post-pass reports them besides the parity
+    /// population and `--parity-select`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     parity_pairs: Vec<String>,
     cells: Vec<CellId>,
@@ -8574,28 +8581,59 @@ struct RepetitionSample<'a> {
     retained_prerequisite: bool,
 }
 
-/// Fold one repetition into its cell's tally: the one place a repetition
-/// becomes terminal/clean/qualifying passes or a failure class. An inner
-/// result history that cannot be parsed is appended to
-/// `sample_evidence_errors`, which the caller also reports.
-fn fold_repetition(
-    tally: &mut RepeatedCellTally,
-    sample: &RepetitionSample<'_>,
-    sample_evidence_errors: &mut Vec<String>,
-) {
+/// What one repetition's retained result history establishes, as
+/// [`assess_repetition_history`] decides it: the one judgement both
+/// [`fold_repetition`] (the series tally) and the parity admission of the
+/// same repetition use, so parity can never credit a history the series
+/// refuses.
+struct HistoryAssessment {
+    inner_history: Option<Result<BTreeSet<RepetitionClassification>, InnerHistoryRejection>>,
+    /// A result a retained timed-out attempt contradicts.
+    contradicted: bool,
+    labelled_clean: bool,
+    /// A PASS row retaining an invocation that did not pass.
+    contradicted_pass: Option<String>,
+    sample_artifacts_valid: bool,
+    /// The retained history is unknown or contradicts its own PASS label.
+    unknown_history: bool,
+}
+
+impl HistoryAssessment {
+    /// Why the series refuses this repetition's retained history, if it
+    /// does: an unknown history (inner evidence or retained artifacts that do
+    /// not validate, or a PASS label its own invocations contradict) or a
+    /// result a timed-out attempt contradicts. Such a repetition earns no
+    /// clean-pass credit, so it earns no parity credit either.
+    fn refusal(&self) -> Option<String> {
+        if !self.contradicted && !self.unknown_history {
+            return None;
+        }
+        let mut why = Vec::new();
+        if let Some(Err(rejection)) = &self.inner_history {
+            why.push(rejection.message().to_owned());
+        }
+        if let Some(error) = &self.contradicted_pass {
+            why.push(error.clone());
+        }
+        if !self.sample_artifacts_valid {
+            why.push("its retained artifacts did not validate".to_owned());
+        }
+        if why.is_empty() {
+            why.push("its retained result history is unknown or contradicts its result".into());
+        }
+        Some(why.join("; "))
+    }
+}
+
+/// Judge one repetition's retained result history; see [`HistoryAssessment`].
+fn assess_repetition_history(sample: &RepetitionSample<'_>) -> HistoryAssessment {
     let RepetitionSample {
         result,
         rows,
-        retained_attempts,
         row_valid,
         evidence_error_count,
         typed_no_comparison_refusal,
-        prepared_empty_result_file,
-        initial_evidence_valid,
-        rejected_result_history,
-        proven_timeout,
-        proven_oom,
-        retained_prerequisite,
+        ..
     } = *sample;
     let inner_history = if rows.is_empty() {
         None
@@ -8611,12 +8649,6 @@ fn fold_repetition(
         &inner_history,
         Some(Err(InnerHistoryRejection::ContradictedResult(_)))
     );
-    let passed = result == "pass" && !contradicted;
-    tally.total += 1;
-    tally.terminal_passes += usize::from(passed);
-    tally.contradicted_results += usize::from(contradicted);
-    tally.infrastructure_errors +=
-        usize::from(matches!(result, "infrastructure-error" | "sandbox-denied"));
     // What the outer labels alone would credit as a clean pass: a terminal
     // pass whose every retained row is labelled PASS. The label is never
     // enough by itself; the clean-pass credit below also requires a known,
@@ -8631,26 +8663,6 @@ fn fold_repetition(
         Some(Ok(_)) if labelled_clean => pass_row_retaining_a_nonpassing_invocation(rows),
         _ => None,
     };
-    // Skid-recovery credit is granted only to a history that passed the
-    // inner-history validation above (every outer row's inner attempts
-    // present, with nonempty distinct indices and retained reports whose
-    // digests match) and whose validated inner categories are all
-    // infrastructure failures: a history the runner would not have written,
-    // or one that retains a product failure, a no-result or a prerequisite
-    // failure anywhere, keeps the ordinary reading, under which a pass after
-    // a retry is a flake. `passed_after_skid_retries_only` already requires
-    // skid-only earlier rows (every inner attempt an infrastructure ERROR) and
-    // a selected PASS of qualifying subruns (no category at all), so the
-    // category condition restates that requirement on the validated history
-    // rather than adding a new one.
-    let recovered_from_infrastructure = retained_attempts > 1
-        && matches!(
-            &inner_history,
-            Some(Ok(categories)) if categories
-                .iter()
-                .all(|category| *category == RepetitionClassification::InfrastructureFailure)
-        )
-        && passed_after_skid_retries_only(result, rows);
     // A typed NoResult stamp legitimately has no comparison. Only
     // that one verified reader refusal may be explained here; missing
     // captures, golden output or other artifact errors stay incomplete.
@@ -8671,6 +8683,74 @@ fn fold_repetition(
         .is_some_and(|history| history.is_err())
         || contradicted_pass.is_some()
         || (row_valid && !sample_artifacts_valid);
+    HistoryAssessment {
+        inner_history,
+        contradicted,
+        labelled_clean,
+        contradicted_pass,
+        sample_artifacts_valid,
+        unknown_history,
+    }
+}
+
+/// Fold one repetition into its cell's tally: the one place a repetition
+/// becomes terminal/clean/qualifying passes or a failure class. An inner
+/// result history that cannot be parsed is appended to
+/// `sample_evidence_errors`, which the caller also reports.
+fn fold_repetition(
+    tally: &mut RepeatedCellTally,
+    sample: &RepetitionSample<'_>,
+    sample_evidence_errors: &mut Vec<String>,
+) {
+    let RepetitionSample {
+        result,
+        rows,
+        retained_attempts,
+        row_valid,
+        evidence_error_count,
+        // Read by `assess_repetition_history` below.
+        typed_no_comparison_refusal: _,
+        prepared_empty_result_file,
+        initial_evidence_valid,
+        rejected_result_history,
+        proven_timeout,
+        proven_oom,
+        retained_prerequisite,
+    } = *sample;
+    let HistoryAssessment {
+        inner_history,
+        contradicted,
+        labelled_clean,
+        contradicted_pass,
+        sample_artifacts_valid,
+        unknown_history,
+    } = assess_repetition_history(sample);
+    let passed = result == "pass" && !contradicted;
+    tally.total += 1;
+    tally.terminal_passes += usize::from(passed);
+    tally.contradicted_results += usize::from(contradicted);
+    tally.infrastructure_errors +=
+        usize::from(matches!(result, "infrastructure-error" | "sandbox-denied"));
+    // Skid-recovery credit is granted only to a history that passed the
+    // inner-history validation above (every outer row's inner attempts
+    // present, with nonempty distinct indices and retained reports whose
+    // digests match) and whose validated inner categories are all
+    // infrastructure failures: a history the runner would not have written,
+    // or one that retains a product failure, a no-result or a prerequisite
+    // failure anywhere, keeps the ordinary reading, under which a pass after
+    // a retry is a flake. `passed_after_skid_retries_only` already requires
+    // skid-only earlier rows (every inner attempt an infrastructure ERROR) and
+    // a selected PASS of qualifying subruns (no category at all), so the
+    // category condition restates that requirement on the validated history
+    // rather than adding a new one.
+    let recovered_from_infrastructure = retained_attempts > 1
+        && matches!(
+            &inner_history,
+            Some(Ok(categories)) if categories
+                .iter()
+                .all(|category| *category == RepetitionClassification::InfrastructureFailure)
+        )
+        && passed_after_skid_retries_only(result, rows);
     let passed_cleanly = labelled_clean && !contradicted && !unknown_history;
     tally.clean_passes += usize::from(passed_cleanly);
     tally.infrastructure_recovered += usize::from(recovered_from_infrastructure);
@@ -9355,8 +9435,10 @@ fn summarize(
     // the same way ([`parity_rejection`]): a missing or invalid row, verify
     // logs that were not retained, or a cell that only the retained
     // harness summary proves host-inapplicable. A harness or
-    // evidence defect alone is therefore unmeasured, in the floor as 0, and
-    // never an outcome that left no golden. Every other row that is the
+    // evidence defect alone is therefore unmeasured (0 in the parity
+    // population on the candidate side; on the reference side it leaves the
+    // cell outside the population, counted apart), and never an outcome that
+    // left no golden. Every other row that is the
     // cell's own (valid: its identity, harness exit and terminal attempt
     // match) and records a verify mismatch ([`parity::records_mismatch`]) is
     // handed over as where it did, with what the summary refused about it if
@@ -9370,6 +9452,12 @@ fn summarize(
     let mut parity_rows: Vec<CellResult> = Vec::new();
     let mut parity_rejected: BTreeMap<(String, String), parity::ParityRejection> = BTreeMap::new();
     let mut parity_nondeterministic: BTreeMap<(String, String), String> = BTreeMap::new();
+    // A verify cell whose first repetition supplies a passing operand but a
+    // later repetition of which did not pass: the series calls the cell red,
+    // so parity must not credit it (a candidate is a typed 0, a reference
+    // leaves its test's cells outside the population). The earliest such
+    // repetition is kept.
+    let mut parity_later_failed: BTreeMap<(String, String), parity::LaterFailure> = BTreeMap::new();
     // A sample's parity references are summarized like its cells, for the
     // post-pass, but reported apart: their rows go to `reference_rows`, and
     // they add nothing to the sample's counts, tallies or exit status.
@@ -9738,16 +9826,74 @@ fn summarize(
             if !evidence_errors.is_empty() {
                 result = "infrastructure-error";
             }
+            let retained_attempts = retained_attempt_count(
+                &result_rows_for_history,
+                &evidence_run_id,
+                &metadata,
+                cell,
+                expected.get(cell).copied().unwrap_or(false),
+                runner,
+                harness_status,
+            )?;
+            // The repetition exactly as `fold_repetition` will judge it: its
+            // history assessment is the series' own, so a repetition whose
+            // retained history the series refuses (an inner history that does
+            // not validate, retained artifacts that do not, a PASS label its
+            // invocations contradict, or a result a timed-out attempt
+            // contradicts) earns no parity credit either, whatever its outer
+            // PASS label says.
+            let sample = RepetitionSample {
+                result,
+                rows: &result_rows_for_history,
+                retained_attempts,
+                row_valid,
+                evidence_error_count: evidence_errors.len(),
+                typed_no_comparison_refusal,
+                prepared_empty_result_file,
+                initial_evidence_valid,
+                rejected_result_history,
+                proven_timeout,
+                proven_oom,
+                retained_prerequisite,
+            };
+            let history_refusal = assess_repetition_history(&sample).refusal();
             if cell.mode == parity::PARITY_MODE {
                 let first = repetition.is_none_or(|number| number == 1);
-                if first && row_valid && evidence_errors.is_empty() {
+                if first && row_valid && evidence_errors.is_empty() && history_refusal.is_none() {
                     parity_rows.extend(result_rows_for_history.iter().cloned());
                 } else {
-                    if first {
-                        let why = if evidence_errors.is_empty() {
-                            format!("result {result} with no valid result row")
+                    if !first {
+                        let detail = if evidence_errors.is_empty() {
+                            String::new()
                         } else {
-                            evidence_errors.join("; ")
+                            format!(" ({})", evidence_errors.join("; "))
+                        };
+                        let number = repetition.unwrap_or(0);
+                        let later = parity::LaterFailure::from_result(
+                            result,
+                            format!("repetition {number} of the series ended {result}{detail}"),
+                        )
+                        .or_else(|| {
+                            history_refusal.as_ref().map(|why| {
+                                parity::LaterFailure::refused_history(format!(
+                                    "the series summary refused the retained result history \
+                                     of repetition {number}: {why}"
+                                ))
+                            })
+                        });
+                        if let Some(later) = later {
+                            parity_later_failed
+                                .entry((cell.test.clone(), cell.backend.clone()))
+                                .or_insert(later);
+                        }
+                    }
+                    if first {
+                        let why = match (&history_refusal, evidence_errors.is_empty()) {
+                            (_, false) => evidence_errors.join("; "),
+                            (Some(why), true) if row_valid => {
+                                format!("its retained result history was refused: {why}")
+                            }
+                            _ => format!("result {result} with no valid result row"),
                         };
                         let reason = format!("result row rejected by the series summary: {why}");
                         let evidence = RefusedParityEvidence {
@@ -9762,7 +9908,11 @@ fn summarize(
                             no_row: result_rows_for_history.is_empty()
                                 && matches!(result_file_size, None | Some(0)),
                             row_valid,
-                            other_error: evidence_errors.len() > log_errors,
+                            // A history refused with no evidence error of its
+                            // own is an invalid row; one whose evidence errors
+                            // already refused it keeps their class.
+                            other_error: evidence_errors.len() > log_errors
+                                || (evidence_errors.is_empty() && history_refusal.is_some()),
                             log_error: log_errors > 0,
                         };
                         parity_rejected.insert(
@@ -9804,15 +9954,6 @@ fn summarize(
                     }
                 }
             }
-            let retained_attempts = retained_attempt_count(
-                &result_rows_for_history,
-                &evidence_run_id,
-                &metadata,
-                cell,
-                expected.get(cell).copied().unwrap_or(false),
-                runner,
-                harness_status,
-            )?;
             if !is_reference {
                 attempted = attempted
                     .checked_add(retained_attempts)
@@ -9826,20 +9967,7 @@ fn summarize(
             if metadata.repetitions.is_some() && !is_reference {
                 fold_repetition(
                     repeated.entry(cell.clone()).or_default(),
-                    &RepetitionSample {
-                        result,
-                        rows: &result_rows_for_history,
-                        retained_attempts,
-                        row_valid,
-                        evidence_error_count: evidence_errors.len(),
-                        typed_no_comparison_refusal,
-                        prepared_empty_result_file,
-                        initial_evidence_valid,
-                        rejected_result_history,
-                        proven_timeout,
-                        proven_oom,
-                        retained_prerequisite,
-                    },
+                    &sample,
                     &mut sample_evidence_errors,
                 );
                 if retained_attempts > 1 {
@@ -10290,6 +10418,7 @@ fn summarize(
         &parity_rows,
         &parity_rejected,
         &parity_nondeterministic,
+        &parity_later_failed,
         &mut std::io::stdout(),
         &mut std::io::stderr(),
     );
@@ -10361,8 +10490,9 @@ struct RefusedParityEvidence {
 /// the parity post-pass with ([`parity::PostPassConfig::rejected`]): the
 /// condition the harness's own post-pass classifies the same way
 /// ([`parity::ParityRejection::typed`]). A harness or evidence defect is
-/// therefore unmeasured, in the floor as 0, and never an outcome that left
-/// no golden; `infrastructure-error` stays the class of a row whose own
+/// therefore unmeasured (0 in the parity population on the candidate side;
+/// on the reference side the cell is outside the population, counted apart),
+/// and never an outcome that left no golden; `infrastructure-error` stays the class of a row whose own
 /// typed result says so. <https://github.com/rrnewton/hermit/issues/3301>
 ///
 /// In order, as the post-pass checks an operand:
@@ -10424,6 +10554,7 @@ fn report_parity(
     rows: &[CellResult],
     rejected: &BTreeMap<(String, String), parity::ParityRejection>,
     nondeterministic: &BTreeMap<(String, String), String>,
+    later_failed: &BTreeMap<(String, String), parity::LaterFailure>,
     out: &mut dyn std::io::Write,
     err: &mut dyn std::io::Write,
 ) {
@@ -10437,6 +10568,7 @@ fn report_parity(
     config.jobs = usize::try_from(metadata.jobs).unwrap_or(1).max(1);
     config.rejected = rejected.clone();
     config.nondeterministic = nondeterministic.clone();
+    config.later_failed = later_failed.clone();
     let mut warnings = Vec::new();
     let mut scope = None;
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -10476,7 +10608,7 @@ fn report_parity(
 /// The same [`parity::post_pass`] that `test-harness run` calls, over the
 /// verify histories of the whole series that the summary accepted. Its scope
 /// comes from [`parity::resolve_scope`], the harness's rule: a cell of the
-/// committed selection or of `--parity-select` is reported when the series
+/// parity population or of `--parity-select` is reported when the series
 /// ran its ptrace or its candidate verify cell, and an explicit cell with
 /// neither side in the series is dropped with a warning. `None` when nothing
 /// is in scope, after the previous outputs are removed. A scope that cannot
@@ -10513,14 +10645,21 @@ fn pressure_parity(
     if PANIC_IN_SERIES_PARITY.with(|armed| armed.replace(false)) {
         panic!("planted series post-pass panic");
     }
-    parity::post_pass(config, &scope.cells, rows).map(Some)
+    // A population cell whose candidate full validation does not run, and
+    // which the series did not run either, is typed by why (not enabled, or
+    // not selected) and scores 0.
+    let mut config = config.clone();
+    config.candidate_not_run = scope.candidate_not_run;
+    parity::post_pass(&config, &scope.cells, rows).map(Some)
 }
 
 /// [`parity::resolve_scope`] over the verify cells the series selected, and
-/// its `--parity-select` cells and sampled pairs. A parity reference is not a
+/// its `--parity-select` cells and sampled pairs, with every enabled and
+/// selected candidate the series did not plan marked not sampled
+/// ([`parity::ResolvedScope::mark_unsampled_candidates`]). A parity reference is not a
 /// planned side here: it contributes only the pair it was added for, which
-/// `parity_pairs` names, and never pulls its test's other committed
-/// selection cells into the scope as `candidate-missing` rows. Its rows still
+/// `parity_pairs` names, and never pulls its test's other population cells
+/// into the scope as `candidate-missing` rows. Its rows still
 /// reach the post-pass as that pair's reference operand.
 fn series_parity_scope(
     root: &Path,
@@ -10532,7 +10671,7 @@ fn series_parity_scope(
         .iter()
         .filter(|cell| cell.mode == parity::PARITY_MODE)
         .map(|cell| (cell.test.clone(), cell.backend.clone()))
-        .collect();
+        .collect::<BTreeSet<_>>();
     let explicit = metadata
         .parity_select
         .iter()
@@ -10540,7 +10679,12 @@ fn series_parity_scope(
         .cloned()
         .collect::<Vec<_>>()
         .join(",");
-    parity::resolve_scope(root, &manifests, Some(&explicit), &planned)
+    // A series runs a sample, not the full plan: a population cell whose
+    // candidate full validation runs but this series did not plan is outside
+    // the series' population, counted apart, never scored 0.
+    let mut scope = parity::resolve_scope(&manifests, Some(&explicit), &planned)?;
+    scope.mark_unsampled_candidates(&planned);
+    Ok(scope)
 }
 
 /// The hermit whose `log-diff` compares the logs: the binary the verify cells
@@ -24472,8 +24616,9 @@ mod pressure_sample_tests {
     /// A verify cell whose first repetition the summary refused reaches the
     /// parity post-pass as the condition the harness's own post-pass
     /// classifies the same way, checked in the post-pass's order. Every such
-    /// harness or evidence defect is unmeasured, in the floor as 0, as the
-    /// reference or as a candidate. Only a cell the retained harness summary
+    /// harness or evidence defect is unmeasured, as the reference or as a
+    /// candidate (0 in the parity population for a candidate; a reference's
+    /// leaves its cell outside the population, counted apart). Only a cell the retained harness summary
     /// proves host-inapplicable leaves no golden, as a `HOST-INAPPLICABLE`
     /// row does, and nothing the summary refuses is `infrastructure-error`.
     #[test]
@@ -24590,7 +24735,7 @@ mod pressure_sample_tests {
     /// dropped with a warning. A post-pass that measures nothing, because its
     /// scope is empty or cannot be resolved, leaves no records of an earlier
     /// summary behind. A verify cell no row of which is the cell's own makes
-    /// its parity cells unmeasured, in the floor as 0, with the class the
+    /// its parity cells unmeasured, with the class the
     /// harness gives the first repetition's condition and the summary's
     /// reason for it.
     #[test]
@@ -24604,12 +24749,12 @@ mod pressure_sample_tests {
                 .get(cell)
                 .is_some_and(parity::ParityAvailability::applicable)
         };
-        // A test the committed selection does not name, so a series of its
-        // ptrace verify cell alone has nothing in scope until a cell is
-        // selected explicitly.
-        let committed_tests: BTreeSet<String> = parity::ParitySelection::load(&root, &matrix)
-            .unwrap()
-            .cells
+        // A test outside the parity population (full validation does not
+        // select its ptrace verify cell), so a series of its ptrace verify
+        // cell alone has nothing in scope until a cell is selected
+        // explicitly.
+        let committed_tests: BTreeSet<String> = matrix
+            .population()
             .into_iter()
             .map(|cell| cell.test_id)
             .collect();
@@ -24631,7 +24776,7 @@ mod pressure_sample_tests {
             })
             .expect(
                 "fixture needs a red ptrace verify cell whose test has a comparable parity cell \
-                 and is not in the committed selection",
+                 and is not in the parity population",
             );
         let missing_cell = matrix
             .cells()
@@ -24765,6 +24910,7 @@ mod pressure_sample_tests {
             &rows,
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
             &mut out,
             &mut err,
         );
@@ -24776,14 +24922,20 @@ mod pressure_sample_tests {
             out.starts_with("pressure-test: parity: 1 cell(s) -> "),
             "{out}"
         );
+        // The reference left no golden, so the one cell is outside the
+        // population and counted apart.
         assert!(
-            out.ends_with(
-                ": matched 0, diverged 0, nondeterministic 1, reference-missing 0, \
+            out.ends_with(&format!(
+                ": population 0: mean credit n/a over 0 (0 full, 0 partial, 0 zero); 1 excluded \
+                 (ptrace reference left no golden); per backend: {} population 0: mean credit \
+                 n/a over 0 (0 full, 0 partial, 0 zero), 1 excluded (ptrace reference left no \
+                 golden); matched 0, diverged 0, nondeterministic 1, reference-missing 0, \
                  candidate-missing 0, unavailable 0, inputs-not-equalized 0; measured 0; no \
-                 golden 1 (determinism-mismatch 1); not compared 0; unmeasured 0; none measured \
-                 with equal inputs; none measured with unequal inputs; 0 log-diff \
-                 comparison(s), 0 guest runs\n"
-            ),
+                 golden 1 (determinism-mismatch 1); not compared 0; unmeasured 0; candidate not \
+                 run 0; none measured with equal inputs; none measured with unequal inputs; 0 \
+                 log-diff comparison(s), 0 guest runs\n",
+                failed_cell.backend
+            )),
             "{out}"
         );
         assert_eq!(err.lines().count(), 1, "{err}");
@@ -24849,8 +25001,9 @@ mod pressure_sample_tests {
         // contradict their harness exit are not the cell's own: an invalid
         // row, like a history the harness refuses, and no evidence of a
         // mismatch either way, although every one of them recorded one. The
-        // cell is unmeasured with the summary's reason, in the floor as 0. A
-        // refused reference does not take its test's cells out of the floor.
+        // cell is unmeasured with the summary's reason. A refused reference
+        // leaves its test's cells outside the parity population, counted
+        // apart.
         metadata.parity_select = vec![failed_cell.to_string()];
         write_metadata(&metadata);
         let harness_statuses: Vec<PathBuf> = (1..=PROMOTION_REPETITIONS)
@@ -25027,7 +25180,7 @@ mod pressure_sample_tests {
     /// summary refused -- a match that kept run 2's log too, or lost its
     /// golden log -- is not compared: it did not retain the logs the summary
     /// requires, unmeasured (`log-not-retained`) with the summary's reason and
-    /// in the floor as 0.
+    /// 0 in the parity population.
     #[test]
     fn series_parity_post_pass_measures_only_the_verify_cells_summarize_accepted() {
         let root = checkout_root();
@@ -25333,6 +25486,7 @@ mod pressure_sample_tests {
             &rows,
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
             &mut out,
             &mut err,
         );
@@ -25362,6 +25516,7 @@ mod pressure_sample_tests {
             &rows,
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
             &mut Closed,
             &mut Closed,
         );
@@ -25375,7 +25530,7 @@ mod pressure_sample_tests {
         // compared. A match that kept run 2's log beside its golden log is
         // refused, and so is one that lost its golden log. Either way the
         // candidate did not retain the logs the summary requires: unmeasured
-        // with the summary's reason, in the floor as 0, and the golden is
+        // with the summary's reason, 0 in the parity population, and the golden is
         // still named.
         // A parity record names a log below the results directory under the
         // canonical /results root, as the container's records do
@@ -25685,6 +25840,18 @@ mod pressure_sample_tests {
         metadata: &RunMetadata,
         repetition: Option<usize>,
     ) -> String {
+        plant_matched_verify_cell_run_by(results, cell, metadata, repetition, "hermit")
+    }
+
+    /// [`plant_matched_verify_cell`] with `hermit` as the binary the cell
+    /// ran (argv[0]), which the series post-pass compares its logs with.
+    fn plant_matched_verify_cell_run_by(
+        results: &Path,
+        cell: &CellId,
+        metadata: &RunMetadata,
+        repetition: Option<usize>,
+        hermit: &str,
+    ) -> String {
         let epoch = metadata
             .hermit_epoch
             .clone()
@@ -25704,7 +25871,7 @@ mod pressure_sample_tests {
         .unwrap();
         let mut inner = comparison_attempt("verify", 0);
         inner.argv = vec![
-            "hermit".into(),
+            hermit.into(),
             "--verify-log-dir".into(),
             logs.to_string_lossy().into_owned(),
         ];
@@ -25742,6 +25909,349 @@ mod pressure_sample_tests {
         )
         .unwrap();
         slug
+    }
+
+    /// A repeated series whose candidate passes its first repetition, which
+    /// supplies the compared log and matches ptrace, but crashes or times out
+    /// in its second (no verification mismatch) is red in the series, so its
+    /// parity cell is a typed 0 -- the later failure's class, operand
+    /// `candidate`, no credit -- in `parity.jsonl` and in the ledger rows the
+    /// series exports, never `matched` with credit 1. So is a candidate whose
+    /// first or later repetition keeps its outer PASS label but whose
+    /// retained result history the series refuses (here a verification
+    /// report digest that does not match): `no-result-row`, the class of a
+    /// refused row. A ptrace reference that fails or is refused the same way
+    /// leaves the pair outside the population (reference-side, counted
+    /// apart), so it gives no credit either.
+    #[test]
+    fn a_red_or_refused_repetition_gives_its_parity_cell_no_credit_through_the_ledger() {
+        let root = checkout_root();
+        let checked = CheckedScorecard {
+            root: &root,
+            enforce_host_capabilities: false,
+            memory_budget_override: Some(i64::MAX),
+        };
+        let manifests = ManifestSet::load(&root).unwrap();
+        let matrix = parity::ParityMatrix::derive(&manifests).unwrap();
+        let ids: Vec<CellId> = pressure_cells(
+            &root,
+            &CellSelection {
+                green: true,
+                mode: Some("verify".into()),
+                repetitions: Some(2),
+                ..CellSelection::default()
+            },
+        )
+        .unwrap()
+        .selected
+        .iter()
+        .map(|cell| cell.id.clone())
+        .collect();
+        // The first seed whose two-cell sample is one test's ptrace verify
+        // cell and a selected candidate of it.
+        let (seed, reference, candidate, cell) = (0..1_000_000u64)
+            .find_map(|seed| {
+                let mut scored: Vec<(u64, &CellId)> =
+                    ids.iter().map(|id| (sample_score(id, seed), id)).collect();
+                scored.select_nth_unstable(1);
+                let (first, second) = (scored[0].1, scored[1].1);
+                if first.test != second.test {
+                    return None;
+                }
+                let (reference, candidate) = if first.backend == parity::PARITY_REFERENCE_BACKEND {
+                    (first, second)
+                } else if second.backend == parity::PARITY_REFERENCE_BACKEND {
+                    (second, first)
+                } else {
+                    return None;
+                };
+                let cell = parity::ParityCellId {
+                    test_id: candidate.test.clone(),
+                    backend: parity::ParityBackend::parse(&candidate.backend).ok()?,
+                };
+                matrix
+                    .get(&cell)
+                    .is_some_and(parity::ParityAvailability::selectable)
+                    .then(|| (seed, reference.clone(), candidate.clone(), cell))
+            })
+            .expect("a seed samples one test's ptrace and a selected candidate verify cell");
+        // (label, which side fails, in which repetition, and how: a typed
+        // failure -- its result, failure class and whether its attempt timed
+        // out -- or `None` for an outer PASS whose retained result history
+        // the series refuses (its verification report digest is wrong);
+        // then the class the parity cell must carry and a fragment of its
+        // reason).
+        type Failure = Option<(ObservedResult, FailureClass, bool)>;
+        let crash: Failure = Some((
+            ObservedResult::CrashError,
+            FailureClass::ProductFailure,
+            false,
+        ));
+        let timeout: Failure = Some((ObservedResult::Timeout, FailureClass::NoResult, true));
+        let ended = "repetition 2 of the series ended";
+        let refused_later = "refused the retained result history of repetition 2";
+        let refused_first = "its retained result history was refused";
+        let scenarios = [
+            (
+                "later-crash",
+                &candidate,
+                2,
+                crash,
+                parity::UnavailableClass::Crash,
+                ended,
+            ),
+            (
+                "later-timeout",
+                &candidate,
+                2,
+                timeout,
+                parity::UnavailableClass::Timeout,
+                ended,
+            ),
+            (
+                "reference-later-crash",
+                &reference,
+                2,
+                crash,
+                parity::UnavailableClass::Crash,
+                ended,
+            ),
+            (
+                "later-refused-history",
+                &candidate,
+                2,
+                None,
+                parity::UnavailableClass::NoResultRow,
+                refused_later,
+            ),
+            (
+                "first-refused-history",
+                &candidate,
+                1,
+                None,
+                parity::UnavailableClass::NoResultRow,
+                refused_first,
+            ),
+            (
+                "reference-later-refused-history",
+                &reference,
+                2,
+                None,
+                parity::UnavailableClass::NoResultRow,
+                refused_later,
+            ),
+            (
+                "reference-first-refused-history",
+                &reference,
+                1,
+                None,
+                parity::UnavailableClass::NoResultRow,
+                refused_first,
+            ),
+        ];
+        for (label, failing, failing_repetition, failure, expected_class, reason_part) in scenarios
+        {
+            let (results, cleanup) = parity_self_test_results(label);
+            let (mut metadata, _) = write_plan_after_scorecard_check(
+                &checked,
+                &results,
+                &results.join("dag.json"),
+                &CellSelection {
+                    green: true,
+                    mode: Some("verify".into()),
+                    repetitions: Some(2),
+                    sample: Some(2),
+                    seed: Some(seed),
+                    run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+                    ..CellSelection::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                metadata.cells.iter().cloned().collect::<BTreeSet<_>>(),
+                BTreeSet::from([reference.clone(), candidate.clone()]),
+                "{label}"
+            );
+            metadata.source_tree_dirty = false;
+            fs::write(
+                results.join("run.json"),
+                serde_json::to_vec(&metadata).unwrap(),
+            )
+            .unwrap();
+            // The binary the cells ran compares the logs: identical logs
+            // match, so without the later failure the pair is full credit.
+            let tools = results.join("measured-tools");
+            fs::create_dir_all(&tools).unwrap();
+            let hermit = tools.join("hermit");
+            fs::copy(
+                root.join("ci/manifest-plan/tests/fixtures/fake-parity-log-diff.py"),
+                &hermit,
+            )
+            .unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&hermit, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let hermit = hermit.to_string_lossy().into_owned();
+            let mut evidence = BTreeMap::new();
+            for id in [&reference, &candidate] {
+                for repetition in [1, 2] {
+                    let slug = plant_matched_verify_cell_run_by(
+                        &results,
+                        id,
+                        &metadata,
+                        Some(repetition),
+                        &hermit,
+                    );
+                    let fails = repetition == failing_repetition && id == failing;
+                    if fails && failure.is_none() {
+                        // An outer PASS whose retained history the series
+                        // refuses: its attempt's verification report no
+                        // longer matches the digest the row records.
+                        let path = results.join("cells").join(&slug).join("results.jsonl");
+                        let mut row: CellResult =
+                            serde_json::from_str(fs::read_to_string(&path).unwrap().trim_end())
+                                .unwrap();
+                        for attempt in &mut row.attempts {
+                            attempt.verification_report_sha256 = Some("0".repeat(64));
+                        }
+                        fs::write(&path, format!("{}\n", serde_json::to_string(&row).unwrap()))
+                            .unwrap();
+                    }
+                    if let (true, Some((result, failure_class, timed_out))) = (fails, failure) {
+                        // Its two runs still matched (no verification
+                        // mismatch); the cell itself failed afterwards.
+                        let cell_dir = results.join("cells").join(&slug);
+                        let path = cell_dir.join("results.jsonl");
+                        let mut row: CellResult =
+                            serde_json::from_str(fs::read_to_string(&path).unwrap().trim_end())
+                                .unwrap();
+                        row.outcome = "FAIL".into();
+                        row.result = Some(result);
+                        row.failure_class = Some(failure_class);
+                        if timed_out {
+                            // The harness's own E2E deadline, as the runner
+                            // words it.
+                            row.reason = Some(format!(
+                                "test {}/verify/{} exceeded 57 s in attempt 1 (innermost E2E \
+                                 timeout: deadline reached (exit 124))",
+                                id.test, id.backend
+                            ));
+                            row.error_kind = Some("wall-timeout".into());
+                        }
+                        for attempt in &mut row.attempts {
+                            attempt.outcome = "FAIL".into();
+                            if timed_out {
+                                attempt.timed_out = true;
+                                attempt.error_kind = Some("cpu-timeout".into());
+                            }
+                        }
+                        fs::write(&path, format!("{}\n", serde_json::to_string(&row).unwrap()))
+                            .unwrap();
+                        fs::write(cell_dir.join("harness-status"), "1\n").unwrap();
+                    }
+                    evidence.insert(
+                        format!("cell.{slug}"),
+                        RunnerEvidence {
+                            seen: true,
+                            ok: !(fails && failure.is_some()),
+                            ..RunnerEvidence::default()
+                        },
+                    );
+                }
+            }
+            // A red or refused repetition of either sampled operand fails a
+            // green series; the parity report is written before that verdict
+            // and changes nothing about it.
+            let verdict = summarize(&root, &results, false, Some(&evidence), true);
+            assert!(verdict.is_err(), "{label}: {verdict:?}");
+            let summary: JsonValue =
+                serde_json::from_slice(&fs::read(results.join("summary.json")).unwrap()).unwrap();
+            if failure.is_some() {
+                // The series itself calls the failing repetition red.
+                let failing_result = summary["rows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .chain(summary["reference_cells"].as_array().into_iter().flatten())
+                    .filter(|row| row["cell"]["backend"] == json!(failing.backend))
+                    .map(|row| row["result"].as_str().unwrap().to_string())
+                    .filter(|result| result != "pass")
+                    .collect::<Vec<_>>();
+                assert!(!failing_result.is_empty(), "{label}: {summary}");
+            } else {
+                // The outer label stays PASS; the series refuses the history,
+                // whichever sampled operand carries it.
+                let refused = verdict.as_ref().unwrap_err();
+                assert!(
+                    refused.contains("unknown or contradictory result history"),
+                    "{label}: {refused}"
+                );
+            }
+            let records = read_parity_records(&results.join(parity::PARITY_JSONL));
+            let record = parity_record(&records, &cell);
+            record.validate().unwrap();
+            let (expected_operand, standing) = if failing == &candidate {
+                (
+                    parity::ParityOperand::Candidate,
+                    parity::PopulationStanding::Scored(0.0),
+                )
+            } else {
+                (
+                    parity::ParityOperand::Reference,
+                    parity::PopulationStanding::ReferenceExcluded,
+                )
+            };
+            assert_eq!(
+                (
+                    record.verdict,
+                    record.unavailable_class,
+                    record.operand,
+                    record.measured_credit()
+                ),
+                (
+                    parity::ParityVerdict::Unavailable,
+                    Some(expected_class),
+                    Some(expected_operand),
+                    None
+                ),
+                "{label}: {record:?}"
+            );
+            assert!(
+                record.reason.as_deref().unwrap().contains(reason_part),
+                "{label}: {record:?}"
+            );
+            assert_eq!(record.population_standing(), standing, "{label}");
+            // The ledger rows the series exports carry the same typed zero.
+            let ledger = parity::node_ledger_sources(
+                &results,
+                parity::PRESSURE_TEST_LEDGER_LANE,
+                parity::PRESSURE_TEST_LEDGER_NODE,
+                None,
+            )
+            .unwrap();
+            let row = ledger
+                .iter()
+                .find(|row| row.cell == cell.to_string())
+                .unwrap_or_else(|| panic!("{label}: no ledger row for {cell}"));
+            assert_eq!(
+                (row.verdict, row.unavailable_class, row.operand),
+                (
+                    parity::LedgerVerdict::Unavailable,
+                    Some(expected_class),
+                    Some(expected_operand)
+                ),
+                "{label}: {row:?}"
+            );
+            assert_eq!(
+                row.record
+                    .as_ref()
+                    .and_then(parity::ParityRecord::measured_credit),
+                None,
+                "{label}: {row:?}"
+            );
+            cleanup.remove().unwrap();
+        }
     }
 
     /// The first seed whose one-cell red sample satisfies `wanted`.
@@ -25985,10 +26495,94 @@ mod pressure_sample_tests {
         without_cleanup.remove().unwrap();
     }
 
+    /// A series runs a sample, so a population cell whose candidate full
+    /// validation enables and selects, but which the series did not plan, is
+    /// outside the series' population: typed `candidate-not-sampled`, never
+    /// scored 0. A candidate full validation never runs keeps its own class
+    /// and still scores 0.
+    #[test]
+    fn a_series_scores_no_candidate_its_sample_did_not_plan() {
+        let root = checkout_root();
+        let checked = CheckedScorecard {
+            root: &root,
+            enforce_host_capabilities: false,
+            memory_budget_override: Some(i64::MAX),
+        };
+        let manifests = ManifestSet::load(&root).unwrap();
+        let matrix = parity::ParityMatrix::derive(&manifests).unwrap();
+        let cell = |test: &str, backend| parity::ParityCellId {
+            test_id: test.to_string(),
+            backend,
+        };
+        let population = matrix.population();
+        // The ptrace verify cell of a population test whose kvm candidate full
+        // validation selects and which has a candidate it never runs, chosen
+        // as an explicit green repetition (population cells are green).
+        let selection = |test: &str| CellSelection {
+            test: Some(test.to_string()),
+            mode: Some("verify".into()),
+            backend: Some("ptrace".into()),
+            repetitions: Some(PROMOTION_REPETITIONS),
+            run_id_prefix: Some("parity-unsampled".into()),
+            run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+            green: true,
+            ..CellSelection::default()
+        };
+        let test = population
+            .iter()
+            .filter(|id| id.backend == parity::ParityBackend::Kvm)
+            .map(|id| id.test_id.clone())
+            .find(|test| {
+                matrix
+                    .candidate_not_run(&cell(test, parity::ParityBackend::Kvm))
+                    .is_none()
+                    && parity::ParityBackend::ALL.into_iter().any(|backend| {
+                        matrix
+                            .candidate_not_run(&cell(test, backend))
+                            .map(|why| why.class)
+                            == Some(parity::UnavailableClass::CandidateNotEnabled)
+                    })
+                    && pressure_cells(&root, &selection(test)).is_ok()
+            })
+            .expect("a sampleable ptrace verify cell of a population test with a selected kvm");
+        let (results, cleanup) = parity_self_test_results("unsampled");
+        let (metadata, _) = write_plan_after_scorecard_check(
+            &checked,
+            &results,
+            &results.join("dag.json"),
+            &selection(&test),
+        )
+        .unwrap();
+        assert!(
+            metadata
+                .cells
+                .iter()
+                .all(|planned| planned.test == test && planned.backend == "ptrace"),
+            "{:?}",
+            metadata.cells
+        );
+        let scope = series_parity_scope(&root, &metadata).unwrap();
+        for backend in parity::ParityBackend::ALL {
+            let id = cell(&test, backend);
+            assert!(scope.cells.contains(&id), "{id}");
+            let expected = match matrix.candidate_not_run(&id) {
+                // Full validation runs it; this series did not.
+                None => parity::UnavailableClass::CandidateNotSampled,
+                Some(why) => why.class,
+            };
+            assert_eq!(
+                scope.candidate_not_run.get(&id).map(|why| why.class),
+                Some(expected),
+                "{id}"
+            );
+        }
+        cleanup.remove().unwrap();
+    }
+
     /// A parity reference contributes only the pair it was added for. Its
-    /// ptrace side must not pull its test's other committed selection cells
-    /// into the scope, where each would be a `candidate-missing` row; cells
-    /// whose side the sample itself ran keep the selection's rule.
+    /// ptrace side must not pull its test's other population cells into the
+    /// scope, where each would be a `candidate-missing` row; cells whose side
+    /// the sample itself ran keep the population's rule.
     #[test]
     fn a_reference_contributes_only_its_own_pair_to_the_parity_scope() {
         let root = checkout_root();
@@ -25999,7 +26593,7 @@ mod pressure_sample_tests {
         };
         let manifests = ManifestSet::load(&root).unwrap();
         let matrix = parity::ParityMatrix::derive(&manifests).unwrap();
-        let selection = parity::ParitySelection::load(&root, &matrix).unwrap().cells;
+        let selection = matrix.population();
         let pairs = snapshot_parity_pairs(&root).unwrap();
         let (seed, candidate) = one_cell_sample_seed(&root, |cell| {
             cell.mode == parity::PARITY_MODE
@@ -26036,7 +26630,7 @@ mod pressure_sample_tests {
             .collect();
         assert!(
             foreign.is_empty(),
-            "the reference of {} pulled its test's other selection cells into the scope: {foreign:?}",
+            "the reference of {} pulled its test's other population cells into the scope: {foreign:?}",
             candidate.test
         );
         cleanup.remove().unwrap();

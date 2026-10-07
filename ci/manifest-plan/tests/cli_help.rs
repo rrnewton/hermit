@@ -850,7 +850,7 @@ fn sync_cells_refuses_bad_flags_and_checks_the_committed_tree() {
     let output = run(harness, &["sync-cells", "--check"]);
     assert!(
         output.status.success(),
-        "the committed plan or parity selection is stale: {}",
+        "the committed plan or optional-cell inventory is stale: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("are current"));

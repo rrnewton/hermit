@@ -8532,7 +8532,7 @@ fn validate_parity_expected_scope<'a>(
             .filter_map(|cell| cell.id.backend.map(|backend| (cell.id.test, backend)))
             .collect::<BTreeSet<_>>();
         let explicit = setting(parity::PARITY_SELECT_ENV);
-        let scope = parity::resolve_scope(root, manifests, explicit.as_deref(), &planned)
+        let scope = parity::resolve_scope(manifests, explicit.as_deref(), &planned)
             .map_err(|error| format!("{}: {error}", step.tag()))?;
         if !scope.cells.is_empty() {
             expected
@@ -29495,22 +29495,20 @@ sys.exit(2)
         );
     }
 
-    /// The committed DAG's manifest nodes owe exactly the committed
-    /// selection in `parity::PARITY_CELLS_PATH`, each cell to one node, and
-    /// the privileged c-programs node owes exactly the selected cells of the
-    /// one test it runs, c-programs/cpuid-probe. RUN 1953 measured 192 cells
-    /// (190 portable, 2 privileged). 2be6440ddd6 then selected
-    /// c-programs/pid-probe@dbt (portable) and c-programs/cpuid-probe@dbt
-    /// (privileged), which makes 194 (191 and 3). The sizes are derived from
-    /// the snapshot, so a selection change moves them with it; the
-    /// snapshot's own freshness test keeps it equal to the manifests. A node
-    /// whose environment turns the post-pass off owes nothing, and so does a
-    /// node withheld whole. A node that runs with only some cells withheld
-    /// owes its whole scope, so if it leaves no parity status, every cell of
-    /// that scope is a `record-missing` row, and the `parity:` line counts
-    /// every one of them.
+    /// The committed DAG's manifest nodes owe exactly the parity population
+    /// that `parity::PARITY_CELLS_PATH` snapshots (its `selected` cells),
+    /// each cell to one node: every test whose ptrace verify cell full
+    /// validation selects, on every candidate backend, so a node owes the
+    /// population cells of the tests whose verify cells it plans, whether or
+    /// not their candidates run. The sizes are derived from the snapshot, so
+    /// a manifest change moves them with it; the snapshot's own freshness
+    /// test keeps it equal to the manifests. A node whose environment turns
+    /// the post-pass off owes nothing, and so does a node withheld whole. A
+    /// node that runs with only some cells withheld owes its whole scope, so
+    /// if it leaves no parity status, every cell of that scope is a
+    /// `record-missing` row, and the `parity:` line counts every one of them.
     #[test]
-    fn the_committed_nodes_owe_the_committed_selection() {
+    fn the_committed_nodes_owe_the_parity_population() {
         let root = test_source_root();
         let steps = validate_plan::validation_config(&root).unwrap().steps;
         let expected = validate_parity_expected_scope(&root, steps.iter(), &[]).unwrap();
@@ -29525,6 +29523,7 @@ sys.exit(2)
             .filter(|cell| cell.selected)
             .map(|cell| format!("{}@{}", cell.test_id, cell.backend))
             .collect::<BTreeSet<_>>();
+        assert_eq!(committed.len(), snapshot.counts.all.population);
         let owed = expected
             .values()
             .flatten()
@@ -29536,26 +29535,24 @@ sys.exit(2)
             "a cell is owed twice or not at all"
         );
         assert_eq!(owed.into_iter().collect::<BTreeSet<_>>(), committed);
-        let privileged = committed
-            .iter()
-            .filter(|cell| cell.starts_with("c-programs/cpuid-probe@"))
-            .count();
-        let sizes = expected
-            .iter()
-            .map(|(node, cells)| (node.as_str(), cells.len()))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            sizes,
-            [
-                ("portable/manifest_c_programs", committed.len() - privileged),
-                ("privileged/manifest_c_programs", privileged)
-            ]
-        );
-        assert!(
-            expected["privileged/manifest_c_programs"]
+        let lane_cells = |scope: &hermit_manifest_plan::parity::ExpectedScope, lane: &str| {
+            scope
                 .iter()
-                .all(|cell| cell.test_id == "c-programs/cpuid-probe")
-        );
+                .filter(|(node, _)| node.starts_with(&format!("{lane}/")))
+                .map(|(_, cells)| cells.len())
+                .sum::<usize>()
+        };
+        let privileged = lane_cells(&expected, "privileged");
+        let portable = lane_cells(&expected, "portable");
+        assert!(privileged > 0 && portable > 0, "{privileged} {portable}");
+        assert_eq!(privileged + portable, committed.len());
+        let only = |scope: &hermit_manifest_plan::parity::ExpectedScope, lane: &str| {
+            scope
+                .iter()
+                .filter(|(node, _)| node.starts_with(&format!("{lane}/")))
+                .map(|(node, cells)| (node.clone(), cells.clone()))
+                .collect::<hermit_manifest_plan::parity::ExpectedScope>()
+        };
 
         let mut off = steps.clone();
         for step in &mut off {
@@ -29563,17 +29560,14 @@ sys.exit(2)
                 step.env.insert("E2E_PARITY_POST_PASS".into(), "0".into());
             }
         }
-        let expected = validate_parity_expected_scope(&root, off.iter(), &[]).unwrap();
-        assert_eq!(
-            expected.keys().collect::<Vec<_>>(),
-            ["portable/manifest_c_programs"]
-        );
+        let expected_off = validate_parity_expected_scope(&root, off.iter(), &[]).unwrap();
+        assert_eq!(expected_off, only(&expected, "portable"));
         let withheld = steps
             .iter()
             .filter(|step| {
-                step.manifest.as_ref().is_some_and(|manifest| {
-                    manifest.lane == "portable" && manifest.category == "c-programs"
-                })
+                step.manifest
+                    .as_ref()
+                    .is_some_and(|manifest| manifest.lane == "portable")
             })
             .map(|step| validate_plan::HostInapplicableNode {
                 tag: step.tag(),
@@ -29583,11 +29577,9 @@ sys.exit(2)
             })
             .collect::<Vec<_>>();
         assert!(!withheld.is_empty());
-        let expected = validate_parity_expected_scope(&root, steps.iter(), &withheld).unwrap();
-        assert_eq!(
-            expected.keys().collect::<Vec<_>>(),
-            ["privileged/manifest_c_programs"]
-        );
+        let expected_withheld =
+            validate_parity_expected_scope(&root, steps.iter(), &withheld).unwrap();
+        assert_eq!(expected_withheld, only(&expected, "privileged"));
 
         // A node that runs with only some cells withheld still starts its
         // harness, which names its whole scope, withheld cells included, so it
@@ -29603,10 +29595,7 @@ sys.exit(2)
             })
             .collect::<Vec<_>>();
         let partly_expected = validate_parity_expected_scope(&root, steps.iter(), &partly).unwrap();
-        assert_eq!(
-            partly_expected,
-            validate_parity_expected_scope(&root, steps.iter(), &[]).unwrap()
-        );
+        assert_eq!(partly_expected, expected);
         // So when it leaves no parity status, each cell it owes is a
         // `record-missing` row, the most adverse ledger verdict, where the
         // node withheld whole owes no row at all.
@@ -29627,7 +29616,7 @@ sys.exit(2)
                 .collect::<Vec<_>>()
         };
         let rows = portable_rows(&partly_expected);
-        assert_eq!(rows.len(), committed.len() - privileged);
+        assert_eq!(rows.len(), portable);
         assert!(rows.iter().all(|row| {
             row.verdict == hermit_manifest_plan::parity::LedgerVerdict::RecordMissing
                 && row.source.post_pass_state
@@ -29641,7 +29630,7 @@ sys.exit(2)
             hermit_manifest_plan::parity::ledger_row_counts(&all),
             format!("record-missing {}", committed.len())
         );
-        assert!(portable_rows(&expected).is_empty());
+        assert!(portable_rows(&expected_withheld).is_empty());
     }
 }
 
