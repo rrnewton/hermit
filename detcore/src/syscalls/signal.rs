@@ -599,6 +599,63 @@ impl<T: RecordOrReplay> Detcore<T> {
         result
     }
 
+    /// Block every guest signal in the kernel mask of a thread that is about to
+    /// exit on a backend whose signals interrupt real blocking syscalls.
+    ///
+    /// Call this at the start of a thread `exit`, while the thread still holds
+    /// its turn and before Detcore deregisters it. On SaBRe the backend
+    /// deregisters the thread (`Tool::on_exit_thread`) and only then issues
+    /// the raw `exit`, so for a while the thread is gone from the scheduler but
+    /// still alive in the kernel. Linux never delivers a signal to a thread
+    /// that has entered `exit` (`do_exit` sets `PF_EXITING`, which
+    /// `wants_signal` refuses, and `exit_signals` retargets its shared pending
+    /// signals to a live sibling). Without this block the departing thread
+    /// could still take a process-directed signal into SaBRe's thread-local
+    /// queue in that window and then die with it, so a sibling that the
+    /// scheduler had judged the process's only thread could not count on a
+    /// signal it saw pending (R5-F1 of the review of this series; see
+    /// `BlockedPool::rt_sigsuspend_sole_pending`). With every signal blocked
+    /// from this point, a signal the kernel has not yet given to this thread
+    /// stays process-pending for the survivors, as Linux leaves it.
+    ///
+    /// Hermit's reserved preemption signal is left out of the set; it is
+    /// never a guest signal. The SaBRe backend also keeps its own controlled
+    /// exit signal unblocked (`sys_rt_sigprocmask`). `SIGKILL` and `SIGSTOP`
+    /// cannot be blocked and need not be.
+    ///
+    /// The thread is exiting, so it never observes the changed mask. If the
+    /// block cannot be injected (the private scratch arena is unwritable),
+    /// the exit proceeds; this is reported because the guarantee above is
+    /// then lost for this thread.
+    pub(crate) async fn block_signals_for_thread_exit<G: Guest<Self>>(&self, guest: &mut G) {
+        let mut stack = guest.stack().await;
+        let block_set = stack.push(without_perf_event_signal(KernelSigset::MAX));
+        let guard = match stack.commit() {
+            Ok(guard) => guard,
+            Err(errno) => {
+                tracing::error!(
+                    "[dtid {}] cannot block signals before thread exit: {}",
+                    guest.thread_state().dettid,
+                    errno
+                );
+                return;
+            }
+        };
+        let block = syscalls::RtSigprocmask::new()
+            .with_how(libc::SIG_BLOCK)
+            .with_set(Some(block_set.cast()))
+            .with_oldset(None)
+            .with_sigsetsize(KERNEL_SIGSET_SIZE);
+        if let Err(errno) = guest.inject_with_retry(block).await {
+            tracing::error!(
+                "[dtid {}] cannot block signals before thread exit: {}",
+                guest.thread_state().dettid,
+                errno
+            );
+        }
+        drop(guard);
+    }
+
     /// rt_sigaction
     pub async fn handle_rt_sigaction<G: Guest<Self>>(
         &self,

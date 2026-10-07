@@ -1268,6 +1268,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Exit,
     ) -> Result<i64, Error> {
+        // Before this thread leaves the scheduler, make sure it cannot take a
+        // process-directed signal in the window where it is deregistered but
+        // still alive in the kernel (see `block_signals_for_thread_exit`).
+        if self.cfg.sequentialize_threads && self.cfg.backend.signal_interrupts_external_syscalls {
+            self.block_signals_for_thread_exit(guest).await;
+        }
         let request = guest.thread_state().mk_request(
             ResourceID::Exit {
                 group: false,
@@ -3700,5 +3706,230 @@ mod tests {
             "handle_sched_getattr writes SCHED_OTHER into sched_policy for every thread; \
              KEEP_POLICY must substitute that same value"
         );
+    }
+}
+
+#[cfg(test)]
+mod exit_signal_block_tests {
+    use futures::channel::oneshot;
+    use reverie::GlobalRPC;
+    use reverie::GlobalTool;
+    use reverie::Tid;
+    use reverie::Tool;
+
+    use super::*;
+    use crate::config::Config;
+    use crate::tool_global::GlobalRequest;
+    use crate::tool_global::GlobalResponse;
+    use crate::tool_global::GlobalState;
+    use crate::types::MmId;
+
+    const ARENA_WORDS: usize = 4;
+
+    /// A private scratch arena standing in for SaBRe's heap-backed
+    /// `guest.stack()`.
+    struct ArenaStack {
+        arena: usize,
+        used: usize,
+    }
+
+    struct ArenaStackGuard;
+
+    impl Drop for ArenaStackGuard {
+        fn drop(&mut self) {}
+    }
+
+    impl reverie::Stack for ArenaStack {
+        type StackGuard = ArenaStackGuard;
+
+        fn size(&self) -> usize {
+            self.used
+        }
+        fn capacity(&self) -> usize {
+            ARENA_WORDS * std::mem::size_of::<u64>()
+        }
+        fn push<'stack, T>(&mut self, value: T) -> Addr<'stack, T> {
+            let size = std::mem::size_of::<T>().next_multiple_of(8);
+            assert!(self.used + size <= self.capacity());
+            let address = self.arena + self.used;
+            // SAFETY: the arena is owned by the guest, outlives the call, and
+            // has room for `value` at this 8-byte aligned offset.
+            unsafe { std::ptr::write(address as *mut T, value) };
+            self.used += size;
+            Addr::from_raw(address).unwrap()
+        }
+        fn reserve<'stack, T>(&mut self) -> AddrMut<'stack, T> {
+            panic!("the exit block pushes its set")
+        }
+        fn commit(self) -> Result<Self::StackGuard, Errno> {
+            Ok(ArenaStackGuard)
+        }
+    }
+
+    /// Runs the real `exit` handler and records, in order, the signal mask
+    /// changes it injects, the scheduler requests it sends, and its final
+    /// tail injection.
+    struct ExitGuest {
+        config: Config,
+        thread: crate::ThreadState<()>,
+        arena: Box<[u64; ARENA_WORDS]>,
+        events: Mutex<Vec<String>>,
+        tail_reached: Option<oneshot::Sender<()>>,
+    }
+
+    #[reverie::tool]
+    impl GlobalRPC<GlobalState> for ExitGuest {
+        async fn send_rpc(
+            &self,
+            message: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            match &message.2 {
+                GlobalRequest::RequestResources(request, _) => {
+                    let exit = request
+                        .resources
+                        .keys()
+                        .any(|resource| matches!(resource, ResourceID::Exit { group: false, .. }));
+                    assert!(exit, "exit requests only its Exit resource");
+                    self.events.lock().unwrap().push("request Exit".to_owned());
+                    (None, GlobalResponse::RequestResources(ResumeStatus::Normal))
+                }
+                other => panic!("unexpected RPC from exit: {other:?}"),
+            }
+        }
+        fn config(&self) -> &Config {
+            &self.config
+        }
+    }
+
+    #[reverie::tool]
+    impl Guest<Detcore> for ExitGuest {
+        type Memory = reverie::syscalls::LocalMemory;
+        type Stack = ArenaStack;
+
+        fn tid(&self) -> Tid {
+            Tid::from_raw(18)
+        }
+        fn pid(&self) -> Tid {
+            Tid::from_raw(17)
+        }
+        fn ppid(&self) -> Option<Tid> {
+            None
+        }
+        fn memory(&self) -> Self::Memory {
+            reverie::syscalls::LocalMemory::new()
+        }
+        fn thread_state(&self) -> &crate::ThreadState<()> {
+            &self.thread
+        }
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
+            &mut self.thread
+        }
+        async fn regs(&mut self) -> libc::user_regs_struct {
+            panic!("exit must not read registers")
+        }
+        async fn stack(&mut self) -> Self::Stack {
+            ArenaStack {
+                arena: self.arena.as_mut_ptr() as usize,
+                used: 0,
+            }
+        }
+        async fn daemonize(&mut self) {
+            panic!("exit must not daemonize")
+        }
+        async fn inject<S: SyscallInfo>(&mut self, call: S) -> Result<i64, Errno> {
+            let (number, args) = call.into_parts();
+            match Syscall::from_raw(number, args) {
+                Syscall::RtSigprocmask(call) => {
+                    assert_eq!(call.sigsetsize(), KERNEL_SIGSET_SIZE);
+                    assert!(call.oldset().is_none());
+                    let set = call.set().expect("the block names a set");
+                    // SAFETY: the set lives in this guest's own arena.
+                    let mask = unsafe { *(set.as_raw() as *const u64) };
+                    self.events
+                        .lock()
+                        .unwrap()
+                        .push(format!("block how={} mask={mask:#x}", call.how()));
+                    Ok(0)
+                }
+                other => panic!("unexpected injection from exit: {other:?}"),
+            }
+        }
+        async fn tail_inject<S: SyscallInfo>(&mut self, call: S) -> reverie::Never {
+            assert_eq!(call.number(), syscalls::Sysno::exit);
+            self.events.lock().unwrap().push("tail exit".to_owned());
+            let _ = self.tail_reached.take().unwrap().send(());
+            std::future::pending().await
+        }
+        fn set_timer(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+            panic!("exit must not replace the timer")
+        }
+        fn set_timer_precise(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+            panic!("exit must not replace the timer")
+        }
+        fn read_clock(&mut self) -> Result<u64, Error> {
+            panic!("exit must not sample the clock")
+        }
+    }
+
+    /// R5-F1 of the review of this series: on SaBRe a thread leaving with
+    /// `exit` is deregistered from the scheduler before its raw `exit` runs,
+    /// so for a while a sibling is judged the process's only live thread
+    /// while this thread is still alive in the kernel. If it could still take
+    /// a process-directed signal then, a signal the sibling saw pending when
+    /// it published its `rt_sigsuspend` could vanish, and the owed wake would
+    /// hold every turn forever. The real `exit` handler must therefore block
+    /// every guest signal (all but Hermit's reserved preemption signal) in the
+    /// kernel mask first, while it still holds its turn and before it asks
+    /// for its `Exit` resource or deregisters. A backend whose signals do not
+    /// interrupt real blocking calls changes nothing. Before the fix the
+    /// handler went straight to the `Exit` request.
+    #[tokio::test]
+    async fn sabre_thread_exit_blocks_every_guest_signal_before_leaving_the_scheduler() {
+        let all_guest_signals = !(1_u64 << (reverie::PERF_EVENT_SIGNAL as u32 - 1));
+        for sabre in [true, false] {
+            let config = Config {
+                sequentialize_threads: true,
+                ..Config::default().with_backend(|backend| {
+                    if sabre {
+                        backend.needs_killed_thread_rpc_cancellation = true;
+                        backend.reports_physical_process_exits = true;
+                        backend.signal_interrupts_external_syscalls = true;
+                    }
+                })
+            };
+            let process = DetPid::from_raw(17);
+            let tool = Detcore::new(Tid::from_raw(17), &config);
+            let mut thread = crate::ThreadState::new(DetTid::from_raw(18), &config, ());
+            thread.detpid = Some(process);
+            thread.mm_id = MmId::initial(process);
+            let (tail_reached, reached) = oneshot::channel();
+            let mut guest = ExitGuest {
+                config: config.clone(),
+                thread,
+                arena: Box::new([0; ARENA_WORDS]),
+                events: Mutex::new(Vec::new()),
+                tail_reached: Some(tail_reached),
+            };
+            {
+                let exit = tool.handle_exit(&mut guest, syscalls::Exit::new().with_status(0));
+                futures::pin_mut!(exit);
+                match futures::future::select(exit, reached).await {
+                    futures::future::Either::Left(_) => panic!("exit returned"),
+                    futures::future::Either::Right((reached, _)) => reached.unwrap(),
+                }
+            }
+            let events = guest.events.into_inner().unwrap();
+            let mut expected = Vec::new();
+            if sabre {
+                expected.push(format!(
+                    "block how={} mask={all_guest_signals:#x}",
+                    libc::SIG_BLOCK
+                ));
+            }
+            expected.push("request Exit".to_owned());
+            expected.push("tail exit".to_owned());
+            assert_eq!(events, expected, "sabre: {sabre}");
+            assert_ne!(all_guest_signals & (1 << (libc::SIGCHLD - 1)), 0);
+        }
     }
 }

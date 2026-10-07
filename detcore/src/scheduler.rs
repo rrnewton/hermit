@@ -326,6 +326,14 @@ pub struct BlockedPool {
     /// another thread, and it is blocked until the grant, so no other thread
     /// of the process can exist to consume the signal before the real call
     /// starts. The grant owes the pending waker only with this proof.
+    ///
+    /// "Live" here is registration, and a sibling that has deregistered can
+    /// still be alive in the kernel: on SaBRe a thread leaving with `exit` is
+    /// deregistered before its raw `exit` runs. Such a sibling has blocked
+    /// every guest signal in its kernel mask before it deregistered
+    /// (`Detcore::block_signals_for_thread_exit`), so it cannot take the
+    /// captured signal either, as Linux never gives a signal to a thread that
+    /// has entered `exit`.
     pub rt_sigsuspend_sole_pending: BTreeMap<DetTid, ExternalOpId>,
 
     /// Parents parked awaiting deterministic delivery of a host-async `SIGCHLD`.
@@ -4057,7 +4065,11 @@ impl Scheduler {
     /// A process-directed signal may be taken by any thread that does not block
     /// it, and any thread may change the process's signal actions, so only a
     /// single-threaded process lets the scheduler know which thread a signal
-    /// wakes and that its action has not changed.
+    /// wakes and that its action has not changed. A deregistered sibling that
+    /// is still exiting in the kernel does not count: on a backend where a
+    /// signal interrupts the real blocking call it blocked every guest signal
+    /// before deregistering (`Detcore::block_signals_for_thread_exit`), and it
+    /// runs no further guest code that could change an action.
     fn is_sole_live_thread(&mut self, dettid: DetTid) -> bool {
         let leader = if self.thread_tree.thread_group_leaders.contains(&dettid) {
             dettid
