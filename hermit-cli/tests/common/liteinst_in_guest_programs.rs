@@ -1778,7 +1778,7 @@ fn verify_digest_records_an_unobservable_recvmsg_and_keeps_the_kernel_result() {
         );
         assert_eq!(stdout, expected_stdout, "{mode}");
         let hashed = format!("recvmsg in fd=4 {buffer}+16->");
-        let marker = "recvmsg in fd=4 unobserved ret=16 reason=iovec-short covered=1";
+        let marker = "recvmsg in fd=4 unobserved ret=16 reason=buffer-unreadable at=";
         let counted = "unobservable after the call (compared as 'unobserved' buffer-digest entries): run1=1, run2=1";
         let golden: Vec<PathBuf> = fs::read_dir(&log_dir)
             .expect("failed to read the retained verify logs")

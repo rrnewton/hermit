@@ -1773,6 +1773,20 @@ fn compare_two_runs_with_unsupported_scan(
                 left: summary.compared_left,
                 right: summary.compared_right,
             });
+            // A recvmsg whose buffers could not be observed after the call is
+            // logged as an `unobserved` buffer-digest record and compared like
+            // any other; every verification path reports how many there were,
+            // so the gap is never silent.
+            let unobserved = [log1.as_ref(), log2.as_ref()].map(|log: &std::path::Path| {
+                logdiff::count_unobserved_receives(log)
+                    .map_or_else(|_| "unreadable".to_string(), |count| count.to_string())
+            });
+            if unobserved.iter().any(|count| count != "0") {
+                eprintln!(
+                    ":: recvmsg calls whose buffers were unobservable after the call (compared as 'unobserved' buffer-digest entries): run1={}, run2={}",
+                    unobserved[0], unobserved[1]
+                );
+            }
             if summary.diff_found {
                 failed = true;
                 if let Some(refusal_reason) = summary.refusal_reason.clone() {

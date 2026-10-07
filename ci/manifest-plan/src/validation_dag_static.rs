@@ -1341,7 +1341,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // an_exit_that_names_another_process_installs_no_hold retains all 1075:
     // 1076, measured with cargo nextest list --profile ci.
     // The four recvmsg unobserved-digest tests (header, short iovec, unreadable buffer, other calls still fail) retain all 1076: 1080, re-listed.
-    ("test.detcore_unit", 1080),
+    // The two unobserved-record logdiff tests (anchored counting, ordinary --verify compares it) retain all 1080: 1082, re-listed.
+    ("test.detcore_unit", 1082),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1870,7 +1871,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test.detcore_unit, re-listed with the host twin's selection: 1075.
     // And an_exit_that_names_another_process_installs_no_hold, re-listed: 1076.
     // The host twin selects the four unobserved-digest tests too: 1080.
-    ("test.detcore_unit_on_host", 1080),
+    // The host twin selects the two logdiff tests too: 1082.
+    ("test.detcore_unit_on_host", 1082),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

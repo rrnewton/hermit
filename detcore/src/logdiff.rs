@@ -2063,6 +2063,33 @@ pub fn compare_complete_prefix_with_filter(
     })
 }
 
+/// Whether `line` is one `unobserved` recvmsg buffer-digest record, as Detcore's
+/// `detlog_io_buffers` writes it when a receive's buffers cannot be observed
+/// after the call. The whole record is matched from the level onwards, with
+/// its producer module and structured kind, so text elsewhere (a pathname in
+/// a syscall record, say) cannot be counted.
+pub fn is_unobserved_receive(line: &str) -> bool {
+    static RECORD: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"^\S+\s+INFO detcore::io_buffers: DETLOG \[iobuf\]\[dtid \d+\] recvmsg in fd=\S+ unobserved ret=\d+ reason=[a-z-]+(?: [a-z]+=\S+)? DETLOG_RECORD=\{"schema":1,"event":\{"kind":"other"\}\}$"#,
+        )
+        .unwrap()
+    });
+    RECORD.is_match(line)
+}
+
+/// The number of [`is_unobserved_receive`] records in the log at `path`.
+pub fn count_unobserved_receives(path: &Path) -> std::io::Result<usize> {
+    use std::io::BufRead;
+    let mut count = 0;
+    for line in std::io::BufReader::new(std::fs::File::open(path)?).split(b'\n') {
+        if is_unobserved_receive(&String::from_utf8_lossy(&line?)) {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 /// Boolean-only wrapper retained for tests that only ask "did it differ?".
 /// Prefer [`log_diff_summary_from_strs`] where the counts matter.
 #[cfg(test)]
@@ -3437,6 +3464,54 @@ mod test {
         );
 
         Ok(())
+    }
+
+    const UNOBSERVED: &str = r#"2026-10-07T08:56:08.497110Z  INFO detcore::io_buffers: DETLOG [iobuf][dtid 3] recvmsg in fd=4 unobserved ret=16 reason=iovec-short covered=1 DETLOG_RECORD={"schema":1,"event":{"kind":"other"}}"#;
+    const HASHED: &str = r#"2026-10-07T08:56:08.497000Z  INFO detcore::io_buffers: DETLOG [iobuf][dtid 3] write out fd=1 0x404070+3->4e7f92057ff4026cb921ad4502638b3392880999758f79640cb2043686104341 DETLOG_RECORD={"schema":1,"event":{"kind":"other"}}"#;
+
+    /// Only a whole `unobserved` record counts; a syscall record whose
+    /// pathname contains the same words does not.
+    #[test]
+    fn only_whole_unobserved_receive_records_are_counted() {
+        assert!(super::is_unobserved_receive(UNOBSERVED));
+        let forwarded = UNOBSERVED.replace(
+            "2026-10-07T08:56:08.497110Z  ",
+            "1970-01-01T00:00:00.000000Z ",
+        );
+        assert!(super::is_unobserved_receive(&forwarded));
+        let decoy = r#"2026-10-07T08:56:08.497110Z  INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #3: openat(-100, "/tmp/DETLOG [iobuf][dtid 3] recvmsg in fd=4 unobserved ret=16 reason=x", 0) = Ok(3) DETLOG_RECORD={"schema":1,"event":{"kind":"other"}}"#;
+        assert!(!super::is_unobserved_receive(decoy));
+        assert!(!super::is_unobserved_receive(HASHED));
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("log");
+        std::fs::write(
+            &log,
+            format!("{HASHED}\n{UNOBSERVED}\n{decoy}\n{UNOBSERVED}\n"),
+        )
+        .unwrap();
+        assert_eq!(super::count_unobserved_receives(&log).unwrap(), 2);
+    }
+
+    /// Ordinary `--verify` (the Stripped comparator over the deterministic
+    /// records, with the default DETLOG kinds) compares `unobserved` records:
+    /// one present in only one run is a difference, and the same record in
+    /// both is not.
+    #[test]
+    fn ordinary_verify_compares_unobserved_receive_records() {
+        let opts = super::LogDiffOpts {
+            strip_lines: true,
+            canonicalize_addresses: false,
+            comparison: super::LogComparisonMode::Deterministic,
+            require_structured_events: true,
+            ..Default::default()
+        };
+        let compare = |a: &str, b: &str| {
+            let mut output = Vec::new();
+            super::log_diff_from_strs(a, b, &opts, &mut output).unwrap()
+        };
+        let both = format!("{HASHED}\n{UNOBSERVED}\n");
+        assert!(!compare(&both, &both));
+        assert!(compare(&format!("{HASHED}\n"), &both));
     }
 
     #[test]

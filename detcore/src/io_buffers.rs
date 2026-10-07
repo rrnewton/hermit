@@ -697,8 +697,9 @@ where
     // A recvmsg's buffers are found by re-reading its msghdr after the call,
     // and Linux lets the receive's own output overwrite that header. When the
     // re-read, a buffer read, or the re-read iovec's coverage of the returned
-    // length fails, the call's bytes cannot be observed. That is recorded as
-    // an explicit, compared `unobserved` entry, and the guest still gets the
+    // length fails, the call's bytes cannot be (fully) observed. That is
+    // recorded as an explicit, compared `unobserved` entry after whatever was
+    // hashed, as before, from the re-read; and the guest still gets the
     // kernel's result: the instrumentation must never change the guest's
     // execution. Other calls keep failing on an observation error.
     let unobserved = |reason: String| {
@@ -727,17 +728,14 @@ where
             Err(error) => return Err(error),
         }
     };
-    if let Some(receive) = receive {
-        // Without MSG_TRUNC, Linux returns at most what the iovec it
-        // imported holds. A re-read iovec that holds less was overwritten.
-        // With MSG_TRUNC a datagram returns its full length, so the check
-        // cannot be made.
-        let covered: u64 = moved_extents.iter().map(|extent| extent.len).sum();
-        if receive.flags() & libc::MSG_TRUNC == 0 && covered < ret as u64 {
-            unobserved(format!("iovec-short covered={covered}"));
-            return Ok(());
-        }
-    }
+    // Without MSG_TRUNC, Linux returns at most what the iovec it imported
+    // holds, so a re-read iovec that holds less was overwritten; its extents
+    // are still hashed below, as before, and the entry follows them. With
+    // MSG_TRUNC a datagram returns its full length, so the check cannot be
+    // made.
+    let covered: u64 = moved_extents.iter().map(|extent| extent.len).sum();
+    let short = receive
+        .is_some_and(|receive| receive.flags() & libc::MSG_TRUNC == 0 && covered < ret as u64);
     let records = matches!(call, Syscall::Getdents64(_));
     for extent in moved_extents {
         let digests = extent_digests(
@@ -786,6 +784,9 @@ where
             located,
             unread
         );
+    }
+    if short {
+        unobserved(format!("iovec-short covered={covered}"));
     }
     Ok(())
 }
@@ -2244,9 +2245,9 @@ mod event_tests {
     }
 
     /// Without MSG_TRUNC, a re-read iovec that holds fewer bytes than the
-    /// call returned was overwritten, so the call is unobserved. With
-    /// MSG_TRUNC a datagram returns its full length, so the copied prefix is
-    /// hashed as before.
+    /// call returned was overwritten: what it names is hashed, as before, and
+    /// an `unobserved` entry follows. With MSG_TRUNC a datagram returns its
+    /// full length, so the copied prefix is hashed with no entry.
     #[test]
     fn a_recvmsg_iovec_short_of_the_return_is_unobserved_unless_msg_trunc() {
         let logs = BufferLog::default();
@@ -2258,8 +2259,9 @@ mod event_tests {
         digest(&mut guest, &call, 16).unwrap();
         {
             let messages = logs.0.lock().unwrap();
-            assert_eq!(messages.len(), 1, "{messages:?}");
-            assert_unobserved(&messages[0], 16, "iovec-short covered=1");
+            assert_eq!(messages.len(), 2, "{messages:?}");
+            assert_named_extent(&messages[0], "recvmsg", FIRST_DEST, &[CANARY; 1]);
+            assert_unobserved(&messages[1], 16, "iovec-short covered=1");
         }
         logs.0.lock().unwrap().clear();
         let call = recvmsg_with_iov(&memory, IOV, 1, libc::MSG_TRUNC);
