@@ -242,6 +242,7 @@ fn cores_stay_within_the_per_core_and_total_caps() {
         &guest_args,
     );
 
+    // EXIT-CLASS: guest. `children` mode exits 1 after its children crash.
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     let kept = files(&cores);
     assert_eq!(

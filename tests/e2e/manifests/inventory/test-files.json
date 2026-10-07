@@ -373,6 +373,12 @@
       "why": "tests/c/fallocate_extents.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/fatal_core_capture.c",
+      "runner": "hermit-cli/tests/fatal_core_capture.rs",
+      "why": "tests/c/fatal_core_capture.c is owned by hermit-cli/tests/fatal_core_capture.rs: Guest that dies of a core-dumping signal in several shapes (a segfault after marking its heap, forked children dirtying incompressible heap, a child that segfaults under a parent that exits 0, and a non-main thread that faults with a marker in r12) so the integration test can check what hermit run --fatal-core-dir keeps: one core per dying process from the faulting thread, within the per-core and total caps, nothing on a green run, and unchanged --verify parity. Driven only by its own integration test, which compiles it with -pthread, so it is a test-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/fchmod_bits.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

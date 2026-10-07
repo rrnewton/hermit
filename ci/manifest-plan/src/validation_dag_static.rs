@@ -1437,7 +1437,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tool_local::timeslice_tests::instruction_trap_* (four tests, lane
     // qemu-rcb, https://github.com/rrnewton/hermit/pull/3859) retain all 1123:
     // 1127.
-    ("test.detcore_unit", 1127),
+    // Eleven fatal_core::tests (core layout, zstd frames, caps, deadline,
+    // dumping-thread and unreadable-memory cases): 1138.
+    ("test.detcore_unit", 1138),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1569,7 +1571,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 25 external_signal_interrupt ptrace cases that need the PMU timer
     // move to test.pmu_integration_cases: 287 - 25 = 262, listed
     // with this node's filter.
-    ("test.hermit_integration", 262),
+    // The six fatal_core_capture tests: 268.
+    ("test.hermit_integration", 268),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -2014,7 +2017,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same thirteen SIGALRM ledger tests, re-listed: 1110.
     // And the same five SIGALRM ledger control tests, re-listed: 1123.
     // The host twin selects the same four instruction_trap tests: 1127.
-    ("test.detcore_unit_on_host", 1127),
+    // And the same eleven fatal_core::tests: 1138.
+    ("test.detcore_unit_on_host", 1138),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -2039,7 +2043,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the three stdout-file tests (286).
     // And the minimal-environment test (287, measured).
     // The host twin skips the same 25 PMU-timer cases: 262.
-    ("test.hermit_integration_on_host", 262),
+    // And the same six fatal_core_capture tests: 268.
+    ("test.hermit_integration_on_host", 268),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
