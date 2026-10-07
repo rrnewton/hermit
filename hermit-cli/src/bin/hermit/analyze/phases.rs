@@ -730,10 +730,6 @@ impl AnalyzeOpts {
         }
     }
 
-    /// Take the settings `analyze` inherits from the global options: every
-    /// trial runs on the globally selected backend
-    /// (`hermit --backend <BACKEND> analyze ...`) and charges the invocation's
-    /// shared `--max-log-bytes` budget.
     /// Everything `main` does before phase 0 creates the workspace: a
     /// refusal here starts nothing.
     fn prepare(&mut self, global: &GlobalOpts) -> anyhow::Result<()> {
@@ -765,6 +761,10 @@ impl AnalyzeOpts {
         self.adopt_recorded_epoch(&recordings)
     }
 
+    /// Take the settings `analyze` inherits from the global options: every
+    /// trial runs on the globally selected backend
+    /// (`hermit --backend <BACKEND> analyze ...`) and charges the invocation's
+    /// shared `--max-log-bytes` budget.
     pub fn apply_global(&mut self, global: &GlobalOpts) {
         self.backend = global.backend;
         self.max_log_bytes = global.max_log_bytes;
