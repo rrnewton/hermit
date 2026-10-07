@@ -1363,7 +1363,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (the same pull request) retains all 1183: 1184, listed the same way.
     // syscalls::files::inject_fstat_scratch::getdents_under_an_inherited_seccomp_filter_injects_no_fstatfs
     // (the same pull request) retains all 1184: 1185, listed the same way.
-    ("test.detcore_unit", 1185),
+    // syscalls::files::inject_fstat_scratch::getdents_keys_an_overlay_entry_alike_whatever_was_read_before
+    // (the same pull request) retains all 1185: 1186, listed the same way.
+    ("test.detcore_unit", 1186),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1914,7 +1916,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // arguments.
     // And the non-UTF-8 maps numbering test (1172).
     // And the inherited-seccomp getdents test (1173).
-    ("test.detcore_unit_on_host", 1173),
+    // And the overlay read-order getdents test (1174).
+    ("test.detcore_unit_on_host", 1174),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
