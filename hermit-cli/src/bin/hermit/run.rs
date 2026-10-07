@@ -4853,11 +4853,18 @@ impl RunOpts {
     /// present for it keeps `--max-timeslice` from being downgraded with a
     /// warning, so the in-guest refusal sees the timeslice and stops the run.
     fn arms_reverie_ptrace_pmu_timer(&self) -> bool {
-        !self.namespace_only
-            && match self.selected_backend() {
-                Backend::Ptrace | Backend::E9patch => true,
-                Backend::Liteinst | Backend::Dbt | Backend::Sabre | Backend::Kvm => false,
-            }
+        !self.namespace_only && self.backend_arms_reverie_ptrace_pmu_timer()
+    }
+
+    /// Whether the selected backend's own runtime arms Reverie ptrace's PMU
+    /// timer, before `--namespace-only` is considered. `RunOpts::run` launches
+    /// that runtime even with `--namespace-only`: only `main` dispatches the
+    /// flag to `run_with_namespace_only`.
+    fn backend_arms_reverie_ptrace_pmu_timer(&self) -> bool {
+        match self.selected_backend() {
+            Backend::Ptrace | Backend::E9patch => true,
+            Backend::Liteinst | Backend::Dbt | Backend::Sabre | Backend::Kvm => false,
+        }
     }
 
     fn validate_args_with_perf_support(&mut self, perf_supported: bool) -> Result<(), Error> {
@@ -6873,13 +6880,21 @@ impl RunOpts {
     /// Refuse rather than run a strict guest on a clock that is not exact.
     /// Runs without `--strict` go ahead, and Reverie logs the failed
     /// validation.
-    ///
-    /// `hermit analyze` and `hermit bisect` call this on their trial options
-    /// (`AnalyzeOpts::refuse_strict_with_inexact_branch_counter`), because
-    /// their trials start through `RunOpts::run` and never pass through `main`
-    /// (https://github.com/rrnewton/hermit/issues/3810).
-    pub(crate) fn refuse_strict_with_inexact_branch_counter(&self) -> Result<(), Error> {
+    fn refuse_strict_with_inexact_branch_counter(&self) -> Result<(), Error> {
         if !self.strict || !self.arms_reverie_ptrace_pmu_timer() {
+            return Ok(());
+        }
+        refuse_an_inexact_branch_counter(self.selected_backend(), self.inexact_branch_counter)
+    }
+
+    /// [`Self::refuse_strict_with_inexact_branch_counter`] for an `analyze` or
+    /// `bisect` trial (`AnalyzeOpts::refuse_strict_with_inexact_branch_counter`).
+    /// Trials start through `RunOpts::run` and never pass through `main`
+    /// (<https://github.com/rrnewton/hermit/issues/3810>), so `--namespace-only`
+    /// (alias `--lite`) does not reach `run_with_namespace_only`: the trial
+    /// still runs on the backend's runtime and its counter, and is not exempt.
+    pub(crate) fn refuse_strict_trial_with_inexact_branch_counter(&self) -> Result<(), Error> {
+        if !self.strict || !self.backend_arms_reverie_ptrace_pmu_timer() {
             return Ok(());
         }
         refuse_an_inexact_branch_counter(self.selected_backend(), self.inexact_branch_counter)

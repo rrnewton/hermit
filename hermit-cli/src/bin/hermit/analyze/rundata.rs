@@ -588,9 +588,11 @@ impl AnalyzeOpts {
     /// `bisect` make the check here, before any workspace or trial exists.
     /// Without it a trial on a miscounting counter can disagree with another
     /// for a hardware reason and be reported as a race
-    /// (https://github.com/rrnewton/hermit/issues/3810).
+    /// (https://github.com/rrnewton/hermit/issues/3810). Unlike `run`, a trial
+    /// with `--namespace-only` is not exempt: trials never reach the
+    /// namespace-only launcher, so they still run on ptrace.
     pub fn refuse_strict_with_inexact_branch_counter(&self) -> anyhow::Result<()> {
-        RunData::get_raw_runopts(self).refuse_strict_with_inexact_branch_counter()
+        RunData::get_raw_runopts(self).refuse_strict_trial_with_inexact_branch_counter()
     }
 }
 
@@ -743,6 +745,25 @@ mod tests {
                 "--strict",
                 "/bin/true",
             ][..],
+            // `RunOpts::run` ignores `--namespace-only`, so these trials still
+            // run on ptrace and its counter (rel-041 review of
+            // https://github.com/rrnewton/hermit/pull/3834).
+            &[
+                "hermit",
+                "analyze",
+                "--",
+                "--strict",
+                "--namespace-only",
+                "/bin/true",
+            ][..],
+            &[
+                "hermit",
+                "analyze",
+                "--run-arg=--strict",
+                "--run-arg=--lite",
+                "--",
+                "/bin/true",
+            ][..],
         ] {
             let error = options(refused, inexact)
                 .refuse_strict_with_inexact_branch_counter()
@@ -787,35 +808,40 @@ mod tests {
     }
 
     /// Through `main`: the refusal must be wired into analyze's preflight,
-    /// ahead of the workspace and every trial. `--run1-schedule` is not
-    /// implemented and `main` panics on it right after that preflight, so an
-    /// analyze that passed the refusal panics instead of starting anything.
+    /// ahead of the workspace and every trial, including for a trial with
+    /// `--namespace-only` or `--lite`, which still runs on ptrace.
+    /// `--run1-schedule` is not implemented and `main` panics on it right
+    /// after that preflight, so an analyze that passed the refusal panics
+    /// instead of starting anything.
     #[test]
     fn strict_analyze_refuses_an_inexact_branch_counter_before_its_workspace() {
-        let argv = [
-            "hermit",
-            "analyze",
-            "--run1-schedule=/nonexistent/schedule.json",
-            "--",
-            "--strict",
-            "/bin/true",
-        ];
-        let args = crate::Args::try_parse_from(argv).unwrap();
-        let crate::Subcommand::Analyze(mut options) = args.command else {
-            panic!("{argv:?} is not analyze")
-        };
-        options.inexact_branch_counter = || Some("SpecLockMap is enabled".to_string());
-        let error = options.main(&args.global).unwrap_err();
-        assert!(
-            error
-                .downcast_ref::<crate::container::PolicyRefusal>()
-                .is_some(),
-            "{error:#}"
-        );
-        assert!(
-            error.to_string().contains("SpecLockMap is enabled"),
-            "{error:#}"
-        );
+        for extra in [None, Some("--namespace-only"), Some("--lite")] {
+            let mut argv = vec![
+                "hermit",
+                "analyze",
+                "--run1-schedule=/nonexistent/schedule.json",
+                "--",
+                "--strict",
+            ];
+            argv.extend(extra);
+            argv.push("/bin/true");
+            let args = crate::Args::try_parse_from(&argv).unwrap();
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            options.inexact_branch_counter = || Some("SpecLockMap is enabled".to_string());
+            let error = options.main(&args.global).unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{argv:?}: {error:#}"
+            );
+            assert!(
+                error.to_string().contains("SpecLockMap is enabled"),
+                "{argv:?}: {error:#}"
+            );
+        }
     }
 
     /// `run` has no `--backend`, so `hermit --backend <BACKEND> analyze` is the

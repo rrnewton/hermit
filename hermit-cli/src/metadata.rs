@@ -412,7 +412,8 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
     // properties that define it (see run.rs: only `sequentialize_threads` matches).
     // Any claim that recording is "strict" in that sense is wrong; the `--strict` flag
     // on `hermit record` is accepted for command-line compatibility, and its only effect
-    // is to refuse a host whose retired-branch counter is inexact (rrnewton/hermit#3810).
+    // is to refuse a host whose retired-branch counter is inexact
+    // (https://github.com/rrnewton/hermit/issues/3810).
     let default_config: detcore::Config = Default::default();
     let mut config = detcore::Config {
         // Record and replay are determinism claims, so an unsupported syscall
