@@ -656,6 +656,203 @@ fn verify_signal_report_cannot_hold_agreed_guest_stdout() {
     );
 }
 
+/// The control for the two tests below: with room in the stdout file, the
+/// agreed `x` that both verified runs print with no newline reaches it, and
+/// hermit then ends by the guest's signal. Before hermit flushed stdout itself,
+/// raising the signal discarded the `x`.
+#[test]
+fn verify_delivers_agreed_unterminated_stdout_before_the_guest_signal() {
+    let (status, appended, stderr) = run_with_stdout_held_in_a_file(
+        &["--verify-allow=failure"],
+        "printf x; kill -USR1 $$",
+        StdoutFile {
+            size_limited: false,
+        },
+    );
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGUSR1),
+        "unexpected status {status:?}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Determinism verified."),
+        "the runs did not verify\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        appended, b"x",
+        "the agreed guest stdout must arrive\nstderr:\n{stderr}"
+    );
+}
+
+/// The same with the stdout file already at the file-size limit and SIGXFSZ
+/// at its default: writing the `x` fails, and hermit must still end by the
+/// guest's SIGUSR1 rather than be killed by SIGXFSZ for its own write.
+#[test]
+fn verify_keeps_the_guest_signal_when_stdout_is_at_its_size_limit() {
+    let (status, appended, stderr) = run_with_stdout_held_in_a_file(
+        &["--verify-allow=failure"],
+        "printf x; kill -USR1 $$",
+        StdoutFile { size_limited: true },
+    );
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGUSR1),
+        "hermit's own write replaced the guest's signal: {status:?}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Determinism verified."),
+        "the runs did not verify\nstderr:\n{stderr}"
+    );
+    assert!(
+        appended.is_empty(),
+        "the file grew past its limit: {appended:?}"
+    );
+}
+
+/// And for a status hermit exits with: the runs differ only in run 1's check
+/// for the marker and are rejected (1). `exit` flushes stdout again, so the
+/// `x` that could not be written is written again there, and that write must
+/// not be killed by SIGXFSZ either.
+#[test]
+fn verify_keeps_the_rejected_status_when_stdout_is_at_its_size_limit() {
+    let marker = run_1_marker("run-1-marked-stdout-at-limit");
+    let script = format!(
+        "[ -e '{0}' ]; : > '{0}'; printf x; kill -USR1 $$",
+        marker.display()
+    );
+    let (status, appended, stderr) = run_with_stdout_held_in_a_file(
+        &["--verify-allow=failure"],
+        &script,
+        StdoutFile { size_limited: true },
+    );
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "hermit's own write replaced the rejected runs' status: {status:?}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(":: The run 1 guest was terminated by signal 10 (SIGUSR1)."),
+        "the runs were not rejected for their difference\nstderr:\n{stderr}"
+    );
+    assert!(
+        appended.is_empty(),
+        "the file grew past its limit: {appended:?}"
+    );
+}
+
+/// hermit's stdout: a file opened for appending that already holds
+/// `STDOUT_FILE_HELD` bytes (sparse), so hermit appends at that offset.
+struct StdoutFile {
+    /// Whether hermit runs with `RLIMIT_FSIZE` at `STDOUT_FILE_HELD`, so the
+    /// file is already at the limit. The limit is high enough for every file
+    /// hermit writes from the start. SIGXFSZ is at its default and unblocked
+    /// either way.
+    size_limited: bool,
+}
+
+const STDOUT_FILE_HELD: u64 = 1 << 30;
+
+/// Run `hermit run --verify --base-env=minimal` with `extra_args` and then
+/// `-- /bin/sh -c script`, its stdout `file`, and return its status, within a
+/// bound, what it appended to the file, and its stderr.
+fn run_with_stdout_held_in_a_file(
+    extra_args: &[&str],
+    script: &str,
+    file: StdoutFile,
+) -> (std::process::ExitStatus, Vec<u8>, String) {
+    let _guard = hermit_signal_lock();
+    let mut stdout = tempfile::tempfile().expect("failed to create the stdout file");
+    stdout
+        .set_len(STDOUT_FILE_HELD)
+        .expect("failed to size the stdout file");
+    let appending = fs::OpenOptions::new()
+        .append(true)
+        .open(format!(
+            "/proc/self/fd/{}",
+            std::os::fd::AsRawFd::as_raw_fd(&stdout)
+        ))
+        .expect("failed to open the stdout file for appending");
+    let mut stderr = tempfile::tempfile().expect("failed to create the stderr file");
+
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command
+        .args(["run", "--verify", "--base-env=minimal"])
+        .args(extra_args)
+        .args(["--", "/bin/sh", "-c", script]);
+    // Before stdio, as in `run_against_an_undrained_pipe`.
+    hermit_test::configure_guest_execution(&mut command);
+    command
+        .stdin(Stdio::null())
+        .stdout(appending)
+        .stderr(stderr.try_clone().expect("failed to clone the stderr file"));
+    let size_limited = file.size_limited;
+    // SAFETY: only async-signal-safe calls, on local values, in the child.
+    unsafe {
+        command.pre_exec(move || {
+            if size_limited {
+                let limit = libc::rlimit {
+                    rlim_cur: STDOUT_FILE_HELD,
+                    rlim_max: STDOUT_FILE_HELD,
+                };
+                if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            libc::signal(libc::SIGXFSZ, libc::SIG_DFL);
+            let mut xfsz: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut xfsz);
+            libc::sigaddset(&mut xfsz, libc::SIGXFSZ);
+            libc::sigprocmask(libc::SIG_UNBLOCK, &xfsz, std::ptr::null_mut());
+            Ok(())
+        });
+    }
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to start hermit: {error}"));
+    drop(command);
+    let deadline = Duration::from_secs(30);
+    let status = wait_within(&mut child, deadline);
+
+    let mut appended = Vec::new();
+    stdout
+        .seek(SeekFrom::Start(STDOUT_FILE_HELD))
+        .expect("failed to seek the stdout file");
+    stdout
+        .read_to_end(&mut appended)
+        .expect("failed to read the stdout file");
+    let mut stderr_bytes = Vec::new();
+    stderr
+        .seek(SeekFrom::Start(0))
+        .expect("failed to seek the stderr file");
+    stderr
+        .read_to_end(&mut stderr_bytes)
+        .expect("failed to read the stderr file");
+    let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
+    let status = status
+        .unwrap_or_else(|| panic!("hermit had not exited after {deadline:?}\nstderr:\n{stderr}"));
+    (status, appended, stderr)
+}
+
+/// Wait for `child` until `deadline` has passed since now; then kill and reap
+/// it and return `None`.
+fn wait_within(
+    child: &mut std::process::Child,
+    deadline: Duration,
+) -> Option<std::process::ExitStatus> {
+    let started = Instant::now();
+    loop {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => return Some(status),
+            None if started.elapsed() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
 /// Run a first run that a signal ends and `--verify` rejects, with stderr a
 /// `pipe_bytes` pipe holding `waiting_bytes` that nobody reads until hermit
 /// exits, `O_NONBLOCK` when `nonblocking`, and require the rejected first

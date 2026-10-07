@@ -587,6 +587,8 @@ fn main() {
     if let Some(error) = evidence_error {
         display_error(error);
     }
+    // From here on a write may fail but must not replace `status`.
+    block_write_signals_until_exit();
     // Guest output agreed by both `--verify` runs can still be buffered (no
     // final newline), and `exit` would flush it after the report, behind
     // whatever room the report took. As at exit, a failed flush is ignored.
@@ -594,6 +596,29 @@ fn main() {
     // Last, so that nothing hermit must say waits behind it.
     verify::write_queued_signal_reports();
     status.raise_or_exit();
+}
+
+/// Block `SIGXFSZ` and `SIGPIPE` for the rest of the process. A write of
+/// required output to a stdout file already at its `RLIMIT_FSIZE`, or to a
+/// closed reader, would otherwise kill hermit with that signal in place of the
+/// status it is about to propagate. Blocked, the write fails with `EFBIG` or
+/// `EPIPE` instead. That includes the flush `exit` retries when a buffered
+/// write failed, so the block lasts until exit rather than one write.
+/// Dispositions are unchanged and nothing is consumed, so a signal already
+/// pending stays pending. `raise_or_exit` unblocks the guest's own signal after
+/// raising it, so a guest that died of either still has that signal propagated.
+/// `SIGTTOU` stays unblocked, so a background hermit still stops on a `TOSTOP`
+/// terminal.
+fn block_write_signals_until_exit() {
+    // SAFETY: sigset operations on a local, initialized set; pthread_sigmask
+    // affects only the calling thread, which is the one that writes and exits.
+    unsafe {
+        let mut blocked: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut blocked);
+        libc::sigaddset(&mut blocked, libc::SIGXFSZ);
+        libc::sigaddset(&mut blocked, libc::SIGPIPE);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, std::ptr::null_mut());
+    }
 }
 
 /// Machine-readable classification of a hermit-internal failure, on stderr.
