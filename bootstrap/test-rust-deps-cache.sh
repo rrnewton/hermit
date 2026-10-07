@@ -49,7 +49,33 @@ for f in regenerate-rust-deps rust-deps-cache.sh rust-deps-cache-key.rs; do
   [[ -f $script_dir/$f ]] || { echo "test-rust-deps-cache: missing $script_dir/$f" >&2; exit 2; }
 done
 
-tmp=$(mktemp -d)
+# The fixture must have no Buck cell marker (.buckconfig, .buckroot) above it
+# (see "Buck cell markers" below). A TMPDIR inside a Buck checkout would put
+# the checkout's own marker above it: validate points TMPDIR into the
+# checkout's target/validation when the caller sets none, as on a GitHub-hosted
+# runner, and hermit tracks a .buckconfig at its root. So the fixture takes the
+# first temporary root with no marker above it.
+marker_free() {
+  local up
+  up=$(cd -- "$1" 2>/dev/null && pwd -P) || return 1
+  while :; do
+    [[ ! -e $up/.buckconfig && ! -e $up/.buckroot ]] || return 1
+    [[ $up != / ]] || return 0
+    up=$(dirname -- "$up")
+  done
+}
+tmp_root=
+for candidate in "${TMPDIR:-/tmp}" /tmp /var/tmp; do
+  if marker_free "$candidate"; then
+    tmp_root=$candidate
+    break
+  fi
+done
+[[ -n $tmp_root ]] || {
+  echo "test-rust-deps-cache: TMPDIR, /tmp and /var/tmp each have a Buck cell marker above them" >&2
+  exit 2
+}
+tmp=$(mktemp -d -p "$tmp_root")
 trap 'rm -rf "${tmp:?}"' EXIT
 failures=0
 fail() { echo "FAIL: $*" >&2; failures=$((failures + 1)); }
