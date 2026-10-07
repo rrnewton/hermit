@@ -1528,31 +1528,77 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         raw_fd: RawFd,
     ) -> Result<libc::stat, Errno> {
+        Self::inject_into_stack_buffer(guest, |stat| {
+            Syscall::Fstat(
+                syscalls::Fstat::new()
+                    .with_fd(raw_fd)
+                    .with_stat(Some(StatPtr(stat))),
+            )
+        })
+        .await
+    }
+
+    /// Inject the system call `syscall` makes around a `B` buffer in the
+    /// guest stack scratch, and read back what the kernel wrote there, saving
+    /// and restoring the scratch's bytes as [`Self::inject_fstat_on_stack`]
+    /// describes. Returns `EFAULT` when the scratch cannot be read, committed
+    /// or written.
+    async fn inject_into_stack_buffer<G: Guest<Self>, B: Copy>(
+        guest: &mut G,
+        syscall: impl FnOnce(AddrMut<'_, B>) -> Syscall,
+    ) -> Result<B, Errno> {
+        const SAVED_MAX: usize = 256;
+        let len = std::mem::size_of::<B>();
+        assert!(len <= SAVED_MAX, "a {len}-byte stack buffer");
         let mut stack = guest.stack().await;
-        let statptr: StatPtr = StatPtr(stack.reserve());
-        let mut saved = [0u8; std::mem::size_of::<libc::stat>()];
-        // `EFAULT` here sends the fstat to a transient page before anything
-        // is written.
-        guest.memory().read_exact(statptr.0.cast(), &mut saved)?;
+        let buffer: AddrMut<B> = stack.reserve();
+        // On the stack, not the heap: this runs for every getdents, and the
+        // Detcore tests run under an allocator that never frees.
+        let mut saved = [0u8; SAVED_MAX];
+        let saved = &mut saved[..len];
+        // `EFAULT` here sends an fstat to a transient page before anything is
+        // written.
+        guest.memory().read_exact(buffer.cast(), saved)?;
         // Keep the guard until the buffer is written back. DBT and SaBRe free
         // their Tool-owned arena when the guard drops; LiteInst and e9patch
         // move it to a list of committed arenas that is cleared when the
-        // current dispatch ends. Either way, an injected fstat after the drop
+        // current dispatch ends. Either way, an injected call after the drop
         // could write into memory the scratch no longer owns. A failed commit
         // is written back too: the ptrace commit writes page by page, so it
         // can fail after writing a lower writable page.
         let committed = stack.commit();
         let copied = match &committed {
-            Ok(_) => Self::inject_fstat_into(guest, raw_fd, statptr).await,
+            // NOTE: Must retry the injection here. This could get interrupted
+            // and we don't want to rerun the entire syscall handler twice.
+            Ok(_) => match guest.inject_with_retry(syscall(buffer)).await {
+                Ok(_) => guest.memory().read_value(buffer),
+                Err(errno) => Err(errno),
+            },
             Err(errno) => Err(*errno),
         };
-        let restored = guest.memory().write_exact(statptr.0.cast(), &saved);
+        let restored = guest.memory().write_exact(buffer.cast(), saved);
         drop(committed);
         match (copied, restored) {
             (Ok(copied), Ok(())) => Ok(copied),
             (Err(errno), Ok(())) | (Ok(_), Err(errno)) => Err(errno),
             (Err(Errno::EFAULT), Err(errno)) | (Err(errno), Err(_)) => Err(errno),
         }
+    }
+
+    /// The filesystem type (`f_type`) of the open file `raw_fd`, from an
+    /// injected `fstatfs` whose buffer is in the guest stack scratch (see
+    /// [`Self::inject_into_stack_buffer`]). There is no transient-page
+    /// fallback: the one caller, [`Self::directory_entry_lookup`], has a
+    /// faithful answer without the type.
+    async fn inject_fstatfs_type<G: Guest<Self>>(
+        guest: &mut G,
+        raw_fd: RawFd,
+    ) -> Result<libc::__fsword_t, Errno> {
+        let statfs: libc::statfs = Self::inject_into_stack_buffer(guest, |buf| {
+            Syscall::Fstatfs(syscalls::Fstatfs::new().with_fd(raw_fd).with_buf(Some(buf)))
+        })
+        .await?;
+        Ok(statfs.f_type)
     }
 
     /// The fallback of [`Self::inject_fstat`]: the buffer lives in a private
@@ -1772,10 +1818,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// `stat` itself is not determinized in that mode. Both values stay
     /// deterministic.
     ///
-    /// Directory entries do not have that gap when metadata is virtualized:
-    /// `getdents` keys each `d_ino` on the device the entry's own `lstat`
-    /// reports when that `lstat` reports the same inode
-    /// (`directory_entry_identity`).
+    /// Directory entries mostly avoid that gap when metadata is virtualized:
+    /// `getdents` keys a `d_ino` on the device the entry's own `lstat`
+    /// reports when that `lstat` reports the same inode. It asks every entry
+    /// on overlayfs, but elsewhere only `..` and, on btrfs, an entry whose
+    /// `d_ino` is 256, so a mount point whose root has the inode number of
+    /// the entry it covers keeps the directory's device
+    /// (`directory_entry_identity` names the classes).
     async fn mapping_stat_identity<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -7081,6 +7130,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let buf = call.dirent().ok_or(Errno::EFAULT)?.cast::<u8>();
         // Resolved before the real call: see `directory_device`.
         let device = self.directory_device(guest, call.fd() as RawFd).await?;
+        let lookup = self.directory_entry_lookup(guest, call.fd() as RawFd).await;
         self.serve_directory_stream(
             guest,
             GetdentsCall {
@@ -7088,6 +7138,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 empty: Syscall::from(call.with_count(0)),
                 fd: call.fd() as i32,
                 device,
+                lookup,
                 buf,
                 capacity: call.count() as usize,
                 format: DirentFormat::Legacy,
@@ -7108,6 +7159,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let buf = call.dirent().ok_or(Errno::EFAULT)?.cast::<u8>();
         // Resolved before the real call: see `directory_device`.
         let device = self.directory_device(guest, call.fd() as RawFd).await?;
+        let lookup = self.directory_entry_lookup(guest, call.fd() as RawFd).await;
         self.serve_directory_stream(
             guest,
             GetdentsCall {
@@ -7115,6 +7167,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 empty: Syscall::from(call.with_count(0)),
                 fd: call.fd() as i32,
                 device,
+                lookup,
                 buf,
                 capacity: call.count() as usize,
                 format: DirentFormat::Dirent64,
@@ -7284,9 +7337,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let mut records = Vec::new();
                 let mut names = Vec::with_capacity(batch.len());
                 for (index, entry) in batch.iter().enumerate() {
-                    let identity = self
-                        .directory_entry_identity(guest, call.fd, call.device, entry)
-                        .await?;
+                    let identity = self.directory_entry_identity(guest, call, entry).await?;
                     let (d_ino, _) = determinize_inode(guest, identity).await;
                     let d_off = i64::try_from(start + index as u64 + 1).unwrap_or(i64::MAX);
                     call.format
@@ -7320,21 +7371,22 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// The raw identity that keys the deterministic inode of `entry`, read
-    /// from the directory open as `fd`, whose device is `device` (see
-    /// [`Self::directory_device`]).
+    /// by `call` from the directory open as `call.fd`, whose device is
+    /// `call.device` (see [`Self::directory_device`]).
     ///
     /// An entry's inode number is not always on the directory's device. On
     /// overlayfs with `xino=off` over layers on different filesystems, a
     /// file's `d_ino` is its `st_ino`, but `stat` reports the layer's device.
-    /// So the entry is `lstat`ed relative to `fd`, with `AT_SYMLINK_NOFOLLOW`
-    /// because a `d_ino` names a symbolic link itself, and `AT_NO_AUTOMOUNT`
-    /// so that asking mounts nothing. When that reports the entry's `d_ino`,
-    /// the device it reports keys the entry, so the guest's `d_ino` and
-    /// `st_ino` for the file agree, as they do natively. When it reports
-    /// another inode, `device` keys the entry: a mount point's entry names
-    /// the directory beneath the mount, and a btrfs subvolume's carries the
+    /// So an entry that `call.lookup` asks (see [`EntryLookup`]) is `lstat`ed
+    /// relative to the descriptor, with `AT_SYMLINK_NOFOLLOW` because a
+    /// `d_ino` names a symbolic link itself, and `AT_NO_AUTOMOUNT` so that
+    /// asking mounts nothing. When that reports the entry's `d_ino`, the
+    /// device it reports keys the entry, so the guest's `d_ino` and `st_ino`
+    /// for the file agree, as they do natively. When it reports another
+    /// inode, `call.device` keys the entry: a mount point's entry names the
+    /// directory beneath the mount, and a btrfs subvolume's carries the
     /// subvolume's id, and both differ from `st_ino` natively too. So does an
-    /// entry removed or replaced after the read. `device` also keys the
+    /// entry removed or replaced after the read. `call.device` also keys the
     /// entry when the guest's filesystem answers that the name reaches
     /// nothing (`ENOENT`, `ENOTDIR`, `ELOOP`, `ENAMETOOLONG`, or `EACCES`
     /// from a directory that may be read but not searched). That is a guess,
@@ -7343,21 +7395,88 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// search, whose `stat` reports it on another device; then the two views
     /// key different identities. This is a known gap.
     ///
+    /// An entry that `call.lookup` does not ask is keyed on `call.device`
+    /// without a `stat`. Where its `lstat` would have reported its `d_ino` on
+    /// another device, the guest's `d_ino` and `st_ino` for it then differ
+    /// where Linux's agree. That is a second known gap, narrower than the
+    /// first: outside overlayfs it needs an entry whose own `lstat` leaves
+    /// the directory's device and lands on the same inode number. The
+    /// classes are (1) a mount point, or a file bind-mounted over another,
+    /// whose mounted root or source file has the inode number of the entry
+    /// it covers. A filesystem's root has a small fixed number (1 on procfs,
+    /// sysfs and tmpfs, 2 on ext4, usually 128 on xfs, 256 on a btrfs
+    /// subvolume), so this needs a covered entry with one of those numbers.
+    /// That is rare: on ext4 and btrfs those numbers are the covering
+    /// filesystem's own root or reserved, though a directory on tmpfs,
+    /// procfs, sysfs or xfs can have one. (2) A filesystem other than
+    /// overlayfs and btrfs whose `stat` reports a device per entry rather
+    /// than its superblock's. None is handled; bcachefs subvolumes and union
+    /// filesystems outside mainline, such as aufs and shiftfs, are not
+    /// checked. FUSE, NFS and ecryptfs report the superblock's device, and
+    /// their submounts are mounts, class (1).
+    ///
     /// Any other failure is a refusal, and `ESRCH` its errno, as for every
     /// guest stat (see [`Self::stat_guest_path`]). The getdents has already
-    /// been issued then. Each entry returned costs one injected `fstatat`.
+    /// been issued then. Each entry asked costs one injected `fstatat`.
     async fn directory_entry_identity<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        fd: RawFd,
-        device: u64,
+        call: GetdentsCall<'_>,
         entry: &DirEntry,
     ) -> Result<RawInode, Error> {
-        let stat = Self::stat_guest_path_at(guest, StatAt::entry_of(fd), &entry.name).await?;
+        if !call.lookup.asks(entry) {
+            return Ok(RawInode::new(call.device, entry.ino));
+        }
+        let stat = Self::stat_guest_path_at(guest, StatAt::entry_of(call.fd), &entry.name).await?;
         Ok(match stat {
             Some(stat) if stat.st_ino == entry.ino => RawInode::new(stat.st_dev, entry.ino),
-            _ => RawInode::new(device, entry.ino),
+            _ => RawInode::new(call.device, entry.ino),
         })
+    }
+
+    /// Which entries of the directory open as `fd` are `lstat`ed for the
+    /// device their inode number is on (see [`EntryLookup`]), from the type
+    /// of the directory's filesystem. A descriptor Detcore tracks keeps the
+    /// answer on its open file description, so it is asked once per open
+    /// directory; for any other descriptor, each getdents asks an injected
+    /// `fstatfs` (see [`Self::inject_fstatfs_type`]).
+    ///
+    /// Asking every entry is never less faithful than asking fewer: an entry
+    /// whose `lstat` does not report its `d_ino` is keyed on the directory's
+    /// device either way. So when the `fstatfs` fails or cannot be asked (an
+    /// unwritable stack scratch, `ENOSYS` under a seccomp policy), every
+    /// entry is asked, as before the type was consulted, and nothing is
+    /// cached; the failure never becomes the getdents' result. The getdents
+    /// handlers call this before the real call, after
+    /// [`Self::directory_device`].
+    async fn directory_entry_lookup<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> EntryLookup {
+        let cached = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.directory_entry_lookup());
+        if let Ok(Some(lookup)) = cached {
+            return lookup;
+        }
+        match Self::inject_fstatfs_type(guest, fd).await {
+            Ok(f_type) => {
+                let lookup = EntryLookup::of_filesystem(f_type);
+                // A descriptor Detcore does not track has nowhere to keep it.
+                let _ = guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.set_directory_entry_lookup(lookup));
+                lookup
+            }
+            Err(errno) => {
+                info!(
+                    "fstatfs of directory fd {} failed ({}); every entry's lstat is asked.",
+                    fd, errno
+                );
+                EntryLookup::Every
+            }
+        }
     }
 
     /// The host device of the directory open as `fd`, which keys an entry's
@@ -7445,9 +7564,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         sort_dir_entries(&mut entries);
         let mut records = Vec::with_capacity(len);
         for entry in &entries {
-            let identity = self
-                .directory_entry_identity(guest, call.fd, call.device, entry)
-                .await?;
+            let identity = self.directory_entry_identity(guest, call, entry).await?;
             let (d_ino, _) = determinize_inode(guest, identity).await;
             call.format
                 .encode(entry, d_ino.as_raw(), entry.off, &mut records);
@@ -7950,6 +8067,9 @@ struct GetdentsCall<'a> {
     /// another device (see `Detcore::directory_entry_identity`); resolved
     /// before the real call (see `Detcore::directory_device`).
     device: u64,
+    /// Which entries are `lstat`ed for that device at all; the others are
+    /// keyed on `device` (see `Detcore::directory_entry_lookup`).
+    lookup: EntryLookup,
     buf: AddrMut<'a, u8>,
     /// The guest's buffer size.
     capacity: usize,
@@ -7973,6 +8093,7 @@ impl<'a> GetdentsCall<'a> {
             empty: self.empty,
             fd: self.fd,
             device: self.device,
+            lookup: self.lookup,
             buf,
             capacity: count as usize,
             format: self.format,
@@ -9335,6 +9456,18 @@ pub(crate) mod inject_fstat_scratch {
         answers_touch_file: bool,
         /// Raw identity of each `TouchFile` request, in order.
         touched: std::sync::Mutex<Vec<RawInode>>,
+        /// What every injected `fstatfs` answers instead of running, when
+        /// set: the filesystem type it reports, or the errno it fails with.
+        /// The test's own directories are on whatever filesystem `TMPDIR`
+        /// is.
+        fstatfs_answer: Option<Result<libc::__fsword_t, Errno>>,
+        /// (descriptor, whether a stack guard was live) of each injected
+        /// fstatfs.
+        fstatfs_calls: Vec<(RawFd, bool)>,
+        /// (name, inode): an injected getdents64 reports `inode` as the
+        /// `d_ino` of the entry `name`, for an inode number the test cannot
+        /// give a file, such as a btrfs subvolume's.
+        getdents_inode_answers: Vec<(Vec<u8>, u64)>,
     }
 
     /// The deterministic inode `send_rpc` gives the first `DeterminizeInode`
@@ -9391,6 +9524,9 @@ pub(crate) mod inject_fstat_scratch {
                 fstat_answers: Vec::new(),
                 answers_touch_file: false,
                 touched: std::sync::Mutex::new(Vec::new()),
+                fstatfs_answer: None,
+                fstatfs_calls: Vec::new(),
+                getdents_inode_answers: Vec::new(),
             };
             (tool, guest)
         }
@@ -9797,18 +9933,59 @@ pub(crate) mod inject_fstat_scratch {
                         args.arg5,
                     )
                 },
-                // A directory read or seek a getdents handler issues, run as
-                // it is on the test's own descriptor and buffers.
-                Syscall::Getdents64(_) | Syscall::Lseek(_) => unsafe {
-                    libc::syscall(
-                        number as libc::c_long,
-                        args.arg0,
-                        args.arg1,
-                        args.arg2,
-                        args.arg3,
-                        args.arg4,
-                        args.arg5,
-                    )
+                Syscall::Fstatfs(call) => {
+                    let buffer = call.buf().expect("fstatfs without a buffer").as_raw();
+                    self.fstatfs_calls
+                        .push((call.fd(), self.guard_live.load(Ordering::SeqCst)));
+                    match self.fstatfs_answer {
+                        Some(Ok(f_type)) => {
+                            let mut answer: libc::statfs = unsafe { std::mem::zeroed() };
+                            answer.f_type = f_type;
+                            unsafe {
+                                std::ptr::write_unaligned(buffer as *mut libc::statfs, answer)
+                            };
+                            0
+                        }
+                        Some(Err(errno)) => return Err(errno),
+                        None => i64::from(unsafe {
+                            libc::fstatfs(call.fd(), buffer as *mut libc::statfs)
+                        }),
+                    }
+                }
+                // A directory read a getdents handler issues, run as it is on
+                // the test's own descriptor and buffers, with any scripted
+                // `d_ino` written over the kernel's.
+                Syscall::Getdents64(call) => {
+                    let len = unsafe {
+                        libc::syscall(number as libc::c_long, args.arg0, args.arg1, args.arg2)
+                    };
+                    if len > 0 && !self.getdents_inode_answers.is_empty() {
+                        let buffer = call.dirent().expect("getdents64 without a buffer");
+                        // SAFETY: the kernel just wrote `len` bytes there.
+                        let records = unsafe {
+                            std::slice::from_raw_parts_mut(buffer.as_raw() as *mut u8, len as usize)
+                        };
+                        let mut at = 0;
+                        while at < records.len() {
+                            let reclen =
+                                u16::from_ne_bytes([records[at + 16], records[at + 17]]) as usize;
+                            let name = &records[at + 19..at + reclen];
+                            let name = &name[..name.iter().position(|&b| b == 0).unwrap()];
+                            if let Some((_, inode)) = self
+                                .getdents_inode_answers
+                                .iter()
+                                .find(|(scripted, _)| scripted == name)
+                            {
+                                records[at..at + 8].copy_from_slice(&inode.to_ne_bytes());
+                            }
+                            at += reclen;
+                        }
+                    }
+                    len
+                }
+                // A seek a getdents handler issues, run as it is.
+                Syscall::Lseek(_) => unsafe {
+                    libc::syscall(number as libc::c_long, args.arg0, args.arg1, args.arg2)
                 },
                 // The test process stands in for the guest's thread.
                 Syscall::Getpid(_) => i64::from(unsafe { libc::getpid() }),
@@ -12246,6 +12423,8 @@ pub(crate) mod inject_fstat_scratch {
             let scratch = Pages::map(1, 1);
             let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
             guest.answers_determinize_inode = true;
+            // Overlayfs, where every entry is asked.
+            guest.fstatfs_answer = Some(Ok(libc::OVERLAYFS_SUPER_MAGIC));
             if tracked {
                 tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
                     .await
@@ -12329,6 +12508,8 @@ pub(crate) mod inject_fstat_scratch {
                 let (tool, mut guest) =
                     ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
                 guest.answers_determinize_inode = true;
+                // Overlayfs, where `plain` is asked.
+                guest.fstatfs_answer = Some(Ok(libc::OVERLAYFS_SUPER_MAGIC));
                 if tracked {
                     tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
                         .await
@@ -12352,6 +12533,290 @@ pub(crate) mod inject_fstat_scratch {
                     Some(&b"plain"[..]),
                     "tracked {tracked}, {errno}: no entry after the failed one is asked"
                 );
+            }
+        }
+    }
+
+    /// The `d_ino` a scripted getdents64 gives `..`, which a scripted `lstat`
+    /// reports on [`OTHER_DEVICE`] as the parent of a mount or subvolume root
+    /// does.
+    const SCRIPTED_PARENT_INODE: u64 = 4242;
+
+    /// The names of the entries whose `lstat` was injected after the first
+    /// `from` ones, each checked to be relative to `fd`.
+    fn entries_asked(guest: &ScriptedGuest, fd: RawFd, from: usize) -> Vec<String> {
+        let entry_lstat = (fd, AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_NO_AUTOMOUNT);
+        assert!(
+            guest.fstatat_starts[from..]
+                .iter()
+                .all(|start| *start == entry_lstat),
+            "every lstat is relative to the descriptor: {:?}",
+            &guest.fstatat_starts[from..]
+        );
+        guest.fstatat_paths[from..]
+            .iter()
+            .map(|name| String::from_utf8_lossy(name).into_owned())
+            .collect()
+    }
+
+    // https://github.com/rrnewton/hermit/pull/3255 asked every entry's
+    // `lstat`, which cost the 3000-entry `readdir_order` test 5.9 GiB and
+    // triple its time. On btrfs only two kinds of entry can carry their
+    // `st_ino` on another device: `..` of a subvolume or mount root, and the
+    // entry of the first subvolume, whose id and root inode are both 256.
+    // Those are asked and keyed on the device their `lstat` reports; an
+    // entry whose `lstat` would report another device (`lower`) is not
+    // asked and keeps the directory's. Both getdents paths.
+    #[tokio::test]
+    async fn getdents_on_btrfs_asks_only_the_parent_and_a_first_subvolume() {
+        for tracked in [false, true] {
+            let (_dir, fd, inodes, device) = directory_with_entries();
+            let scratch = Pages::map(1, 1);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.answers_determinize_inode = true;
+            guest.fstatfs_answer = Some(Ok(libc::BTRFS_SUPER_MAGIC));
+            if tracked {
+                tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
+                    .await
+                    .expect("precondition: Detcore tracks the directory");
+            }
+            guest.getdents_inode_answers = vec![
+                (b"..".to_vec(), SCRIPTED_PARENT_INODE),
+                (b"covered".to_vec(), 256),
+            ];
+            guest.fstatat_answers = vec![
+                (
+                    b"..".to_vec(),
+                    Ok(stat_answer(
+                        OTHER_DEVICE,
+                        SCRIPTED_PARENT_INODE,
+                        libc::S_IFDIR | 0o755,
+                    )),
+                ),
+                (
+                    b"covered".to_vec(),
+                    Ok(stat_answer(OTHER_DEVICE, 256, libc::S_IFDIR | 0o755)),
+                ),
+                (
+                    b"lower".to_vec(),
+                    Ok(stat_answer(
+                        OTHER_DEVICE,
+                        inodes["lower"],
+                        libc::S_IFREG | 0o644,
+                    )),
+                ),
+            ];
+            let asked_before = guest.fstatat_paths.len();
+            let keyed_before = guest.determinized.lock().unwrap().len();
+
+            let returned = getdents64_of(&tool, &mut guest, fd).await;
+            close_unless_detcore_did(&guest, fd);
+
+            assert!(
+                returned.as_ref().is_ok_and(|len| *len > 0),
+                "tracked {tracked}: {returned:?}"
+            );
+            let keyed = guest.determinized.lock().unwrap()[keyed_before..].to_vec();
+            assert_eq!(
+                keyed.get(1..),
+                Some(
+                    &[
+                        RawInode::new(OTHER_DEVICE, SCRIPTED_PARENT_INODE),
+                        RawInode::new(OTHER_DEVICE, 256),
+                        RawInode::new(device, inodes["lower"]),
+                        RawInode::new(device, inodes["plain"]),
+                        RawInode::new(device, inodes["vanished"]),
+                    ][..]
+                ),
+                "tracked {tracked}: .., covered, lower, plain and vanished, after ."
+            );
+            assert_eq!(
+                entries_asked(&guest, fd, asked_before),
+                ["..", "covered"],
+                "tracked {tracked}: only .. and the entry whose d_ino is 256 are asked"
+            );
+            assert_eq!(
+                guest.fstatfs_calls,
+                [(fd, true)],
+                "tracked {tracked}: one fstatfs, in the guarded stack scratch"
+            );
+        }
+    }
+
+    // The same measurement: on any filesystem but overlayfs and btrfs, `..`
+    // is the only entry asked. An ext4 mount root's `..` has inode 2, as
+    // the ext4 root above it does, so it is keyed on the device its `lstat`
+    // reports; `lower`, whose `lstat` would report another device, keeps
+    // the directory's.
+    #[tokio::test]
+    async fn getdents_elsewhere_asks_only_the_parent() {
+        for f_type in [0xef53, 0x0102_1994] {
+            for tracked in [false, true] {
+                let (_dir, fd, inodes, device) = directory_with_entries();
+                let scratch = Pages::map(1, 1);
+                let (tool, mut guest) =
+                    ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+                guest.answers_determinize_inode = true;
+                guest.fstatfs_answer = Some(Ok(f_type));
+                if tracked {
+                    tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
+                        .await
+                        .expect("precondition: Detcore tracks the directory");
+                }
+                guest.getdents_inode_answers = vec![(b"..".to_vec(), SCRIPTED_PARENT_INODE)];
+                guest.fstatat_answers = vec![
+                    (
+                        b"..".to_vec(),
+                        Ok(stat_answer(
+                            OTHER_DEVICE,
+                            SCRIPTED_PARENT_INODE,
+                            libc::S_IFDIR | 0o755,
+                        )),
+                    ),
+                    (
+                        b"lower".to_vec(),
+                        Ok(stat_answer(
+                            OTHER_DEVICE,
+                            inodes["lower"],
+                            libc::S_IFREG | 0o644,
+                        )),
+                    ),
+                ];
+                let asked_before = guest.fstatat_paths.len();
+                let keyed_before = guest.determinized.lock().unwrap().len();
+
+                let returned = getdents64_of(&tool, &mut guest, fd).await;
+                close_unless_detcore_did(&guest, fd);
+
+                let case = format!("f_type {f_type:#x}, tracked {tracked}");
+                assert!(
+                    returned.as_ref().is_ok_and(|len| *len > 0),
+                    "{case}: {returned:?}"
+                );
+                let keyed = guest.determinized.lock().unwrap()[keyed_before..].to_vec();
+                assert_eq!(
+                    keyed.get(1..),
+                    Some(
+                        &[
+                            RawInode::new(OTHER_DEVICE, SCRIPTED_PARENT_INODE),
+                            RawInode::new(device, inodes["covered"]),
+                            RawInode::new(device, inodes["lower"]),
+                            RawInode::new(device, inodes["plain"]),
+                            RawInode::new(device, inodes["vanished"]),
+                        ][..]
+                    ),
+                    "{case}: .., covered, lower, plain and vanished, after ."
+                );
+                assert_eq!(
+                    entries_asked(&guest, fd, asked_before),
+                    [".."],
+                    "{case}: no entry but .. is asked"
+                );
+            }
+        }
+    }
+
+    // Asking every entry is never less faithful than asking fewer, so an
+    // `fstatfs` that fails -- `ENOSYS` under a seccomp policy, or `EFAULT`
+    // from an unwritable stack scratch -- asks every entry, never fails the
+    // getdents, and is not remembered: the next getdents asks again.
+    #[tokio::test]
+    async fn getdents_asks_every_entry_when_the_filesystem_type_is_unknown() {
+        for unwritable_scratch in [false, true] {
+            for tracked in [false, true] {
+                let (_dir, fd, _, _) = directory_with_entries();
+                let scratch = Pages::map(1, 1);
+                let (tool, mut guest) =
+                    ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+                guest.answers_determinize_inode = true;
+                if tracked {
+                    tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
+                        .await
+                        .expect("precondition: Detcore tracks the directory");
+                }
+                // The descriptor's device is resolved first and is not
+                // what is measured here.
+                guest.fstat_answers = vec![(fd, stat_answer(1, 1, libc::S_IFDIR | 0o755))];
+                if unwritable_scratch {
+                    guest.commit_error = Some(Errno::EFAULT);
+                } else {
+                    guest.fstatfs_answer = Some(Err(Errno::ENOSYS));
+                }
+                let asked_before = guest.fstatat_paths.len();
+                let case = format!("unwritable scratch {unwritable_scratch}, tracked {tracked}");
+
+                let first = getdents64_of(&tool, &mut guest, fd).await;
+                let second = getdents64_of(&tool, &mut guest, fd).await;
+                let cached = guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.directory_entry_lookup());
+                close_unless_detcore_did(&guest, fd);
+
+                assert!(
+                    first.as_ref().is_ok_and(|len| *len > 0),
+                    "{case}: {first:?}"
+                );
+                assert!(second.as_ref().is_ok(), "{case}: {second:?}");
+                assert_eq!(
+                    entries_asked(&guest, fd, asked_before),
+                    [".", "..", "covered", "lower", "plain", "vanished"],
+                    "{case}: every entry is asked"
+                );
+                // An unwritable scratch fails before the `fstatfs` is
+                // injected; a refused one is injected on each getdents.
+                assert_eq!(
+                    guest.fstatfs_calls.len(),
+                    if unwritable_scratch { 0 } else { 2 },
+                    "{case}: each getdents asks the type again"
+                );
+                let expected_cache = if tracked { Ok(None) } else { Err(Errno::EBADF) };
+                assert_eq!(cached, expected_cache, "{case}: nothing is remembered");
+            }
+        }
+    }
+
+    // A descriptor Detcore tracks asks its filesystem's type once, through a
+    // real `fstatfs` in the guarded stack scratch that leaves the scratch as
+    // it was, and keeps the answer on its open file description; one it does
+    // not track asks on every getdents. The answer is the real filesystem's.
+    #[tokio::test]
+    async fn getdents_asks_a_tracked_directorys_filesystem_type_once() {
+        for tracked in [false, true] {
+            let (dir, fd, _, _) = directory_with_entries();
+            let scratch = Pages::map(1, 1);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.answers_determinize_inode = true;
+            if tracked {
+                tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
+                    .await
+                    .expect("precondition: Detcore tracks the directory");
+            }
+            let real = nix::sys::statfs::statfs(dir.path()).unwrap();
+            let expected = EntryLookup::of_filesystem(real.filesystem_type().0);
+
+            let first = getdents64_of(&tool, &mut guest, fd).await;
+            let second = getdents64_of(&tool, &mut guest, fd).await;
+            let cached = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.directory_entry_lookup());
+            close_unless_detcore_did(&guest, fd);
+
+            assert!(
+                first.as_ref().is_ok_and(|len| *len > 0),
+                "tracked {tracked}: {first:?}"
+            );
+            assert!(second.as_ref().is_ok(), "tracked {tracked}: {second:?}");
+            let expected_calls = if tracked {
+                vec![(fd, true)]
+            } else {
+                vec![(fd, true), (fd, true)]
+            };
+            assert_eq!(guest.fstatfs_calls, expected_calls, "tracked {tracked}");
+            assert_eq!(guest.unguarded_scratch_writes(), 0, "tracked {tracked}");
+            if tracked {
+                assert_eq!(cached, Ok(Some(expected)), "the real filesystem's lookup");
+            } else {
+                assert_eq!(cached, Err(Errno::EBADF), "nowhere to keep it");
             }
         }
     }

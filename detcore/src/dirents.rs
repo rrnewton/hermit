@@ -348,6 +348,71 @@ pub(crate) struct DirEntry {
     pub(crate) ty: u8,
 }
 
+/// The inode number of every btrfs subvolume's root directory
+/// (`BTRFS_FIRST_FREE_OBJECTID`), and the id of the first subvolume made on a
+/// filesystem, which is that number too.
+const BTRFS_SUBVOLUME_ROOT_INODE: u64 = 256;
+
+/// Which entries of a directory Detcore `lstat`s to learn the device an
+/// entry's inode number is on, chosen once per open directory from the type
+/// of its filesystem (`fstatfs`'s `f_type`). An entry that is not asked is
+/// keyed on the directory's own device (see
+/// `Detcore::directory_entry_identity`).
+///
+/// Linux reports a `d_ino` that is the entry's `st_ino` on a device other than
+/// the directory's in three places:
+///
+/// - overlayfs, whose files on a lower layer of another filesystem report
+///   that layer's device when the inode numbers cannot be folded into one
+///   (`xino` off or full), though `readdir` gives their real inode number,
+///   so every entry is asked;
+/// - btrfs, where every subvolume has its own device and its root directory
+///   is inode 256, and `readdir` gives a subvolume's entry the subvolume's id
+///   as `d_ino`; only the first subvolume of a filesystem has id 256, so only
+///   an entry whose `d_ino` is 256 can match there;
+/// - `..` of a directory that is the root of a mount or of a btrfs subvolume,
+///   whose `d_ino` is the inode of the directory above it, on another device;
+///   for a mount root, Linux gives `..` the root's own inode number instead,
+///   which still matches when the two filesystems number their roots alike
+///   (two ext4 roots are both inode 2).
+///
+/// `.` is the open directory itself, whose device is the directory's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum EntryLookup {
+    /// Every entry: overlayfs, or a directory whose filesystem type Detcore
+    /// could not learn.
+    Every,
+    /// `..`, and each entry other than `.` whose `d_ino` is 256: btrfs.
+    BtrfsSubvolumes,
+    /// `..` only: every other filesystem.
+    ParentOnly,
+}
+
+impl EntryLookup {
+    /// The entries to ask on a filesystem whose `fstatfs` reports `f_type`.
+    pub(crate) fn of_filesystem(f_type: libc::__fsword_t) -> Self {
+        if f_type == libc::OVERLAYFS_SUPER_MAGIC {
+            EntryLookup::Every
+        } else if f_type == libc::BTRFS_SUPER_MAGIC {
+            EntryLookup::BtrfsSubvolumes
+        } else {
+            EntryLookup::ParentOnly
+        }
+    }
+
+    /// Whether `entry`'s own `lstat` is asked for the device that keys it.
+    pub(crate) fn asks(self, entry: &DirEntry) -> bool {
+        let parent = entry.name == b"..";
+        match self {
+            EntryLookup::Every => true,
+            EntryLookup::BtrfsSubvolumes => {
+                parent || (entry.ino == BTRFS_SUBVOLUME_ROOT_INODE && entry.name != b".")
+            }
+            EntryLookup::ParentOnly => parent,
+        }
+    }
+}
+
 /// Sort `.` first, `..` second, then by name bytes. Names within one
 /// directory are unique, so this is a total order on a directory's entries.
 pub(crate) fn sort_dir_entries(entries: &mut [DirEntry]) {
@@ -1256,5 +1321,45 @@ mod test {
         // A rewind drops the snapshot and the kernel returns to the start.
         stream.seek(0);
         assert_eq!(stream.kernel_target(), 0);
+    }
+
+    // https://github.com/rrnewton/hermit/pull/3255 asked every entry's
+    // `lstat`, which cost a 3000-entry directory test 5.9 GiB under the test
+    // allocator. Only overlayfs asks every entry now; btrfs asks `..` and an
+    // entry whose `d_ino` is 256 (the first subvolume); any other filesystem
+    // asks `..` alone.
+    #[test]
+    fn entry_lookup_asks_only_where_the_filesystem_can_differ() {
+        let overlay = EntryLookup::of_filesystem(0x794c_7630);
+        let btrfs = EntryLookup::of_filesystem(0x9123_683e);
+        let ext4 = EntryLookup::of_filesystem(0xef53);
+        let tmpfs = EntryLookup::of_filesystem(0x0102_1994);
+        assert_eq!(overlay, EntryLookup::Every);
+        assert_eq!(btrfs, EntryLookup::BtrfsSubvolumes);
+        assert_eq!(ext4, EntryLookup::ParentOnly);
+        assert_eq!(tmpfs, EntryLookup::ParentOnly);
+
+        let with_ino = |name: &str, ino: u64| DirEntry { ino, ..entry(name) };
+        let entries = [
+            with_ino(".", 256),
+            with_ino("..", 4096),
+            with_ino("subvolume", 256),
+            with_ino("later_subvolume", 257),
+            with_ino("file", 300),
+        ];
+        let asked = |lookup: EntryLookup| -> Vec<&str> {
+            entries
+                .iter()
+                .filter(|entry| lookup.asks(entry))
+                .map(|entry| std::str::from_utf8(&entry.name).unwrap())
+                .collect()
+        };
+        assert_eq!(
+            asked(overlay),
+            [".", "..", "subvolume", "later_subvolume", "file"]
+        );
+        assert_eq!(asked(btrfs), ["..", "subvolume"]);
+        assert_eq!(asked(ext4), [".."]);
+        assert_eq!(asked(tmpfs), [".."]);
     }
 }
