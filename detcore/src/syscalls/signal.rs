@@ -372,7 +372,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             // `LogicalTime::INDEFINITE` records that, and the scheduler refuses to
             // fast-forward virtual time onto it (see `step2d_handle_empty_queue`),
             // so the `Normal` arm below stays unreachable.
-            let req = Self::sleep_request_abs(guest, LogicalTime::INDEFINITE).await;
+            let mut req = Self::sleep_request_abs(guest, LogicalTime::INDEFINITE).await;
+            req.fyi(crate::resources::PAUSE_FYI);
             match crate::tool_global::parked_wait_request(
                 guest,
                 req,

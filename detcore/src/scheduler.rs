@@ -16,6 +16,7 @@ mod parked_tests;
 pub(crate) mod real_timer;
 mod replayer;
 pub mod runqueue;
+mod sigalrm;
 pub(crate) mod signal_control;
 pub mod timed_waiters;
 
@@ -852,6 +853,10 @@ pub struct Scheduler {
     controlled_turn_entries: u64,
     pub(crate) real_timers: real_timer::RealTimers,
     parked: parked::ParkedRequests,
+
+    /// Guest-handled SIGALRMs on a backend that runs Detcore inside each guest
+    /// process (`sigalrm`).
+    sigalrm: sigalrm::SigalrmLedger,
 
     /// Raw TIDs removed by logical teardown. Tombstones are permanent for the life of this
     /// scheduler: accepting Linux TID reuse would let delayed backend RPCs bind to a new thread.
@@ -2114,6 +2119,7 @@ impl Scheduler {
             controlled_turn_entries: 0,
             real_timers: Default::default(),
             parked: Default::default(),
+            sigalrm: Default::default(),
             logically_killed_threads: Default::default(),
             exec_incarnations: Default::default(),
             retired_transferred_exec_callers: Default::default(),
@@ -2632,6 +2638,7 @@ impl Scheduler {
         self.deschedule_or_defer(*dtid);
         // Remove from all non-runnable pools:
         self.remove_blocking_entries(dtid);
+        self.retire_sigalrm_thread(*dtid, *detpid);
         self.remove_physical_thread(dtid, mm);
         self.vfork_registration_origins.remove(dtid);
         self.saved_guest_sigmasks.remove(dtid);
@@ -3576,6 +3583,8 @@ impl Scheduler {
         &mut self,
         global_time: &Arc<Mutex<GlobalTime>>,
     ) -> Result<(), SkipTurn> {
+        // Before anything can return or pop a timer (`sigalrm`).
+        self.step2_sigalrm_ledger();
         self.step2_release_signaled_background()?;
         self.step2_drain_prefix()?;
         self.step2b_process_timed();
@@ -3800,6 +3809,10 @@ impl Scheduler {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     fn fire_alarm(&mut self, dpid: DetPid, dtid: DetTid, sig: Signal) {
+        // A guest-handled SIGALRM goes to the process's ledger, not the kernel.
+        if self.divert_sigalrm(dpid, sig) {
+            return;
+        }
         #[cfg(test)]
         {
             self.host_signal_attempts += 1;
@@ -4666,6 +4679,8 @@ impl Scheduler {
             dettid
         );
         self.remove_blocking_entries(&dettid);
+        // The substituted request resolves any polling wait the thread was in.
+        self.end_sigalrm_polling_wait(dettid);
 
         if let Some(nxt) = self.next_turns.get_mut(&dettid) {
             // Counterfeit the entry as though the thread had requested this resource from the start:
@@ -5471,6 +5486,8 @@ impl Scheduler {
             assert_eq!(dettid, popped);
             self.run_queue
                 .push_poller(dettid, self.get_priority(dettid), rs.poll_attempt);
+            // Before the count reset below hides that this is a retry.
+            self.note_sigalrm_polling_wait(dettid, rs);
             trace!(
                 "[dtid {}] after deprioritizing polling request, run queue: {:?}",
                 dettid, &self.run_queue
@@ -5543,6 +5560,10 @@ impl Scheduler {
                         "[dtid {}] time-based action ready to execute, target time {} is before committed global time {}",
                         dettid, target_ns, self.committed_time
                     );
+                    Ok(())
+                } else if target_ns.is_indefinite() && self.admit_pause_with_due_sigalrm(dettid) {
+                    // A pause admitted with a due guest-handled SIGALRM returns
+                    // in this turn instead of parking (`sigalrm`).
                     Ok(())
                 } else {
                     trace!(
@@ -6294,6 +6315,8 @@ impl Scheduler {
             .ok_or(parked::ProtocolFailure::Overflow)?;
         self.settle_parked_grant(dtid);
         self.clear_ready_polled_read(dtid);
+        // The granted request is consumed; so is any polling wait it continued.
+        self.end_sigalrm_polling_wait(dtid);
         let nextturn = self
             .next_turns
             .get_mut(&dtid)

@@ -3628,3 +3628,409 @@ fn real_timers_follow_the_installed_control() {
         })
     );
 }
+
+/// A sequentialized scheduler for in-guest LiteInst, the backend the SIGALRM
+/// ledger serves.
+fn liteinst_scheduler() -> Scheduler {
+    scheduler_for(BackendCapabilities::LITEINST_IN_GUEST, true)
+}
+
+/// Files `tid`'s request for `resource` as in-guest LiteInst does: an ordinary
+/// request with no parked origin (the backend offers no parked signal sites),
+/// through the ledger's view of `request_put`. The runtime has published the
+/// thread's "SIGALRM virtually blocked" bit `blocked`.
+fn file(s: &mut Scheduler, tid: DetTid, resource: ResourceID, blocked: bool) {
+    file_attempt(s, tid, resource, 0, blocked);
+}
+
+/// [`file`] with a polling attempt count.
+fn file_attempt(
+    s: &mut Scheduler,
+    tid: DetTid,
+    resource: ResourceID,
+    poll_attempt: u32,
+    blocked: bool,
+) {
+    let mut r = Resources::new(tid);
+    r.insert(resource, Permission::W);
+    r.poll_attempt = poll_attempt;
+    file_request(s, r, blocked);
+}
+
+fn file_request(s: &mut Scheduler, r: Resources, blocked: bool) {
+    let tid = r.tid;
+    s.set_sigalrm_blocked(tid, blocked);
+    s.next_turns[&tid].req.put(Ok(r));
+}
+
+/// Files `tid`'s polling retry and lets step 4 defer it as a poller, which
+/// resets the stored request's attempt count.
+fn defer_polling_retry(s: &mut Scheduler, tid: DetTid) {
+    let mut r = Resources::new(tid);
+    r.insert(ResourceID::InternalIOPolling, Permission::W);
+    r.poll_attempt = 1;
+    file_request(s, r.clone(), false);
+    s.runqueue_push_back(tid);
+    assert_eq!(s.run_queue.tentative_pop_tid(tid), Some(tid));
+    assert!(s.step4_resource_block(tid, &r, &Ivar::new()).is_err());
+    let stored = s.next_turns[&tid].req.try_read().unwrap().unwrap();
+    assert_eq!(stored.poll_attempt, 0, "the deferral reset the count");
+    assert!(s.run_queue.contains_tid(tid));
+}
+
+/// Files `tid`'s emulated `pause` as `handle_pause` does, without parking it.
+fn file_pause(s: &mut Scheduler, tid: DetTid, blocked: bool) {
+    let mut r = Resources::new(tid);
+    r.insert(
+        ResourceID::SleepUntil(LogicalTime::INDEFINITE),
+        Permission::W,
+    );
+    r.fyi(crate::resources::PAUSE_FYI);
+    file_request(s, r, blocked);
+}
+
+/// Parks `tid` in an emulated `pause`, as `handle_pause` and its admission do:
+/// a filed `SleepUntil(INDEFINITE)` registered with no deadline.
+fn pause(s: &mut Scheduler, tid: DetTid, blocked: bool) {
+    file_pause(s, tid, blocked);
+    s.blocked.timed_waiters.insert(LogicalTime::INDEFINITE, tid);
+}
+
+/// Publishes `tid`'s SIGALRM bit as its runtime would.
+fn eligibility(s: &mut Scheduler, tid: DetTid, blocked: bool) {
+    s.set_sigalrm_blocked(tid, blocked);
+}
+
+/// The filed request of `tid` now carries an `InboundSignal(SIGALRM)`, which
+/// its grant answers with `Signaled` (`unblock_guest`).
+fn woken_by_sigalrm(s: &Scheduler, tid: DetTid) -> bool {
+    s.inbound_signals(tid) == vec![SigWrapper::from(Signal::SIGALRM)]
+}
+
+/// While a process handles SIGALRM, an emulated expiry is pending in the
+/// scheduler's ledger instead of reaching the kernel, and it wakes the process
+/// parked in `pause`, which then takes it once.
+#[test]
+fn a_handled_sigalrm_expiry_goes_to_the_ledger_and_wakes_a_parked_pause() {
+    let mut s = liteinst_scheduler();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    let pid = DetPid::from_raw(100);
+    s.set_sigalrm_handled(pid, true);
+    pause(&mut s, tid, false);
+    let attempts = s.host_signal_attempts;
+
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+
+    assert_eq!(s.host_signal_attempts, attempts, "no host signal");
+    assert!(s.sigalrm_pending(pid));
+    assert!(woken_by_sigalrm(&s, tid));
+    assert!(s.run_queue.contains_tid(tid));
+    assert!(s.blocked.timed_waiters.is_empty());
+    assert!(s.take_sigalrm(pid, tid));
+    assert!(!s.sigalrm_pending(pid));
+    assert!(!s.take_sigalrm(pid, tid));
+}
+
+/// Without a published handler, and for any other signal, the expiry takes
+/// the host path as before. (Neither process is registered, so the host path
+/// stops at target selection instead of signalling a real thread.)
+#[test]
+fn an_unhandled_sigalrm_expiry_still_reaches_the_host() {
+    let mut s = liteinst_scheduler();
+    let (unhandled, handled) = (DetPid::from_raw(100), DetPid::from_raw(101));
+    s.set_sigalrm_handled(handled, true);
+    let attempts = s.host_signal_attempts;
+
+    s.fire_alarm(unhandled, DetTid::from_raw(100), Signal::SIGALRM);
+    assert_eq!(s.host_signal_attempts, attempts + 1);
+    s.fire_alarm(handled, DetTid::from_raw(101), Signal::SIGUSR1);
+    assert_eq!(s.host_signal_attempts, attempts + 2);
+    assert!(!s.sigalrm_pending(unhandled));
+    assert!(!s.sigalrm_pending(handled));
+}
+
+/// A second expiry while one is pending coalesces; a blocked SIGALRM stays
+/// pending and wakes nothing; once the bit clears, the sweep wakes the parked
+/// pause.
+#[test]
+fn a_pending_sigalrm_coalesces_and_waits_until_it_is_unblocked() {
+    let mut s = liteinst_scheduler();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    let pid = DetPid::from_raw(100);
+    s.set_sigalrm_handled(pid, true);
+    pause(&mut s, tid, true);
+
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+    assert!(s.sigalrm_pending(pid));
+    s.step2_sigalrm_ledger();
+    assert!(!woken_by_sigalrm(&s, tid));
+    assert!(!s.run_queue.contains_tid(tid));
+    assert!(!s.sigalrm_loss_recorded(pid));
+    assert!(!s.take_sigalrm(pid, tid), "a blocked SIGALRM is not taken");
+
+    eligibility(&mut s, tid, false);
+    s.step2_sigalrm_ledger();
+    assert!(woken_by_sigalrm(&s, tid));
+    assert!(s.take_sigalrm(pid, tid));
+    assert!(!s.take_sigalrm(pid, tid), "two expiries coalesced into one");
+}
+
+/// A pause selected with its entry already due is resolved in that same
+/// selected turn: the admission grants it with `Signaled(SIGALRM)` instead of
+/// parking it, so no other thread queued behind it commits first.
+#[test]
+fn a_pause_admitted_with_a_due_sigalrm_returns_in_its_own_turn() {
+    let mut s = liteinst_scheduler();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    let (other, _, _) = add(&mut s, 200, 200);
+    let pid = DetPid::from_raw(100);
+    s.set_sigalrm_handled(pid, true);
+    eligibility(&mut s, tid, false);
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+    assert!(s.sigalrm_pending(pid));
+
+    file_pause(&mut s, tid, false);
+    s.runqueue_push_back(tid);
+    s.runqueue_push_back(other);
+    // The entry is pending and due, but the pause has not been admitted yet:
+    // not a loss, and not woken.
+    s.step2_sigalrm_ledger();
+    assert!(!s.sigalrm_loss_recorded(pid));
+    assert!(!woken_by_sigalrm(&s, tid));
+
+    assert_eq!(s.run_queue.tentative_pop_tid(tid), Some(tid));
+    let pause = ResourceID::SleepUntil(LogicalTime::INDEFINITE);
+    assert!(
+        s.block_for_one_resource(tid, &pause, &Permission::W, None, None, &Ivar::new())
+            .is_ok(),
+        "granted in its own selected turn"
+    );
+    assert!(woken_by_sigalrm(&s, tid));
+    assert!(s.blocked.timed_waiters.is_empty(), "never parked");
+    assert!(s.take_sigalrm(pid, tid));
+}
+
+/// A pause admitted while SIGALRM is blocked, or with nothing pending, is
+/// not resolved by the ledger.
+#[test]
+fn a_pause_without_a_due_sigalrm_is_not_resolved_at_admission() {
+    let mut s = liteinst_scheduler();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    let pid = DetPid::from_raw(100);
+    s.set_sigalrm_handled(pid, true);
+    file_pause(&mut s, tid, false);
+    assert!(!s.admit_pause_with_due_sigalrm(tid), "nothing pending");
+    assert!(s.next_turns[&tid].req.try_read().is_some(), "pause kept");
+    assert!(!woken_by_sigalrm(&s, tid));
+
+    eligibility(&mut s, tid, true);
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+    assert!(!s.admit_pause_with_due_sigalrm(tid), "blocked");
+    assert!(s.next_turns[&tid].req.try_read().is_some(), "pause kept");
+    assert!(!woken_by_sigalrm(&s, tid));
+    assert!(s.sigalrm_pending(pid));
+}
+
+/// A due SIGALRM that finds its thread blocked in a wait phase 1 cannot
+/// interrupt (a nanosleep here) records one determinism loss and wakes
+/// nothing; the sweep that opens step 2 records it for a sleep that blocked
+/// with its entry already due.
+#[test]
+fn a_due_sigalrm_in_a_blocked_wait_records_one_loss() {
+    let mut s = liteinst_scheduler();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    let pid = DetPid::from_raw(100);
+    s.set_sigalrm_handled(pid, true);
+    file(&mut s, tid, ResourceID::SleepUntil(at(1_000_000)), false);
+    s.blocked.timed_waiters.insert(at(1_000_000), tid);
+
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+    assert!(s.sigalrm_loss_recorded(pid));
+    assert!(!woken_by_sigalrm(&s, tid));
+    assert!(s.next_turns[&tid].resp.try_read().is_none(), "not answered");
+    assert!(!s.run_queue.contains_tid(tid), "still blocked");
+    // Reported once, however many sweeps see it.
+    s.step2_sigalrm_ledger();
+    assert!(s.sigalrm_loss_recorded(pid));
+
+    // A second process whose sleep blocked after its entry became due.
+    let (late, _, _) = add(&mut s, 300, 300);
+    let late_pid = DetPid::from_raw(300);
+    s.set_sigalrm_handled(late_pid, true);
+    eligibility(&mut s, late, false);
+    s.fire_alarm(late_pid, late, Signal::SIGALRM);
+    assert!(!s.sigalrm_loss_recorded(late_pid), "running: not a loss");
+    file(&mut s, late, ResourceID::SleepUntil(at(1_000_000)), false);
+    s.blocked.timed_waiters.insert(at(1_000_000), late);
+    s.step2_sigalrm_ledger();
+    assert!(s.sigalrm_loss_recorded(late_pid));
+}
+
+/// The sweep opens step 2, before the timed events: a sleep that blocked with
+/// its entry already due and whose deadline has now passed is recorded as
+/// lost before step 2b wakes it. Linux would have interrupted it.
+#[test]
+fn the_sigalrm_sweep_sees_an_expiring_sleep_before_the_timed_events_wake_it() {
+    let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+    let mut s = liteinst_scheduler();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    let pid = DetPid::from_raw(100);
+    s.set_sigalrm_handled(pid, true);
+    eligibility(&mut s, tid, false);
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+    file(&mut s, tid, ResourceID::SleepUntil(at(5)), false);
+    s.blocked.timed_waiters.insert(at(5), tid);
+    s.committed_time = at(10);
+
+    let _ = s.step2_process_blocked(&global_time);
+
+    assert!(s.run_queue.contains_tid(tid), "step 2b woke the sleep");
+    assert!(s.sigalrm_loss_recorded(pid));
+}
+
+/// A filed request that has not blocked is no loss: a yield
+/// (`SleepUntil(0)`), granted at once, or a sleep not yet admitted. The entry
+/// waits for the call's completion.
+#[test]
+fn a_due_sigalrm_with_a_filed_request_that_has_not_blocked_is_no_loss() {
+    let mut s = liteinst_scheduler();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    let pid = DetPid::from_raw(100);
+    s.set_sigalrm_handled(pid, true);
+    file(&mut s, tid, ResourceID::SleepUntil(at(0)), false);
+    s.runqueue_push_back(tid);
+
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+    s.step2_sigalrm_ledger();
+    assert!(s.sigalrm_pending(pid));
+    assert!(!s.sigalrm_loss_recorded(pid));
+    assert!(!woken_by_sigalrm(&s, tid));
+}
+
+/// A due SIGALRM finds its thread in a polling wait, an `InternalIOPolling`
+/// operation retried after EAGAIN, which stays on the run queue between
+/// retries: a loss, whether step 4 has yet to see the filed retry or has
+/// deferred it and reset its count. A first attempt, which may complete at
+/// once, is not.
+#[test]
+fn a_due_sigalrm_in_a_polling_wait_records_one_loss() {
+    let mut s = liteinst_scheduler();
+    let (first, _, _) = add(&mut s, 100, 100);
+    let first_pid = DetPid::from_raw(100);
+    s.set_sigalrm_handled(first_pid, true);
+    file(&mut s, first, ResourceID::InternalIOPolling, false);
+    s.runqueue_push_back(first);
+    s.fire_alarm(first_pid, first, Signal::SIGALRM);
+    assert!(
+        !s.sigalrm_loss_recorded(first_pid),
+        "a first attempt is not a wait"
+    );
+    // The attempt saw EAGAIN; its retry is filed but not yet seen by step 4.
+    s.clear_nextturn(first).unwrap();
+    file_attempt(&mut s, first, ResourceID::InternalIOPolling, 1, false);
+    s.step2_sigalrm_ledger();
+    assert!(s.sigalrm_loss_recorded(first_pid));
+
+    let (deferred, _, _) = add(&mut s, 200, 200);
+    let deferred_pid = DetPid::from_raw(200);
+    s.set_sigalrm_handled(deferred_pid, true);
+    defer_polling_retry(&mut s, deferred);
+    s.fire_alarm(deferred_pid, deferred, Signal::SIGALRM);
+    assert!(s.sigalrm_loss_recorded(deferred_pid));
+}
+
+/// A polling wait ends when its request is granted: the thread's next wait,
+/// a futex wait here, woken before its own grant, is no polling wait.
+#[test]
+fn a_granted_polling_retry_ends_the_sigalrm_polling_wait() {
+    let mut s = liteinst_scheduler();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    let pid = DetPid::from_raw(100);
+    s.set_sigalrm_handled(pid, true);
+    defer_polling_retry(&mut s, tid);
+    // Its retry is granted and completes; it then waits on a futex, and
+    // another process's wake leaves it runnable with the request filed.
+    s.clear_nextturn(tid).unwrap();
+    file(&mut s, tid, ResourceID::FutexWait, false);
+
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+    s.step2_sigalrm_ledger();
+    assert!(s.sigalrm_pending(pid));
+    assert!(!s.sigalrm_loss_recorded(pid));
+}
+
+/// A `nanosleep` whose deadline saturates files `SleepUntil(INDEFINITE)` too,
+/// but without the pause tag: a due entry neither resolves it at admission
+/// nor wakes it parked; it is a lost wait, like any other sleep.
+#[test]
+fn a_saturated_nanosleep_with_a_due_sigalrm_is_a_loss_not_a_pause() {
+    let mut s = liteinst_scheduler();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    let pid = DetPid::from_raw(100);
+    s.set_sigalrm_handled(pid, true);
+    eligibility(&mut s, tid, false);
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+    file(
+        &mut s,
+        tid,
+        ResourceID::SleepUntil(LogicalTime::INDEFINITE),
+        false,
+    );
+    assert!(
+        !s.admit_pause_with_due_sigalrm(tid),
+        "not admitted as a pause"
+    );
+    assert!(!woken_by_sigalrm(&s, tid));
+
+    s.blocked.timed_waiters.insert(LogicalTime::INDEFINITE, tid);
+    s.step2_sigalrm_ledger();
+    assert!(!woken_by_sigalrm(&s, tid));
+    assert!(s.sigalrm_loss_recorded(pid));
+}
+
+/// A polling wait that another signal resolves, through the request
+/// substitution of `force_unblock_thread`, is no longer a polling wait: a
+/// later due SIGALRM is not a loss.
+#[test]
+fn a_polling_wait_resolved_by_another_signal_is_not_a_sigalrm_loss() {
+    let mut s = liteinst_scheduler();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    let pid = DetPid::from_raw(100);
+    s.set_sigalrm_handled(pid, true);
+    defer_polling_retry(&mut s, tid);
+    assert!(s.run_queue.remove_tid(tid));
+    let mut sigchld = Resources::new(tid);
+    sigchld.insert(
+        ResourceID::InboundSignal(SigWrapper::from(Signal::SIGCHLD)),
+        Permission::W,
+    );
+    s.force_unblock_thread(tid, sigchld);
+
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+    s.step2_sigalrm_ledger();
+    assert!(s.sigalrm_pending(pid));
+    assert!(!s.sigalrm_loss_recorded(pid));
+}
+
+/// Changing the disposition away from the handler discards a pending entry, as
+/// Linux discards a pending signal that becomes ignored; the process's exit
+/// forgets its ledger state.
+#[test]
+fn an_ignored_or_exited_process_drops_its_pending_sigalrm() {
+    let mut s = liteinst_scheduler();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    let pid = DetPid::from_raw(100);
+    s.set_sigalrm_handled(pid, true);
+    eligibility(&mut s, tid, true);
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+    assert!(s.sigalrm_pending(pid));
+    s.set_sigalrm_handled(pid, false);
+    assert!(!s.sigalrm_pending(pid));
+
+    s.set_sigalrm_handled(pid, true);
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+    s.retire_sigalrm_thread(tid, pid);
+    assert!(!s.sigalrm_pending(pid));
+    assert!(!s.sigalrm_handled(pid));
+}
