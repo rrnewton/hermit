@@ -27,7 +27,6 @@ use tracing::info;
 use tracing::trace;
 
 use crate::detlog;
-use crate::procmaps;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
@@ -387,13 +386,6 @@ fn require_live_time_store_probe(replay_data_is_some: bool) -> Result<(), Error>
     }
 }
 
-/// A failed `gettimeofday` needs its `tv` repaired only on a backend where the
-/// failing host call may already have stored host wall-clock words
-/// (`BackendCapabilities::failed_gettimeofday_may_store_host_time`).
-fn should_repair_failed_gettimeofday_tv(failed_call_may_store_host_time: bool) -> bool {
-    failed_call_may_store_host_time
-}
-
 /// Replaces the host wall-clock time that a `gettimeofday` failing with EFAULT
 /// may have stored in `tv` with virtual time, in exactly the words Linux
 /// stored.
@@ -443,10 +435,13 @@ fn should_repair_failed_gettimeofday_tv(failed_call_may_store_host_time: bool) -
 /// used there. A custom configuration that combines replay data with virtual
 /// time fails closed before probing: a recorded EFAULT does not establish that
 /// this execution performed any stores for a live `time(2)` to reproduce.
-/// KVM does not call this repair: its executor implements `gettimeofday`
-/// directly with an all-zero timeval, so it never stores host time, and it
-/// does not implement the injected `time(2)` probe. Its original EFAULT is
-/// therefore already safe and must be returned unchanged.
+///
+/// Every backend runs this repair. The memory map comes from
+/// `Guest::storable_memory_ranges`, which lists `/proc/<pid>/maps` of the
+/// guest by default and the guest's own page record on a backend whose
+/// `pid()` is not the guest (KVM). A backend that executes `gettimeofday` and
+/// `time(2)` itself, as KVM does, stores them as Linux does: each word with an
+/// all-or-nothing store to a writable page, in kernel order.
 async fn overwrite_failed_gettimeofday_tv<'a, G, T>(
     guest: &mut G,
     tv_addr: AddrMut<'a, Timeval>,
@@ -481,8 +476,7 @@ where
                     match require_unchanged_stopped_word(field, before[stopped], after)? {
                         StoppedWord::Unchanged => {}
                         StoppedWord::Unreadable => {
-                            let maps = procmaps::from_pid(guest.pid(), |_| true)
-                                .map(|maps| maps.into_iter().map(|map| map.address).collect());
+                            let maps = guest.storable_memory_ranges();
                             require_unmapped_unreadable_word(field, maps, addr.as_raw() as u64)?;
                         }
                     }
@@ -564,18 +558,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let time_ns = guest_clock_time(guest).await;
 
-        let repair_on_efault = should_repair_failed_gettimeofday_tv(
-            guest
-                .config()
-                .backend
-                .failed_gettimeofday_may_store_host_time,
-        );
         // What Detcore could read in `tv` before the call; the repair uses it
         // to confirm which words a failing call left alone.
-        let before = match call.tv() {
-            Some(tp) if repair_on_efault => Some(snapshot_timeval_words(guest, tp.into())),
-            _ => None,
-        };
+        let before = call.tv().map(|tp| snapshot_timeval_words(guest, tp.into()));
 
         // A call failing with EFAULT may still have stored host wall-clock time
         // in `tv`, so keep its result until `tv` holds virtual time.
@@ -1211,16 +1196,6 @@ mod tests {
                     }
                 );
             }
-        }
-
-        #[test]
-        fn failed_gettimeofday_repair_is_skipped_only_for_kvm() {
-            assert!(should_repair_failed_gettimeofday_tv(
-                reverie::BackendCapabilities::PTRACE.failed_gettimeofday_may_store_host_time
-            ));
-            assert!(!should_repair_failed_gettimeofday_tv(
-                reverie::BackendCapabilities::KVM.failed_gettimeofday_may_store_host_time
-            ));
         }
 
         #[test]

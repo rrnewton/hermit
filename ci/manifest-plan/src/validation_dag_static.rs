@@ -1344,7 +1344,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The two unobserved-record logdiff tests (anchored counting, ordinary --verify compares it) retain all 1080: 1082, re-listed.
     // tool_global::tests::backend_exit_reports_take_the_path_the_backend_capabilities_select
     // retains all 1082: 1083, measured with cargo nextest list --profile ci.
-    ("test.detcore_unit", 1083),
+    // syscalls::time::tests::failed_gettimeofday_repair_is_skipped_only_for_kvm
+    // is deleted with the capability it tested, which reverie-kvm's time(2)
+    // and Guest::storable_memory_ranges replace: 1083 - 1 = 1082, measured with
+    // cargo nextest list --profile ci -p hermit-detcore --lib --bins.
+    ("test.detcore_unit", 1082),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1876,7 +1880,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the two logdiff tests too: 1082.
     // And backend_exit_reports_take_the_path_the_backend_capabilities_select,
     // re-listed: 1083.
-    ("test.detcore_unit_on_host", 1083),
+    // The host twin loses the same deleted time test: 1082.
+    ("test.detcore_unit_on_host", 1082),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

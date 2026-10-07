@@ -3463,7 +3463,6 @@ mod tests {
                         // backend now reports per exec (`backend_refuses`).
                         backend.provides_process_signal_control = true;
                         backend.emulates_child_waits = true;
-                        backend.failed_gettimeofday_may_store_host_time = false;
                         backend.user_address_limit =
                             Some(reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT);
                     }

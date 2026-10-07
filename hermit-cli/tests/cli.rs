@@ -4378,19 +4378,23 @@ fn run_kvm_gettimeofday_invalid_tv_returns_efault_and_guest_continues() {
     let program = kvm_gettimeofday_efault_guest()
         .to_str()
         .expect("KVM gettimeofday EFAULT guest path should be UTF-8");
-    let args = [
-        "--backend",
-        "kvm",
-        "run",
-        "--strict",
-        "--",
-        program,
-        "invalid-tv",
-    ];
-    let output = hermit(&args);
+    // A tv past the end of the address space, a tv on a read-only page, and a
+    // tv whose tv_usec lies on a read-only page. KVM enforces page
+    // permissions on these stores as Linux does.
+    for (mode, expected) in [
+        ("invalid-tv", "invalid-tv: EFAULT\n"),
+        ("readonly-tv", "readonly-tv: EFAULT tv unchanged\n"),
+        (
+            "straddle-tv",
+            "straddle-tv: EFAULT tv_sec stored, tv_usec unchanged\n",
+        ),
+    ] {
+        let args = ["--backend", "kvm", "run", "--strict", "--", program, mode];
+        let output = hermit(&args);
 
-    assert_success(&output, &args);
-    assert_eq!(stdout(&output), "invalid-tv: EFAULT\n");
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "mode {mode}");
+    }
 }
 
 #[test]
@@ -4414,7 +4418,10 @@ fn run_kvm_gettimeofday_faulting_tz_returns_efault_without_tool_error() {
     let output = hermit(&args);
 
     assert_success(&output, &args);
-    assert_eq!(stdout(&output), "faulting-tz: EFAULT tv=0.000000\n");
+    assert_eq!(
+        stdout(&output),
+        "faulting-tz: EFAULT tv between the surrounding reads\n"
+    );
 }
 
 /// ⚠️ A GUEST THAT MUTATES hermit's OWN stderr MUST NOT MAKE `--verify` REPORT
