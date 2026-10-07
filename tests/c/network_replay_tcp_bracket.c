@@ -109,13 +109,18 @@
  * runs ahead of the wall clock in proportion to how long the host keeps the
  * peer from answering: in one failed run, 8 virtual seconds passed in about
  * one wall second, and a peer delayed by host load turned into a client
- * timeout or into a SIGALRM that record refuses. These bounds therefore lie
- * far beyond any virtual time a run can reach within the wall-clock bounds,
- * which stay where wall time is measured: the controllers'
- * alarm(FIXTURE_DEADLINE_SECONDS) and socket timeouts, and the tests' own
- * process timeouts. The alarm still ends a client stuck on itself at once:
- * when every guest thread is blocked, Hermit advances virtual time straight
- * to the next timer.
+ * timeout or into a SIGALRM that record refuses. These bounds are therefore
+ * set far beyond the virtual time a run has been seen to reach within the
+ * wall-clock bounds: at the fastest rate measured, about 8 virtual seconds per
+ * wall second, the tests' 45-second process timeout comes to about 6 virtual
+ * minutes, a tenth of the wait below. Nothing enforces that rate, so this is
+ * a wide margin, not a guarantee. The wall-clock bounds stay where wall time
+ * is measured: the controllers' alarm(FIXTURE_DEADLINE_SECONDS) and socket
+ * timeouts, and the tests' own process timeouts. A client whose threads are
+ * all blocked still ends at its alarm at once, because Hermit then advances
+ * virtual time straight to the next timer. A client still retrying a network
+ * wait keeps that from happening; it ends when the controller's alarm closes
+ * the connection, or at the test's process timeout.
  */
 #define CLIENT_PEER_WAIT_SECONDS 3600
 #define CLIENT_DEADLINE_SECONDS (2 * CLIENT_PEER_WAIT_SECONDS)

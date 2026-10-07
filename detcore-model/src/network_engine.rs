@@ -60,8 +60,8 @@ use crate::time::LogicalTime;
 /// Requests cross a serializer on their way to the global state: the RPC
 /// transport of a backend whose tool runs in the guest process, and, in a build
 /// with debug assertions (the `dev` and `validate` profiles), reverie-ptrace's
-/// round trip of every request through bincode. A blocking send that waits for
-/// buffer space passes its whole unsent remainder on every wait, so the
+/// round trip of every request through bincode. In replay, a blocking send that
+/// waits for buffer space passes its whole unsent remainder on every wait, so the
 /// per-element cost of a sequence is paid again on every wait: a 252 KB
 /// remainder took about 21 ms per bincode round trip in a `dev` build, against
 /// 0.02 ms as a byte string, and the replay of a send that had waited a few
@@ -1230,9 +1230,10 @@ mod tests {
         );
     }
 
-    /// Round-trips `request` through the encodings requests cross on their way
-    /// to the global state: bincode, legacy (reverie-ptrace's debug round trip)
-    /// and standard, and JSON, which writes guest bytes as a sequence.
+    /// Round-trips `request` through bincode's legacy configuration, which the
+    /// RPC transports and reverie-ptrace's debug round trip use, and, as
+    /// compatibility checks, through bincode's standard configuration and
+    /// through JSON, which writes guest bytes as a sequence.
     fn assert_survives_rpc_encodings(request: &NetworkRequest, bytes: &[u8]) {
         assert_bincode_round_trip(request, bytes, bincode::config::legacy());
         assert_bincode_round_trip(request, bytes, bincode::config::standard());
