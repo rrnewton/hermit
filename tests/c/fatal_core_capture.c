@@ -14,8 +14,12 @@
  *                 dirties that many MiB of incompressible heap and segfaults;
  *                 exit 1
  *   child-segv-ok fork one child that segfaults; exit 0
+ *   threads       two threads wait forever while a third, not the main
+ *                 thread, segfaults with THREAD_MARKER in r12
  */
 
+#include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +27,7 @@
 #include <unistd.h>
 
 #define MARKER "HERMIT-FATAL-CORE-MARKER"
+#define THREAD_MARKER 0x4845524d49543132u
 
 /* Volatile so that no store to the heap is dropped as dead. */
 static unsigned char* volatile heap;
@@ -64,6 +69,42 @@ static void fork_segfaulting_children(int count, char** mib) {
   }
 }
 
+static pthread_mutex_t never_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t never = PTHREAD_COND_INITIALIZER;
+
+static void* wait_forever(void* arg) {
+  (void)arg;
+  pthread_mutex_lock(&never_lock);
+  for (;;) {
+    pthread_cond_wait(&never, &never_lock);
+  }
+  return NULL;
+}
+
+/* Faults by writing to address 8 with THREAD_MARKER in r12, so the core
+ * shows whose registers it kept. */
+static void* segfault_with_marker(void* arg) {
+  (void)arg;
+  __asm__ volatile(
+      "movabs %0, %%r12\n\tmovl $1, 8" ::"i"(THREAD_MARKER)
+      : "r12", "memory");
+  return NULL;
+}
+
+static void segfault_on_a_third_thread(void) {
+  pthread_t threads[3];
+  for (int i = 0; i < 2; i++) {
+    if (pthread_create(&threads[i], NULL, wait_forever, NULL) != 0) {
+      exit(3);
+    }
+  }
+  if (pthread_create(&threads[2], NULL, segfault_with_marker, NULL) != 0) {
+    exit(3);
+  }
+  pthread_join(threads[2], NULL);
+  exit(4);
+}
+
 int main(int argc, char** argv) {
   const char* mode = argc > 1 ? argv[1] : "";
   if (strcmp(mode, "segv") == 0) {
@@ -75,7 +116,12 @@ int main(int argc, char** argv) {
     char* one[] = {"1"};
     fork_segfaulting_children(1, one);
     return 0;
+  } else if (strcmp(mode, "threads") == 0) {
+    segfault_on_a_third_thread();
   }
-  fprintf(stderr, "usage: %s segv | children MIB... | child-segv-ok\n", argv[0]);
+  fprintf(
+      stderr,
+      "usage: %s segv | children MIB... | child-segv-ok | threads\n",
+      argv[0]);
   return 2;
 }

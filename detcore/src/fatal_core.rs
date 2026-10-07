@@ -8,26 +8,32 @@
 
 //! Opt-in core files for guest threads killed by a core-dumping signal.
 //!
-//! The ptrace backend offers each such thread at its exit stop
-//! ([`reverie::GlobalTool::on_fatal_signal_exit`]): after the kernel's fatal
-//! decision, while the thread's memory is still mapped. [`capture`] then
-//! writes one ELF core per process, compressed as a sequence of zstd frames,
-//! into [`FatalCoreCapture::dir`]. It only reads the stopped guest, through
-//! procfs, so the guest observes nothing and its exit status is already
-//! fixed.
+//! The ptrace backend offers each thread of such a process at its exit stop
+//! ([`reverie::GlobalTool::on_fatal_signal_exit`]), after the kernel's fatal
+//! decision. [`capture`] keeps a core only for the one thread that ran the
+//! kernel's core dump step (`exit.dumping`), so the registers in the core are
+//! those of the thread that took the signal. A process the kernel would not
+//! dump, for example one that is not dumpable, gets no core. It writes one ELF
+//! core, compressed as a sequence of zstd frames, into
+//! [`FatalCoreCapture::dir`]. It only reads the stopped guest, through procfs,
+//! so the guest observes nothing and its exit status is already fixed.
+//!
+//! The thread's memory is normally still mapped at the exit stop, but nothing
+//! pins it: it can be reaped before or during the capture. A page that cannot
+//! be read, or reads short, is stored as zeros and the core is kept as a
+//! partial one; when `/proc/<tid>/mem` cannot be opened at all, the core holds
+//! only the notes and the mapping layout. Neither fails the capture.
 //!
 //! The capture is best effort and bounded. One core never exceeds
 //! `max_core_bytes`; the regular files in the directory never exceed
 //! `max_total_bytes` together, counted under a directory lock that every
-//! writer takes. A core that would break either cap, or that takes too long,
-//! is retried with less memory: first only the stack the thread was running
-//! on, then only the notes (registers, signal, process identity, auxiliary
-//! vector and mapped files) and the mapping layout. A core that cannot fit
-//! even then is not written. Every failure is returned for the caller to log.
-//!
-//! The registers are those of the first thread of the process offered here,
-//! which is not necessarily the thread that took the signal when several
-//! threads were running.
+//! writer takes. It never runs past `time_limit`, nor past `exit.deadline`
+//! when the run has already failed and the backend must finish cleaning up.
+//! A core that would break either cap, or that takes too long, is retried
+//! with less memory: first only the stack the thread was running on, then
+//! only the notes (registers, signal, process identity, auxiliary vector and
+//! mapped files) and the mapping layout. A core that cannot fit even then is
+//! not written. Every failure is returned for the caller to log.
 
 use std::fs;
 use std::fs::File;
@@ -57,15 +63,14 @@ static ZEROS: [u8; CHUNK] = [0; CHUNK];
 /// What one [`capture`] did.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
-    /// A core was written to `path`, `bytes` long after compression.
-    Written {
-        path: PathBuf,
-        bytes: u64,
-        tier: Tier,
-    },
+    /// A core was written to `path`.
+    Written { path: PathBuf },
+    /// The thread did not run the kernel's core dump step, so it gets no
+    /// core: another thread of its process did, or none did.
+    NotDumping,
     /// This run already holds a core for the thread's process.
     AlreadyCaptured,
-    /// No tier fitted in `budget` bytes within the time limit.
+    /// No tier fitted in `budget` bytes before the capture's end.
     NoRoom { budget: u64 },
 }
 
@@ -85,20 +90,21 @@ pub(crate) enum Tier {
 /// Captures `exit` under `cfg` and reports the outcome on stderr. Never fails
 /// the run.
 ///
-/// The report goes to stderr, not to the tracing log: a `--verify` run compares
-/// its two runs' logs, and a report that names the core's size or tier, which
-/// depend on host timing, would make two identical runs differ.
+/// The report goes to stderr, not to the tracing log, which a `--verify` run
+/// compares. Hermit's stderr can still be the guest's stderr, which `--verify`
+/// also compares, so the report names only the file: the core's size and tier
+/// depend on host timing and memory pressure and would make two identical runs
+/// differ.
 pub(crate) fn capture_and_log(cfg: &FatalCoreCapture, exit: &FatalSignalExit) {
     let report = match capture(cfg, exit) {
-        Ok(Outcome::Written { path, bytes, tier }) => format!(
-            "kept as {} ({bytes} bytes, {tier:?})",
+        Ok(Outcome::Written { path }) => format!(
+            "kept as {}",
             path.file_name().unwrap_or_default().to_string_lossy()
         ),
-        Ok(Outcome::AlreadyCaptured) => return,
-        Ok(Outcome::NoRoom { budget }) => format!(
-            "not kept: no core fits in {budget} bytes within {:?}",
-            cfg.time_limit
-        ),
+        Ok(Outcome::NotDumping | Outcome::AlreadyCaptured) => return,
+        Ok(Outcome::NoRoom { .. }) => {
+            "not kept: no core fits within its size and time limits".to_string()
+        }
         Err(error) => format!("not kept: {error:#}"),
     };
     let line = format!(
@@ -108,14 +114,31 @@ pub(crate) fn capture_and_log(cfg: &FatalCoreCapture, exit: &FatalSignalExit) {
     crate::nonwaiting_write::write_without_waiting(libc::STDERR_FILENO, line.as_bytes());
 }
 
-/// Writes a core for the thread `exit` names, held at its exit stop.
+/// Writes a core for the thread `exit` names, held at its exit stop, if it is
+/// the thread that ran the kernel's core dump step.
 pub(crate) fn capture(cfg: &FatalCoreCapture, exit: &FatalSignalExit) -> anyhow::Result<Outcome> {
+    if !exit.dumping {
+        return Ok(Outcome::NotDumping);
+    }
+    // A memory that is already gone still leaves the notes worth keeping.
+    let mem = File::open(format!("/proc/{}/mem", exit.tid.as_raw())).ok();
+    capture_from(cfg, exit, mem.as_ref())
+}
+
+/// [`capture`] with the thread's memory, or `None` when it cannot be read at
+/// all, in which case only the notes and the mapping layout are kept.
+fn capture_from(
+    cfg: &FatalCoreCapture,
+    exit: &FatalSignalExit,
+    mem: Option<&File>,
+) -> anyhow::Result<Outcome> {
     let start = Instant::now();
+    let end = capture_end(start, cfg.time_limit, exit.deadline);
     let tid = exit.tid.as_raw();
     let process = Process::new(tid)?;
     let snapshot = Snapshot::read(&process, exit)?;
     fs::create_dir_all(&cfg.dir)?;
-    let _lock = DirLock::acquire(&cfg.dir, start + cfg.time_limit)?;
+    let _lock = DirLock::acquire(&cfg.dir, end)?;
     let stem = format!("{}core.{}.", cfg.file_prefix, snapshot.tgid);
     if has_entry_with_prefix(&cfg.dir, &stem)? {
         return Ok(Outcome::AlreadyCaptured);
@@ -127,14 +150,18 @@ pub(crate) fn capture(cfg: &FatalCoreCapture, exit: &FatalSignalExit) -> anyhow:
     let name = format!("{stem}{tid}.{}.zst", exit.signal.as_str());
     let path = cfg.dir.join(&name);
     let temp = cfg.dir.join(format!(".{name}.tmp"));
-    let mem = File::open(format!("/proc/{tid}/mem"))?;
-    for (tier, tenths) in [(Tier::Full, 7), (Tier::Stack, 9), (Tier::NotesOnly, 10)] {
-        let deadline = start + cfg.time_limit * tenths / 10;
+    let span = end.saturating_duration_since(start);
+    let tiers: &[(Tier, u32)] = match mem {
+        Some(_) => &[(Tier::Full, 7), (Tier::Stack, 9), (Tier::NotesOnly, 10)],
+        None => &[(Tier::NotesOnly, 10)],
+    };
+    for &(tier, tenths) in tiers {
+        let deadline = start + span * tenths / 10;
         let segments = snapshot.segments(tier);
-        match write_core(&temp, budget, deadline, &snapshot, &segments, &mem) {
-            Ok(bytes) => {
+        match write_core(&temp, budget, deadline, &snapshot, &segments, mem) {
+            Ok(_) => {
                 fs::rename(&temp, &path)?;
-                return Ok(Outcome::Written { path, bytes, tier });
+                return Ok(Outcome::Written { path });
             }
             Err(error) => {
                 let _ = fs::remove_file(&temp);
@@ -146,6 +173,13 @@ pub(crate) fn capture(cfg: &FatalCoreCapture, exit: &FatalSignalExit) -> anyhow:
         }
     }
     Ok(Outcome::NoRoom { budget })
+}
+
+/// When a capture started at `start` must be over: after `time_limit`, or at
+/// the backend's cleanup `deadline` if that comes first.
+fn capture_end(start: Instant, time_limit: Duration, deadline: Option<Instant>) -> Instant {
+    let limit = start + time_limit;
+    deadline.map_or(limit, |deadline| deadline.min(limit))
 }
 
 /// An exclusive `flock` on the core directory itself, held for the whole
@@ -584,7 +618,7 @@ fn write_core(
     deadline: Instant,
     snapshot: &Snapshot,
     segments: &[Segment],
-    mem: &File,
+    mem: Option<&File>,
 ) -> Result<u64, WriteError> {
     let _ = fs::remove_file(temp);
     let file = fs::OpenOptions::new()
@@ -605,7 +639,10 @@ fn write_core(
     out.push_zeros(data_offset - headers.len() as u64 - snapshot.notes.len() as u64)?;
     let mut page = vec![0u8; CHUNK];
     for segment in segments {
-        copy_memory(&mut out, mem, segment.vaddr, segment.filesz, &mut page)?;
+        match mem {
+            Some(mem) => copy_memory(&mut out, mem, segment.vaddr, segment.filesz, &mut page)?,
+            None => out.push_zeros(segment.filesz)?,
+        }
         out.push_zeros(segment.filesz.next_multiple_of(PAGE) - segment.filesz)?;
     }
     out.flush()?;
@@ -759,6 +796,108 @@ mod tests {
         let mut out = compressed(dir.path(), u64::MAX, Instant::now());
         out.push(b"late").unwrap();
         assert!(matches!(out.flush(), Err(WriteError::Deadline)));
+    }
+
+    #[test]
+    fn the_capture_ends_at_the_earlier_of_its_time_limit_and_the_cleanup_deadline() {
+        let start = Instant::now();
+        let limit = Duration::from_secs(10);
+        assert_eq!(capture_end(start, limit, None), start + limit);
+        let soon = start + Duration::from_secs(2);
+        assert_eq!(capture_end(start, limit, Some(soon)), soon);
+        let late = start + Duration::from_secs(60);
+        assert_eq!(capture_end(start, limit, Some(late)), start + limit);
+    }
+
+    fn config(dir: &Path) -> FatalCoreCapture {
+        FatalCoreCapture {
+            dir: dir.to_path_buf(),
+            file_prefix: "test-".to_string(),
+            max_core_bytes: 64 << 20,
+            max_total_bytes: 64 << 20,
+            time_limit: Duration::from_secs(10),
+        }
+    }
+
+    /// An exit for this test's own thread, which procfs can describe and read
+    /// like a stopped guest's.
+    fn own_exit(dumping: bool, deadline: Option<Instant>) -> FatalSignalExit {
+        // SAFETY: gettid has no preconditions.
+        let tid = reverie::Pid::from_raw(unsafe { libc::gettid() });
+        // SAFETY: user_regs_struct is plain old data; zero is a valid value.
+        let regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+        let status = reverie::ExitStatus::Signaled(reverie::Signal::SIGSEGV, false);
+        FatalSignalExit::new(tid, status, dumping, deadline, regs).unwrap()
+    }
+
+    /// The decompressed core at `path` and the bytes of memory its `PT_LOAD`
+    /// segments store.
+    fn stored_memory(path: &Path) -> u64 {
+        use std::io::Read;
+        let stored = fs::read(path).unwrap();
+        let mut rest = stored.as_slice();
+        let mut core = Vec::new();
+        while !rest.is_empty() {
+            ruzstd::decoding::StreamingDecoder::new(&mut rest)
+                .unwrap()
+                .read_to_end(&mut core)
+                .unwrap();
+        }
+        let u16_at = |at: usize| u16::from_le_bytes(core[at..at + 2].try_into().unwrap());
+        let u32_at = |at: usize| u32::from_le_bytes(core[at..at + 4].try_into().unwrap());
+        let u64_at = |at: usize| u64::from_le_bytes(core[at..at + 8].try_into().unwrap());
+        assert_eq!(u16_at(16), 4, "not an ET_CORE file");
+        (0..u64::from(u16_at(56)))
+            .map(|i| (EHDR_SIZE + i * PHDR_SIZE) as usize)
+            .filter(|&phdr| u32_at(phdr) == PT_LOAD)
+            .map(|phdr| u64_at(phdr + 32))
+            .sum()
+    }
+
+    #[test]
+    fn a_thread_that_did_not_dump_gets_no_core() {
+        let dir = tempfile::tempdir().unwrap();
+        let cores = dir.path().join("cores");
+        let outcome = capture(&config(&cores), &own_exit(false, None)).unwrap();
+        assert_eq!(outcome, Outcome::NotDumping);
+        assert!(
+            !cores.exists(),
+            "a non-dumping thread created the directory"
+        );
+    }
+
+    #[test]
+    fn unreadable_memory_still_keeps_the_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let Outcome::Written { path } =
+            capture_from(&config(dir.path()), &own_exit(true, None), None).unwrap()
+        else {
+            panic!("no core was kept without memory");
+        };
+        assert_eq!(
+            stored_memory(&path),
+            0,
+            "memory was stored without a mem file"
+        );
+    }
+
+    #[test]
+    fn readable_memory_is_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let Outcome::Written { path } =
+            capture(&config(dir.path()), &own_exit(true, None)).unwrap()
+        else {
+            panic!("no core was kept");
+        };
+        assert!(stored_memory(&path) > 0, "the core stores no memory");
+    }
+
+    #[test]
+    fn a_passed_cleanup_deadline_keeps_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = capture(&config(dir.path()), &own_exit(true, Some(Instant::now()))).unwrap();
+        assert!(matches!(outcome, Outcome::NoRoom { .. }), "{outcome:?}");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]

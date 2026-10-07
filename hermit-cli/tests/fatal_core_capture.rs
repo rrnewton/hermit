@@ -18,6 +18,8 @@ use std::process::Command;
 use std::process::Output;
 
 const MARKER: &[u8] = b"HERMIT-FATAL-CORE-MARKER";
+/// What the guest's faulting thread holds in r12 in `threads` mode.
+const THREAD_MARKER: u64 = 0x4845_524d_4954_3132;
 const MIB: u64 = 1 << 20;
 
 /// Builds the guest once per test into its own directory and returns it with
@@ -33,7 +35,14 @@ fn guest(test: &str) -> (PathBuf, PathBuf) {
     fs::create_dir_all(&root).expect("failed to create the test directory");
     let guest = root.join("fatal_core_capture");
     let output = Command::new("cc")
-        .args(["-O1", "-std=c11", "-Wall", "-Wextra", "-Werror"])
+        .args([
+            "-O1",
+            "-std=gnu11",
+            "-pthread",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+        ])
         .arg(repository.join("tests/c/fatal_core_capture.c"))
         .arg("-o")
         .arg(&guest)
@@ -104,6 +113,21 @@ fn decode_core(path: &Path) -> Vec<u8> {
     core
 }
 
+/// The bytes of memory a decompressed core's `PT_LOAD` segments store.
+fn stored_memory(core: &[u8]) -> u64 {
+    let at = |offset: usize, len: usize| {
+        let mut bytes = [0u8; 8];
+        bytes[..len].copy_from_slice(&core[offset..offset + len]);
+        u64::from_le_bytes(bytes)
+    };
+    let (phoff, phentsize, phnum) = (at(32, 8) as usize, at(54, 2) as usize, at(56, 2));
+    (0..phnum as usize)
+        .map(|i| phoff + i * phentsize)
+        .filter(|&phdr| at(phdr, 4) == 1) // PT_LOAD
+        .map(|phdr| at(phdr + 32, 8)) // p_filesz
+        .sum()
+}
+
 #[test]
 fn a_segfault_keeps_one_core_and_reports_what_it_would_without_one() {
     let (guest, root) = guest("segfault");
@@ -140,14 +164,56 @@ fn a_segfault_keeps_one_core_and_reports_what_it_would_without_one() {
         "unexpected core name {name}"
     );
     assert!(
-        stderr(&with).contains(&format!("kept as {name}")),
-        "hermit did not report the core:\n{}",
+        stderr(&with).contains(&format!("kept as {name}\n")),
+        "hermit did not report the core by name alone (a size or tier depends on \
+         host timing and would differ between two --verify runs):\n{}",
         stderr(&with)
     );
     let core = decode_core(&cores.join(name));
     assert!(
         core.windows(MARKER.len()).any(|window| window == MARKER),
         "the core does not hold the guest's heap"
+    );
+}
+
+/// r12 in a decompressed core's first `NT_PRSTATUS` note, which is written
+/// first, right after the program headers.
+fn prstatus_r12(core: &[u8]) -> u64 {
+    let u64_at = |offset: usize| u64::from_le_bytes(core[offset..offset + 8].try_into().unwrap());
+    let u32_at = |offset: usize| u32::from_le_bytes(core[offset..offset + 4].try_into().unwrap());
+    let notes = u64_at(u64_at(32) as usize + 8) as usize; // PT_NOTE p_offset
+    assert_eq!(u32_at(notes + 8), 1, "the first note is not NT_PRSTATUS");
+    // 12-byte note header, "CORE\0" padded to 8, then elf_prstatus, whose
+    // registers start at 112; r12 is the fourth.
+    u64_at(notes + 20 + 112 + 3 * 8)
+}
+
+#[test]
+fn a_multithreaded_crash_keeps_the_faulting_threads_registers() {
+    let (guest, root) = guest("threads");
+    let cores = root.join("cores");
+    let output = hermit(
+        &["--fatal-core-dir", cores.to_str().unwrap()],
+        &guest,
+        &["threads"],
+    );
+    assert!(
+        !output.status.success(),
+        "the guest must die:\n{}",
+        stderr(&output)
+    );
+    let kept = files(&cores);
+    assert_eq!(kept.len(), 1, "expected one core, found {kept:?}");
+    assert_eq!(
+        stderr(&output).matches("fatal core").count(),
+        1,
+        "expected one report:\n{}",
+        stderr(&output)
+    );
+    let r12 = prstatus_r12(&decode_core(&cores.join(&kept[0].0)));
+    assert_eq!(
+        r12, THREAD_MARKER,
+        "the core holds another thread's registers (r12 {r12:#x})"
     );
 }
 
@@ -184,17 +250,20 @@ fn cores_stay_within_the_per_core_and_total_caps() {
         "every child should keep a core, if only a smaller one: {kept:?}\n{}",
         stderr(&output)
     );
+    let mut stored = Vec::new();
     for (name, bytes) in &kept {
         assert!(*bytes <= max_core, "{name} is {bytes} bytes");
-        decode_core(&cores.join(name));
+        stored.push(stored_memory(&decode_core(&cores.join(name))));
     }
     let total: u64 = kept.iter().map(|(_, bytes)| bytes).sum();
     assert!(total <= max_total, "the cores take {total} bytes: {kept:?}");
     assert!(
-        stderr(&output).contains(", Full)") && !stderr(&output).contains("not kept"),
-        "{}",
+        stored.iter().any(|&bytes| bytes >= 8 * MIB),
+        "no core kept a whole 8 MiB child's memory, so the caps were never \
+         approached from a full core: {stored:?}\n{}",
         stderr(&output)
     );
+    assert!(!stderr(&output).contains("not kept"), "{}", stderr(&output));
 }
 
 #[test]
