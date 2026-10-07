@@ -1438,7 +1438,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // syscalls::files::inject_fstat_scratch::getdents_settles_an_overlay_alike_whichever_directory_is_read_first
     // and ::getdents_takes_a_candidates_answer_where_the_kernel_cannot_tell_a_mount
     // (the same pull request) retain all 1207: 1209, listed the same way.
-    ("test.detcore_unit", 1209),
+    // syscalls::files::inject_fstat_scratch::getdents_keys_a_mount_root_alike_before_and_after_an_overlay_settles_layer_devices
+    // (the same pull request) retains all 1209: 1210, listed the same way.
+    ("test.detcore_unit", 1210),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2024,7 +2026,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the inherited-seccomp getdents test (1194).
     // And the overlay read-order getdents test (1195).
     // And the two overlay mount-root getdents tests (1197).
-    ("test.detcore_unit_on_host", 1197),
+    // And the layer-device mount-root getdents test (1198).
+    ("test.detcore_unit_on_host", 1198),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
