@@ -13,9 +13,9 @@
 # its `ci: false` becomes true. That manifest edit is the only hand edit. This
 # script then rewrites, in dependency order,
 #
-#   test-harness sync-cells      ci/expected-e2e-plan.json, ci/optional-e2e-cells.txt,
-#                                tests/e2e/parity-selection.yaml
-#   generate-parity-cells        ci/compat-envelope/parity-cells.json
+#   test-harness sync-cells      ci/expected-e2e-plan.json, ci/optional-e2e-cells.txt
+#   generate-parity-cells        ci/compat-envelope/parity-cells.json (the parity
+#                                population, derived from the manifests)
 #   scorecard.rs update          SCORECARD.md, ci/compat-envelope/cells.json
 #   generate-validation-dag      ci/dag/validate.json
 #   generate-test-footprints     checked only; a flip does not move a footprint
@@ -31,7 +31,7 @@ usage() {
 Usage: ci/sync-cell-config.sh [--check]
 
 Regenerate every file derived from the E2E manifests after a cell flip: the
-expected plan, the optional-cell inventory, the parity selection, parity-cells.json, the scorecard and cell
+expected plan, the optional-cell inventory, parity-cells.json, the scorecard and cell
 table, and the validation DAG. Edit the manifest, run this,
 and commit the manifest with the files it rewrites.
 

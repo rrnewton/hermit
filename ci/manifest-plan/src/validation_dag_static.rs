@@ -825,7 +825,36 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // hermit-manifest-plan's validation_dag::tests::
     // buck_cells_hand_validate_node_their_wall_bound retains all 991: 992 (validate run
     // validate-tickhub-ops-2-8d85cb2d50e0-1791374991259209356-157714-59e7d85a executed 992).
-    ("test.regular_crates", 992),
+    // Making the parity population the verify matrix (every test whose ptrace
+    // verify cell full validation selects, on every candidate backend, in
+    // place of tests/e2e/parity-selection.yaml) keeps hermit-manifest-plan at
+    // 726 tests and this node at 991, with changed identities. parity.rs
+    // removes parity::tests::{the_initial_selection_is_exactly_its_rule,
+    // a_selection_with_nothing_selectable_is_a_vacuous_snapshot,
+    // the_selection_loader_refuses_what_it_cannot_measure,
+    // a_selection_under_the_manifest_directory_is_refused} and adds
+    // parity::tests::{the_snapshot_marks_exactly_the_population_selected,
+    // a_disabled_candidate_of_a_population_test_is_a_parity_cell,
+    // the_population_counts_every_candidate_zero_and_excludes_only_reference_failures};
+    // parity::tests::the_scope_is_every_cell_with_a_planned_side_and_dbt_retains_nothing
+    // is renamed ..._and_each_planned_side_is_retained. test-harness removes
+    // tests::sync_cells_round_trips_a_parity_selected_kvm_cell and renames
+    // tests::the_full_profile_reports_each_selected_parity_cell_exactly_once
+    // to ..._each_population_parity_cell_exactly_once. The new
+    // tests/parity_population.rs adds
+    // the_parity_population_is_every_selected_ptrace_verify_test_on_every_candidate
+    // and every_candidate_verify_column_is_a_parity_backend: 726 - 5 + 5 = 726
+    // (`cargo nextest list --profile ci -p hermit-manifest-plan` lists 726).
+    // parity::tests::an_unsampled_enabled_and_selected_candidate_is_outside_the_population_not_zero,
+    // for the pressure test's not-sampled candidates, retains all 991: 992
+    // (the same listing gives 727 with it).
+    // The review fixes of 326e0b23 add
+    // parity::tests::a_red_candidate_is_a_typed_zero_however_its_runs_compared and
+    // parity::tests::a_not_sampled_row_is_admitted_only_from_the_pressure_test,
+    // and rename runner::tests::selected_portable_parity_candidates_preserve_identical_guest_arguments
+    // to runner::tests::population_parity_candidates_preserve_identical_guest_arguments:
+    // 992 + 2 = 994 (the same listing gives 729).
+    ("test.regular_crates", 995),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2090,7 +2119,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/pull/3361 listed there retain all 988: 990.
     // The prepared-input field-naming test of 2a43eb81 listed there retains all 990: 991.
     // The Buck cells wall-bound test listed there retains all 991: 992.
-    ("test.regular_crates_on_host", 992),
+    // The parity-population identity changes listed for test.regular_crates
+    // keep the count at 991, its not-sampled test listed there makes 992, and
+    // the two review-fix tests listed there make 994.
+    ("test.regular_crates_on_host", 995),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

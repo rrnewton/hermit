@@ -16788,62 +16788,101 @@ exit "$(cat "$PWD/exit-status")"
         (result, invocations, retained_parity_report)
     }
 
+    /// Every candidate verify cell full validation selects, of every test in
+    /// the parity population (every test whose ptrace verify cell full
+    /// validation selects, https://github.com/rrnewton/hermit/issues/3301),
+    /// hands its guest the same arguments as the ptrace reference, so a
+    /// parity comparison of the two can be labelled equal-input. The only
+    /// exceptions are the cells pinned in `DELIBERATELY_UNEQUAL`, each with
+    /// why: their guests are told which backend they run on, so their argv
+    /// differs from ptrace's and their parity comparison is labelled
+    /// unequal-input (`parity::inputs_equalized` compares argv). A new
+    /// difference fails here until it is fixed or pinned with its reason, and
+    /// a pinned cell that stops differing fails too.
     #[test]
-    fn selected_portable_parity_candidates_preserve_identical_guest_arguments() {
+    fn population_parity_candidates_preserve_identical_guest_arguments() {
+        const DELIBERATELY_UNEQUAL: &[(&str, &str, &str)] = &[
+            (
+                "c-programs/madvise-determinism",
+                "kvm",
+                "`--kvm` adds the guest's KVM-only madvise advice checks",
+            ),
+            (
+                "c-programs/pipe2-errno-precedence",
+                "kvm",
+                "the kvm cell passes no expected pipe capacity (ptrace, dbt and sabre pass \
+                 8192), so its guest prints F_GETPIPE_SZ without asserting Detcore's pin",
+            ),
+        ];
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let manifests = ManifestSet::load(&root).unwrap();
-        // The tests folded from the retired backend-parity-c bucket into
-        // c-programs (https://github.com/rrnewton/hermit/issues/3301, slice S6).
-        let folded = crate::retired_ids::RetiredIds::load(&root)
-            .unwrap()
-            .successors_of("backend-parity-c")
-            .unwrap();
         let cells = manifests
             .select(&Selection {
-                lane: Some("portable".into()),
-                category: Some("c-programs".into()),
                 population: Some(Population::Required),
+                mode: Some("verify".into()),
                 ..Selection::default()
             })
             .unwrap();
+        let population = cells
+            .iter()
+            .filter(|cell| cell.id.backend.as_deref() == Some("ptrace"))
+            .map(|cell| cell.id.test.clone())
+            .collect::<BTreeSet<_>>();
         let candidates = cells
             .iter()
-            .filter(|cell| folded.contains(&cell.id.test))
-            .filter(|cell| cell.id.mode == "verify" && cell.id.backend.as_deref() != Some("ptrace"))
+            .filter(|cell| population.contains(&cell.id.test))
+            .filter(|cell| cell.id.backend.as_deref() != Some("ptrace"))
             .collect::<Vec<_>>();
-        // Check every candidate's arguments. The population itself is the
-        // committed plan's, which the manifest gate holds to the manifests
-        // (https://github.com/rrnewton/hermit/issues/3606).
-        assert!(!candidates.is_empty());
+        // The population's selected candidates (`generate-parity-cells`
+        // counts 536 at this change), on every candidate backend that has one.
+        assert!(candidates.len() > 500, "{}", candidates.len());
+        let backends = candidates
+            .iter()
+            .filter_map(|cell| cell.id.backend.as_deref())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            ["dbt", "kvm", "sabre"]
+                .iter()
+                .all(|backend| backends.contains(backend)),
+            "{backends:?}"
+        );
         assert!(
             candidates
                 .iter()
                 .any(|cell| cell.id.test == "c-programs/readdir-order-identity"
                     && cell.id.backend.as_deref() == Some("kvm"))
         );
+        let mut unequal = BTreeMap::new();
         for cell in candidates {
-            let mode = &cell.test.modes["verify"];
             let candidate = cell.id.backend.as_deref().unwrap();
-            assert!(
-                mode.backends_enabled
-                    .iter()
-                    .any(|backend| backend == "ptrace")
+            let (theirs, ours) = (
+                cell_guest_args(cell, candidate),
+                cell_guest_args(cell, "ptrace"),
             );
-            assert_eq!(
-                mode.guest_args.get(candidate).cloned().unwrap_or_default(),
-                mode.guest_args.get("ptrace").cloned().unwrap_or_default(),
-                "{}",
-                cell.id.test
-            );
+            if theirs != ours {
+                unequal.insert(
+                    (cell.id.test.clone(), candidate.to_string()),
+                    format!("{theirs:?} vs ptrace {ours:?}"),
+                );
+            }
             if cell.id.test == "c-programs/readdir-order-identity" {
                 let required = [
                     "--require-small-determinized",
                     "--require-large-determinized",
                 ];
-                assert_eq!(mode.guest_args[candidate], required);
-                assert_eq!(mode.guest_args["ptrace"], required);
+                assert_eq!(theirs, required);
+                assert_eq!(ours, required);
             }
         }
+        let pinned = DELIBERATELY_UNEQUAL
+            .iter()
+            .map(|(test, backend, _)| (test.to_string(), backend.to_string()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            unequal.keys().cloned().collect::<BTreeSet<_>>(),
+            pinned,
+            "candidates whose guest arguments differ from ptrace's: {unequal:#?}"
+        );
     }
 
     /// The kvm, liteinst and sabre candidates checked above used to add a ptrace reference run and a `hermit log-diff` comparison, and the

@@ -184,7 +184,13 @@ and `E2E_FIXTURE_DIR` name those paths and a prepared program runs as
 `/tmp/e2e/fixtures/program`. Every backend's guest therefore sees the same
 strings, which the parity post-pass requires before it reports a
 comparison's `credit` rather than its `unequalized_credit`
-(<https://github.com/rrnewton/hermit/issues/3301>). A guest in any other mode
+(<https://github.com/rrnewton/hermit/issues/3301>). The parity population is
+the verify matrix itself, with no selection file: every test whose ptrace
+`verify` cell full validation selects, on every candidate backend (dbt, kvm,
+liteinst and sabre). A candidate whose `verify` cell is disabled, not selected,
+red or missing scores 0 and is counted; only a test whose ptrace run left no
+golden is left out, and counted apart. `ci/compat-envelope/parity-cells.json`
+snapshots it. A guest in any other mode
 sees the host paths. Read these directories through the variables rather
 than assuming either form.
 
@@ -550,8 +556,8 @@ To flip a cell (make an existing manifest cell required, or stop requiring it),
 edit only the manifest, then run `ci/sync-cell-config.sh`. It regenerates every
 file derived from the manifests: `ci/expected-e2e-plan.json`,
 `ci/optional-e2e-cells.txt` (the enabled `ci = false` cells),
-`tests/e2e/parity-selection.yaml`, `ci/compat-envelope/parity-cells.json`,
-`SCORECARD.md`, `ci/compat-envelope/cells.json` and `ci/dag/validate.json`.
+`ci/compat-envelope/parity-cells.json`, `SCORECARD.md`,
+`ci/compat-envelope/cells.json` and `ci/dag/validate.json`.
 Commit them with the manifest; the diff of the expected plan, and of the
 optional-cell inventory for a `ci = false` cell, is the record of the change. `ci/sync-cell-config.sh --check` writes nothing and fails on any
 drift, and validation runs the same checks
