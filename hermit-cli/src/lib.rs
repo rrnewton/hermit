@@ -3698,28 +3698,78 @@ fn parse_controlling_terminal_device(stat: &str) -> Option<i64> {
 fn prepare_run_config(config: DetConfig, backend: Backend) -> DetConfig {
     let mut config = prepare_backend_config(config, backend);
     // A seccomp filter is inherited across fork and exec and can never be
-    // removed, so a filter on this process is on every guest it starts, on
-    // every backend, before any guest exists to install one of its own.
+    // removed, so a filter on the thread that starts a guest is on that guest,
+    // on every backend, before any guest exists to install one of its own.
     config.seccomp_filter_inherited =
         config.seccomp_filter_inherited || launcher_inherits_a_seccomp_filter();
     config
 }
 
-/// Whether this process runs under a seccomp filter, read from the `Seccomp:`
-/// line of its own `/proc/self/status`. An unreadable status counts as a
-/// filter: the answer only lets Detcore skip a probe it could otherwise make,
-/// so not knowing must mean not probing.
+/// Whether any thread of this process runs under a seccomp filter, read from
+/// the `Seccomp:` line of each `/proc/self/task/<tid>/status`.
+///
+/// Every thread is read, not `/proc/self/status`, which shows the thread
+/// group leader's: a filter belongs to the thread that installed it and to
+/// the threads it creates afterwards, unless installed with
+/// `SECCOMP_FILTER_FLAG_TSYNC`, and the thread that forks a guest (a runtime
+/// worker, or a caller's own thread that called [`run`]) need not be the
+/// leader. A thread that exits while the list is read is skipped; any other
+/// failure to read counts as a filter: the answer only lets Detcore skip a
+/// probe it could otherwise make, so not knowing must mean not probing.
+///
+/// What this cannot see: a filter a thread installs after this is read, and
+/// one a caller's `Command` installs in the child itself (a `pre_exec`
+/// callback, or a seccomp filter set on the command where the backend keeps
+/// it). A caller that does either sets
+/// [`DetConfig::seccomp_filter_inherited`] itself; a true there is never
+/// cleared.
 fn launcher_inherits_a_seccomp_filter() -> bool {
-    match std::fs::read_to_string("/proc/self/status") {
-        Ok(status) => seccomp_filter_in_status(&status),
+    seccomp_filter_in_any_task(Path::new("/proc/self/task"))
+}
+
+/// [`launcher_inherits_a_seccomp_filter`] over the task directory `tasks`.
+fn seccomp_filter_in_any_task(tasks: &Path) -> bool {
+    let entries = match std::fs::read_dir(tasks) {
+        Ok(entries) => entries,
         Err(error) => {
             tracing::debug!(
-                "could not read /proc/self/status ({error}); assuming the guest may run under \
-                 an inherited seccomp filter"
+                "could not list {} ({error}); assuming the guest may run under an inherited \
+                 seccomp filter",
+                tasks.display()
             );
-            true
+            return true;
+        }
+    };
+    for entry in entries {
+        let status_path = match entry {
+            Ok(entry) => entry.path().join("status"),
+            Err(error) => {
+                tracing::debug!(
+                    "could not list {} ({error}); assuming the guest may run under an \
+                     inherited seccomp filter",
+                    tasks.display()
+                );
+                return true;
+            }
+        };
+        match std::fs::read_to_string(&status_path) {
+            Ok(status) if seccomp_filter_in_status(&status) => return true,
+            Ok(_) => {}
+            // The thread exited after the directory was listed: it starts no
+            // guest.
+            Err(error)
+                if matches!(error.raw_os_error(), Some(libc::ENOENT) | Some(libc::ESRCH)) => {}
+            Err(error) => {
+                tracing::debug!(
+                    "could not read {} ({error}); assuming the guest may run under an \
+                     inherited seccomp filter",
+                    status_path.display()
+                );
+                return true;
+            }
         }
     }
+    false
 }
 
 /// Whether a `/proc/<pid>/status` text reports a seccomp mode. The `Seccomp:`
@@ -6187,10 +6237,97 @@ mod tests {
         ));
     }
 
+    /// Held by every test here that reads this process's seccomp state, so
+    /// that the thread [`a_filter_on_a_thread_other_than_the_leader_counts`]
+    /// filters is not seen by another test in the same process.
+    static SECCOMP_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Every task's status is read: one with a filter is enough, a task whose
+    /// status vanished (it exited) is skipped, and a task list that cannot be
+    /// read counts as a filter.
+    #[test]
+    fn a_seccomp_filter_on_any_task_counts_as_an_inherited_filter() {
+        let root = tempfile::tempdir().unwrap();
+        let tasks = root.path().join("task");
+        let status = |mode: &str| format!("Name:\thermit\nSeccomp:\t{mode}\n");
+        for (tid, mode) in [("100", "0"), ("101", "0")] {
+            std::fs::create_dir_all(tasks.join(tid)).unwrap();
+            std::fs::write(tasks.join(tid).join("status"), status(mode)).unwrap();
+        }
+        // A thread that exited after the list was read has no status.
+        std::fs::create_dir_all(tasks.join("102")).unwrap();
+        assert!(!super::seccomp_filter_in_any_task(&tasks));
+        std::fs::create_dir_all(tasks.join("103")).unwrap();
+        std::fs::write(tasks.join("103").join("status"), status("2")).unwrap();
+        assert!(super::seccomp_filter_in_any_task(&tasks));
+        assert!(super::seccomp_filter_in_any_task(
+            &root.path().join("absent")
+        ));
+    }
+
+    /// Codex review round 9 of https://github.com/rrnewton/hermit/pull/3255:
+    /// a filter installed by a thread other than the thread group leader,
+    /// without `SECCOMP_FILTER_FLAG_TSYNC`, is on that thread and on any guest
+    /// it forks, but not on the leader, whose state `/proc/self/status`
+    /// shows. Here a thread installs a filter that allows every call, so the
+    /// mode is 2 on that thread alone, and the launcher's answer is true
+    /// while the thread lives, where reading `/proc/self/status` gave the
+    /// leader's.
+    #[test]
+    fn a_filter_on_a_thread_other_than_the_leader_counts() {
+        let _held = SECCOMP_STATE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let leader =
+            super::seccomp_filter_in_status(&std::fs::read_to_string("/proc/self/status").unwrap());
+        let (installed_tx, installed_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let filtered = std::thread::spawn(move || {
+            let allow = [libc::sock_filter {
+                code: (libc::BPF_RET | libc::BPF_K) as u16,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ALLOW,
+            }];
+            let program = libc::sock_fprog {
+                len: allow.len() as u16,
+                filter: allow.as_ptr() as *mut libc::sock_filter,
+            };
+            // SAFETY: both prctls act on this thread only; the program
+            // outlives the call, which copies it.
+            let installed = unsafe {
+                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0
+                    && libc::prctl(
+                        libc::PR_SET_SECCOMP,
+                        libc::SECCOMP_MODE_FILTER,
+                        &program as *const libc::sock_fprog,
+                    ) == 0
+            };
+            installed_tx.send(installed).unwrap();
+            done_rx.recv().unwrap();
+        });
+        assert!(
+            installed_rx.recv().unwrap(),
+            "precondition: the thread installs its filter: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            super::seccomp_filter_in_status(&std::fs::read_to_string("/proc/self/status").unwrap()),
+            leader,
+            "precondition: the leader's status does not show another thread's filter"
+        );
+        assert!(super::launcher_inherits_a_seccomp_filter());
+        done_tx.send(()).unwrap();
+        filtered.join().unwrap();
+    }
+
     /// The run config carries this process's own seccomp state on every
     /// backend, and a caller's true is never cleared.
     #[test]
     fn the_run_config_carries_the_launchers_seccomp_state() {
+        let _held = SECCOMP_STATE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let own = super::launcher_inherits_a_seccomp_filter();
         for backend in [
             Backend::Ptrace,

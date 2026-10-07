@@ -2348,12 +2348,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         statxptr: StatxPtr<'_>,
         mask: StatxMask,
     ) -> Result<Option<libc::statx>, Error> {
-        let statx = match Self::statx_in_page(guest, path, page, statxptr, mask).await {
-            Ok(Some(statx)) => statx,
-            Ok(None) => return Ok(None),
-            Err(Errno::ESRCH) => return Err(Error::Errno(Errno::ESRCH)),
-            Err(errno) => return Err(identity_lookup_refused("statx", path, errno)),
-        };
+        let statx =
+            match Self::statx_in_page(guest, StatAt::path(), path, page, statxptr, mask).await {
+                Ok(Some(statx)) => statx,
+                Ok(None) => return Ok(None),
+                Err(Errno::ESRCH) => return Err(Error::Errno(Errno::ESRCH)),
+                Err(errno) => return Err(identity_lookup_refused("statx", path, errno)),
+            };
         let device = libc::makedev(statx.stx_dev_major, statx.stx_dev_minor);
         if (device, statx.stx_ino) != (stat.st_dev, stat.st_ino) {
             trace!(
@@ -2382,10 +2383,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Stage `path` NUL-terminated at `path_address` and inject
-    /// `statx(AT_FDCWD, path, 0, mask, statxptr)`, with the answers and
-    /// errors of [`Self::fstatat_in_scratch`].
+    /// `statx(at.dirfd, path, at.flags, mask, statxptr)`, with the answers
+    /// and errors of [`Self::fstatat_in_scratch`].
     async fn statx_in_page<G: Guest<Self>>(
         guest: &mut G,
+        at: StatAt,
         path: &[u8],
         path_address: AddrMut<'_, u8>,
         statxptr: StatxPtr<'_>,
@@ -2396,11 +2398,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         staged.push(0);
         guest.memory().write_exact(path_address, &staged)?;
         let call = syscalls::Statx::new()
-            .with_dirfd(libc::AT_FDCWD)
+            .with_dirfd(at.dirfd)
             .with_path(PathPtr::from_ptr(
                 path_address.as_raw() as *const libc::c_char
             ))
-            .with_flags(AtFlags::empty())
+            .with_flags(at.flags)
             .with_mask(mask)
             .with_statx(Some(statxptr));
         match guest.inject_with_retry(call).await {
@@ -8056,6 +8058,81 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(identities)
     }
 
+    /// Whether the entry `name` of the directory open as `dirfd`, whose
+    /// `lstat` reported `stat`, is on the mount the directory is on, asked by
+    /// a guest `statx(dirfd, name, AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT,
+    /// STATX_INO)` in a transient page. The last component of a path either
+    /// stays on its directory's mount or crosses onto a mount over it, whose
+    /// root it then is, so the entry is on the directory's mount exactly when
+    /// `statx` does not report `STATX_ATTR_MOUNT_ROOT` (Linux 5.8; `fs/stat.c`
+    /// sets it for the root of every mount, a file bind mount included).
+    ///
+    /// `false` when the entry is a mount root, and when the guest's filesystem
+    /// answers that the name now reaches nothing or another file than `stat`
+    /// described (the entry changed between the two calls), since then this
+    /// `lstat` says nothing about the directory's mount. `true` when the
+    /// kernel does not report the attribute (`stx_attributes_mask` without
+    /// it, before Linux 5.8): it cannot tell, and the answer is taken as it
+    /// was before this was asked. A `statx` that cannot be asked is a refusal,
+    /// and `ESRCH` that errno, as for the `lstat` (see
+    /// [`Self::stat_guest_path_at`]).
+    ///
+    /// Asked only by [`Self::settle_overlay_entry_lookup`], for a candidate
+    /// whose `lstat` would settle an overlay as
+    /// [`EntryLookup::OverlayLayerDevices`]: at most once per candidate, and
+    /// on an overlay that settles, once per run for most overlays.
+    async fn entry_is_on_the_listed_mount<G: Guest<Self>>(
+        guest: &mut G,
+        dirfd: RawFd,
+        name: &[u8],
+        stat: &libc::stat,
+    ) -> Result<bool, Error> {
+        if name.contains(&0) {
+            return Ok(false);
+        }
+        let statx_offset = (name.len() + 1).next_multiple_of(8);
+        let len =
+            (statx_offset + std::mem::size_of::<libc::statx>()).next_multiple_of(host_page_size());
+        let page = map_identity_page(guest, len, "statx the directory entry", name).await?;
+        // SAFETY: the offset is within the `len` bytes just mapped.
+        let statxptr = StatxPtr(unsafe { page.add(statx_offset) }.cast::<libc::statx>());
+        let asked = Self::statx_in_page(
+            guest,
+            StatAt::entry_of(dirfd),
+            name,
+            page,
+            statxptr,
+            StatxMask::STATX_INO,
+        )
+        .await;
+        unmap_identity_page(guest, page, len, name).await;
+        let statx = match asked {
+            Ok(Some(statx)) => statx,
+            Ok(None) => return Ok(false),
+            Err(Errno::ESRCH) => return Err(Error::Errno(Errno::ESRCH)),
+            Err(errno) => {
+                return Err(identity_lookup_refused(
+                    "statx the directory entry",
+                    name,
+                    errno,
+                ));
+            }
+        };
+        let device = libc::makedev(statx.stx_dev_major, statx.stx_dev_minor);
+        if (device, statx.stx_ino) != (stat.st_dev, stat.st_ino) {
+            trace!(
+                "directory entry {:?} names another file than its lstat did",
+                String::from_utf8_lossy(name)
+            );
+            return Ok(false);
+        }
+        let mount_root = libc::STATX_ATTR_MOUNT_ROOT as u64;
+        if statx.stx_attributes_mask & mount_root == 0 {
+            return Ok(true);
+        }
+        Ok(statx.stx_attributes & mount_root == 0)
+    }
+
     /// On overlayfs, settle which of two kinds the overlay `call` lists is
     /// (see [`EntryLookup::Overlay`]) before any entry of the listing is
     /// keyed, and return the `lstat` of each entry asked for that, by name,
@@ -8068,7 +8145,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// tracked or not, every later open and every alias keys the overlay's
     /// entries alike. Until it is settled, the entries that may tell (see
     /// [`EntryLookup::may_tell_the_overlay_kind`]) are asked in sorted order
-    /// until one tells (see [`EntryLookup::learn`]). For a stream served from
+    /// until one tells (see [`EntryLookup::learn`]). A candidate whose `lstat`
+    /// would settle [`EntryLookup::OverlayLayerDevices`] is first asked
+    /// whether it is the root of a mount (see
+    /// [`Self::entry_is_on_the_listed_mount`]): a file bind-mounted over a
+    /// merged entry is not a file of the overlay, and can report another
+    /// device with the entry's own number on an overlay of either kind, so a
+    /// mount root tells nothing. Without that, which directory of the overlay
+    /// the run listed first chose the kind, and with it the keys of the whole
+    /// overlay (Codex review round 9 of
+    /// https://github.com/rrnewton/hermit/pull/3255). The answer
+    /// [`EntryLookup::OverlayOwnDevice`] needs no such question: only a file
+    /// of the overlay reports the overlay's device. For a stream served from
     /// its snapshot (`buffer` `None`), they are those of the whole sorted
     /// snapshot, not of the guest's batch, so neither the stream's position
     /// nor which entries the guest read before changes the answer, nor which
@@ -8089,11 +8177,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// A listing none of whose entries tells is keyed as
     /// [`EntryLookup::OverlayOwnDevice`], and nothing is settled, so a later
     /// listing asks again. The entries that kind leaves unasked are then
-    /// directories, which report the overlay's device on every kind, and
-    /// files whose `lstat` did not report their `d_ino`, which are keyed on
-    /// the directory's device either way, so the key is the one either kind
-    /// gives, but for a directory that is a mount point: the first class of
-    /// the second known gap again.
+    /// directories, which report the overlay's device on every kind, files
+    /// whose `lstat` did not report their `d_ino`, which are keyed on the
+    /// directory's device either way, and mount roots, so the key is the one
+    /// either kind gives, but for a mount point (a directory, or a file
+    /// whose `lstat` reported its `d_ino` on another device as a mount
+    /// root): the first class of the second known gap again, keyed on the
+    /// directory's device in such a listing and on its `lstat`'s device once
+    /// the overlay has settled as [`EntryLookup::OverlayLayerDevices`].
     ///
     /// The overlay is known by the raw device its directories report, which
     /// Linux gives no other mounted filesystem while it is mounted; a device
@@ -8134,10 +8225,20 @@ impl<T: RecordOrReplay> Detcore<T> {
             for entry in candidates {
                 let stat =
                     Self::stat_guest_path_at(guest, StatAt::entry_of(call.fd), &entry.name).await?;
-                let shown = stat
+                let mut shown = stat
                     .as_ref()
                     .map(|stat| EntryLookup::Overlay.learn(&entry, stat, call.device))
                     .filter(|shown| *shown != EntryLookup::Overlay);
+                // Only a file of the overlay itself tells which kind it is. A
+                // mount over the entry (a file bind-mounted over it) can show
+                // another device with the entry's number on either kind, but
+                // never the overlay's own, so only that answer is checked.
+                if let (Some(EntryLookup::OverlayLayerDevices), Some(lstat)) = (shown, &stat)
+                    && !Self::entry_is_on_the_listed_mount(guest, call.fd, &entry.name, lstat)
+                        .await?
+                {
+                    shown = None;
+                }
                 told.push((entry.name, stat));
                 if let Some(shown) = shown {
                     settled = settle_overlay_entry_lookup(guest, call.device, Some(shown)).await;
@@ -8189,9 +8290,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// The last two would make a listing signal or kill a program that runs
     /// natively, so the `fstatfs` is injected only where no such filter can
     /// apply: Detcore refuses a guest's own filter, and the launcher sets
-    /// [`crate::Config::seccomp_filter_inherited`] whenever the process that starts
-    /// the guest runs under one (or cannot tell), since a filter is inherited
-    /// by every guest. Then every entry is asked, no `fstatfs` is injected,
+    /// [`crate::Config::seccomp_filter_inherited`] whenever any thread of the
+    /// process that starts the guest runs under one (or it cannot tell), since
+    /// a filter is inherited by every guest that thread starts. Then every entry is asked, no `fstatfs` is injected,
     /// and nothing is cached. The backend's own filter, such as the ptrace
     /// backend's, lets Detcore's injections through. The `fstatat` of each
     /// asked entry and the `fstat` of a directory Detcore does not track
@@ -10457,6 +10558,15 @@ pub(crate) mod inject_fstat_scratch {
         /// kernel before Linux 6.8 does, and so reports the reusable mount
         /// id instead.
         statx_without_unique_mount_id: bool,
+        /// Directory entries an injected `statx` relative to a directory
+        /// reports as the root of a mount (`STATX_ATTR_MOUNT_ROOT`), as a
+        /// file bind-mounted over the entry is.
+        statx_mount_roots: Vec<Vec<u8>>,
+        /// (start, path) of each injected statx.
+        statx_starts: Vec<(RawFd, AtFlags)>,
+        /// Whether an injected statx reports no `STATX_ATTR_MOUNT_ROOT` in its
+        /// attributes mask, as a kernel before Linux 5.8 does.
+        statx_without_mount_root_attribute: bool,
         /// The errno every injected `statmount` fails with instead of
         /// running, when set: `ENOSYS` as under a seccomp policy, or an
         /// answer the test process's own mounts do not give.
@@ -10574,6 +10684,9 @@ pub(crate) mod inject_fstat_scratch {
                 fstatat_answers: Vec::new(),
                 statx_paths: Vec::new(),
                 statx_without_unique_mount_id: false,
+                statx_mount_roots: Vec::new(),
+                statx_starts: Vec::new(),
+                statx_without_mount_root_attribute: false,
                 statmount_error: None,
                 statmount_omits_superblock: false,
                 statmount_mounts: Vec::new(),
@@ -10881,32 +10994,78 @@ pub(crate) mod inject_fstat_scratch {
                     }
                 }
                 Syscall::Statx(call) => {
-                    assert_eq!(call.dirfd(), libc::AT_FDCWD);
-                    assert_eq!(call.flags(), AtFlags::empty());
+                    // A path's statx, or a directory entry's relative to the
+                    // open directory, as its lstat is asked; nothing else.
+                    let start = (call.dirfd(), call.flags());
+                    let entry = start.0 >= 0
+                        && start.1 == AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_NO_AUTOMOUNT;
+                    assert!(
+                        start == (libc::AT_FDCWD, AtFlags::empty()) || entry,
+                        "unexpected statx start {start:?}"
+                    );
                     let path = call.path().expect("statx without a path");
                     let buffer = call.statx().expect("statx without a buffer").0.as_raw();
-                    self.statx_paths.push(
-                        path.read(&LocalMemory::new())
-                            .expect("statx names a path it cannot read")
-                            .into_os_string()
-                            .into_vec(),
-                    );
+                    let named = path
+                        .read(&LocalMemory::new())
+                        .expect("statx names a path it cannot read")
+                        .into_os_string()
+                        .into_vec();
+                    self.statx_starts.push(start);
+                    self.statx_paths.push(named.clone());
+                    // An entry whose lstat is scripted is reported by its
+                    // statx alike: the same file, device and number.
+                    let scripted = entry
+                        .then(|| {
+                            self.fstatat_answers
+                                .iter()
+                                .find(|(answered, _)| *answered == named)
+                                .map(|(_, answer)| *answer)
+                        })
+                        .flatten();
                     // The raw mask: `call.mask()` drops bits the pinned
                     // Reverie does not name, such as STATX_MNT_ID_UNIQUE.
                     let mut mask = args.arg3 as u32;
                     if self.statx_without_unique_mount_id {
                         mask &= !STATX_MNT_ID_UNIQUE;
                     }
-                    unsafe {
-                        libc::syscall(
-                            libc::SYS_statx,
-                            libc::AT_FDCWD,
-                            Some(path).into_raw(),
-                            0,
-                            mask,
-                            buffer,
-                        )
+                    let raw = match scripted {
+                        Some(Err(errno)) => return Err(errno),
+                        Some(Ok(answer)) => {
+                            let mut statx: libc::statx = unsafe { std::mem::zeroed() };
+                            statx.stx_mask = libc::STATX_TYPE | libc::STATX_MODE | libc::STATX_INO;
+                            statx.stx_mode = answer.st_mode as u16;
+                            statx.stx_ino = answer.st_ino;
+                            statx.stx_dev_major = libc::major(answer.st_dev);
+                            statx.stx_dev_minor = libc::minor(answer.st_dev);
+                            statx.stx_attributes_mask = libc::STATX_ATTR_MOUNT_ROOT as u64;
+                            unsafe { std::ptr::write_unaligned(buffer as *mut libc::statx, statx) };
+                            0
+                        }
+                        None => unsafe {
+                            libc::syscall(
+                                libc::SYS_statx,
+                                start.0,
+                                Some(path).into_raw(),
+                                start.1.bits(),
+                                mask,
+                                buffer,
+                            )
+                        },
+                    };
+                    if raw == 0 && entry {
+                        let mount_root = libc::STATX_ATTR_MOUNT_ROOT as u64;
+                        let mut statx: libc::statx =
+                            unsafe { std::ptr::read_unaligned(buffer as *const libc::statx) };
+                        if self.statx_mount_roots.contains(&named) {
+                            statx.stx_attributes |= mount_root;
+                        }
+                        if self.statx_without_mount_root_attribute {
+                            statx.stx_attributes &= !mount_root;
+                            statx.stx_attributes_mask &= !mount_root;
+                        }
+                        unsafe { std::ptr::write_unaligned(buffer as *mut libc::statx, statx) };
                     }
+                    raw
                 }
                 Syscall::Other(Sysno::statmount, args) => {
                     // SAFETY: Detcore staged the request in a page it mapped.
@@ -14049,6 +14208,193 @@ pub(crate) mod inject_fstat_scratch {
                 "{read}: plain is keyed once, on the directory's device, as in every read"
             );
         }
+    }
+
+    /// Scripted answers that make the directory read next stand for one of
+    /// two directories of the same overlay, whose layers share one
+    /// filesystem, so every file of it reports the overlay's device, which
+    /// is the directory's (`device`). In `A`, `lower` (`d_ino` 300) has a
+    /// file bind-mounted over it, from `OTHER_DEVICE` with the same number,
+    /// and `plain` (301) is an ordinary file of the overlay when `ordinary`,
+    /// and gone otherwise; in `B`, `lower` (400) is an ordinary file.
+    fn read_as_overlay_directory(guest: &mut ScriptedGuest, a: bool, ordinary: bool, device: u64) {
+        let base = if a { 300 } else { 400 };
+        let file = |ino: u64| stat_answer(device, ino, libc::S_IFREG | 0o644);
+        guest.getdents_inode_answers = vec![
+            (b"..".to_vec(), SCRIPTED_PARENT_INODE),
+            (b"covered".to_vec(), base - 1),
+            (b"lower".to_vec(), base),
+            (b"plain".to_vec(), base + 1),
+            (b"vanished".to_vec(), base + 2),
+        ];
+        let lower = if a {
+            stat_answer(OTHER_DEVICE, base, libc::S_IFREG | 0o644)
+        } else {
+            file(base)
+        };
+        let plain = if a && !ordinary {
+            Err(Errno::ENOENT)
+        } else {
+            Ok(file(base + 1))
+        };
+        guest.fstatat_answers = vec![
+            (
+                b"..".to_vec(),
+                Ok(stat_answer(
+                    OTHER_DEVICE,
+                    SCRIPTED_PARENT_INODE,
+                    libc::S_IFDIR | 0o755,
+                )),
+            ),
+            (
+                b"covered".to_vec(),
+                Ok(stat_answer(device, base - 1, libc::S_IFDIR | 0o755)),
+            ),
+            (b"lower".to_vec(), Ok(lower)),
+            (b"plain".to_vec(), plain),
+            (b"vanished".to_vec(), Err(Errno::ENOENT)),
+        ];
+        guest.statx_mount_roots = if a { vec![b"lower".to_vec()] } else { vec![] };
+    }
+
+    // Codex review of https://github.com/rrnewton/hermit/pull/3255, round 9,
+    // P1. The overlay's kind is settled once per run from the first file in
+    // sorted order whose `lstat` tells, but a file bind-mounted over a merged
+    // entry is not a file of the overlay: on an overlay whose layers share
+    // one filesystem it can report another device with the entry's own
+    // number, which reads as an overlay that reports a layer's device for
+    // every file. When it was taken as such, the kind of the whole overlay,
+    // and so the key of `lower` in `A`, depended on whether `A` or `B` was
+    // listed first, though both were read whole through tracked descriptors.
+    // A candidate that would settle `OverlayLayerDevices` is now asked
+    // whether it is the root of a mount (`STATX_ATTR_MOUNT_ROOT`), and a
+    // mount root tells nothing, so the overlay settles as it keeps its files
+    // in either order, from `plain` or from `B`'s `lower`, and `A`'s `lower`
+    // is keyed on the directory's device in every run: the first class of
+    // the second known gap at `Detcore::directory_entry_identity`, the same
+    // in every read. When `A` has no other file, its first listing settles
+    // nothing and is keyed as an overlay that keeps its files, which gives
+    // `lower` the same key. A kernel without the attribute (before Linux
+    // 5.8) cannot tell, and the answer is taken as before: the documented
+    // fallback.
+    #[tokio::test]
+    async fn getdents_settles_an_overlay_alike_whichever_directory_is_read_first() {
+        for ordinary in [true, false] {
+            let mut keys = Vec::new();
+            for a_first in [true, false] {
+                let (_dir_a, fd_a, _, device) = directory_with_entries();
+                let (_dir_b, fd_b, _, device_b) = directory_with_entries();
+                assert_eq!(device, device_b, "precondition: one filesystem");
+                let scratch = Pages::map(1, 1);
+                let (tool, mut guest) =
+                    ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+                guest.answers_determinize_inode = true;
+                guest.fstatfs_answer = Some(Ok(libc::OVERLAYFS_SUPER_MAGIC));
+                for fd in [fd_a, fd_b] {
+                    tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
+                        .await
+                        .expect("precondition: Detcore tracks the directory");
+                }
+                let order = if a_first {
+                    [(true, fd_a), (false, fd_b)]
+                } else {
+                    [(false, fd_b), (true, fd_a)]
+                };
+                let mut lower_of_a = Vec::new();
+                for (a, fd) in order {
+                    read_as_overlay_directory(&mut guest, a, ordinary, device);
+                    let before = guest.determinized.lock().unwrap().len();
+                    let statx_before = guest.statx_paths.len();
+                    let read = getdents64_of(&tool, &mut guest, fd).await;
+                    assert!(
+                        read.as_ref().is_ok_and(|len| *len > 0),
+                        "ordinary {ordinary}, A first {a_first}, A {a}: {read:?}"
+                    );
+                    if a {
+                        lower_of_a = guest.determinized.lock().unwrap()[before..]
+                            .iter()
+                            .copied()
+                            .filter(|raw| raw.ino == 300)
+                            .collect();
+                        assert_eq!(
+                            guest.statx_paths[statx_before..],
+                            if a_first {
+                                vec![b"lower".to_vec()]
+                            } else {
+                                vec![]
+                            },
+                            "ordinary {ordinary}, A first {a_first}: only A's bound lower is \
+                             asked whether it is a mount, and only before the overlay settles"
+                        );
+                        if a_first {
+                            assert_eq!(
+                                guest.statx_starts.last(),
+                                Some(&(
+                                    fd,
+                                    AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_NO_AUTOMOUNT
+                                )),
+                                "the statx is asked as the lstat is, relative to the directory"
+                            );
+                        }
+                    }
+                }
+                let proposals: Vec<Option<EntryLookup>> = guest
+                    .settle_requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(_, proposal)| *proposal)
+                    .collect();
+                assert!(
+                    !proposals.contains(&Some(EntryLookup::OverlayLayerDevices)),
+                    "ordinary {ordinary}, A first {a_first}: a mount root settled the overlay: \
+                     {proposals:?}"
+                );
+                assert!(
+                    proposals.contains(&Some(EntryLookup::OverlayOwnDevice)),
+                    "ordinary {ordinary}, A first {a_first}: the overlay settles as it keeps its \
+                     files: {proposals:?}"
+                );
+                keys.push((a_first, device, lower_of_a));
+                close_unless_detcore_did(&guest, fd_a);
+                close_unless_detcore_did(&guest, fd_b);
+            }
+            for (a_first, device, keyed) in keys {
+                assert_eq!(
+                    keyed,
+                    [RawInode::new(device, 300)],
+                    "ordinary {ordinary}, A first {a_first}: A's lower is keyed once, on the \
+                     directory's device, whichever directory is read first"
+                );
+            }
+        }
+    }
+
+    // The fallback of the test above: a kernel that does not report
+    // `STATX_ATTR_MOUNT_ROOT` (before Linux 5.8) cannot tell a mount root,
+    // and `A`'s bound `lower` settles the overlay as it did before the
+    // question was asked, as `Detcore::entry_is_on_the_listed_mount`
+    // documents.
+    #[tokio::test]
+    async fn getdents_takes_a_candidates_answer_where_the_kernel_cannot_tell_a_mount() {
+        let (_dir, fd, _, device) = directory_with_entries();
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        guest.answers_determinize_inode = true;
+        guest.fstatfs_answer = Some(Ok(libc::OVERLAYFS_SUPER_MAGIC));
+        guest.statx_without_mount_root_attribute = true;
+        tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
+            .await
+            .expect("precondition: Detcore tracks the directory");
+        read_as_overlay_directory(&mut guest, true, true, device);
+        let read = getdents64_of(&tool, &mut guest, fd).await;
+        close_unless_detcore_did(&guest, fd);
+        assert!(read.as_ref().is_ok_and(|len| *len > 0), "{read:?}");
+        assert_eq!(guest.statx_paths, [b"lower".to_vec()]);
+        assert_eq!(
+            guest.settle_requests.lock().unwrap().last(),
+            Some(&(device, Some(EntryLookup::OverlayLayerDevices)))
+        );
     }
 
     // The same F5: an entry whose `lstat` cannot be asked (here a scripted

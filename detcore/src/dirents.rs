@@ -528,8 +528,10 @@ impl EntryLookup {
     /// overlay, which reports its device by the same rule, unless it is a
     /// mount. A file bind-mounted over the entry, whose source has the
     /// covered entry's inode number, can mislead it only toward
-    /// [`EntryLookup::OverlayLayerDevices`], since on an overlay of the third
-    /// kind no non-directory reports the overlay's device.
+    /// [`EntryLookup::OverlayLayerDevices`], since only a file of the overlay
+    /// reports the overlay's device, so before an entry that shows that kind
+    /// settles the overlay, Detcore asks whether it is the root of a mount and
+    /// takes nothing from one (see `Detcore::entry_is_on_the_listed_mount`).
     ///
     /// Detcore asks this of the first files of a listing in sorted order,
     /// before any entry is keyed, and keeps the first answer that decides for
