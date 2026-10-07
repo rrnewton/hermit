@@ -184,7 +184,20 @@ impl RecordVersion {
 // replay numbers every raw ID from it. An older recording's metadata cannot
 // rebuild the mapping its guest saw, so replaying it could change the mount IDs
 // the guest reads and its control flow.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x122);
+// 0x122 -> 0x124: /proc/<pid>/mounts and its aliases are a Detcore procfs
+// snapshot (https://github.com/rrnewton/hermit/issues/3719): a descriptor's
+// first read captures the whole file through recorded reads up to end of
+// file, drops host seed mounts, rewrites mount points, and serves every read
+// of that descriptor from the capture. And when the spelling of a successful
+// open names no procfs file, Detcore classifies the descriptor by a recorded
+// readlink of /proc/thread-self/fd/<fd>, one more event per such open. An
+// older stream has neither the capture's reads nor those events, so replaying
+// it would desynchronize at its first such open or read. 0x123 was taken in
+// parallel, on another base, by the inode pool format of
+// https://github.com/rrnewton/hermit/issues/2897; this change uses 0x124 so
+// that no number names two formats, and a tree with both changes records
+// 0x124.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x124);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -209,7 +222,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x122);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x122;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x124;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -663,6 +676,17 @@ mod tests {
     #[test]
     fn record_version_rejects_pre_flock_streams() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x10b)));
+    }
+
+    /// A 0x122 recording read /proc/<pid>/mounts as ordinary reads and has
+    /// no recorded descriptor readlink after an open whose spelling names no
+    /// procfs file. This replayer captures mounts files and replays that
+    /// readlink, so it would consume other events; the version gate must
+    /// refuse the recording instead. 0x123 is another base's format.
+    #[test]
+    fn record_version_rejects_pre_mounts_snapshot_streams() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x122)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x123)));
     }
 
     #[test]

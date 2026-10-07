@@ -14,7 +14,23 @@
 //! `pread64` and `sendfile` read live kernel bytes. The probe asserts that a
 //! positioned read observes the sanitized snapshot and that a procfs `sendfile`
 //! input is refused, and Hermit's own `--verify` proves both are deterministic.
+//!
+//! TODO-HUMAN-REVIEW(PR-3712): Review vectored /proc/self/mounts coverage.
+//! With `--mounts`, the probe also asserts that `readv`, `preadv` and
+//! `preadv2` of `/proc/self/mounts` return the bytes `read` returns, with
+//! Linux's shared and explicit positions, `RWF_HIPRI` and `RWF_NOWAIT`
+//! results, and fault results. It also asserts that `lseek`, `read` and
+//! `pread64` of that file follow Linux's seq_file rules: `SEEK_SET` and
+//! `SEEK_CUR` before the first read and past the end, `EINVAL` for
+//! `SEEK_END`, `SEEK_DATA`, `SEEK_HOLE` and a negative result, 0 for a
+//! positioned read at or past the end into an unwritable buffer, and `EFAULT`
+//! without a position change for a faulting read. Those checks compare several
+//! opens, and the verify run compares two executions, so both runs use a
+//! private copy of the host mount table that host mounts and unmounts cannot
+//! change. They run on the ptrace backend only.
 
+#[path = "common/frozen_mount_table.rs"]
+mod frozen_mount_table;
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
 
@@ -44,9 +60,11 @@ fn procfs_positioned_reads_are_mediated_and_deterministic() {
 
     // First a plain strict run so the guest's stdout reaches this process. The
     // probe itself asserts that pread observed the *sanitized* snapshot (stat
-    // starttime == 0) and that a procfs sendfile input was refused; a nonzero
-    // guest exit fails `status.success()`, and the markers confirm both checks
-    // actually executed rather than being skipped.
+    // starttime == 0), that a procfs sendfile input was refused, that
+    // vectored reads of /proc/self/mounts match read(), and that lseek, read
+    // and pread64 of that file follow Linux; a nonzero guest exit fails
+    // `status.success()`, and the markers confirm all four checks actually
+    // executed rather than being skipped.
     let mut run_command = Command::new("timeout");
     run_command
         .args(["--kill-after", "5s", "90s"])
@@ -60,8 +78,10 @@ fn procfs_positioned_reads_are_mediated_and_deterministic() {
             "--base-env=minimal",
             "--",
         ])
-        .arg(&guest);
+        .arg(&guest)
+        .arg("--mounts");
     hermit_test::configure_guest_execution(&mut run_command);
+    frozen_mount_table::freeze_mount_table(&mut run_command);
     let run = run_command
         .output()
         .expect("failed to run procfs positioned probe");
@@ -79,6 +99,14 @@ fn procfs_positioned_reads_are_mediated_and_deterministic() {
     assert!(
         stdout.contains("procfs-sendfile-refused-ok"),
         "sendfile with a procfs input was not refused\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("procfs-mounts-vectored-ok"),
+        "vectored reads of /proc/self/mounts did not match read()\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("procfs-mounts-scalar-ok"),
+        "lseek, read or pread64 of /proc/self/mounts departed from Linux\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
     // Then a --verify run so Hermit proves the positioned/copy paths are
@@ -98,8 +126,10 @@ fn procfs_positioned_reads_are_mediated_and_deterministic() {
             "--base-env=minimal",
             "--",
         ])
-        .arg(&guest);
+        .arg(&guest)
+        .arg("--mounts");
     hermit_test::configure_guest_execution(&mut verify_command);
+    frozen_mount_table::freeze_mount_table(&mut verify_command);
     let verify = verify_command
         .output()
         .expect("failed to verify procfs positioned probe");

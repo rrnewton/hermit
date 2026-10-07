@@ -42,6 +42,26 @@ impl UserAddressPolicy {
         }
     }
 
+    /// `vfs_read`'s `access_ok(buf, count)` for a scalar read or pread64,
+    /// made on the full requested count before `rw_verify_area` and before
+    /// the count is capped at `MAX_RW_COUNT`. A count above `isize::MAX`
+    /// cannot fit below any user address limit, so it is `EFAULT` before the
+    /// policy is asked (the native oracle would read it as a negative iovec
+    /// length and answer `EINVAL`).
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3712)
+    pub(crate) fn validate_buffer(self, base: usize, len: usize) -> Result<(), Error> {
+        if len > isize::MAX as usize {
+            return Err(Errno::EFAULT.into());
+        }
+        // Two descriptors prevent the single-vector MAX_RW_COUNT special case
+        // from shortening the range check, as for the iovec array itself.
+        self.validate(&[
+            ImportedIovec { base, len },
+            ImportedIovec { base: 0, len: 0 },
+        ])
+    }
+
     pub(crate) fn validate(self, iovecs: &[ImportedIovec]) -> Result<(), Error> {
         match self {
             Self::Limit(limit) => validate_ranges(iovecs, limit).map_err(Error::from),
@@ -453,6 +473,51 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_scalar_read_buffer_is_validated_over_its_full_uncapped_count() {
+        let limit = UserAddressPolicy::Limit(FOUR_LEVEL_USER_LIMIT);
+        let validate = |policy: UserAddressPolicy, base: usize, len: usize| {
+            policy
+                .validate_buffer(base, len)
+                .map_err(|error| match error {
+                    Error::Errno(errno) => errno,
+                    other => panic!("expected a guest errno, got {other:?}"),
+                })
+        };
+        // vfs_read's access_ok sees the count before MAX_RW_COUNT caps it, so
+        // a range that fits only once capped is EFAULT.
+        let base = FOUR_LEVEL_USER_LIMIT - MAX_RW_COUNT - 1;
+        assert_eq!(validate(limit, base, MAX_RW_COUNT), Ok(()));
+        assert_eq!(validate(limit, base, MAX_RW_COUNT + 2), Err(Errno::EFAULT));
+        assert_eq!(validate(limit, 0x1000, MAX_RW_COUNT + 1), Ok(()));
+        // NULL is a valid user address; only the store faults later.
+        assert_eq!(validate(limit, 0, 1), Ok(()));
+        assert_eq!(validate(limit, 0, 0), Ok(()));
+        assert_eq!(validate(limit, FOUR_LEVEL_USER_LIMIT, 0), Ok(()));
+        assert_eq!(
+            validate(limit, FOUR_LEVEL_USER_LIMIT, 1),
+            Err(Errno::EFAULT)
+        );
+        for policy in [limit, UserAddressPolicy::Native] {
+            assert_eq!(
+                validate(policy, 0x1000, isize::MAX as usize + 1),
+                Err(Errno::EFAULT)
+            );
+            assert_eq!(validate(policy, 0x1000, usize::MAX), Err(Errno::EFAULT));
+            assert_eq!(validate(policy, usize::MAX - 10, 100), Err(Errno::EFAULT));
+            assert_eq!(validate(policy, 0, 0), Ok(()));
+        }
+        let buffer = [0_u8; 64];
+        assert_eq!(
+            validate(
+                UserAddressPolicy::Native,
+                buffer.as_ptr() as usize,
+                buffer.len()
+            ),
+            Ok(())
+        );
     }
 
     #[test]

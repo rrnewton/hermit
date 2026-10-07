@@ -793,7 +793,18 @@ fn canonical_record_replay_command(name: &str, program: &Path, args: &[&OsStr]) 
     );
 }
 
-fn record_then_replay_command(name: &str, program: &Path, args: &[&OsStr]) {
+fn record_then_replay_command(name: &str, program: &Path, args: &[&OsStr]) -> Vec<u8> {
+    record_then_replay_command_with(name, program, args, |_| {})
+}
+
+/// [`record_then_replay_command`], with `prepare` applied to both the record
+/// and the replay command before either runs.
+fn record_then_replay_command_with(
+    name: &str,
+    program: &Path,
+    args: &[&OsStr],
+    prepare: impl Fn(&mut Command),
+) -> Vec<u8> {
     let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
     let mut record = Command::new("timeout");
     record
@@ -804,6 +815,7 @@ fn record_then_replay_command(name: &str, program: &Path, args: &[&OsStr]) {
         .arg("--")
         .arg(program)
         .args(args);
+    prepare(&mut record);
     let record_output = command_output(record, &format!("recording for {name}"));
 
     let mut replay = Command::new("timeout");
@@ -812,12 +824,14 @@ fn record_then_replay_command(name: &str, program: &Path, args: &[&OsStr]) {
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args(["--log=off", "replay", "--autopilot"])
         .arg(format!("--data-dir={}", data_dir.path().display()));
+    prepare(&mut replay);
     let replay_output = command_output(replay, &format!("replay for {name}"));
 
     assert_eq!(
         record_output.stdout, replay_output.stdout,
         "replayed guest stdout did not match the recording for {name}"
     );
+    record_output.stdout
 }
 
 fn record_then_mutate_and_replay_command<F>(
@@ -1100,6 +1114,168 @@ fn record_proc_mountinfo_replays_the_captured_read_buffer() {
         Path::new("/bin/cat"),
         &[OsStr::new("/proc/self/mountinfo")],
     );
+}
+
+/// Splits `stdout` into `parts` equal pieces and requires them to be
+/// identical: each piece is one file `cat` printed, all naming the same
+/// procfs object.
+fn assert_identical_parts(stdout: &[u8], parts: usize, label: &str) {
+    assert!(
+        !stdout.is_empty() && stdout.len().is_multiple_of(parts),
+        "{label}: {} bytes do not split into {parts} non-empty copies:\n{}",
+        stdout.len(),
+        String::from_utf8_lossy(stdout)
+    );
+    let size = stdout.len() / parts;
+    let first = &stdout[..size];
+    for (index, part) in stdout.chunks(size).enumerate() {
+        assert_eq!(
+            part,
+            first,
+            "{label}: copy {index} differs from copy 0:\n{}",
+            String::from_utf8_lossy(stdout)
+        );
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-3712): Review the recorded procfs alias classification.
+#[test]
+fn record_etc_mtab_replays_the_recorded_mounts_classification() {
+    let _guard = hermit_record_lock();
+    // `/etc/mtab` names `/proc/self/mounts` only through a symlink, so its
+    // spelling does not classify and Detcore asks what the descriptor
+    // resolved to. Replayer's descriptor is a placeholder, so that question
+    // must be answered from the recording or replay classifies differently.
+    // 7-byte reads make the difference fatal rather than cosmetic: a
+    // classified descriptor records its whole snapshot at the first read,
+    // so an unclassified replay would consume those reads one at a time and
+    // diverge at dd's first write. Every run uses a private copy of the
+    // mount table: the copies `cat` prints must match, and a host mount or
+    // unmount between its opens would change the later copy.
+    let mtab = fs::read_link("/etc/mtab").expect("this test needs /etc/mtab to be a symlink");
+    assert!(
+        mtab.ends_with("proc/self/mounts"),
+        "this test needs /etc/mtab to name /proc/self/mounts, found {}",
+        mtab.display()
+    );
+    record_then_replay_command_with(
+        "etc mtab 7-byte reads",
+        Path::new("/bin/dd"),
+        &[
+            OsStr::new("if=/etc/mtab"),
+            OsStr::new("bs=7"),
+            OsStr::new("count=4"),
+            OsStr::new("status=none"),
+        ],
+        frozen_mount_table::freeze_mount_table,
+    );
+    let stdout = record_then_replay_command_with(
+        "etc mtab beside proc self mounts",
+        Path::new("/bin/cat"),
+        &[OsStr::new("/proc/self/mounts"), OsStr::new("/etc/mtab")],
+        frozen_mount_table::freeze_mount_table,
+    );
+    assert_identical_parts(&stdout, 2, "/proc/self/mounts then /etc/mtab");
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-3712): Review the recorded procfs alias classification.
+#[test]
+fn record_symlinked_mounts_alias_replays_the_recorded_classification() {
+    let _guard = hermit_record_lock();
+    // An arbitrary symlink, and a symlink to that symlink, reach the same
+    // procfs object as `/proc/self/mounts`. The replay root does not contain
+    // the fixture directory at all, so only the recording can classify them.
+    // As above, every run uses a private copy of the mount table so the
+    // copies `cat` prints cannot differ by a host mount change.
+    let fixture = tempfile::tempdir().expect("failed to create mounts alias fixture");
+    let alias = fixture.path().join("alias");
+    let chain = fixture.path().join("chain");
+    std::os::unix::fs::symlink("/proc/self/mounts", &alias).expect("failed to create mounts alias");
+    std::os::unix::fs::symlink(&alias, &chain).expect("failed to create chained mounts alias");
+    let chain_if = {
+        let mut argument = std::ffi::OsString::from("if=");
+        argument.push(&chain);
+        argument
+    };
+    record_then_replay_command_with(
+        "chained mounts alias 7-byte reads",
+        Path::new("/bin/dd"),
+        &[
+            chain_if.as_os_str(),
+            OsStr::new("bs=7"),
+            OsStr::new("count=4"),
+            OsStr::new("status=none"),
+        ],
+        frozen_mount_table::freeze_mount_table,
+    );
+    let stdout = record_then_replay_command_with(
+        "mounts aliases beside proc self mounts",
+        Path::new("/bin/cat"),
+        &[
+            OsStr::new("/proc/self/mounts"),
+            alias.as_os_str(),
+            chain.as_os_str(),
+        ],
+        frozen_mount_table::freeze_mount_table,
+    );
+    assert_identical_parts(&stdout, 3, "/proc/self/mounts, alias, chained alias");
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-3712): Review seek-before-read of the mounts snapshot.
+#[test]
+fn record_seek_before_the_first_mounts_read_replays_the_recorded_position() {
+    let _guard = hermit_record_lock();
+    // `dd skip=3 bs=7` calls lseek(SEEK_CUR, 21) on its input before reading
+    // it. Detcore captures the mounts snapshot at the first read, so the seek
+    // comes first and must move the snapshot position itself: the descriptor
+    // replay holds is a placeholder, so a seek that reached Linux would leave
+    // replay reading from a different place than the recording did. Each
+    // spelling below is seeked before its first read, and the last `dd`
+    // prints the first 49 bytes, so the seeked copies must equal bytes 21 to
+    // 48 of that. One shell runs every command so that all of them read the
+    // same private copy of the mount table.
+    let mtab = fs::read_link("/etc/mtab").expect("this test needs /etc/mtab to be a symlink");
+    assert!(
+        mtab.ends_with("proc/self/mounts"),
+        "this test needs /etc/mtab to name /proc/self/mounts, found {}",
+        mtab.display()
+    );
+    let fixture = tempfile::tempdir().expect("failed to create mounts alias fixture");
+    let alias = fixture.path().join("alias");
+    std::os::unix::fs::symlink("/proc/self/mounts", &alias).expect("failed to create mounts alias");
+    let stdout = record_then_replay_command_with(
+        "seek before the first mounts read",
+        Path::new("/bin/sh"),
+        &[
+            OsStr::new("-c"),
+            OsStr::new(
+                "for f in \"$@\"; do dd if=\"$f\" bs=7 skip=3 count=4 iflag=fullblock status=none || exit 1; done; dd if=/proc/self/mounts bs=49 count=1 iflag=fullblock status=none",
+            ),
+            OsStr::new("sh"),
+            OsStr::new("/proc/self/mounts"),
+            OsStr::new("/etc/mtab"),
+            alias.as_os_str(),
+        ],
+        frozen_mount_table::freeze_mount_table,
+    );
+    assert_eq!(
+        stdout.len(),
+        3 * 28 + 49,
+        "expected three 28-byte seeked copies and a 49-byte prefix:\n{}",
+        String::from_utf8_lossy(&stdout)
+    );
+    let (seeked, prefix) = stdout.split_at(3 * 28);
+    for (index, copy) in seeked.chunks(28).enumerate() {
+        assert_eq!(
+            copy,
+            &prefix[21..49],
+            "seeked copy {index} did not start at byte 21:\n{}",
+            String::from_utf8_lossy(&stdout)
+        );
+    }
 }
 
 #[test]
@@ -2637,6 +2813,9 @@ record_replay_tests! {
     record_rs_stack_ptr => "rustbin_stack_ptr",
     record_rs_thread_random => "rustbin_thread_random",
 }
+
+#[path = "common/frozen_mount_table.rs"]
+mod frozen_mount_table;
 
 #[path = "record_replay/network_trace.rs"]
 mod network_trace;

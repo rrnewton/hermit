@@ -551,6 +551,40 @@ fn stage_recorded_exec_image(
 mod tests {
     use super::*;
 
+    /// Replay refuses a recording from before the mounts snapshot and the
+    /// recorded descriptor readlink (RECORD_VERSION 0x124) as soon as it
+    /// reads the metadata, before it starts the guest, whose first
+    /// /proc/<pid>/mounts read or unclassified open would otherwise consume
+    /// events the recording never made.
+    #[tokio::test]
+    async fn replay_refuses_a_recording_from_before_the_mounts_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = serde_json::json!({
+            "exe": "/bin/true",
+            "program": "true",
+            "arg0": "true",
+            "args": [],
+            "current_dir": "/",
+            "hostname": null,
+            "domainname": null,
+            "envs": {},
+            "version": 0x122,
+        });
+        fs::write(
+            dir.path().join(crate::consts::METADATA_NAME),
+            metadata.to_string(),
+        )
+        .unwrap();
+        let error = match Replay::spawn(dir.path(), false, None, &[]).await {
+            Ok(_) => panic!("replay accepted a 0x122 recording"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("Version mismatch, recording version RecordVersion(290)"),
+            "unexpected refusal: {error}"
+        );
+    }
+
     #[test]
     fn private_bootstrap_path_is_long_enough_without_oversized_components() {
         let chroot = Path::new("/tmp/replay-root");

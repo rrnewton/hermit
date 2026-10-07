@@ -779,7 +779,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // canonical_verdict::tests::the_exact_branch_counter_verdict_is_optional_and_strictly_typed,
     // which manifest-plan path-includes, retains all 975 (976, measured with
     // cargo nextest list).
-    ("test.regular_crates", 976),
+    // detcore-model's two /proc/mounts seed-class tests
+    // (https://github.com/rrnewton/hermit/issues/3719),
+    // procfs::tests::mounts_file_rows_use_the_same_seed_class and
+    // procfs::tests::mounts_file_seed_filter_drops_only_seed_rows_and_keeps_order,
+    // retain all 976 prior identities: 976 + 2 = 978, measured with cargo
+    // nextest list --profile ci --workspace --exclude hermit-detcore
+    // --exclude hermit --exclude hermetic_infra_hermit_flaky-tests
+    // (detcore-model 156).
+    ("test.regular_crates", 978),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1007,7 +1015,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // analyze::minimize::tests::a_failing_minimize_trial_ends_minimization_with_its_error;
     // and schedule_search::tests::{a_failing_trial_ends_the_schedule_search_with_its_error,
     // a_failing_jitter_replay_returns_its_error}.
-    ("test.hermit_unit", 902),
+    // The RECORD_VERSION 0x124 gate tests of
+    // https://github.com/rrnewton/hermit/issues/3719,
+    // metadata::tests::record_version_rejects_pre_mounts_snapshot_streams and
+    // replay::tests::replay_refuses_a_recording_from_before_the_mounts_snapshot,
+    // retain all 902 prior identities: 902 + 2 = 904 (measured with
+    // `cargo nextest list --profile ci` and this node's filters).
+    ("test.hermit_unit", 904),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1138,7 +1152,29 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/3686) retains all 970 prior
     // identities: 970 + 1 = 971, measured with cargo nextest list --profile ci
     // -p hermit-detcore --lib --bins.
-    ("test.detcore_unit", 971),
+    // The four /proc/mounts snapshot tests
+    // (https://github.com/rrnewton/hermit/issues/3719),
+    // procfs::tests::mounts_mount_points_take_the_mountinfo_prefix_rewrites,
+    // procfs::tests::mounts_reads_do_not_depend_on_the_private_tmp_name,
+    // procfs::tests::proven_mountpoint_prefix_rewrites_order_and_refusals and
+    // procfs::tests::seed_churn_does_not_change_guest_mounts, retain all 971
+    // prior identities: 971 + 4 = 975, measured with cargo nextest list
+    // --profile ci -p hermit-detcore --lib --bins.
+    // The eleven vectored /proc/<pid>/mounts read tests of the same issue,
+    // syscalls::files::procfs_wiring_guard::vectored_reads_of_mounts_use_the_shared_snapshot
+    // and ten syscalls::files::procfs_vector_tests
+    // (a_fault_after_the_first_byte_returns_the_copied_prefix,
+    // a_fault_at_the_first_byte_is_efault,
+    // a_position_past_the_file_offset_limit_is_einval_before_flags,
+    // a_short_store_is_not_a_fault,
+    // a_store_error_other_than_a_fault_is_a_tool_failure,
+    // a_zero_total_skips_position_and_flag_checks,
+    // bytes_scatter_in_vector_order, mounts_vector_flags_match_linux,
+    // only_the_seq_file_description_refuses_nowait and
+    // the_end_of_the_snapshot_reads_zero_without_storing), retain all 975
+    // prior identities: 975 + 11 = 986, measured with the same cargo nextest
+    // list.
+    ("test.detcore_unit", 986),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1216,9 +1252,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // reverie_private_page_is_the_range_hermit_guards retain all 203 (207).
     ("test.hermit_integration", 207),
     ("test.arbitrary_binaries", 4),
-    // Every record_replay identity but one (`cargo nextest list` lists 110):
+    // Every record_replay identity but one (`cargo nextest list` lists 112):
     // the --skip waiver of record_node_eventfd_epoll_sequence
-    // (https://github.com/rrnewton/hermit/issues/3782) leaves 109.
+    // (https://github.com/rrnewton/hermit/issues/3782) leaves 111.
+    // record_etc_mtab_replays_the_recorded_mounts_classification and
+    // record_symlinked_mounts_alias_replays_the_recorded_classification
+    // (https://github.com/rrnewton/hermit/issues/3719) add two and retain all
+    // 109 prior identities: 109 + 2 = 111, measured with cargo nextest list
+    // --profile ci -p hermit --features third-party-backends --test
+    // record_replay -- --skip record_node_eventfd_epoll_sequence.
     // network_trace::curl_recording_replays_offline_with_identical_logs runs
     // since the pinned root provides curl
     // (https://github.com/rrnewton/hermit/issues/3786).
@@ -1237,7 +1279,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // network_trace::tcp_select_family_records_and_replays_offline
     // (https://github.com/rrnewton/hermit/issues/3804) adds one and retains
     // all 107 prior identities.
-    ("test.record_replay", 109),
+    ("test.record_replay", 111),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -1506,7 +1548,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the three untraced-code tests (970).
     // The host twin selects the same
     // https://github.com/rrnewton/hermit/pull/3686 logdiff test: 970 + 1 = 971.
-    ("test.detcore_unit_on_host", 971),
+    // The four /proc/mounts snapshot tests listed there retain all 971: 975.
+    // The eleven vectored mounts read tests listed there retain all 975: 986.
+    ("test.detcore_unit_on_host", 986),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -1564,7 +1608,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same 40
     // https://github.com/rrnewton/hermit/pull/3686 --max-log-bytes tests:
     // 862 + 40 = 902.
-    ("test.hermit_unit_on_host", 902),
+    // And the same two RECORD_VERSION 0x124 gate tests: 902 + 2 = 904.
+    ("test.hermit_unit_on_host", 904),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -1633,7 +1678,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The two network trace codec tests listed there retain all 972: 974.
     // The row-recording exact-branch-counter test listed there retains all 974: 975.
     // The report exact-branch-counter test listed there retains all 975: 976.
-    ("test.regular_crates_on_host", 976),
+    // The two /proc/mounts seed-class tests listed there retain all 976: 978.
+    ("test.regular_crates_on_host", 978),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
@@ -4226,7 +4272,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"test"########,
         job: r########"record_replay"########,
         desc: r########"Record/replay integration tests"########,
-        description: r########"Runs every test in hermit-cli/tests/record_replay.rs except one, 109 of its 110 Nextest identities, on one thread in the pinned root. Most tests run `hermit record start --verify` (some with --strict --verify-strict and a --verify-json verdict, some as separate record and `replay --autopilot` invocations) under a `timeout --kill-after=5s 45s` wrapper with --record-timeout=30, against the C and Rust workloads that build.workspace_in_pinned_root prepares and the prepared Nextest runner names in HERMIT_PREPARED_RECORD_WORKLOADS, and against host programs such as sh, bash, find, sqlite3 and coreutils pipelines; they require exit 0 and "Success: replay matched recording.", and the strict ones require verified and bitwise_parity in the verdict. They protect record/replay of file-system side effects (including a standalone replay of a mkdir and of AT_FDCWD- and descriptor-relative mkdirat calls beneath host directories that only existed at record time), fork and exec chains, pipes (including a blocking read after the guest clears O_NONBLOCK with FIONBIO or F_SETFL), poll, select, ppoll and pselect copy-outs, futexes, clocks and RDTSC; record timeouts that kill the guest and its descendants without committing a partial recording; replay bootstrap from the recorded executable and interpreter; refusal of an unsupported syscall by name in both phases; and replay output that cannot create a host file through /proc/<pid>/root or truncate stdout through /dev/fd. Seven record_workloads unit tests check how those workloads are built and handed over, including that a consumer refuses a prepared workload whose bytes, path or alias set changed after preparation. record_replay_matrix is also what super.record_replay_matrix_diagnostic runs alone. All thirteen network_trace tests run here: one checks the TCP fixture natively against its loopback controller; three record and replay it with 4-KiB socket buffers that fill, one checking that a nonblocking send replays EAGAIN at the same offset, one that a blocking send does not stall a sibling thread, and one that replay refuses a blocking send where the recording holds a refused nonblocking send and that record refuses another send on the connection while a blocking send waits; three more check what happens around that wait: one records a client that prints whether the thread that released the peer had run and its monotonic clock before and after the send, replays it offline in the same configuration and requires the same stdout byte for byte and the same sequence of network-send retry lines in the INFO log, one requires record to refuse, with exit 122, a waiting send whose descriptor number another thread replaced with dup2 while a dup kept the original open, and requires that the replacement connection received no byte, and one sends from a shared file mapping whose unsent half a forked child rewrites during the wait and requires that the recorded outputs equal what the peer received and that the recording replays at L2; and three record the fixture's client with --record-networking against that controller and replay it with --replay-networking after the controller is gone, under four schedules at L2, checking that record and replay refuse socket operations outside the model and that replay refuses changed outbound bytes; one records the client waiting on a connection and a pipe with select, pselect6 and glibc's select and pselect, each result checked against Linux's, and replays it offline under two schedules, requiring the same stdout, an L2 verdict and an unchanged trace; one records the pinned root's unmodified curl (nixpkgs' curl.bin, added to the image for https://github.com/rrnewton/hermit/issues/3786) fetching from a one-shot loopback HTTP server under --strict with --record-networking, replays it with --replay-networking after the server has exited, and requires the same stdout, a matched `hermit log-diff` of the two INFO logs that compared messages on both sides, and an L2 verdict from a --verify-strict replay; the last checks, without running Hermit, that the stdout comparison the backpressure tests share is exact, apart from the observe mode's own lines, which it removes byte for byte. Record/replay does not enable PMU preemption, so the node needs no performance counters. A replay that diverges from its recording, a recording or replay that hangs until its timeout, a prepared workload that fails that check, or a run that executes other than 109 tests fails the node. WAIVER: `--skip record_node_eventfd_epoll_sequence` excludes the test that records and replays `node -e console.log(42)` under --backend=ptrace --strict --verify --verify-strict. At hermit d1744e9fc07e it diverges deterministically at scheduler turn 144: the recording commits DetPid(3) there, while the replay first reschedules the backgrounded DetPid(5) and commits it, so the INFO log comparison stops at that line and Hermit exits 1 (https://github.com/rrnewton/hermit/issues/3782). Run alone with this node's runner, the test fails and the runner exits 100. Remove the skip and raise the expected count by one when that issue is fixed. MEASURED 2026-10-05 in the pinned root at 2ab6a514458d (https://github.com/rrnewton/hermit/pull/3795 before its est_duration_s and this paragraph were updated, five tests fewer than now; the mkdir, mkdirat and pipe-clear-nonblock tests added since took 2.9 s, 2.5 s and 2.6 s wall in a debug-build nextest run outside the pinned root on 2026-10-06, and the curl test, unskipped since, took 3.2 s there, with 4.7 CPU-s for the whole `cargo nextest run` of that one test, cargo included), by a full validate run (validate-netreplay-rework-2ab6a514458d-1791233575988436941-3055230-bbd98825, off the record) at load average 14: 103 passed, 2 filtered, in 76.7 s wall and 70.6 CPU-s (cgroup cpu.usage_usec; 22.6 user, 48.0 system), with a cgroup memory peak of 152 MiB and 1.8 s of throttling. The 103 tests' own cgroups sum to 64.8 CPU-s. The six tcp_backpressure tests took 9.7, 8.1, 8.1, 6.8, 4.7 and 2.3 CPU-s (the shared-mapping, nonblocking, blocking, refusal, waited-send and replaced-descriptor tests; wall within 0.1 s of each), each under the 22 CPU-s per-test cap; no other test took more than 1.7 CPU-s. The previous measurement, at a67d9d031189 before the three wait tests were added, was 100 passed in 59.5 s wall and 53.2 CPU-s. Earlier runs of the debug-profile build outside the pinned root took 211 to 290 s wall and up to 285 CPU-s; the validate-profile Hermit and prepared workloads account for the difference, so those numbers no longer set the budget. est_duration_s is the pinned-root wall. The 1-GiB baseline rounds the cgroup peak up and the 3-GiB hard cap adds 2 GiB. The 300-second wall timeout is 1.5 times the wall rounded up to the next 300-second bucket, and the 300-second CPU cap applies the same rule to the CPU time."########,
+        description: r########"Runs every test in hermit-cli/tests/record_replay.rs except one, 111 of its 112 Nextest identities, on one thread in the pinned root. Most tests run `hermit record start --verify` (some with --strict --verify-strict and a --verify-json verdict, some as separate record and `replay --autopilot` invocations) under a `timeout --kill-after=5s 45s` wrapper with --record-timeout=30, against the C and Rust workloads that build.workspace_in_pinned_root prepares and the prepared Nextest runner names in HERMIT_PREPARED_RECORD_WORKLOADS, and against host programs such as sh, bash, find, sqlite3 and coreutils pipelines; they require exit 0 and "Success: replay matched recording.", and the strict ones require verified and bitwise_parity in the verdict. They protect record/replay of file-system side effects (including a standalone replay of a mkdir and of AT_FDCWD- and descriptor-relative mkdirat calls beneath host directories that only existed at record time), fork and exec chains, pipes (including a blocking read after the guest clears O_NONBLOCK with FIONBIO or F_SETFL), poll, select, ppoll and pselect copy-outs, futexes, clocks and RDTSC; record timeouts that kill the guest and its descendants without committing a partial recording; replay bootstrap from the recorded executable and interpreter; refusal of an unsupported syscall by name in both phases; and replay output that cannot create a host file through /proc/<pid>/root or truncate stdout through /dev/fd. Two tests record dd's 7-byte reads and cat's whole reads of the mount table through /etc/mtab, and through a symlink the test creates to /proc/self/mounts and a symlink to that symlink, replay each with `replay --autopilot`, and require the replay's stdout to equal the recording's and each alias to print the bytes /proc/self/mounts prints, so replay classifies such an alias as the recording did and serves the recorded snapshot rather than a raw read of its placeholder descriptor. Seven record_workloads unit tests check how those workloads are built and handed over, including that a consumer refuses a prepared workload whose bytes, path or alias set changed after preparation. record_replay_matrix is also what super.record_replay_matrix_diagnostic runs alone. All thirteen network_trace tests run here: one checks the TCP fixture natively against its loopback controller; three record and replay it with 4-KiB socket buffers that fill, one checking that a nonblocking send replays EAGAIN at the same offset, one that a blocking send does not stall a sibling thread, and one that replay refuses a blocking send where the recording holds a refused nonblocking send and that record refuses another send on the connection while a blocking send waits; three more check what happens around that wait: one records a client that prints whether the thread that released the peer had run and its monotonic clock before and after the send, replays it offline in the same configuration and requires the same stdout byte for byte and the same sequence of network-send retry lines in the INFO log, one requires record to refuse, with exit 122, a waiting send whose descriptor number another thread replaced with dup2 while a dup kept the original open, and requires that the replacement connection received no byte, and one sends from a shared file mapping whose unsent half a forked child rewrites during the wait and requires that the recorded outputs equal what the peer received and that the recording replays at L2; and three record the fixture's client with --record-networking against that controller and replay it with --replay-networking after the controller is gone, under four schedules at L2, checking that record and replay refuse socket operations outside the model and that replay refuses changed outbound bytes; one records the client waiting on a connection and a pipe with select, pselect6 and glibc's select and pselect, each result checked against Linux's, and replays it offline under two schedules, requiring the same stdout, an L2 verdict and an unchanged trace; one records the pinned root's unmodified curl (nixpkgs' curl.bin, added to the image for https://github.com/rrnewton/hermit/issues/3786) fetching from a one-shot loopback HTTP server under --strict with --record-networking, replays it with --replay-networking after the server has exited, and requires the same stdout, a matched `hermit log-diff` of the two INFO logs that compared messages on both sides, and an L2 verdict from a --verify-strict replay; the last checks, without running Hermit, that the stdout comparison the backpressure tests share is exact, apart from the observe mode's own lines, which it removes byte for byte. Record/replay does not enable PMU preemption, so the node needs no performance counters. A replay that diverges from its recording, a recording or replay that hangs until its timeout, a prepared workload that fails that check, or a run that executes other than 111 tests fails the node. WAIVER: `--skip record_node_eventfd_epoll_sequence` excludes the test that records and replays `node -e console.log(42)` under --backend=ptrace --strict --verify --verify-strict. At hermit d1744e9fc07e it diverges deterministically at scheduler turn 144: the recording commits DetPid(3) there, while the replay first reschedules the backgrounded DetPid(5) and commits it, so the INFO log comparison stops at that line and Hermit exits 1 (https://github.com/rrnewton/hermit/issues/3782). Run alone with this node's runner, the test fails and the runner exits 100. Remove the skip and raise the expected count by one when that issue is fixed. MEASURED 2026-10-05 in the pinned root at 2ab6a514458d (https://github.com/rrnewton/hermit/pull/3795 before its est_duration_s and this paragraph were updated, five tests fewer than now; the mkdir, mkdirat and pipe-clear-nonblock tests added since took 2.9 s, 2.5 s and 2.6 s wall in a debug-build nextest run outside the pinned root on 2026-10-06, and the curl test, unskipped since, took 3.2 s there, with 4.7 CPU-s for the whole `cargo nextest run` of that one test, cargo included), by a full validate run (validate-netreplay-rework-2ab6a514458d-1791233575988436941-3055230-bbd98825, off the record) at load average 14: 103 passed, 2 filtered, in 76.7 s wall and 70.6 CPU-s (cgroup cpu.usage_usec; 22.6 user, 48.0 system), with a cgroup memory peak of 152 MiB and 1.8 s of throttling. The 103 tests' own cgroups sum to 64.8 CPU-s. The six tcp_backpressure tests took 9.7, 8.1, 8.1, 6.8, 4.7 and 2.3 CPU-s (the shared-mapping, nonblocking, blocking, refusal, waited-send and replaced-descriptor tests; wall within 0.1 s of each), each under the 22 CPU-s per-test cap; no other test took more than 1.7 CPU-s. The previous measurement, at a67d9d031189 before the three wait tests were added, was 100 passed in 59.5 s wall and 53.2 CPU-s. Earlier runs of the debug-profile build outside the pinned root took 211 to 290 s wall and up to 285 CPU-s; the validate-profile Hermit and prepared workloads account for the difference, so those numbers no longer set the budget. est_duration_s is the pinned-root wall. The 1-GiB baseline rounds the cgroup peak up and the 3-GiB hard cap adds 2 GiB. The 300-second wall timeout is 1.5 times the wall rounded up to the next 300-second bucket, and the 300-second CPU cap applies the same rule to the CPU time."########,
         labels: &[r########"full"########, r########"portable"########],
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test record_replay -j 1 -- --skip record_node_eventfd_epoll_sequence"########,
         cmdtype: CmdType::Unknown,

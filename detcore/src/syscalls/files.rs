@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -145,8 +146,9 @@ fn vectored_offset(low: u64, high: u64) -> i64 {
     }
 }
 
-/// RNG vectors use either the shared stream or an independent explicit offset.
-struct RandomVectoredRead {
+/// A vectored read at the description's shared position (`offset` is
+/// `None`) or at an independent explicit offset.
+struct VectoredRead {
     address: usize,
     count: usize,
     offset: Option<u64>,
@@ -154,7 +156,17 @@ struct RandomVectoredRead {
 }
 
 /// Apply Linux's checks after complete iovec import, before touching output.
-fn validate_random_vector_read(offset: Option<u64>, total: usize, flags: i32) -> Result<(), Errno> {
+///
+/// `nowait_supported` is the description's `FMODE_NOWAIT`: random-device
+/// controls set it, and a seq_file procfs description does not, so its
+/// `RWF_NOWAIT` is `EOPNOTSUPP` (`kiocb_set_rw_flags`, after the
+/// APPEND/NOAPPEND conflict).
+fn validate_vector_read(
+    offset: Option<u64>,
+    total: usize,
+    flags: i32,
+    nowait_supported: bool,
+) -> Result<(), Errno> {
     if total == 0 {
         return Ok(());
     }
@@ -185,10 +197,65 @@ fn validate_random_vector_read(offset: Option<u64>, total: usize, flags: i32) ->
     if flags & libc::RWF_APPEND != 0 && flags & libc::RWF_NOAPPEND != 0 {
         return Err(Errno::EINVAL);
     }
+    if !nowait_supported && flags & libc::RWF_NOWAIT != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
     if flags & (libc::RWF_ATOMIC | libc::RWF_DONTCACHE) != 0 {
         return Err(Errno::EOPNOTSUPP);
     }
     Ok(())
+}
+
+/// Copy procfs snapshot bytes through imported read vectors the way
+/// `seq_read_iter`'s `copy_to_iter` does: in vector order, skipping empty
+/// vectors, until the bytes run out or a store faults. A fault before the
+/// first byte is `EFAULT`; after it, the copied prefix is the result. The
+/// copy honours the guest's page protections, so a read-only vector faults
+/// as it does natively. Any other copy error is a backend failure, not a
+/// guest errno.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-3712)
+fn scatter_procfs_bytes(
+    memory: &mut impl MemoryAccess,
+    iovecs: &[crate::iovecs::ImportedIovec],
+    bytes: &[u8],
+) -> Result<usize, Error> {
+    let mut copied = 0;
+    for iov in iovecs {
+        let mut segment = 0;
+        while segment < iov.len && copied < bytes.len() {
+            let wanted = (iov.len - segment).min(bytes.len() - copied);
+            let stored = match iov
+                .base
+                .checked_add(segment)
+                .and_then(AddrMut::<u8>::from_raw)
+            {
+                Some(address) => {
+                    memory.write_with_user_access(address, &bytes[copied..copied + wanted])
+                }
+                None => Err(Errno::EFAULT),
+            };
+            match stored {
+                // A short count does not prove the next byte faults, so only
+                // a fault (or a nonempty copy of nothing) ends the transfer.
+                Ok(0) | Err(Errno::EFAULT) if copied == 0 => return Err(Errno::EFAULT.into()),
+                Ok(0) | Err(Errno::EFAULT) => return Ok(copied),
+                Ok(stored) => {
+                    copied += stored;
+                    segment += stored;
+                }
+                Err(errno) => {
+                    return Err(Error::Tool(anyhow::anyhow!(
+                        "procfs snapshot user-access copy failed after {copied} bytes: {errno}"
+                    )));
+                }
+            }
+        }
+        if copied == bytes.len() {
+            break;
+        }
+    }
+    Ok(copied)
 }
 
 fn read_iovecs<M: MemoryAccess>(
@@ -333,7 +400,9 @@ fn random_device_lseek_result(status_flags: i32, whence: Whence) -> Result<i64, 
     }
 }
 
-fn require_random_device_read_access(status_flags: i32) -> Result<(), Errno> {
+/// `vfs_read`/`vfs_readv`'s `FMODE_READ` check, made before any argument is
+/// imported: an `O_PATH` or write-only description is `EBADF`.
+fn require_read_access(status_flags: i32) -> Result<(), Errno> {
     if status_flags & libc::O_PATH != 0
         || !matches!(
             status_flags & libc::O_ACCMODE,
@@ -344,6 +413,41 @@ fn require_random_device_read_access(status_flags: i32) -> Result<(), Errno> {
     } else {
         Ok(())
     }
+}
+
+/// `seq_lseek` over the virtual position of a procfs open file served from
+/// its snapshot (see `ProcfsFile::serves_seq_file_snapshot`).
+///
+/// `fdget_pos` refuses an `O_PATH` description with `EBADF` before the
+/// whence is looked at. SEEK_CUR adds the current position and falls
+/// through to SEEK_SET; a negative result is `EINVAL`, and so is every other
+/// whence (SEEK_END, SEEK_DATA, SEEK_HOLE and unknown values), each leaving
+/// the position unchanged. A position past the end is accepted: `traverse`
+/// stops at the last record and returns success, so the result never
+/// depends on the contents and needs no capture. The kernel adds in 64 bits
+/// and a sum past `i64::MAX` wraps negative; the wider sum refuses the same
+/// inputs.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-3712)
+fn seq_file_snapshot_seek(
+    status_flags: i32,
+    current: usize,
+    offset: i64,
+    whence: Whence,
+) -> Result<usize, Errno> {
+    if status_flags & libc::O_PATH != 0 {
+        return Err(Errno::EBADF);
+    }
+    let requested = i128::from(offset);
+    let position = match whence {
+        Whence::SEEK_SET => requested,
+        Whence::SEEK_CUR => current as i128 + requested,
+        _ => return Err(Errno::EINVAL),
+    };
+    if !(0..=i128::from(i64::MAX)).contains(&position) {
+        return Err(Errno::EINVAL);
+    }
+    usize::try_from(position).map_err(|_| Errno::EINVAL)
 }
 
 /// Inherited container output is a stream even when an outer runner stores it
@@ -419,8 +523,11 @@ fn reopens_scheduler_managed_pipe(pid: i32, fd: RawFd, managed_pipe_fds: &[RawFd
         .any(|&held| held != fd && link(held).as_ref() == Some(&opened))
 }
 
-/// The path the kernel resolved an open descriptor to, read from the guest's
-/// own `/proc/<pid>/fd/<fd>` link. This is the evidence authority for "which
+/// The path the kernel resolved an open descriptor to, read from the opening
+/// thread's own `/proc/<tid>/fd/<fd>` link. Read through the thread, not its
+/// leader, because a thread cloned without CLONE_FILES has a private
+/// descriptor table (as for [`descriptor_identity`]); the leader's table may
+/// hold nothing, or another file, at that number. This is the evidence authority for "which
 /// object was opened": it is produced by the kernel from the descriptor itself,
 /// so it is independent of the pathname spelling the guest used.
 ///
@@ -431,8 +538,8 @@ fn reopens_scheduler_managed_pipe(pid: i32, fd: RawFd, managed_pipe_fds: &[RawFd
 ///
 /// `None` when the link cannot be read (the descriptor is gone, or procfs is
 /// unavailable), in which case the lexical result stands unchanged.
-fn resolved_open_path(pid: i32, fd: RawFd) -> Option<PathBuf> {
-    let link = std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()?;
+fn resolved_open_path(tid: i32, fd: RawFd) -> Option<PathBuf> {
+    let link = std::fs::read_link(format!("/proc/{tid}/fd/{fd}")).ok()?;
     // A deleted or anonymous target is not a stable object name.
     link.is_absolute().then_some(link)
 }
@@ -612,6 +719,68 @@ fn utimensat_input_overlaps<M: MemoryAccess>(
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3712): Review the recorded descriptor resolution.
+    /// [`resolved_open_path`] for record/replay: the same question, asked as a
+    /// recorded `readlink("/proc/thread-self/fd/<fd>")` in the guest.
+    ///
+    /// Recorder performs the readlink and stores the target bytes; Replayer
+    /// writes the same bytes back without touching its placeholder descriptor.
+    /// Both modes therefore see the recording's answer, so they classify the
+    /// descriptor alike and agree on whether its reads come from a procfs
+    /// snapshot. `thread-self` names the opening thread's own descriptor
+    /// table, which a thread cloned without CLONE_FILES does not share with
+    /// its leader.
+    ///
+    /// `None` when the readlink fails, when its target is not absolute (an
+    /// anonymous or deleted object), when the target fills the buffer (it may
+    /// be truncated, and every path `ProcfsFile::from_path` recognizes is far
+    /// shorter), or when the guest stack has no room for the scratch buffers.
+    /// Each of these depends only on guest state and on the recorded result,
+    /// so record and replay reach the same answer.
+    async fn recorded_open_path<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<Option<PathBuf>, Error> {
+        const TARGET_CAPACITY: usize = 256;
+        let link = format!("/proc/thread-self/fd/{fd}");
+        let mut link_buffer = [0_u8; 40];
+        assert!(link.len() < link_buffer.len());
+        link_buffer[..link.len()].copy_from_slice(link.as_bytes());
+
+        let mut stack = guest.stack().await;
+        let link_address = stack.push(link_buffer).cast::<libc::c_char>();
+        let target = stack
+            .reserve::<[u8; TARGET_CAPACITY]>()
+            .cast::<libc::c_char>();
+        let Ok(stack_guard) = stack.commit() else {
+            return Ok(None);
+        };
+        let call = syscalls::Readlink::new()
+            .with_path(PathPtr::from_ptr(
+                link_address.as_raw() as *const libc::c_char
+            ))
+            .with_buf(Some(target))
+            .with_bufsize(TARGET_CAPACITY);
+        let resolved = match self.record_or_replay(guest, call).await {
+            Ok(length) => {
+                let length =
+                    usize::try_from(length).expect("a successful readlink result must fit usize");
+                if length >= TARGET_CAPACITY {
+                    None
+                } else {
+                    let mut bytes = vec![0; length];
+                    guest.memory().read_exact(target.cast::<u8>(), &mut bytes)?;
+                    Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+                }
+            }
+            Err(_) => None,
+        };
+        drop(stack_guard);
+        Ok(resolved.filter(|path| path.is_absolute()))
+    }
+
     async fn observe_timer_slack_identity<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1284,8 +1453,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let fd = fd as RawFd;
                 // Under a network trace mode only; the run ends before the
                 // guest sees the descriptor.
-                let pid = guest.pid().as_raw();
-                self.network_check_open(guest, &observed_path, || resolved_open_path(pid, fd))
+                let tid = guest.tid().as_raw();
+                self.network_check_open(guest, &observed_path, || resolved_open_path(tid, fd))
                     .await;
                 let fd_type = path.to_str().map_or(FdType::Regular, |fname| {
                     if fname == "/dev/random" || fname == "/dev/urandom" {
@@ -1365,14 +1534,28 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // Only when the spelling yields nothing do we ask the kernel
                 // what the descriptor actually names. That is exactly the
                 // AT_FDCWD/alias gap -- `chdir("/sys/module/kvm"); open("refcnt")`
-                // classifies as nothing lexically -- and scoping it this way
-                // makes the fallback MONOTONE: it can only add a classification
-                // where there was none, never change one that already existed.
-                let mut procfs = ProcfsFile::from_path(&observed_path).or_else(|| {
-                    resolved_open_path(guest.pid().as_raw(), fd)
+                // classifies as nothing lexically, and `/etc/mtab` is a symlink
+                // to `/proc/self/mounts` -- and scoping it this way makes the
+                // fallback MONOTONE: it can only add a classification where
+                // there was none, never change one that already existed.
+                //
+                // Under record/replay the answer must come from the recording:
+                // Replayer's descriptor is a placeholder, so a host lookup in
+                // replay names an eventfd and classifies nothing, while the
+                // recording classified the procfs file and captured its
+                // snapshot reads. See `recorded_open_path`.
+                let mut procfs = ProcfsFile::from_path(&observed_path);
+                if procfs.is_none() {
+                    let resolved = if self.cfg.recordreplay_modes {
+                        self.recorded_open_path(guest, fd).await?
+                    } else {
+                        // The opening thread's table: see `resolved_open_path`.
+                        resolved_open_path(guest.tid().as_raw(), fd)
+                    };
+                    procfs = resolved
                         .filter(|resolved| resolved != &observed_path)
-                        .and_then(|resolved| ProcfsFile::from_path(&resolved))
-                });
+                        .and_then(|resolved| ProcfsFile::from_path(&resolved));
+                }
                 if procfs
                     .as_ref()
                     .is_some_and(ProcfsFile::needs_bound_thread_identity)
@@ -1787,11 +1970,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         // runtime state, not part of that namespace; exclude the class at
         // capture so snapshot identity assignment and every later read agree
         // on the same membership.
+        //
+        // `/proc/<pid>/mounts` lists the same mounts in another grammar, so its
+        // capture drops the same class
+        // (https://github.com/rrnewton/hermit/issues/3719).
+        let needs_mounts_rewrites = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_needs_mounts_rewrites())?;
         let contents = if guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_needs_mountinfo_identities())?
         {
             crate::procfs::exclude_ephemeral_host_seed_mounts(&raw_contents)
+        } else if needs_mounts_rewrites {
+            crate::procfs::exclude_ephemeral_host_seed_rows_from_mounts_file(&raw_contents)
         } else {
             raw_contents
         };
@@ -2077,12 +2269,38 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
+        // The mount points of a `mounts` snapshot take the proven prefix
+        // rewrites mountinfo applies to its field 5, from the same
+        // configuration and with the same duplicate and malformed-pair
+        // refusals, so both files name a mount below Hermit's private `/tmp`
+        // by its guest path rather than by the per-run staging directory.
+        let mounts_mountpoint_rewrites = if needs_mounts_rewrites {
+            let mut by_mount_id = BTreeMap::new();
+            for rewrite in &guest.config().mountinfo_root_rewrites {
+                if by_mount_id.insert(rewrite.raw_mount_id, rewrite).is_some() {
+                    return Err(Error::Tool(anyhow::anyhow!(
+                        "duplicate proven mountinfo root rewrite for mount ID {}",
+                        rewrite.raw_mount_id
+                    )));
+                }
+            }
+            crate::procfs::proven_mountpoint_prefix_rewrites(by_mount_id.into_values()).ok_or_else(
+                || {
+                    Error::Tool(anyhow::anyhow!(
+                        "a proven mount-point prefix rewrite is malformed"
+                    ))
+                },
+            )?
+        } else {
+            Vec::new()
+        };
         guest.thread_state().with_detfd(call.fd(), |detfd| {
             detfd.initialize_procfs(
                 contents.clone(),
                 ProcfsSnapshotContext {
                     mapping_identities: mapping_identities.clone(),
                     mountinfo: mountinfo.clone(),
+                    mounts_mountpoint_rewrites: mounts_mountpoint_rewrites.clone(),
                     virtual_uptime_seconds,
                     virtual_boot_time_seconds,
                     virtual_realtime_seconds,
@@ -2117,7 +2335,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // Replay reserves random-device fd slots with eventfds. A
                 // physical zero-length read of that placeholder returns EINVAL
                 // even though the logical random-device read must return zero.
-                require_random_device_read_access(status_flags)?;
+                require_read_access(status_flags)?;
                 let policy = crate::iovecs::UserAddressPolicy::for_backend(
                     guest.config().backend.user_address_limit,
                 );
@@ -2137,6 +2355,25 @@ impl<T: RecordOrReplay> Detcore<T> {
             // TODO-HUMAN-REVIEW(PR-3601)
             return self
                 .record_or_replay_preserving_tool_errors(guest, call)
+                .await;
+        }
+
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-3712): A seq_file snapshot captures without
+        // touching the caller's buffer and moves the position only by the
+        // bytes actually copied.
+        if guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_serves_seq_file_snapshot())?
+        {
+            return self
+                .read_seq_file_snapshot(
+                    guest,
+                    call.fd(),
+                    call.buf().map_or(0, |address| address.as_raw()),
+                    call.len(),
+                    None,
+                )
                 .await;
         }
 
@@ -2186,7 +2423,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let status_flags = random_device.status_flags();
                 random_device
                     .with_random_device_stream(|offset| {
-                        require_random_device_read_access(status_flags)?;
+                        require_read_access(status_flags)?;
                         let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
                         self.fill_random_device_bytes(guest, remote_buf, call.len(), offset)
                     })
@@ -2248,6 +2485,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let offset = usize::try_from(call.offset()).map_err(|_| Errno::EINVAL)?;
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-3712): As for read, after ksys_pread64's
+        // negative-position EINVAL, which precedes the descriptor lookup.
+        if guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_serves_seq_file_snapshot())?
+        {
+            return self
+                .read_seq_file_snapshot(
+                    guest,
+                    call.fd(),
+                    call.buf().map_or(0, |address| address.as_raw()),
+                    call.len(),
+                    Some(offset as u64),
+                )
+                .await;
+        }
         let needs_procfs_snapshot = guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_needs_snapshot())?;
@@ -2311,17 +2565,25 @@ impl<T: RecordOrReplay> Detcore<T> {
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.directory_lock())?;
         let _seeking = directory_lock.lock().await;
-        let (fd_type, status_flags, procfs_position, resource, directory_stream, host_order) =
-            guest.thread_state().with_detfd(call.fd(), |detfd| {
-                (
-                    detfd.ty(),
-                    detfd.status_flags(),
-                    detfd.procfs_position(),
-                    detfd.resource(),
-                    detfd.has_directory_stream(),
-                    detfd.directory_in_host_order(),
-                )
-            })?;
+        let (
+            fd_type,
+            status_flags,
+            procfs_position,
+            seq_file_snapshot,
+            resource,
+            directory_stream,
+            host_order,
+        ) = guest.thread_state().with_detfd(call.fd(), |detfd| {
+            (
+                detfd.ty(),
+                detfd.status_flags(),
+                detfd.procfs_position(),
+                detfd.procfs_serves_seq_file_snapshot(),
+                detfd.resource(),
+                detfd.has_directory_stream(),
+                detfd.directory_in_host_order(),
+            )
+        })?;
         if fd_type == FdType::Rng {
             return random_device_lseek_result(status_flags, call.whence()).map_err(Into::into);
         }
@@ -2386,6 +2648,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             return Ok(position);
         };
+
+        if seq_file_snapshot {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-3712): The whole seek is virtual, before
+            // and after capture, and the host descriptor is never sought.
+            // Under replay that descriptor is a placeholder whose own seek
+            // answers differently, and the capture rewinds the real one
+            // before reading, so the virtual position is the only one the
+            // guest can observe. Nothing is recorded: the result is a pure
+            // function of the arguments and the virtual position, which
+            // record and replay share.
+            let position =
+                seq_file_snapshot_seek(status_flags, current, call.offset(), call.whence())?;
+            guest
+                .thread_state()
+                .with_detfd(call.fd(), |detfd| detfd.set_procfs_offset(position))?;
+            return Ok(position as i64);
+        }
 
         if let Some(binding) = timer_slack_binding {
             // Linux exposes this file through seq_lseek, which accepts only
@@ -2921,16 +3201,200 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.handle_readv_with_output(guest, call, &mut None).await
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3712)
+    /// Capture the snapshot of a procfs open file served as a seq_file (see
+    /// `ProcfsFile::serves_seq_file_snapshot`) without touching any caller
+    /// destination.
+    ///
+    /// The capture reads through a scratch buffer on the guest stack, so a
+    /// caller buffer that is inaccessible, or that the requested position
+    /// leaves unused, plays no part, and no raw host byte is left in caller
+    /// memory. The scratch is zeroed before it is released so raw host bytes
+    /// do not remain below the guest stack pointer either; the scratch
+    /// address, like every guest-stack scratch address, depends only on guest
+    /// state, so record and replay read through the same address.
+    ///
+    /// Cost: one recorded read per `SCRATCH` bytes of the host table plus the
+    /// final empty read, where a capture through the caller's buffer took
+    /// one per buffer length.
+    ///
+    /// When the stack has no room for the scratch (every current backend has
+    /// at least 896 bytes on a fresh stack), the capture falls back to the
+    /// older behavior of reading through the first nonempty caller vector;
+    /// with none, the capture fails with `EFAULT`.
+    async fn capture_seq_file_snapshot<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        fallback: &[crate::iovecs::ImportedIovec],
+    ) -> Result<(), Error> {
+        const SCRATCH: usize = 512;
+        let mut stack = guest.stack().await;
+        if stack.capacity().saturating_sub(stack.size()) >= SCRATCH {
+            let scratch = stack.reserve::<[u8; SCRATCH]>().cast::<u8>();
+            if let Ok(stack_guard) = stack.commit() {
+                let read = syscalls::Read::new()
+                    .with_fd(fd)
+                    .with_buf(Some(scratch))
+                    .with_len(SCRATCH);
+                let captured = self.initialize_procfs_snapshot(guest, read).await;
+                let cleared = guest.memory().write_exact(scratch, &[0; SCRATCH]);
+                drop(stack_guard);
+                captured?;
+                cleared?;
+                return Ok(());
+            }
+        } else {
+            drop(stack);
+        }
+        let read = match fallback.iter().find(|iov| iov.len > 0) {
+            Some(iov) => syscalls::Read::new()
+                .with_fd(fd)
+                .with_buf(AddrMut::from_raw(iov.base))
+                .with_len(iov.len),
+            None => syscalls::Read::new().with_fd(fd).with_buf(None).with_len(0),
+        };
+        self.initialize_procfs_snapshot(guest, read).await
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3712)
+    /// Serve a read of a procfs open file served as a seq_file from its
+    /// snapshot, after the caller has made `vfs_read`'s or `vfs_readv`'s
+    /// access and import checks.
+    ///
+    /// The order is the rest of Linux's: a zero total returns zero before
+    /// any position or flag check, `rw_verify_area`'s position-plus-length
+    /// overflow is `EINVAL`, then `kiocb_set_rw_flags` for a description
+    /// without `FMODE_NOWAIT`. The snapshot is captured only then, and
+    /// independently of the destinations (`capture_seq_file_snapshot`).
+    /// Bytes are copied as `seq_read_iter` copies them: up to the first
+    /// fault, `EFAULT` only when nothing was copied. A sequential read
+    /// (`offset` is `None`) moves the shared position by exactly the bytes
+    /// copied, so a faulting read leaves it unchanged; a positioned read
+    /// never moves it.
+    async fn serve_seq_file_snapshot<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        iovecs: &[crate::iovecs::ImportedIovec],
+        offset: Option<u64>,
+        flags: i32,
+    ) -> Result<i64, Error> {
+        let total = iovecs
+            .iter()
+            .try_fold(0_usize, |sum, iov| sum.checked_add(iov.len))
+            .ok_or(Errno::EINVAL)?;
+        if total == 0 {
+            return Ok(0);
+        }
+        let position = match offset {
+            Some(offset) => offset,
+            None => guest
+                .thread_state()
+                .with_detfd(fd, |detfd| {
+                    detfd.procfs_position().map(|(offset, _)| offset)
+                })?
+                .expect("a procfs descriptor has a shared cursor") as u64,
+        };
+        validate_vector_read(Some(position), total, flags, false)?;
+
+        let needs_procfs_snapshot = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.procfs_needs_snapshot())?;
+        if needs_procfs_snapshot {
+            self.capture_seq_file_snapshot(guest, fd, iovecs).await?;
+        }
+
+        // `rw_verify_area` bounded `position + total` by `i64::MAX`. The copy
+        // itself is capped at MAX_RW_COUNT, as Linux caps it after the checks.
+        let start = usize::try_from(position).map_err(|_| Errno::EINVAL)?;
+        let wanted = total.min(crate::iovecs::MAX_RW_COUNT);
+        let bytes = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.take_procfs_at(start, wanted))?
+            .expect("the procfs snapshot was initialized above");
+        let copied = scatter_procfs_bytes(&mut guest.memory(), iovecs, &bytes)?;
+        if offset.is_none() && copied > 0 {
+            guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.set_procfs_offset(start + copied))?;
+        }
+        Ok(copied as i64)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3712)
+    /// read and pread64 of a procfs open file served as a seq_file, in
+    /// `vfs_read`'s order: the `FMODE_READ` check (`O_PATH` or write-only is
+    /// `EBADF`), `access_ok` over the whole uncapped count, then
+    /// `serve_seq_file_snapshot`. A NULL buffer passes `access_ok` and faults
+    /// only when a byte is stored, as natively.
+    async fn read_seq_file_snapshot<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        buf: usize,
+        len: usize,
+        offset: Option<u64>,
+    ) -> Result<i64, Error> {
+        let status_flags = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.status_flags())?;
+        require_read_access(status_flags)?;
+        crate::iovecs::UserAddressPolicy::for_backend(guest.config().backend.user_address_limit)
+            .validate_buffer(buf, len)?;
+        self.serve_seq_file_snapshot(
+            guest,
+            fd,
+            &[crate::iovecs::ImportedIovec { base: buf, len }],
+            offset,
+            0,
+        )
+        .await
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3712)
+    /// readv, preadv and preadv2 of a procfs open file served as a seq_file
+    /// (`/proc/<pid>/mounts`; see `ProcfsFile::serves_seq_file_snapshot`), in
+    /// `vfs_readv`'s order: the `FMODE_READ` check, the import of the whole
+    /// vector array (which caps the lengths at MAX_RW_COUNT), then
+    /// `serve_seq_file_snapshot`.
+    async fn read_procfs_vectors<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        request: VectoredRead,
+    ) -> Result<i64, Error> {
+        let status_flags = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.status_flags())?;
+        require_read_access(status_flags)?;
+        let policy = crate::iovecs::UserAddressPolicy::for_backend(
+            guest.config().backend.user_address_limit,
+        );
+        let iovecs = crate::iovecs::import_read_iovecs(
+            &guest.memory(),
+            request.address,
+            request.count,
+            policy,
+        )?;
+        self.serve_seq_file_snapshot(guest, fd, &iovecs, request.offset, request.flags)
+            .await
+    }
+
     /// Import after the resource wait and retain that geometry through copyout.
     /// The shared-cursor closure is synchronous and takes no metadata locks.
     fn read_random_vectors<G: Guest<Self>>(
         &self,
         guest: &mut G,
         detfd: &DetFd,
-        request: RandomVectoredRead,
+        request: VectoredRead,
         rng_output: &mut Option<Vec<crate::io_buffers::BufferExtent>>,
     ) -> Result<i64, Error> {
-        require_random_device_read_access(detfd.status_flags())?;
+        require_read_access(detfd.status_flags())?;
         let policy = crate::iovecs::UserAddressPolicy::for_backend(
             guest.config().backend.user_address_limit,
         );
@@ -2941,7 +3405,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             policy,
         )?;
         let total = iovecs.iter().map(|iov| iov.len).sum();
-        validate_random_vector_read(request.offset, total, request.flags)?;
+        validate_vector_read(request.offset, total, request.flags, true)?;
         let written = if let Some(offset) = request.offset {
             self.fill_random_device_iovecs(guest, &iovecs, offset)?
         } else {
@@ -2969,9 +3433,27 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await;
         }
 
-        let is_procfs = guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_position().is_some())?;
+        let (is_procfs, seq_file_snapshot) =
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                (
+                    detfd.procfs_position().is_some(),
+                    detfd.procfs_serves_seq_file_snapshot(),
+                )
+            })?;
+        if seq_file_snapshot {
+            return self
+                .read_procfs_vectors(
+                    guest,
+                    call.fd(),
+                    VectoredRead {
+                        address: call.iov().map_or(0, |addr| addr.as_raw()),
+                        count: call.len(),
+                        offset: None,
+                        flags: 0,
+                    },
+                )
+                .await;
+        }
         if is_procfs {
             return Err(Errno::ENOSYS.into());
         }
@@ -3004,7 +3486,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             self.read_random_vectors(
                 guest,
                 &detfd,
-                RandomVectoredRead {
+                VectoredRead {
                     address: call.iov().map_or(0, |addr| addr.as_raw()),
                     count: call.len(),
                     offset: None,
@@ -3058,9 +3540,27 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await;
         }
 
-        let is_procfs = guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_position().is_some())?;
+        let (is_procfs, seq_file_snapshot) =
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                (
+                    detfd.procfs_position().is_some(),
+                    detfd.procfs_serves_seq_file_snapshot(),
+                )
+            })?;
+        if seq_file_snapshot {
+            return self
+                .read_procfs_vectors(
+                    guest,
+                    call.fd(),
+                    VectoredRead {
+                        address: call.iov().map_or(0, |addr| addr.as_raw()),
+                        count: call.iov_len(),
+                        offset: Some(offset as u64),
+                        flags: 0,
+                    },
+                )
+                .await;
+        }
         if is_procfs {
             return Err(Errno::ENOSYS.into());
         }
@@ -3078,7 +3578,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             self.read_random_vectors(
                 guest,
                 &detfd,
-                RandomVectoredRead {
+                VectoredRead {
                     address: call.iov().map_or(0, |addr| addr.as_raw()),
                     count: call.iov_len(),
                     offset: Some(offset as u64),
@@ -3130,9 +3630,27 @@ impl<T: RecordOrReplay> Detcore<T> {
             };
         }
 
-        let is_procfs = guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_position().is_some())?;
+        let (is_procfs, seq_file_snapshot) =
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                (
+                    detfd.procfs_position().is_some(),
+                    detfd.procfs_serves_seq_file_snapshot(),
+                )
+            })?;
+        if seq_file_snapshot {
+            return self
+                .read_procfs_vectors(
+                    guest,
+                    call.fd(),
+                    VectoredRead {
+                        address: call.iov().map_or(0, |addr| addr.as_raw()),
+                        count: call.iov_len() as usize,
+                        offset: (offset != -1).then_some(offset as u64),
+                        flags: call.flags(),
+                    },
+                )
+                .await;
+        }
         if is_procfs {
             return Err(Errno::ENOSYS.into());
         }
@@ -3150,7 +3668,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             self.read_random_vectors(
                 guest,
                 &detfd,
-                RandomVectoredRead {
+                VectoredRead {
                     address: call.iov().map_or(0, |addr| addr.as_raw()),
                     count: call.iov_len() as usize,
                     offset: (offset != -1).then_some(offset as u64),
@@ -6170,6 +6688,23 @@ mod procfs_wiring_guard {
              the files that carry mountinfo identities (`let contents = if ... \
              procfs_needs_mountinfo_identities()`); found {gate:?}"
         );
+        let mounts_capture = body
+            .find("exclude_ephemeral_host_seed_rows_from_mounts_file(&raw_contents)")
+            .expect(
+                "MISSING MECHANISM: the guest read's `/proc/<pid>/mounts` capture is no \
+                 longer filtered for host seed rows \
+                 (https://github.com/rrnewton/hermit/issues/3719)",
+            );
+        let mounts_gate = body[guest_capture..mounts_capture]
+            .rfind("else if")
+            .map(|start| &body[guest_capture + start..mounts_capture])
+            .unwrap_or_default();
+        assert!(
+            mounts_gate.contains("needs_mounts_rewrites"),
+            "MISSING MECHANISM: the mounts seed filter must apply exactly to the \
+             `/proc/<pid>/mounts` files (`else if needs_mounts_rewrites`); found \
+             {mounts_gate:?}"
+        );
         let fdinfo_capture = body
             .find("exclude_ephemeral_host_seed_mounts(&mountinfo_contents)")
             .expect(
@@ -6183,6 +6718,140 @@ mod procfs_wiring_guard {
             fdinfo_capture < parse,
             "MISSING MECHANISM: the fdinfo mnt_id capture parses mountinfo before \
              dropping host seed rows"
+        );
+    }
+
+    /// readv, preadv and preadv2 of a `/proc/<pid>/mounts` snapshot must
+    /// reach the vectored snapshot reader before the procfs ENOSYS refusal,
+    /// and that reader must capture through the shared initializer.
+    #[test]
+    fn vectored_reads_of_mounts_use_the_shared_snapshot() {
+        let reader = handler_body("read_procfs_vectors");
+        assert!(
+            reader.contains("import_read_iovecs(")
+                && reader.contains("self.serve_seq_file_snapshot("),
+            "MISSING MECHANISM: read_procfs_vectors no longer imports the vector \
+             array and serves it from the seq_file snapshot"
+        );
+        let serve = handler_body("serve_seq_file_snapshot");
+        let capture_call = serve
+            .find("self.capture_seq_file_snapshot(")
+            .expect("MISSING MECHANISM: serve_seq_file_snapshot no longer captures");
+        let take = serve
+            .find("take_procfs_at(")
+            .expect("MISSING MECHANISM: serve_seq_file_snapshot no longer reads the snapshot");
+        let scatter = serve
+            .find("scatter_procfs_bytes(")
+            .expect("MISSING MECHANISM: serve_seq_file_snapshot no longer scatters");
+        assert!(
+            serve.contains("procfs_needs_snapshot") && capture_call < take && take < scatter,
+            "MISSING MECHANISM: serve_seq_file_snapshot must capture (when the snapshot \
+             is missing), then read the snapshot, then copy it out"
+        );
+        let capture = handler_body("capture_seq_file_snapshot");
+        assert!(
+            capture.contains("self.initialize_procfs_snapshot(")
+                && capture.contains("stack.commit()")
+                && capture.contains("write_exact(scratch, &[0; SCRATCH])"),
+            "MISSING MECHANISM: capture_seq_file_snapshot must capture through the shared \
+             initializer into a guest-stack scratch that it zeroes afterwards"
+        );
+        for handler in [
+            "handle_readv_with_output",
+            "handle_preadv_with_output",
+            "handle_preadv2_with_output",
+        ] {
+            let body = handler_body(handler);
+            let dispatch = body.find(".read_procfs_vectors(").unwrap_or_else(|| {
+                panic!("MISSING MECHANISM: `{handler}` does not call read_procfs_vectors")
+            });
+            let refusal = body
+                .find("return Err(Errno::ENOSYS.into())")
+                .unwrap_or_else(|| panic!("`{handler}` lost its procfs ENOSYS refusal"));
+            assert!(
+                body.contains("procfs_serves_seq_file_snapshot()") && dispatch < refusal,
+                "MISSING MECHANISM: `{handler}` must send snapshots that serve vectored \
+                 reads to read_procfs_vectors before refusing other procfs kinds"
+            );
+        }
+    }
+
+    /// read and pread64 of a seq_file snapshot must reach the seq_file reader
+    /// before the generic procfs path, whose capture reads through the
+    /// caller's buffer and whose cursor moves before the copy-out
+    /// (round-9 findings F9-5 and F9-6 on
+    /// https://github.com/rrnewton/hermit/issues/3712).
+    #[test]
+    fn scalar_reads_of_mounts_use_the_seq_file_reader() {
+        for (handler, offset) in [("handle_read", "None,"), ("handle_pread64", "Some(offset")] {
+            let body = handler_body(handler);
+            let gate = body
+                .find("procfs_serves_seq_file_snapshot()")
+                .unwrap_or_else(|| panic!("MISSING MECHANISM: `{handler}` lost its gate"));
+            let dispatch = body.find(".read_seq_file_snapshot(").unwrap_or_else(|| {
+                panic!("MISSING MECHANISM: `{handler}` does not call read_seq_file_snapshot")
+            });
+            let generic = body
+                .find("procfs_needs_snapshot")
+                .unwrap_or_else(|| panic!("`{handler}` lost its generic procfs path"));
+            assert!(
+                gate < dispatch && dispatch < generic && body[dispatch..generic].contains(offset),
+                "MISSING MECHANISM: `{handler}` must send seq_file snapshots to \
+                 read_seq_file_snapshot (offset `{offset}`) before the generic procfs path"
+            );
+        }
+        let reader = handler_body("read_seq_file_snapshot");
+        let access = reader
+            .find("require_read_access(")
+            .expect("lost FMODE_READ check");
+        let validate = reader
+            .find(".validate_buffer(")
+            .expect("lost access_ok check");
+        let serve = reader
+            .find("self.serve_seq_file_snapshot(")
+            .expect("lost serve");
+        assert!(
+            access < validate && validate < serve,
+            "MISSING MECHANISM: read_seq_file_snapshot must check read access, then the \
+             whole buffer, then serve"
+        );
+    }
+
+    /// Every lseek of a seq_file snapshot is virtual: the branch must come
+    /// before the pre-capture host seek and the post-capture SEEK_END,
+    /// SEEK_DATA and SEEK_HOLE arms (round-9 findings F9-2 and F9-7 on
+    /// https://github.com/rrnewton/hermit/issues/3712).
+    #[test]
+    fn lseek_of_mounts_never_reaches_the_host_or_the_regular_file_arms() {
+        let body = handler_body("handle_lseek");
+        let virtual_seek = body
+            .find("seq_file_snapshot_seek(")
+            .expect("MISSING MECHANISM: handle_lseek no longer seeks seq_file snapshots virtually");
+        let host_seek = body
+            .find("guest.inject(Syscall::from(call))")
+            .expect("handle_lseek lost its pre-capture host seek");
+        let seek_end = body
+            .find("Whence::SEEK_END =>")
+            .expect("handle_lseek lost its regular-file SEEK_END arm");
+        assert!(
+            virtual_seek < host_seek && virtual_seek < seek_end,
+            "MISSING MECHANISM: handle_lseek must answer seq_file snapshots before the \
+             host seek and the SEEK_END/SEEK_DATA/SEEK_HOLE arms"
+        );
+    }
+
+    /// The alias fallback must read the opening thread's descriptor table
+    /// (round-9 finding F9-4 on https://github.com/rrnewton/hermit/issues/3712).
+    #[test]
+    fn open_alias_resolution_reads_the_opening_threads_table() {
+        let body = handler_body("handle_openat");
+        assert!(
+            body.contains("resolved_open_path(guest.tid().as_raw(), fd)")
+                && body.contains("let tid = guest.tid().as_raw();")
+                && !body.contains("resolved_open_path(guest.pid()")
+                && !body.contains("resolved_open_path(pid"),
+            "MISSING MECHANISM: handle_openat must resolve descriptors through the opening \
+             thread (`guest.tid()`), whose table may differ from its leader's"
         );
     }
 
@@ -6266,6 +6935,7 @@ mod test {
     use super::parse_timer_slack_write;
     use super::pipe_capacity_failure;
     use super::random_device_lseek_result;
+    use super::seq_file_snapshot_seek;
     use super::should_tag_host_timed_internal_pipe_io;
     use super::unix_autobind_address;
     use super::unix_autobind_addrlen;
@@ -6411,6 +7081,56 @@ mod test {
             random_device_lseek_result(OFlag::O_PATH.bits(), Whence::from_raw(99)),
             Err(Errno::EBADF)
         );
+    }
+
+    /// seq_lseek semantics for a seq_file snapshot (round-9 findings F9-2 and
+    /// F9-7 on https://github.com/rrnewton/hermit/issues/3712): `O_PATH` is
+    /// `EBADF` before anything else, only SEEK_SET and SEEK_CUR are accepted,
+    /// a negative or unrepresentable result is `EINVAL`, and a position past
+    /// the end is accepted because `traverse` past EOF succeeds.
+    #[test]
+    fn seq_file_snapshot_seek_matches_linux_seq_lseek() {
+        /// Status flags, current position, offset, whence, and the result.
+        type SeekCase = (i32, usize, i64, Whence, Result<usize, Errno>);
+        let rd = OFlag::empty().bits();
+        let cases: [SeekCase; 14] = [
+            (rd, 0, 5, Whence::SEEK_SET, Ok(5)),
+            (rd, 7, 0, Whence::SEEK_SET, Ok(0)),
+            (rd, 7, 3, Whence::SEEK_CUR, Ok(10)),
+            (rd, 7, -7, Whence::SEEK_CUR, Ok(0)),
+            (rd, 7, -8, Whence::SEEK_CUR, Err(Errno::EINVAL)),
+            (rd, 0, -1, Whence::SEEK_SET, Err(Errno::EINVAL)),
+            (rd, 0, 1 << 40, Whence::SEEK_SET, Ok(1 << 40)),
+            (rd, 1, i64::MAX, Whence::SEEK_CUR, Err(Errno::EINVAL)),
+            (rd, 0, i64::MAX, Whence::SEEK_CUR, Ok(i64::MAX as usize)),
+            (rd, 3, 0, Whence::SEEK_END, Err(Errno::EINVAL)),
+            (rd, 3, 0, Whence::SEEK_DATA, Err(Errno::EINVAL)),
+            (rd, 3, 0, Whence::SEEK_HOLE, Err(Errno::EINVAL)),
+            (rd, 3, 0, Whence::from_raw(99), Err(Errno::EINVAL)),
+            (
+                OFlag::O_PATH.bits(),
+                0,
+                0,
+                Whence::SEEK_SET,
+                Err(Errno::EBADF),
+            ),
+        ];
+        for (status_flags, current, offset, whence, expected) in cases {
+            assert_eq!(
+                seq_file_snapshot_seek(status_flags, current, offset, whence),
+                expected,
+                "flags {status_flags:#x} current {current} offset {offset} whence {whence:?}"
+            );
+        }
+        // O_PATH wins over an invalid whence, as fdget_pos precedes seq_lseek.
+        assert_eq!(
+            seq_file_snapshot_seek(OFlag::O_PATH.bits(), 0, -1, Whence::from_raw(99)),
+            Err(Errno::EBADF)
+        );
+        // Write-only and read-write descriptions seek like read-only ones.
+        for flags in [OFlag::O_WRONLY.bits(), OFlag::O_RDWR.bits()] {
+            assert_eq!(seq_file_snapshot_seek(flags, 2, 2, Whence::SEEK_CUR), Ok(4));
+        }
     }
 
     #[test]
@@ -6915,6 +7635,308 @@ mod test {
     }
 }
 
+#[cfg(test)]
+mod procfs_vector_tests {
+    //! readv, preadv and preadv2 of a `/proc/<pid>/mounts` snapshot: the
+    //! argument checks and the copy, against Linux 7.1 measurements.
+
+    use reverie::Error;
+    use reverie::syscalls::AddrMut;
+    use reverie::syscalls::Errno;
+    use reverie::syscalls::LocalMemory;
+    use reverie::syscalls::MemoryAccess;
+
+    use super::scatter_procfs_bytes;
+    use super::validate_vector_read;
+    use crate::iovecs::ImportedIovec;
+    use crate::test_pages::PAGE;
+    use crate::test_pages::Pages;
+
+    const RW: libc::c_int = libc::PROT_READ | libc::PROT_WRITE;
+    // Linux 7.1's RWF_NOSIGNAL, newer than the pinned libc crate.
+    const RWF_NOSIGNAL: i32 = 0x100;
+    const UNKNOWN: i32 = 0x200;
+
+    /// `preadv2` flags on `/proc/self/mounts`, `/proc/mounts` and `/etc/mtab`
+    /// as measured natively on Linux 7.1 with a 16-byte vector at offset 0.
+    /// The description has a `read_iter` but no `FMODE_NOWAIT`.
+    const MOUNTS_FLAGS: [(i32, Result<(), Errno>); 17] = [
+        (0, Ok(())),
+        (libc::RWF_HIPRI, Ok(())),
+        (libc::RWF_DSYNC, Ok(())),
+        (libc::RWF_SYNC, Ok(())),
+        (libc::RWF_APPEND, Ok(())),
+        (libc::RWF_NOAPPEND, Ok(())),
+        (RWF_NOSIGNAL, Ok(())),
+        (libc::RWF_NOWAIT, Err(Errno::EOPNOTSUPP)),
+        (libc::RWF_ATOMIC, Err(Errno::EOPNOTSUPP)),
+        (libc::RWF_DONTCACHE, Err(Errno::EOPNOTSUPP)),
+        (UNKNOWN, Err(Errno::EOPNOTSUPP)),
+        (libc::RWF_APPEND | libc::RWF_NOAPPEND, Err(Errno::EINVAL)),
+        (
+            libc::RWF_ATOMIC | libc::RWF_APPEND | libc::RWF_NOAPPEND,
+            Err(Errno::EINVAL),
+        ),
+        (
+            libc::RWF_NOWAIT | libc::RWF_APPEND | libc::RWF_NOAPPEND,
+            Err(Errno::EINVAL),
+        ),
+        (
+            UNKNOWN | libc::RWF_APPEND | libc::RWF_NOAPPEND,
+            Err(Errno::EOPNOTSUPP),
+        ),
+        (libc::RWF_NOWAIT | libc::RWF_ATOMIC, Err(Errno::EOPNOTSUPP)),
+        (
+            libc::RWF_NOWAIT | libc::RWF_DONTCACHE,
+            Err(Errno::EOPNOTSUPP),
+        ),
+    ];
+
+    #[test]
+    fn mounts_vector_flags_match_linux() {
+        for (flags, expected) in MOUNTS_FLAGS {
+            assert_eq!(
+                validate_vector_read(Some(0), 16, flags, false),
+                expected,
+                "flags {flags:#x}"
+            );
+        }
+    }
+
+    /// A zero total returns zero before position or flag checks, natively
+    /// even with an unknown flag.
+    #[test]
+    fn a_zero_total_skips_position_and_flag_checks() {
+        for (flags, _) in MOUNTS_FLAGS {
+            assert_eq!(
+                validate_vector_read(Some(i64::MAX as u64), 0, flags, false),
+                Ok(())
+            );
+        }
+    }
+
+    /// `rw_verify_area` refuses a position whose end passes `i64::MAX`
+    /// (measured: offsets `i64::MAX` and `i64::MAX - 1` with 16 bytes are
+    /// `EINVAL`, offset 2^40 reads zero bytes), and does so before the flag
+    /// check.
+    #[test]
+    fn a_position_past_the_file_offset_limit_is_einval_before_flags() {
+        let max = i64::MAX as u64;
+        assert_eq!(
+            validate_vector_read(Some(max), 16, 0, false),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            validate_vector_read(Some(max - 1), 16, 0, false),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(validate_vector_read(Some(max - 16), 16, 0, false), Ok(()));
+        assert_eq!(validate_vector_read(Some(1 << 40), 16, 0, false), Ok(()));
+        assert_eq!(
+            validate_vector_read(Some(max), 16, UNKNOWN, false),
+            Err(Errno::EINVAL)
+        );
+    }
+
+    /// Random-device controls have `FMODE_NOWAIT`; only the seq_file
+    /// description refuses `RWF_NOWAIT`.
+    #[test]
+    fn only_the_seq_file_description_refuses_nowait() {
+        assert_eq!(
+            validate_vector_read(None, 16, libc::RWF_NOWAIT, true),
+            Ok(())
+        );
+        assert_eq!(
+            validate_vector_read(Some(0), 16, libc::RWF_NOWAIT, false),
+            Err(Errno::EOPNOTSUPP)
+        );
+    }
+
+    fn vector(pages: &Pages, offset: usize, len: usize) -> ImportedIovec {
+        ImportedIovec {
+            base: pages.address(offset).as_raw(),
+            len,
+        }
+    }
+
+    fn snapshot(len: usize) -> Vec<u8> {
+        (0..len).map(|index| b'a' + (index % 26) as u8).collect()
+    }
+
+    /// Bytes go through the vectors in order, empty vectors (even with a
+    /// null base) are skipped, and a total beyond the snapshot copies what
+    /// is left.
+    #[test]
+    fn bytes_scatter_in_vector_order() {
+        let pages = Pages::new(&[RW, RW]);
+        let bytes = snapshot(30);
+        let vectors = [
+            vector(&pages, 100, 7),
+            ImportedIovec { base: 0, len: 0 },
+            vector(&pages, PAGE + 50, 0),
+            vector(&pages, PAGE + 200, 40),
+        ];
+        let copied = scatter_procfs_bytes(&mut LocalMemory::new(), &vectors, &bytes).unwrap();
+        assert_eq!(copied, 30);
+        let contents = pages.contents();
+        assert_eq!(&contents[100..107], &bytes[..7]);
+        assert_eq!(&contents[PAGE + 200..PAGE + 223], &bytes[7..]);
+        assert!(
+            contents[PAGE + 223..]
+                .iter()
+                .all(|&byte| byte == Pages::FILL)
+        );
+        assert!(contents[..100].iter().all(|&byte| byte == Pages::FILL));
+    }
+
+    /// Measured natively: a vector whose last 10 bytes run into an unmapped
+    /// page returns 10 and leaves the next vector alone; so does a good
+    /// vector followed by a bad one.
+    #[test]
+    fn a_fault_after_the_first_byte_returns_the_copied_prefix() {
+        let bytes = snapshot(64);
+        let pages = Pages::new(&[RW, libc::PROT_NONE, RW]);
+        let straddle = [vector(&pages, PAGE - 10, 20), vector(&pages, 2 * PAGE, 10)];
+        let copied = scatter_procfs_bytes(&mut LocalMemory::new(), &straddle, &bytes).unwrap();
+        assert_eq!(copied, 10);
+        let contents = pages.contents();
+        assert_eq!(&contents[PAGE - 10..PAGE], &bytes[..10]);
+        assert!(contents[2 * PAGE..].iter().all(|&byte| byte == Pages::FILL));
+
+        let pages = Pages::new(&[RW, libc::PROT_NONE]);
+        let good_then_bad = [vector(&pages, 0, 10), vector(&pages, PAGE, 10)];
+        let copied = scatter_procfs_bytes(&mut LocalMemory::new(), &good_then_bad, &bytes).unwrap();
+        assert_eq!(copied, 10);
+        assert_eq!(&pages.contents()[..10], &bytes[..10]);
+    }
+
+    /// Measured natively: a first byte in an unmapped or read-only page is
+    /// `EFAULT` with nothing copied. The copy honours page protection, where
+    /// a debugger write would store into read-only memory.
+    #[test]
+    fn a_fault_at_the_first_byte_is_efault() {
+        let bytes = snapshot(16);
+        for protection in [libc::PROT_NONE, libc::PROT_READ] {
+            let pages = Pages::new(&[protection, RW]);
+            let vectors = [vector(&pages, 0, 8), vector(&pages, PAGE, 8)];
+            let result = scatter_procfs_bytes(&mut LocalMemory::new(), &vectors, &bytes);
+            assert!(
+                matches!(result, Err(Error::Errno(Errno::EFAULT))),
+                "protection {protection}: {result:?}"
+            );
+            assert!(
+                pages.contents().iter().all(|&byte| byte == Pages::FILL),
+                "protection {protection}: bytes changed"
+            );
+        }
+        let null = [ImportedIovec { base: 0, len: 8 }];
+        assert!(matches!(
+            scatter_procfs_bytes(&mut LocalMemory::new(), &null, &bytes),
+            Err(Error::Errno(Errno::EFAULT))
+        ));
+    }
+
+    /// At the end of the snapshot nothing is stored, so even unwritable
+    /// vectors read zero bytes, as `seq_read_iter` returns at EOF.
+    #[test]
+    fn the_end_of_the_snapshot_reads_zero_without_storing() {
+        let pages = Pages::new(&[libc::PROT_NONE]);
+        let vectors = [vector(&pages, 0, 8)];
+        assert_eq!(
+            scatter_procfs_bytes(&mut LocalMemory::new(), &vectors, &[]).unwrap(),
+            0
+        );
+    }
+
+    /// Guest memory whose user-access stores copy at most three bytes.
+    struct ShortStores(LocalMemory);
+
+    impl MemoryAccess for ShortStores {
+        fn read_vectored(
+            &self,
+            from: &[std::io::IoSlice],
+            to: &mut [std::io::IoSliceMut],
+        ) -> Result<usize, Errno> {
+            self.0.read_vectored(from, to)
+        }
+
+        fn write_vectored(
+            &mut self,
+            from: &[std::io::IoSlice],
+            to: &mut [std::io::IoSliceMut],
+        ) -> Result<usize, Errno> {
+            self.0.write_vectored(from, to)
+        }
+
+        fn write_with_user_access(
+            &mut self,
+            address: AddrMut<u8>,
+            bytes: &[u8],
+        ) -> Result<usize, Errno> {
+            self.0
+                .write_with_user_access(address, &bytes[..bytes.len().min(3)])
+        }
+    }
+
+    /// A short store count does not prove a fault, so the copy continues
+    /// from the next byte.
+    #[test]
+    fn a_short_store_is_not_a_fault() {
+        let pages = Pages::new(&[RW]);
+        let bytes = snapshot(20);
+        let vectors = [vector(&pages, 0, 8), vector(&pages, 100, 12)];
+        let copied =
+            scatter_procfs_bytes(&mut ShortStores(LocalMemory::new()), &vectors, &bytes).unwrap();
+        assert_eq!(copied, 20);
+        let contents = pages.contents();
+        assert_eq!(&contents[..8], &bytes[..8]);
+        assert_eq!(&contents[100..112], &bytes[8..]);
+    }
+
+    /// Guest memory whose user-access stores fail with one error.
+    struct FailingStores(Errno);
+
+    impl MemoryAccess for FailingStores {
+        fn read_vectored(
+            &self,
+            _: &[std::io::IoSlice],
+            _: &mut [std::io::IoSliceMut],
+        ) -> Result<usize, Errno> {
+            Err(self.0)
+        }
+
+        fn write_vectored(
+            &mut self,
+            _: &[std::io::IoSlice],
+            _: &mut [std::io::IoSliceMut],
+        ) -> Result<usize, Errno> {
+            Err(self.0)
+        }
+
+        fn write_with_user_access(&mut self, _: AddrMut<u8>, _: &[u8]) -> Result<usize, Errno> {
+            Err(self.0)
+        }
+    }
+
+    /// Only a fault is a guest errno. A vanished thread, a backend error, or
+    /// a backend without user-access stores (`ENOSYS`) fails the run instead
+    /// of reaching the guest as a read result.
+    #[test]
+    fn a_store_error_other_than_a_fault_is_a_tool_failure() {
+        let vectors = [ImportedIovec {
+            base: 16 * PAGE,
+            len: 8,
+        }];
+        for errno in [Errno::ESRCH, Errno::EIO, Errno::ENOSYS] {
+            let result = scatter_procfs_bytes(&mut FailingStores(errno), &vectors, &snapshot(8));
+            assert!(
+                matches!(&result, Err(Error::Tool(_))),
+                "{errno}: {result:?}"
+            );
+        }
+    }
+}
+
 /// `inject_fstat` and `add_fd` against a scripted guest whose "address space"
 /// is this test process, so every injected syscall runs for real on host
 /// memory and a real descriptor. Regression coverage for
@@ -6933,6 +7955,7 @@ mod inject_fstat_scratch {
     use reverie::GlobalTool;
     use reverie::Pid;
     use reverie::Tool;
+    use reverie::syscalls::FromToRaw;
     use reverie::syscalls::LocalMemory;
     use reverie::syscalls::ProtFlags;
 
@@ -7247,6 +8270,255 @@ mod inject_fstat_scratch {
         assert_eq!(recorded_inode(&guest, fd), Some(inode));
     }
 
+    /// A `/proc/<pid>/mounts` descriptor in the scripted guest, its snapshot
+    /// not yet captured.
+    fn mounts_descriptor(guest: &mut ScriptedGuest) -> RawFd {
+        let (fd, _) = open_file();
+        guest
+            .thread
+            .add_fd(fd, OFlag::O_RDONLY, FdType::Regular, None)
+            .unwrap();
+        guest
+            .thread
+            .with_detfd(fd, |detfd| {
+                detfd.set_procfs(
+                    crate::procfs::ProcfsFile::from_path(std::path::Path::new("/proc/self/mounts"))
+                        .unwrap(),
+                )
+            })
+            .unwrap();
+        fd
+    }
+
+    /// Stand in for a capture, which needs the global state this guest
+    /// refuses to reach.
+    fn capture_mounts(guest: &ScriptedGuest, fd: RawFd, contents: &[u8]) {
+        guest
+            .thread
+            .with_detfd(fd, |detfd| {
+                detfd.initialize_procfs(
+                    contents.to_vec(),
+                    crate::procfs::ProcfsSnapshotContext::default(),
+                )
+            })
+            .unwrap();
+    }
+
+    fn mounts_position(guest: &ScriptedGuest, fd: RawFd) -> usize {
+        guest
+            .thread
+            .with_detfd(fd, |detfd| detfd.procfs_position())
+            .unwrap()
+            .unwrap()
+            .0
+    }
+
+    fn errno(result: Result<i64, Error>) -> Result<i64, Errno> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(Error::Errno(errno)) => Err(errno),
+            Err(other) => panic!("expected an errno, got {other:?}"),
+        }
+    }
+
+    async fn seek(
+        tool: &Detcore,
+        guest: &mut ScriptedGuest,
+        fd: RawFd,
+        offset: i64,
+        whence: Whence,
+    ) -> Result<i64, Errno> {
+        let call = syscalls::Lseek::new()
+            .with_fd(fd)
+            .with_offset(offset)
+            .with_whence(whence);
+        errno(tool.handle_lseek(guest, call).await)
+    }
+
+    /// lseek of a mounts snapshot is answered from the virtual position,
+    /// before and after capture, with nothing injected into the guest: a
+    /// host seek would bypass record/replay (round-9 finding F9-2 on
+    /// https://github.com/rrnewton/hermit/issues/3712), and seq_lseek
+    /// refuses SEEK_END, SEEK_DATA and SEEK_HOLE at either point (F9-7).
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3712)
+    #[tokio::test]
+    async fn lseek_of_a_mounts_snapshot_never_reaches_the_host() {
+        let (tool, mut guest) = ScriptedGuest::new(true, false);
+        let fd = mounts_descriptor(&mut guest);
+        let refused = [
+            Whence::SEEK_END,
+            Whence::SEEK_DATA,
+            Whence::SEEK_HOLE,
+            Whence::from_raw(99),
+        ];
+
+        assert_eq!(
+            seek(&tool, &mut guest, fd, 5, Whence::SEEK_SET).await,
+            Ok(5)
+        );
+        for whence in refused {
+            assert_eq!(
+                seek(&tool, &mut guest, fd, 0, whence).await,
+                Err(Errno::EINVAL),
+                "{whence:?} before capture"
+            );
+        }
+        assert_eq!(
+            seek(&tool, &mut guest, fd, -6, Whence::SEEK_CUR).await,
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            seek(&tool, &mut guest, fd, -1, Whence::SEEK_SET).await,
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            mounts_position(&guest, fd),
+            5,
+            "a refused seek moved the position"
+        );
+        assert_eq!(
+            seek(&tool, &mut guest, fd, 2, Whence::SEEK_CUR).await,
+            Ok(7)
+        );
+        assert!(
+            guest
+                .thread
+                .with_detfd(fd, |detfd| detfd.procfs_needs_snapshot())
+                .unwrap(),
+            "a seek must not capture"
+        );
+
+        capture_mounts(&guest, fd, b"proc /proc proc rw 0 0\n");
+        for whence in refused {
+            assert_eq!(
+                seek(&tool, &mut guest, fd, 0, whence).await,
+                Err(Errno::EINVAL),
+                "{whence:?} after capture"
+            );
+        }
+        assert_eq!(mounts_position(&guest, fd), 7);
+        assert_eq!(
+            seek(&tool, &mut guest, fd, 1000, Whence::SEEK_SET).await,
+            Ok(1000),
+            "seq_lseek accepts a position past the end"
+        );
+        assert_eq!(mounts_position(&guest, fd), 1000);
+        assert_eq!(guest.injected, [], "a mounts seek must inject nothing");
+        close_unless_detcore_did(&guest, fd);
+    }
+
+    /// read and pread64 of a mounts snapshot copy as seq_read_iter copies:
+    /// a fault with bytes pending is `EFAULT` and leaves the position
+    /// (round-9 finding F9-6), and a positioned read at or past the end
+    /// returns 0 whatever the destination (F9-5), all without injecting.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3712)
+    #[tokio::test]
+    async fn a_faulting_read_of_a_mounts_snapshot_leaves_the_position() {
+        let (tool, mut guest) = ScriptedGuest::new(true, false);
+        let fd = mounts_descriptor(&mut guest);
+        let contents = b"proc /proc proc rw 0 0\n";
+        capture_mounts(&guest, fd, contents);
+        // SAFETY: an inaccessible anonymous page owned by this test.
+        let inaccessible = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(inaccessible, libc::MAP_FAILED);
+        let inaccessible = inaccessible as usize;
+        let read = |buf: usize, len: usize| {
+            syscalls::Read::new()
+                .with_fd(fd)
+                .with_buf(AddrMut::from_raw(buf))
+                .with_len(len)
+        };
+        let pread = |buf: usize, len: usize, offset: i64| {
+            syscalls::Pread64::new()
+                .with_fd(fd)
+                .with_buf(AddrMut::from_raw(buf))
+                .with_len(len)
+                .with_offset(offset)
+        };
+
+        for buf in [0, inaccessible] {
+            assert_eq!(
+                errno(tool.handle_read(&mut guest, read(buf, 1)).await),
+                Err(Errno::EFAULT),
+                "read into {buf:#x}"
+            );
+            assert_eq!(
+                mounts_position(&guest, fd),
+                0,
+                "a faulting read moved the position"
+            );
+        }
+        let end = contents.len() as i64;
+        for offset in [end, end + 100] {
+            assert_eq!(
+                errno(
+                    tool.handle_pread64(&mut guest, pread(inaccessible, 16, offset))
+                        .await
+                ),
+                Ok(0),
+                "pread64 at {offset} of {end}"
+            );
+        }
+        assert_eq!(
+            errno(
+                tool.handle_pread64(&mut guest, pread(inaccessible, 16, 0))
+                    .await
+            ),
+            Err(Errno::EFAULT)
+        );
+        assert_eq!(
+            errno(tool.handle_pread64(&mut guest, pread(0, 16, -1)).await),
+            Err(Errno::EINVAL)
+        );
+
+        let mut buffer = [0_u8; 8];
+        let address = buffer.as_mut_ptr() as usize;
+        assert_eq!(
+            errno(
+                tool.handle_read(&mut guest, read(address, buffer.len()))
+                    .await
+            ),
+            Ok(8)
+        );
+        assert_eq!(&buffer, &contents[..8]);
+        assert_eq!(mounts_position(&guest, fd), 8);
+        assert_eq!(
+            errno(tool.handle_read(&mut guest, read(0, 1)).await),
+            Err(Errno::EFAULT)
+        );
+        assert_eq!(mounts_position(&guest, fd), 8);
+        let mut rest = [0_u8; 64];
+        let address = rest.as_mut_ptr() as usize;
+        assert_eq!(
+            errno(
+                tool.handle_pread64(&mut guest, pread(address, rest.len(), 8))
+                    .await
+            ),
+            Ok(end - 8)
+        );
+        assert_eq!(&rest[..contents.len() - 8], &contents[8..]);
+        assert_eq!(mounts_position(&guest, fd), 8, "pread64 moved the position");
+        assert_eq!(
+            guest.injected,
+            [],
+            "a captured mounts read must inject nothing"
+        );
+        // SAFETY: the page mapped above.
+        assert_eq!(unsafe { libc::munmap(inaccessible as *mut _, 4096) }, 0);
+        close_unless_detcore_did(&guest, fd);
+    }
+
     #[tokio::test]
     async fn descriptor_is_closed_when_no_scratch_can_be_found() {
         let (fd, _) = open_file();
@@ -7365,6 +8637,37 @@ mod untraced_code_tests {
                 );
                 assert_eq!(unsafe { libc::close(number) }, 0);
             }
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// The alias fallback for an open reads the opening thread's table
+    /// (round-9 finding F9-4 on https://github.com/rrnewton/hermit/issues/3712).
+    /// In a thread cloned without CLONE_FILES, a descriptor naming
+    /// `/proc/<pid>/mounts` classifies as the mounts snapshot through the
+    /// thread, while the leader's table names nothing at that number.
+    #[test]
+    fn an_open_alias_is_resolved_through_the_thread_that_opened_it() {
+        use std::os::fd::AsRawFd;
+
+        std::thread::spawn(|| {
+            // SAFETY: gives only this thread a private copy of the table.
+            assert_eq!(unsafe { libc::unshare(libc::CLONE_FILES) }, 0);
+            // SAFETY: plain syscalls on this thread's own descriptors.
+            let tid = unsafe { libc::gettid() };
+            let leader = std::process::id() as i32;
+            let file = std::fs::File::open("/proc/self/mounts").unwrap();
+            let number = 917;
+            assert_eq!(unsafe { libc::dup2(file.as_raw_fd(), number) }, number);
+            drop(file);
+            let resolved = super::resolved_open_path(tid, number)
+                .expect("the opening thread's table names the descriptor");
+            let procfs = crate::procfs::ProcfsFile::from_path(&resolved)
+                .unwrap_or_else(|| panic!("{resolved:?} does not classify"));
+            assert!(procfs.serves_seq_file_snapshot(), "{resolved:?}");
+            assert_eq!(super::resolved_open_path(leader, number), None);
+            assert_eq!(unsafe { libc::close(number) }, 0);
         })
         .join()
         .unwrap();
