@@ -29,7 +29,8 @@
 //!   just above a guard page or unmapped memory still gets the listing, and
 //!   neither the stack nor the caller's buffer beyond the output is changed.
 //! - As in Linux, a requested range beyond the user address limit gets
-//!   `EFAULT` even at end of file, where any other range gets 0.
+//!   `EFAULT` even at end of file, where any other range gets 0. At the limit
+//!   itself the answer is the kernel's own for a file it reads.
 
 use std::fs::File;
 use std::os::fd::AsRawFd;
@@ -612,6 +613,29 @@ fn read_at_eof(fd: libc::c_int, positioned: bool, buf: usize, count: usize) -> (
     (n, if n < 0 { errno() } else { 0 })
 }
 
+/// The running kernel's user address limit, found from its own reads of
+/// `null`, a `/dev/null` descriptor, which is always at end of file: the
+/// highest address at which it accepts an empty read.
+fn kernel_user_address_limit(null: libc::c_int) -> usize {
+    let accepts = |buf| match read_at_eof(null, false, buf, 0) {
+        (0, 0) => true,
+        (-1, libc::EFAULT) => false,
+        other => panic!("empty read of /dev/null at {buf:#x}: {other:?}"),
+    };
+    let (mut accepted, mut refused) = (0_usize, usize::MAX);
+    assert!(accepts(accepted));
+    assert!(!accepts(refused));
+    while refused - accepted > 1 {
+        let middle = accepted + (refused - accepted) / 2;
+        if accepts(middle) {
+            accepted = middle;
+        } else {
+            refused = middle;
+        }
+    }
+    accepted
+}
+
 fn assert_eof_ranges(fd: libc::c_int, positioned: bool, offset: i64) {
     let call = if positioned { "pread" } else { "read" };
     // Within the limit: no page is mapped at 4 KiB, and NULL has no bytes to take.
@@ -631,6 +655,35 @@ fn assert_eof_ranges(fd: libc::c_int, positioned: bool, offset: i64) {
             read_at_eof(fd, positioned, buf, count),
             (-1, libc::EFAULT),
             "{call} of {count:#x} bytes at {buf:#x} at EOF"
+        );
+    }
+    // At the limit: each read gets what the kernel gives the same read of a
+    // file it reads itself, and the kernel accepts the empty range at the
+    // limit and refuses the byte there.
+    let null = File::open("/dev/null").unwrap();
+    let limit = kernel_user_address_limit(null.as_raw_fd());
+    #[cfg(target_arch = "x86_64")]
+    assert!(limit >= (1 << 47) - 4096, "{limit:#x}");
+    assert_eq!(read_at_eof(null.as_raw_fd(), false, limit, 0), (0, 0));
+    assert_eq!(
+        read_at_eof(null.as_raw_fd(), false, limit, 1),
+        (-1, libc::EFAULT)
+    );
+    for (buf, count) in [
+        (limit, 0),
+        (limit + 1, 0),
+        (limit - 1, 1),
+        (limit, 1),
+        (limit - 0x1000, 0x1000),
+        (limit - 0xfff, 0x1000),
+        // Past MAX_RW_COUNT, which `read` checks uncapped.
+        (0x1000, limit - 0x1000),
+        (0x1000, limit - 0xfff),
+    ] {
+        assert_eq!(
+            read_at_eof(fd, positioned, buf, count),
+            read_at_eof(null.as_raw_fd(), false, buf, count),
+            "{call} of {count:#x} bytes at {buf:#x} at EOF, limit {limit:#x}"
         );
     }
     assert_eq!(unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) }, offset);

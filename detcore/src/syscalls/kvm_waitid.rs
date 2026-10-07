@@ -654,12 +654,10 @@ mod tests {
     // Use the actual child-state initializer, including its emulated-wait/serial gate,
     // rather than manufacturing a ready notification in the component.
     fn unpublished_child(guest: &mut CompletionGuest) -> crate::ThreadState<()> {
-        // The three behaviours the old `backend_is_kvm` identity flag selected
+        // The two behaviours the old `backend_is_kvm` identity flag selected
         // that remain capabilities.
         guest.config.backend.provides_process_signal_control = true;
         guest.config.backend.emulates_child_waits = true;
-        guest.config.backend.user_address_limit =
-            Some(reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT);
         guest.config.sequentialize_threads = true;
         guest.thread.clone_flags = Some(syscalls::CloneFlags::empty());
         let tool = <Detcore as reverie::Tool>::new(Pid::from_raw(3), &guest.config);
