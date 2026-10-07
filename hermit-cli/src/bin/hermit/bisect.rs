@@ -121,6 +121,8 @@ impl BisectOpts {
         // Before the schedules are read: a refused cap or counter reads and
         // starts nothing.
         analyzer.refuse_unsupervised_log_cap()?;
+        analyzer.refuse_options_trials_do_not_apply()?;
+        analyzer.install_trial_pmu_config()?;
         analyzer.refuse_strict_with_inexact_branch_counter()?;
 
         let good = read_schedule(&self.good, "good")?;
@@ -157,46 +159,118 @@ mod tests {
 
     /// Through `main`: bisect refuses `--strict` in its run arguments on an
     /// inexact retired-branch counter before it reads either schedule
-    /// (https://github.com/rrnewton/hermit/issues/3810), including with
-    /// `--namespace-only` or `--lite`, which its replays ignore. The schedules
-    /// do not exist, so a bisect that passed the refusal fails on reading them.
+    /// (https://github.com/rrnewton/hermit/issues/3810). The schedules do not
+    /// exist, so a bisect that passed the refusal fails on reading them. With
+    /// `--namespace-only` or `--lite`, which its replays ignore, bisect refuses
+    /// earlier, for a dropped option
+    /// (`bisect_refuses_run_options_its_replays_do_not_apply`).
     #[test]
     fn strict_bisect_refuses_an_inexact_branch_counter_before_reading_schedules() {
-        for extra in [None, Some("--namespace-only"), Some("--lite")] {
+        let argv = [
+            "hermit",
+            "bisect",
+            "--good=/nonexistent/good.json",
+            "--bad=/nonexistent/bad.json",
+            "--",
+            "--strict",
+            "/bin/true",
+        ];
+        let args = crate::Args::try_parse_from(argv).unwrap();
+        let crate::Subcommand::Bisect(mut options) = args.command else {
+            panic!("{argv:?} is not bisect")
+        };
+        options.inexact_branch_counter = || Some("SpecLockMap is enabled".to_string());
+        let error = options.main(&args.global).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::container::PolicyRefusal>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert!(
+            error.to_string().contains("SpecLockMap is enabled"),
+            "{error:#}"
+        );
+
+        options.inexact_branch_counter = || None;
+        let error = options.main(&args.global).unwrap_err();
+        assert!(
+            error.to_string().contains("failed to read --good schedule"),
+            "{error:#}"
+        );
+    }
+
+    /// Through `main`: bisect refuses run arguments that its replays would
+    /// accept and run without (`RunOpts::options_only_main_applies`), before
+    /// it reads either schedule. Without one, it reaches the missing
+    /// schedule instead.
+    #[test]
+    fn bisect_refuses_run_options_its_replays_do_not_apply() {
+        let bisect = |run_args: &[&str]| {
             let mut argv = vec![
                 "hermit",
                 "bisect",
                 "--good=/nonexistent/good.json",
                 "--bad=/nonexistent/bad.json",
                 "--",
-                "--strict",
             ];
-            argv.extend(extra);
+            argv.extend(run_args);
             argv.push("/bin/true");
             let args = crate::Args::try_parse_from(&argv).unwrap();
-            let crate::Subcommand::Bisect(mut options) = args.command else {
+            let crate::Subcommand::Bisect(options) = args.command else {
                 panic!("{argv:?} is not bisect")
             };
-            options.inexact_branch_counter = || Some("SpecLockMap is enabled".to_string());
-            let error = options.main(&args.global).unwrap_err();
+            options.main(&args.global).unwrap_err()
+        };
+        for (run_args, named) in [
+            (&["--namespace-only"][..], "--namespace-only"),
+            (&["--lite"][..], "--namespace-only"),
+            (&["--verify"][..], "--verify"),
+        ] {
+            let error = bisect(run_args);
             assert!(
                 error
                     .downcast_ref::<crate::container::PolicyRefusal>()
                     .is_some(),
-                "{argv:?}: {error:#}"
+                "{run_args:?}: {error:#}"
             );
-            assert!(
-                error.to_string().contains("SpecLockMap is enabled"),
-                "{argv:?}: {error:#}"
-            );
-
-            options.inexact_branch_counter = || None;
-            let error = options.main(&args.global).unwrap_err();
-            assert!(
-                error.to_string().contains("failed to read --good schedule"),
-                "{argv:?}: {error:#}"
-            );
+            assert!(error.to_string().contains(named), "{run_args:?}: {error:#}");
         }
+        let error = bisect(&["--no-namespace"]);
+        assert!(
+            error.to_string().contains("failed to read --good schedule"),
+            "{error:#}"
+        );
+    }
+
+    /// Bisect's replays apply `--skid-margin`: it is installed as Reverie's
+    /// per-process PMU configuration before either schedule is read, so a
+    /// later installation is refused. This relies on nextest running each
+    /// test in a process of its own, as the validation DAG does.
+    #[test]
+    fn bisect_installs_the_replays_skid_margin() {
+        let argv = [
+            "hermit",
+            "bisect",
+            "--good=/nonexistent/good.json",
+            "--bad=/nonexistent/bad.json",
+            "--",
+            "--skid-margin=4321",
+            "/bin/true",
+        ];
+        let args = crate::Args::try_parse_from(argv).unwrap();
+        let crate::Subcommand::Bisect(options) = args.command else {
+            panic!("{argv:?} is not bisect")
+        };
+        let error = options.main(&args.global).unwrap_err();
+        assert!(
+            error.to_string().contains("failed to read --good schedule"),
+            "{error:#}"
+        );
+        assert!(
+            reverie_ptrace::set_pmu_config(reverie_ptrace::PmuConfig::new()).is_err(),
+            "bisect did not install the replays' --skid-margin"
+        );
     }
 
     #[test]

@@ -594,6 +594,39 @@ impl AnalyzeOpts {
     pub fn refuse_strict_with_inexact_branch_counter(&self) -> anyhow::Result<()> {
         RunData::get_raw_runopts(self).refuse_strict_trial_with_inexact_branch_counter()
     }
+
+    /// Installs the trials' `--skid-margin`, as `RunOpts::main` does for a
+    /// run: Reverie's PMU configuration is per process, and every trial of
+    /// one `analyze` or `bisect` runs in this process with the same run
+    /// arguments. It must precede the strict counter refusal, whose
+    /// validation reads that configuration. Before this, trials accepted
+    /// `--skid-margin`, ran with the default margin, and printed a
+    /// reproducer that applied it.
+    pub fn install_trial_pmu_config(&self) -> anyhow::Result<()> {
+        RunData::get_raw_runopts(self).install_pmu_config()
+    }
+
+    /// Refuses (exit 122) run arguments that a trial would accept and run
+    /// without (`RunOpts::options_only_main_applies`), before any workspace,
+    /// schedule read or trial exists. Accepting them would run every trial
+    /// without them and print a reproducer that applies them, so the
+    /// reproducer would not reproduce the trial.
+    pub fn refuse_options_trials_do_not_apply(&self) -> anyhow::Result<()> {
+        let dropped = RunData::get_raw_runopts(self).options_only_main_applies();
+        if dropped.is_empty() {
+            return Ok(());
+        }
+        Err(
+            anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                "`hermit analyze` and `hermit bisect` cannot apply {} to their trials: each trial \
+             starts through `RunOpts::run`, and only `hermit run` itself applies {}. Remove {} \
+             from the run arguments, or run the program with `hermit run`.",
+                dropped.join(", "),
+                if dropped.len() == 1 { "it" } else { "them" },
+                if dropped.len() == 1 { "it" } else { "them" },
+            )),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -807,29 +840,101 @@ mod tests {
         }
     }
 
-    /// Through `main`: the refusal must be wired into analyze's preflight,
-    /// ahead of the workspace and every trial, including for a trial with
-    /// `--namespace-only` or `--lite`, which still runs on ptrace.
-    /// `--run1-schedule` is not implemented and `main` panics on it right
-    /// after that preflight, so an analyze that passed the refusal panics
-    /// instead of starting anything.
+    /// Trials start through `RunOpts::run`, so run options that only
+    /// `RunOpts::main` applies are refused, each named, instead of being
+    /// dropped from every trial while the printed reproducer keeps them.
+    /// Options the trials do apply are admitted.
     #[test]
-    fn strict_analyze_refuses_an_inexact_branch_counter_before_its_workspace() {
-        for extra in [None, Some("--namespace-only"), Some("--lite")] {
-            let mut argv = vec![
+    fn trials_refuse_run_options_only_main_applies() {
+        let options = |argv: &[&str]| {
+            let args = crate::Args::try_parse_from(argv)
+                .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            options.apply_global(&args.global);
+            options
+        };
+        for (run_args, named) in [
+            (&["--namespace-only"][..], &["--namespace-only"][..]),
+            (&["--lite"][..], &["--namespace-only"][..]),
+            (&["--verify"][..], &["--verify"][..]),
+            (&["--verify", "--verify-strict"][..], &["--verify"][..]),
+            (
+                &[
+                    "--run-result-json=r.json",
+                    "--guest-stdout=o",
+                    "--guest-stderr=e",
+                    "--run-evidence-dir=ev",
+                ][..],
+                &[
+                    "--run-result-json",
+                    "--guest-stdout",
+                    "--guest-stderr",
+                    "--run-evidence-dir",
+                ][..],
+            ),
+            (
+                &["--backend-engagement-json=b.json"][..],
+                &["--backend-engagement-json"][..],
+            ),
+            (
+                &["--verify", "--happens-before=hb.txt"][..],
+                &["--verify", "--happens-before"][..],
+            ),
+        ] {
+            let mut argv = vec!["hermit", "analyze", "--"];
+            argv.extend(run_args);
+            argv.push("/bin/true");
+            let error = options(&argv)
+                .refuse_options_trials_do_not_apply()
+                .expect_err("a dropped run option");
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{argv:?}: {error:#}"
+            );
+            let message = error.to_string();
+            for option in named {
+                assert!(message.contains(option), "{argv:?}: {option}: {message}");
+            }
+        }
+        for run_args in [
+            &[][..],
+            &["--strict"][..],
+            &["--no-namespace"][..],
+            &["--timeout=5"][..],
+            &["--skid-margin=500"][..],
+            &["--summary"][..],
+        ] {
+            let mut argv = vec!["hermit", "analyze", "--"];
+            argv.extend(run_args);
+            argv.push("/bin/true");
+            options(&argv)
+                .refuse_options_trials_do_not_apply()
+                .unwrap_or_else(|error| panic!("{argv:?}: {error:#}"));
+        }
+    }
+
+    /// Through `main`: the dropped-option refusal is in analyze's preflight,
+    /// before the workspace and every trial (see the `--run1-schedule` note
+    /// on the strict counter test below).
+    #[test]
+    fn trials_refuse_run_options_only_main_applies_before_their_workspace() {
+        for extra in ["--namespace-only", "--lite", "--verify"] {
+            let argv = [
                 "hermit",
                 "analyze",
                 "--run1-schedule=/nonexistent/schedule.json",
                 "--",
-                "--strict",
+                extra,
+                "/bin/true",
             ];
-            argv.extend(extra);
-            argv.push("/bin/true");
-            let args = crate::Args::try_parse_from(&argv).unwrap();
+            let args = crate::Args::try_parse_from(argv).unwrap();
             let crate::Subcommand::Analyze(mut options) = args.command else {
                 panic!("{argv:?} is not analyze")
             };
-            options.inexact_branch_counter = || Some("SpecLockMap is enabled".to_string());
             let error = options.main(&args.global).unwrap_err();
             assert!(
                 error
@@ -837,11 +942,103 @@ mod tests {
                     .is_some(),
                 "{argv:?}: {error:#}"
             );
-            assert!(
-                error.to_string().contains("SpecLockMap is enabled"),
-                "{argv:?}: {error:#}"
-            );
         }
+    }
+
+    /// Analyze's trials apply `--skid-margin`: its preflight installs it as
+    /// Reverie's per-process PMU configuration, so a later installation is
+    /// refused. `main` panics on the unimplemented `--run1-schedule` right
+    /// after that preflight. This relies on nextest running each test in a
+    /// process of its own, as the validation DAG does.
+    #[test]
+    fn analyze_installs_the_trials_skid_margin() {
+        let argv = [
+            "hermit",
+            "analyze",
+            "--run1-schedule=/nonexistent/schedule.json",
+            "--",
+            "--skid-margin=4321",
+            "/bin/true",
+        ];
+        let args = crate::Args::try_parse_from(argv).unwrap();
+        let crate::Subcommand::Analyze(mut options) = args.command else {
+            panic!("{argv:?} is not analyze")
+        };
+        let reached_run1_schedule =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| options.main(&args.global)));
+        assert!(
+            reached_run1_schedule.is_err(),
+            "the preflight refused: {:?}",
+            reached_run1_schedule.ok()
+        );
+        assert!(
+            reverie_ptrace::set_pmu_config(reverie_ptrace::PmuConfig::new()).is_err(),
+            "analyze did not install the trials' --skid-margin"
+        );
+    }
+
+    /// The printed reproducer carries `--timeout`, which every trial applies
+    /// (`run_in_container` reads it), so the reproducer is bounded as the
+    /// trial was.
+    #[test]
+    fn analyzer_reproducer_retains_the_trial_timeout() {
+        use clap::CommandFactory;
+        let mut options =
+            AnalyzeOpts::try_parse_from(["analyze", "--", "--timeout=7", "/bin/true"]).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        options.tmp_dir = Some(workspace.path().to_path_buf());
+        let run = RunData::new_baseline(&options, "timeout-repro".to_owned()).unwrap();
+        let repro = run.to_repro();
+        assert_eq!(repro.matches(" --timeout=7").count(), 1, "{repro}");
+        let matches = crate::Args::command()
+            .try_get_matches_from(shell_words::split(&repro).unwrap())
+            .unwrap();
+        let args = crate::args_from_matches_with_clock(&matches, || {
+            panic!("analyzer reproduction must retain its actual fixed input")
+        })
+        .unwrap();
+        let crate::Subcommand::Run(mut parsed) = args.command else {
+            panic!("expected run")
+        };
+        parsed.validate_args().unwrap();
+        assert_eq!(parsed.to_string(), run.runopts.to_string());
+    }
+
+    /// Through `main`: the refusal must be wired into analyze's preflight,
+    /// ahead of the workspace and every trial. `--run1-schedule` is not
+    /// implemented and `main` panics on it right after that preflight, so an
+    /// analyze that passed the refusal panics instead of starting anything.
+    /// A trial with `--namespace-only` or `--lite` is refused earlier in that
+    /// preflight, for a dropped option
+    /// (`trials_refuse_run_options_only_main_applies_before_their_workspace`);
+    /// `strict_trials_refuse_an_inexact_branch_counter` keeps it covered at
+    /// the counter refusal itself.
+    #[test]
+    fn strict_analyze_refuses_an_inexact_branch_counter_before_its_workspace() {
+        let argv = [
+            "hermit",
+            "analyze",
+            "--run1-schedule=/nonexistent/schedule.json",
+            "--",
+            "--strict",
+            "/bin/true",
+        ];
+        let args = crate::Args::try_parse_from(argv).unwrap();
+        let crate::Subcommand::Analyze(mut options) = args.command else {
+            panic!("{argv:?} is not analyze")
+        };
+        options.inexact_branch_counter = || Some("SpecLockMap is enabled".to_string());
+        let error = options.main(&args.global).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::container::PolicyRefusal>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert!(
+            error.to_string().contains("SpecLockMap is enabled"),
+            "{error:#}"
+        );
     }
 
     /// `run` has no `--backend`, so `hermit --backend <BACKEND> analyze` is the

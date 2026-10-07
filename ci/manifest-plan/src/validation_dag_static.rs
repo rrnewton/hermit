@@ -1074,7 +1074,17 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The verify signal report's six verify::tests (signal_termination_report_*
     // and a_log_tail_starts_at_a_whole_line) retain all 936: 942 (measured
     // with cargo nextest list).
-    ("test.hermit_unit", 942),
+    // Run options that analyze and bisect trials do not apply are refused, and
+    // their --skid-margin is installed
+    // (https://github.com/rrnewton/hermit/issues/3835):
+    // analyze::rundata::tests::{trials_refuse_run_options_only_main_applies,
+    // trials_refuse_run_options_only_main_applies_before_their_workspace,
+    // analyzer_reproducer_retains_the_trial_timeout,
+    // analyze_installs_the_trials_skid_margin} and
+    // bisect::tests::{bisect_refuses_run_options_its_replays_do_not_apply,
+    // bisect_installs_the_replays_skid_margin} retain all 942: 948 (measured
+    // with cargo nextest list).
+    ("test.hermit_unit", 948),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1909,7 +1919,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests (905, measured).
     // The host twin selects the same tests, re-listed together: 936.
     // The host twin selects the same six signal-report tests: 942.
-    ("test.hermit_unit_on_host", 942),
+    ("test.hermit_unit_on_host", 948),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

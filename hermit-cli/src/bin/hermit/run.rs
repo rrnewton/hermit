@@ -1497,6 +1497,9 @@ impl fmt::Display for RunOpts {
         if let Some(skid_margin) = self.skid_margin {
             write!(f, " --skid-margin={skid_margin}")?;
         }
+        if let Some(timeout) = self.timeout {
+            write!(f, " --timeout={timeout}")?;
+        }
         if self.no_sequentialize_threads {
             write!(f, " --no-sequentialize-threads")?;
         }
@@ -5342,7 +5345,7 @@ impl RunOpts {
         Ok(Some(file))
     }
 
-    fn install_pmu_config(&self) -> Result<(), Error> {
+    pub(crate) fn install_pmu_config(&self) -> Result<(), Error> {
         let Some(skid_margin) = self.skid_margin else {
             return Ok(());
         };
@@ -6995,6 +6998,43 @@ impl RunOpts {
             return Ok(());
         }
         refuse_an_inexact_branch_counter(self.selected_backend(), self.inexact_branch_counter)
+    }
+
+    /// The run options set here that only `RunOpts::main` applies, as the
+    /// spellings a user would write. A trial started through `RunOpts::run`,
+    /// as `hermit analyze` and `hermit bisect` start theirs, would accept them
+    /// and run without them, while its printed reproducer still carried them:
+    ///
+    /// - `--namespace-only`: only `main` dispatches to `run_with_namespace_only`;
+    ///   `run` launches the backend's runtime.
+    /// - `--verify` (and every option that requires it): only `main`
+    ///   dispatches to `verify()`; `run` is a single run.
+    /// - `--happens-before` (and `--hb-list-events`): only `main` resolves the
+    ///   specification, so `run` hands the scheduler none.
+    /// - `--run-result-json`, `--guest-stdout`, `--guest-stderr`: only `main`
+    ///   opens the guest capture.
+    /// - `--run-evidence-dir`: only `hermit run`'s top level arms it.
+    /// - `--backend-engagement-json`: only `main` writes it.
+    ///
+    /// `--skid-margin` is not listed: `hermit analyze` and `hermit bisect`
+    /// install it for their trials themselves (`install_pmu_config`).
+    pub(crate) fn options_only_main_applies(&self) -> Vec<&'static str> {
+        [
+            (self.namespace_only, "--namespace-only"),
+            (self.verify, "--verify"),
+            (self.happens_before.is_some(), "--happens-before"),
+            (self.run_result_json.is_some(), "--run-result-json"),
+            (self.guest_stdout.is_some(), "--guest-stdout"),
+            (self.guest_stderr.is_some(), "--guest-stderr"),
+            (self.run_evidence_dir.is_some(), "--run-evidence-dir"),
+            (
+                self.backend_engagement_json.is_some(),
+                "--backend-engagement-json",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(set, option)| set.then_some(option))
+        .collect()
     }
 
     /// Replace the host's retired-branch-counter probe, for a `RunOpts` built
