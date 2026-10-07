@@ -113,6 +113,25 @@ use super::verify::write_verification_json;
 
 const TMP_DIR: &str = "/tmp";
 
+/// Why this host cannot arm Reverie's ptrace PMU timer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TimerUnavailable {
+    /// `perf_event_open` cannot open a hardware counter here.
+    NoPerfEvents,
+    /// The counters work, but Reverie has no profile (event and skid margin)
+    /// for this CPU, so it gives no task a timer.
+    NoPmuProfile(String),
+}
+
+/// Whether this host can arm Reverie's ptrace PMU timer.
+fn reverie_timer_support() -> Result<(), TimerUnavailable> {
+    if !reverie_ptrace::is_perf_supported() {
+        return Err(TimerUnavailable::NoPerfEvents);
+    }
+    reverie_ptrace::host_pmu_profile()
+        .map_err(|error| TimerUnavailable::NoPmuProfile(error.to_string()))
+}
+
 fn warn_bind_outside_tmp(bind: &Bind) {
     crate::tracing::diagnostic_eprintln!(
         "WARNING: --bind target {} is outside guest /tmp, so this option has no \
@@ -3741,6 +3760,23 @@ fn display_runopts_without_perf_support() {
     );
 }
 
+/// Working counters on a CPU Reverie has no PMU profile for (a GitHub-hosted
+/// runner's Emerald Rapids before Reverie had one) leave the run without the
+/// timer, as missing counters do, instead of failing at the first task.
+#[test]
+fn display_runopts_without_a_pmu_profile() {
+    let mut ro = RunOpts::parse_from(["fakehermit", "fakeprog", "arg1"]);
+    ro.validate_args_with_timer_support(Err(TimerUnavailable::NoPmuProfile(
+        "Unsupported CPU family 0x6, model 0x1: Reverie has no performance-counter profile for it"
+            .to_owned(),
+    )))
+    .unwrap();
+    assert_eq!(
+        format!("{}", ro),
+        " --max-timeslice=disabled --epoch=2026-01-01T00:00:00+00:00 -- fakeprog arg1"
+    );
+}
+
 fn shebang_interpreter(path: &Path) -> Option<PathBuf> {
     let mut file = File::open(path).ok()?;
     let mut bytes = [0_u8; 256];
@@ -4956,9 +4992,12 @@ impl RunOpts {
     /// Some arguments imply others. This is the place where that validation occurs.
     /// Also this performs side effects like accessing system randomness to implement --seed-from=SystemArgs
     pub fn validate_args(&mut self) -> Result<(), Error> {
-        let perf_supported =
-            !self.arms_reverie_ptrace_pmu_timer() || reverie_ptrace::is_perf_supported();
-        self.validate_args_with_perf_support(perf_supported)?;
+        let timer = if self.arms_reverie_ptrace_pmu_timer() {
+            reverie_timer_support()
+        } else {
+            Ok(())
+        };
+        self.validate_args_with_timer_support(timer)?;
         self.refuse_unqualified_liteinst_in_guest_options()
     }
 
@@ -4989,7 +5028,21 @@ impl RunOpts {
         }
     }
 
+    /// [`Self::validate_args_with_timer_support`] for tests, with a missing
+    /// timer reported as missing perf counters.
+    #[cfg(test)]
     fn validate_args_with_perf_support(&mut self, perf_supported: bool) -> Result<(), Error> {
+        self.validate_args_with_timer_support(if perf_supported {
+            Ok(())
+        } else {
+            Err(TimerUnavailable::NoPerfEvents)
+        })
+    }
+
+    fn validate_args_with_timer_support(
+        &mut self,
+        timer: Result<(), TimerUnavailable>,
+    ) -> Result<(), Error> {
         let backend = self.selected_backend();
         if self.run_evidence_dir.is_some() {
             let limitation = match backend {
@@ -5140,17 +5193,27 @@ impl RunOpts {
 
         // This is a Detcore Config-internal matter, but relies on reverie_ptrace, which detcore is
         // allowed to depend on:
-        if config.max_timeslice.is_some() && !perf_supported {
+        if config.max_timeslice.is_some()
+            && let Err(unavailable) = &timer
+        {
             // TODO(T124429978): this could change back to tracing::warn! when the bug is fixed.
             // With --max-log-bytes this must not wait on a stderr nobody reads: it runs before
             // the container starts, so a blocked write would keep the run from ever reaching
             // the cap.
-            crate::tracing::write_stderr_diagnostic(
-                "WARNING: --max-timeslice requires user-space perf counters, but \
-                 perf_event_open is unavailable; continuing with \
-                 --max-timeslice=disabled. Check the host perf_event_paranoid value and \
-                 container seccomp policy.\n",
-            );
+            match unavailable {
+                TimerUnavailable::NoPerfEvents => crate::tracing::write_stderr_diagnostic(
+                    "WARNING: --max-timeslice requires user-space perf counters, but \
+                     perf_event_open is unavailable; continuing with \
+                     --max-timeslice=disabled. Check the host perf_event_paranoid value and \
+                     container seccomp policy.\n",
+                ),
+                TimerUnavailable::NoPmuProfile(reason) => {
+                    crate::tracing::write_stderr_diagnostic(&format!(
+                        "WARNING: --max-timeslice requires a performance-counter profile for \
+                         this CPU, but {reason}; continuing with --max-timeslice=disabled.\n"
+                    ))
+                }
+            }
             config.max_timeslice = None;
         }
 
@@ -5376,12 +5439,14 @@ impl RunOpts {
         Ok(Some(file))
     }
 
+    /// Records `--skid-margin` for Reverie's PMU configuration. Recording reads
+    /// nothing from the host's CPU, so it holds wherever the configuration is
+    /// built later, and a CPU with no profile is handled where a timer is armed.
     pub(crate) fn install_pmu_config(&self) -> Result<(), Error> {
         let Some(skid_margin) = self.skid_margin else {
             return Ok(());
         };
-        let config = reverie_ptrace::PmuConfig::new().with_skid_margin_override(skid_margin);
-        reverie_ptrace::set_pmu_config(config).map_err(|_| {
+        reverie_ptrace::set_skid_margin_override(skid_margin).map_err(|_| {
             anyhow::anyhow!(
                 "Reverie PMU configuration was initialized before --skid-margin could be applied"
             )

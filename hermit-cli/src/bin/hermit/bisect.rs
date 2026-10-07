@@ -293,9 +293,9 @@ mod tests {
         );
     }
 
-    /// Bisect's replays apply `--skid-margin`: it is installed as Reverie's
-    /// per-process PMU configuration before either schedule is read, so a
-    /// later installation is refused. This relies on nextest running each
+    /// Bisect's replays apply `--skid-margin`: it is recorded as the skid
+    /// margin of Reverie's per-process PMU configuration before either
+    /// schedule is read, so a later margin is refused. This relies on nextest running each
     /// test in a process of its own, as the validation DAG does.
     #[test]
     fn bisect_installs_the_replays_skid_margin() {
@@ -317,8 +317,11 @@ mod tests {
             error.to_string().contains("failed to read --good schedule"),
             "{error:#}"
         );
+        // A second margin is refused once one is recorded. Neither recording
+        // reads the host's CPU, so this holds on a host Reverie has no PMU
+        // profile for, such as a GitHub-hosted runner's Emerald Rapids.
         assert!(
-            reverie_ptrace::set_pmu_config(reverie_ptrace::PmuConfig::new()).is_err(),
+            reverie_ptrace::set_skid_margin_override(1).is_err(),
             "bisect did not install the replays' --skid-margin"
         );
     }

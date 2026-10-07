@@ -1192,9 +1192,9 @@ mod tests {
         }
     }
 
-    /// Analyze's trials apply `--skid-margin`: its preflight installs it as
-    /// Reverie's per-process PMU configuration, so a later installation is
-    /// refused. `main` panics on the unimplemented `--run1-schedule` right
+    /// Analyze's trials apply `--skid-margin`: its preflight records it as the
+    /// skid margin of Reverie's per-process PMU configuration, so a later
+    /// margin is refused. `main` panics on the unimplemented `--run1-schedule` right
     /// after that preflight. This relies on nextest running each test in a
     /// process of its own, as the validation DAG does.
     #[test]
@@ -1218,8 +1218,11 @@ mod tests {
             "the preflight refused: {:?}",
             reached_run1_schedule.ok()
         );
+        // A second margin is refused once one is recorded. Neither recording
+        // reads the host's CPU, so this holds on a host Reverie has no PMU
+        // profile for, such as a GitHub-hosted runner's Emerald Rapids.
         assert!(
-            reverie_ptrace::set_pmu_config(reverie_ptrace::PmuConfig::new()).is_err(),
+            reverie_ptrace::set_skid_margin_override(1).is_err(),
             "analyze did not install the trials' --skid-margin"
         );
     }

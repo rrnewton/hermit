@@ -1143,7 +1143,14 @@ fi
 # reverie-dbt, the root Cargo.toml, third-party or rust-toolchain.toml
 # changes, so the four budget inputs are unchanged. Carry, not recalibration:
 # no new timing sample or >=5-sample replacement claim is made.
-expected_pin=2c86fe0fa14d987d8bf8befb0c3a9ca297814202
+# CARRY TO 1cc1918a4a5900963d7d0c682b642f25ea46bc1b (2026-10-07): from
+# 2c86fe0fa14d987d8bf8befb0c3a9ca297814202. The one commit changes reverie/src/pmu.rs
+# (an Emerald Rapids PMU profile) and reverie-ptrace (a typed refusal for a CPU
+# with no profile, a recorded skid margin and host_pmu_profile); no file under
+# reverie-dbt, the root Cargo.toml, third-party or rust-toolchain.toml
+# changes, so the four budget inputs are unchanged. Carry, not recalibration:
+# no new timing sample or >=5-sample replacement claim is made.
+expected_pin=1cc1918a4a5900963d7d0c682b642f25ea46bc1b
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
