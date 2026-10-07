@@ -1106,7 +1106,14 @@ fi
 # (reverie-dbt/native is tree 27a61eb170f7372b5120f0ef92a900e9e8d6071c at both).
 # Carry, not recalibration: no new timing sample or >=5-sample replacement
 # claim is made.
-expected_pin=0f7ffe7e3f82320c45d5d220b846b2a055b29501
+# CARRY TO d78f770f2fde06db9d2787e0fea0ca0984891763 (2026-10-07): from
+# 0f7ffe7e3f82320c45d5d220b846b2a055b29501. The one commit changes reverie/src (typed
+# unsupported-operation refusals and one removed BackendCapabilities field)
+# and reverie-kvm; no file under reverie-dbt, the root Cargo.toml,
+# third-party or rust-toolchain.toml changes, so the four budget inputs are
+# unchanged. Carry, not recalibration: no new timing sample or >=5-sample
+# replacement claim is made.
+expected_pin=d78f770f2fde06db9d2787e0fea0ca0984891763
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

@@ -1296,10 +1296,10 @@ mod event_tests {
             detlog_stack: false,
             detlog_regs: false,
             ..Config::default().with_backend(|backend| {
-                // The five behaviours the old `backend_is_kvm` identity flag selected.
+                // The four behaviours the old `backend_is_kvm` identity flag
+                // selected that remain capabilities.
                 backend.provides_process_signal_control = true;
                 backend.emulates_child_waits = true;
-                backend.refuses_nonleader_exec_with_enosys = true;
                 backend.failed_gettimeofday_may_store_host_time = false;
                 backend.user_address_limit = Some(reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT);
                 backend.virtualizes_syscall_clobbers = true;
