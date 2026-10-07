@@ -587,6 +587,8 @@ fn main() {
     if let Some(error) = evidence_error {
         display_error(error);
     }
+    // Last, so that nothing hermit must say waits behind it.
+    verify::write_queued_signal_reports();
     status.raise_or_exit();
 }
 

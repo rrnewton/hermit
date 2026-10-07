@@ -1262,22 +1262,53 @@ pub(crate) fn signal_termination_report(
 /// The [`signal_termination_report`]s of a verification's runs, prepared
 /// while each run's log exists, because the comparison consumes the logs.
 ///
-/// They are written to stderr once, when this is dropped, unless
-/// [`Self::verified`] discarded them first. So every way a verification ends
-/// without verifying its runs reports the signals that ended them: a status
-/// `--verify-allow` refuses, a comparison that rejects runs whose statuses
-/// `--verify-allow=both` or `failure` admitted, or an error. A verification
-/// that verifies its runs has nothing to explain and prints nothing.
+/// When this is dropped they are queued, unless [`Self::verified`] discarded
+/// them first. So every way a verification ends without verifying its runs
+/// reports the signals that ended them: a status `--verify-allow` refuses, a
+/// comparison that rejects runs whose statuses `--verify-allow=both` or
+/// `failure` admitted, or an error. A verification that verifies its runs has
+/// nothing to explain and prints nothing.
 ///
-/// Each line is written separately through
-/// [`crate::tracing::write_stderr_diagnostic`]: while `--max-log-bytes` is in
-/// force a line stderr cannot take at once is omitted rather than waited for,
-/// and a write that fails is ignored, so the report can neither delay nor
-/// replace the verification's own disposition. A line a full pipe refuses
-/// costs only that line.
+/// `main` writes the queue with [`write_queued_signal_reports`], after
+/// everything else hermit says, so the report can neither delay nor replace
+/// the verification's own disposition: nothing waits behind it, and it never
+/// waits itself.
 #[must_use]
 #[derive(Default)]
 pub(crate) struct SignalTerminationReports(Vec<String>);
+
+/// The reports of verifications that ended unverified, for
+/// [`write_queued_signal_reports`].
+static QUEUED_SIGNAL_REPORTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Write the queued [`SignalTerminationReports`] to stderr. `main` calls this
+/// last, just before hermit exits.
+///
+/// No write waits for the reader of stderr, with or without
+/// `--max-log-bytes`: each goes through
+/// [`hermit::nonwaiting_write::write_without_waiting_for_a_reader`], and the
+/// first one that stderr refuses or that fails ends the report. A pipe nobody
+/// reads therefore gets what fits and hermit exits; the line that filled it
+/// may be cut.
+pub(crate) fn write_queued_signal_reports() {
+    let reports = std::mem::take(
+        &mut *QUEUED_SIGNAL_REPORTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    for report in &reports {
+        let mut rest = report.as_bytes();
+        while !rest.is_empty() {
+            match hermit::nonwaiting_write::write_without_waiting_for_a_reader(
+                libc::STDERR_FILENO,
+                rest,
+            ) {
+                Ok(written) if written > 0 => rest = &rest[written..],
+                _ => return,
+            }
+        }
+    }
+}
 
 impl SignalTerminationReports {
     /// Prepare the report of run `label`, if `status` is a termination by a
@@ -1294,14 +1325,13 @@ impl SignalTerminationReports {
 
 impl Drop for SignalTerminationReports {
     fn drop(&mut self) {
-        if std::thread::panicking() {
+        if std::thread::panicking() || self.0.is_empty() {
             return;
         }
-        for report in &self.0 {
-            for line in report.split_inclusive('\n') {
-                crate::tracing::write_stderr_diagnostic(line);
-            }
-        }
+        QUEUED_SIGNAL_REPORTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .append(&mut self.0);
     }
 }
 

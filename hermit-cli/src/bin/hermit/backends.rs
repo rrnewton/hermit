@@ -1225,7 +1225,7 @@ pub(super) fn run_dbt(
             String::from_utf8_lossy(&first.stdout),
             String::from_utf8_lossy(&first.stderr),
         );
-        // Written here, after the run's own output.
+        // Queued here; `main` writes it after everything else.
         drop(signal_reports);
         // Record the rejected first run where its disposition is known, as the
         // ptrace path does. Left alone, the pre-stamped `not_run` record keeps

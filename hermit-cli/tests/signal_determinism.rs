@@ -578,9 +578,41 @@ fn verify_writes_no_signal_report_when_the_signaled_runs_verify() {
 /// name long paths, so the report is larger than the pipe. Written with
 /// `eprint!`, the report fails with `EAGAIN` once the pipe is full and the
 /// print macro panics: hermit exits 101 instead of the rejected first run's
-/// 125. On a blocking pipe the same write would wait forever.
+/// 125.
 #[test]
 fn verify_signal_report_cannot_replace_the_disposition_on_a_full_stderr() {
+    assert_signal_report_cannot_hold_the_disposition(&["--max-log-bytes=64M"], true, 4096, 0);
+}
+
+/// The same without `--max-log-bytes`, on a blocking pipe: the report must
+/// not wait for room itself, and must not fill the pipe ahead of the
+/// disposition hermit still has to write (`main`'s error report waits for a
+/// reader to make room).
+///
+/// The pipe has two pages, and 2048 bytes already wait in it, so the report
+/// cannot fit in what is left: written with an ordinary write, it waits.
+/// Linux adds a short write only to a pipe's last page, and the report is
+/// longer than what is left of the first, so it ends on a full second page
+/// and an ordinary write behind it waits too. With one page the report could
+/// only top up the first, leaving the room a disposition written after it
+/// needs, and the order would go untested.
+#[test]
+fn verify_signal_report_cannot_hold_the_disposition_on_a_full_blocking_stderr() {
+    assert_signal_report_cannot_hold_the_disposition(&[], false, 8192, 2048);
+}
+
+/// Run a first run that a signal ends and `--verify` rejects, with stderr a
+/// `pipe_bytes` pipe holding `waiting_bytes` that nobody reads until hermit
+/// exits, `O_NONBLOCK` when `nonblocking`, and require the rejected first
+/// run's status, within a bound, with the disposition and the report's first
+/// line delivered. The report (20 records naming a 300-byte path, about
+/// 7.8 KB) is larger than a page.
+fn assert_signal_report_cannot_hold_the_disposition(
+    global_args: &[&str],
+    nonblocking: bool,
+    pipe_bytes: i32,
+    waiting_bytes: usize,
+) {
     use std::os::unix::io::FromRawFd;
     let _guard = hermit_signal_lock();
 
@@ -593,15 +625,21 @@ fn verify_signal_report_cannot_replace_the_disposition_on_a_full_stderr() {
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
     let (read_fd, write_fd) = (fds[0], fds[1]);
     // SAFETY: fcntl on descriptors this test owns.
-    let pipe_bytes = unsafe {
-        libc::fcntl(write_fd, libc::F_SETPIPE_SZ, 4096);
+    let capacity = unsafe {
+        libc::fcntl(write_fd, libc::F_SETPIPE_SZ, pipe_bytes);
         libc::fcntl(write_fd, libc::F_GETPIPE_SZ)
     };
-    assert_eq!(pipe_bytes, 4096, "pipe capacity");
-    // SAFETY: as above.
-    unsafe {
-        let flags = libc::fcntl(write_fd, libc::F_GETFL);
-        libc::fcntl(write_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    assert_eq!(capacity, pipe_bytes, "pipe capacity");
+    let waiting = vec![b'.'; waiting_bytes];
+    // SAFETY: `waiting` is valid for its length; it fits in the empty pipe.
+    let written = unsafe { libc::write(write_fd, waiting.as_ptr().cast(), waiting.len()) };
+    assert_eq!(written, waiting_bytes as isize, "bytes waiting in the pipe");
+    if nonblocking {
+        // SAFETY: as above.
+        unsafe {
+            let flags = libc::fcntl(write_fd, libc::F_GETFL);
+            libc::fcntl(write_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
     }
     // SAFETY: each descriptor is owned by exactly one of these.
     let (mut reader, writer) =
@@ -609,8 +647,8 @@ fn verify_signal_report_cannot_replace_the_disposition_on_a_full_stderr() {
 
     let mut command = Command::new(hermit_test::hermit_binary());
     command
+        .args(global_args)
         .args([
-            "--max-log-bytes=64M",
             "run",
             "--verify",
             "--base-env=minimal",
@@ -629,7 +667,7 @@ fn verify_signal_report_cannot_replace_the_disposition_on_a_full_stderr() {
     // Dropped so that only hermit holds the write end.
     drop(command);
     // Bounded, so a report that waits is a failure rather than a hang.
-    let deadline = Duration::from_secs(60);
+    let deadline = Duration::from_secs(30);
     let status = loop {
         match child.try_wait().expect("try_wait") {
             Some(status) => break Some(status),
@@ -653,6 +691,10 @@ fn verify_signal_report_cannot_replace_the_disposition_on_a_full_stderr() {
         status.code(),
         Some(HERMIT_INTERNAL_FAILURE_EXIT),
         "the report replaced the rejected first run's status\nstderr:\n{delivered}"
+    );
+    assert!(
+        delivered.contains("First run during --verify"),
+        "the disposition must arrive ahead of the report\nstderr:\n{delivered}"
     );
     assert!(
         delivered.contains(":: The run 1 guest was terminated by signal 10 (SIGUSR1)."),

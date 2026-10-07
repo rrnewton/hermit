@@ -6315,7 +6315,7 @@ impl RunOpts {
                 String::from_utf8_lossy(&out1.stdout),
                 String::from_utf8_lossy(&out1.stderr),
             );
-            // Written here, after the run's own output.
+            // Queued here; `main` writes it after everything else.
             drop(signal_reports);
             // ⚠️ RECORD THE DISPOSITION HERE, WHERE IT IS KNOWN. `out1.status`
             // is in hand, yet the pre-stamped `no_result` record was previously

@@ -1421,7 +1421,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // verify_writes_no_signal_report_when_the_signaled_runs_verify and
     // verify_signal_report_cannot_replace_the_disposition_on_a_full_stderr)
     // retain all 275 (281, measured with cargo nextest list).
-    ("test.hermit_integration", 281),
+    // verify_signal_report_cannot_hold_the_disposition_on_a_full_blocking_stderr
+    // retains all 281 (282).
+    ("test.hermit_integration", 282),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -1848,7 +1850,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin also selects the 68 external_signal_interrupt tests
     // (https://github.com/rrnewton/hermit/pull/3361) (275, measured).
     // And the six verify signal-report tests (281).
-    ("test.hermit_integration_on_host", 281),
+    // And the blocking-stderr signal-report test (282).
+    ("test.hermit_integration_on_host", 282),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
