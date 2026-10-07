@@ -1105,6 +1105,42 @@ mod tests {
         Ok(*options)
     }
 
+    /// Runs `test` (this module's test of that name) in two child processes,
+    /// once with `HERMIT_EPOCH` unset and once set to [`OTHER`], and returns
+    /// `None`. Inside such a child it returns the arm, `"unset"` or `"set"`.
+    /// `HERMIT_EPOCH` counts as an explicit epoch, so the validation's
+    /// forwarded value cannot decide the checks.
+    fn epoch_environment_arm(test: &str) -> Option<String> {
+        const CHILD: &str = "HERMIT_ANALYZE_EPOCH_TEST_CHILD";
+        if let Some(arm) = std::env::var_os(CHILD) {
+            return Some(arm.into_string().unwrap());
+        }
+        let name = format!("{}::{test}", module_path!().split_once("::").unwrap().1);
+        for arm in ["unset", "set"] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", &name, "--nocapture"])
+                .env(CHILD, arm);
+            if arm == "set" {
+                child.env("HERMIT_EPOCH", OTHER);
+            } else {
+                child.env_remove("HERMIT_EPOCH");
+            }
+            let output = child.output().unwrap();
+            assert!(output.status.success(), "{arm}: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{arm}: the child ran no test: {output:?}"
+            );
+        }
+        None
+    }
+
+    fn refused(error: anyhow::Error, expected: &str) {
+        assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+        assert!(error.to_string().contains(expected), "{error:#}");
+    }
+
     /// The trial that replays `--run1-preemptions` starts from the epoch the
     /// record was made under, as `hermit run` replaying it does
     /// (https://github.com/rrnewton/hermit/issues/3870). Before, it started
@@ -1114,37 +1150,13 @@ mod tests {
     /// other than the recorded one.
     #[test]
     fn analyze_replays_a_record_from_the_epoch_it_was_recorded_under() {
-        const CHILD: &str = "HERMIT_ANALYZE_EPOCH_TEST_CHILD";
-        let Some(arm) = std::env::var_os(CHILD) else {
-            let name = format!(
-                "{}::analyze_replays_a_record_from_the_epoch_it_was_recorded_under",
-                module_path!().split_once("::").unwrap().1
-            );
-            for arm in ["unset", "set"] {
-                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
-                child
-                    .args(["--exact", &name, "--nocapture"])
-                    .env(CHILD, arm);
-                if arm == "set" {
-                    child.env("HERMIT_EPOCH", OTHER);
-                } else {
-                    child.env_remove("HERMIT_EPOCH");
-                }
-                let output = child.output().unwrap();
-                assert!(output.status.success(), "{arm}: {output:?}");
-                assert!(
-                    String::from_utf8_lossy(&output.stdout).contains("1 passed"),
-                    "{arm}: the child ran no test: {output:?}"
-                );
-            }
+        let Some(arm) =
+            epoch_environment_arm("analyze_replays_a_record_from_the_epoch_it_was_recorded_under")
+        else {
             return;
         };
         let dir = tempfile::tempdir().unwrap();
         let dir = dir.path();
-        let refused = |error: anyhow::Error, expected: &str| {
-            assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
-            assert!(error.to_string().contains(expected), "{error:#}");
-        };
         if arm == "set" {
             refused(
                 prepared_analysis(dir, Some(RECORDED), None, &[]).unwrap_err(),
@@ -1187,6 +1199,69 @@ mod tests {
                 "was recorded under the virtual-time epoch {RECORDED_RFC3339} and \
                  --run2-preemptions"
             ),
+        );
+    }
+
+    /// A network trace the run arguments replay (`--replay-networking`)
+    /// releases its inputs at absolute virtual times measured from its own
+    /// epoch, and every trial replays it. The trials start from that epoch,
+    /// and a trace that disagrees with a preemption record or an explicit
+    /// epoch is refused before any trial, as `hermit run` refuses it
+    /// (https://github.com/rrnewton/hermit/issues/3875). Before, the trials
+    /// replayed it from the run arguments' epoch.
+    #[test]
+    fn analyze_replays_a_network_trace_from_the_epoch_it_was_recorded_under() {
+        let Some(arm) = epoch_environment_arm(
+            "analyze_replays_a_network_trace_from_the_epoch_it_was_recorded_under",
+        ) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        let trace = |name: &str, epoch: &str| {
+            let path = dir.join(format!("{name}.trace"));
+            detcore_model::network_engine::NetworkEngine::new_record(epoch.parse().unwrap())
+                .finish()
+                .unwrap()
+                .write_framed(std::fs::File::create(&path).unwrap())
+                .unwrap();
+            format!("--replay-networking={}", path.display())
+        };
+        let recorded = trace("recorded", RECORDED);
+        if arm == "set" {
+            refused(
+                prepared_analysis(dir, None, None, &[&recorded]).unwrap_err(),
+                &format!(
+                    "the explicit virtual-time epoch 2026-01-01T00:00:00+00:00 (from --epoch or \
+                     HERMIT_EPOCH) differs from the epoch {RECORDED_RFC3339} that \
+                     --replay-networking"
+                ),
+            );
+            return;
+        }
+
+        // The trace alone sets the trials' epoch.
+        let analysis = prepared_analysis(dir, None, None, &[&recorded]).unwrap();
+        assert_eq!(analysis.trial_epoch_for_test(), RECORDED_RFC3339);
+
+        // With a preemption record from the same epoch it is accepted.
+        let analysis = prepared_analysis(dir, Some(RECORDED), None, &[&recorded]).unwrap();
+        assert_eq!(analysis.trial_epoch_for_test(), RECORDED_RFC3339);
+
+        // A trace from another epoch than the record is refused, naming both.
+        let other = trace("other", OTHER);
+        refused(
+            prepared_analysis(dir, Some(RECORDED), None, &[&other]).unwrap_err(),
+            &format!(
+                "was recorded under the virtual-time epoch {RECORDED_RFC3339} and \
+                 --replay-networking"
+            ),
+        );
+
+        // An explicit epoch other than the trace's is refused.
+        refused(
+            prepared_analysis(dir, None, None, &[&recorded, "--epoch", OTHER]).unwrap_err(),
+            &format!("pass --epoch={RECORDED_RFC3339}"),
         );
     }
 }

@@ -5464,6 +5464,13 @@ impl RunOpts {
         Ok(())
     }
 
+    /// The trace `--replay-networking` names, as given. `hermit analyze` and
+    /// `hermit bisect` reconcile its epoch before their trials start
+    /// (`AnalyzeOpts::adopt_recorded_epoch`).
+    pub(crate) fn replay_networking_trace(&self) -> Option<&Path> {
+        self.replay_networking.as_deref()
+    }
+
     /// The network trace mode the record and replay flags select, `Off` with
     /// neither. A replay trace is read and checked here so a bad path fails
     /// before the guest starts.

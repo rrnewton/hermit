@@ -617,21 +617,52 @@ impl AnalyzeOpts {
     /// reconcile epochs, so without this they would start from the run
     /// arguments' epoch instead.
     ///
+    /// A network trace that the run arguments replay (`--replay-networking`)
+    /// is reconciled with them: its inputs are released at absolute virtual
+    /// times too (https://github.com/rrnewton/hermit/issues/3875).
+    ///
     /// Records stored under two different epochs, or an explicit epoch
     /// (`--epoch` or `HERMIT_EPOCH`) that differs from theirs, are refused
     /// before any trial. Records written before epochs were stored carry none
     /// and change nothing. Each recording is named by its option, such as
     /// `--good`, and its path.
     pub fn adopt_recorded_epoch(&mut self, recordings: &[(&str, &Path)]) -> anyhow::Result<()> {
+        let run_cmd = std::iter::once("hermit-run").chain(
+            self.run_arg
+                .iter()
+                .chain(&self.run_args)
+                .map(String::as_str),
+        );
+        let matches = RunOpts::command()
+            .try_get_matches_from(run_cmd)
+            .context("cannot parse the trials' run arguments")?;
+        let parsed = RunOpts::from_arg_matches(&matches)?;
+        let mut epochs = Vec::new();
+        for (option, path) in recordings {
+            let epoch =
+                detcore::preemptions::read_recorded_epoch(path).map_err(anyhow::Error::msg)?;
+            epochs.push((format!("{option} {}", path.display()), epoch));
+        }
+        // A network trace given in the run arguments releases its inputs at
+        // absolute virtual times too, and every trial replays it.
+        if let Some(path) = parsed.replay_networking_trace() {
+            let file = File::open(path)
+                .with_context(|| format!("cannot open network trace {}", path.display()))?;
+            let trace = detcore_model::network_trace::NetworkTraceV2::read_framed(
+                std::io::BufReader::new(file),
+            )
+            .with_context(|| format!("{} is not a valid network trace", path.display()))?;
+            epochs.push((
+                format!("--replay-networking {}", path.display()),
+                Some(trace.epoch),
+            ));
+        }
         let mut recorded = None;
         let mut sources: Vec<String> = Vec::new();
-        for (option, path) in recordings {
-            let Some(epoch) =
-                detcore::preemptions::read_recorded_epoch(path).map_err(anyhow::Error::msg)?
-            else {
+        for (source, epoch) in epochs {
+            let Some(epoch) = epoch else {
                 continue;
             };
-            let source = format!("{option} {}", path.display());
             match recorded {
                 None => recorded = Some(epoch),
                 Some(first) if first != epoch => {
@@ -654,24 +685,12 @@ impl AnalyzeOpts {
         let Some(recorded) = recorded else {
             return Ok(());
         };
-        let run_cmd = std::iter::once("hermit-run").chain(
-            self.run_arg
-                .iter()
-                .chain(&self.run_args)
-                .map(String::as_str),
-        );
-        let matches = RunOpts::command()
-            .try_get_matches_from(run_cmd)
-            .context("cannot parse the trials' run arguments")?;
         let recorded_text = recorded.to_rfc3339();
         if matches.value_source("epoch") == Some(ValueSource::DefaultValue) {
             self.run_arg.push(format!("--epoch={recorded_text}"));
             return Ok(());
         }
-        let explicit = RunOpts::from_arg_matches(&matches)?
-            .det_opts
-            .det_config
-            .epoch;
+        let explicit = parsed.det_opts.det_config.epoch;
         if explicit == recorded {
             return Ok(());
         }

@@ -1144,7 +1144,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run::display_runopts_without_a_pmu_profile retains all 957: 958, listed
     // with this node's arguments.
     // run::tests::a_green_run_removes_only_its_own_fatal_cores: 959.
-    ("test.hermit_unit", 959),
+    // analyze::phases::tests::analyze_replays_a_network_trace_from_the_epoch_it_was_recorded_under
+    // (https://github.com/rrnewton/hermit/issues/3875) retains all 959: 960,
+    // measured with cargo nextest list.
+    ("test.hermit_unit", 960),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2111,7 +2114,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the analyze epoch test: 957.
     // And the PMU-profile validation test: 958.
     // And the same fatal-core cleanup test: 959.
-    ("test.hermit_unit_on_host", 959),
+    // And the analyze network-trace epoch test: 960.
+    ("test.hermit_unit_on_host", 960),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
