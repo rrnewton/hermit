@@ -601,6 +601,61 @@ fn verify_signal_report_cannot_hold_the_disposition_on_a_full_blocking_stderr() 
     assert_signal_report_cannot_hold_the_disposition(&[], false, 8192, 2048);
 }
 
+/// The guest output both runs agreed on is required output too, and the
+/// report must not hold it either. Both runs print `x` with no newline, so
+/// hermit's stdout still buffers it when the report is written, and are
+/// killed by SIGUSR1; `--verify-allow=failure` admits that. Only the result
+/// of run 1's check for the marker differs, which keeps the comparison's
+/// report of the difference short (about 4.7 KB), and the runs are rejected
+/// (status 1) with both reports kept (about 13 KB).
+///
+/// stdout and stderr are one blocking pipe of four pages with 5632 bytes
+/// waiting. What hermit must write ends in the third page (anywhere from
+/// about 2.5 KB to 6.5 KB of it does), leaving the fourth empty; run 1's
+/// report is larger than what is left, so it fills the fourth page, and
+/// Linux adds a short write only to a last page with room. Flushed only at
+/// exit, the `x` waits behind it until the bound kills hermit; in any other
+/// geometry it would arrive after the report, which fails too.
+#[test]
+fn verify_signal_report_cannot_hold_agreed_guest_stdout() {
+    let _guard = hermit_signal_lock();
+    let marker = run_1_marker("run-1-marked-agreed-stdout");
+    let script = format!(
+        "[ -e '{0}' ]; : > '{0}'; {1}; printf x; kill -USR1 $$",
+        marker.display(),
+        twenty_long_path_checks(),
+    );
+    let pipe = UndrainedPipe {
+        bytes: 16384,
+        waiting: 5632,
+        nonblocking: false,
+        stdout_too: true,
+    };
+    let (status, delivered) = run_against_an_undrained_pipe(
+        &[
+            "run",
+            "--verify",
+            "--verify-allow=failure",
+            "--base-env=minimal",
+        ],
+        &script,
+        pipe,
+    );
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "the report replaced the rejected runs' status\ndelivered:\n{delivered}"
+    );
+    let heading = ":: The run 1 guest was terminated by signal 10 (SIGUSR1).";
+    let (before, _) = delivered.split_once(heading).unwrap_or_else(|| {
+        panic!("the report's first line fits in the pipe and must arrive\ndelivered:\n{delivered}")
+    });
+    assert!(
+        before.ends_with('x'),
+        "the agreed guest stdout must arrive, ahead of the report\ndelivered:\n{delivered}"
+    );
+}
+
 /// Run a first run that a signal ends and `--verify` rejects, with stderr a
 /// `pipe_bytes` pipe holding `waiting_bytes` that nobody reads until hermit
 /// exits, `O_NONBLOCK` when `nonblocking`, and require the rejected first
@@ -613,28 +668,76 @@ fn assert_signal_report_cannot_hold_the_disposition(
     pipe_bytes: i32,
     waiting_bytes: usize,
 ) {
-    use std::os::unix::io::FromRawFd;
     let _guard = hermit_signal_lock();
-
-    let path = format!("/{}", "p".repeat(300));
-    let script = format!(
-        "for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ -e {path} ]; done; kill -USR1 $$"
+    let script = format!("{}; kill -USR1 $$", twenty_long_path_checks());
+    let pipe = UndrainedPipe {
+        bytes: pipe_bytes,
+        waiting: waiting_bytes,
+        nonblocking,
+        stdout_too: false,
+    };
+    let args: Vec<&str> = global_args
+        .iter()
+        .copied()
+        .chain(["run", "--verify", "--base-env=minimal"])
+        .collect();
+    let (status, delivered) = run_against_an_undrained_pipe(&args, &script, pipe);
+    assert_eq!(
+        status.code(),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
+        "the report replaced the rejected first run's status\nstderr:\n{delivered}"
     );
+    assert!(
+        delivered.contains("First run during --verify"),
+        "the disposition must arrive ahead of the report\nstderr:\n{delivered}"
+    );
+    assert!(
+        delivered.contains(":: The run 1 guest was terminated by signal 10 (SIGUSR1)."),
+        "the report's first line fits in the pipe and must arrive\nstderr:\n{delivered}"
+    );
+}
+
+/// Twenty checks for a path whose name is 300 bytes long, so that each of a
+/// run's last records is long.
+fn twenty_long_path_checks() -> String {
+    let path = format!("/{}", "p".repeat(300));
+    format!("for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ -e {path} ]; done")
+}
+
+/// A pipe of `bytes` with `waiting` bytes already in it, which nobody reads
+/// until hermit exits.
+struct UndrainedPipe {
+    bytes: i32,
+    waiting: usize,
+    nonblocking: bool,
+    /// Whether hermit's stdout is the pipe too, rather than `/dev/null`.
+    stdout_too: bool,
+}
+
+/// Run hermit with `hermit_args` and then `-- /bin/sh -c script`, its stderr
+/// `pipe`, and return its status, within a bound, and what reached the pipe.
+fn run_against_an_undrained_pipe(
+    hermit_args: &[&str],
+    script: &str,
+    pipe: UndrainedPipe,
+) -> (std::process::ExitStatus, String) {
+    use std::os::unix::io::FromRawFd;
+
     let mut fds = [0i32; 2];
     // SAFETY: `fds` holds two descriptors.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
     let (read_fd, write_fd) = (fds[0], fds[1]);
     // SAFETY: fcntl on descriptors this test owns.
     let capacity = unsafe {
-        libc::fcntl(write_fd, libc::F_SETPIPE_SZ, pipe_bytes);
+        libc::fcntl(write_fd, libc::F_SETPIPE_SZ, pipe.bytes);
         libc::fcntl(write_fd, libc::F_GETPIPE_SZ)
     };
-    assert_eq!(capacity, pipe_bytes, "pipe capacity");
-    let waiting = vec![b'.'; waiting_bytes];
+    assert_eq!(capacity, pipe.bytes, "pipe capacity");
+    let waiting = vec![b'.'; pipe.waiting];
     // SAFETY: `waiting` is valid for its length; it fits in the empty pipe.
     let written = unsafe { libc::write(write_fd, waiting.as_ptr().cast(), waiting.len()) };
-    assert_eq!(written, waiting_bytes as isize, "bytes waiting in the pipe");
-    if nonblocking {
+    assert_eq!(written, pipe.waiting as isize, "bytes waiting in the pipe");
+    if pipe.nonblocking {
         // SAFETY: as above.
         unsafe {
             let flags = libc::fcntl(write_fd, libc::F_GETFL);
@@ -642,24 +745,27 @@ fn assert_signal_report_cannot_hold_the_disposition(
         }
     }
     // SAFETY: each descriptor is owned by exactly one of these.
-    let (mut reader, writer) =
-        unsafe { (fs::File::from_raw_fd(read_fd), Stdio::from_raw_fd(write_fd)) };
+    let (mut reader, writer) = unsafe {
+        (
+            fs::File::from_raw_fd(read_fd),
+            fs::File::from_raw_fd(write_fd),
+        )
+    };
 
     let mut command = Command::new(hermit_test::hermit_binary());
     command
-        .args(global_args)
-        .args([
-            "run",
-            "--verify",
-            "--base-env=minimal",
-            "--",
-            "/bin/sh",
-            "-c",
-            &script,
-        ])
-        .stdout(Stdio::null())
-        .stderr(writer);
+        .args(hermit_args)
+        .args(["--", "/bin/sh", "-c", script]);
+    // Before stdio: in the marked integration gate this rebuilds `command`,
+    // which keeps its arguments but not its stdio.
     hermit_test::configure_guest_execution(&mut command);
+    let stdout = if pipe.stdout_too {
+        Stdio::from(writer.try_clone().expect("failed to clone the pipe"))
+    } else {
+        Stdio::null()
+    };
+    // `--verify` reads stdin to its end before run 1.
+    command.stdin(Stdio::null()).stdout(stdout).stderr(writer);
     let started = Instant::now();
     let mut child = command
         .spawn()
@@ -682,22 +788,10 @@ fn assert_signal_report_cannot_hold_the_disposition(
     let mut delivered = Vec::new();
     reader
         .read_to_end(&mut delivered)
-        .expect("failed to read the delivered stderr");
-    let delivered = String::from_utf8_lossy(&delivered);
+        .expect("failed to read the delivered output");
+    let delivered = String::from_utf8_lossy(&delivered).into_owned();
     let status = status.unwrap_or_else(|| {
-        panic!("hermit had not exited after {deadline:?}\nstderr:\n{delivered}")
+        panic!("hermit had not exited after {deadline:?}\ndelivered:\n{delivered}")
     });
-    assert_eq!(
-        status.code(),
-        Some(HERMIT_INTERNAL_FAILURE_EXIT),
-        "the report replaced the rejected first run's status\nstderr:\n{delivered}"
-    );
-    assert!(
-        delivered.contains("First run during --verify"),
-        "the disposition must arrive ahead of the report\nstderr:\n{delivered}"
-    );
-    assert!(
-        delivered.contains(":: The run 1 guest was terminated by signal 10 (SIGUSR1)."),
-        "the report's first line fits in the pipe and must arrive\nstderr:\n{delivered}"
-    );
+    (status, delivered)
 }

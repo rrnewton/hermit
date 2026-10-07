@@ -587,6 +587,10 @@ fn main() {
     if let Some(error) = evidence_error {
         display_error(error);
     }
+    // Guest output agreed by both `--verify` runs can still be buffered (no
+    // final newline), and `exit` would flush it after the report, behind
+    // whatever room the report took. As at exit, a failed flush is ignored.
+    let _ = std::io::Write::flush(&mut std::io::stdout());
     // Last, so that nothing hermit must say waits behind it.
     verify::write_queued_signal_reports();
     status.raise_or_exit();
