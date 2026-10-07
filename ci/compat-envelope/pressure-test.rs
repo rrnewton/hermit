@@ -27573,7 +27573,11 @@ print("fixture " + args[0] + " accepted")
     /// A dev-hermit checkout under `root` whose `series.py` reads and accepts
     /// an append-parity and runs `cells`, Python with `args`, `parent`,
     /// `json`, `os`, `stat`, `subprocess`, `sys` and `time` in scope, for an
-    /// append-cells.
+    /// append-cells. Its `append-parity --help` writes `parity-help-started`
+    /// next to it: its own time namespace, the target of
+    /// `/proc/self/ns/time` (`none` where Linux has no time namespaces),
+    /// then for itself and each process above it, a line with the pid, the
+    /// parent's pid and the start time from `/proc/<pid>/stat`.
     fn scripted_parent(root: &Path, cells: &str) -> PathBuf {
         let parent = root.join("parent");
         let series = parent.join("ci-hub/series");
@@ -27582,6 +27586,20 @@ print("fixture " + args[0] + " accepted")
             "import json, os, pathlib, stat, subprocess, sys, time",
             "args = sys.argv[1:]",
             "if args == ['append-parity', '--help']:",
+            "    try:",
+            "        ns = os.readlink('/proc/self/ns/time')",
+            "    except FileNotFoundError:",
+            "        ns = 'none'",
+            "    pid, chain = os.getpid(), [f'{ns}\\n']",
+            "    while pid > 1:",
+            "        try:",
+            "            stat = pathlib.Path(f'/proc/{pid}/stat').read_text()",
+            "        except OSError:",
+            "            break",
+            "        fields = stat.rsplit(')', 1)[1].split()",
+            "        chain.append(f'{pid} {fields[1]} {fields[19]}\\n')",
+            "        pid = int(fields[1])",
+            "    pathlib.Path(__file__).with_name('parity-help-started').write_text(''.join(chain))",
             "    sys.exit(0)",
             "parent = pathlib.Path(args[args.index('--parent') + 1])",
             "if args[0] == 'append-parity':",
@@ -27667,31 +27685,339 @@ print("fixture " + args[0] + " accepted")
         assert_eq!(emission.parity, accepted_parity(&results));
     }
 
-    /// An append-cells still running at its bound is killed with everything
-    /// it started, the emit says so, and the parity rows still go out
+    /// What a probe in a writer's process group runs, as `bash -c` with the
+    /// writer's pid as `$1`: it exits with status 3 as soon as it finds the
+    /// writer dead (a zombie, or reaped), checking every 10 ms (`read -t` on
+    /// a pipe that nothing writes to). A probe that is in the group when the
+    /// group is killed never exits with status 3. Linux kills a process
+    /// group by making SIGKILL pending for every member while it holds the
+    /// task list lock, and the writer can become a zombie only once it holds
+    /// that lock itself, so SIGKILL is pending for the probe before the
+    /// writer is dead. The probe can see the writer dead only through a
+    /// system call that reads /proc after that, and Linux acts on a pending
+    /// SIGKILL before a system call returns, so the probe never gets to run
+    /// `exit 3`; an exit it calls with SIGKILL pending ends with the kill's
+    /// status instead (checked against the 7.1.3 kernel these tests ran on).
+    /// So a probe that exits with status 3 was not in the kill that ended
+    /// the writer, or could not read the writer's stat for some other
+    /// reason, which can fail the test but never pass it.
+    const PROBE: &str = "while read -r stat < \"/proc/$1/stat\"; do stat=${stat##*) }; \
+        case ${stat%% *} in Z | X) break ;; esac; read -r -t 0.01 || :; done; exit 3";
+
+    /// A [`PROBE`] started in a writer's process group, killed and reaped
+    /// when dropped so that a failed check leaves no process behind.
+    struct Probe(std::process::Child);
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// The fields of a process's `/proc/<pid>/stat` that these tests read,
+    /// which follow its parenthesised command name.
+    struct ProcStat {
+        parent: u32,
+        group: u32,
+        /// When the process was created, in clock ticks on a [`BootClock`].
+        started: u64,
+    }
+
+    fn proc_stat(pid: u32) -> Option<ProcStat> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let fields = stat
+            .rsplit_once(')')?
+            .1
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        Some(ProcStat {
+            parent: fields.get(1)?.parse().ok()?,
+            group: fields.get(2)?.parse().ok()?,
+            started: fields.get(19)?.parse().ok()?,
+        })
+    }
+
+    /// Why process `pid`, as `/proc/<pid>/status` shows it, is not still
+    /// running unharmed: a zombie or dead, or with SIGKILL pending, which a
+    /// kill leaves in its shared pending set until it is reaped. That holds
+    /// for a kill that starts the process's exit, not for one that comes
+    /// once its exit has begun for another reason (an exit of its own, or
+    /// another fatal signal): Linux drops that kill and records nothing, so
+    /// such a process looks unharmed here until it is a zombie. This test's
+    /// writer only sleeps, so nothing but a kill starts its exit.
+    fn killed_or_dead(pid: u32) -> Option<String> {
+        const SIGKILL_BIT: u64 = 1 << (9 - 1);
+        let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
+            return Some("its status could not be read".to_string());
+        };
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .map(str::trim)
+        };
+        match field("State:") {
+            Some(state) if !state.starts_with(['Z', 'X']) => {}
+            Some(state) => return Some(format!("its state was {state}")),
+            None => return Some("its status had no State".to_string()),
+        }
+        for pending in ["SigPnd:", "ShdPnd:"] {
+            match field(pending).map(|mask| u64::from_str_radix(mask, 16)) {
+                Some(Ok(mask)) if mask & SIGKILL_BIT == 0 => {}
+                Some(Ok(mask)) => return Some(format!("SIGKILL was pending ({pending} {mask:x})")),
+                _ => return Some(format!("its status had no readable {pending}")),
+            }
+        }
+        None
+    }
+
+    /// CLOCK_BOOTTIME, the clock on which Linux records when each process
+    /// was created. A start time read from it was fixed by the kernel, so a
+    /// thread that reads it late cannot move it.
+    #[derive(Clone, Copy)]
+    struct BootClock {
+        /// The unit of a start time in `/proc/<pid>/stat`: `AT_CLKTCK` in
+        /// this process's auxiliary vector, where `sysconf(_SC_CLK_TCK)`
+        /// reads it.
+        ticks_per_second: u64,
+    }
+
+    impl BootClock {
+        fn new() -> Result<Self, String> {
+            const AT_CLKTCK: u64 = 17;
+            let auxv = fs::read("/proc/self/auxv")
+                .map_err(|e| format!("cannot read /proc/self/auxv: {e}"))?;
+            let (entries, _) = auxv.as_chunks::<16>();
+            entries
+                .iter()
+                .map(|entry| {
+                    let word =
+                        |at: usize| u64::from_ne_bytes(entry[at..at + 8].try_into().unwrap());
+                    (word(0), word(8))
+                })
+                .find(|&(key, _)| key == AT_CLKTCK)
+                .map(|(_, ticks)| ticks)
+                .filter(|&ticks| ticks > 0)
+                .map(|ticks_per_second| Self { ticks_per_second })
+                .ok_or_else(|| "/proc/self/auxv has no AT_CLKTCK".to_string())
+        }
+
+        /// The start of clock tick `ticks`. A process's start time is
+        /// rounded down to its tick, so it started no earlier than this,
+        /// and before `tick(ticks + 1)`.
+        fn tick(self, ticks: u64) -> Duration {
+            let per_second = self.ticks_per_second;
+            Duration::from_secs(ticks / per_second)
+                + Duration::from_nanos((ticks % per_second) * 1_000_000_000 / per_second)
+        }
+
+        /// Now, from `/proc/uptime`. That gives it in hundredths of a
+        /// second rounded down; this rounds up, so that a time measured
+        /// from a start to now is never short.
+        fn now(self) -> Result<Duration, String> {
+            let uptime = fs::read_to_string("/proc/uptime")
+                .map_err(|e| format!("cannot read /proc/uptime: {e}"))?;
+            let (seconds, hundredths) = uptime
+                .split_whitespace()
+                .next()
+                .and_then(|up| up.split_once('.'))
+                .and_then(|(seconds, hundredths)| {
+                    Some((
+                        seconds.parse::<u64>().ok()?,
+                        hundredths.parse::<u64>().ok()?,
+                    ))
+                })
+                .ok_or_else(|| format!("/proc/uptime is not readable: {uptime:?}"))?;
+            Ok(Duration::from_secs(seconds) + Duration::from_millis(10 * (hundredths + 1)))
+        }
+    }
+
+    /// Start a [`PROBE`] with `bash` in the process group of the
+    /// append-cells writer that this process started on `script`, as soon as
+    /// that writer exists, and return it with its start on `clock`. The
+    /// writer takes its own group before its exec, so the probe joins it
+    /// however long the writer then takes to start. Fails unless the writer
+    /// leads its own group, and unless, once the probe is in that group, the
+    /// writer is still running without SIGKILL pending: so whatever kills
+    /// the writer does so after the probe joined. The search stops when
+    /// `finished` has no sender left.
+    fn probe_writer_group(
+        script: &Path,
+        bash: &Path,
+        clock: BootClock,
+        finished: &std::sync::mpsc::Receiver<()>,
+    ) -> Result<(Probe, Duration), String> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::process::CommandExt;
+
+        let me = std::process::id();
+        let script = script.as_os_str().as_bytes();
+        while let Err(std::sync::mpsc::TryRecvError::Empty) = finished.try_recv() {
+            let processes = fs::read_dir("/proc").map_err(|e| format!("cannot list /proc: {e}"))?;
+            for process in processes.flatten() {
+                let Some(pid) = process
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse().ok())
+                else {
+                    continue;
+                };
+                let Some(found) = proc_stat(pid).filter(|stat| stat.parent == me) else {
+                    continue;
+                };
+                let Ok(cmdline) = fs::read(process.path().join("cmdline")) else {
+                    continue;
+                };
+                let argv = cmdline.split(|byte| *byte == 0).collect::<Vec<_>>();
+                if !argv.contains(&script) || !argv.contains(&b"append-cells".as_slice()) {
+                    continue;
+                }
+                // Read after the exec that set this command line, so the
+                // group the writer took before it is already in place. The
+                // same start time shows the same process throughout.
+                let Some(writer) = proc_stat(pid).filter(|stat| stat.started == found.started)
+                else {
+                    continue;
+                };
+                if writer.group != pid {
+                    return Err(format!(
+                        "the writer {pid} does not lead its own process group: it is in {}",
+                        writer.group
+                    ));
+                }
+                let group = i32::try_from(pid).map_err(|e| format!("pid {pid}: {e}"))?;
+                // The pipe's writing end stays open in the returned child
+                // until it is waited for.
+                let probe = Command::new(bash)
+                    .args(["-c", PROBE, "probe", &pid.to_string()])
+                    .env_remove("BASH_ENV")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .process_group(group)
+                    .spawn()
+                    .map(Probe)
+                    .map_err(|e| {
+                        format!("cannot start a probe in the writer's process group {group}: {e}")
+                    })?;
+                // The probe joins the group before its exec, and `spawn`
+                // returns only after that exec. The status is read before
+                // the stat: a writer reaped in between shows nothing
+                // pending, and then has no stat with its start time.
+                let late = killed_or_dead(pid).or_else(|| {
+                    proc_stat(pid)
+                        .filter(|stat| stat.started == writer.started)
+                        .is_none()
+                        .then(|| "it was gone".to_string())
+                });
+                if let Some(why) = late {
+                    return Err(format!(
+                        "the writer {pid} was already killed or dead ({why}) when this thread \
+                         looked, after the probe joined its process group: the probe may have \
+                         joined after the kill at the bound, so this run shows nothing about \
+                         that kill"
+                    ));
+                }
+                let Some(joined) = proc_stat(probe.0.id()) else {
+                    return Err("cannot read the probe's stat".to_string());
+                };
+                if joined.group != pid {
+                    return Err(format!(
+                        "the probe is in process group {}, not in the writer's {pid}",
+                        joined.group
+                    ));
+                }
+                return Ok((probe, clock.tick(joined.started)));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Err(format!(
+            "no append-cells writer on {} appeared among this process's children",
+            String::from_utf8_lossy(script)
+        ))
+    }
+
+    /// An append-cells still running at its bound is killed with its whole
+    /// process group, the emit says so, and the parity rows still go out
     /// (review A Minor of
     /// <https://github.com/rrnewton/hermit/issues/3301#issuecomment-5911273090>).
-    /// The bound leaves the writer ample time to start its child first.
+    /// The group's other member is a probe this test starts in it as soon as
+    /// the writer exists, not a child the writer starts itself: whether the
+    /// writer got that far within its bound depended on how fast it started,
+    /// and a loaded host has delayed that start past the 5 s bound. The test
+    /// fails unless the probe joined the group before the writer was killed,
+    /// and it times the kill and the end of the bounded wait from the probe's
+    /// start as Linux recorded it, which a thread scheduled late cannot move.
     #[test]
     fn a_hung_cells_writer_is_killed_with_its_process_group() {
+        use std::os::unix::process::ExitStatusExt;
+
+        const BOUND: Duration = Duration::from_secs(5);
+        // Three times the writer's bound, from the probe's start.
+        const WINDOW: Duration = Duration::from_secs(15);
         let fixture = Fixture::new("emit-hung", WRITER);
         let results = fixture.path("results");
         plant_emittable_series(&results, 0);
         let parent = scripted_parent(
             &fixture.root.path,
-            "sleeper = subprocess.Popen(['sleep', '60'])\n\
-             parent.joinpath('sleeper.pid').write_text(str(sleeper.pid))\n\
-             time.sleep(60)",
+            "time.sleep(30)\n\
+             parent.joinpath('slept-30-s').write_text('')\n\
+             time.sleep(30)",
         );
-        let started = Instant::now();
-        let emission = emit_series_to(
-            &parent,
-            &results,
-            &fixture.path("checkout"),
-            false,
-            Duration::from_secs(5),
-            parity::AppendBounds::default(),
-        );
+        let script = parent.join("ci-hub/series/series.py");
+        // Found before the emit starts, in an absolute directory: a PATH
+        // lookup can stall on a loaded host, and a process stalled in one
+        // does not die at once of SIGKILL.
+        let bash = env::var_os("PATH")
+            .and_then(|path| {
+                env::split_paths(&path)
+                    .map(|dir| dir.join("bash"))
+                    .find(|file| file.is_absolute() && file.is_file())
+            })
+            .expect("bash is in an absolute directory on PATH");
+        let clock = BootClock::new().unwrap_or_else(|why| panic!("{why}"));
+        let (emission, probe) = std::thread::scope(|scope| {
+            // Dropping `emitting`, by a panic too, ends the probe's search.
+            let (emitting, finished) = std::sync::mpsc::channel::<()>();
+            let probe = scope.spawn(move || {
+                // Watched while the emit runs, and timed from the probe's
+                // start, which comes after the writer's exec, so the
+                // writer's start does not count. This thread's delays cannot
+                // move that origin, but they do count: an end it sees only
+                // after the window fails the test, however early it came.
+                let (mut probe, started) = probe_writer_group(&script, &bash, clock, &finished)?;
+                loop {
+                    let ended = probe
+                        .0
+                        .try_wait()
+                        .map_err(|e| format!("cannot wait for the probe: {e}"))?;
+                    // Read after the wait, so the probe ended no later than
+                    // this, however long this thread went unscheduled.
+                    let now = clock.now()?;
+                    let waited = now.checked_sub(started).ok_or_else(|| {
+                        format!("the clock read {now:?}, before the probe's start at {started:?}")
+                    })?;
+                    if ended.is_some() || waited >= WINDOW {
+                        return Ok((probe, started, ended, waited));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
+            let emission = emit_series_to(
+                &parent,
+                &results,
+                &fixture.path("checkout"),
+                false,
+                BOUND,
+                parity::AppendBounds::default(),
+            );
+            drop(emitting);
+            (emission, probe.join().unwrap())
+        });
+        // The probe was in the writer's group before the writer was killed,
+        // or the observer failed here.
+        let (_probe, started, ended, waited) = probe.unwrap_or_else(|why: String| panic!("{why}"));
         assert_eq!(
             emission.cells,
             Err(
@@ -27701,25 +28027,82 @@ print("fixture " + args[0] + " accepted")
             )
         );
         assert_eq!(emission.parity, accepted_parity(&results));
-        assert!(started.elapsed() < Duration::from_secs(30));
-        // The writer's child was killed with it: its process is gone or
-        // awaits only its reaper.
-        let sleeper = fs::read_to_string(parent.join("sleeper.pid")).unwrap();
-        let stat = PathBuf::from(format!("/proc/{}/stat", sleeper.trim()));
-        let killed = || {
-            fs::read_to_string(&stat).map_or(true, |text| {
-                text.rsplit_once(')')
-                    .is_some_and(|(_, rest)| rest.trim_start().starts_with(['Z', 'X']))
-            })
-        };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !killed() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        // A probe in the writer's group when the group is killed never exits
+        // with status 3 (see PROBE): one that did saw the writer killed
+        // without the rest of its group (alone, or with the group killed
+        // later, even a second later), or could not read the writer's stat.
+        // The converse does not hold. Between a kill of the writer alone at
+        // its bound and a kill of its group later in the window, the probe
+        // must both read the writer's stat afresh, finding it dead, and exit
+        // with status 3 before that later kill, or this passes: a probe kept
+        // off the CPU for that time, or one that runs then only on a read
+        // made before the writer died, dies of the later kill having never
+        // seen the writer dead.
         assert!(
-            killed(),
-            "the writer's child {} outlived it",
-            sleeper.trim()
+            ended.and_then(|status| status.code()) != Some(3),
+            "the probe in the writer's process group saw the writer dead while the probe \
+             still ran: the writer was killed at its {BOUND:?} bound without the rest of its \
+             group, or the probe could not read the writer's stat"
+        );
+        // The writer was killed at its bound, not waited for. Counted from
+        // the writer's own start, so a slow start cannot fail it, unlike a
+        // limit on the whole emit, which also waits for the parity check's
+        // and the parity append's python3 starts.
+        assert!(
+            !parent.join("slept-30-s").exists(),
+            "the writer slept for 30 s, so it was not killed at its 5 s bound"
+        );
+        // And the group's kill ended the probe, within the window. An end
+        // seen only after the window may have come from the cleanup kill
+        // that ends the bounded wait, however late that is.
+        assert!(
+            ended.map(|status| status.signal()) == Some(Some(9)) && waited < WINDOW,
+            "the probe in the writer's process group was not killed with it within \
+             {WINDOW:?} of the probe's start: {ended:?} after {waited:?}"
+        );
+        // And the emit returned from the writer's bounded wait within the
+        // window too: it starts its parity check right after that wait, in a
+        // process of its own that this test's process started and whose
+        // start Linux fixed before that process looked for python3. A
+        // bounded wait that returned late, however promptly it killed the
+        // group, starts the check late.
+        let me = std::process::id().to_string();
+        let chain = fs::read_to_string(parent.join("ci-hub/series/parity-help-started"))
+            .expect("the emit ran its parity check");
+        let mut lines = chain.lines();
+        // Linux shifts a start time read from /proc by the boot-time offset
+        // of the reader's time namespace, so the parity check's start is on
+        // the clock of the probe's start and of `clock.now()`, both read by
+        // this test, only if the parity check read it in this test's.
+        let namespace = match fs::read_link("/proc/self/ns/time") {
+            Ok(namespace) => namespace.to_string_lossy().into_owned(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => "none".to_string(),
+            Err(error) => panic!("cannot read this test's time namespace: {error}"),
+        };
+        assert_eq!(
+            lines.next(),
+            Some(namespace.as_str()),
+            "the parity check read its start in a time namespace other than this test's, so \
+             on a clock that may be offset from the window's"
+        );
+        let parity_started = lines
+            .find_map(|line| match line.split(' ').collect::<Vec<_>>()[..] {
+                [_, ppid, ticks] if ppid == me => ticks.parse::<u64>().ok(),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no process started by this test in {chain:?}"));
+        let parity_by = clock.tick(parity_started + 1);
+        let returned = parity_by.checked_sub(started).unwrap_or_else(|| {
+            panic!(
+                "the emit started its parity check by {parity_by:?}, before the probe started \
+                 at {started:?}, though it starts it only once the writer is dead, which came \
+                 after the probe's start"
+            )
+        });
+        assert!(
+            returned < WINDOW,
+            "the emit started its parity check {returned:?} after the probe started, not \
+             within {WINDOW:?}: the bounded wait for the writer returned late"
         );
     }
 }
