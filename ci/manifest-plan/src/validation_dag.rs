@@ -231,11 +231,17 @@ pub const HOSTED_PORTABLE_EXCLUDED_BACKENDS: &[&str] = &["kvm"];
 /// initialization failed: CPUID faulting is unavailable: No such device`, and
 /// the runtime-staging case failed earlier only because the prebuilt tree did
 /// not yet ship the runtime it launches. The five `liteinst_in_guest_verify_`
-/// cases came later and run guests under the same runtime. Only
-/// `test.cli_on_host` excludes
-/// them, with one exact-name filterset (`-E 'not (test(=NAME) | ...)'`) rather
-/// than substring `--skip`s; the local `test.cli` keeps running every one in
-/// the pinned root, and a test below holds both sides to this list.
+/// cases came later and run guests under the same runtime. In portable run
+/// <https://github.com/rrnewton/hermit/actions/runs/37543769782> four later
+/// cases (exit reaping, unscheduled deaths, userfaultfd self-service and the
+/// `/dev/fuse` refusal) failed with the same error. The FUSE plain-file case
+/// starts the same runtime; that run reported it passed only because the
+/// runner has no FUSE mount, so it returned before launching anything, and on
+/// a runner with one it would fail the same way. Only `test.cli_on_host`
+/// excludes them, with one exact-name filterset (`-E 'not (test(=NAME) |
+/// ...)'`) rather than substring `--skip`s; the local `test.cli` keeps running
+/// every one in the pinned root, and a test below holds both sides to this
+/// list.
 pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_backend_stats_report_the_guests_own_dispatch_paths",
     "liteinst_in_guest_programs::liteinst_in_guest_abnormal_exit_after_registration_does_not_hang",
@@ -245,6 +251,7 @@ pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_in_guest_programs::liteinst_in_guest_dispatch_record_reports_patched_sites",
     "liteinst_in_guest_programs::liteinst_in_guest_dup_aliases_share_one_cursor_after_fork",
     "liteinst_in_guest_programs::liteinst_in_guest_encoding_and_digest_utilities",
+    "liteinst_in_guest_programs::liteinst_in_guest_exit_reaping_matches_ptrace",
     "liteinst_in_guest_programs::liteinst_in_guest_file_and_text_utilities",
     "liteinst_in_guest_programs::liteinst_in_guest_fork_runs_without_hanging",
     "liteinst_in_guest_programs::liteinst_in_guest_formatting_and_sequence_utilities",
@@ -254,6 +261,8 @@ pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_in_guest_programs::liteinst_in_guest_path_and_language_utilities",
     "liteinst_in_guest_programs::liteinst_in_guest_python_entropy",
     "liteinst_in_guest_programs::liteinst_in_guest_python_random_example",
+    "liteinst_in_guest_programs::liteinst_in_guest_reads_a_plain_file_on_a_fuse_filesystem",
+    "liteinst_in_guest_programs::liteinst_in_guest_refuses_a_guest_that_opens_dev_fuse",
     "liteinst_in_guest_programs::liteinst_in_guest_round2_arithmetic_and_predicate_utilities",
     "liteinst_in_guest_programs::liteinst_in_guest_round2_encoding_and_comparison_utilities",
     "liteinst_in_guest_programs::liteinst_in_guest_round2_representation_and_path_utilities",
@@ -263,7 +272,9 @@ pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_in_guest_programs::liteinst_in_guest_runtime_bootstrap_is_not_charged_to_host_identity_uptime",
     "liteinst_in_guest_programs::liteinst_in_guest_semantic_file_and_sqlite_utilities",
     "liteinst_in_guest_programs::liteinst_in_guest_semantic_text_utilities",
+    "liteinst_in_guest_programs::liteinst_in_guest_serves_its_own_userfaultfd_and_exits_registered",
     "liteinst_in_guest_programs::liteinst_in_guest_shell_and_entropy_consumer",
+    "liteinst_in_guest_programs::liteinst_in_guest_unscheduled_deaths_complete_and_refuse_verification",
     "liteinst_in_guest_programs::liteinst_in_guest_virtual_identity_and_time",
     "liteinst_in_guest_verify_compares_the_records_the_guest_forwards",
     "liteinst_in_guest_verify_forwards_records_by_the_cli_filters_per_target_answer",
