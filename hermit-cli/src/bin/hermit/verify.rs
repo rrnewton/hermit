@@ -1296,13 +1296,30 @@ pub(crate) fn write_queued_signal_reports() {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
     );
-    for report in &reports {
-        let mut rest = report.as_bytes();
+    write_signal_reports(libc::STDERR_FILENO, &reports);
+}
+
+/// Write `reports` to `fd` for [`write_queued_signal_reports`], one line per
+/// write.
+///
+/// ⚠️ ONE WRITE OF A WHOLE REPORT CAN PUT NOTHING IN A PIPE THAT HAS ROOM. A
+/// non-blocking write to a Linux pipe adds to the pipe's last page only the
+/// part of the write past its last whole page, and only when all of that part
+/// fits there; the rest needs an empty page. A report of 7.8 KB written to a
+/// one-page pipe that already holds 700 bytes is therefore refused whole,
+/// although 3.4 KB of the page are free: whether its first line arrived
+/// depended on how much hermit had said before it, and the no-perf-counters
+/// warning a GitHub-hosted runner prints was enough to lose it. Records are
+/// cut at [`SIGNAL_REPORT_LINE_BYTES`], far less than a page, so each line is
+/// added to the last page while it fits.
+fn write_signal_reports(fd: libc::c_int, reports: &[String]) {
+    for line in reports
+        .iter()
+        .flat_map(|report| report.split_inclusive('\n'))
+    {
+        let mut rest = line.as_bytes();
         while !rest.is_empty() {
-            match hermit::nonwaiting_write::write_without_waiting_for_a_reader(
-                libc::STDERR_FILENO,
-                rest,
-            ) {
+            match hermit::nonwaiting_write::write_without_waiting_for_a_reader(fd, rest) {
                 Ok(written) if written > 0 => rest = &rest[written..],
                 _ => return,
             }
@@ -2204,6 +2221,56 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    /// A report larger than a page reaches a one-page pipe that has room for
+    /// its first lines. Written as one write it put nothing there: 3600 bytes
+    /// waiting plus the 1004 bytes past the report's whole page do not fit in
+    /// the page, and a one-page pipe has no empty page for the rest.
+    #[test]
+    fn signal_reports_fill_a_pipe_that_cannot_take_them_whole() {
+        let mut fds = [0; 2];
+        // SAFETY: `fds` has room for the two descriptors.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let (read_end, write_end) = (fds[0], fds[1]);
+        // SAFETY: F_SETPIPE_SZ only resizes the pipe.
+        assert_eq!(
+            unsafe { libc::fcntl(write_end, libc::F_SETPIPE_SZ, 4096) },
+            4096
+        );
+        let waiting = vec![b'.'; 3600];
+        // SAFETY: `waiting` is valid for its length.
+        let wrote = unsafe { libc::write(write_end, waiting.as_ptr().cast(), waiting.len()) };
+        assert_eq!(wrote, 3600);
+
+        let heading = format!(
+            "{:<99}\n",
+            ":: The run 1 guest was terminated by signal 10 (SIGUSR1)."
+        );
+        let record = format!("{:<99}\n", "record");
+        let report = format!("{heading}{}", record.repeat(50));
+        assert_eq!(report.len() % 4096, 1004);
+        write_signal_reports(write_end, &[report]);
+        // SAFETY: closes only the pipe's write end, opened above.
+        unsafe { libc::close(write_end) };
+
+        let mut delivered = Vec::new();
+        let mut buffer = [0u8; 8192];
+        loop {
+            // SAFETY: `buffer` is valid for its length.
+            let read = unsafe { libc::read(read_end, buffer.as_mut_ptr().cast(), buffer.len()) };
+            assert!(read >= 0, "{}", std::io::Error::last_os_error());
+            if read == 0 {
+                break;
+            }
+            delivered.extend_from_slice(&buffer[..read as usize]);
+        }
+        // SAFETY: closes only the pipe's read end, opened above.
+        unsafe { libc::close(read_end) };
+        // The four whole lines that fit: a line is never split across the
+        // page's end, because the part past a whole page must fit whole.
+        assert_eq!(delivered.len(), 4000);
+        assert_eq!(&delivered[3600..3700], heading.as_bytes());
+    }
 
     #[test]
     fn signal_termination_report_shows_the_last_detlog_records() {
