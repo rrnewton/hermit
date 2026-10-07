@@ -134,6 +134,12 @@ struct InodePool {
     ///
     /// It counts *requests*, not distinct host inodes: see [`Self::add_inode`].
     next_inode: u64,
+    /// Virtual mtimes set (by a write or `utimensat`) on host inodes that have
+    /// no deterministic number yet. Setting an mtime does not number the file:
+    /// whether those calls reach the pool depends on host state (see
+    /// [`Self::set_mtime`]), so they must not consume counter values. The
+    /// file's first numbering request takes the pending mtime.
+    pending_mtimes: HashMap<RawInode, LogicalTime>,
 }
 
 /// Everything we know (globally) about a DetInode.
@@ -257,13 +263,19 @@ impl InodePool {
             // Above the fixed stdio inodes (`DET_SPECIAL_INODE_OFFSET`), so a
             // pooled number can never collide with one of them.
             next_inode: crate::consts::DET_INODE_OFFSET.as_raw(),
+            pending_mtimes: HashMap::new(),
         }
     }
 
     // Allocate the next deterministic inode.  This takes the raw-inode and
     // can return an existing mapping or extend the mapping by creating a
-    // new deterministic inode. The returned inode is strictly increasing
-    // to avoid inode re-use issue in some filesystem like ext4.
+    // new deterministic inode. Minted numbers are strictly increasing and
+    // never handed out twice.
+    //
+    // Host inode reuse is contained, not handled: nothing removes a mapping
+    // when its file is unlinked (`unlink_inode` has no caller), so a new file
+    // that the host gives a freed `(dev, ino)` (ext4 does) inherits the old
+    // file's number and mtime. Only that file is affected.
     //
     // Every call consumes the next counter value, whether or not it mints.
     // Whether a host inode is "new" depends on host state the guest does not
@@ -299,7 +311,7 @@ impl InodePool {
                     new,
                     DetInodeInfo {
                         raw: raw_inode,
-                        mtime: None,
+                        mtime: self.pending_mtimes.remove(&raw_inode),
                     },
                 );
                 assert!(prev.is_none()); // Should not have been previously used.
@@ -314,6 +326,28 @@ impl InodePool {
             info.mtime = observed.first_seen_mtime(epoch);
         }
         (dino, info.mtime.unwrap_or(epoch))
+    }
+
+    // Set a file's virtual mtime, replacing whatever the first-seen policy
+    // chose or would choose. This never consumes a counter value: its callers
+    // (a write's mtime bump, `utimensat`) reach the pool or not depending on
+    // host state, such as whether the target's host identity held still
+    // during the call, and a request counted here would shift the number of
+    // every file numbered after it. A file not yet numbered keeps the mtime
+    // pending until its first numbering request.
+    fn set_mtime(&mut self, raw_inode: RawInode, mtime: LogicalTime) {
+        match self.inodes.get(&raw_inode) {
+            Some(dino) => {
+                self.detinodes_info
+                    .get_mut(dino)
+                    // TODO(T87258449): remove this `expect`:
+                    .expect("Invariant violation: det inode missing from map.")
+                    .mtime = Some(mtime);
+            }
+            None => {
+                self.pending_mtimes.insert(raw_inode, mtime);
+            }
+        }
     }
 
     // remove a det inode
@@ -1886,6 +1920,9 @@ impl GlobalTool for GlobalState {
             GlobalRequest::DeterminizeInode(ino, observed) => {
                 R::DeterminizeInode(self.recv_determinize_inode(from, ino, observed).await)
             }
+            GlobalRequest::DeterminizeMappingInodes(inodes) => R::DeterminizeMappingInodes(
+                self.recv_determinize_mapping_inodes(from, inodes).await,
+            ),
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping RPC.
             GlobalRequest::DeterminizeDevice(dev) => {
@@ -2904,6 +2941,25 @@ impl GlobalState {
         (dino, ns)
     }
 
+    async fn recv_determinize_mapping_inodes(
+        &self,
+        from: Tid,
+        inodes: Vec<RawInode>,
+    ) -> Vec<DetInode> {
+        let _sched = self.lock_rpc_scheduler(false).await;
+        let epoch = self.epoch_logical_time();
+        let mut pool = self.inodes.lock().unwrap();
+        let dinos: Vec<DetInode> = inodes
+            .iter()
+            .map(|ino| pool.add_inode(*ino, ObservedMtime::Unobserved, epoch).0)
+            .collect();
+        trace!(
+            "[detcore, dtid {}] resolved mapping (raw) inodes {:?} to {:?}",
+            from, inodes, dinos
+        );
+        dinos
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping RPC.
     async fn recv_determinize_device(&self, from: Tid, raw_device: u64) -> u64 {
@@ -2995,18 +3051,7 @@ impl GlobalState {
     }
 
     fn set_inode_mtime(&self, ino: RawInode, mtime: LogicalTime) {
-        let epoch = self.epoch_logical_time();
-        let mut mg = self.inodes.lock().unwrap();
-        // If we haven't seen this inode yet (e.g. because there hasnt been a
-        // stat on it), this just-in-time adds it; the mtime set below replaces
-        // whatever the first-seen policy would have chosen.
-        let (dino, _) = mg.add_inode(ino, ObservedMtime::Unobserved, epoch);
-        let info = mg
-            .detinodes_info
-            .get_mut(&dino)
-            // TODO(T87258449): remove this `expect`:
-            .expect("Invariant violation: det inode missing from map.");
-        info.mtime = Some(mtime);
+        self.inodes.lock().unwrap().set_mtime(ino, mtime);
     }
 
     async fn recv_trace_schedevent(
@@ -3364,6 +3409,10 @@ pub enum GlobalRequest {
     /// caller observed of the host mtime (see `ObservedMtime`).
     DeterminizeInode(RawInode, ObservedMtime),
 
+    /// Translate the inode of every file-backed line of one `/proc/*/maps`
+    /// read, in line order, repeats included: one numbering request per line.
+    DeterminizeMappingInodes(Vec<RawInode>),
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping RPC.
     /// Translate a nondeterministic (host-assigned) device number to a
@@ -3513,6 +3562,7 @@ pub enum GlobalResponse {
     FutexAction(Option<SchedValue>),
     /// Return the mtime as well:
     DeterminizeInode((DetInode, LogicalTime)),
+    DeterminizeMappingInodes(Vec<DetInode>),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping RPC.
     DeterminizeDevice(u64),
@@ -4166,6 +4216,24 @@ where
     let resp = send_and_update_time(guest, GlobalRequest::DeterminizeInode(inode, observed)).await;
     match resp.1 {
         GlobalResponse::DeterminizeInode(x) => x,
+        _ => unreachable!(),
+    }
+}
+
+/// Determinize the inode of every file-backed line of one `/proc/*/maps` read.
+/// `inodes` holds one entry per line, in line order, with repeats: each entry
+/// is one numbering request, so how many requests a read makes depends on the
+/// guest's mappings alone, never on whether two lines name the same host file
+/// (<https://github.com/rrnewton/hermit/issues/2897>). The result is in the
+/// same order.
+pub async fn determinize_mapping_inodes<G, T>(guest: &mut G, inodes: Vec<RawInode>) -> Vec<DetInode>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let resp = send_and_update_time(guest, GlobalRequest::DeterminizeMappingInodes(inodes)).await;
+    match resp.1 {
+        GlobalResponse::DeterminizeMappingInodes(x) => x,
         _ => unreachable!(),
     }
 }
@@ -7856,6 +7924,45 @@ mod tests {
             later_files(&mut linked),
             later_files(&mut separate),
             "a host-dependent reused inode renumbered files minted after it"
+        );
+    }
+
+    /// Whether an mtime update reaches the pool depends on host state:
+    /// `utimensat` skips it when the target's host identity changed during the
+    /// call or the kernel stored an unexpected time. Setting an mtime must not
+    /// consume a number, so a skipped update cannot renumber later files; and
+    /// a file that gets its mtime before its number keeps that mtime.
+    #[test]
+    fn an_mtime_update_does_not_number_files() {
+        use crate::types::DetInode;
+        use crate::types::RawInode;
+
+        let epoch = LogicalTime::from_nanos(0);
+        let set = LogicalTime::from_nanos(5_000_000_000);
+        let seen = super::ObservedMtime::Unobserved;
+        let touched = RawInode::new(2049, 77);
+        let later_files = |pool: &mut super::InodePool| -> Vec<DetInode> {
+            (1_000..1_003)
+                .map(|ino| pool.add_inode(RawInode::new(2049, ino), seen, epoch).0)
+                .collect()
+        };
+
+        // The update reached the pool, before and after the file was numbered.
+        let mut applied = super::InodePool::new();
+        applied.set_mtime(touched, set);
+        let (_, mtime) = applied.add_inode(touched, seen, epoch);
+        assert_eq!(
+            mtime, set,
+            "a pending mtime is lost when the file is numbered"
+        );
+        applied.set_mtime(touched, set);
+        // The same calls with the updates skipped.
+        let mut skipped = super::InodePool::new();
+        skipped.add_inode(touched, seen, epoch);
+        assert_eq!(
+            later_files(&mut applied),
+            later_files(&mut skipped),
+            "a host-dependent mtime update renumbered later files"
         );
     }
 

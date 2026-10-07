@@ -20,6 +20,7 @@ use std::collections::BTreeSet;
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::fs::File;
+use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -2463,6 +2464,200 @@ fn host_dependent_inode_sighting_does_not_renumber_a_later_listing() {
             root
         },
         host_dependent_inode_sighting_guest,
+        true,
+    );
+}
+
+/// A `/proc/self/maps` read numbers the file behind each file-backed line.
+/// Even runs map two names that are one host file (as a hard-linked library in
+/// an optimised Nix store is), odd runs two names that are two host files.
+/// Each run fstats and maps both, reads its maps, and then lists a third
+/// directory. The fstats number both files first, so the maps read mints
+/// nothing in either case. The listing's `d_ino` values must not tell the runs
+/// apart: how many numbering requests a maps read makes must follow from the
+/// guest's mappings, not from whether two of them are one host file.
+fn mapped_hard_link_guest(root: &tempfile::TempDir) {
+    let mut mappings = Vec::new();
+    for name in ["a", "b"] {
+        let file = File::open(root.path().join(name)).unwrap();
+        file.metadata().unwrap();
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(addr, libc::MAP_FAILED);
+        mappings.push(addr);
+    }
+    let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+    assert!(maps.contains(&*root.path().join("a").to_string_lossy()));
+    let dir = open_dir(&root.path().join("listed"));
+    let listing = read_listing(dir);
+    unsafe { libc::closedir(dir) };
+    for addr in mappings {
+        assert_eq!(unsafe { libc::munmap(addr, 4096) }, 0);
+    }
+    assert_eq!(listing.names, [".", "..", "x", "y", "z"]);
+    println!("listed {:016x}", listing.digest);
+}
+
+#[test]
+fn mapped_hard_link_does_not_renumber_a_later_listing() {
+    let runs = std::sync::atomic::AtomicUsize::new(0);
+    run_five_times_on(
+        || {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("a"), [7u8; 4096]).unwrap();
+            if runs
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .is_multiple_of(2)
+            {
+                std::fs::hard_link(root.path().join("a"), root.path().join("b")).unwrap();
+            } else {
+                std::fs::write(root.path().join("b"), [7u8; 4096]).unwrap();
+            }
+            let listed = root.path().join("listed");
+            std::fs::create_dir(&listed).unwrap();
+            for name in ["x", "y", "z"] {
+                File::create(listed.join(name)).unwrap();
+            }
+            root
+        },
+        mapped_hard_link_guest,
+        true,
+    );
+}
+
+/// The test process's stdin, replaced by a pipe for one run and restored when
+/// the run's value is dropped. Detcore takes the guest's stdio identities from
+/// that descriptor.
+struct StdinAliasSetup {
+    root: tempfile::TempDir,
+    /// The read end of a pipe the guest inherits above fd 2.
+    held: std::os::fd::OwnedFd,
+    /// The pipe now on fd 0: `held`'s own pipe on even runs, another on odd.
+    _stdin_pipe: Vec<std::os::fd::OwnedFd>,
+    saved_stdin: std::os::fd::OwnedFd,
+    /// The test process, which holds `held` outside the guest.
+    test_pid: u32,
+}
+
+impl Drop for StdinAliasSetup {
+    fn drop(&mut self) {
+        assert_eq!(
+            unsafe { libc::dup2(self.saved_stdin.as_raw_fd(), libc::STDIN_FILENO) },
+            libc::STDIN_FILENO
+        );
+    }
+}
+
+fn host_pipe() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+    use std::os::fd::FromRawFd;
+    let mut fds = [0; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    unsafe {
+        (
+            std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+            std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+        )
+    }
+}
+
+/// A readlink of another guest process's `pipe:[N]` descriptor numbers that pipe,
+/// and renders the fixed stdio number instead when the pipe is the reader's
+/// inherited stdin. Even runs give the guest a descriptor that is its stdin's
+/// pipe, odd runs one that is another pipe. The guest fstats it (numbering it
+/// in both cases), forks a child that keeps it, reads the child's link, and
+/// then lists a third directory. The listing's `d_ino` values must not tell
+/// the runs apart: whether the link's pipe is the reader's stdin must not
+/// decide how many numbering requests the readlink makes.
+fn stdin_alias_readlink_guest(setup: &StdinAliasSetup) {
+    // Detcore's descriptor table admits only fds 0-2 from the tool, so the
+    // guest opens the pipe through the test process's procfs entry to get a
+    // descriptor it tracks.
+    let reopened = File::open(format!(
+        "/proc/{}/fd/{}",
+        setup.test_pid,
+        setup.held.as_raw_fd()
+    ))
+    .unwrap();
+    let held = reopened.as_raw_fd();
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    assert_eq!(unsafe { libc::fstat(held, &mut stat) }, 0);
+    let mut sync = [0; 2];
+    assert_eq!(unsafe { libc::pipe(sync.as_mut_ptr()) }, 0);
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0, "fork failed");
+    if child == 0 {
+        unsafe {
+            libc::close(sync[1]);
+            let mut byte = 0_u8;
+            let n = libc::read(sync[0], (&raw mut byte).cast(), 1);
+            libc::_exit(if n == 0 { 0 } else { 1 });
+        }
+    }
+    unsafe { libc::close(sync[0]) };
+    let link = std::fs::read_link(format!("/proc/{child}/fd/{held}")).unwrap();
+    assert!(
+        link.as_os_str().as_bytes().starts_with(b"pipe:["),
+        "unexpected link {link:?}"
+    );
+    unsafe { libc::close(sync[1]) };
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+    assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+    let dir = open_dir(&setup.root.path().join("listed"));
+    let listing = read_listing(dir);
+    unsafe { libc::closedir(dir) };
+    assert_eq!(listing.names, [".", "..", "x", "y", "z"]);
+    drop(reopened);
+    println!("listed {:016x}", listing.digest);
+}
+
+#[test]
+fn stdin_alias_does_not_renumber_a_later_listing() {
+    let runs = std::sync::atomic::AtomicUsize::new(0);
+    run_five_times_on(
+        || {
+            let root = tempfile::tempdir().unwrap();
+            let listed = root.path().join("listed");
+            std::fs::create_dir(&listed).unwrap();
+            for name in ["x", "y", "z"] {
+                File::create(listed.join(name)).unwrap();
+            }
+            let saved_stdin = std::io::stdin().as_fd().try_clone_to_owned().unwrap();
+            let (held, held_write) = host_pipe();
+            let stdin_pipe = if runs
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .is_multiple_of(2)
+            {
+                assert_eq!(
+                    unsafe { libc::dup2(held.as_raw_fd(), libc::STDIN_FILENO) },
+                    libc::STDIN_FILENO
+                );
+                vec![held_write]
+            } else {
+                let (other, other_write) = host_pipe();
+                assert_eq!(
+                    unsafe { libc::dup2(other.as_raw_fd(), libc::STDIN_FILENO) },
+                    libc::STDIN_FILENO
+                );
+                vec![held_write, other, other_write]
+            };
+            StdinAliasSetup {
+                root,
+                held,
+                _stdin_pipe: stdin_pipe,
+                saved_stdin,
+                test_pid: std::process::id(),
+            }
+        },
+        stdin_alias_readlink_guest,
         true,
     );
 }

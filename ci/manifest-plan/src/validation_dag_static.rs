@@ -1029,7 +1029,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The two verification-latch tests and the in-guest kernel-floor test retain all 915: 918.
     // The watcher's two auto-reap tests retain all 918: 920.
     // Three C3.5 fix-forward tests (a refused admission, a brief exit-path sleep, a recorded failure failing the run) retain all 920: 923.
-    ("test.hermit_unit", 923),
+    // metadata::tests::record_version_rejects_pre_request_ordinal_inode_streams
+    // and replay::tests::replay_refuses_a_recording_from_before_inode_request_ordinals
+    // (https://github.com/rrnewton/hermit/issues/2897) retain all 923: 925.
+    ("test.hermit_unit", 925),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1185,7 +1188,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tool_global::tests::a_host_dependent_new_inode_does_not_renumber_later_files
     // (https://github.com/rrnewton/hermit/issues/2897) retains all 999 (1000,
     // measured with cargo nextest list --profile ci).
-    ("test.detcore_unit", 1000),
+    // tool_global::tests::an_mtime_update_does_not_number_files (the same
+    // issue) retains all 1000 (1001, measured with cargo nextest list --profile ci).
+    ("test.detcore_unit", 1001),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1214,7 +1219,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // readdir_order's host_dependent_inode_sighting_does_not_renumber_a_later_listing
     // (https://github.com/rrnewton/hermit/issues/2897) retains all 78
     // (measured 79).
-    ("test.detcore_misc", 79),
+    // readdir_order's mapped_hard_link_does_not_renumber_a_later_listing (the
+    // same issue) retains all 79 (measured 80).
+    // readdir_order's stdin_alias_does_not_renumber_a_later_listing (the same
+    // issue) retains all 80 (measured 81).
+    ("test.detcore_misc", 81),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -1603,8 +1612,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.app_strict_verify_on_host", 8),
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
-    // The host node carries the identical 79-test tests_misc selection.
-    ("test.detcore_misc_on_host", 79),
+    // The host node carries the identical 81-test tests_misc selection.
+    ("test.detcore_misc_on_host", 81),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -1649,7 +1658,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the three write-only digest-read tests (998).
     // And the poll-family nfds extent test (999).
     // And the inode request-ordinal test (1000).
-    ("test.detcore_unit_on_host", 1000),
+    // And the mtime-update inode test (1001).
+    ("test.detcore_unit_on_host", 1001),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -1712,7 +1722,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same three latch and kernel-floor tests: 918.
     // The host twin selects the same two auto-reap tests: 920.
     // The host twin selects the same three tests: 923.
-    ("test.hermit_unit_on_host", 923),
+    // And the same two record-version tests (925).
+    ("test.hermit_unit_on_host", 925),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

@@ -2179,27 +2179,42 @@ impl<T: RecordOrReplay> Detcore<T> {
                     stdio_by_raw_inode.insert(raw, det);
                 }
             }
-            // Mint in the order the mappings appear (address order, which the
-            // guest's own mmaps decide), never in raw `(dev, ino)` order: the
-            // pools hand out numbers in request order, so sorting by host
-            // values would let a host-assigned inode decide which file gets
-            // which number (https://github.com/rrnewton/hermit/issues/2897).
-            let mut seen_pairs: BTreeSet<(u64, u64)> = BTreeSet::new();
+            // One numbering request per file-backed line, in line order
+            // (address order, which the guest's own mmaps decide), repeats and
+            // stdio-backed lines included. The pool numbers files in request
+            // order and every request consumes a number, so sorting by raw
+            // `(dev, ino)` would let a host inode decide which file gets which
+            // number, and skipping lines whose host pair repeats (hard-linked
+            // libraries) or matches stdio would let host identity decide how
+            // many numbers a read consumes
+            // (https://github.com/rrnewton/hermit/issues/2897).
+            //
+            // The device a mapping names is the filesystem's own, which on
+            // btrfs is not the per-subvolume device `stat` reports; the pair is
+            // the identity either way, as it is for the device determinized
+            // below.
             let raw_pairs: Vec<(u64, u64)> = String::from_utf8_lossy(&contents)
                 .lines()
                 .filter_map(crate::procfs::mapping_header_identity)
-                .filter(|pair| seen_pairs.insert(*pair))
                 .collect();
-            for (raw_dev, raw_inode) in raw_pairs {
-                // The device a mapping names is the filesystem's own, which on
-                // btrfs is not the per-subvolume device `stat` reports; the
-                // pair is the identity either way, as it is for the device
-                // determinized below.
-                let identity = RawInode::new(raw_dev, raw_inode);
-                let det_inode = match stdio_by_raw_inode.get(&identity) {
-                    Some(inode) => *inode,
-                    None => determinize_inode(guest, identity).await.0,
-                };
+            let pooled = determinize_mapping_inodes(
+                guest,
+                raw_pairs
+                    .iter()
+                    .map(|&(raw_dev, raw_inode)| RawInode::new(raw_dev, raw_inode))
+                    .collect(),
+            )
+            .await;
+            for (&(raw_dev, raw_inode), pooled) in raw_pairs.iter().zip(pooled) {
+                if mapping_identities.contains_key(&(raw_dev, raw_inode)) {
+                    continue;
+                }
+                let det_inode = stdio_by_raw_inode
+                    .get(&RawInode::new(raw_dev, raw_inode))
+                    .copied()
+                    .unwrap_or(pooled);
+                // The device pool numbers first sightings only, so a repeated
+                // device request changes nothing.
                 let det_dev = determinize_device(guest, raw_dev).await;
                 mapping_identities.insert((raw_dev, raw_inode), (det_dev, det_inode.as_raw()));
             }

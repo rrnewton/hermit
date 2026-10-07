@@ -184,7 +184,15 @@ impl RecordVersion {
 // replay numbers every raw ID from it. An older recording's metadata cannot
 // rebuild the mapping its guest saw, so replaying it could change the mount IDs
 // the guest reads and its control flow.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x122);
+// 0x122 -> 0x123: Detcore's inode pool starts at 9000 instead of 1 and every
+// numbering request consumes a number, so the deterministic inode numbers
+// differ (https://github.com/rrnewton/hermit/issues/2897). Even with
+// virtualize_metadata off, as record/replay runs, the procfs sanitizer renders
+// pool numbers into /proc/*/fdinfo `ino:` lines and /proc/*/maps and smaps
+// inode columns over the recorded raw bytes, during recording and again during
+// replay. An older recording replayed under the new numbering could show the
+// guest different bytes, although no event shape changed.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x123);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -209,7 +217,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x122);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x122;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x123;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -662,6 +670,15 @@ mod tests {
     #[test]
     fn record_version_rejects_pre_flock_streams() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x10b)));
+    }
+
+    /// A 0x122 recording's procfs inode numbers came from the old pool, which
+    /// started at 1 and counted only new host inodes. Replay re-renders them
+    /// from the recorded raw bytes with the current pool, so the version gate
+    /// must refuse the recording rather than show its guest other numbers.
+    #[test]
+    fn record_version_rejects_pre_request_ordinal_inode_streams() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x122)));
     }
 
     #[test]

@@ -304,10 +304,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             anonymous_object_device(anonymous_object_devices(), identity.kind)?,
             identity.raw_inode,
         );
-        let inode = match deterministic_stdio_inode_for_raw(raw_inode, &stdio_raw_inodes) {
-            Some(inode) => inode,
-            None => determinize_inode(guest, raw_inode).await.0,
-        };
+        // Every link sends its numbering request, and a stdio match only
+        // chooses the rendering afterwards, as `/proc/*/maps` does: whether
+        // the raw identity matches stdio is host identity, which must not
+        // decide how many inode numbers the call consumes
+        // (<https://github.com/rrnewton/hermit/issues/2897>).
+        let pooled = determinize_inode(guest, raw_inode).await.0;
+        let inode =
+            deterministic_stdio_inode_for_raw(raw_inode, &stdio_raw_inodes).unwrap_or(pooled);
         let target = canonical_anonymous_proc_fd_target(&identity, inode, buffer_len);
         let buffer = buffer.ok_or(Errno::EFAULT)?;
         guest.memory().write_exact(buffer.cast(), &target)?;
