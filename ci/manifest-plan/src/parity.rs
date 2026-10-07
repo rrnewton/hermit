@@ -296,7 +296,7 @@ impl LaterFailure {
     /// `crash-error`, `oom`, `infrastructure-error`, `sandbox-denied`,
     /// `determinism-failure`, `replay-failure`, ...) stands for, or `None`
     /// for `pass`. A typed result keeps its own class, as
-    /// [`evaluate_history`] types a row; any other non-pass result is
+    /// `evaluate_history` types a row; any other non-pass result is
     /// [`UnavailableClass::FailedUntyped`].
     pub fn from_result(result: &str, reason: String) -> Option<Self> {
         let class = match result {
