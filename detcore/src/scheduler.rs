@@ -1226,6 +1226,19 @@ impl ThreadTree {
             .map(|metadata| metadata.process_group)
     }
 
+    /// Every process Detcore records as a member of `process_group`, in
+    /// `DetPid` order.
+    pub fn processes_in_group(&self, process_group: DetPid) -> Vec<DetPid> {
+        let mut members: Vec<DetPid> = self
+            .process_wait
+            .iter()
+            .filter(|(_, metadata)| metadata.process_group == process_group)
+            .map(|(process, _)| *process)
+            .collect();
+        members.sort();
+        members
+    }
+
     pub fn set_process_group(&mut self, pid: DetPid, process_group: DetPid) -> bool {
         let Some(metadata) = self.process_wait.get_mut(&pid) else {
             return false;
@@ -2107,6 +2120,47 @@ impl Scheduler {
         None
     }
 
+    /// A guest thread `sender` has just successfully sent `SIGKILL` to process
+    /// group `group` (`kill(-group, SIGKILL)`), which kills every process of
+    /// the group.
+    ///
+    /// This is the same deterministic edge as `note_sigkill_sent`, reached by
+    /// the one process-group spelling the SaBRe backend forwards
+    /// (`can_forward_process_group_signal`). On a backend that retires a
+    /// killed process at that edge, every live process Detcore records in the
+    /// group is retired, in `DetPid` order, exactly as a positive-PID
+    /// `SIGKILL` of that process would retire it. The sender's own process,
+    /// when it is in the group, dies too and is left to the existing paths, as
+    /// `retire_sigkilled_process` leaves a self-kill. Without this, a member
+    /// suspended in `rt_sigsuspend` stayed registered after the kill, and
+    /// whether its posted continuation was later granted (and then waited for
+    /// forever) depended on when the supervisor reported its death.
+    ///
+    /// Returns one receiver per retired process whose parent is owed an exit
+    /// signal that the supervisor has not reported reaping yet; the caller
+    /// replies to the sender only after all of them resolve.
+    pub(crate) fn note_process_group_sigkill_sent(
+        &mut self,
+        sender: DetTid,
+        group: DetPid,
+    ) -> Vec<oneshot::Receiver<()>> {
+        if self.backend.requires_thread_directed_process_signals
+            || !self.backend.reports_physical_process_exits
+            || !self.backend.needs_killed_thread_rpc_cancellation
+        {
+            return Vec::new();
+        }
+        let members = self.thread_tree.processes_in_group(group);
+        debug!(
+            "[dtid {}] SIGKILL to process group {} reaches process(es) {:?}",
+            sender, group, members
+        );
+        members
+            .into_iter()
+            .filter_map(|process| self.retire_sigkilled_process(sender, process, Some(process)))
+            .collect()
+    }
+
     /// Retire every live thread of the process that a guest `SIGKILL` from
     /// another process has just killed, exactly as an exit-group would.
     ///
@@ -2121,7 +2175,9 @@ impl Scheduler {
     ///
     /// A `SIGKILL` the sender sends to its own process kills the sender too
     /// and is left to the existing paths, as is any death this edge does not
-    /// see (a process-group or external kill, or another fatal signal).
+    /// see (an external kill, or another fatal signal). A process-group
+    /// `SIGKILL` reaches this once per member through
+    /// `note_process_group_sigkill_sent`.
     ///
     /// When the parent is owed its exit signal and the supervisor has not yet
     /// reported the reap, this returns a receiver that resolves at that report

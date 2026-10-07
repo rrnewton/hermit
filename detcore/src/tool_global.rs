@@ -1984,28 +1984,23 @@ impl GlobalTool for GlobalState {
                         .flatten();
                     (exit_report, scheduler.backend_failure_waiter())
                 };
-                if let Some(exit_report) = exit_report {
-                    // The killed process's parent is owed its exit signal, and
-                    // the supervisor has not reported the reap that queues
-                    // it. Reply only after that report, with the scheduler
-                    // lock released, so that the signal is pending before the
-                    // sender returns from `kill` and is taken before its next
-                    // request on every run (`Scheduler::retire_sigkilled_process`).
-                    futures::pin_mut!(exit_report, failure);
-                    if let futures::future::Either::Left(_) =
-                        futures::future::select(failure, exit_report).await
-                    {
-                        // As in `lock_rpc_scheduler`, a callback that loses to
-                        // terminal publication stays pending and is dropped
-                        // with the backend; no normal reply is invented. The
-                        // epilogue's scheduler lock withholds the reply for
-                        // most senders too, but it is skipped for an exec
-                        // caller after its local mm swap, so this handler does
-                        // not rely on it.
-                        std::future::pending::<()>().await;
-                    }
-                }
+                await_sigkill_exit_reports(exit_report.into_iter().collect(), failure).await;
                 R::NotifySignalPending(())
+            }
+            GlobalRequest::NotifyProcessGroupSigkill(group) => {
+                // Sent, like `NotifySignalPending`, from the authenticated
+                // sender's own turn after its `kill(-group, SIGKILL)`
+                // succeeded, so retiring the group's members here happens
+                // at a deterministic point in the run.
+                let (exit_reports, failure) = {
+                    let mut scheduler = self.lock_rpc_scheduler(false).await;
+                    (
+                        scheduler.note_process_group_sigkill_sent(dtid, group),
+                        scheduler.backend_failure_waiter(),
+                    )
+                };
+                await_sigkill_exit_reports(exit_reports, failure).await;
+                R::NotifyProcessGroupSigkill(())
             }
             GlobalRequest::ThreadIsLive(dtid) => {
                 R::ThreadIsLive(self.lock_rpc_scheduler(false).await.thread_is_live(dtid))
@@ -3419,6 +3414,9 @@ pub enum GlobalRequest {
     ResolveKillTargets(DetPid),
     /// A successful kill(2) queued a physical signal for this sole target.
     NotifySignalPending(DetTid, SigWrapper, Option<DetPid>),
+    /// A successful `kill(-group, SIGKILL)` killed every process of this
+    /// process group.
+    NotifyProcessGroupSigkill(DetPid),
     /// Liveness of one tid, leader or not; see [`thread_is_live`].
     ThreadIsLive(DetTid),
     /// Scheduler-owned lifecycle state for a direct child process.
@@ -3525,6 +3523,7 @@ pub enum GlobalResponse {
     // TODO-HUMAN-REVIEW(#663)
     ResolveKillTargets(Vec<DetTid>),
     NotifySignalPending(()),
+    NotifyProcessGroupSigkill(()),
     ThreadIsLive(bool),
     ExactChildWaitState(ExactChildWaitState),
     // TODO: use void_send_rpc, and remove this bogus response:
@@ -4668,6 +4667,48 @@ fn alarm_signal(sig: SigWrapper) -> Signal {
             sig.raw()
         )
     })
+}
+
+/// Tell the scheduler that this thread's `kill(-group, SIGKILL)` succeeded.
+/// See `Scheduler::note_process_group_sigkill_sent`.
+pub async fn notify_process_group_sigkill<G, T>(guest: &mut G, group: DetPid)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response =
+        send_and_update_time(guest, GlobalRequest::NotifyProcessGroupSigkill(group)).await;
+    match response.1 {
+        GlobalResponse::NotifyProcessGroupSigkill(()) => {}
+        _ => unreachable!(),
+    }
+}
+
+/// Complete a `SIGKILL` edge only once every killed process whose parent is
+/// owed its exit signal has been reported reaped.
+///
+/// The kernel queues that parent's one real `SIGCHLD` when the supervisor
+/// reaps the child, before the supervisor reports the reap. Replying only
+/// after every report, with the scheduler lock released, makes each such
+/// signal pending before the sender returns from `kill`, so it is taken before
+/// the sender's next request on every run (`Scheduler::retire_sigkilled_process`).
+async fn await_sigkill_exit_reports(
+    exit_reports: Vec<futures::channel::oneshot::Receiver<()>>,
+    failure: futures::future::Shared<futures::channel::oneshot::Receiver<()>>,
+) {
+    if exit_reports.is_empty() {
+        return;
+    }
+    let reported = futures::future::join_all(exit_reports);
+    futures::pin_mut!(reported, failure);
+    if let futures::future::Either::Left(_) = futures::future::select(failure, reported).await {
+        // As in `lock_rpc_scheduler`, a callback that loses to terminal
+        // publication stays pending and is dropped with the backend; no normal
+        // reply is invented. The epilogue's scheduler lock withholds the reply
+        // for most senders too, but it is skipped for an exec caller after its
+        // local mm swap, so this does not rely on it.
+        std::future::pending::<()>().await;
+    }
 }
 
 pub async fn notify_signal_pending<G, T>(
@@ -7093,6 +7134,101 @@ mod tests {
                 "report first: {report_first}"
             );
         }
+    }
+
+    /// Drive the production RPC for a process-group `SIGKILL` (R5-F2 of the
+    /// review of this series): a SaBRe parent registers three child processes,
+    /// moves two of them into their own process group, and kills that group
+    /// with `kill(-group, SIGKILL)`. The notification retires both members at
+    /// the edge and leaves the third child, in the parent's group, alone. Its
+    /// reply waits until the supervisor has reported reaping both members,
+    /// because the kernel queues the parent's real `SIGCHLD` for each at its
+    /// reap. Before the fix the group kill sent no notification and the dead
+    /// members stayed registered.
+    #[tokio::test]
+    async fn process_group_sigkill_rpc_retires_every_member_at_its_edge() {
+        let config = sabre_profile(Config {
+            sequentialize_threads: false,
+            ..Config::default()
+        });
+        let state = GlobalState::initialize(&config, false);
+        let parent = DetTid::from_raw(17);
+        let parent_pid = DetPid::from_raw(17);
+        let members = [DetPid::from_raw(18), DetPid::from_raw(19)];
+        let bystander = DetPid::from_raw(20);
+        let group = members[0];
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .thread_tree
+            .add_child(parent, parent, true);
+        install_test_registration(&state, parent, Ivar::new());
+        let rpc = |request| (DetTime::new(&config), MmId::initial(parent_pid), request);
+        for child in [members[0], members[1], bystander] {
+            let created = state
+                .receive_rpc(
+                    reverie::Tid::from_raw(parent.as_raw()),
+                    rpc(GlobalRequest::CreateChildThread(
+                        child,
+                        parent_pid,
+                        0,
+                        Some(CloneFlags::empty()),
+                        libc::SIGCHLD,
+                        None,
+                        Some(DEFAULT_PRIORITY),
+                    )),
+                )
+                .await;
+            assert_eq!(created.1, GlobalResponse::CreateChildThread(None));
+        }
+        for member in members {
+            let moved = state
+                .receive_rpc(
+                    reverie::Tid::from_raw(parent.as_raw()),
+                    rpc(GlobalRequest::SetProcessGroup(member, group)),
+                )
+                .await;
+            assert_eq!(moved.1, GlobalResponse::SetProcessGroup(true));
+        }
+
+        let mut killed = std::pin::pin!(state.receive_rpc(
+            reverie::Tid::from_raw(parent.as_raw()),
+            rpc(GlobalRequest::NotifyProcessGroupSigkill(group)),
+        ));
+        assert!(futures::poll!(killed.as_mut()).is_pending());
+        {
+            let mut sched = state.sched.lock().unwrap();
+            for member in members {
+                assert!(sched.thread_is_logically_killed(member));
+                assert!(!sched.next_turns.contains_key(&member));
+                assert!(sched.process_signal_targets(member).is_empty());
+                assert_eq!(
+                    sched.test_process_exit_state(member),
+                    (true, false, Some(parent_pid))
+                );
+            }
+            assert!(sched.next_turns.contains_key(&bystander));
+            assert!(!sched.thread_is_logically_killed(bystander));
+        }
+        state.complete_physical_process_exit(members[0].as_raw());
+        assert!(
+            futures::poll!(killed.as_mut()).is_pending(),
+            "the edge waits for every member's reap report"
+        );
+        state.complete_physical_process_exit(members[1].as_raw());
+        assert_eq!(
+            killed.await.1,
+            GlobalResponse::NotifyProcessGroupSigkill(())
+        );
+        let sched = state.sched.lock().unwrap();
+        for member in members {
+            assert_eq!(
+                sched.test_process_exit_state(member),
+                (false, true, Some(parent_pid))
+            );
+        }
+        assert!(sched.next_turns.contains_key(&bystander));
     }
 
     /// A `SIGKILL` edge waiting for the reap report must not invent a normal

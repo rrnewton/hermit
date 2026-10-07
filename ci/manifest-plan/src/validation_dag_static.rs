@@ -1198,7 +1198,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tool_global::tests test
     // (sigkill_edge_waiting_for_the_reap_invents_no_reply_on_backend_failure)
     // retain all 1008: 1008 + 3 = 1011, measured the same way.
-    ("test.detcore_unit", 1011),
+    // Two scheduler::parked_tests process-group SIGKILL tests
+    // (process_group_sigkill_edge_retires_a_suspended_member_identically_in_every_report_order,
+    // process_group_sigkill_edge_retires_every_member_but_the_senders_own_process),
+    // one tool_global::tests test
+    // (process_group_sigkill_rpc_retires_every_member_at_its_edge) and one
+    // syscalls::signal::process_group_kill_tests test
+    // (successful_process_group_sigkill_reports_its_group) retain all 1011:
+    // 1011 + 4 = 1015, measured the same way.
+    ("test.detcore_unit", 1015),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1583,7 +1591,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same six rt_sigsuspend death and pending-waker tests retain all 996: 1002.
     // The same six SIGKILL-edge and publication tests retain all 1002: 1008.
     // The same three SIGKILL reap-wait tests retain all 1008: 1011.
-    ("test.detcore_unit_on_host", 1011),
+    // The same four process-group SIGKILL tests retain all 1011: 1015.
+    ("test.detcore_unit_on_host", 1015),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

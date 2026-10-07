@@ -35,6 +35,7 @@ use crate::syscalls::threads::KernelSigaction;
 use crate::syscalls::threads::KernelSigset;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::alarm_remaining;
+use crate::tool_global::notify_process_group_sigkill;
 use crate::tool_global::notify_signal_pending;
 use crate::tool_global::register_alarm;
 use crate::tool_global::resolve_kill_targets;
@@ -805,7 +806,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .backend
                 .requires_thread_directed_process_signals,
         ) {
-            return Ok(self.record_or_replay(guest, call).await?);
+            let value = self.record_or_replay(guest, call).await?;
+            // The kill succeeded, so every process of the group is dead.
+            // Report that from this turn, as a positive-PID SIGKILL reports
+            // its target, on a backend that retires killed processes at this
+            // edge (`Scheduler::note_process_group_sigkill_sent`).
+            let backend = &guest.config().backend;
+            if backend.reports_physical_process_exits
+                && backend.needs_killed_thread_rpc_cancellation
+            {
+                notify_process_group_sigkill(guest, DetPid::from_raw(-tgid)).await;
+            }
+            return Ok(value);
         }
         if tgid <= 0 {
             return Err(Errno::ENOSYS.into());
@@ -1216,5 +1228,195 @@ mod appropriated_signal_tests {
     /// mirrored copy would keep passing if `appropriated_reason` were gutted.
     fn reports(signum: i32, handler: u64) -> bool {
         appropriated_reason(signum, handler).is_some()
+    }
+}
+
+#[cfg(test)]
+mod process_group_kill_tests {
+    use std::sync::Mutex;
+
+    use reverie::GlobalRPC;
+    use reverie::GlobalTool;
+    use reverie::Tid;
+    use reverie::Tool;
+    use reverie::syscalls::SyscallInfo;
+    use reverie::syscalls::Sysno;
+
+    use super::*;
+    use crate::config::Config;
+    use crate::tool_global::GlobalRequest;
+    use crate::tool_global::GlobalResponse;
+    use crate::tool_global::GlobalState;
+
+    struct UnusedStack;
+    struct UnusedStackGuard;
+
+    impl Drop for UnusedStackGuard {
+        fn drop(&mut self) {}
+    }
+
+    impl reverie::Stack for UnusedStack {
+        type StackGuard = UnusedStackGuard;
+
+        fn size(&self) -> usize {
+            panic!("kill must not use the guest stack")
+        }
+        fn capacity(&self) -> usize {
+            panic!("kill must not use the guest stack")
+        }
+        fn push<'stack, T>(&mut self, _: T) -> Addr<'stack, T> {
+            panic!("kill must not use the guest stack")
+        }
+        fn reserve<'stack, T>(&mut self) -> AddrMut<'stack, T> {
+            panic!("kill must not use the guest stack")
+        }
+        fn commit(self) -> Result<Self::StackGuard, Errno> {
+            panic!("kill must not use the guest stack")
+        }
+    }
+
+    /// Runs the real `kill` handler with the kernel's answer scripted and
+    /// every scheduler RPC recorded.
+    struct KillGuest {
+        config: Config,
+        thread: crate::ThreadState<()>,
+        kernel_result: Result<i64, Errno>,
+        injected: Vec<Sysno>,
+        requests: Mutex<Vec<GlobalRequest>>,
+    }
+
+    #[reverie::tool]
+    impl GlobalRPC<GlobalState> for KillGuest {
+        async fn send_rpc(
+            &self,
+            message: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            let response = match &message.2 {
+                GlobalRequest::NotifyProcessGroupSigkill(_) => {
+                    GlobalResponse::NotifyProcessGroupSigkill(())
+                }
+                other => panic!("unexpected RPC from kill: {other:?}"),
+            };
+            self.requests.lock().unwrap().push(message.2);
+            (None, response)
+        }
+        fn config(&self) -> &Config {
+            &self.config
+        }
+    }
+
+    #[reverie::tool]
+    impl Guest<Detcore> for KillGuest {
+        type Memory = reverie::syscalls::LocalMemory;
+        type Stack = UnusedStack;
+
+        fn tid(&self) -> Tid {
+            Tid::from_raw(17)
+        }
+        fn pid(&self) -> Tid {
+            Tid::from_raw(17)
+        }
+        fn ppid(&self) -> Option<Tid> {
+            None
+        }
+        fn memory(&self) -> Self::Memory {
+            panic!("kill must not read guest memory")
+        }
+        fn thread_state(&self) -> &crate::ThreadState<()> {
+            &self.thread
+        }
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
+            &mut self.thread
+        }
+        async fn regs(&mut self) -> libc::user_regs_struct {
+            panic!("kill must not read registers")
+        }
+        async fn stack(&mut self) -> Self::Stack {
+            UnusedStack
+        }
+        async fn daemonize(&mut self) {
+            panic!("kill must not daemonize")
+        }
+        async fn inject<S: SyscallInfo>(&mut self, call: S) -> Result<i64, Errno> {
+            self.injected.push(call.number());
+            self.kernel_result
+        }
+        async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> reverie::Never {
+            panic!("kill must not retire the guest")
+        }
+        fn set_timer(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+            panic!("kill must not replace the timer")
+        }
+        fn set_timer_precise(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+            panic!("kill must not replace the timer")
+        }
+        fn read_clock(&mut self) -> Result<u64, Error> {
+            panic!("kill must not sample the clock")
+        }
+    }
+
+    /// R5-F2 of the review of this series: a successful
+    /// `kill(-group, SIGKILL)` on SaBRe tells the scheduler, from the sender's
+    /// own turn and after the kernel accepted the signal, which process group
+    /// it killed, so the scheduler can retire the members at that edge. A
+    /// failed kill reports nothing, and a backend that does not retire killed
+    /// processes at the edge gets no extra RPC. Before the fix the forwarded
+    /// group kill returned without any notification.
+    #[tokio::test]
+    async fn successful_process_group_sigkill_reports_its_group() {
+        for (sabre, kernel_result, notified) in [
+            (true, Ok(0), true),
+            (true, Err(Errno::ESRCH), false),
+            (true, Err(Errno::EPERM), false),
+            (false, Ok(0), false),
+        ] {
+            let case = format!("sabre {sabre}, kernel {kernel_result:?}");
+            let config = Config {
+                sequentialize_threads: true,
+                ..Config::default().with_backend(|backend| {
+                    if sabre {
+                        backend.needs_killed_thread_rpc_cancellation = true;
+                        backend.reports_physical_process_exits = true;
+                        backend.signal_interrupts_external_syscalls = true;
+                    }
+                })
+            };
+            let tool = Detcore::new(Tid::from_raw(17), &config);
+            let mut thread = crate::ThreadState::new(DetTid::from_raw(17), &config, ());
+            thread.detpid = Some(DetPid::from_raw(17));
+            let mut guest = KillGuest {
+                config: config.clone(),
+                thread,
+                kernel_result,
+                injected: Vec::new(),
+                requests: Mutex::new(Vec::new()),
+            };
+            let call = syscalls::Kill::new().with_pid(-42).with_sig(libc::SIGKILL);
+            let result = tool.handle_kill(&mut guest, call).await;
+            match kernel_result {
+                Ok(value) => assert!(matches!(result, Ok(v) if v == value), "{case}"),
+                Err(errno) => {
+                    assert!(
+                        matches!(result, Err(Error::Errno(e)) if e == errno),
+                        "{case}"
+                    )
+                }
+            }
+            assert_eq!(guest.injected, vec![Sysno::kill], "{case}");
+            let requests = guest.requests.lock().unwrap();
+            if notified {
+                assert_eq!(requests.len(), 1, "{case}");
+                assert!(
+                    matches!(
+                        requests[0],
+                        GlobalRequest::NotifyProcessGroupSigkill(group)
+                            if group == DetPid::from_raw(42)
+                    ),
+                    "{case}"
+                );
+            } else {
+                assert!(requests.is_empty(), "{case}: {requests:?}");
+            }
+        }
     }
 }

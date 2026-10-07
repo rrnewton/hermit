@@ -2914,8 +2914,9 @@ fn killed_waiter_fixture(
 
 /// Must not hang, and must decide the same way on every run: a SaBRe child
 /// suspended for SIGCHLD is killed by a death the scheduler sees no guest
-/// `SIGKILL` edge for (a process-group or external kill; the edge itself is
-/// covered by the `sigkill_edge_*` tests), and the child's own child then
+/// `SIGKILL` edge for (an external kill; the edge itself, for a positive PID
+/// or a process group, is covered by the `sigkill_edge_*` and
+/// `process_group_sigkill_*` tests), and the child's own child then
 /// exits. SaBRe runs no exit hook for a thread killed outright, so the dead
 /// waiter stays registered and the grandchild's exit owes it a wake it will
 /// never take: before the fix the scheduler held every turn for a continuation
@@ -4954,4 +4955,207 @@ fn real_timers_follow_the_installed_control() {
             interval: at(3),
         })
     );
+}
+
+/// Must not hang or diverge: R5-F2 of the review of this series. The SaBRe
+/// child `Q` leads its own process group and is suspended for a caught
+/// SIGCHLD; its child `A` leads a different group. A SIGWINCH outside `Q`'s
+/// waking set interrupted the real call, so `Q` has posted its continuation,
+/// which waits behind `P`'s work. `P` then kills `Q` with
+/// `kill(-Q, SIGKILL)`, the process-group spelling the SaBRe backend forwards.
+/// The supervisor's report of `Q`'s death is host-timed: before the edge,
+/// right after it, or after several held passes, and `A` exits after the edge.
+/// In every order the group edge retires `Q` exactly as a positive-PID
+/// `SIGKILL` does: its posted request is cancelled and never granted, no wake
+/// is owed to it when `A` exits, `A` (in another group) lives on until its own
+/// exit, and `P` gets one SIGCHLD wakeup once the reap is reported. All orders
+/// end in the same run queue and the same first turn, which belongs to a
+/// survivor. Before the fix the group kill sent no notification, so nothing
+/// retired `Q`; when `A`'s exit was seen before `Q`'s death report, `Q` was
+/// owed a wake and its dead continuation was admitted ahead of `P`'s work.
+#[test]
+fn process_group_sigkill_edge_retires_a_suspended_member_identically_in_every_report_order() {
+    let mut outcomes = Vec::new();
+    for order in [
+        DeathReport::BeforeEdge,
+        DeathReport::AfterEdge,
+        DeathReport::AfterHeldPasses,
+    ] {
+        let case = format!("report {order:?}");
+        let mut s = sabre_scheduler();
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        let time = global_time.lock().unwrap().as_nanos();
+        let (parent, waiter, op_id, grandchild, grandchild_mm, sleeper) =
+            killed_waiter_fixture(&mut s);
+        let waiter_process = DetPid::from_raw(200);
+        let grandchild_process = DetPid::from_raw(300);
+        assert!(
+            s.thread_tree
+                .set_process_group(waiter_process, waiter_process)
+        );
+        assert!(
+            s.thread_tree
+                .set_process_group(grandchild_process, grandchild_process)
+        );
+        s.notify_signal_pending(waiter, SigWrapper::from(Signal::SIGWINCH));
+        assert!(s.blocked.rt_sigsuspend_wake_owed.is_empty(), "{case}");
+        post_rt_sigsuspend_continuation(&mut s, waiter, op_id);
+        let response = s.next_turns[&waiter].resp.clone();
+        if matches!(order, DeathReport::BeforeEdge) {
+            assert!(!report_process_death(&mut s, waiter), "{case}");
+        }
+
+        let reports = s.note_process_group_sigkill_sent(parent, waiter_process);
+        assert_eq!(
+            reports.len(),
+            usize::from(!matches!(order, DeathReport::BeforeEdge)),
+            "{case}"
+        );
+        assert!(!s.next_turns.contains_key(&waiter), "{case}");
+        assert!(s.thread_is_logically_killed(waiter), "{case}");
+        assert!(
+            matches!(response.try_read(), Some(SchedResponse::Signaled(None))),
+            "{case}"
+        );
+        assert!(
+            !s.blocked.rt_sigsuspend_blockers.contains_key(&waiter),
+            "{case}"
+        );
+        assert!(s.blocked.rt_sigsuspend_wake_owed.is_empty(), "{case}");
+        assert!(
+            s.logically_exited_processes.contains(&waiter_process),
+            "{case}"
+        );
+        assert_eq!(
+            s.child_exit_signals_owed.get(&waiter_process),
+            Some(&DetPid::from_raw(100)),
+            "{case}"
+        );
+        // A leads another group, so the kill did not reach it.
+        assert!(s.next_turns.contains_key(&grandchild), "{case}");
+        assert!(!s.thread_is_logically_killed(grandchild), "{case}");
+
+        grant_child_exit_and_remove_thread(&mut s, grandchild, grandchild_mm);
+        assert!(
+            s.complete_physical_process_exit(grandchild_process),
+            "{case}"
+        );
+        assert!(s.blocked.rt_sigsuspend_wake_owed.is_empty(), "{case}");
+        match order {
+            DeathReport::BeforeEdge => {}
+            DeathReport::AfterEdge => {
+                assert!(report_process_death(&mut s, waiter), "{case}");
+            }
+            DeathReport::AfterHeldPasses => {
+                assert!(s.step2_process_blocked(&global_time).is_err(), "{case}");
+                let queued: Vec<DetTid> = s.run_queue.tids().copied().collect();
+                assert!(!queued.contains(&waiter), "{case}");
+                for _ in 0..2 {
+                    assert!(s.step2_process_blocked(&global_time).is_err(), "{case}");
+                    assert!(s.take_terminal_deadlock().is_none(), "{case}");
+                }
+                assert_eq!(
+                    s.run_queue.tids().copied().collect::<Vec<_>>(),
+                    queued,
+                    "{case}"
+                );
+                assert_eq!(global_time.lock().unwrap().as_nanos(), time, "{case}");
+                assert!(report_process_death(&mut s, waiter), "{case}");
+            }
+        }
+        for mut report in reports {
+            assert!(matches!(report.try_recv(), Ok(Some(()))), "{case}");
+        }
+        assert!(s.step2_process_blocked(&global_time).is_ok(), "{case}");
+        assert!(s.take_terminal_deadlock().is_none(), "{case}");
+        assert!(s.child_exit_signals_owed.is_empty(), "{case}");
+        assert_eq!(global_time.lock().unwrap().as_nanos(), time, "{case}");
+        let queue: Vec<DetTid> = s.run_queue.tids().copied().collect();
+        assert!(
+            queue.contains(&parent) && queue.contains(&sleeper) && !queue.contains(&waiter),
+            "{case}: {queue:?}"
+        );
+        let (first, _, _) = s.select_test_turn().expect("a survivor is runnable");
+        assert_ne!(first, waiter, "{case}");
+        outcomes.push((queue, first, s.owed_child_exit_wakeups));
+    }
+    assert!(
+        outcomes.iter().all(|outcome| *outcome == outcomes[0]),
+        "{outcomes:?}"
+    );
+}
+
+/// A process-group `SIGKILL` retires exactly the live processes Detcore
+/// records in that group, in `DetPid` order, each once: not a process of
+/// another group, and not the sender's own process, which the kill reaches
+/// too but which is left to the existing paths as a self-kill is. The edge
+/// waits for the reap report of every retired process whose parent is owed
+/// its exit signal. A group with no members, and a backend without SaBRe's
+/// whole profile, retire nothing.
+#[test]
+fn process_group_sigkill_edge_retires_every_member_but_the_senders_own_process() {
+    let group = DetPid::from_raw(200);
+    let mut s = sabre_scheduler();
+    let (parent, _, _) = add(&mut s, 100, 100);
+    let (first, _, _) = add_process_child(&mut s, 100, 200);
+    let (second, _, _) = add_process_child(&mut s, 100, 300);
+    let (other, _, _) = add_process_child(&mut s, 100, 400);
+    assert!(
+        s.thread_tree
+            .set_process_group(DetPid::from_raw(200), group)
+    );
+    assert!(
+        s.thread_tree
+            .set_process_group(DetPid::from_raw(300), group)
+    );
+    queue_ordinary_work(&mut s, parent);
+    queue_ordinary_work(&mut s, other);
+
+    assert!(
+        s.note_process_group_sigkill_sent(parent, DetPid::from_raw(999))
+            .is_empty()
+    );
+    let mut reports = s.note_process_group_sigkill_sent(parent, group);
+    assert_eq!(reports.len(), 2);
+    for tid in [first, second] {
+        assert!(!s.next_turns.contains_key(&tid));
+        assert!(s.thread_is_logically_killed(tid));
+    }
+    assert!(s.next_turns.contains_key(&other) && s.next_turns.contains_key(&parent));
+    assert!(matches!(reports[0].try_recv(), Ok(None)));
+    assert!(matches!(reports[1].try_recv(), Ok(None)));
+    assert!(s.complete_physical_process_exit(DetPid::from_raw(200)));
+    assert!(matches!(reports[0].try_recv(), Ok(Some(()))));
+    assert!(matches!(reports[1].try_recv(), Ok(None)));
+    assert!(s.complete_physical_process_exit(DetPid::from_raw(300)));
+    assert!(matches!(reports[1].try_recv(), Ok(Some(()))));
+    assert!(s.note_process_group_sigkill_sent(parent, group).is_empty());
+    assert!(s.step2_drain_prefix().is_ok());
+    assert_eq!(s.owed_child_exit_wakeups, 2);
+
+    // The sender's own group: its own process is skipped, `other` is retired.
+    let own_group = DetPid::from_raw(100);
+    let reports = s.note_process_group_sigkill_sent(parent, own_group);
+    assert_eq!(reports.len(), 1);
+    assert!(s.thread_is_logically_killed(other));
+    assert!(s.next_turns.contains_key(&parent));
+    assert!(!s.thread_is_logically_killed(parent));
+    assert!(s.take_terminal_deadlock().is_none());
+
+    for mut s in [
+        physical_exit_reporting_scheduler(),
+        Scheduler::new(&Config::default().with_backend(|backend| {
+            backend.needs_killed_thread_rpc_cancellation = true;
+        })),
+    ] {
+        let (parent, _, _) = add(&mut s, 100, 100);
+        let (child, _, _) = add_process_child(&mut s, 100, 200);
+        assert!(
+            s.thread_tree
+                .set_process_group(DetPid::from_raw(200), group)
+        );
+        assert!(s.note_process_group_sigkill_sent(parent, group).is_empty());
+        assert!(s.next_turns.contains_key(&child));
+        assert!(s.child_exit_signals_owed.is_empty());
+    }
 }
