@@ -870,6 +870,48 @@ fn utimensat_input_overlaps<M: MemoryAccess>(
     path || times
 }
 
+/// The descriptor a `*at` stat call describes by itself: `dirfd`, when the
+/// call passes `AT_EMPTY_PATH` with an empty or NULL path (Linux 6.11 accepts
+/// NULL). `None` for every call that resolves a path, and for `AT_FDCWD`. A
+/// path that cannot be read counts as nonempty, so the call keeps the
+/// path-based numbering and the kernel reports the fault. The path is read
+/// only after the flag and `dirfd` checks, so an ordinary `stat()` reads no
+/// guest memory here.
+fn empty_path_fd<M: MemoryAccess>(
+    memory: &M,
+    dirfd: i32,
+    path: Option<PathPtr>,
+    flags: AtFlags,
+) -> Option<i32> {
+    if dirfd < 0 || !flags.contains(AtFlags::AT_EMPTY_PATH) {
+        return None;
+    }
+    let empty = match path {
+        None => true,
+        Some(path) => path
+            .read(memory)
+            .is_ok_and(|path| path.as_os_str().is_empty()),
+    };
+    empty.then_some(dirfd)
+}
+
+/// The fixed inode that `fd` reports when it is still the container's
+/// inherited stdin, stdout or stderr, as fdinfo and `/proc/self/fd/N` report
+/// it. Every stat call that describes the descriptor itself must use it, or
+/// the guest's libc decides which number `fstat()` sees.
+fn stdio_inode_override<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    guest: &G,
+    fd: i32,
+) -> Option<DetInode> {
+    guest
+        .thread_state()
+        .with_detfd(fd, |detfd| {
+            deterministic_stdio_inode_for_resource(fd, detfd.resource())
+        })
+        .ok()
+        .flatten()
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     async fn observe_timer_slack_identity<G: Guest<Self>>(
         &self,
@@ -3904,16 +3946,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             // filesystem (squashfs_ll).
             guest.inject(Syscall::from(call)).await?;
             let statptr = call.stat().ok_or(Errno::EFAULT)?;
-            let inode_override = match call {
-                StatFamily::Fstat(call) => guest
-                    .thread_state()
-                    .with_detfd(call.fd(), |detfd| {
-                        deterministic_stdio_inode_for_resource(call.fd(), detfd.resource())
-                    })
-                    .ok()
-                    .flatten(),
-                _ => None,
+            let described_fd = match call {
+                StatFamily::Fstat(call) => Some(call.fd()),
+                StatFamily::Fstatat(call) => {
+                    empty_path_fd(&guest.memory(), call.dirfd(), call.path(), call.flags())
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                StatFamily::Stat(_) | StatFamily::Lstat(_) => None,
             };
+            let inode_override = described_fd.and_then(|fd| stdio_inode_override(guest, fd));
             let mut memory = guest.memory();
             let stat = memory.read_value(statptr.0)?;
             let stat = self.determinize_stat(guest, stat, inode_override).await?;
@@ -3936,9 +3977,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             // may cause tracer to hang under certain fuse filesystem (squashfs_ll).
             guest.inject(call).await?;
             let statptr = call.statx().ok_or(Errno::EFAULT)?;
+            let inode_override =
+                empty_path_fd(&guest.memory(), call.dirfd(), call.path(), call.flags())
+                    .and_then(|fd| stdio_inode_override(guest, fd));
             let mut memory = guest.memory();
             let stat = memory.read_value(statptr.0)?;
-            let stat = self.determinize_stat(guest, stat, None).await?;
+            let stat = self.determinize_stat(guest, stat, inode_override).await?;
             memory.write_value(statptr.0, &stat.into())?;
             Ok(0)
         } else {

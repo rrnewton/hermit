@@ -2825,6 +2825,85 @@ fn mapped_stdin_reports_the_inode_fdinfo_reports() {
     );
 }
 
+/// The inode and mtime one raw stat syscall reports. `fstat` takes only
+/// `dirfd`; `newfstatat` and `statx` also take `path` and `flags`.
+fn raw_stat(sysno: libc::c_long, dirfd: i32, path: &CStr, flags: i32) -> (u64, i64, i64) {
+    let path = path.as_ptr();
+    if sysno == libc::SYS_statx {
+        let mut stx = unsafe { std::mem::zeroed::<libc::statx>() };
+        let mask = libc::STATX_INO | libc::STATX_MTIME;
+        let rc = unsafe { libc::syscall(sysno, dirfd, path, flags, mask, &raw mut stx) };
+        assert_eq!(rc, 0, "statx on dirfd {dirfd} failed");
+        return (
+            stx.stx_ino,
+            stx.stx_mtime.tv_sec,
+            stx.stx_mtime.tv_nsec.into(),
+        );
+    }
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    let rc = if sysno == libc::SYS_fstat {
+        unsafe { libc::syscall(sysno, dirfd, &raw mut stat) }
+    } else {
+        unsafe { libc::syscall(sysno, dirfd, path, &raw mut stat, flags) }
+    };
+    assert_eq!(rc, 0, "stat syscall {sysno} on dirfd {dirfd} failed");
+    (stat.st_ino, stat.st_mtime, stat.st_mtime_nsec)
+}
+
+/// Every stat syscall that describes an inherited stdio descriptor by itself
+/// reports the inode fdinfo reports, and one mtime. glibc's `fstat()` issues
+/// `fstat` or `newfstatat(fd, "", AT_EMPTY_PATH)` depending on the build, and
+/// Rust's `File::metadata()` issues `statx`, so the guest's libc must not
+/// decide which number it sees. A call that names a path describes that path
+/// instead, even with a stdio `dirfd` and `AT_EMPTY_PATH`: an absolute path
+/// ignores `dirfd`. Raw syscalls keep this test independent of the host libc.
+fn stdio_empty_path_stat_guest(_setup: &StdinMemfdSetup) {
+    let empty = libc::AT_EMPTY_PATH;
+    for fd in 0..=2 {
+        let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).unwrap();
+        let fdinfo_inode: u64 = fdinfo
+            .lines()
+            .find_map(|line| line.strip_prefix("ino:"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let fstat = raw_stat(libc::SYS_fstat, fd, c"", 0);
+        let newfstatat = raw_stat(libc::SYS_newfstatat, fd, c"", empty);
+        let statx = raw_stat(libc::SYS_statx, fd, c"", empty);
+        assert_eq!(
+            (fstat.0, newfstatat, statx),
+            (fdinfo_inode, fstat, fstat),
+            "fd {fd}: fstat, newfstatat and statx (inode, mtime) disagree with fdinfo inode {fdinfo_inode}"
+        );
+        let root = raw_stat(libc::SYS_newfstatat, libc::AT_FDCWD, c"/", 0).0;
+        let root_via_fd = [
+            raw_stat(libc::SYS_newfstatat, fd, c"/", 0).0,
+            raw_stat(libc::SYS_newfstatat, fd, c"/", empty).0,
+            raw_stat(libc::SYS_statx, fd, c"/", empty).0,
+        ];
+        assert_eq!(
+            root_via_fd, [root; 3],
+            "fd {fd}: a stat of \"/\" with dirfd {fd} took the descriptor's inode {fdinfo_inode}"
+        );
+        assert_ne!(root, fdinfo_inode);
+        println!("fd {fd} inode {fdinfo_inode}, / inode {root}");
+    }
+}
+
+#[test]
+fn stdio_empty_path_stat_reports_the_inode_fdinfo_reports() {
+    let runs = std::sync::atomic::AtomicUsize::new(0);
+    run_five_times_on(
+        || {
+            runs.store(0, std::sync::atomic::Ordering::Relaxed);
+            stdin_memfd_setup(&runs)
+        },
+        stdio_empty_path_stat_guest,
+        true,
+    );
+}
+
 /// The test process's stdin, replaced by a pipe for one run and restored
 /// when the run's value is dropped.
 struct StdinPipeSetup {
