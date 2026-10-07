@@ -2960,10 +2960,12 @@ impl RunContext {
 
     /// The context of a run that executes no cell: `E2E_IMPORT_RESULTS`
     /// re-publishes rows another harness process wrote. No cell launches the
-    /// Hermit binary, so it is not probed and the binary-derived fields stay
-    /// empty; only the parity post-pass runs it, for `hermit log-diff`, so it is
-    /// [`resolve_import_hermit_bin`]'s choice. Every other field is read as
-    /// `from_env` reads it.
+    /// Hermit binary, so it is [`resolve_import_hermit_bin`]'s choice and the
+    /// fields that describe the binary stay empty; the parity post-pass runs
+    /// it for `hermit log-diff`. It is still asked for `exact_branch_counter`,
+    /// which describes this machine: a producer's claim that a strict ptrace
+    /// or e9patch cell is inapplicable counts only when this machine confirms
+    /// it. Every other field is read as `from_env` reads it.
     pub fn for_import(root: PathBuf, source_sha: Option<&str>) -> Result<Self, String> {
         Self::from_env_probing(root, true, source_sha, false)
     }
@@ -3033,10 +3035,11 @@ impl RunContext {
             .then(|| probe_binary_build_sha(&hermit_bin))
             .flatten();
         // Only the binary can run Reverie's counter validation, and it is the
-        // binary that refuses `--strict` when the validation fails.
-        let exact_branch_counter = probe_hermit
-            .then(|| probe_exact_branch_counter(&hermit_bin))
-            .flatten();
+        // binary that refuses `--strict` when the validation fails. An import
+        // asks too: the verdict describes this machine, not the binary, and it
+        // is what confirms a producer's claim that a strict ptrace or e9patch
+        // cell is inapplicable here.
+        let exact_branch_counter = probe_exact_branch_counter(&hermit_bin);
         // Published main still exposes the legacy `--verify-strict` spelling;
         // the canonical-only cutover removes it and makes bare `--verify`
         // canonical.  Detect the running binary rather than keying behavior to
@@ -8396,7 +8399,8 @@ fn git(root: &Path, args: &[&str]) -> Result<String, String> {
 
 /// The binary's `exact_branch_counter` verdict, or `None` (with a note on
 /// stderr) when it cannot be read. `None` withholds no cell: a binary that
-/// then refuses `--strict` fails its cells loudly instead.
+/// then refuses `--strict` fails its cells loudly instead. An import
+/// confirms no producer's inexact-counter claim without a verdict.
 fn probe_exact_branch_counter(program: &Path) -> Option<CapabilityVerdict> {
     let read = || -> Result<CapabilityVerdict, String> {
         let output = Command::new(program)
@@ -8412,7 +8416,7 @@ fn probe_exact_branch_counter(program: &Path) -> Option<CapabilityVerdict> {
         .map_err(|error| {
             eprintln!(
                 "test-harness: no exact_branch_counter verdict from `{} host-capabilities --json` \
-                 ({error}); strict ptrace and e9patch cells run regardless",
+                 ({error}); this machine is not taken to lack an exact branch counter",
                 program.display()
             )
         })
