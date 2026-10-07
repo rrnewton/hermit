@@ -1040,7 +1040,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and record_start::tests::{strict_record_refuses_an_inexact_branch_counter_before_it_records,
     // record_refusal_needs_strict_and_an_inexact_counter} retain all 925: 930
     // (measured with cargo nextest list).
-    ("test.hermit_unit", 930),
+    // Re-listed with the admission-failed hook test: 926.
+    ("test.hermit_unit", 931),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1731,7 +1732,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same two auto-reap tests: 920.
     // The host twin selects the same three tests: 923.
     // And the same two record-version tests (925).
-    ("test.hermit_unit_on_host", 930),
+    // The host twin selects the same tests: 926.
+    ("test.hermit_unit_on_host", 931),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
