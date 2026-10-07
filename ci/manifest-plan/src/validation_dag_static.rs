@@ -817,6 +817,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // guest_may_inherit_a_terminal_never_enters_the_legacy_form
     // (https://github.com/rrnewton/hermit/pull/3361) retain all 979 (981, measured with
     // cargo nextest list --profile ci).
+    // The 986 pinned before https://github.com/rrnewton/hermit/pull/3361 and its two tests above,
+    // re-listed together: 988 (measured with cargo nextest list --profile ci).
     ("test.regular_crates", 990),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
@@ -1069,6 +1071,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests::only_gated_backends_record_an_inherited_terminal
     // (https://github.com/rrnewton/hermit/pull/3361) retain all 902 (905, measured with cargo
     // nextest list).
+    // The 933 pinned before https://github.com/rrnewton/hermit/pull/3361 and its three tests above,
+    // re-listed together: 936 (measured with cargo nextest list --profile ci).
     ("test.hermit_unit", 936),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
@@ -1305,6 +1309,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     //   a_rearming_wait_is_not_ended_by_a_default_job_control_stop,
     //   kernel_signal_state_parses_proc_status,
     //   only_unblocked_caught_or_fatal_signals_interrupt_a_wait;
+    // The 1002 pinned before https://github.com/rrnewton/hermit/pull/3361 and its 66 tests above,
+    // re-listed together: 1068 (measured with cargo nextest list --profile ci).
     ("test.detcore_unit", 1068),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
@@ -1816,6 +1822,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the descriptor-alias interning test (1002).
     // And the same 66 https://github.com/rrnewton/hermit/pull/3361 signal tests
     // listed for test.detcore_unit (1041, measured).
+    // The host twin selects the same tests, re-listed together: 1068.
     ("test.detcore_unit_on_host", 1068),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
@@ -1886,6 +1893,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same tests: 928.
     // And the same blocked-wait backend-contract test and two inherited-terminal
     // tests (905, measured).
+    // The host twin selects the same tests, re-listed together: 936.
     ("test.hermit_unit_on_host", 936),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
@@ -1965,6 +1973,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The two detcore-dbt handler-error tests listed there retain all 984: 986.
     // The two framework-retry ledger tests listed there retain all 986: 988.
     // The two detcore-model legacy-form tests listed there retain all 979: 981.
+    // The host twin selects the same tests, re-listed together: 988.
     ("test.regular_crates_on_host", 990),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
