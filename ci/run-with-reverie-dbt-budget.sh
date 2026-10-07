@@ -1113,7 +1113,16 @@ fi
 # third-party or rust-toolchain.toml changes, so the four budget inputs are
 # unchanged. Carry, not recalibration: no new timing sample or >=5-sample
 # replacement claim is made.
-expected_pin=d78f770f2fde06db9d2787e0fea0ca0984891763
+# CARRY TO 8bfb450ed8cbcebfbf474ea083e68cf332324e51 (2026-10-07): from
+# d78f770f2fde06db9d2787e0fea0ca0984891763. The one commit changes reverie/src (one removed
+# BackendCapabilities field and the Guest::storable_memory_ranges query) and
+# reverie-kvm (time(2); time and gettimeofday stores only to writable pages,
+# shared file mappings included, through a new UserMemory::store_user_u64; and
+# the storable-range report); no file under
+# reverie-dbt, the root Cargo.toml, third-party or rust-toolchain.toml
+# changes, so the four budget inputs are unchanged. Carry, not recalibration:
+# no new timing sample or >=5-sample replacement claim is made.
+expected_pin=8bfb450ed8cbcebfbf474ea083e68cf332324e51
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
