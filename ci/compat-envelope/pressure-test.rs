@@ -27760,6 +27760,9 @@ print("fixture " + args[0] + " accepted")
     fn a_hung_cells_writer_is_killed_with_its_process_group() {
         use std::os::unix::process::ExitStatusExt;
 
+        // Three times the writer's bound, timed from the moment the probe is
+        // in the writer's group.
+        const KILLED_WITHIN: Duration = Duration::from_secs(15);
         let fixture = Fixture::new("emit-hung", WRITER);
         let results = fixture.path("results");
         plant_emittable_series(&results, 0);
@@ -27782,7 +27785,24 @@ print("fixture " + args[0] + " accepted")
         let (emission, probe) = std::thread::scope(|scope| {
             // Dropping `emitting`, by a panic too, ends the probe's search.
             let (emitting, finished) = std::sync::mpsc::channel::<()>();
-            let probe = scope.spawn(move || probe_writer_group(&script, &sleep, &finished));
+            let probe = scope.spawn(move || {
+                let mut probe = probe_writer_group(&script, &sleep, &finished)?;
+                // Watched while the emit runs, and timed from here, where the
+                // writer and the probe have both started: neither start
+                // counts, and a kill of the group that comes only later, for
+                // example once the leader has been reaped, is too late.
+                let joined = Instant::now();
+                loop {
+                    let ended = probe
+                        .0
+                        .try_wait()
+                        .map_err(|e| format!("cannot wait for the probe: {e}"))?;
+                    if ended.is_some() || joined.elapsed() >= KILLED_WITHIN {
+                        return Ok((probe, ended, joined.elapsed()));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
             let emission = emit_series_to(
                 &parent,
                 &results,
@@ -27794,7 +27814,7 @@ print("fixture " + args[0] + " accepted")
             drop(emitting);
             (emission, probe.join().unwrap())
         });
-        let mut probe = probe.unwrap_or_else(|why| panic!("{why}"));
+        let (_probe, ended, waited) = probe.unwrap_or_else(|why: String| panic!("{why}"));
         assert_eq!(
             emission.cells,
             Err(
@@ -27811,21 +27831,14 @@ print("fixture " + args[0] + " accepted")
             !parent.join("slept-30-s").exists(),
             "the writer slept for 30 s, so it was not killed at its 5 s bound"
         );
-        // Only the kill of the writer's whole group sends the probe SIGKILL,
-        // and that kill came before the emit returned; the probe sleeps in
-        // nanosleep, so it ends as soon as it is scheduled.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let ended = loop {
-            match probe.0.try_wait().unwrap() {
-                Some(status) => break Some(status),
-                None if Instant::now() >= deadline => break None,
-                None => std::thread::sleep(Duration::from_millis(20)),
-            }
-        };
+        // Only the kill of the writer's whole group sends the probe SIGKILL;
+        // the probe sleeps in nanosleep, so it ends as soon as it is
+        // scheduled.
         assert_eq!(
             ended.map(|status| status.signal()),
             Some(Some(9)),
-            "the probe in the writer's process group was not killed with it: {ended:?}"
+            "the probe in the writer's process group was not killed with it within \
+             {KILLED_WITHIN:?}: {ended:?} after {waited:?}"
         );
     }
 }
