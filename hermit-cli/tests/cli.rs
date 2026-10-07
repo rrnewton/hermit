@@ -51,6 +51,14 @@ mod dispatch_stats;
 #[path = "common/liteinst_in_guest_programs.rs"]
 mod liteinst_in_guest_programs;
 
+// Builds and checks tests/c/fixtures/inode_identity_views.c, which two of the
+// in-guest LiteInst program tests run. Its helpers are shared with the
+// procfs_determinism and sabre_examples binaries, so each carries
+// `#[allow(dead_code)]` for the ones this binary does not call.
+#[cfg(feature = "liteinst")]
+#[path = "common/inode_identity_views.rs"]
+mod inode_identity_views;
+
 #[path = "common/readonly_proc.rs"]
 mod readonly_proc;
 
