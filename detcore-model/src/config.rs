@@ -1676,6 +1676,9 @@ impl LegacyBackendKeys {
         backend.virtualizes_capability_prctls = self.backend_virtualizes_capability_prctls;
         backend.virtualizes_cpuid = self.cpuid_virtualized_by_backend;
         backend.supports_madvise = self.backend_supports_madvise;
+        // A legacy encoding predates this key: every backend that supports
+        // madvise supports MADV_DONTNEED, and KVM implements it alone.
+        backend.supports_madv_dontneed = self.backend_supports_madvise || self.backend_is_kvm;
         backend.provides_process_signal_control = self.backend_is_kvm;
         backend.emulates_child_waits = self.backend_is_kvm;
         backend.failed_gettimeofday_may_store_host_time = !self.backend_is_kvm;
@@ -2397,7 +2400,10 @@ mod tests {
             let mut expected = BackendCapabilities::PTRACE;
             match key {
                 "cpuid_virtualized_by_backend" => expected.virtualizes_cpuid = true,
-                "backend_supports_madvise" => expected.supports_madvise = false,
+                "backend_supports_madvise" => {
+                    expected.supports_madvise = false;
+                    expected.supports_madv_dontneed = false;
+                }
                 "discover_live_file_metadata" => {
                     expected.tool_shares_guest_descriptor_table = true;
                     expected.rediscovers_descriptors_after_exec = true;

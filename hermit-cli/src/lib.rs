@@ -2591,7 +2591,8 @@ async fn run_kvm(
 
     let setup_started = Instant::now();
     // `prepare_backend_config` already copied `KvmBackend::capabilities()`,
-    // which reports the backend's own CPUID table and its lack of madvise.
+    // which reports the backend's own CPUID table and that, of the madvise
+    // advice with guest-visible semantics, it implements only MADV_DONTNEED.
     // KVM does not enter Hermit's UTS namespace, so Detcore must provide the
     // same synthetic identity that the namespace-backed ptrace path exposes.
     // TODO-HUMAN-REVIEW(PR-998): Review KVM UTS namespace parity.
@@ -5808,6 +5809,7 @@ mod tests {
             // `run_kvm` set these two after `prepare_backend_config`.
             "virtualizes_cpuid": kvm,
             "supports_madvise": !kvm,
+            "supports_madv_dontneed": true,
             "provides_process_signal_control": kvm,
             "emulates_child_waits": kvm,
             "failed_gettimeofday_may_store_host_time": !kvm,
