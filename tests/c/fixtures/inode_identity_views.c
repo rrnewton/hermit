@@ -12,6 +12,8 @@
 //        inode_identity_views proc-fd-links
 //        inode_identity_views stdio-mmap-sentinel < REGULAR-FILE
 //        inode_identity_views stdio-getdents > DIR
+//        inode_identity_views stdout-alias-maps PATH 1<> PATH
+//        inode_identity_views stdout-pipe-links | READER
 //
 // Detcore keys its deterministic inodes on a raw device and inode together
 // (https://github.com/rrnewton/hermit/issues/3307). Every interface that
@@ -93,6 +95,29 @@
 //   stdin's device would list inodes stat does not report. Stdout is the
 //   directory, so the result goes to stderr, on a line beginning
 //   "stdio-getdents ".
+//
+// stdout-alias-maps PATH 1<> PATH
+//   Stdout is PATH, a regular file of at least one page opened for reading
+//   and writing; the owning test makes stdin /dev/null, another object. Dups
+//   stdout to a descriptor above 2 (the alias), maps the first page of the
+//   alias, opens PATH again read-only and maps the first page of that
+//   descriptor, and reads the alias's /proc/self/fdinfo. Each maps line's
+//   inode and the fdinfo `ino:` line must equal the st_ino fstat of the alias
+//   reports, which must equal what stat and statx of PATH report. fstat of
+//   descriptor 1 itself is not compared: Hermit reports a fixed inode for an
+//   inherited stdio descriptor, on purpose, where Linux reports the file's.
+//   Stdout is the file, so the result goes to stderr, on a line beginning
+//   "stdout-alias-maps ": one field per view, "agrees" or "differs".
+//
+// stdout-pipe-links | READER
+//   Stdout is a pipe; the owning test makes stdin /dev/null. Dups stdout to a
+//   descriptor above 2 (the alias) and forks. The child reads its own
+//   /proc/self/fd link of the alias, and the parent's /proc/<pid>/fd links of
+//   descriptor 1 and of the alias, the parent's each through readlink and
+//   through readlinkat relative to /proc/<pid>/fd. Each must read pipe:[N],
+//   where N is the st_ino the child's fstat of the alias reports. The result
+//   goes to stderr, on a line beginning "stdout-pipe-links ": one field per
+//   view, "agrees" or "differs".
 
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -840,6 +865,264 @@ static int stdio_getdents(void) {
   return 0;
 }
 
+// ---------------------------------------------------------------------------
+// stdout-alias-maps and stdout-pipe-links
+
+// A dup of stdout at the lowest free descriptor from 10 up, clear of the three
+// stdio descriptors.
+static int dup_stdout_above_stdio(void) {
+  int alias = fcntl(STDOUT_FILENO, F_DUPFD, 10);
+  CHECK(alias >= 10);
+  return alias;
+}
+
+// "agrees" when `reported` is `expected`; otherwise prints both to stderr and
+// returns "differs".
+static const char* inode_verdict(
+    const char* view,
+    unsigned long long reported,
+    unsigned long long expected) {
+  if (reported == expected) {
+    return "agrees";
+  }
+  fprintf(
+      stderr,
+      "%s reports inode %llu, but fstat of the alias and stat of the path "
+      "report %llu\n",
+      view,
+      reported,
+      expected);
+  return "differs";
+}
+
+// The inode column of the one /proc/self/maps line whose range holds
+// `address`.
+static unsigned long long maps_inode_at(uintptr_t address) {
+  FILE* maps = fopen("/proc/self/maps", "re");
+  CHECK(maps != NULL);
+  char* line = NULL;
+  size_t capacity = 0;
+  unsigned long long found = 0;
+  int lines = 0;
+  while (getline(&line, &capacity, maps) > 0) {
+    uintptr_t start = 0;
+    uintptr_t end = 0;
+    unsigned long long inode = 0;
+    CHECK(
+        sscanf(
+            line,
+            "%lx-%lx %*4s %*x %*x:%*x %llu",
+            &start,
+            &end,
+            &inode) == 3);
+    if (address >= start && address < end) {
+      found = inode;
+      lines++;
+    }
+  }
+  free(line);
+  CHECK(fclose(maps) == 0);
+  CHECK(lines == 1);
+  return found;
+}
+
+// Maps the first page of `fd` read-only and returns the inode its maps line
+// reports.
+static unsigned long long mapping_inode(int fd) {
+  void* mapped = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+  CHECK(mapped != MAP_FAILED);
+  unsigned long long inode = maps_inode_at((uintptr_t)mapped);
+  CHECK(munmap(mapped, 4096) == 0);
+  return inode;
+}
+
+// The inode the `ino:` line of /proc/self/fdinfo/<fd> reports.
+static unsigned long long fdinfo_inode(int fd) {
+  char path[64];
+  CHECK(
+      snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", fd) <
+      (int)sizeof(path));
+  FILE* fdinfo = fopen(path, "re");
+  CHECK(fdinfo != NULL);
+  char* line = NULL;
+  size_t capacity = 0;
+  unsigned long long inode = 0;
+  int lines = 0;
+  while (getline(&line, &capacity, fdinfo) > 0) {
+    if (sscanf(line, "ino: %llu", &inode) == 1) {
+      lines++;
+    }
+  }
+  free(line);
+  CHECK(fclose(fdinfo) == 0);
+  CHECK(lines == 1);
+  return inode;
+}
+
+static int stdout_alias_maps(const char* path) {
+  struct stat stdout_stat;
+  CHECK(fstat(STDOUT_FILENO, &stdout_stat) == 0);
+  CHECK(S_ISREG(stdout_stat.st_mode) && stdout_stat.st_size >= 4096);
+  int alias = dup_stdout_above_stdio();
+  struct stat alias_stat;
+  CHECK(fstat(alias, &alias_stat) == 0);
+  struct stat path_stat;
+  CHECK(stat(path, &path_stat) == 0);
+  struct statx path_statx;
+  CHECK(statx(AT_FDCWD, path, 0, STATX_INO, &path_statx) == 0);
+  CHECK((path_statx.stx_mask & STATX_INO) != 0);
+  // One file: Linux reports one inode for it through every interface.
+  CHECK(alias_stat.st_ino == path_stat.st_ino);
+  CHECK(path_statx.stx_ino == (uint64_t)path_stat.st_ino);
+  const unsigned long long expected = (unsigned long long)path_stat.st_ino;
+
+  const char* alias_view =
+      inode_verdict("the maps line of the alias", mapping_inode(alias), expected);
+  int reopened = open(path, O_RDONLY | O_CLOEXEC);
+  CHECK(reopened >= 0);
+  struct stat reopened_stat;
+  CHECK(fstat(reopened, &reopened_stat) == 0);
+  CHECK(reopened_stat.st_ino == path_stat.st_ino);
+  const char* reopened_view = inode_verdict(
+      "the maps line of the path opened again read-only",
+      mapping_inode(reopened),
+      expected);
+  const char* fdinfo_view = inode_verdict(
+      "the alias's fdinfo ino: line", fdinfo_inode(alias), expected);
+  CHECK(close(reopened) == 0);
+  CHECK(close(alias) == 0);
+  fprintf(
+      stderr,
+      "stdout-alias-maps alias=%s reopened=%s fdinfo=%s\n",
+      alias_view,
+      reopened_view,
+      fdinfo_view);
+  return strcmp(alias_view, "agrees") == 0 &&
+          strcmp(reopened_view, "agrees") == 0 &&
+          strcmp(fdinfo_view, "agrees") == 0
+      ? 0
+      : 1;
+}
+
+// "agrees" when `target` is `expected`; otherwise prints both to stderr and
+// returns "differs".
+static const char*
+link_verdict(const char* view, const char* target, const char* expected) {
+  if (strcmp(target, expected) == 0) {
+    return "agrees";
+  }
+  fprintf(
+      stderr,
+      "%s reads %s, but fstat of the alias reports %s\n",
+      view,
+      target,
+      expected);
+  return "differs";
+}
+
+// The parent's /proc/<pid>/fd/<fd> link, read through readlink and through
+// readlinkat relative to the parent's open /proc/<pid>/fd: "agrees" when both
+// read `expected`.
+static const char* parent_link_verdict(
+    const char* parent,
+    int parent_fd_directory,
+    int fd,
+    const char* expected) {
+  char path[64];
+  char target[128];
+  CHECK(
+      snprintf(path, sizeof(path), "/proc/%s/fd/%d", parent, fd) <
+      (int)sizeof(path));
+  ssize_t length = readlink(path, target, sizeof(target) - 1);
+  CHECK(length > 0);
+  target[length] = '\0';
+  const char* through_path = link_verdict(path, target, expected);
+
+  char name[16];
+  char view[96];
+  CHECK(snprintf(name, sizeof(name), "%d", fd) < (int)sizeof(name));
+  CHECK(
+      snprintf(view, sizeof(view), "readlinkat(/proc/%s/fd, %s)", parent, name) <
+      (int)sizeof(view));
+  length = readlinkat(parent_fd_directory, name, target, sizeof(target) - 1);
+  CHECK(length > 0);
+  target[length] = '\0';
+  const char* through_directory = link_verdict(view, target, expected);
+  return strcmp(through_path, "agrees") == 0 &&
+          strcmp(through_directory, "agrees") == 0
+      ? "agrees"
+      : "differs";
+}
+
+static int stdout_pipe_links(void) {
+  struct stat stdout_stat;
+  CHECK(fstat(STDOUT_FILENO, &stdout_stat) == 0);
+  CHECK(S_ISFIFO(stdout_stat.st_mode));
+  int alias = dup_stdout_above_stdio();
+  // Name the parent's /proc directory by what /proc/self reads IN the parent;
+  // see proc_fd_links.
+  char parent[32];
+  ssize_t parent_length = readlink("/proc/self", parent, sizeof(parent) - 1);
+  CHECK(parent_length > 0);
+  parent[parent_length] = '\0';
+
+  pid_t child = fork();
+  CHECK(child >= 0);
+  if (child == 0) {
+    struct stat alias_stat;
+    CHECK(fstat(alias, &alias_stat) == 0);
+    char expected[64];
+    CHECK(
+        snprintf(
+            expected,
+            sizeof(expected),
+            "pipe:[%llu]",
+            (unsigned long long)alias_stat.st_ino) < (int)sizeof(expected));
+
+    char path[64];
+    char target[128];
+    CHECK(
+        snprintf(path, sizeof(path), "/proc/self/fd/%d", alias) <
+        (int)sizeof(path));
+    ssize_t length = readlink(path, target, sizeof(target) - 1);
+    CHECK(length > 0);
+    target[length] = '\0';
+    const char* own_alias = link_verdict(path, target, expected);
+
+    char directory_path[64];
+    CHECK(
+        snprintf(
+            directory_path, sizeof(directory_path), "/proc/%s/fd", parent) <
+        (int)sizeof(directory_path));
+    int parent_fd_directory =
+        open(directory_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(parent_fd_directory >= 0);
+    const char* parent_alias =
+        parent_link_verdict(parent, parent_fd_directory, alias, expected);
+    const char* parent_stdout = parent_link_verdict(
+        parent, parent_fd_directory, STDOUT_FILENO, expected);
+    CHECK(close(parent_fd_directory) == 0);
+    fprintf(
+        stderr,
+        "stdout-pipe-links own-alias=%s parent-alias=%s parent-stdout=%s\n",
+        own_alias,
+        parent_alias,
+        parent_stdout);
+    _exit(
+        strcmp(own_alias, "agrees") == 0 &&
+                strcmp(parent_alias, "agrees") == 0 &&
+                strcmp(parent_stdout, "agrees") == 0
+            ? 0
+            : 1);
+  }
+
+  int status = 0;
+  CHECK(waitpid(child, &status, 0) == child);
+  CHECK(WIFEXITED(status));
+  CHECK(close(alias) == 0);
+  return WEXITSTATUS(status);
+}
+
 int main(int argc, char** argv) {
   if (argc == 3 && strcmp(argv[1], "scm-getdents") == 0) {
     return scm_getdents(argv[2]);
@@ -859,10 +1142,17 @@ int main(int argc, char** argv) {
   if (argc == 2 && strcmp(argv[1], "stdio-getdents") == 0) {
     return stdio_getdents();
   }
+  if (argc == 3 && strcmp(argv[1], "stdout-alias-maps") == 0) {
+    return stdout_alias_maps(argv[2]);
+  }
+  if (argc == 2 && strcmp(argv[1], "stdout-pipe-links") == 0) {
+    return stdout_pipe_links();
+  }
   fprintf(
       stderr,
       "usage: %s scm-getdents DIR | maps-stat [DIR] | maps-stat-full-table | "
-      "proc-fd-links | stdio-mmap-sentinel | stdio-getdents\n",
+      "proc-fd-links | stdio-mmap-sentinel | stdio-getdents | "
+      "stdout-alias-maps PATH | stdout-pipe-links\n",
       argv[0]);
   return 2;
 }
