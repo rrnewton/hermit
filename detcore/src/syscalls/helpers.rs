@@ -3924,6 +3924,25 @@ mod kernel_signal_wait_failures {
         let exited = std::thread::spawn(|| unsafe { libc::gettid() })
             .join()
             .unwrap();
+        // `join` returns when the kernel clears the thread's TID word, early in
+        // its exit; the thread stays in `/proc` and answers `tgkill` until the
+        // kernel releases it a moment later. Measured on the development host,
+        // 62 of 20000 joined threads were still listed right after `join`, and
+        // a GitHub-hosted run read such a thread's status here
+        // (https://github.com/rrnewton/hermit/actions/runs/37683205050). So wait
+        // for the release. The path is in this process's own task directory, so
+        // no other process's thread can appear under it, and Linux hands out
+        // TIDs cyclically, so this one is not reissued here before the counter
+        // wraps.
+        let task = format!("/proc/self/task/{exited}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::path::Path::new(&task).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "thread {exited} is still in /proc 10 s after it was joined"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         let (guest, _kernel) = WaitGuest::new(Pid::from_raw(exited), guest_mask());
         // No script: the read goes to the real `/proc`, where the thread is gone.
 
