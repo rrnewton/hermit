@@ -10279,6 +10279,187 @@ mod test {
         scheduler.wake_signaled_guest(creator, Signal::SIGCHLD);
     }
 
+    /// The resources of `thread`'s posted request, or `None` while it has
+    /// posted nothing.
+    fn request_resources(scheduler: &Scheduler, thread: DetTid) -> Option<Vec<ResourceID>> {
+        scheduler.next_turns[&thread]
+            .req
+            .try_read()
+            .map(|request| request.unwrap().resources.keys().cloned().collect())
+    }
+
+    /// A synthesized `SIGCHLD` that reaches a vfork parent still inside its real
+    /// vfork (its request is empty) arms nothing and counterfeits nothing. A
+    /// vfork parent sleeps killable, so the signal stays pending; a counterfeit
+    /// request would put a thread that cannot answer on the run queue and lose
+    /// the continuation that releases the vfork barrier. Once the child has
+    /// exited, the parent's own continuation arrives and the ordinary barrier
+    /// and blocker paths return it to the run queue.
+    #[test]
+    fn child_exit_signal_leaves_vfork_parent_waiting_for_its_continuation() {
+        let (mut scheduler, _parent, creator, child) = sigchld_family(libc::SIGCHLD);
+        let op = ExternalOpId::new(creator, 7);
+        commit_out_of_scheduler_call(
+            &mut scheduler,
+            creator,
+            ResourceID::BlockingExternalIO(op),
+            Some(0),
+        );
+        scheduler.vfork_barriers.insert(creator, Some(child));
+
+        scheduler.wake_signaled_guest(creator, Signal::SIGCHLD);
+
+        assert!(scheduler.blocked.signaled_background.is_empty());
+        assert_eq!(
+            scheduler.blocked.external_io_blockers.get(&creator),
+            Some(&op)
+        );
+        assert!(!scheduler.run_queue.contains_tid(creator));
+        assert_eq!(request_resources(&scheduler, creator), None);
+
+        let mut continuation = Resources::new(creator);
+        continuation.insert(ResourceID::BlockedExternalContinue(op), Permission::RW);
+        scheduler.next_turns.get_mut(&creator).unwrap().req = Ivar::full(Ok(continuation));
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
+        assert!(scheduler.vfork_barriers.is_empty());
+        assert!(scheduler.step2c_process_io_blockers().is_ok());
+        assert!(scheduler.blocked.external_io_blockers.is_empty());
+        assert!(scheduler.run_queue.contains_tid(creator));
+        assert_eq!(
+            request_resources(&scheduler, creator),
+            Some(vec![ResourceID::BlockedExternalContinue(op)])
+        );
+    }
+
+    /// A `SIGCHLD` that reaches a vfork parent whose continuation is already
+    /// posted neither replaces that continuation nor requeues the parent ahead
+    /// of the barrier.
+    #[test]
+    fn child_exit_signal_does_not_replace_a_posted_vfork_continuation() {
+        let (mut scheduler, _parent, creator, child) = sigchld_family(libc::SIGCHLD);
+        let op = ExternalOpId::new(creator, 7);
+        commit_out_of_scheduler_call(
+            &mut scheduler,
+            creator,
+            ResourceID::BlockingExternalIO(op),
+            Some(0),
+        );
+        scheduler.vfork_barriers.insert(creator, Some(child));
+        let mut continuation = Resources::new(creator);
+        continuation.insert(ResourceID::BlockedExternalContinue(op), Permission::RW);
+        scheduler.next_turns.get_mut(&creator).unwrap().req = Ivar::full(Ok(continuation));
+
+        scheduler.wake_signaled_guest(creator, Signal::SIGCHLD);
+
+        assert!(scheduler.blocked.signaled_background.is_empty());
+        assert_eq!(
+            scheduler.blocked.external_io_blockers.get(&creator),
+            Some(&op)
+        );
+        assert!(!scheduler.run_queue.contains_tid(creator));
+        assert_eq!(
+            request_resources(&scheduler, creator),
+            Some(vec![ResourceID::BlockedExternalContinue(op)])
+        );
+    }
+
+    /// A signal that the recorded mask of a thread blocked in external IO
+    /// admits arms the thread and leaves it in its pool with its request empty:
+    /// the scheduler waits for the thread's own report and every pass until
+    /// then is empty.
+    #[test]
+    fn signal_leaves_blocking_external_io_waiting_for_its_own_report() {
+        let (mut scheduler, _parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+        let op = ExternalOpId::new(creator, 291);
+        commit_out_of_scheduler_call(
+            &mut scheduler,
+            creator,
+            ResourceID::BlockingExternalIO(op),
+            Some(0),
+        );
+
+        scheduler.wake_signaled_guest(creator, Signal::SIGALRM);
+
+        assert!(scheduler.blocked.signaled_background.contains(&creator));
+        assert!(!scheduler.blocked.sigchld_ready.contains(&creator));
+        assert_eq!(
+            scheduler.blocked.external_io_blockers.get(&creator),
+            Some(&op)
+        );
+        assert!(!scheduler.run_queue.contains_tid(creator));
+        assert_eq!(request_resources(&scheduler, creator), None);
+        assert!(scheduler.step2_release_signaled_background().is_err());
+        assert!(!scheduler.run_queue.contains_tid(creator));
+    }
+
+    /// `rt_sigsuspend` completes only through a signal. A signal its recorded
+    /// mask admits arms the waiter without counterfeiting a request: the waiter
+    /// rejoins the run queue only with the `InboundSignal` report it posts
+    /// itself, and that report is what it runs with.
+    #[test]
+    fn signal_requeues_rt_sigsuspend_without_counterfeiting_its_report() {
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        let (mut scheduler, _parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+        let op = ExternalOpId::new(creator, 291);
+        commit_out_of_scheduler_call(
+            &mut scheduler,
+            creator,
+            ResourceID::BlockingRtSigsuspend(op),
+            Some(0),
+        );
+
+        scheduler.wake_signaled_guest(creator, Signal::SIGALRM);
+
+        assert!(scheduler.blocked.signaled_background.contains(&creator));
+        assert!(!scheduler.blocked.sigchld_ready.contains(&creator));
+        assert_eq!(request_resources(&scheduler, creator), None);
+        assert!(!scheduler.run_queue.contains_tid(creator));
+        assert!(scheduler.step2_release_signaled_background().is_err());
+
+        post_inbound_signal(&mut scheduler, creator, libc::SIGALRM, &global_time);
+        assert!(scheduler.step2_release_signaled_background().is_ok());
+        assert!(scheduler.blocked.rt_sigsuspend_blockers.is_empty());
+        assert!(scheduler.run_queue.contains_tid(creator));
+        assert_eq!(
+            request_resources(&scheduler, creator),
+            Some(vec![ResourceID::InboundSignal(SigWrapper(libc::SIGALRM))])
+        );
+    }
+
+    /// Only a backend whose blocked waits are interrupted by the kernel's
+    /// signal state (`backend_supports_blocked_wait_signal_interruption`)
+    /// arms an `rt_sigsuspend` waiter to await its report. On SaBRe, where a
+    /// signal interrupts an external syscall through its own continuation
+    /// RPC, the waiter stays in its pool, unarmed, with its request empty.
+    #[test]
+    fn signal_leaves_rt_sigsuspend_in_its_pool_on_a_backend_without_a_guaranteed_report() {
+        let config = Config::default().with_backend(|backend| {
+            backend.reports_physical_process_exits = true;
+            backend.signal_interrupts_external_syscalls = true;
+        });
+        let mut scheduler = Scheduler::new(&config);
+        assert!(!scheduler.models_signal_targets);
+        let waiter = DetTid::from_raw(11);
+        let op = ExternalOpId::new(waiter, 291);
+        register_known_thread(&mut scheduler, waiter);
+        commit_out_of_scheduler_call(
+            &mut scheduler,
+            waiter,
+            ResourceID::BlockingRtSigsuspend(op),
+            Some(0),
+        );
+
+        scheduler.wake_signaled_guest(waiter, Signal::SIGALRM);
+
+        assert!(scheduler.blocked.signaled_background.is_empty());
+        assert_eq!(
+            scheduler.blocked.rt_sigsuspend_blockers.get(&waiter),
+            Some(&op)
+        );
+        assert!(!scheduler.run_queue.contains_tid(waiter));
+        assert_eq!(request_resources(&scheduler, waiter), None);
+    }
+
     /// A child-exit timer whose creator already dequeued the kernel's own
     /// `SIGCHLD` for the process, and had that delivery deferred, commits that
     /// delivery instead of sending a second signal. Before, only the leader was
