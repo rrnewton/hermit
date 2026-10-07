@@ -476,7 +476,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         // Record and replay never virtualize metadata, so Detcore never asks
         // which filesystem a directory is on. Claiming a possible filter keeps
         // any such ask from injecting a syscall the recording did not capture.
-        seccomp_filter_inherited: true,
+        seccomp_may_refuse_entry_lookup_syscalls: true,
         has_uts_namespace: true,
         // The path to the directory where syscalls will be recorded.
         replay_data: Some(data.to_path_buf()),

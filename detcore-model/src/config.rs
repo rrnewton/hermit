@@ -132,14 +132,15 @@ pub struct Config {
     #[clap(skip)]
     pub tool_opens_outside_guest_descriptor_table: bool,
 
-    /// Whether the guest may run under a seccomp filter it did not install: one the launcher
-    /// itself ran under (from a container runtime, supervisor or sandbox), which every process
-    /// Hermit starts inherits. Filters stack and the most restrictive action wins, so such a
-    /// filter judges every syscall Detcore makes the guest execute on its own behalf, and a
-    /// filter that traps or kills one signals or kills the guest for a call the program never
-    /// made. Detcore then avoids injected syscalls that only make it cheaper (the `fstatfs` that
-    /// picks which directory entries are `lstat`ed). False, the default, means no such filter
-    /// can exist. The launcher sets it when the `Seccomp:` line of any of its threads'
+    /// Whether a syscall Detcore injects to choose which entries of a directory listing are
+    /// `lstat`ed (Detcore's `EntryLookup`) might not simply succeed in the guest: the `fstatfs`
+    /// of the listed directory and, on overlayfs, the `mmap`, `statx` and `munmap` of its
+    /// mount-root check. They run in the guest's own thread under every seccomp filter the
+    /// guest runs under, and a filter the guest inherited (from a container runtime, supervisor
+    /// or sandbox the launcher ran under) may trap, kill, fail, trace or notify on one of them,
+    /// for a call the program never made. When true Detcore makes none of them and asks every
+    /// entry, as when the filesystem type is unknown. False, the default, means they succeed.
+    /// The launcher sets it when the `Seccomp:` line of any of its threads'
     /// `/proc/self/task/<tid>/status` is not 0 (a filter belongs to the thread that installed it
     /// unless synchronized, and any thread may start the guest), read before any guest exists,
     /// and whenever it cannot tell; Detcore never infers it. A caller whose command installs a
@@ -147,7 +148,7 @@ pub struct Config {
     /// a true.
     #[serde(default)]
     #[clap(skip)]
-    pub seccomp_filter_inherited: bool,
+    pub seccomp_may_refuse_entry_lookup_syscalls: bool,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1058): Review process-signal identity translation.
@@ -1604,7 +1605,7 @@ impl Default for Config {
 /// [`Config::anonymous_object_devices`],
 /// [`Config::exit_process_on_identity_lookup_refusal`],
 /// [`Config::tool_opens_outside_guest_descriptor_table`] and
-/// [`Config::seccomp_filter_inherited`] came after the bytes this form
+/// [`Config::seccomp_may_refuse_entry_lookup_syscalls`] came after the bytes this form
 /// preserves. DBT's launcher leaves the first three at their serde defaults
 /// (`None`, `false` and `false`), and the fourth at its default, `false`,
 /// unless the launcher itself runs under a seccomp filter, which the guest
@@ -1963,7 +1964,7 @@ mod legacy_backend_json {
     /// The fields `Config` gained after the bytes the legacy form preserves,
     /// each with a test of whether a configuration holds the field's serde
     /// default. DBT's launcher leaves each at that default, except
-    /// `seccomp_filter_inherited` when the launcher runs under a seccomp
+    /// `seccomp_may_refuse_entry_lookup_syscalls` when the launcher runs under a seccomp
     /// filter.
     ///
     /// The encoder leaves such a field out while it holds its default, so a
@@ -1986,8 +1987,8 @@ mod legacy_backend_json {
         ("tool_opens_outside_guest_descriptor_table", |config| {
             !config.tool_opens_outside_guest_descriptor_table
         }),
-        ("seccomp_filter_inherited", |config| {
-            !config.seccomp_filter_inherited
+        ("seccomp_may_refuse_entry_lookup_syscalls", |config| {
+            !config.seccomp_may_refuse_entry_lookup_syscalls
         }),
     ];
 
@@ -2910,7 +2911,7 @@ mod tests {
             anonymous_object_devices: Some(AnonymousObjectDevices { pipe: 1, socket: 2 }),
             exit_process_on_identity_lookup_refusal: true,
             tool_opens_outside_guest_descriptor_table: true,
-            seccomp_filter_inherited: true,
+            seccomp_may_refuse_entry_lookup_syscalls: true,
             ..Config::default()
         };
         let all: Vec<&str> = left_out.iter().map(|(name, _)| *name).collect();
@@ -3314,11 +3315,11 @@ mod tests {
     }
 
     #[test]
-    fn seccomp_filter_inherited_is_written_when_set_and_reads_back() {
+    fn seccomp_may_refuse_entry_lookup_syscalls_is_written_when_set_and_reads_back() {
         assert_left_out_at_its_default_and_written_when_set(
-            "seccomp_filter_inherited",
+            "seccomp_may_refuse_entry_lookup_syscalls",
             Config {
-                seccomp_filter_inherited: true,
+                seccomp_may_refuse_entry_lookup_syscalls: true,
                 ..Config::default()
             },
             "true",

@@ -8290,7 +8290,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// The last two would make a listing signal or kill a program that runs
     /// natively, so the `fstatfs` is injected only where no such filter can
     /// apply: Detcore refuses a guest's own filter, and the launcher sets
-    /// [`crate::Config::seccomp_filter_inherited`] whenever any thread of the
+    /// [`crate::Config::seccomp_may_refuse_entry_lookup_syscalls`] whenever any thread of the
     /// process that starts the guest runs under one (or it cannot tell), since
     /// a filter is inherited by every guest that thread starts. Then every entry is asked, no `fstatfs` is injected,
     /// and nothing is cached. The backend's own filter, such as the ptrace
@@ -8307,7 +8307,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         fd: RawFd,
     ) -> EntryLookup {
-        if guest.config().seccomp_filter_inherited {
+        if guest.config().seccomp_may_refuse_entry_lookup_syscalls {
             return EntryLookup::Every;
         }
         let cached = guest
@@ -14706,13 +14706,13 @@ pub(crate) mod inject_fstat_scratch {
     // F2. A seccomp filter the guest inherited may trap the injected
     // `fstatfs` (`SECCOMP_RET_TRAP`): the ptrace backend then reports
     // `ENOSYS` and requeues the `SIGSYS`, which reaches the guest for a call
-    // it never made. With `seccomp_filter_inherited` set, which the launcher
+    // it never made. With `seccomp_may_refuse_entry_lookup_syscalls` set, which the launcher
     // sets whenever it runs under a filter, no `fstatfs` is injected, so the
     // guest gets no `SIGSYS`; every entry is asked and keyed exactly as when
     // the type is unknown, and nothing is remembered. Both getdents paths,
     // two reads each.
     #[tokio::test]
-    async fn getdents_under_an_inherited_seccomp_filter_injects_no_fstatfs() {
+    async fn getdents_where_seccomp_may_refuse_the_lookup_injects_no_fstatfs() {
         for tracked in [false, true] {
             let (dir, unknown_fd, _, _) = directory_with_entries();
             let trapped_fd = std::fs::File::open(dir.path()).unwrap().into_raw_fd();
@@ -14722,7 +14722,7 @@ pub(crate) mod inject_fstat_scratch {
                 let (tool, mut guest) =
                     ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
                 guest.answers_determinize_inode = true;
-                guest.config.seccomp_filter_inherited = inherited;
+                guest.config.seccomp_may_refuse_entry_lookup_syscalls = inherited;
                 if inherited {
                     guest.fstatfs_traps = true;
                 } else {

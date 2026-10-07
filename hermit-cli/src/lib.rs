@@ -3312,7 +3312,7 @@ mod dbt_detconfig_omit_tests {
     /// filter gives DBT, the key is absent from `HERMIT_DBT_DETCONFIG`, so the
     /// value the guest can read keeps its baseline bytes.
     #[test]
-    fn seccomp_filter_inherited_false_is_absent_from_the_dbt_config() {
+    fn seccomp_may_refuse_entry_lookup_syscalls_false_is_absent_from_the_dbt_config() {
         for (name, config) in [
             ("default", default_config()),
             (
@@ -3320,10 +3320,10 @@ mod dbt_detconfig_omit_tests {
                 prepare_backend_config(default_config(), Backend::Dbt),
             ),
         ] {
-            assert!(!config.seccomp_filter_inherited, "{name}");
+            assert!(!config.seccomp_may_refuse_entry_lookup_syscalls, "{name}");
             let encoded = dbt_detconfig_json(&config).unwrap();
             assert!(
-                !encoded.contains("seccomp_filter_inherited"),
+                !encoded.contains("seccomp_may_refuse_entry_lookup_syscalls"),
                 "{name}: {encoded}"
             );
         }
@@ -3333,16 +3333,16 @@ mod dbt_detconfig_omit_tests {
     /// whose key is omitted, and with it true, whose key is emitted, so a DBT
     /// guest under an inherited filter does not probe.
     #[test]
-    fn seccomp_filter_inherited_round_trips_through_the_dbt_config() {
+    fn seccomp_may_refuse_entry_lookup_syscalls_round_trips_through_the_dbt_config() {
         let mut config = default_config();
-        config.seccomp_filter_inherited = false;
+        config.seccomp_may_refuse_entry_lookup_syscalls = false;
         assert_dbt_detconfig_round_trips(&config);
 
-        config.seccomp_filter_inherited = true;
+        config.seccomp_may_refuse_entry_lookup_syscalls = true;
         let encoded = dbt_detconfig_json(&config).unwrap();
         assert_eq!(
             encoded
-                .matches(r#""seccomp_filter_inherited":true"#)
+                .matches(r#""seccomp_may_refuse_entry_lookup_syscalls":true"#)
                 .count(),
             1,
             "{encoded}"
@@ -3700,8 +3700,8 @@ fn prepare_run_config(config: DetConfig, backend: Backend) -> DetConfig {
     // A seccomp filter is inherited across fork and exec and can never be
     // removed, so a filter on the thread that starts a guest is on that guest,
     // on every backend, before any guest exists to install one of its own.
-    config.seccomp_filter_inherited =
-        config.seccomp_filter_inherited || launcher_inherits_a_seccomp_filter();
+    config.seccomp_may_refuse_entry_lookup_syscalls =
+        config.seccomp_may_refuse_entry_lookup_syscalls || launcher_inherits_a_seccomp_filter();
     config
 }
 
@@ -3721,7 +3721,7 @@ fn prepare_run_config(config: DetConfig, backend: Backend) -> DetConfig {
 /// one a caller's `Command` installs in the child itself (a `pre_exec`
 /// callback, or a seccomp filter set on the command where the backend keeps
 /// it). A caller that does either sets
-/// [`DetConfig::seccomp_filter_inherited`] itself; a true there is never
+/// [`DetConfig::seccomp_may_refuse_entry_lookup_syscalls`] itself; a true there is never
 /// cleared.
 fn launcher_inherits_a_seccomp_filter() -> bool {
     seccomp_filter_in_any_task(Path::new("/proc/self/task"))
@@ -6342,13 +6342,14 @@ mod tests {
                 ..super::DetConfig::default()
             };
             assert_eq!(
-                super::prepare_run_config(config.clone(), backend).seccomp_filter_inherited,
+                super::prepare_run_config(config.clone(), backend)
+                    .seccomp_may_refuse_entry_lookup_syscalls,
                 own,
                 "{backend:?}"
             );
-            config.seccomp_filter_inherited = true;
+            config.seccomp_may_refuse_entry_lookup_syscalls = true;
             assert!(
-                super::prepare_run_config(config, backend).seccomp_filter_inherited,
+                super::prepare_run_config(config, backend).seccomp_may_refuse_entry_lookup_syscalls,
                 "{backend:?}"
             );
         }
