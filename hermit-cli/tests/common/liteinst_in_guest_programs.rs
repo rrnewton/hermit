@@ -57,6 +57,7 @@ use std::time::Instant;
 
 use super::dispatch_stats;
 use super::hermit_run_guard;
+use super::inode_identity_views;
 use super::process_build_root;
 
 static LITEINST_ADVANCED_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -388,6 +389,32 @@ fn run_liteinst_in_guest(program: &Path, args: &[&str]) -> Output {
 
 fn run_liteinst_in_guest_with_stdin(program: &Path, args: &[&str], input: &[u8]) -> Output {
     assert_liteinst_in_guest_output(run_liteinst_with_input(program, args, Some(input), None))
+}
+
+/// An in-guest LiteInst run whose stdin is `stdin` itself, so the guest can map
+/// it, rather than a pipe. The command is the one `run_liteinst_with_input`
+/// builds.
+fn run_liteinst_in_guest_with_stdin_file(program: &Path, args: &[&str], stdin: fs::File) -> Output {
+    let home = tempfile::tempdir().expect("failed to create isolated LiteInst HOME");
+    let xdg_config_home = home.path().join(".config");
+    fs::create_dir_all(&xdg_config_home).expect("failed to create isolated XDG config directory");
+    let mut command = liteinst_command_at_epoch("info", None);
+    command
+        .arg(format!("--env=HOME={}", home.path().display()))
+        .arg(format!(
+            "--env=XDG_CONFIG_HOME={}",
+            xdg_config_home.display()
+        ))
+        .arg("--env=PYTHONDONTWRITEBYTECODE=1")
+        .env("HOME", home.path())
+        .env("PYTHONDONTWRITEBYTECODE", "1");
+    command.arg("--").arg(program).args(args);
+    assert_liteinst_in_guest_output(
+        command
+            .stdin(stdin)
+            .output()
+            .expect("failed to run Hermit LiteInst with a stdin file"),
+    )
 }
 
 fn assert_liteinst_in_guest(program: &Path, args: &[&str], expected_stdout: &[u8]) {
@@ -2297,4 +2324,57 @@ fn liteinst_in_guest_user_address_limit_queries_keep_the_guest_errno() {
             assert_in_guest_selected(&String::from_utf8_lossy(&output.stderr));
         }
     }
+}
+
+// getdents keys each entry's deterministic inode on the directory's device as
+// well as the entry's inode (https://github.com/rrnewton/hermit/issues/3307),
+// and a descriptor received over SCM_RIGHTS is one Detcore does not track, so
+// it has no cached stat to read that device from. This guards that getdents on
+// such a descriptor still succeeds and lists every entry with the inode number
+// `stat` reports for it. It runs in-guest without `--verify`, which in-guest
+// LiteInst refuses (see the module documentation).
+#[test]
+fn liteinst_in_guest_untracked_directory_descriptor_lists_stat_inodes() {
+    let _guard = hermit_run_guard();
+    let guest = inode_identity_views::compile_guest("liteinst-scm-getdents");
+    let output = run_liteinst_in_guest(&guest, &["scm-getdents", "/test"]);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        inode_identity_views::scm_getdents_expected_stdout()
+    );
+}
+
+// Every file-backed /proc/self/maps line must report the inode `stat` reports
+// for that file. Deterministic inodes are keyed on device and inode
+// (https://github.com/rrnewton/hermit/issues/3307), and on btrfs maps and stat
+// report different devices for one file, so the device in a maps line cannot
+// be the key. This guards that every mapping of a live path, the mapped stdin
+// file, and two files mapped and then unlinked (no path leads to them; one
+// descriptor is still open, the other closed) keep the inode fstat reports.
+// The unlinked files go in a host directory rather than the guest's tmpfs
+// working directory, so that on a btrfs host they are the two-device case. It
+// runs in-guest without `--verify`, which in-guest LiteInst refuses (see the
+// module documentation).
+#[test]
+fn liteinst_in_guest_maps_inodes_equal_stat_inodes() {
+    let _guard = hermit_run_guard();
+    let guest = inode_identity_views::compile_guest("liteinst-maps-stat");
+    let mut input =
+        tempfile::NamedTempFile::new_in(env!("CARGO_TARGET_TMPDIR")).expect("stdin file to map");
+    input.write_all(&[b'x'; 4096]).expect("fill stdin file");
+    let stdin = input.reopen().expect("reopen stdin file");
+    let unlinked =
+        tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("directory to unlink files in");
+    let unlinked_arg = unlinked
+        .path()
+        .to_str()
+        .expect("CARGO_TARGET_TMPDIR should be UTF-8");
+    let output = run_liteinst_in_guest_with_stdin_file(&guest, &["maps-stat", unlinked_arg], stdin);
+    let stdout = String::from_utf8(output.stdout).expect("maps-stat output should be UTF-8");
+    inode_identity_views::assert_maps_stat_summary(
+        stdout.trim_end(),
+        &guest,
+        "agrees",
+        Some(unlinked.path()),
+    );
 }

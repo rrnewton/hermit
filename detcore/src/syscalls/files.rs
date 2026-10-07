@@ -38,7 +38,9 @@ use reverie::syscalls::ReadAddr;
 use reverie::syscalls::SockFlag;
 use reverie::syscalls::StatPtr;
 use reverie::syscalls::StatxMask;
+use reverie::syscalls::StatxPtr;
 use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallArgs;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
 use reverie::syscalls::Timespec;
@@ -50,9 +52,11 @@ use tracing::trace;
 use tracing::warn;
 
 use super::deterministic_stdio_inode_for_resource;
+use crate::IdentityLookupRefused;
 use crate::config::SchedHeuristic;
 use crate::dirents::*;
 use crate::fd::*;
+use crate::procfs::MappingSubject;
 use crate::procfs::MountInfoSnapshot;
 use crate::procfs::ProcfsFile;
 use crate::procfs::ProcfsSnapshotContext;
@@ -619,6 +623,29 @@ fn is_inherited_container_output(resource: Option<ResourceID>) -> bool {
     )
 }
 
+/// Whether a descriptor carries an inherited container stdio resource: one of
+/// descriptors 0-2 as the guest received them, or a dup of one. Its cached
+/// stat is the tracer's `fstat(0)` stand-in, not the descriptor's own.
+fn is_container_stdio(resource: Option<ResourceID>) -> bool {
+    matches!(
+        resource,
+        Some(ResourceID::Device(
+            Device::ContainerStdin | Device::ContainerStdout | Device::ContainerStderr
+        ))
+    )
+}
+
+/// Where `handle_mmap` takes the identity it records for a file mapping.
+enum MappedFileIdentity {
+    /// No file identity: an anonymous mapping, an untracked descriptor, or one
+    /// with no cached stat.
+    None,
+    /// The descriptor's cached stat.
+    Cached(RawInode),
+    /// A stdio descriptor, whose cached stat is a stand-in.
+    Stdio,
+}
+
 fn unix_autobind_addrlen() -> i32 {
     (std::mem::offset_of!(libc::sockaddr_un, sun_path) + UNIX_AUTOBIND_NAME_LEN) as i32
 }
@@ -938,7 +965,277 @@ fn stdio_inode_override<T: RecordOrReplay, G: Guest<Detcore<T>>>(
         .flatten()
 }
 
+/// The longest path, NUL excluded, that `Detcore::stat_guest_path` stages in
+/// the guest stack scratch; a longer one goes to a transient page.
+const GUEST_STAT_PATH_CAPACITY: usize = 512;
+
+/// What the stack-scratch attempt of `Detcore::stat_guest_path` found.
+enum StackStat {
+    /// The scratch held the stat: the guest's answer, `None` when its stat
+    /// failed.
+    Answered(Option<libc::stat>),
+    /// The scratch is too small, or faulted with `EFAULT`.
+    Unusable,
+}
+
+/// Length of the transient mapping `Detcore::stat_guest_path` stages a path
+/// of `path_len` bytes in: the path and its NUL, then an 8-aligned
+/// `struct stat`, rounded up to whole pages.
+fn transient_stat_page_len(path_len: usize) -> usize {
+    // SAFETY: sysconf has no preconditions.
+    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+        .expect("page size must be positive");
+    ((path_len + 1).next_multiple_of(8) + std::mem::size_of::<libc::stat>()).next_multiple_of(page)
+}
+
+fn host_page_size() -> usize {
+    // SAFETY: sysconf has no preconditions.
+    usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+        .expect("page size must be positive")
+}
+
+/// `statx` mask bit for the mount's unique id (Linux 6.8 and later). Older
+/// kernels ignore it and report the reusable id under `STATX_MNT_ID`.
+const STATX_MNT_ID_UNIQUE: u32 = 0x4000;
+/// `statmount` request bit for the superblock's device and magic.
+const STATMOUNT_SB_BASIC: u64 = 0x1;
+/// Size of the first version of `struct mnt_id_req`: `u32 size`, `u32 spare`,
+/// `u64 mnt_id`, `u64 param`.
+const MNT_ID_REQ_SIZE_VER0: usize = 24;
+/// Bytes offered to `statmount`: the whole fixed `struct statmount`, which
+/// the kernel copies only as far as it fills.
+const STATMOUNT_BUFFER: usize = 512;
+/// Offsets in `struct statmount` of `u64 mask`, `u32 sb_dev_major` and
+/// `u32 sb_dev_minor`.
+const STATMOUNT_MASK_OFFSET: usize = 8;
+const STATMOUNT_SB_DEV_MAJOR_OFFSET: usize = 16;
+const STATMOUNT_SB_DEV_MINOR_OFFSET: usize = 20;
+
+/// What the guest's kernel answered for the mount a file is on.
+#[derive(Debug, PartialEq, Eq)]
+enum MountSuperblock {
+    /// `statmount` reported this superblock device.
+    Device(u64),
+    /// The guest cannot see that mount, or the path changed: no proof.
+    Unproven,
+    /// The kernel reported only this reusable mount id, which the guest's
+    /// `mountinfo` lists.
+    Listed(u64),
+}
+
+/// Whether `errno` from a path lookup the guest made is its filesystem's
+/// answer that the path names nothing that lookup reaches, rather than a
+/// failure to ask (see `Detcore::stat_guest_path`).
+fn is_path_answer(errno: Errno) -> bool {
+    matches!(
+        errno,
+        Errno::ENOENT | Errno::ENOTDIR | Errno::ELOOP | Errno::ENAMETOOLONG | Errno::EACCES
+    )
+}
+
+/// The error of an identity lookup that could not be asked: a tool error
+/// carrying [`IdentityLookupRefused`], which stops the refusing process on
+/// every backend, never an errno the guest's call would report as its own
+/// result.
+fn identity_lookup_refused(what: &str, path: &[u8], cause: impl std::fmt::Display) -> Error {
+    IdentityLookupRefused(format!(
+        "could not ask the guest to {what} {:?}: {cause}; refusing rather than \
+         keying the file's identity on another source",
+        String::from_utf8_lossy(path)
+    ))
+    .into_error()
+}
+
+/// A private anonymous mapping of `len` bytes in the guest, made for one
+/// identity lookup and unmapped by `unmap_identity_page` before the guest
+/// resumes; its address never reaches the guest. A failure is the lookup's
+/// refusal, as for the transient page of `Detcore::stat_guest_path`.
+async fn map_identity_page<'a, G, T>(
+    guest: &mut G,
+    len: usize,
+    what: &str,
+    path: &[u8],
+) -> Result<AddrMut<'a, u8>, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let mapped = guest
+        .inject_with_retry(Syscall::Mmap(
+            syscalls::Mmap::new()
+                .with_addr(None)
+                .with_len(len)
+                .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+                .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
+                .with_fd(-1)
+                .with_offset(0),
+        ))
+        .await
+        .map_err(|errno| {
+            warn!(
+                "[detcore] could not map a transient page for a {what} of {:?} ({errno}); \
+                 refusing rather than keying on another identity",
+                String::from_utf8_lossy(path)
+            );
+            match errno {
+                Errno::ESRCH => Error::Errno(errno),
+                errno => identity_lookup_refused(what, path, errno),
+            }
+        })?;
+    Ok(usize::try_from(mapped)
+        .ok()
+        .and_then(AddrMut::<u8>::from_raw)
+        .unwrap_or_else(|| panic!("transient identity page mmap returned {mapped}")))
+}
+
+/// Unmaps a page `map_identity_page` made. A failure is only logged, as for
+/// `Detcore::stat_guest_path`'s transient page: the lookup's answer stands.
+async fn unmap_identity_page<G, T>(guest: &mut G, page: AddrMut<'_, u8>, len: usize, path: &[u8])
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if let Err(errno) = guest
+        .inject_with_retry(Syscall::Munmap(
+            syscalls::Munmap::new()
+                .with_addr(Some(page.cast::<libc::c_void>().into()))
+                .with_len(len),
+        ))
+        .await
+    {
+        warn!(
+            "[detcore] could not unmap the transient identity page for {:?}: {errno}",
+            String::from_utf8_lossy(path)
+        );
+    }
+}
+
+/// The guest's `/proc/<pid>/mountinfo`, read on the tool's side as the
+/// fdinfo mount-id check reads it.
+fn guest_mountinfo<G: Guest<Detcore<T>>, T: RecordOrReplay>(guest: &G) -> Result<Vec<u8>, Error> {
+    #[cfg(test)]
+    inject_fstat_scratch::MOUNTINFO_READS.with(|reads| reads.set(reads.get() + 1));
+    #[cfg(test)]
+    if let Some(scripted) =
+        inject_fstat_scratch::SCRIPTED_MOUNTINFO.with(|scripted| scripted.borrow().clone())
+    {
+        return Ok(scripted);
+    }
+    let path = format!("/proc/{}/mountinfo", guest.pid().as_raw());
+    std::fs::read(&path).map_err(|error| {
+        IdentityLookupRefused(format!(
+            "could not read {path} to prove a maps line's device: {error}; refusing \
+             rather than keying the file's identity on another source"
+        ))
+        .into_error()
+    })
+}
+
+/// The superblock device of mount `mount_id` in `mountinfo`: a row's first
+/// field is its mount id and its third the superblock's `major:minor`, in
+/// decimal (`show_mountinfo`). Only those fields are read. `Ok(None)` when no
+/// row has that id; an error when the row that has it does not give a
+/// device.
+fn mountinfo_superblock_device(mountinfo: &[u8], mount_id: u64) -> Result<Option<u64>, String> {
+    for row in mountinfo.split(|&byte| byte == b'\n') {
+        let mut fields = row.split(|&byte| byte == b' ');
+        let id = fields
+            .next()
+            .and_then(|field| std::str::from_utf8(field).ok())
+            .and_then(|field| field.parse::<u64>().ok());
+        if id != Some(mount_id) {
+            continue;
+        }
+        let device = fields
+            .nth(1)
+            .and_then(|field| std::str::from_utf8(field).ok())
+            .and_then(|field| field.split_once(':'))
+            .and_then(|(major, minor)| Some((major.parse().ok()?, minor.parse().ok()?)));
+        return match device {
+            Some((major, minor)) => Ok(Some(libc::makedev(major, minor))),
+            None => Err(format!("{:?}", String::from_utf8_lossy(row))),
+        };
+    }
+    Ok(None)
+}
+
+/// The run-global identity pools, reached through this guest's RPCs to the
+/// global tool: the same `InodePool`/`DevicePool` that `stat` determinizes
+/// through, so a mapping line and a `stat` of the same file agree. A header is
+/// resolved to the file identity `stat` reports by `mapping_stat_identity`.
+struct GuestMappingMinter<'a, G, T: RecordOrReplay> {
+    detcore: &'a Detcore<T>,
+    guest: &'a mut G,
+    /// Whose address space the snapshot shows (`ProcfsFile::mapping_subject`):
+    /// the reader's mapping records describe its lines only when it is the
+    /// reader's own.
+    subject: MappingSubject,
+}
+
+impl<'a, G, T: RecordOrReplay> GuestMappingMinter<'a, G, T> {
+    fn new(detcore: &'a Detcore<T>, guest: &'a mut G, subject: MappingSubject) -> Self {
+        Self {
+            detcore,
+            guest,
+            subject,
+        }
+    }
+}
+
+impl<G, T> crate::procfs::MappingIdentityMinter for GuestMappingMinter<'_, G, T>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    type Error = Error;
+
+    async fn stat_identity(
+        &mut self,
+        key: &crate::procfs::MappingKey,
+        starts: &[usize],
+    ) -> Result<RawInode, Error> {
+        self.detcore
+            .mapping_stat_identity(self.guest, key, starts, self.subject)
+            .await
+    }
+
+    async fn inodes(&mut self, raw_files: Vec<RawInode>) -> Vec<DetInode> {
+        determinize_mapping_inodes(self.guest, raw_files).await
+    }
+
+    async fn device(&mut self, raw_device: u64) -> u64 {
+        determinize_device(self.guest, raw_device).await
+    }
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
+    /// Binds, at open time, whose address space a `maps`/`smaps` descriptor
+    /// shows (`ProcfsFile::bind_mapping_subject`).
+    ///
+    /// The opener's thread-group id and thread id are asked of the guest,
+    /// through injected `getpid` and `gettid` that the guest does not see,
+    /// only when metadata is virtualized: the only mode in which a mapping's
+    /// identity is resolved through its subject (`mapping_stat_identity`).
+    /// Both are in the guest's pid namespace, the one its `/proc` spellings
+    /// name, as in `canonicalize_namespace_readlink_result`.
+    pub(crate) async fn bind_procfs_mapping_subject<G: Guest<Self>>(
+        guest: &mut G,
+        procfs: &mut ProcfsFile,
+    ) -> Result<(), Error> {
+        if !procfs.needs_mapping_opener_ids() {
+            return Ok(());
+        }
+        let opener_ids = if guest.config().virtualize_metadata {
+            let tgid = guest.inject(syscalls::Getpid::new()).await? as i32;
+            let tid = guest.inject(syscalls::Gettid::new()).await? as i32;
+            Some((tgid, tid))
+        } else {
+            None
+        };
+        procfs.bind_mapping_subject(guest.thread_state().mm_id, opener_ids);
+        Ok(())
+    }
+
     async fn observe_timer_slack_identity<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1280,6 +1577,56 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(())
     }
 
+    /// The raw identity the `ino:` line of `/proc/*/fdinfo/<target_fd>` is
+    /// keyed on: the descriptor's cached stat, or an `fstat` of it.
+    ///
+    /// With `virtualize_metadata` that is the object's device and inode, as
+    /// `stat` reports them. Without it -- `hermit record` and `hermit replay`
+    /// -- a pipe or a socket is keyed on its inode alone, on device 0, which
+    /// is how its `/proc/<pid>/fd/<fd>` link is keyed in that mode
+    /// (`canonicalize_other_proc_fd_target` and `own_proc_fd_link_identity`),
+    /// so the link's `pipe:[N]` and the fdinfo `ino:` line name one inode, as
+    /// they do on Linux. Every other file keeps its device, so the same inode
+    /// number on two filesystems still names two files
+    /// (<https://github.com/rrnewton/hermit/issues/3307>).
+    ///
+    /// In that mode the pipe's or socket's inode comes from the `ino:` line
+    /// of `contents`, the fdinfo bytes being sanitized, and the descriptor's
+    /// `fstat` decides only its file type. At replay those bytes are the
+    /// recording's (ReadV2 supplies them), as is the link's `pipe:[N]`, while
+    /// the replayer's recreated pipe has an inode of its own; keying on the
+    /// live inode made the two views name two inodes whenever those numbers
+    /// differed. When `contents` has no single well-formed `ino:` line (a
+    /// kernel older than the field), the `fstat` inode is used, as before.
+    ///
+    /// ⚠️ THE FILE TYPE ALONE DECIDES. A named FIFO, or a socket file reached
+    /// through an `O_PATH` descriptor, is keyed on device 0 as well, although
+    /// its link names a path. Its inode can then share a deterministic inode
+    /// with an anonymous pipe or socket whose inode number happens to be
+    /// equal, as every file could before the pool was keyed on devices.
+    pub(crate) async fn fdinfo_raw_file_id<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        target_fd: i32,
+        cached_stat: Option<crate::stat::DetStat>,
+        contents: &[u8],
+    ) -> Result<RawInode, Error> {
+        let (mode, raw) = match cached_stat {
+            Some(stat) => (stat.mode, stat.raw_inode()),
+            None => {
+                let stat = self.inject_fstat(guest, target_fd).await?;
+                (stat.st_mode, RawInode::new(stat.st_dev, stat.st_ino))
+            }
+        };
+        let pipe_or_socket = matches!(mode & libc::S_IFMT, libc::S_IFIFO | libc::S_IFSOCK);
+        Ok(if pipe_or_socket && !guest.config().virtualize_metadata {
+            let inode = crate::procfs::parse_fdinfo_inode(contents).unwrap_or(raw.ino);
+            RawInode::new(0, inode)
+        } else {
+            raw
+        })
+    }
+
     /// Inject an extra fstat to retrieve file metadata.
     ///
     /// The kernel needs a writable `struct stat` in the guest. It is staged
@@ -1397,24 +1744,50 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// The fast path of [`Self::inject_fstat`]: the buffer lives in the guest
-    /// stack scratch. Returns `EFAULT` when that scratch is not writable.
+    /// stack scratch. Returns `EFAULT` when that scratch cannot be read,
+    /// committed or written.
+    ///
+    /// On ptrace the buffer is the guest's own memory below its red zone,
+    /// which the commit and the kernel's `fstat` overwrite. (The KVM backend
+    /// of the pinned Reverie hands out its reserved `ToolScratch` region
+    /// instead, outside the guest's view, where the save and restore below
+    /// protect nothing of the guest's and cost only the copy.) A guest that
+    /// issues raw system calls may keep live data there, and Linux never
+    /// writes there for it, so the 144 bytes under the buffer are read before
+    /// the scratch is committed and written back afterwards: on success, on a
+    /// failed `fstat` and after a fault alike, before the scratch guard drops.
+    /// A scratch whose bytes cannot be read is not used. This is the same
+    /// save and restore [`Self::stat_guest_path`] performs; an error other
+    /// than `EFAULT` from any step wins over an `EFAULT` from another.
     async fn inject_stat_on_stack<G: Guest<Self>>(
         guest: &mut G,
         stat_call: impl Fn(StatPtr<'_>) -> Syscall,
     ) -> Result<libc::stat, Errno> {
         let mut stack = guest.stack().await;
         let statptr: StatPtr = StatPtr(stack.reserve());
-        // Keep the guard until the buffer is no longer used. Backends whose
-        // scratch is a Tool-owned arena (DBT, SaBRe) free it when the guard
-        // drops, so dropping it before the injected fstat would let the kernel
-        // write into freed memory.
-        let _stack_guard = stack.commit()?;
-        let copied = Self::inject_stat_into(guest, stat_call(statptr), statptr).await?;
-        // clear stack memory used for fstat allocation
-        guest
-            .memory()
-            .write_exact(statptr.0.cast(), &[0; std::mem::size_of::<libc::stat>()])?;
-        Ok(copied)
+        let mut saved = [0u8; std::mem::size_of::<libc::stat>()];
+        // `EFAULT` here sends the fstat to a transient page before anything
+        // is written.
+        guest.memory().read_exact(statptr.0.cast(), &mut saved)?;
+        // Keep the guard until the buffer is written back. DBT and SaBRe free
+        // their Tool-owned arena when the guard drops; LiteInst and e9patch
+        // move it to a list of committed arenas that is cleared when the
+        // current dispatch ends. Either way, an injected fstat after the drop
+        // could write into memory the scratch no longer owns. A failed commit
+        // is written back too: the ptrace commit writes page by page, so it
+        // can fail after writing a lower writable page.
+        let committed = stack.commit();
+        let copied = match &committed {
+            Ok(_) => Self::inject_stat_into(guest, stat_call(statptr), statptr).await,
+            Err(errno) => Err(*errno),
+        };
+        let restored = guest.memory().write_exact(statptr.0.cast(), &saved);
+        drop(committed);
+        match (copied, restored) {
+            (Ok(copied), Ok(())) => Ok(copied),
+            (Err(errno), Ok(())) | (Ok(_), Err(errno)) => Err(errno),
+            (Err(Errno::EFAULT), Err(errno)) | (Err(errno), Err(_)) => Err(errno),
+        }
     }
 
     /// The fallback of [`Self::inject_fstat`] and [`Self::inject_lstatat`]:
@@ -1473,6 +1846,899 @@ impl<T: RecordOrReplay> Detcore<T> {
         // we don't want to rerun the entire syscall handler twice.
         guest.inject_with_retry(stat_call).await?;
         statptr.read(&guest.memory())
+    }
+
+    /// The raw identity `stat` reports for the file a `maps`/`smaps` header
+    /// names, which keys that mapping's deterministic inode. `starts` are the
+    /// start addresses of the snapshot's lines with this header, and
+    /// `subject` says whose address space the snapshot shows
+    /// (`ProcfsFile::mapping_subject`).
+    ///
+    /// The header's own `(device, inode)` pair is NOT always that identity: on
+    /// btrfs maps prints the superblock's device and `stat` the subvolume's,
+    /// and on overlayfs maps prints the lower file's device. Keying the inode
+    /// pool on the maps pair then gives the maps inode column a different
+    /// value from `st_ino` for the same file
+    /// (<https://github.com/rrnewton/hermit/issues/3307>). In order:
+    ///
+    /// 1. A file the reader mapped through a descriptor Detcore tracks is
+    ///    keyed on the `fstat` identity `handle_mmap` recorded for that
+    ///    address range (`MemoryMetadata::mapped_file_at`). That record needs
+    ///    no path, so it still holds after the file is unlinked or replaced
+    ///    and its descriptor closed, when the line reads ` (deleted)`. It is
+    ///    consulted only for a snapshot of the reader's own address space
+    ///    (`MappingSubject::Reader`): a file opened in that same address space
+    ///    through `/proc/self`, `/proc/thread-self`, or the opener's own
+    ///    thread-group id or thread id (`ProcfsFile::bind_mapping_subject`).
+    /// 2. Otherwise the pathname is resolved in the guest. This covers the
+    ///    executable and the ELF interpreter, which `execve` maps without a
+    ///    system call Detcore sees, and files mapped through a descriptor
+    ///    Detcore does not track, such as one received over `SCM_RIGHTS`.
+    ///    The file it names keys the line only with proof that it lies on
+    ///    the superblock the header names (`Self::proves_header_device`).
+    /// 3. Otherwise the guest `stat`s the executable link of the process
+    ///    whose address space the snapshot shows: `/proc/self/exe` for the
+    ///    reader's own, `/proc/<pid>/exe` for a task the file names by
+    ///    number (`MappingSubject::Process`), and none when that task is not
+    ///    known. That link names the running
+    ///    executable even after it is unlinked or replaced (the line then
+    ///    reads ` (deleted)`, or its path names another inode), and `stat`
+    ///    follows it to the file, so this covers the executable where step 2
+    ///    cannot. It keys the line only when the link reads as the line's
+    ///    pathname (`Self::link_names_mapping`) and the executable lies on
+    ///    the header's superblock (`Self::proves_header_device`): an
+    ///    executable that merely shares the line's inode number is another
+    ///    file. Linux binds a `maps` file's address space at open, while
+    ///    `/proc/<pid>/exe` is resolved at read time; after that task exits or
+    ///    calls `execve` the snapshot is empty, so no line asks.
+    ///    `/proc/<pid>/map_files/<range>` would name every mapped
+    ///    file the same way, but following it needs `CAP_SYS_ADMIN` or
+    ///    `CAP_CHECKPOINT_RESTORE` in the initial user namespace
+    ///    (`proc_map_files_get_link`), so it is not used.
+    ///
+    /// Each answer is accepted only if its inode is the one the header
+    /// reports, and a resolved path or executable link only with the
+    /// superblock proof as well: an inode number alone names no file, since
+    /// every filesystem, and every btrfs subvolume, numbers its own. For the
+    /// record the inode check is a guard against staleness: the
+    /// record can outlive the mapping it describes, because `handle_mmap`,
+    /// `handle_munmap` and `handle_mremap` update it only after a successful
+    /// call, and only they (and `execve`, which starts an empty record) change
+    /// it. Unmodelled sources of a stale record:
+    ///
+    /// - a range replaced by a call those handlers never see: `shmat` with
+    ///   `SHM_REMAP` (refused with `ENOSYS` today, so latent), or any mapping
+    ///   call that escapes interception on an in-guest backend;
+    /// - a failed `MAP_FIXED` mmap or `MREMAP_FIXED` mremap, which some
+    ///   kernels return after unmapping the target range, leaving a record
+    ///   for a hole that one of the calls above can then fill.
+    ///
+    /// A stale record names another file, which almost always has another
+    /// inode, so the check discards it and the path or the header decides.
+    /// ⚠️ A STALE RECORD WITH THE NEW FILE'S INODE NUMBER STILL WINS: the
+    /// same inode number on another device passes. A record is provenance,
+    /// not a path, so there is no mount to prove, and its device cannot be
+    /// compared with the header's when the header's device is not `stat`'s.
+    /// Steps 2 and 3 compare superblocks, which still passes two files with
+    /// one inode number on ONE superblock: two btrfs subvolumes of one
+    /// filesystem, or two overlayfs layers of one overlay mount.
+    ///
+    /// Falls back to the header's pair -- which IS `stat`'s identity on every
+    /// filesystem whose `st_dev` is its superblock device, such as ext4, xfs
+    /// and tmpfs -- when metadata is not virtualized (record/replay, where
+    /// `stat` is not determinized either and a resolution at replay time would
+    /// depend on the replay host), and when no step names the file.
+    ///
+    /// ⚠️ ON BTRFS AND OVERLAYFS THAT FALLBACK DISAGREES WITH `stat`. The maps
+    /// inode column then differs from `st_ino` for a file that is absent from
+    /// the record and that no step can prove: the ELF interpreter after it is
+    /// unlinked or replaced, a file mapped through an untracked descriptor
+    /// and then unlinked, any unlinked file other than the executable in
+    /// another process's maps (whose records Detcore does not consult), an
+    /// unlinked executable in maps whose process is not known by number
+    /// (`MappingSubject::Unknown`: a `/proc/self/maps` descriptor read in
+    /// another address space when the opener's ids were not asked for), and
+    /// a file on a mount outside the guest's root, which its mountinfo does
+    /// not list. Before the inode pool was keyed on the device as well, such a
+    /// line agreed with `st_ino` only because two files with one inode number
+    /// on different devices shared one deterministic inode; no unprivileged
+    /// kernel interface gives `stat`'s device for a mapping without a path,
+    /// so the line keeps the header's pair rather than borrow another file's
+    /// identity. On overlayfs before Linux 6.8 maps prints the real file's
+    /// device rather than the overlay's, so no overlay line is proven there.
+    /// A lookup that cannot be asked -- `stat_guest_path` finds no scratch,
+    /// faults in its own buffers, or an injected stat, `statx` or `readlink`
+    /// fails with anything but the guest filesystem's answer that the path
+    /// names nothing -- is an error, never a step to the next source or to
+    /// this fallback, so host resources cannot choose the identity (see
+    /// there).
+    ///
+    /// ⚠️ WITHOUT `virtualize_metadata` THE SPLIT REACHES FDINFO TOO. There
+    /// the header's pair keys every line, while the `ino:` line of
+    /// `/proc/*/fdinfo/<fd>` is keyed on `fstat`'s device and inode
+    /// (`fdinfo_raw_file_id`). On btrfs and overlayfs the two devices differ,
+    /// so a file that is both mapped and open shows one inode in `maps` and
+    /// another in its fdinfo, where Linux shows the same number in both.
+    /// `stat` itself is not determinized in that mode. Both values stay
+    /// deterministic.
+    ///
+    /// Directory entries have the same overlayfs gap: `getdents` keys `d_ino`
+    /// on the directory's device (`directory_device`), but with `xino=off` and
+    /// layers on different filesystems `stat` reports a non-directory's lower
+    /// device, so the guest sees a `d_ino` other than that entry's `st_ino`
+    /// (natively they are equal). Both values stay deterministic.
+    async fn mapping_stat_identity<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        key: &crate::procfs::MappingKey,
+        starts: &[usize],
+        subject: MappingSubject,
+    ) -> Result<RawInode, Error> {
+        let header = RawInode::new(key.device, key.inode);
+        if !guest.config().virtualize_metadata {
+            return Ok(header);
+        }
+        if subject == MappingSubject::Reader {
+            let recorded = {
+                let thread = guest.thread_state();
+                starts.iter().find_map(|&start| {
+                    thread
+                        .mapped_file_at(start)
+                        .filter(|file| file.ino == key.inode)
+                })
+            };
+            if let Some(file) = recorded {
+                return Ok(file);
+            }
+        }
+        for candidate in crate::procfs::mapping_path_candidates(&key.pathname) {
+            let path = candidate.as_bytes();
+            if let Some(stat) = self.stat_guest_path(guest, path).await?
+                && stat.st_ino == key.inode
+                && Self::proves_header_device(guest, path, &stat, key.device).await?
+            {
+                return Ok(RawInode::new(stat.st_dev, stat.st_ino));
+            }
+        }
+        // Step 3: the executable link of the subject's process, resolved by
+        // the guest's `fstatat`, so `/proc/self` is the reader.
+        let executable_link = match subject {
+            MappingSubject::Reader => Some(b"/proc/self/exe".to_vec()),
+            MappingSubject::Process(pid) => Some(format!("/proc/{pid}/exe").into_bytes()),
+            MappingSubject::Unknown => None,
+        };
+        if key.pathname.starts_with('/')
+            && let Some(link) = executable_link
+            && let Some(stat) = self.stat_guest_path(guest, &link).await?
+            && stat.st_ino == key.inode
+            && Self::link_names_mapping(guest, &link, &key.pathname).await?
+            && Self::proves_header_device(guest, &link, &stat, key.device).await?
+        {
+            return Ok(RawInode::new(stat.st_dev, stat.st_ino));
+        }
+        Ok(header)
+    }
+
+    /// Whether the file a guest `stat` of `path` returned, whose inode is
+    /// already the maps header's, lies on the superblock whose device that
+    /// header reports. An inode number alone names no file: every filesystem
+    /// numbers its own inodes, and btrfs numbers each subvolume's. So steps 2
+    /// and 3 of [`Self::mapping_stat_identity`] accept an answer only with
+    /// this proof as well.
+    ///
+    /// Proven at once when `stat`'s device IS the header's, as on ext4, xfs
+    /// and tmpfs. Otherwise -- on btrfs, where `stat` reports the subvolume's
+    /// device, and on overlayfs, where it can report a layer's -- the guest
+    /// `statx`es the same path for the id of its mount, and that mount's
+    /// superblock device is the device `maps` prints. The `statx` must report
+    /// the device and inode the `stat` did, or the path has changed in
+    /// between and proves nothing.
+    ///
+    /// On Linux 6.8 and later the `statx` reports the mount's unique id
+    /// (`STATX_MNT_ID_UNIQUE`), and a guest `statmount` of that id, made in
+    /// the same transient page, reports the superblock's device
+    /// (`STATMOUNT_SB_BASIC`). Neither call opens anything, so the proof
+    /// takes no slot in the guest's descriptor table. On DBT, SaBRe and
+    /// LiteInst the tool runs in the guest process and shares that table: a
+    /// descriptor the proof held there could change the number another guest
+    /// thread's `open` or `SCM_RIGHTS` receipt is given, and at the guest's
+    /// descriptor limit the proof could not be made at all.
+    ///
+    /// An older kernel reports only the reusable id (`STATX_MNT_ID`), and the
+    /// proof falls back to that mount's row of the guest's
+    /// `/proc/<pid>/mountinfo`, read on the tool's side as the fdinfo
+    /// mount-id check reads it. So does a `statmount` that answers `ENOSYS`,
+    /// as a seccomp policy can, after a second `statx` for the reusable id.
+    /// That read opens a file, so it is made only where the launcher says a
+    /// file Detcore opens takes a descriptor outside the guest's table
+    /// (`Config::tool_opens_outside_guest_descriptor_table`): the tracer's on
+    /// ptrace, the VMM's on KVM. Anywhere else -- DBT, SaBRe and LiteInst --
+    /// the read would hold a guest descriptor, with the race above, and fail
+    /// at the guest's descriptor limit, so the proof refuses before it opens
+    /// anything. On those backends a guest that reads a btrfs or overlayfs
+    /// mapping on a kernel before Linux 6.8, or under a policy that denies
+    /// `statmount`, is stopped by that refusal rather than given an identity
+    /// another source chose.
+    ///
+    /// `Ok(false)` -- no proof, so the line falls back to its header -- when
+    /// that mount's superblock is another one, when the guest's filesystem
+    /// answers that the path no longer names that file, or when the mount is
+    /// not one the guest can see: `statmount` answers `ENOENT` (no such
+    /// mount in the guest's mount namespace) or `EPERM` (outside the guest's
+    /// root, for a guest without `CAP_SYS_ADMIN` over that namespace), or the
+    /// guest's `mountinfo` lists no row for it. Mounts and namespace changes
+    /// are refused once Detcore starts, so that is the guest's own
+    /// configuration. A proof that could not be asked is an error, never a
+    /// `false`, as in [`Self::stat_guest_path`]: no transient page, a fault
+    /// in Detcore's own buffers, any other errno from the injected `statx` or
+    /// `statmount`, a kernel that reports no mount id or no superblock, or a
+    /// `mountinfo` that cannot be read or has a malformed row for that
+    /// mount. Otherwise host resources would choose the identity.
+    ///
+    /// ⚠️ THE SAME INODE NUMBER IN TWO BTRFS SUBVOLUMES OF ONE FILESYSTEM STILL
+    /// PASSES, and so do two overlayfs layers on one overlay mount: both share
+    /// the superblock device `maps` prints, which is all a maps line says
+    /// about where its file lives. For step 3, [`Self::link_names_mapping`]
+    /// also requires the executable link's text to be the line's pathname.
+    async fn proves_header_device<G: Guest<Self>>(
+        guest: &mut G,
+        path: &[u8],
+        stat: &libc::stat,
+        header_device: u64,
+    ) -> Result<bool, Error> {
+        if stat.st_dev == header_device {
+            return Ok(true);
+        }
+        let mount_id = match Self::guest_superblock_of(guest, path, stat).await? {
+            MountSuperblock::Device(device) => return Ok(device == header_device),
+            MountSuperblock::Unproven => return Ok(false),
+            MountSuperblock::Listed(mount_id) => mount_id,
+        };
+        if !guest.config().tool_opens_outside_guest_descriptor_table {
+            return Err(identity_lookup_refused(
+                "find the superblock of",
+                path,
+                format_args!(
+                    "the kernel reported only reusable mount id {mount_id}, and reading the \
+                     guest's mountinfo for it would hold a descriptor in the guest's own table"
+                ),
+            ));
+        }
+        let mountinfo = guest_mountinfo(guest)?;
+        match mountinfo_superblock_device(&mountinfo, mount_id) {
+            Ok(Some(device)) => Ok(device == header_device),
+            // A mount outside the guest's root is not in its mountinfo: an
+            // exe link can name one. That is the guest's own configuration,
+            // the same on every host, so it is an answer -- no proof -- and
+            // not a failure to ask.
+            Ok(None) => {
+                trace!(
+                    "{:?} is on mount {mount_id}, which the guest's mountinfo does not list",
+                    String::from_utf8_lossy(path)
+                );
+                Ok(false)
+            }
+            Err(malformed) => Err(identity_lookup_refused(
+                "find the superblock of",
+                path,
+                format_args!("its mountinfo row is malformed: {malformed}"),
+            )),
+        }
+    }
+
+    /// The superblock of the mount the file at `path` is on, asked in one
+    /// transient page by a guest `statx` and, when that reports the mount's
+    /// unique id, a guest `statmount`; see [`Self::proves_header_device`]
+    /// for the answers and the errors.
+    async fn guest_superblock_of<G: Guest<Self>>(
+        guest: &mut G,
+        path: &[u8],
+        stat: &libc::stat,
+    ) -> Result<MountSuperblock, Error> {
+        let statx_offset = (path.len() + 1).next_multiple_of(8);
+        let request_offset = statx_offset + std::mem::size_of::<libc::statx>();
+        let statmount_offset = request_offset + MNT_ID_REQ_SIZE_VER0;
+        let len = (statmount_offset + STATMOUNT_BUFFER).next_multiple_of(host_page_size());
+        let page = map_identity_page(guest, len, "statx", path).await?;
+        // SAFETY: every offset is within the `len` bytes just mapped.
+        let (statxptr, request, statmount) = unsafe {
+            (
+                StatxPtr(page.add(statx_offset).cast::<libc::statx>()),
+                page.add(request_offset),
+                page.add(statmount_offset),
+            )
+        };
+        let asked =
+            Self::superblock_in_page(guest, path, stat, page, statxptr, request, statmount).await;
+        unmap_identity_page(guest, page, len, path).await;
+        asked
+    }
+
+    /// The questions of [`Self::guest_superblock_of`], in its page.
+    async fn superblock_in_page<G: Guest<Self>>(
+        guest: &mut G,
+        path: &[u8],
+        stat: &libc::stat,
+        page: AddrMut<'_, u8>,
+        statxptr: StatxPtr<'_>,
+        request: AddrMut<'_, u8>,
+        statmount: AddrMut<'_, u8>,
+    ) -> Result<MountSuperblock, Error> {
+        let unique = StatxMask::STATX_INO
+            | StatxMask::STATX_MNT_ID
+            | StatxMask::from_bits_retain(STATX_MNT_ID_UNIQUE);
+        let Some(statx) = Self::statx_of_stat(guest, path, stat, page, statxptr, unique).await?
+        else {
+            return Ok(MountSuperblock::Unproven);
+        };
+        if statx.stx_mask & STATX_MNT_ID_UNIQUE == 0 {
+            // Before Linux 6.8 the bit is unknown and ignored, and the kernel
+            // reports the reusable id instead.
+            return Self::listed_mount(path, &statx);
+        }
+        match Self::statmount_in_page(guest, statx.stx_mnt_id, request, statmount).await {
+            Ok(Some(device)) => Ok(MountSuperblock::Device(device)),
+            Ok(None) => Err(identity_lookup_refused(
+                "statmount",
+                path,
+                "the kernel reported no superblock (STATMOUNT_SB_BASIC)",
+            )),
+            Err(errno @ (Errno::ENOENT | Errno::EPERM)) => {
+                trace!(
+                    "{:?} is on mount {}, which the guest cannot see: {errno}",
+                    String::from_utf8_lossy(path),
+                    statx.stx_mnt_id
+                );
+                Ok(MountSuperblock::Unproven)
+            }
+            Err(Errno::ENOSYS) => {
+                let listed = StatxMask::STATX_INO | StatxMask::STATX_MNT_ID;
+                match Self::statx_of_stat(guest, path, stat, page, statxptr, listed).await? {
+                    Some(statx) => Self::listed_mount(path, &statx),
+                    None => Ok(MountSuperblock::Unproven),
+                }
+            }
+            Err(Errno::ESRCH) => Err(Error::Errno(Errno::ESRCH)),
+            Err(errno) => Err(identity_lookup_refused("statmount", path, errno)),
+        }
+    }
+
+    /// A guest `statx` of `path` asking `mask`, made in `page`, when the file
+    /// it reports is still the one `stat` describes. `None` when the guest's
+    /// filesystem answers that `path` names nothing or another file.
+    async fn statx_of_stat<G: Guest<Self>>(
+        guest: &mut G,
+        path: &[u8],
+        stat: &libc::stat,
+        page: AddrMut<'_, u8>,
+        statxptr: StatxPtr<'_>,
+        mask: StatxMask,
+    ) -> Result<Option<libc::statx>, Error> {
+        let statx = match Self::statx_in_page(guest, path, page, statxptr, mask).await {
+            Ok(Some(statx)) => statx,
+            Ok(None) => return Ok(None),
+            Err(Errno::ESRCH) => return Err(Error::Errno(Errno::ESRCH)),
+            Err(errno) => return Err(identity_lookup_refused("statx", path, errno)),
+        };
+        let device = libc::makedev(statx.stx_dev_major, statx.stx_dev_minor);
+        if (device, statx.stx_ino) != (stat.st_dev, stat.st_ino) {
+            trace!(
+                "{:?} names another file than its stat did: {:#x}/{} after {:#x}/{}",
+                String::from_utf8_lossy(path),
+                device,
+                statx.stx_ino,
+                stat.st_dev,
+                stat.st_ino
+            );
+            return Ok(None);
+        }
+        Ok(Some(statx))
+    }
+
+    /// The reusable mount id a `statx` reported, for the guest's `mountinfo`.
+    fn listed_mount(path: &[u8], statx: &libc::statx) -> Result<MountSuperblock, Error> {
+        if statx.stx_mask & StatxMask::STATX_MNT_ID.bits() == 0 {
+            return Err(identity_lookup_refused(
+                "statx",
+                path,
+                "the kernel reported no mount id (STATX_MNT_ID needs Linux 5.8)",
+            ));
+        }
+        Ok(MountSuperblock::Listed(statx.stx_mnt_id))
+    }
+
+    /// Stage `path` NUL-terminated at `path_address` and inject
+    /// `statx(AT_FDCWD, path, 0, mask, statxptr)`, with the answers and
+    /// errors of [`Self::fstatat_in_scratch`].
+    async fn statx_in_page<G: Guest<Self>>(
+        guest: &mut G,
+        path: &[u8],
+        path_address: AddrMut<'_, u8>,
+        statxptr: StatxPtr<'_>,
+        mask: StatxMask,
+    ) -> Result<Option<libc::statx>, Errno> {
+        let mut staged = Vec::with_capacity(path.len() + 1);
+        staged.extend_from_slice(path);
+        staged.push(0);
+        guest.memory().write_exact(path_address, &staged)?;
+        let call = syscalls::Statx::new()
+            .with_dirfd(libc::AT_FDCWD)
+            .with_path(PathPtr::from_ptr(
+                path_address.as_raw() as *const libc::c_char
+            ))
+            .with_flags(AtFlags::empty())
+            .with_mask(mask)
+            .with_statx(Some(statxptr));
+        match guest.inject_with_retry(call).await {
+            Ok(_) => statxptr.read(&guest.memory()).map(Some),
+            Err(error) if is_path_answer(error) => {
+                trace!(
+                    "guest statx of {:?} failed: {error}",
+                    String::from_utf8_lossy(path)
+                );
+                Ok(None)
+            }
+            Err(error) => {
+                warn!(
+                    "[detcore] guest statx of {:?} could not be asked: {error}",
+                    String::from_utf8_lossy(path)
+                );
+                Err(error)
+            }
+        }
+    }
+
+    /// Stage a `struct mnt_id_req` for mount `mount_id` asking
+    /// `STATMOUNT_SB_BASIC` at `request`, and inject
+    /// `statmount(request, statmount, STATMOUNT_BUFFER, 0)`. The superblock's
+    /// device, or `None` when the kernel reports no superblock fields.
+    async fn statmount_in_page<G: Guest<Self>>(
+        guest: &mut G,
+        mount_id: u64,
+        request: AddrMut<'_, u8>,
+        statmount: AddrMut<'_, u8>,
+    ) -> Result<Option<u64>, Errno> {
+        let mut staged = [0u8; MNT_ID_REQ_SIZE_VER0];
+        staged[..4].copy_from_slice(&(MNT_ID_REQ_SIZE_VER0 as u32).to_ne_bytes());
+        // `spare`, bytes 4 to 8, stays zero: the kernel refuses anything else.
+        staged[8..16].copy_from_slice(&mount_id.to_ne_bytes());
+        staged[16..].copy_from_slice(&STATMOUNT_SB_BASIC.to_ne_bytes());
+        guest.memory().write_exact(request, &staged)?;
+        let asked = guest
+            .inject_with_retry(Syscall::Other(
+                Sysno::statmount,
+                SyscallArgs::new(
+                    request.as_raw(),
+                    statmount.as_raw(),
+                    STATMOUNT_BUFFER,
+                    0,
+                    0,
+                    0,
+                ),
+            ))
+            .await;
+        if let Err(error) = asked {
+            trace!("guest statmount of mount {mount_id} failed: {error}");
+            return Err(error);
+        }
+        let mut answer = [0u8; STATMOUNT_SB_DEV_MINOR_OFFSET + 4];
+        guest.memory().read_exact(statmount, &mut answer)?;
+        let word = |offset: usize| {
+            u32::from_ne_bytes(answer[offset..offset + 4].try_into().expect("4 bytes"))
+        };
+        let mask = u64::from_ne_bytes(
+            answer[STATMOUNT_MASK_OFFSET..STATMOUNT_MASK_OFFSET + 8]
+                .try_into()
+                .expect("8 bytes"),
+        );
+        if mask & STATMOUNT_SB_BASIC == 0 {
+            return Ok(None);
+        }
+        Ok(Some(libc::makedev(
+            word(STATMOUNT_SB_DEV_MAJOR_OFFSET),
+            word(STATMOUNT_SB_DEV_MINOR_OFFSET),
+        )))
+    }
+
+    /// Whether the guest's `readlink` of the executable link `link` reads as
+    /// `pathname`, the maps line's: `maps` prints a mapped file's path as the
+    /// link would, with ` (deleted)` once it is unlinked, except that it
+    /// spells a newline `\012`. A file that merely shares the executable's
+    /// inode number -- a non-executable mapping, a file literally named
+    /// `x (deleted)` -- has another pathname, so step 3 of
+    /// [`Self::mapping_stat_identity`] does not borrow the executable's
+    /// identity for it. `Ok(false)` when the guest's filesystem answers that
+    /// the link names nothing; errors as in [`Self::proves_header_device`].
+    async fn link_names_mapping<G: Guest<Self>>(
+        guest: &mut G,
+        link: &[u8],
+        pathname: &str,
+    ) -> Result<bool, Error> {
+        // Twice `PATH_MAX`: `d_path`, which both texts come from, never
+        // writes more than one page, so a full buffer cannot be a whole link.
+        const LINK_CAPACITY: usize = 2 * libc::PATH_MAX as usize;
+        let buffer_offset = (link.len() + 1).next_multiple_of(8);
+        let len = (buffer_offset + LINK_CAPACITY).next_multiple_of(host_page_size());
+        let page = map_identity_page(guest, len, "readlink", link).await?;
+        // SAFETY: `buffer_offset` is within the `len` bytes just mapped.
+        let buffer = unsafe { page.add(buffer_offset) };
+        let asked = Self::readlink_in_page(guest, link, page, buffer, LINK_CAPACITY).await;
+        unmap_identity_page(guest, page, len, link).await;
+        let text = match asked {
+            Ok(Some(text)) => text,
+            Ok(None) => return Ok(false),
+            Err(Errno::ESRCH) => return Err(Error::Errno(Errno::ESRCH)),
+            Err(errno) => return Err(identity_lookup_refused("readlink", link, errno)),
+        };
+        if text.len() >= LINK_CAPACITY {
+            return Err(identity_lookup_refused(
+                "readlink",
+                link,
+                format_args!("the link filled all {LINK_CAPACITY} bytes of its buffer"),
+            ));
+        }
+        let mut spelled = Vec::with_capacity(text.len());
+        for &byte in &text {
+            if byte == b'\n' {
+                spelled.extend_from_slice(b"\\012");
+            } else {
+                spelled.push(byte);
+            }
+        }
+        Ok(spelled == pathname.as_bytes())
+    }
+
+    /// Stage `link` NUL-terminated at `path_address` and inject
+    /// `readlinkat(AT_FDCWD, link, buffer, capacity)`; the link's text, or
+    /// `None` when the guest's filesystem answers that `link` names no link.
+    async fn readlink_in_page<G: Guest<Self>>(
+        guest: &mut G,
+        link: &[u8],
+        path_address: AddrMut<'_, u8>,
+        buffer: AddrMut<'_, u8>,
+        capacity: usize,
+    ) -> Result<Option<Vec<u8>>, Errno> {
+        let mut staged = Vec::with_capacity(link.len() + 1);
+        staged.extend_from_slice(link);
+        staged.push(0);
+        guest.memory().write_exact(path_address, &staged)?;
+        let call = syscalls::Readlinkat::new()
+            .with_dirfd(libc::AT_FDCWD)
+            .with_path(PathPtr::from_ptr(
+                path_address.as_raw() as *const libc::c_char
+            ))
+            .with_buf(Some(buffer.cast::<libc::c_char>()))
+            .with_buf_len(capacity);
+        match guest.inject_with_retry(call).await {
+            Ok(read) => {
+                let read = usize::try_from(read).expect("readlinkat returned a negative length");
+                let mut text = vec![0u8; read];
+                guest.memory().read_exact(buffer, &mut text)?;
+                Ok(Some(text))
+            }
+            Err(error) if is_path_answer(error) || error == Errno::EINVAL => {
+                trace!(
+                    "guest readlink of {:?} failed: {error}",
+                    String::from_utf8_lossy(link)
+                );
+                Ok(None)
+            }
+            Err(error) => {
+                warn!(
+                    "[detcore] guest readlink of {:?} could not be asked: {error}",
+                    String::from_utf8_lossy(link)
+                );
+                Err(error)
+            }
+        }
+    }
+
+    /// `stat(path)` performed BY THE GUEST, through an injected
+    /// `fstatat(AT_FDCWD, path, _, 0)`. `None` when the guest's filesystem
+    /// answers that `path` names nothing this stat can reach -- `ENOENT`,
+    /// `ENOTDIR`, `ELOOP`, `ENAMETOOLONG` or `EACCES` under the guest's own
+    /// credentials -- or when `path` contains a NUL. Any other failure is an
+    /// error, not a missing answer: no scratch to stage the call in, a fault
+    /// in Detcore's own buffers, or any other errno from the injected stat
+    /// (`ENOMEM`, retries exhausted) says nothing about the path, and a caller
+    /// that moved on to another identity source would let host resources
+    /// choose the identity.
+    ///
+    /// Injected rather than performed here for the reason `handle_stat_family`
+    /// gives: an access from the tracer can hang on some FUSE filesystems
+    /// (squashfs_ll), and on in-guest backends "here" is the guest process
+    /// anyway. The guest resolves the path in its own mount namespace and
+    /// root, which is also the root `maps` printed the path relative to. The
+    /// injection is not a guest-visible system call, charges no virtual time,
+    /// and leaves no host inode number or timestamp in guest memory.
+    ///
+    /// The path and the `struct stat` are staged in one of two scratches, as
+    /// `inject_fstat` stages its buffer:
+    ///
+    /// 1. The guest stack scratch, for a path shorter than
+    ///    `GUEST_STAT_PATH_CAPACITY` bytes. On the ptrace backend it lies below
+    ///    the red zone under the guest's stack pointer, and an injection there
+    ///    has 896 bytes, which must hold the path buffer and the 144-byte
+    ///    `struct stat`. That memory is the guest's own: a guest that issues
+    ///    raw system calls may keep live data below its red zone, and Linux
+    ///    never writes there for it. So the bytes under both buffers are read
+    ///    before the scratch is committed and written back afterwards, on
+    ///    success, on a failed stat and after a fault alike, before the
+    ///    scratch guard drops (DBT and SaBRe free their Tool-owned arena
+    ///    then; LiteInst and e9patch keep it only until the current dispatch
+    ///    ends). A scratch whose bytes cannot be read is not used.
+    ///    That memory need not be writable either, for the reasons
+    ///    `inject_fstat` gives. The fault belongs to Detcore's bookkeeping,
+    ///    not to the guest (<https://github.com/rrnewton/hermit/issues/3328>),
+    ///    so an `EFAULT` from reading the scratch, committing it, staging the
+    ///    path, the `fstatat` itself (whose path and buffer are both
+    ///    Detcore's) or writing either buffer back sends the stat to the
+    ///    transient page below. Both buffers are first written back as far as
+    ///    they are writable: every write into the scratch, the commit's and
+    ///    the kernel's included, runs forward from a buffer's start and stops
+    ///    at its first fault, so whatever it changed is a prefix that writing
+    ///    back from the same start reaches. Every other error is an error of
+    ///    the whole stat (see below).
+    /// 2. A private anonymous mapping made for this call alone, of whole
+    ///    pages sized for the NUL-terminated path and an 8-aligned
+    ///    `struct stat`. It serves a stack scratch that is too small, a fault
+    ///    there, and every path of `GUEST_STAT_PATH_CAPACITY` bytes or more.
+    ///    The guest never learns its address, and it is unmapped whole before
+    ///    the guest resumes. If that `munmap` fails, which is not expected for
+    ///    a page this call mapped and whose address the guest never saw,
+    ///    Detcore only warns and keeps the answer, and the page stays mapped.
+    ///    An `EFAULT` there is an error.
+    ///
+    /// ⚠️ WHEN THAT MAPPING CANNOT BE MADE, THE STAT FAILS WITH AN ERROR, and
+    /// so does the call it serves (a `read` of `maps` or `smaps`, a
+    /// `readlink` of `/proc/<pid>/fd/<n>`). Every failure that is not the
+    /// guest filesystem's answer is returned as a tool error rather than an
+    /// errno, a refusal ([`IdentityLookupRefused`]) that stops the refusing
+    /// process on every backend, except `ESRCH`: that thread is gone, and
+    /// nothing it would print an identity to is left. Why the `mmap` fails
+    /// is partly guest state and partly host state: the guest's `RLIMIT_AS`
+    /// and its mapping count are the guest's, but the limit on that count
+    /// (`vm.max_map_count`) is a host setting, and a strict overcommit policy
+    /// (`vm.overcommit_memory=2`) refuses the page on the host's commit
+    /// charge. A caller that treated the failure as "no such file" and keyed
+    /// on its fallback identity would key differently on such a host than
+    /// elsewhere, and every deterministic inode minted after it would shift.
+    /// A host-resource failure may stop a run; it must not change a minted
+    /// identity. Detcore logs why at `warn`. No page is reserved up front
+    /// instead, because a page kept mapped in the guest would itself be a
+    /// line of the guest's `maps`; the pinned KVM backend's reserved
+    /// `ToolScratch` memory is outside the guest's view and has no such
+    /// cost.
+    pub(crate) async fn stat_guest_path<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        path: &[u8],
+    ) -> Result<Option<libc::stat>, Error> {
+        if path.contains(&0) {
+            return Ok(None);
+        }
+        let asked = if path.len() < GUEST_STAT_PATH_CAPACITY {
+            match Self::stat_guest_path_on_stack(guest, path).await {
+                Ok(StackStat::Answered(identity)) => Ok(identity),
+                Ok(StackStat::Unusable) => {
+                    Self::stat_guest_path_in_transient_page(guest, path).await
+                }
+                Err(errno) => Err(errno),
+            }
+        } else {
+            Self::stat_guest_path_in_transient_page(guest, path).await
+        };
+        asked.map_err(|errno| match errno {
+            // The thread is gone, so nothing it would print an identity to
+            // is left; the errno is returned as before.
+            Errno::ESRCH => Error::Errno(errno),
+            // Not an `Error::Errno`: the guest's call must not see a host
+            // resource's errno as its own result. The refusal stops the
+            // refusing process on every backend.
+            errno => identity_lookup_refused("stat", path, errno),
+        })
+    }
+
+    /// The fast path of [`Self::stat_guest_path`]: the path and the
+    /// `struct stat` live in the guest stack scratch.
+    async fn stat_guest_path_on_stack<G: Guest<Self>>(
+        guest: &mut G,
+        path: &[u8],
+    ) -> Result<StackStat, Errno> {
+        let mut stack = guest.stack().await;
+        let needed = GUEST_STAT_PATH_CAPACITY + std::mem::size_of::<libc::stat>();
+        if stack.capacity().saturating_sub(stack.size()) < needed {
+            trace!(
+                "guest stack scratch has no room for a stat of {:?}",
+                String::from_utf8_lossy(path)
+            );
+            return Ok(StackStat::Unusable);
+        }
+        let path_address: AddrMut<[u8; GUEST_STAT_PATH_CAPACITY]> = stack.reserve();
+        let statptr = StatPtr(stack.reserve());
+        // On ptrace both buffers are the guest's own stack memory below its
+        // red zone, which the commit, the staged path and the kernel's stat
+        // overwrite. Save what is there first, so it can be put back.
+        let mut saved_path = [0u8; GUEST_STAT_PATH_CAPACITY];
+        let mut saved_stat = [0u8; std::mem::size_of::<libc::stat>()];
+        let saved = {
+            let memory = guest.memory();
+            memory
+                .read_exact(path_address.cast::<u8>(), &mut saved_path)
+                .and_then(|()| memory.read_exact(statptr.0.cast(), &mut saved_stat))
+        };
+        match saved {
+            Ok(()) => {}
+            Err(Errno::EFAULT) => {
+                trace!(
+                    "guest stack scratch cannot be read for a stat of {:?}",
+                    String::from_utf8_lossy(path)
+                );
+                return Ok(StackStat::Unusable);
+            }
+            Err(errno) => return Err(errno),
+        }
+        // Keep the guard until both buffers are written back: DBT and SaBRe
+        // free their Tool-owned arena when the guard drops, and LiteInst and
+        // e9patch move it to a list of committed arenas that is cleared when
+        // the current dispatch ends. A failed commit is written back too: the
+        // ptrace commit writes page by page, so it can fail after writing a
+        // lower writable page.
+        let committed = stack.commit();
+        let identity = match &committed {
+            Ok(_) => {
+                Self::fstatat_in_scratch(guest, path, path_address.cast::<u8>(), statptr).await
+            }
+            Err(errno) => Err(*errno),
+        };
+        let mut memory = guest.memory();
+        let restored_stat = memory.write_exact(statptr.0.cast(), &saved_stat);
+        let restored_path = memory.write_exact(path_address.cast::<u8>(), &saved_path);
+        drop(committed);
+        // An error other than EFAULT from any step wins over an EFAULT from
+        // another.
+        let failure = [
+            identity.as_ref().err(),
+            restored_stat.as_ref().err(),
+            restored_path.as_ref().err(),
+        ]
+        .into_iter()
+        .flatten()
+        .copied()
+        .reduce(|kept, next| if kept == Errno::EFAULT { next } else { kept });
+        match failure {
+            None => identity.map(StackStat::Answered),
+            Some(Errno::EFAULT) => {
+                trace!(
+                    "guest stack scratch faulted during a stat of {:?}",
+                    String::from_utf8_lossy(path)
+                );
+                Ok(StackStat::Unusable)
+            }
+            Some(errno) => Err(errno),
+        }
+    }
+
+    /// The fallback of [`Self::stat_guest_path`]: the path and the
+    /// `struct stat` live in a private anonymous mapping made for this call
+    /// only, and unmapped whole before it returns.
+    async fn stat_guest_path_in_transient_page<G: Guest<Self>>(
+        guest: &mut G,
+        path: &[u8],
+    ) -> Result<Option<libc::stat>, Errno> {
+        let stat_offset = (path.len() + 1).next_multiple_of(8);
+        let len = transient_stat_page_len(path.len());
+        let mapped = match guest
+            .inject_with_retry(Syscall::Mmap(
+                syscalls::Mmap::new()
+                    .with_addr(None)
+                    .with_len(len)
+                    .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+                    .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
+                    .with_fd(-1)
+                    .with_offset(0),
+            ))
+            .await
+        {
+            Ok(mapped) => mapped,
+            Err(errno) => {
+                warn!(
+                    "[detcore] could not map a transient page for a stat of {:?} ({}); \
+                     refusing rather than keying on another identity",
+                    String::from_utf8_lossy(path),
+                    errno
+                );
+                return Err(errno);
+            }
+        };
+        let page = usize::try_from(mapped)
+            .ok()
+            .and_then(AddrMut::<u8>::from_raw)
+            .unwrap_or_else(|| panic!("transient stat page mmap returned {mapped}"));
+        // SAFETY: `stat_offset` is within the `len` bytes just mapped.
+        let statptr = StatPtr(unsafe { page.add(stat_offset) }.cast::<libc::stat>());
+        let identity = Self::fstatat_in_scratch(guest, path, page, statptr).await;
+        if let Err(errno) = guest
+            .inject_with_retry(Syscall::Munmap(
+                syscalls::Munmap::new()
+                    .with_addr(Some(page.cast::<libc::c_void>().into()))
+                    .with_len(len),
+            ))
+            .await
+        {
+            // Not expected: the page was mapped by this call and its address
+            // never reached the guest. The answer is still valid, so a
+            // leftover page is no reason to discard it.
+            warn!(
+                "[detcore] could not unmap the transient stat page for {:?}: {}",
+                String::from_utf8_lossy(path),
+                errno
+            );
+        }
+        if let Err(errno) = identity {
+            warn!(
+                "[detcore] the stat of {:?} in a transient page could not be asked ({}); \
+                 refusing rather than keying on another identity",
+                String::from_utf8_lossy(path),
+                errno
+            );
+        }
+        identity
+    }
+
+    /// The body of [`Self::stat_guest_path`] once a scratch is in place: stage
+    /// `path` NUL-terminated at `path_address` and inject
+    /// `fstatat(AT_FDCWD, path, statptr, 0)`. `Ok(None)` when the guest's
+    /// filesystem answers that the path names nothing the stat reaches
+    /// (`ENOENT`, `ENOTDIR`, `ELOOP`, `ENAMETOOLONG`, `EACCES`);
+    /// `Err(EFAULT)` when the scratch faults, from the kernel as from a
+    /// staging write, since the path and the buffer are both Detcore's; and
+    /// the errno itself for every other failure, which is not an answer
+    /// about the path.
+    async fn fstatat_in_scratch<G: Guest<Self>>(
+        guest: &mut G,
+        path: &[u8],
+        path_address: AddrMut<'_, u8>,
+        statptr: StatPtr<'_>,
+    ) -> Result<Option<libc::stat>, Errno> {
+        // The NUL is staged with the path: the stack scratch holds whatever
+        // the guest left there until the commit, and some backends' commits
+        // write nothing.
+        let mut staged = Vec::with_capacity(path.len() + 1);
+        staged.extend_from_slice(path);
+        staged.push(0);
+        guest.memory().write_exact(path_address, &staged)?;
+        let call = syscalls::Fstatat::new()
+            .with_dirfd(libc::AT_FDCWD)
+            .with_path(PathPtr::from_ptr(
+                path_address.as_raw() as *const libc::c_char
+            ))
+            .with_stat(Some(statptr))
+            .with_flags(AtFlags::empty());
+        match guest.inject_with_retry(call).await {
+            Ok(_) => statptr.read(&guest.memory()).map(Some),
+            Err(Errno::EFAULT) => Err(Errno::EFAULT),
+            Err(
+                error @ (Errno::ENOENT
+                | Errno::ENOTDIR
+                | Errno::ELOOP
+                | Errno::ENAMETOOLONG
+                | Errno::EACCES),
+            ) => {
+                trace!(
+                    "guest stat of {:?} failed: {error}",
+                    String::from_utf8_lossy(path)
+                );
+                Ok(None)
+            }
+            Err(error) => {
+                warn!(
+                    "[detcore] guest stat of {:?} could not be asked: {error}",
+                    String::from_utf8_lossy(path)
+                );
+                Err(error)
+            }
+        }
     }
 
     // helper function to track a new file descriptor.
@@ -1911,6 +3177,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .filter(|resolved| resolved != &observed_path)
                         .and_then(|resolved| ProcfsFile::from_path(&resolved))
                 });
+                if let Some(procfs) = procfs.as_mut() {
+                    // A `/proc/self/maps` descriptor shows the opener's address
+                    // space even when a forked child reads it, or the opener
+                    // after an `execve`.
+                    Self::bind_procfs_mapping_subject(guest, procfs).await?;
+                }
                 if procfs
                     .as_ref()
                     .is_some_and(ProcfsFile::needs_bound_thread_identity)
@@ -2482,23 +3754,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_target_fd())?;
         let fdinfo_identity = if let Some(target_fd) = target_fd {
-            let (cached_stat, logical_flags, open_file_id, fd_type, inode_override) =
+            let (logical_flags, open_file_id, fd_type, inode_override) =
                 guest.thread_state().with_detfd(target_fd, |detfd| {
                     (
-                        detfd.stat(),
                         detfd.status_flags(),
                         detfd.open_file_id(),
                         detfd.ty(),
                         deterministic_stdio_inode_for_resource(target_fd, detfd.resource()),
                     )
                 })?;
-            let raw_inode = match cached_stat {
-                Some(stat) => stat.raw_inode(),
-                None => {
-                    let stat = self.inject_fstat(guest, target_fd).await?;
-                    RawInode::new(stat.st_dev, stat.st_ino)
-                }
-            };
+            // The descriptor's own identity rather than its cached stat: an
+            // inherited stdio descriptor's cached stat is a stand-in for stdin
+            // (`descriptor_identity_stat`), which keyed the `ino:` line of a
+            // dup of stdout, at descriptor 3 or above, on stdin's file while
+            // its `fstat` reports stdout's.
+            let identity_stat = self.descriptor_identity_stat(guest, target_fd).await?;
+            let raw_inode = self
+                .fdinfo_raw_file_id(guest, target_fd, identity_stat, &contents)
+                .await?;
             let virtual_inode = match inode_override {
                 Some(inode) => inode,
                 None => determinize_inode(guest, raw_inode).await.0,
@@ -2601,75 +3874,71 @@ impl<T: RecordOrReplay> Detcore<T> {
         let needs_mapping_identities = guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_needs_mapping_identities())?;
-        let mut mapping_identities: BTreeMap<(u64, u64), (u64, u64)> = BTreeMap::new();
-        if needs_mapping_identities {
+        let mapping_identities = if needs_mapping_identities {
             // A mapping backed by stdio must report the SAME inode fdinfo
             // reports for that fd, which is the fixed `deterministic_stdio_inode`
-            // value rather than a pooled one. Matching is by raw inode, read
-            // from the cached stat only: injecting an fstat here would add
-            // syscalls to every maps read and perturb the very traces this
-            // change is meant to keep consistent.
+            // value rather than a pooled one. Matching is by the raw device and
+            // inode of the stdio descriptor's own identity
+            // (`inherited_stdio_identity_stats`): its own `fstat`, not the
+            // stand-in `setup_stdio` caches for all three descriptors, which
+            // is stdin's file and matched a mapping of stdin's file as stdout
+            // as well even where stdout is another file.
             //
-            // The lowest descriptor wins a shared identity, as in
-            // `deterministic_stdio_inode_for_raw`. Detcore gives all three
-            // inherited descriptors the stat of its own stdin (`setup_stdio`),
-            // so they share one until the guest replaces them; a mapping of
-            // that file is a mapping of fd 0, and must report the 1000 that
-            // fd 0's fdinfo reports, not stderr's 1002.
-            let mut stdio_by_raw_inode: BTreeMap<RawInode, DetInode> = BTreeMap::new();
+            // The inode alone is not enough: an unrelated file on another
+            // filesystem can share the stdio inode number (a fresh tmpfs
+            // numbers its files 2, 3, ...; `/dev/null` is inode 3 on
+            // devtmpfs), and it would then be rendered with the stdio inode
+            // in the runs where the host numbers happened to coincide
+            // (https://github.com/rrnewton/hermit/issues/3307).
+            //
+            // When several stdio descriptors share one raw identity the LOWEST
+            // descriptor's inode wins: `2>&1`, or one terminal on all three,
+            // gives several descriptors one file, which a mapping can name
+            // with only one inode. For stdin's file the lowest is the one
+            // `fstat(0)` reports (1000); letting the last insert win reported
+            // stderr's (1002). Without `virtualize_metadata` every
+            // descriptor's identity is still the stand-in, so every mapping of
+            // the stdin file matches all three. `namespace.rs`'s
+            // `deterministic_stdio_inode_for_raw` applies the same precedence.
+            let stdio_stats = self.inherited_stdio_identity_stats(guest).await?;
+            let mut stdio_by_raw_file: BTreeMap<RawInode, DetInode> = BTreeMap::new();
             for fd in libc::STDIN_FILENO..=libc::STDERR_FILENO {
-                let cached = guest
+                let inode = guest
                     .thread_state()
                     .with_detfd(fd, |detfd| {
-                        let inode = deterministic_stdio_inode_for_resource(fd, detfd.resource())?;
-                        detfd.stat().map(|stat| (stat.raw_inode(), inode))
+                        deterministic_stdio_inode_for_resource(fd, detfd.resource())
                     })
                     .ok()
                     .flatten();
-                if let Some((raw, det)) = cached {
-                    stdio_by_raw_inode.entry(raw).or_insert(det);
+                if let (Some(det), Some(stat)) = (inode, stdio_stats[fd as usize]) {
+                    stdio_by_raw_file.entry(stat.raw_inode()).or_insert(det);
                 }
             }
-            // One numbering request per file-backed line, in line order
-            // (address order, which the guest's own mmaps decide), repeats and
-            // stdio-backed lines included. The pool numbers files in request
-            // order and every request consumes a number, so sorting by raw
-            // `(dev, ino)` would let a host inode decide which file gets which
-            // number, and skipping lines whose host pair repeats (hard-linked
-            // libraries) or matches stdio would let host identity decide how
-            // many numbers a read consumes
-            // (https://github.com/rrnewton/hermit/issues/2897).
-            //
-            // The device a mapping names is the filesystem's own, which on
-            // btrfs is not the per-subvolume device `stat` reports; the pair is
-            // the identity either way, as it is for the device determinized
-            // below.
-            let raw_pairs: Vec<(u64, u64)> = String::from_utf8_lossy(&contents)
-                .lines()
-                .filter_map(crate::procfs::mapping_header_identity)
-                .collect();
-            let pooled = determinize_mapping_inodes(
-                guest,
-                raw_pairs
-                    .iter()
-                    .map(|&(raw_dev, raw_inode)| RawInode::new(raw_dev, raw_inode))
-                    .collect(),
+            // The reader's mapping records describe this snapshot only when it
+            // shows the reader's own address space, and the executable link
+            // `GuestMappingMinter` falls back to is the subject's.
+            let reader_mm = guest.thread_state().mm_id;
+            let subject = guest
+                .thread_state()
+                .with_detfd(call.fd(), |detfd| detfd.procfs_mapping_subject(reader_mm))?;
+            // The minting loop lives in `crate::procfs::mint_mapping_identities`
+            // so the unit tests drive the same code: it mints in maps-TEXT
+            // order, never in host raw-number order, because a file first
+            // seen here gets the next deterministic inode. For each header it
+            // keys the INODE on what `stat` reports for the file
+            // (`GuestMappingMinter::stat_identity`) and the DEVICE column on
+            // what maps printed: on btrfs and overlayfs the two devices differ
+            // on native Linux as well, while the inode numbers agree. See
+            // `ProcfsSnapshotContext::mapping_identities`.
+            crate::procfs::mint_mapping_identities(
+                &contents,
+                &stdio_by_raw_file,
+                &mut GuestMappingMinter::new(self, guest, subject),
             )
-            .await;
-            for (&(raw_dev, raw_inode), pooled) in raw_pairs.iter().zip(pooled) {
-                if mapping_identities.contains_key(&(raw_dev, raw_inode)) {
-                    continue;
-                }
-                let det_inode = stdio_by_raw_inode
-                    .get(&RawInode::new(raw_dev, raw_inode))
-                    .copied()
-                    .unwrap_or(pooled);
-                // The device pool numbers first sightings only, so a repeated
-                // device request changes nothing.
-                let det_dev = determinize_device(guest, raw_dev).await;
-                mapping_identities.insert((raw_dev, raw_inode), (det_dev, det_inode.as_raw()));
-            }
-        }
+            .await?
+        } else {
+            crate::procfs::MappingIdentities::new()
+        };
         let mountinfo = if guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_needs_mountinfo_identities())?
@@ -3275,14 +4544,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         let in_type = guest
             .thread_state()
             .with_detfd(call.in_fd(), |detfd| detfd.ty())?;
-        let (out_type, out_resource, out_inode) =
-            guest.thread_state().with_detfd(call.out_fd(), |detfd| {
-                (
-                    detfd.ty(),
-                    detfd.resource(),
-                    detfd.stat().map(|stat| stat.raw_inode()),
-                )
-            })?;
+        let (out_type, out_resource) = guest
+            .thread_state()
+            .with_detfd(call.out_fd(), |detfd| (detfd.ty(), detfd.resource()))?;
 
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-973): Refuse sendfile from a procfs input so it
@@ -3305,11 +4569,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::ENOSYS.into());
         }
 
+        let out_inode = self.written_identity(guest, call.out_fd()).await?;
         let dettid = guest.thread_state().dettid;
         let mut resources = Resources::new(dettid);
-        // `out_inode` is the fd's cached HOST inode, so it must be
-        // determinized before naming a resource. It is deliberately left raw
-        // for the `touch_file` call below, which takes a `RawInode`.
+        // `out_inode` is the fd's HOST identity, so it must be determinized
+        // before naming a resource. It is deliberately left raw for the
+        // `touch_file` call below, which takes a `RawInode`.
         let out_resource = match out_resource {
             Some(resource) => Some(resource),
             None => match out_inode {
@@ -3349,27 +4614,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await;
         }
 
-        let (
-            fd_type,
-            physically_nonblocking,
-            logically_nonblocking,
-            open_file_id,
-            resource,
-            raw_ino,
-        ) = guest.thread_state().with_detfd(call.fd(), |detfd| {
-            (
-                detfd.ty(),
-                detfd.physically_nonblocking(),
-                detfd.is_nonblocking(),
-                detfd.open_file_id(),
-                detfd.resource(),
-                detfd.stat().map(|x| x.raw_inode()),
-            )
-        })?;
+        let (fd_type, physically_nonblocking, logically_nonblocking, open_file_id, resource) =
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                (
+                    detfd.ty(),
+                    detfd.physically_nonblocking(),
+                    detfd.is_nonblocking(),
+                    detfd.open_file_id(),
+                    detfd.resource(),
+                )
+            })?;
+        let written = self.written_identity(guest, call.fd()).await?;
         // It doesn't matter much where the linearization point for this mtime bump falls:
         if guest.config().virtualize_metadata {
             let r =
-                raw_ino.expect("Expect that when virtualize_metadata, DetFd's stat is populated!");
+                written.expect("Expect that when virtualize_metadata, DetFd's stat is populated!");
             touch_file(guest, r).await;
         }
 
@@ -3470,9 +4729,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             });
         }
 
-        let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
-            (detfd.resource(), detfd.stat().map(|stat| stat.raw_inode()))
-        })?;
+        let resource = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.resource())?;
+        let raw_ino = self.written_identity(guest, call.fd()).await?;
         // The fd's cached `DetStat` carries the HOST inode (`DetStat` is built
         // straight from `fstat`/`statx`), so it must be determinized before it
         // can name a guest-visible resource. Passing it through directly used
@@ -3575,23 +4835,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             return self.writev_timer_slack(guest, call.fd(), iovecs, 0).await;
         }
 
-        let (
-            fd_type,
-            physically_nonblocking,
-            logically_nonblocking,
-            open_file_id,
-            resource,
-            raw_ino,
-        ) = guest.thread_state().with_detfd(call.fd(), |detfd| {
-            (
-                detfd.ty(),
-                detfd.physically_nonblocking(),
-                detfd.is_nonblocking(),
-                detfd.open_file_id(),
-                detfd.resource(),
-                detfd.stat().map(|x| x.raw_inode()),
-            )
-        })?;
+        let (fd_type, physically_nonblocking, logically_nonblocking, open_file_id, resource) =
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                (
+                    detfd.ty(),
+                    detfd.physically_nonblocking(),
+                    detfd.is_nonblocking(),
+                    detfd.open_file_id(),
+                    detfd.resource(),
+                )
+            })?;
+        let written = self.written_identity(guest, call.fd()).await?;
 
         if let Some(resource) = resource {
             let mut request = guest.thread_state().mk_request(resource, Permission::W);
@@ -3619,9 +4873,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await
         };
 
-        if guest.config().virtualize_metadata && matches!(&result, Ok(written) if *written > 0) {
+        if guest.config().virtualize_metadata && matches!(&result, Ok(bytes) if *bytes > 0) {
             let inode =
-                raw_ino.expect("virtualized metadata requires stat data for every tracked fd");
+                written.expect("virtualized metadata requires stat data for every tracked fd");
             touch_file(guest, inode).await;
         }
 
@@ -3908,9 +5162,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             };
         }
 
-        let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
-            (detfd.resource(), detfd.stat().map(|stat| stat.raw_inode()))
-        })?;
+        let resource = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.resource())?;
+        let raw_ino = self.written_identity(guest, call.fd()).await?;
         // The fd's cached `DetStat` carries the HOST inode (`DetStat` is built
         // straight from `fstat`/`statx`), so it must be determinized before it
         // can name a guest-visible resource. Passing it through directly used
@@ -3968,9 +5223,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await;
         }
 
-        let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
-            (detfd.resource(), detfd.stat().map(|stat| stat.raw_inode()))
-        })?;
+        let resource = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.resource())?;
+        let raw_ino = self.written_identity(guest, call.fd()).await?;
         // The fd's cached `DetStat` carries the HOST inode (`DetStat` is built
         // straight from `fstat`/`statx`), so it must be determinized before it
         // can name a guest-visible resource. Passing it through directly used
@@ -4041,11 +5297,80 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
+        // The raw identity `fstat` reports for a mapped file. A maps line for
+        // this range keys its inode on it; see `mapping_stat_identity`.
+        //
+        // For an ordinary descriptor it is the descriptor's cached stat
+        // (present only under `virtualize_metadata`), so it costs no syscall.
+        // An inherited stdio descriptor, or a dup of one, is the exception:
+        // its cached stat is a stand-in -- the tracer's `fstat(0)`, given to
+        // all three (see `setup_stdio`) whether or not metadata is
+        // virtualized -- so its identity comes from a real `fstat` of the
+        // descriptor once the mapping has succeeded, and only under
+        // `virtualize_metadata`. That `fstat` cannot be the descriptor's own
+        // answer -- the mapping just succeeded -- so its failure means Detcore
+        // could not ask: the mapping is undone and the call is refused
+        // (`identity_lookup_refused`) rather than recorded without an identity.
+        let mapped_file = if call.flags().contains(MapFlags::MAP_ANONYMOUS) || call.fd() < 0 {
+            MappedFileIdentity::None
+        } else {
+            guest
+                .thread_state()
+                .with_detfd(call.fd(), |fd| {
+                    if is_container_stdio(fd.resource()) {
+                        MappedFileIdentity::Stdio
+                    } else {
+                        fd.stat().map_or(MappedFileIdentity::None, |stat| {
+                            MappedFileIdentity::Cached(stat.raw_inode())
+                        })
+                    }
+                })
+                .unwrap_or(MappedFileIdentity::None)
+        };
+        let fd = call.fd();
         let len = call.len();
         let result = self.record_or_replay(guest, call).await?;
         let start = usize::try_from(result).expect("a successful mmap must return an address");
+        let mapped_file = match mapped_file {
+            MappedFileIdentity::Cached(file) => Some(file),
+            MappedFileIdentity::Stdio if guest.config().virtualize_metadata => {
+                match self.inject_fstat(guest, fd).await {
+                    Ok(stat) => Some(RawInode::new(stat.st_dev, stat.st_ino)),
+                    Err(errno) => {
+                        // The guest will not learn this mapping's address:
+                        // the refusal stops this process on every backend
+                        // before the guest runs again. Undo it anyway, so
+                        // the address space does not keep a mapping nobody
+                        // recorded while the process is being stopped.
+                        guest.thread_state().unmap_memory(start, len);
+                        if let Err(unmap_errno) = guest
+                            .inject_with_retry(Syscall::Munmap(
+                                syscalls::Munmap::new()
+                                    .with_addr(Addr::from_raw(start))
+                                    .with_len(len),
+                            ))
+                            .await
+                        {
+                            warn!(
+                                "[detcore] could not undo the mapping of stdio descriptor {fd} \
+                                 at {start:#x}: {unmap_errno}"
+                            );
+                        }
+                        return Err(identity_lookup_refused(
+                            "fstat the stdio descriptor it mapped",
+                            format!("fd {fd}").as_bytes(),
+                            errno,
+                        ));
+                    }
+                }
+            }
+            MappedFileIdentity::Stdio | MappedFileIdentity::None => None,
+        };
 
         guest.thread_state().unmap_memory(start, len);
+        if let Some(file) = mapped_file {
+            guest.thread_state().map_file(start, len, file);
+        }
         match backing {
             Some(SharedBacking::Anonymous) => {
                 guest.thread_state().map_shared_anonymous(start, len);
@@ -4133,6 +5458,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 } else {
                     ObservedMtime::Unobserved
                 };
+                // Key on the raw device as well as the raw inode, read before
+                // `stat.dev` is overwritten below: inode numbers repeat across
+                // filesystems (https://github.com/rrnewton/hermit/issues/3307).
+                //
                 // A file with a link cannot be one a retired mapping describes:
                 // Linux refuses to link an unlinked file again (only an
                 // `O_TMPFILE` file, which is never retired, may get a name).
@@ -5110,8 +6439,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino) {
             return Ok(res);
         }
+        let file = RawInode::new(after.st_dev, after.st_ino);
         if mtime.tv_nsec == libc::UTIME_NOW {
-            touch_file(guest, RawInode::new(after.st_dev, after.st_ino)).await;
+            touch_file(guest, file).await;
             return Ok(res);
         }
         const NANOS_PER_SEC: i128 = 1_000_000_000;
@@ -5121,12 +6451,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // granularity, at most a second on the filesystems builds use.
         if (0..NANOS_PER_SEC).contains(&(requested - stored)) {
             let nanos = u64::try_from(stored.max(0)).unwrap_or(u64::MAX);
-            set_file_mtime(
-                guest,
-                RawInode::new(after.st_dev, after.st_ino),
-                LogicalTime::from_nanos(nanos),
-            )
-            .await;
+            set_file_mtime(guest, file, LogicalTime::from_nanos(nanos)).await;
         }
         Ok(res)
     }
@@ -6020,6 +7345,116 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(fd as i64)
     }
 
+    /// The stat that identifies the object behind descriptor `fd`, for the
+    /// identity lookups that key a deterministic inode on it; `Ok(None)` when
+    /// Detcore tracks no such descriptor or has no stat for it.
+    ///
+    /// An ordinary descriptor's cached stat is its own and is returned as it
+    /// is. An inherited stdio descriptor, or a dup of one, is the exception:
+    /// `setup_stdio` gives descriptors 0, 1 and 2 one stand-in, the `fstat(0)`
+    /// of the process that runs Detcore (Hermit's on ptrace and KVM, the
+    /// guest's on DBT and LiteInst), so a stdout or stderr on another device
+    /// than stdin, and every dup of one, would be keyed on stdin's file. With
+    /// `virtualize_metadata` its identity is an injected `fstat` of the
+    /// descriptor itself, cached on its open file description
+    /// (`DetFd::identity_stat`), which every alias shares: an alias's `fstat`
+    /// describes the same object, so it does not matter which alias asks
+    /// first.
+    ///
+    /// Without `virtualize_metadata` -- `hermit record` and `hermit replay`
+    /// -- the stand-in is still returned, as before: no `fstat` is injected
+    /// in that mode, as in `handle_mmap`, because at replay it would describe
+    /// the replayer's descriptor rather than the recorded one.
+    ///
+    /// `EBADF` from the `fstat` is the kernel's answer that the descriptor is
+    /// not open, and is returned as that errno. Any other failure means
+    /// Detcore could not ask, and is refused (`identity_lookup_refused`).
+    pub(crate) async fn descriptor_identity_stat<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<Option<DetStat>, Error> {
+        let Ok((stat, stdio, identity_stat)) = guest.thread_state().with_detfd(fd, |detfd| {
+            (
+                detfd.stat(),
+                is_container_stdio(detfd.resource()),
+                detfd.identity_stat(),
+            )
+        }) else {
+            return Ok(None);
+        };
+        if !stdio || !guest.config().virtualize_metadata {
+            return Ok(stat);
+        }
+        if identity_stat.is_some() {
+            return Ok(identity_stat);
+        }
+        match self.inject_fstat(guest, fd).await {
+            Ok(own) => {
+                let own = DetStat::from(own);
+                guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.set_identity_stat(own))?;
+                Ok(Some(own))
+            }
+            Err(Errno::EBADF) => Err(Error::Errno(Errno::EBADF)),
+            Err(errno) => Err(identity_lookup_refused(
+                "fstat the inherited stdio descriptor",
+                format!("fd {fd}").as_bytes(),
+                errno,
+            )),
+        }
+    }
+
+    /// The raw identity of the file a write through `fd` changes, for the
+    /// virtual mtime bump of the write family: the descriptor's own object,
+    /// [`Self::descriptor_identity_stat`]. The cached stat of an inherited
+    /// stdio descriptor, or of a dup of one, is the `fstat(0)` stand-in all
+    /// three share, so bumping it bumped stdin's file for a write to stdout
+    /// while a `stat` of stdout's file looked under that file's own identity.
+    /// `Ok(None)` when Detcore has no stat for `fd`. Asked before the kernel
+    /// writes, so a refusal leaves the guest's file unchanged.
+    async fn written_identity<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<Option<RawInode>, Error> {
+        Ok(self
+            .descriptor_identity_stat(guest, fd)
+            .await?
+            .map(|stat| stat.raw_inode()))
+    }
+
+    /// [`Self::descriptor_identity_stat`] of each inherited stdio descriptor,
+    /// 0 to 2, indexed by descriptor number: `None` where the descriptor is
+    /// not open, or no longer carries an inherited stdio resource
+    /// (`dup2(file, 1)` gives descriptor 1 the file's).
+    pub(crate) async fn inherited_stdio_identity_stats<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Result<[Option<DetStat>; 3], Error> {
+        let mut stats = [None; 3];
+        for fd in libc::STDIN_FILENO..=libc::STDERR_FILENO {
+            let inherited = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| {
+                    deterministic_stdio_inode_for_resource(fd, detfd.resource()).is_some()
+                })
+                .unwrap_or(false);
+            if !inherited {
+                continue;
+            }
+            stats[fd as usize] = match self.descriptor_identity_stat(guest, fd).await {
+                Ok(stat) => stat,
+                // The kernel holds no descriptor there, so no object is that
+                // descriptor's.
+                Err(Error::Errno(Errno::EBADF)) => None,
+                Err(error) => return Err(error),
+            };
+        }
+        Ok(stats)
+    }
+
     /// getdents system call.
     pub async fn handle_getdents<G: Guest<Self>>(
         &self,
@@ -6030,12 +7465,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(self.record_or_replay(guest, call).await?);
         }
         let buf = call.dirent().ok_or(Errno::EFAULT)?.cast::<u8>();
+        // Resolved before the real call: see `directory_device`.
+        let device = self.directory_device(guest, call.fd() as RawFd).await?;
         self.serve_directory_stream(
             guest,
             GetdentsCall {
                 call: Syscall::from(call),
                 empty: Syscall::from(call.with_count(0)),
                 fd: call.fd() as i32,
+                device,
                 buf,
                 capacity: call.count() as usize,
                 format: DirentFormat::Legacy,
@@ -6054,12 +7492,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(self.record_or_replay(guest, call).await?);
         }
         let buf = call.dirent().ok_or(Errno::EFAULT)?.cast::<u8>();
+        // Resolved before the real call: see `directory_device`.
+        let device = self.directory_device(guest, call.fd() as RawFd).await?;
         self.serve_directory_stream(
             guest,
             GetdentsCall {
                 call: Syscall::from(call),
                 empty: Syscall::from(call.with_count(0)),
                 fd: call.fd() as i32,
+                device,
                 buf,
                 capacity: call.count() as usize,
                 format: DirentFormat::Dirent64,
@@ -6235,13 +7676,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         })??;
         let (passed, copied) = match batch {
             Ok(batch) => {
-                let device = self.directory_device(guest, call.fd).await?;
                 let mut records = Vec::new();
                 let mut names = Vec::with_capacity(batch.len());
                 for (index, entry) in batch.iter().enumerate() {
                     let (d_ino, _) = determinize_listed_inode(
                         guest,
-                        RawInode::new(device, entry.ino),
+                        RawInode::new(call.device, entry.ino),
                         retirements,
                     )
                     .await;
@@ -6278,21 +7718,48 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// The host device of the directory open as `fd`, which is the device of
     /// every inode number its entries carry (a mount point's entry names the
-    /// directory beneath the mount, on the same device). It is the cached
-    /// stat's when Detcore tracks `fd`, and an injected `fstat` otherwise.
+    /// directory beneath the mount, on the same device). That is also the
+    /// device `stat` reports for each entry, except on overlayfs (see
+    /// `mapping_stat_identity`). It is the device of the descriptor's identity
+    /// stat (`descriptor_identity_stat`: its cached stat, or an inherited
+    /// stdio descriptor's own `fstat` in place of the stand-in it was given)
+    /// when there is one, and an injected `fstat` otherwise.
+    ///
+    /// A descriptor Detcore does not track (one received over `SCM_RIGHTS`,
+    /// for example) has no cached stat, which is not an error: the kernel owns
+    /// the descriptor table, and the injected `fstat` asks it directly. The
+    /// getdents handlers call this BEFORE the real system call, so an `fstat`
+    /// failure is reported without consuming directory entries, and a
+    /// successful getdents is never turned into an error afterwards.
+    ///
+    /// Only `EBADF` is the descriptor's own answer, one the getdents would
+    /// report too, so it is the call's result. Any other failure means
+    /// Detcore could not ask -- for example `ENOMEM` from the transient page
+    /// `inject_fstat` maps when the guest's stack cannot hold the buffer,
+    /// which can fail for a valid descriptor at the guest's address-space or
+    /// mapping-count limit -- and it is a tool error
+    /// (`identity_lookup_refused`), never an errno the guest would take as
+    /// its getdents' own result.
     async fn directory_device<G: Guest<Self>>(
         &self,
         guest: &mut G,
         fd: RawFd,
-    ) -> Result<u64, Errno> {
-        let cached = guest
-            .thread_state()
-            .with_detfd(fd, |detfd| detfd.stat().map(|stat| stat.dev))
-            .ok()
-            .flatten();
+    ) -> Result<u64, Error> {
+        let cached = self
+            .descriptor_identity_stat(guest, fd)
+            .await?
+            .map(|stat| stat.dev);
         match cached {
             Some(device) => Ok(device),
-            None => Ok(self.inject_fstat(guest, fd).await?.st_dev),
+            None => match self.inject_fstat(guest, fd).await {
+                Ok(stat) => Ok(stat.st_dev),
+                Err(Errno::EBADF) => Err(Error::Errno(Errno::EBADF)),
+                Err(errno) => Err(identity_lookup_refused(
+                    "fstat the directory descriptor",
+                    format!("fd {fd}").as_bytes(),
+                    errno,
+                )),
+            },
         }
     }
 
@@ -6333,10 +7800,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let mut entries = read_records(&guest.memory(), call.buf, len, call.format)?;
         sort_dir_entries(&mut entries);
-        let device = self.directory_device(guest, call.fd).await?;
         let mut records = Vec::with_capacity(len);
         for entry in &entries {
-            let (d_ino, _) = determinize_named_inode(guest, RawInode::new(device, entry.ino)).await;
+            let (d_ino, _) =
+                determinize_named_inode(guest, RawInode::new(call.device, entry.ino)).await;
             call.format
                 .encode(entry, d_ino.as_raw(), entry.off, &mut records);
         }
@@ -6833,6 +8300,10 @@ struct GetdentsCall<'a> {
     /// The same call asking for no bytes.
     empty: Syscall,
     fd: RawFd,
+    /// The raw device of the directory's filesystem, which keys each entry's
+    /// deterministic inode; resolved before the real call (see
+    /// `Detcore::directory_device`).
+    device: u64,
     buf: AddrMut<'a, u8>,
     /// The guest's buffer size.
     capacity: usize,
@@ -6855,6 +8326,7 @@ impl<'a> GetdentsCall<'a> {
             call,
             empty: self.empty,
             fd: self.fd,
+            device: self.device,
             buf,
             capacity: count as usize,
             format: self.format,
@@ -7023,6 +8495,166 @@ mod procfs_wiring_guard {
             "MISSING MECHANISM: the fdinfo mnt_id capture parses mountinfo before \
              dropping host seed rows"
         );
+    }
+
+    /// What `maps_identities_are_minted_through_the_tested_loop` requires of
+    /// the `initialize_procfs_snapshot` body; an empty result means it passes.
+    fn maps_minting_wiring_violations(body: &str) -> Vec<&'static str> {
+        const CALL: &str = "crate::procfs::mint_mapping_identities(";
+        let mut violations = Vec::new();
+        match body.find(CALL) {
+            None => violations.push("does not call `crate::procfs::mint_mapping_identities`"),
+            Some(start) => {
+                // The call's argument list, up to its balancing `)`. The
+                // snapshot bytes must be the ones passed, unmodified: a
+                // re-sorted copy would feed the tested loop host-ordered input.
+                // And the stdio map built above, keyed on the raw device and
+                // inode `stat` reports, must be the one passed: an empty map
+                // here would drop the fdinfo-consistent stdio inode override
+                // and no unit test of the loop itself could notice.
+                let args = &body[start + CALL.len()..];
+                let mut depth = 0usize;
+                let end = args
+                    .char_indices()
+                    .find_map(|(i, c)| match c {
+                        '(' | '[' | '{' => {
+                            depth += 1;
+                            None
+                        }
+                        ')' | ']' | '}' if depth == 0 => Some(i),
+                        ')' | ']' | '}' => {
+                            depth -= 1;
+                            None
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(args.len());
+                if args[..end].split(',').next().map(str::trim) != Some("&contents") {
+                    violations.push("does not pass `&contents` as the snapshot to mint from");
+                }
+                if !args[..end]
+                    .split(',')
+                    .any(|arg| arg.trim() == "&stdio_by_raw_file")
+                {
+                    violations.push("does not pass `&stdio_by_raw_file` to the minting loop");
+                }
+            }
+        }
+        // Parsing mapping headers, collecting their keys, or resolving their
+        // `stat` identities here would mean the order in which this body
+        // resolves and mints is no longer the order the unit tests drive.
+        // `mapping_keys` also matches `mapping_keys_in_text_order`.
+        if [
+            "mapping_header_identity",
+            "mapping_header_key",
+            "mapping_keys",
+            "mapping_stat_identity",
+        ]
+        .iter()
+        .any(|local_parse| body.contains(local_parse))
+        {
+            violations.push("parses mapping identities itself instead of delegating");
+        }
+        violations
+    }
+
+    #[test]
+    fn maps_identities_are_minted_through_the_tested_loop() {
+        // The mint ORDER is tested behaviourally, against the production loop
+        // itself, by `tool_global::tests::maps_*_are_minted_in_text_order_not_raw_order`,
+        // and `maps_keys_are_minted_in_text_order_under_device_keying`, which
+        // drive `crate::procfs::mint_mapping_identities`. What those tests
+        // cannot see is whether the snapshot initialiser still calls that loop.
+        // This checks only that: the body calls it with `&contents` and
+        // `&stdio_by_raw_file`, and does not parse mapping headers or resolve
+        // their identities on its own. It does not check the order.
+        let body = handler_body("initialize_procfs_snapshot");
+        assert!(
+            body.len() > 200 && body.contains("needs_mapping_identities"),
+            "guard extractor did not find a real body for `initialize_procfs_snapshot` \
+             (len {}), so the wiring assertion would be vacuous",
+            body.len()
+        );
+        let violations = maps_minting_wiring_violations(body);
+        assert!(
+            violations.is_empty(),
+            "MISSING MECHANISM: `initialize_procfs_snapshot` {violations:?}. /proc/*/maps \
+             identities must be minted by `crate::procfs::mint_mapping_identities`, whose \
+             text-order minting is what the tool_global unit tests exercise; a local loop \
+             could mint in host raw-number order without any test noticing."
+        );
+    }
+
+    #[test]
+    fn maps_minting_wiring_check_rejects_a_local_loop() {
+        // Positive controls: bodies that bypass the tested loop must be rejected,
+        // otherwise the guard above would pass vacuously. Each control asserts
+        // the EXACT violation list, and all but `local_loop` violate one rule
+        // only, so disabling any single check makes its own control fail.
+        const NO_CALL: &str = "does not call `crate::procfs::mint_mapping_identities`";
+        const NOT_CONTENTS: &str = "does not pass `&contents` as the snapshot to mint from";
+        const NO_STDIO: &str = "does not pass `&stdio_by_raw_file` to the minting loop";
+        const LOCAL_PARSE: &str = "parses mapping identities itself instead of delegating";
+
+        let no_call = "let mapping_identities = BTreeMap::new();";
+        assert_eq!(maps_minting_wiring_violations(no_call), [NO_CALL]);
+        let local_loop = "let raw_pairs: BTreeSet<(u64, u64)> = String::from_utf8_lossy(&contents)\n\
+                          .lines().filter_map(crate::procfs::mapping_header_identity).collect();";
+        assert_eq!(
+            maps_minting_wiring_violations(local_loop),
+            [NO_CALL, LOCAL_PARSE]
+        );
+        // The keying commit's first draft: a local loop over the keys in
+        // sorted order, resolving each one itself.
+        let local_order = "for (key, starts) in crate::procfs::mapping_keys(&contents) {\n\
+                           let raw_file = self.mapping_stat_identity(guest, &key, &starts, subject).await?;";
+        assert_eq!(
+            maps_minting_wiring_violations(local_order),
+            [NO_CALL, LOCAL_PARSE]
+        );
+        // Each forbidden name alone, next to an otherwise valid call, so
+        // dropping any one of them from the check fails its own control.
+        let valid_call = "crate::procfs::mint_mapping_identities(\n\
+                          &contents,\n\
+                          &stdio_by_raw_file,\n\
+                          &mut GuestMappingMinter::new(self, guest, subject),\n\
+                          )";
+        for local_parse in [
+            "let keys = crate::procfs::mapping_keys_in_text_order(&contents);",
+            "let key = crate::procfs::mapping_header_key(line);",
+            "let pair = crate::procfs::mapping_header_identity(line);",
+            "let raw_file = self.mapping_stat_identity(guest, &key, &starts, subject).await?;",
+        ] {
+            assert_eq!(
+                maps_minting_wiring_violations(&format!("{local_parse}\n{valid_call}")),
+                [LOCAL_PARSE],
+                "{local_parse}"
+            );
+        }
+        let other_buffer = "crate::procfs::mint_mapping_identities(\n\
+                            &resorted,\n\
+                            &stdio_by_raw_file,\n\
+                            &mut GuestMappingMinter::new(self, guest, subject),\n\
+                            )";
+        assert_eq!(maps_minting_wiring_violations(other_buffer), [NOT_CONTENTS]);
+        let no_stdio = "crate::procfs::mint_mapping_identities(\n\
+                        &contents,\n\
+                        &BTreeMap::new(),\n\
+                        &mut GuestMappingMinter::new(self, guest, subject),\n\
+                        )";
+        assert_eq!(maps_minting_wiring_violations(no_stdio), [NO_STDIO]);
+        // A stdio map keyed on the raw inode alone, as before
+        // https://github.com/rrnewton/hermit/issues/3307 was fixed.
+        let inode_keyed_stdio = "crate::procfs::mint_mapping_identities(\n\
+                                 &contents,\n\
+                                 &stdio_by_raw_inode,\n\
+                                 &mut GuestMappingMinter::new(self, guest, subject),\n\
+                                 )";
+        assert_eq!(
+            maps_minting_wiring_violations(inode_keyed_stdio),
+            [NO_STDIO]
+        );
+        assert!(maps_minting_wiring_violations(valid_call).is_empty());
     }
 
     #[test]
@@ -8043,24 +9675,30 @@ mod test {
     }
 }
 
-/// `inject_fstat` and `add_fd` against a scripted guest whose "address space"
-/// is this test process, so every injected syscall runs for real on host
-/// memory and a real descriptor. Regression coverage for
-/// <https://github.com/rrnewton/hermit/issues/3328>; the traced end-to-end case
-/// is `tests_misc::tight_stack_openat`.
+/// `inject_fstat`, `add_fd` and `stat_guest_path` against a scripted guest
+/// whose "address space" is this test process, so every injected syscall runs
+/// for real on host memory and a real descriptor or path. Regression coverage
+/// for <https://github.com/rrnewton/hermit/issues/3328>; the traced end-to-end
+/// cases are `tests_misc::tight_stack_openat` and
+/// `tests_misc::tight_stack_maps`. The scripted guest is shared with the
+/// `/proc/<pid>/fd` link tests in `namespace`.
 #[cfg(test)]
-mod inject_fstat_scratch {
+pub(crate) mod inject_fstat_scratch {
     use std::os::fd::IntoRawFd;
     use std::os::fd::RawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
     use reverie::GlobalRPC;
     use reverie::GlobalTool;
     use reverie::Pid;
     use reverie::Tool;
+    use reverie::syscalls::FromToRaw;
     use reverie::syscalls::LocalMemory;
     use reverie::syscalls::ProtFlags;
 
@@ -8070,21 +9708,53 @@ mod inject_fstat_scratch {
     use crate::ThreadState;
     use crate::types::DetPid;
 
+    thread_local! {
+        /// The `mountinfo` `guest_mountinfo` returns instead of reading the
+        /// guest's, while a test sets one: `ScriptedGuest`'s pid is 1, which
+        /// is not the test process.
+        pub(crate) static SCRIPTED_MOUNTINFO: std::cell::RefCell<Option<Vec<u8>>> =
+            const { std::cell::RefCell::new(None) };
+        /// How many times `guest_mountinfo` was called on this thread,
+        /// scripted or not.
+        pub(crate) static MOUNTINFO_READS: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+        /// (unique mount id, superblock device) pairs an injected
+        /// `statmount` answers from instead of running, while a test sets
+        /// them: `ENOENT` for a mount not listed, as the guest's kernel
+        /// answers for a mount outside its namespace.
+        static SCRIPTED_SUPERBLOCKS: std::cell::RefCell<Option<Vec<(u64, u64)>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
     /// Room for one `libc::stat`, 8-byte aligned like a real stack slot.
     const ARENA_WORDS: usize = 32;
 
-    /// A guest stack scratch that is either writable or faults on commit,
-    /// like the ptrace scratch below an `rsp` with no writable memory under
-    /// it. The writable arena belongs to the guest and outlives every guard,
-    /// so an early guard drop is reported by `guard_live` rather than by a
-    /// write into freed memory.
-    struct ScriptedStack {
-        writable: bool,
+    /// A guest stack scratch whose commit fails with `commit_error` when one
+    /// is set, like the ptrace scratch below an `rsp` with no writable memory
+    /// under it (`EFAULT`) or of a task that has gone (`ESRCH`). Otherwise a
+    /// commit writes nothing, as on backends whose scratch is a Tool-owned
+    /// arena (DBT), so a scratch that is not writable faults only when it is
+    /// written -- unless `commit_writes` is set, when it writes zeros over
+    /// every reserved byte in one write from the scratch's start and fails
+    /// with `EFAULT` at the first byte it cannot write, as the ptrace commit
+    /// writes its whole region. `reserve` hands out `arena` in order. The
+    /// arena belongs to the guest and outlives every guard, so an early
+    /// guard drop is reported by `guard_live` rather than by a write into
+    /// freed memory.
+    pub(crate) struct ScriptedStack {
+        commit_error: Option<Errno>,
+        commit_writes: bool,
         arena: usize,
+        arena_len: usize,
+        reserved: usize,
+        /// Whether `size` and `capacity` answer: `inject_fstat` must not ask,
+        /// and `stat_guest_path` asks to bound its path.
+        sized: bool,
         guard_live: Arc<AtomicBool>,
+        commits: Arc<AtomicUsize>,
     }
 
-    struct ScriptedStackGuard {
+    pub(crate) struct ScriptedStackGuard {
         guard_live: Arc<AtomicBool>,
     }
 
@@ -8098,21 +9768,38 @@ mod inject_fstat_scratch {
         type StackGuard = ScriptedStackGuard;
 
         fn size(&self) -> usize {
-            panic!("inject_fstat must not query the scratch size")
+            assert!(self.sized, "inject_fstat must not query the scratch size");
+            self.reserved
         }
         fn capacity(&self) -> usize {
-            panic!("inject_fstat must not query the scratch capacity")
+            assert!(
+                self.sized,
+                "inject_fstat must not query the scratch capacity"
+            );
+            self.arena_len
         }
         fn push<'stack, T>(&mut self, _: T) -> Addr<'stack, T> {
             panic!("inject_fstat reserves its buffer rather than pushing one")
         }
         fn reserve<'stack, T>(&mut self) -> AddrMut<'stack, T> {
-            assert!(std::mem::size_of::<T>() <= ARENA_WORDS * std::mem::size_of::<u64>());
-            AddrMut::from_raw(self.arena).unwrap()
+            let address = self.arena + self.reserved;
+            self.reserved += std::mem::size_of::<T>().next_multiple_of(8);
+            assert!(
+                self.reserved <= self.arena_len,
+                "the scripted scratch is full"
+            );
+            AddrMut::from_raw(address).unwrap()
         }
         fn commit(self) -> Result<Self::StackGuard, Errno> {
-            if !self.writable {
-                return Err(Errno::EFAULT);
+            self.commits.fetch_add(1, Ordering::SeqCst);
+            if let Some(errno) = self.commit_error {
+                return Err(errno);
+            }
+            if self.commit_writes {
+                LocalMemory::new().write_exact(
+                    AddrMut::from_raw(self.arena).unwrap(),
+                    &vec![0; self.reserved],
+                )?;
             }
             self.guard_live.store(true, Ordering::SeqCst);
             Ok(ScriptedStackGuard {
@@ -8121,28 +9808,165 @@ mod inject_fstat_scratch {
         }
     }
 
-    struct ScriptedGuest {
-        config: Config,
-        thread: ThreadState<()>,
-        stack_writable: bool,
+    /// This process's memory as `LocalMemory` reaches it, except that every
+    /// write fails with `write_error` when one is set. Counts each write that
+    /// starts in the test-supplied stack scratch while no stack guard is
+    /// live.
+    pub(crate) struct ScriptedMemory {
+        write_error: Option<Errno>,
+        scratch: Option<(usize, usize)>,
+        guard_live: Arc<AtomicBool>,
+        unguarded_scratch_writes: Arc<AtomicUsize>,
+    }
+
+    impl ScriptedMemory {
+        fn note_write(&self, address: usize) {
+            if let Some((start, len)) = self.scratch
+                && (start..start + len).contains(&address)
+                && !self.guard_live.load(Ordering::SeqCst)
+            {
+                self.unguarded_scratch_writes.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    impl MemoryAccess for ScriptedMemory {
+        fn read_vectored(
+            &self,
+            read_from: &[std::io::IoSlice],
+            write_to: &mut [std::io::IoSliceMut],
+        ) -> Result<usize, Errno> {
+            LocalMemory::new().read_vectored(read_from, write_to)
+        }
+        fn write_vectored(
+            &mut self,
+            read_from: &[std::io::IoSlice],
+            write_to: &mut [std::io::IoSliceMut],
+        ) -> Result<usize, Errno> {
+            for slice in write_to.iter() {
+                self.note_write(slice.as_ptr() as usize);
+            }
+            match self.write_error {
+                Some(errno) => Err(errno),
+                None => LocalMemory::new().write_vectored(read_from, write_to),
+            }
+        }
+        fn read<'a, A>(&self, addr: A, buf: &mut [u8]) -> Result<usize, Errno>
+        where
+            A: Into<Addr<'a, u8>>,
+        {
+            LocalMemory::new().read(addr, buf)
+        }
+        fn write(&mut self, addr: AddrMut<u8>, buf: &[u8]) -> Result<usize, Errno> {
+            self.note_write(addr.as_raw());
+            match self.write_error {
+                Some(errno) => Err(errno),
+                None => LocalMemory::new().write(addr, buf),
+            }
+        }
+        fn write_with_user_access(
+            &mut self,
+            addr: AddrMut<u8>,
+            buf: &[u8],
+        ) -> Result<usize, Errno> {
+            self.note_write(addr.as_raw());
+            match self.write_error {
+                Some(errno) => Err(errno),
+                None => LocalMemory::new().write_with_user_access(addr, buf),
+            }
+        }
+    }
+
+    pub(crate) struct ScriptedGuest {
+        pub(crate) config: Config,
+        pub(crate) thread: ThreadState<()>,
+        commit_error: Option<Errno>,
+        /// Whether a commit writes the scratch, as on ptrace: see
+        /// `ScriptedStack`.
+        commit_writes: bool,
+        /// (address, length) of the stack scratch when the test supplies one;
+        /// otherwise the scratch is `arena` and does not report its size.
+        scratch: Option<(usize, usize)>,
+        write_error: Option<Errno>,
         mmap_fails: bool,
+        /// The errno every injected `fstatat` fails with instead of running,
+        /// when set: a failure the test process cannot provoke on demand.
+        fstatat_error: Option<Errno>,
         arena: Box<[u64; ARENA_WORDS]>,
         guard_live: Arc<AtomicBool>,
-        injected: Vec<Sysno>,
+        /// How many times a stack scratch was committed, successfully or not.
+        commits: Arc<AtomicUsize>,
+        /// Writes into the test-supplied stack scratch made while no stack
+        /// guard was live.
+        unguarded_scratch_writes: Arc<AtomicUsize>,
+        pub(crate) injected: Vec<Sysno>,
         /// Whether a stack guard was live when each fstat was injected.
         fstat_guard_live: Vec<bool>,
         /// Buffer address of each injected fstat.
         fstat_buffers: Vec<usize>,
+        /// Whether a stack guard was live when each fstatat was injected.
+        fstatat_guard_live: Vec<bool>,
+        /// Path each injected fstatat named, as the kernel reads it.
+        pub(crate) fstatat_paths: Vec<Vec<u8>>,
+        /// Path each injected statx named, as the kernel reads it.
+        pub(crate) statx_paths: Vec<Vec<u8>>,
+        /// Whether an injected statx ignores `STATX_MNT_ID_UNIQUE`, as a
+        /// kernel before Linux 6.8 does, and so reports the reusable mount
+        /// id instead.
+        statx_without_unique_mount_id: bool,
+        /// The errno every injected `statmount` fails with instead of
+        /// running, when set: `ENOSYS` as under a seccomp policy, or an
+        /// answer the test process's own mounts do not give.
+        statmount_error: Option<Errno>,
+        /// Whether a scripted `statmount` answers without the superblock
+        /// fields it was asked for.
+        statmount_omits_superblock: bool,
+        /// Mount id each injected statmount asked for.
+        statmount_mounts: Vec<u64>,
+        /// Link each injected readlinkat named, as the kernel reads it.
+        pub(crate) readlink_paths: Vec<Vec<u8>>,
+        /// (link, text): an injected readlinkat of `link` reads `text`
+        /// instead of running, for a link the test process cannot make.
+        pub(crate) readlink_answers: Vec<(Vec<u8>, Vec<u8>)>,
+        /// Buffer address of each injected fstatat.
+        fstatat_buffers: Vec<usize>,
         /// (address, length) of each page the guest mapped.
         mapped: Vec<(usize, usize)>,
         /// (address, length) of each successful munmap.
         unmapped: Vec<(usize, usize)>,
+        /// (address, length) of each file mapping the guest made.
+        file_mapped: Vec<(usize, usize)>,
         /// Descriptors closed through injection.
         closed: Vec<RawFd>,
+        /// Whether `send_rpc` answers `DeterminizeInode`. Off by default, so
+        /// a test that expects no RPC still fails on one.
+        pub(crate) answers_determinize_inode: bool,
+        /// Raw identity of each `DeterminizeInode` request, and of each entry
+        /// of a `DeterminizeMappingInodes` request, in order. Every request
+        /// for the `n`th DISTINCT identity (from 0) is answered with the same
+        /// deterministic inode, `FIRST_SCRIPTED_INODE + n`. Unlike the real
+        /// pool, a repeated request does not consume a number; the tests read
+        /// this log for which requests were sent, not for the pool's ordinals.
+        pub(crate) determinized: std::sync::Mutex<Vec<RawInode>>,
+        /// What `detlog_memory_regions` reports: `None`, as ptrace does, or
+        /// the guest ranges a test wants the memory-map DETLOG to hash.
+        detlog_regions: Option<Vec<reverie::DetlogMemoryRegion>>,
+        /// (descriptor, stat): an injected fstat of the descriptor reads the
+        /// stat instead of running, for a file the test process cannot make.
+        fstat_answers: Vec<(RawFd, libc::stat)>,
+        /// Whether `send_rpc` answers `TouchFile`. Off by default, so a test
+        /// that expects no RPC still fails on one.
+        answers_touch_file: bool,
+        /// Raw identity of each `TouchFile` request, in order.
+        touched: std::sync::Mutex<Vec<RawInode>>,
     }
 
+    /// The deterministic inode `send_rpc` gives the first `DeterminizeInode`
+    /// request.
+    pub(crate) const FIRST_SCRIPTED_INODE: u64 = 7000;
+
     impl ScriptedGuest {
-        fn new(stack_writable: bool, mmap_fails: bool) -> (Detcore, Self) {
+        pub(crate) fn new(stack_writable: bool, mmap_fails: bool) -> (Detcore, Self) {
             let config = Config {
                 virtualize_metadata: true,
                 ..Config::default()
@@ -8154,18 +9978,78 @@ mod inject_fstat_scratch {
             let guest = Self {
                 config,
                 thread,
-                stack_writable,
+                commit_error: (!stack_writable).then_some(Errno::EFAULT),
+                commit_writes: false,
+                scratch: None,
+                write_error: None,
                 mmap_fails,
+                fstatat_error: None,
                 arena: Box::new([u64::MAX; ARENA_WORDS]),
                 guard_live: Arc::new(AtomicBool::new(false)),
+                commits: Arc::new(AtomicUsize::new(0)),
+                unguarded_scratch_writes: Arc::new(AtomicUsize::new(0)),
                 injected: Vec::new(),
                 fstat_guard_live: Vec::new(),
                 fstat_buffers: Vec::new(),
+                fstatat_guard_live: Vec::new(),
+                fstatat_paths: Vec::new(),
+                statx_paths: Vec::new(),
+                statx_without_unique_mount_id: false,
+                statmount_error: None,
+                statmount_omits_superblock: false,
+                statmount_mounts: Vec::new(),
+                readlink_paths: Vec::new(),
+                readlink_answers: Vec::new(),
+                fstatat_buffers: Vec::new(),
                 mapped: Vec::new(),
                 unmapped: Vec::new(),
+                file_mapped: Vec::new(),
                 closed: Vec::new(),
+                answers_determinize_inode: false,
+                determinized: std::sync::Mutex::new(Vec::new()),
+                detlog_regions: None,
+                fstat_answers: Vec::new(),
+                answers_touch_file: false,
+                touched: std::sync::Mutex::new(Vec::new()),
             };
             (tool, guest)
+        }
+
+        /// A guest whose stack scratch is the `len` bytes at `address`, and
+        /// whose commit fails with `commit_error` when one is given.
+        pub(crate) fn with_scratch(
+            address: usize,
+            len: usize,
+            commit_error: Option<Errno>,
+        ) -> (Detcore, Self) {
+            let (tool, mut guest) = Self::new(true, false);
+            guest.scratch = Some((address, len));
+            guest.commit_error = commit_error;
+            (tool, guest)
+        }
+
+        /// How many writes went into the test-supplied stack scratch while
+        /// no stack guard was live.
+        fn unguarded_scratch_writes(&self) -> usize {
+            self.unguarded_scratch_writes.load(Ordering::SeqCst)
+        }
+
+        /// Record one inode request for `raw` in `determinized`, and answer
+        /// it as that log's model of the pool does.
+        fn scripted_inode(&self, raw: RawInode) -> DetInode {
+            let mut determinized = self.determinized.lock().unwrap();
+            determinized.push(raw);
+            let mut distinct: Vec<RawInode> = Vec::new();
+            for seen in determinized.iter() {
+                if !distinct.contains(seen) {
+                    distinct.push(*seen);
+                }
+            }
+            let index = distinct
+                .iter()
+                .position(|seen| *seen == raw)
+                .expect("the request was just recorded");
+            DetInode::mint(FIRST_SCRIPTED_INODE + index as u64)
         }
     }
 
@@ -8175,7 +10059,27 @@ mod inject_fstat_scratch {
             &self,
             message: <GlobalState as GlobalTool>::Request,
         ) -> <GlobalState as GlobalTool>::Response {
-            panic!("fd registration must not send an RPC: {:?}", message.2)
+            match message.2 {
+                GlobalRequest::DeterminizeInode(raw, _, _) if self.answers_determinize_inode => (
+                    None,
+                    GlobalResponse::DeterminizeInode((self.scripted_inode(raw), LogicalTime::ZERO)),
+                ),
+                GlobalRequest::DeterminizeMappingInodes(raws) if self.answers_determinize_inode => {
+                    (
+                        None,
+                        GlobalResponse::DeterminizeMappingInodes(
+                            raws.into_iter()
+                                .map(|raw| self.scripted_inode(raw))
+                                .collect(),
+                        ),
+                    )
+                }
+                GlobalRequest::TouchFile(raw) if self.answers_touch_file => {
+                    self.touched.lock().unwrap().push(raw);
+                    (None, GlobalResponse::TouchFile(()))
+                }
+                request => panic!("fd registration must not send an RPC: {request:?}"),
+            }
         }
         fn config(&self) -> &Config {
             &self.config
@@ -8184,7 +10088,7 @@ mod inject_fstat_scratch {
 
     #[reverie::tool]
     impl Guest<Detcore> for ScriptedGuest {
-        type Memory = LocalMemory;
+        type Memory = ScriptedMemory;
         type Stack = ScriptedStack;
 
         fn tid(&self) -> Pid {
@@ -8197,7 +10101,12 @@ mod inject_fstat_scratch {
             None
         }
         fn memory(&self) -> Self::Memory {
-            LocalMemory::new()
+            ScriptedMemory {
+                write_error: self.write_error,
+                scratch: self.scratch,
+                guard_live: self.guard_live.clone(),
+                unguarded_scratch_writes: self.unguarded_scratch_writes.clone(),
+            }
         }
         fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
             &mut self.thread
@@ -8209,10 +10118,23 @@ mod inject_fstat_scratch {
             panic!("fd registration must not read registers")
         }
         async fn stack(&mut self) -> Self::Stack {
+            let (arena, arena_len, sized) = match self.scratch {
+                Some((address, len)) => (address, len, true),
+                None => (
+                    self.arena.as_mut_ptr() as usize,
+                    ARENA_WORDS * std::mem::size_of::<u64>(),
+                    false,
+                ),
+            };
             ScriptedStack {
-                writable: self.stack_writable,
-                arena: self.arena.as_mut_ptr() as usize,
+                commit_error: self.commit_error,
+                commit_writes: self.commit_writes,
+                arena,
+                arena_len,
+                reserved: 0,
+                sized,
                 guard_live: self.guard_live.clone(),
+                commits: self.commits.clone(),
             }
         }
         async fn daemonize(&mut self) {
@@ -8224,6 +10146,26 @@ mod inject_fstat_scratch {
             // SAFETY: each arm runs the syscall Detcore asked for against this
             // process, on addresses Detcore obtained from this guest.
             let raw = match Syscall::from_raw(number, args) {
+                // A guest's file mapping, forwarded by `handle_mmap`.
+                Syscall::Mmap(call) if call.fd() >= 0 => {
+                    let address = unsafe {
+                        libc::mmap(
+                            call.addr()
+                                .map_or(std::ptr::null_mut(), |addr| addr.as_raw() as *mut _),
+                            call.len(),
+                            call.prot().bits(),
+                            call.flags().bits(),
+                            call.fd(),
+                            call.offset(),
+                        )
+                    };
+                    if address == libc::MAP_FAILED {
+                        -1
+                    } else {
+                        self.file_mapped.push((address as usize, call.len()));
+                        address as i64
+                    }
+                }
                 Syscall::Mmap(call) => {
                     assert!(call.addr().is_none(), "the kernel must choose the address");
                     assert_eq!(call.prot(), ProtFlags::PROT_READ | ProtFlags::PROT_WRITE);
@@ -8256,7 +10198,164 @@ mod inject_fstat_scratch {
                     self.fstat_buffers.push(buffer);
                     self.fstat_guard_live
                         .push(self.guard_live.load(Ordering::SeqCst));
-                    i64::from(unsafe { libc::fstat(call.fd(), buffer as *mut libc::stat) })
+                    match self.fstat_answers.iter().find(|(fd, _)| *fd == call.fd()) {
+                        Some(&(_, answer)) => {
+                            unsafe { std::ptr::write_unaligned(buffer as *mut libc::stat, answer) };
+                            0
+                        }
+                        None => {
+                            i64::from(unsafe { libc::fstat(call.fd(), buffer as *mut libc::stat) })
+                        }
+                    }
+                }
+                Syscall::Newfstatat(call) => {
+                    assert_eq!(call.dirfd(), libc::AT_FDCWD);
+                    assert_eq!(call.flags(), AtFlags::empty());
+                    let path = call.path().expect("fstatat without a path");
+                    let buffer = call.stat().expect("fstatat without a buffer").0.as_raw();
+                    self.fstatat_paths.push(
+                        path.read(&LocalMemory::new())
+                            .expect("fstatat names a path it cannot read")
+                            .into_os_string()
+                            .into_vec(),
+                    );
+                    self.fstatat_buffers.push(buffer);
+                    self.fstatat_guard_live
+                        .push(self.guard_live.load(Ordering::SeqCst));
+                    if let Some(errno) = self.fstatat_error {
+                        return Err(errno);
+                    }
+                    unsafe {
+                        libc::syscall(
+                            libc::SYS_newfstatat,
+                            libc::AT_FDCWD,
+                            Some(path).into_raw(),
+                            buffer,
+                            0,
+                        )
+                    }
+                }
+                Syscall::Statx(call) => {
+                    assert_eq!(call.dirfd(), libc::AT_FDCWD);
+                    assert_eq!(call.flags(), AtFlags::empty());
+                    let path = call.path().expect("statx without a path");
+                    let buffer = call.statx().expect("statx without a buffer").0.as_raw();
+                    self.statx_paths.push(
+                        path.read(&LocalMemory::new())
+                            .expect("statx names a path it cannot read")
+                            .into_os_string()
+                            .into_vec(),
+                    );
+                    // The raw mask: `call.mask()` drops bits the pinned
+                    // Reverie does not name, such as STATX_MNT_ID_UNIQUE.
+                    let mut mask = args.arg3 as u32;
+                    if self.statx_without_unique_mount_id {
+                        mask &= !STATX_MNT_ID_UNIQUE;
+                    }
+                    unsafe {
+                        libc::syscall(
+                            libc::SYS_statx,
+                            libc::AT_FDCWD,
+                            Some(path).into_raw(),
+                            0,
+                            mask,
+                            buffer,
+                        )
+                    }
+                }
+                Syscall::Other(Sysno::statmount, args) => {
+                    // SAFETY: Detcore staged the request in a page it mapped.
+                    let request = unsafe {
+                        std::slice::from_raw_parts(args.arg0 as *const u8, MNT_ID_REQ_SIZE_VER0)
+                    };
+                    let word = |offset: usize| {
+                        u32::from_ne_bytes(request[offset..offset + 4].try_into().unwrap())
+                    };
+                    let dword = |offset: usize| {
+                        u64::from_ne_bytes(request[offset..offset + 8].try_into().unwrap())
+                    };
+                    assert_eq!(word(0) as usize, MNT_ID_REQ_SIZE_VER0, "mnt_id_req.size");
+                    assert_eq!(word(4), 0, "mnt_id_req.spare");
+                    assert_eq!(dword(16), STATMOUNT_SB_BASIC, "mnt_id_req.param");
+                    assert_eq!(args.arg2, STATMOUNT_BUFFER, "statmount bufsize");
+                    assert_eq!(args.arg3, 0, "statmount flags");
+                    let mount_id = dword(8);
+                    self.statmount_mounts.push(mount_id);
+                    if let Some(errno) = self.statmount_error {
+                        return Err(errno);
+                    }
+                    match SCRIPTED_SUPERBLOCKS.with(|scripted| scripted.borrow().clone()) {
+                        Some(superblocks) => {
+                            let Some(&(_, device)) =
+                                superblocks.iter().find(|(id, _)| *id == mount_id)
+                            else {
+                                return Err(Errno::ENOENT);
+                            };
+                            let mut answer = [0u8; STATMOUNT_BUFFER];
+                            answer[..4].copy_from_slice(&(STATMOUNT_BUFFER as u32).to_ne_bytes());
+                            if !self.statmount_omits_superblock {
+                                answer[STATMOUNT_MASK_OFFSET..STATMOUNT_MASK_OFFSET + 8]
+                                    .copy_from_slice(&STATMOUNT_SB_BASIC.to_ne_bytes());
+                                answer[STATMOUNT_SB_DEV_MAJOR_OFFSET
+                                    ..STATMOUNT_SB_DEV_MAJOR_OFFSET + 4]
+                                    .copy_from_slice(&libc::major(device).to_ne_bytes());
+                                answer[STATMOUNT_SB_DEV_MINOR_OFFSET
+                                    ..STATMOUNT_SB_DEV_MINOR_OFFSET + 4]
+                                    .copy_from_slice(&libc::minor(device).to_ne_bytes());
+                            }
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    answer.as_ptr(),
+                                    args.arg1 as *mut u8,
+                                    answer.len(),
+                                )
+                            };
+                            0
+                        }
+                        None => unsafe {
+                            libc::syscall(
+                                Sysno::statmount as libc::c_long,
+                                args.arg0,
+                                args.arg1,
+                                args.arg2,
+                                args.arg3,
+                            )
+                        },
+                    }
+                }
+                Syscall::Readlinkat(call) => {
+                    assert_eq!(call.dirfd(), libc::AT_FDCWD);
+                    let path = call.path().expect("readlinkat without a path");
+                    let buffer = call.buf().expect("readlinkat without a buffer").as_raw();
+                    let link = path
+                        .read(&LocalMemory::new())
+                        .expect("readlinkat names a path it cannot read")
+                        .into_os_string()
+                        .into_vec();
+                    let scripted = self
+                        .readlink_answers
+                        .iter()
+                        .find(|(scripted, _)| *scripted == link)
+                        .map(|(_, text)| text.clone());
+                    self.readlink_paths.push(link);
+                    match scripted {
+                        Some(text) => {
+                            let len = text.len().min(call.buf_len());
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(text.as_ptr(), buffer as *mut u8, len)
+                            };
+                            i64::try_from(len).unwrap()
+                        }
+                        None => unsafe {
+                            libc::syscall(
+                                libc::SYS_readlinkat,
+                                libc::AT_FDCWD,
+                                Some(path).into_raw(),
+                                buffer,
+                                call.buf_len(),
+                            )
+                        },
+                    }
                 }
                 Syscall::Munmap(call) => {
                     let address = call.addr().expect("munmap without an address").as_raw();
@@ -8270,6 +10369,27 @@ mod inject_fstat_scratch {
                     self.closed.push(call.fd());
                     i64::from(unsafe { libc::close(call.fd()) })
                 }
+                // A write a handler forwards, run as it is: the test process
+                // stands in for the guest and owns its buffers.
+                Syscall::Write(_)
+                | Syscall::Pwrite64(_)
+                | Syscall::Writev(_)
+                | Syscall::Pwritev(_)
+                | Syscall::Pwritev2(_)
+                | Syscall::Sendfile(_) => unsafe {
+                    libc::syscall(
+                        number as libc::c_long,
+                        args.arg0,
+                        args.arg1,
+                        args.arg2,
+                        args.arg3,
+                        args.arg4,
+                        args.arg5,
+                    )
+                },
+                // The test process stands in for the guest's thread.
+                Syscall::Getpid(_) => i64::from(unsafe { libc::getpid() }),
+                Syscall::Gettid(_) => unsafe { libc::syscall(libc::SYS_gettid) },
                 other => panic!("unexpected injected syscall {other:?}"),
             };
             Errno::result(raw)
@@ -8285,6 +10405,9 @@ mod inject_fstat_scratch {
         }
         fn read_clock(&mut self) -> Result<u64, Error> {
             panic!("fd registration must not read a clock")
+        }
+        fn detlog_memory_regions(&self) -> Option<Vec<reverie::DetlogMemoryRegion>> {
+            self.detlog_regions.clone()
         }
     }
 
@@ -8332,12 +10455,203 @@ mod inject_fstat_scratch {
             [guest.arena.as_ptr() as usize],
             "fstat must write into the stack scratch"
         );
-        let used_words = std::mem::size_of::<libc::stat>().div_ceil(8);
         assert!(
-            guest.arena[..used_words].iter().all(|word| *word == 0),
-            "the stat must not be left in the guest's stack scratch"
+            guest.arena.iter().all(|word| *word == u64::MAX),
+            "the guest's bytes under the stat buffer must be put back, and the \
+             stat must not be left in the guest's stack scratch"
         );
         assert_eq!(recorded_inode(&guest, fd), Some(inode));
+    }
+
+    /// `inject_fstat`'s result, printable without `libc::stat: Debug`.
+    fn fstat_outcome(result: &Result<libc::stat, Errno>) -> String {
+        match result {
+            Ok(stat) => format!("Ok(stat of inode {})", stat.st_ino),
+            Err(errno) => format!("Err({errno:?})"),
+        }
+    }
+
+    #[tokio::test]
+    async fn inject_fstat_restores_the_guest_bytes_under_its_buffer() {
+        let (fd, inode) = open_file();
+        // A commit that writes zeros over the scratch, as on ptrace, and one
+        // that writes nothing, as on the arena backends.
+        for commit_writes in [true, false] {
+            let scratch = Pages::sentinel(1, 1, 1);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.commit_writes = commit_writes;
+
+            let result = tool.inject_fstat(&mut guest, fd).await;
+
+            let stat = result.unwrap_or_else(|errno| panic!("inject_fstat failed: {errno}"));
+            assert_eq!(stat.st_ino, inode);
+            assert_eq!(guest.injected, [Sysno::fstat]);
+            assert_eq!(
+                guest.fstat_buffers,
+                [scratch.address],
+                "fstat must write into the stack scratch"
+            );
+            assert_eq!(
+                guest.fstat_guard_live,
+                [true],
+                "the stack guard must outlive the injected fstat"
+            );
+            assert_eq!(
+                guest.unguarded_scratch_writes(),
+                0,
+                "the buffer must be written back before the stack guard drops"
+            );
+            assert!(
+                scratch.holds_sentinel(0, scratch.len),
+                "the guest's bytes under the fstat buffer must be put back \
+                 (commit_writes: {commit_writes})"
+            );
+        }
+        assert_eq!(unsafe { libc::close(fd) }, 0);
+    }
+
+    #[tokio::test]
+    async fn inject_fstat_restores_its_scratch_when_the_fstat_fails() {
+        // A descriptor number far above any open one: the guest's fstat
+        // fails with EBADF, which is the guest's answer.
+        let closed: RawFd = 1 << 20;
+        let scratch = Pages::sentinel(1, 1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        guest.commit_writes = true;
+
+        let result = tool.inject_fstat(&mut guest, closed).await;
+
+        assert!(
+            matches!(result, Err(Errno::EBADF)),
+            "a failed fstat is the guest's answer: {}",
+            fstat_outcome(&result)
+        );
+        assert_eq!(
+            guest.injected,
+            [Sysno::fstat],
+            "a failed fstat is not a reason to retry"
+        );
+        assert_eq!(guest.fstat_guard_live, [true]);
+        assert_eq!(guest.unguarded_scratch_writes(), 0);
+        assert!(
+            scratch.holds_sentinel(0, scratch.len),
+            "the guest's bytes must be put back after a failed fstat"
+        );
+    }
+
+    #[tokio::test]
+    async fn inject_fstat_restores_what_a_failed_commit_wrote() {
+        // As on ptrace, the commit writes the whole scratch in one write from
+        // its start: here its first 64 bytes, on a writable page, before it
+        // faults on the read-only page after them.
+        let (fd, inode) = open_file();
+        let written = 64;
+        let scratch = Pages::sentinel(2, 1, 2);
+        let start = page_size() - written;
+        let (tool, mut guest) =
+            ScriptedGuest::with_scratch(scratch.address + start, scratch.len - start, None);
+        guest.commit_writes = true;
+
+        let result = tool.inject_fstat(&mut guest, fd).await;
+
+        let stat = result.unwrap_or_else(|errno| {
+            panic!("a scratch the guest cannot hold must not fail the caller: {errno}")
+        });
+        assert_eq!(stat.st_ino, inode);
+        assert_eq!(guest.commits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap, Sysno::fstat, Sysno::munmap],
+            "no fstat may be injected into a scratch whose commit failed"
+        );
+        let [(page, _)] = guest.mapped[..] else {
+            panic!("expected one transient page, got {:?}", guest.mapped);
+        };
+        assert_eq!(guest.fstat_buffers, [page]);
+        assert!(
+            scratch.holds_sentinel(0, scratch.len),
+            "the bytes the failed commit wrote must be put back"
+        );
+        assert_eq!(unsafe { libc::close(fd) }, 0);
+    }
+
+    #[tokio::test]
+    async fn inject_fstat_does_not_use_a_scratch_it_cannot_save() {
+        // The buffer starts 64 bytes before the end of a writable page, and
+        // the page after it cannot be accessed, so the guest's bytes under the
+        // buffer cannot be read and could not be put back.
+        let (fd, inode) = open_file();
+        let readable = 64;
+        let scratch = Pages::sentinel(2, 1, 1);
+        let start = page_size() - readable;
+        let (tool, mut guest) =
+            ScriptedGuest::with_scratch(scratch.address + start, scratch.len - start, None);
+        guest.commit_writes = true;
+
+        let result = tool.inject_fstat(&mut guest, fd).await;
+
+        let stat = result.unwrap_or_else(|errno| {
+            panic!("a scratch that cannot be saved must not fail the caller: {errno}")
+        });
+        assert_eq!(stat.st_ino, inode);
+        assert_eq!(
+            guest.commits.load(Ordering::SeqCst),
+            0,
+            "a scratch whose bytes cannot be saved must not be committed"
+        );
+        assert_eq!(guest.injected, [Sysno::mmap, Sysno::fstat, Sysno::munmap]);
+        assert!(
+            scratch.holds_sentinel(start, readable),
+            "no byte of a scratch that cannot be saved may be written"
+        );
+        assert_eq!(unsafe { libc::close(fd) }, 0);
+    }
+
+    #[tokio::test]
+    async fn inject_fstat_retries_in_a_transient_page_when_the_kernel_cannot_write_its_buffer() {
+        // The scratch can be read, so its bytes can be saved, and the commit
+        // writes nothing, as on the arena backends; but no byte of it can be
+        // written, so the kernel's fstat faults.
+        let (fd, inode) = open_file();
+        let scratch = Pages::sentinel(1, 0, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+
+        let result = tool.inject_fstat(&mut guest, fd).await;
+
+        let stat = result.unwrap_or_else(|errno| {
+            panic!("a buffer the kernel cannot write must not fail the caller: {errno}")
+        });
+        assert_eq!(stat.st_ino, inode);
+        assert_eq!(
+            guest.injected,
+            [Sysno::fstat, Sysno::mmap, Sysno::fstat, Sysno::munmap]
+        );
+        assert_eq!(
+            guest.fstat_guard_live,
+            [true, false],
+            "the stack guard must outlive the first fstat and be gone by the retry"
+        );
+        assert!(scratch.holds_sentinel(0, scratch.len));
+        assert_eq!(unsafe { libc::close(fd) }, 0);
+    }
+
+    #[tokio::test]
+    async fn inject_fstat_propagates_a_commit_error_other_than_efault() {
+        let (fd, _) = open_file();
+        let scratch = Pages::sentinel(1, 1, 1);
+        let (tool, mut guest) =
+            ScriptedGuest::with_scratch(scratch.address, scratch.len, Some(Errno::ESRCH));
+
+        let result = tool.inject_fstat(&mut guest, fd).await;
+
+        assert!(
+            matches!(result, Err(Errno::ESRCH)),
+            "only EFAULT sends the fstat to a transient page: {}",
+            fstat_outcome(&result)
+        );
+        assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
+        assert!(scratch.holds_sentinel(0, scratch.len));
+        assert_eq!(unsafe { libc::close(fd) }, 0);
     }
 
     #[tokio::test]
@@ -8396,6 +10710,2549 @@ mod inject_fstat_scratch {
             guest.thread.with_detfd(fd, |_| ()),
             Err(Errno::EBADF),
             "a descriptor that failed registration must not be modeled"
+        );
+    }
+
+    fn page_size() -> usize {
+        usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap()
+    }
+
+    /// Fresh zero-filled pages of this process, of which only the first
+    /// `writable` can be accessed; unmapped on drop.
+    pub(crate) struct Pages {
+        pub(crate) address: usize,
+        pub(crate) len: usize,
+    }
+
+    impl Pages {
+        pub(crate) fn map(count: usize, writable: usize) -> Self {
+            let len = count * page_size();
+            let address = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(address, libc::MAP_FAILED, "scratch mmap");
+            if writable > 0 {
+                assert_eq!(
+                    unsafe {
+                        libc::mprotect(
+                            address,
+                            writable * page_size(),
+                            libc::PROT_READ | libc::PROT_WRITE,
+                        )
+                    },
+                    0,
+                    "mprotect of the writable scratch pages"
+                );
+            }
+            Self {
+                address: address as usize,
+                len,
+            }
+        }
+
+        /// `count` fresh pages filled with `SENTINEL`, like guest stack memory
+        /// that holds live data: the first `writable` can be read and
+        /// written, the pages after them up to `readable` can only be read,
+        /// and the rest cannot be accessed.
+        pub(crate) fn sentinel(count: usize, writable: usize, readable: usize) -> Self {
+            assert!(writable <= readable && readable <= count);
+            let pages = Self::map(count, count);
+            // SAFETY: the `len` bytes at `address` were just mapped writable.
+            unsafe { std::ptr::write_bytes(pages.address as *mut u8, SENTINEL, pages.len) };
+            for (first, end, prot) in [
+                (writable, readable, libc::PROT_READ),
+                (readable, count, libc::PROT_NONE),
+            ] {
+                if end > first {
+                    assert_eq!(
+                        unsafe {
+                            libc::mprotect(
+                                (pages.address + first * page_size()) as *mut libc::c_void,
+                                (end - first) * page_size(),
+                                prot,
+                            )
+                        },
+                        0,
+                        "mprotect of the sentinel pages"
+                    );
+                }
+            }
+            pages
+        }
+
+        /// Whether the `len` bytes at `offset`, which must be readable, all
+        /// still hold `SENTINEL`.
+        fn holds_sentinel(&self, offset: usize, len: usize) -> bool {
+            assert!(offset + len <= self.len);
+            unsafe { std::slice::from_raw_parts((self.address + offset) as *const u8, len) }
+                .iter()
+                .all(|byte| *byte == SENTINEL)
+        }
+    }
+
+    /// What `Pages::sentinel` fills its pages with: a stand-in for live data
+    /// the guest keeps below its red zone, which no step of a stat may
+    /// leave changed.
+    const SENTINEL: u8 = 0xa5;
+
+    impl Drop for Pages {
+        fn drop(&mut self) {
+            assert_eq!(
+                unsafe { libc::munmap(self.address as *mut libc::c_void, self.len) },
+                0
+            );
+        }
+    }
+
+    /// `stat_guest_path`'s result, printable without `libc::stat: Debug`.
+    fn outcome(result: &Result<Option<libc::stat>, Error>) -> String {
+        match result {
+            Ok(Some(stat)) => format!("Ok(Some(stat of inode {}))", stat.st_ino),
+            Ok(None) => "Ok(None)".to_owned(),
+            Err(error) => format!("Err({error:?})"),
+        }
+    }
+
+    /// `(device, inode)` of `path` as this process's `stat` reports it.
+    fn identity_of(path: &[u8]) -> (u64, u64) {
+        let metadata = std::fs::metadata(std::ffi::OsStr::from_bytes(path)).unwrap();
+        (metadata.dev(), metadata.ino())
+    }
+
+    /// The one transient page `stat_guest_path` mapped for a path of
+    /// `path_len` bytes, after checking that it was the whole pages that hold
+    /// the NUL-terminated path and an 8-aligned `struct stat`, and that it was
+    /// unmapped whole.
+    fn sole_transient_page(guest: &ScriptedGuest, path_len: usize) -> usize {
+        let [(page, len)] = guest.mapped[..] else {
+            panic!(
+                "expected exactly one transient page, got {:?}",
+                guest.mapped
+            );
+        };
+        let needed = (path_len + 1).next_multiple_of(8) + std::mem::size_of::<libc::stat>();
+        assert_eq!(
+            len,
+            needed.div_ceil(page_size()) * page_size(),
+            "the transient mapping must be the whole pages that hold {needed} bytes"
+        );
+        assert_eq!(
+            guest.unmapped,
+            [(page, len)],
+            "the transient page must be unmapped, whole"
+        );
+        page
+    }
+
+    /// Offset of the `struct stat` in the transient page, after the
+    /// NUL-terminated path.
+    fn transient_stat_offset(path_len: usize) -> usize {
+        (path_len + 1).next_multiple_of(8)
+    }
+
+    #[tokio::test]
+    async fn stat_guest_path_stats_the_path_in_its_scratch_and_restores_it() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().as_os_str().as_bytes();
+        let metadata = file.as_file().metadata().unwrap();
+        // A commit that writes zeros over the scratch, as on ptrace, and one
+        // that writes nothing over the guest's bytes, so the path's NUL must
+        // be staged with it.
+        for commit_writes in [true, false] {
+            let scratch = Pages::sentinel(1, 1, 1);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.commit_writes = commit_writes;
+
+            let result = tool.stat_guest_path(&mut guest, path).await;
+
+            let stat = result
+                .expect("stat_guest_path failed")
+                .expect("the guest's stat must be the answer");
+            assert_eq!((stat.st_dev, stat.st_ino), (metadata.dev(), metadata.ino()));
+            assert_eq!(guest.injected, [Sysno::newfstatat]);
+            assert_eq!(
+                guest.fstatat_paths,
+                [path.to_vec()],
+                "fstatat must name the whole path, NUL-terminated (commit_writes: \
+                 {commit_writes})"
+            );
+            assert_eq!(
+                guest.fstatat_guard_live,
+                [true],
+                "the stack guard must outlive the injected fstatat: backends whose \
+                 scratch is an arena free it when the guard drops"
+            );
+            assert_eq!(
+                guest.unguarded_scratch_writes(),
+                0,
+                "both buffers must be written back before the stack guard drops"
+            );
+            assert!(
+                guest.mapped.is_empty(),
+                "a stack scratch that works needs no transient page: {:?}",
+                guest.mapped
+            );
+            assert!(
+                scratch.holds_sentinel(0, scratch.len),
+                "the guest's bytes under the path and the stat must be put back \
+                 (commit_writes: {commit_writes})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stat_guest_path_restores_its_scratch_when_the_guests_stat_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let absent = directory.path().join("absent");
+        let path = absent.as_os_str().as_bytes();
+        let scratch = Pages::sentinel(1, 1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        guest.commit_writes = true;
+
+        let result = tool.stat_guest_path(&mut guest, path).await;
+
+        assert!(
+            matches!(result, Ok(None)),
+            "a path the guest cannot stat has no answer: {}",
+            outcome(&result)
+        );
+        assert_eq!(
+            guest.injected,
+            [Sysno::newfstatat],
+            "a failed stat is the guest's answer, not a reason to retry"
+        );
+        assert_eq!(guest.fstatat_paths, [path.to_vec()]);
+        assert_eq!(guest.fstatat_guard_live, [true]);
+        assert_eq!(guest.unguarded_scratch_writes(), 0);
+        assert!(
+            scratch.holds_sentinel(0, scratch.len),
+            "the guest's bytes must be put back after a failed stat"
+        );
+    }
+
+    #[tokio::test]
+    async fn stat_guest_path_refuses_a_path_containing_nul() {
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+
+        let result = tool.stat_guest_path(&mut guest, b"/\0/").await;
+
+        assert!(
+            matches!(result, Ok(None)),
+            "a path with a NUL in it names no file: {}",
+            outcome(&result)
+        );
+        assert_eq!(guest.commits.load(Ordering::SeqCst), 0);
+        assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
+    }
+
+    #[tokio::test]
+    async fn stat_guest_path_uses_a_transient_page_when_its_scratch_is_too_small() {
+        // One byte short of the path buffer and the stat buffer.
+        let needed = 512 + std::mem::size_of::<libc::stat>();
+        let scratch = Pages::sentinel(1, 1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, needed - 1, None);
+
+        let result = tool.stat_guest_path(&mut guest, b"/").await;
+
+        let stat = result
+            .expect("a scratch too small for the stat must not fail the caller")
+            .expect("the transient page must give the guest's answer");
+        assert_eq!((stat.st_dev, stat.st_ino), identity_of(b"/"));
+        assert_eq!(
+            guest.commits.load(Ordering::SeqCst),
+            0,
+            "a scratch without room must not be committed"
+        );
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap, Sysno::newfstatat, Sysno::munmap]
+        );
+        let page = sole_transient_page(&guest, 1);
+        assert_eq!(guest.fstatat_paths, [b"/".to_vec()]);
+        assert_eq!(guest.fstatat_buffers, [page + transient_stat_offset(1)]);
+        assert!(
+            scratch.holds_sentinel(0, scratch.len),
+            "the stack scratch was used"
+        );
+    }
+
+    #[tokio::test]
+    async fn stat_guest_path_uses_a_transient_page_when_its_scratch_cannot_be_committed() {
+        let scratch = Pages::sentinel(1, 1, 1);
+        let (tool, mut guest) =
+            ScriptedGuest::with_scratch(scratch.address, scratch.len, Some(Errno::EFAULT));
+
+        let result = tool.stat_guest_path(&mut guest, b"/").await;
+
+        let stat = result
+            .expect("a scratch the guest cannot hold must not fail the caller")
+            .expect("the transient page must give the guest's answer");
+        assert_eq!((stat.st_dev, stat.st_ino), identity_of(b"/"));
+        assert_eq!(
+            guest.commits.load(Ordering::SeqCst),
+            1,
+            "the fallback must come from the commit, not from the capacity check"
+        );
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap, Sysno::newfstatat, Sysno::munmap]
+        );
+        let page = sole_transient_page(&guest, 1);
+        assert_eq!(guest.fstatat_paths, [b"/".to_vec()]);
+        assert_eq!(
+            guest.fstatat_buffers,
+            [page + transient_stat_offset(1)],
+            "the stat must be written into the transient page"
+        );
+        assert_eq!(guest.fstatat_guard_live, [false]);
+        assert!(
+            scratch.holds_sentinel(0, scratch.len),
+            "nothing may be left changed in the stack scratch"
+        );
+    }
+
+    #[tokio::test]
+    async fn stat_guest_path_restores_what_a_failed_commit_wrote() {
+        // As on ptrace, the commit writes the whole scratch in one write from
+        // its start: here its first 256 bytes, on a writable page, before it
+        // faults on the read-only page after them.
+        let written = 256;
+        let scratch = Pages::sentinel(2, 1, 2);
+        let start = page_size() - written;
+        let (tool, mut guest) =
+            ScriptedGuest::with_scratch(scratch.address + start, scratch.len - start, None);
+        guest.commit_writes = true;
+
+        let result = tool.stat_guest_path(&mut guest, b"/").await;
+
+        let stat = result
+            .expect("a scratch the guest cannot hold must not fail the caller")
+            .expect("the transient page must give the guest's answer");
+        assert_eq!((stat.st_dev, stat.st_ino), identity_of(b"/"));
+        assert_eq!(guest.commits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap, Sysno::newfstatat, Sysno::munmap],
+            "no stat may be injected into a scratch whose commit failed"
+        );
+        let page = sole_transient_page(&guest, 1);
+        assert_eq!(guest.fstatat_buffers, [page + transient_stat_offset(1)]);
+        assert!(
+            scratch.holds_sentinel(0, scratch.len),
+            "the bytes the failed commit wrote must be put back"
+        );
+    }
+
+    #[tokio::test]
+    async fn stat_guest_path_does_not_use_a_scratch_it_cannot_save() {
+        // The path buffer fills the last 512 bytes of a writable page and the
+        // stat buffer starts the inaccessible page after it, whose bytes
+        // cannot be read and so could not be put back.
+        let path_capacity = 512;
+        let scratch = Pages::sentinel(2, 1, 1);
+        let path_buffer = page_size() - path_capacity;
+        let (tool, mut guest) = ScriptedGuest::with_scratch(
+            scratch.address + path_buffer,
+            scratch.len - path_buffer,
+            None,
+        );
+        guest.commit_writes = true;
+
+        let result = tool.stat_guest_path(&mut guest, b"/").await;
+
+        let stat = result
+            .expect("a scratch that cannot be saved must not fail the caller")
+            .expect("the transient page must give the guest's answer");
+        assert_eq!((stat.st_dev, stat.st_ino), identity_of(b"/"));
+        assert_eq!(
+            guest.commits.load(Ordering::SeqCst),
+            0,
+            "a scratch whose bytes cannot be saved must not be committed"
+        );
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap, Sysno::newfstatat, Sysno::munmap]
+        );
+        let page = sole_transient_page(&guest, 1);
+        assert_eq!(guest.fstatat_buffers, [page + transient_stat_offset(1)]);
+        assert!(
+            scratch.holds_sentinel(path_buffer, path_capacity),
+            "no byte of a scratch that cannot be saved may be written"
+        );
+    }
+
+    #[tokio::test]
+    async fn stat_guest_path_propagates_a_commit_error_other_than_efault() {
+        let scratch = Pages::sentinel(1, 1, 1);
+        let (tool, mut guest) =
+            ScriptedGuest::with_scratch(scratch.address, scratch.len, Some(Errno::ESRCH));
+
+        let result = tool.stat_guest_path(&mut guest, b"/").await;
+
+        assert!(
+            matches!(result, Err(Error::Errno(Errno::ESRCH))),
+            "only EFAULT sends the stat to a transient page: {}",
+            outcome(&result)
+        );
+        assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
+        assert!(scratch.holds_sentinel(0, scratch.len));
+    }
+
+    #[tokio::test]
+    async fn stat_guest_path_uses_a_transient_page_when_its_path_cannot_be_staged() {
+        // This scratch can be read, so its bytes can be saved, but no byte of
+        // it can be written.
+        let scratch = Pages::sentinel(1, 0, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+
+        let result = tool.stat_guest_path(&mut guest, b"/").await;
+
+        let stat = result
+            .expect("a path the scratch cannot hold must not fail the caller")
+            .expect("the transient page must give the guest's answer");
+        assert_eq!((stat.st_dev, stat.st_ino), identity_of(b"/"));
+        assert_eq!(guest.commits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap, Sysno::newfstatat, Sysno::munmap],
+            "no stat may be injected into the stack scratch without its path"
+        );
+        let page = sole_transient_page(&guest, 1);
+        assert_eq!(guest.fstatat_buffers, [page + transient_stat_offset(1)]);
+        assert!(scratch.holds_sentinel(0, scratch.len));
+    }
+
+    #[tokio::test]
+    async fn stat_guest_path_restores_a_partly_staged_path_before_using_a_transient_page() {
+        // The path buffer starts four bytes before the end of a writable page
+        // and the page after it can only be read, so staging a five-byte path
+        // writes four bytes and then faults.
+        let path = b"/////";
+        let staged = 4;
+        let scratch = Pages::sentinel(2, 1, 2);
+        let path_buffer = page_size() - staged;
+        let (tool, mut guest) = ScriptedGuest::with_scratch(
+            scratch.address + path_buffer,
+            scratch.len - path_buffer,
+            None,
+        );
+
+        let result = tool.stat_guest_path(&mut guest, path).await;
+
+        let stat = result
+            .expect("a path the scratch cannot hold must not fail the caller")
+            .expect("the transient page must give the guest's answer");
+        assert_eq!((stat.st_dev, stat.st_ino), identity_of(b"/"));
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap, Sysno::newfstatat, Sysno::munmap]
+        );
+        let page = sole_transient_page(&guest, path.len());
+        assert_eq!(guest.fstatat_paths, [path.to_vec()]);
+        assert_eq!(
+            guest.fstatat_buffers,
+            [page + transient_stat_offset(path.len())]
+        );
+        assert!(
+            scratch.holds_sentinel(0, scratch.len),
+            "the guest's bytes under the staged prefix of the path must be put back"
+        );
+    }
+
+    #[tokio::test]
+    async fn stat_guest_path_retries_in_a_transient_page_when_its_stat_buffer_faults() {
+        // The path buffer fills the last 512 bytes of a writable page and the
+        // stat buffer starts the page after it, which can only be read.
+        let path_capacity = 512;
+        let scratch = Pages::sentinel(2, 1, 2);
+        let path_buffer = page_size() - path_capacity;
+        let (tool, mut guest) = ScriptedGuest::with_scratch(
+            scratch.address + path_buffer,
+            scratch.len - path_buffer,
+            None,
+        );
+
+        let result = tool.stat_guest_path(&mut guest, b"/").await;
+
+        let stat = result
+            .expect("a stat buffer the scratch cannot hold must not fail the caller")
+            .expect("the transient page must give the guest's answer");
+        assert_eq!((stat.st_dev, stat.st_ino), identity_of(b"/"));
+        assert_eq!(
+            guest.injected,
+            [
+                Sysno::newfstatat,
+                Sysno::mmap,
+                Sysno::newfstatat,
+                Sysno::munmap
+            ]
+        );
+        let page = sole_transient_page(&guest, 1);
+        assert_eq!(
+            guest.fstatat_buffers,
+            [
+                scratch.address + page_size(),
+                page + transient_stat_offset(1)
+            ],
+            "this test needs the first stat buffer at the start of the read-only \
+             page, and the retry in the transient page"
+        );
+        assert_eq!(
+            guest.fstatat_guard_live,
+            [true, false],
+            "the stack guard must outlive the first fstatat and be gone by the retry"
+        );
+        assert!(
+            scratch.holds_sentinel(0, scratch.len),
+            "the guest's bytes under the staged path must be put back"
+        );
+    }
+
+    #[tokio::test]
+    async fn stat_guest_path_stages_a_long_path_in_a_transient_page() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let name = file.path().as_os_str().as_bytes();
+        let expected = identity_of(name);
+        // 600 bytes needs one page; 4000 bytes needs two.
+        for len in [600, 4000] {
+            // Extra leading slashes resolve to the same file.
+            let mut path = vec![b'/'; len - name.len()];
+            path.extend_from_slice(name);
+            assert_eq!(path.len(), len);
+            let scratch = Pages::sentinel(1, 1, 1);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+
+            let result = tool.stat_guest_path(&mut guest, &path).await;
+
+            let stat = result
+                .expect("stat_guest_path failed")
+                .unwrap_or_else(|| panic!("a {len}-byte path must be resolved"));
+            assert_eq!((stat.st_dev, stat.st_ino), expected);
+            assert_eq!(
+                guest.commits.load(Ordering::SeqCst),
+                0,
+                "a {len}-byte path must not be staged in the stack scratch"
+            );
+            assert_eq!(
+                guest.injected,
+                [Sysno::mmap, Sysno::newfstatat, Sysno::munmap]
+            );
+            let page = sole_transient_page(&guest, len);
+            assert_eq!(
+                guest.fstatat_paths,
+                [path.clone()],
+                "fstatat must name the whole {len}-byte path, NUL-terminated"
+            );
+            assert_eq!(guest.fstatat_buffers, [page + transient_stat_offset(len)]);
+            assert!(
+                scratch.holds_sentinel(0, scratch.len),
+                "the stack scratch was used"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stat_guest_path_refuses_when_its_transient_page_cannot_be_mapped() {
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) =
+            ScriptedGuest::with_scratch(scratch.address, scratch.len, Some(Errno::EFAULT));
+        guest.mmap_fails = true;
+
+        let result = tool.stat_guest_path(&mut guest, b"/").await;
+
+        assert!(
+            refused_with(&result, Errno::ENOMEM),
+            "a page Detcore cannot map says nothing about the path, so it must be a tool \
+             error naming the errno, not `Ok(None)`: {}",
+            outcome(&result)
+        );
+        assert_eq!(guest.injected, [Sysno::mmap]);
+        assert!(guest.unmapped.is_empty(), "unmapped {:?}", guest.unmapped);
+    }
+
+    /// Whether `result` is the tool error `stat_guest_path` refuses with
+    /// when it could not ask, naming `errno`.
+    fn refused_with(result: &Result<Option<libc::stat>, Error>, errno: Errno) -> bool {
+        matches!(result, Err(Error::Tool(error)) if error.to_string().contains(&errno.to_string()))
+    }
+
+    // A stat the guest's filesystem answers with "no such file" (or one of
+    // the other answers about the path) is `None`; any other errno from the
+    // injected stat, such as `ENOMEM`, says nothing about the path and is an
+    // error, in the stack scratch and in the transient page alike.
+    #[tokio::test]
+    async fn stat_guest_path_refuses_when_the_guests_stat_cannot_be_asked() {
+        let long = [b"/".as_slice(), &[b'x'; 600]].concat();
+        for (path, scratch_works) in [(b"/".to_vec(), true), (long, false)] {
+            for (errno, answered) in [
+                (Errno::ENOENT, true),
+                (Errno::ENOTDIR, true),
+                (Errno::ELOOP, true),
+                (Errno::ENAMETOOLONG, true),
+                (Errno::EACCES, true),
+                (Errno::ENOMEM, false),
+                (Errno::EIO, false),
+                (Errno::EOVERFLOW, false),
+            ] {
+                let scratch = Pages::sentinel(1, 1, 1);
+                let (tool, mut guest) =
+                    ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+                guest.fstatat_error = Some(errno);
+
+                let result = tool.stat_guest_path(&mut guest, &path).await;
+
+                if answered {
+                    assert!(
+                        matches!(result, Ok(None)),
+                        "{errno} from the guest's stat is its answer about the path: {}",
+                        outcome(&result)
+                    );
+                } else {
+                    assert!(
+                        refused_with(&result, errno),
+                        "{errno} from the guest's stat is not an answer about the path, so \
+                         it must be a tool error naming it, never `Ok(None)`: {}",
+                        outcome(&result)
+                    );
+                }
+                assert_eq!(
+                    guest.fstatat_paths.len(),
+                    1,
+                    "one stat, in the {} (errno {errno})",
+                    if scratch_works {
+                        "stack scratch"
+                    } else {
+                        "transient page"
+                    }
+                );
+                assert!(scratch.holds_sentinel(0, scratch.len));
+                if !scratch_works {
+                    sole_transient_page(&guest, path.len());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stat_guest_path_propagates_a_write_error_other_than_efault() {
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        guest.write_error = Some(Errno::EIO);
+
+        let result = tool.stat_guest_path(&mut guest, b"/").await;
+
+        assert!(
+            refused_with(&result, Errno::EIO),
+            "only EFAULT sends the stat to a transient page; any other failure is a tool \
+             error naming the errno: {}",
+            outcome(&result)
+        );
+        assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
+    }
+
+    /// `(device, inode)` that `fstat` reports for `fd`.
+    fn fd_identity(fd: RawFd) -> RawInode {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0);
+        RawInode::new(stat.st_dev, stat.st_ino)
+    }
+
+    /// `handle_mmap` of a page of `fd`, returning the mapping's start once the
+    /// test has unmapped it.
+    async fn map_and_unmap(tool: &Detcore, guest: &mut ScriptedGuest, fd: RawFd) -> usize {
+        let len = page_size();
+        let result = tool
+            .handle_mmap(
+                guest,
+                syscalls::Mmap::new()
+                    .with_addr(None)
+                    .with_len(len)
+                    .with_prot(ProtFlags::PROT_READ)
+                    .with_flags(MapFlags::MAP_PRIVATE)
+                    .with_fd(fd)
+                    .with_offset(0),
+            )
+            .await;
+        let start = usize::try_from(result.expect("the file mmap must succeed")).unwrap();
+        assert_eq!(guest.file_mapped, [(start, len)]);
+        assert_eq!(unsafe { libc::munmap(start as *mut libc::c_void, len) }, 0);
+        start
+    }
+
+    /// A descriptor that the guest's table records as a dup of inherited
+    /// stdout -- `prog > file` -- whose cached stat is the tracer's `fstat(0)`
+    /// stand-in rather than the file's own.
+    fn stdio_backed_by_a_file(guest: &mut ScriptedGuest) -> (RawFd, RawInode) {
+        let (fd, _) = open_file();
+        guest
+            .thread
+            .dup_fd(libc::STDOUT_FILENO, fd, OFlag::empty())
+            .unwrap();
+        let identity = fd_identity(fd);
+        let cached = guest
+            .thread
+            .with_detfd(fd, |detfd| detfd.stat().map(|stat| stat.raw_inode()))
+            .unwrap();
+        assert_ne!(
+            cached,
+            Some(identity),
+            "precondition: the cached stdio stat must not already be the file's"
+        );
+        (fd, identity)
+    }
+
+    #[tokio::test]
+    async fn handle_mmap_records_a_stdio_descriptor_by_a_real_fstat() {
+        let (tool, mut guest) = ScriptedGuest::new(true, false);
+        let (fd, identity) = stdio_backed_by_a_file(&mut guest);
+
+        let start = map_and_unmap(&tool, &mut guest, fd).await;
+        close_unless_detcore_did(&guest, fd);
+
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap, Sysno::fstat],
+            "the identity must come from an fstat after the mapping succeeds"
+        );
+        assert_eq!(
+            guest.thread.mapped_file_at(start),
+            Some(identity),
+            "a stdio descriptor's mapping must be recorded with the file's own identity, \
+             not the cached fstat(0) stand-in"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_mmap_refuses_when_it_cannot_ask_a_stdio_identity() {
+        // No writable stack scratch and no transient page: the fstat has
+        // nowhere to put its buffer, so Detcore cannot ask the file's identity
+        // after the guest's mapping succeeded.
+        let (tool, mut guest) = ScriptedGuest::new(false, true);
+        let (fd, _) = stdio_backed_by_a_file(&mut guest);
+        let len = page_size();
+
+        let result = tool
+            .handle_mmap(
+                &mut guest,
+                syscalls::Mmap::new()
+                    .with_addr(None)
+                    .with_len(len)
+                    .with_prot(ProtFlags::PROT_READ)
+                    .with_flags(MapFlags::MAP_PRIVATE)
+                    .with_fd(fd)
+                    .with_offset(0),
+            )
+            .await;
+        close_unless_detcore_did(&guest, fd);
+
+        assert!(
+            matches!(result, Err(Error::Tool(_))),
+            "an identity Detcore could not ask must be a tool error, not a mapping \
+             recorded without it: {result:?}"
+        );
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap, Sysno::mmap, Sysno::munmap],
+            "the file mapping, the failed transient page for the fstat, then the undo \
+             of the file mapping"
+        );
+        let &[(start, mapped_len)] = guest.file_mapped.as_slice() else {
+            panic!("expected one file mapping, got {:?}", guest.file_mapped);
+        };
+        assert_eq!(
+            guest.unmapped,
+            [(start, mapped_len)],
+            "the refused mapping must not stay in the guest's address space"
+        );
+        assert_eq!(
+            guest.thread.mapped_file_at(start),
+            None,
+            "a refused mapping must leave nothing recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn getdents_device_lookup_refuses_what_it_could_not_ask() {
+        // A descriptor that is not open is the kernel's own answer, which the
+        // getdents would report too.
+        // (-1 rather than a closed number, which a parallel test could reuse.)
+        let (tool, mut guest) = ScriptedGuest::new(true, false);
+        let result: Result<u64, Error> = tool.directory_device(&mut guest, -1).await;
+        assert!(
+            matches!(result, Err(Error::Errno(Errno::EBADF))),
+            "a descriptor that is not open must be EBADF to the guest: {result:?}"
+        );
+
+        // An open descriptor Detcore does not track, with no writable stack
+        // scratch and no transient page: the fstat could not be asked, which
+        // is not an answer the guest's getdents may report as its own.
+        let (tool, mut guest) = ScriptedGuest::new(false, true);
+        let (fd, _) = open_file();
+        let result: Result<u64, Error> = tool.directory_device(&mut guest, fd).await;
+        close_unless_detcore_did(&guest, fd);
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap],
+            "only the failed transient page for the fstat"
+        );
+        assert!(
+            matches!(result, Err(Error::Tool(_))),
+            "a device lookup Detcore could not ask must be a tool error, not an errno \
+             for the guest's getdents: {result:?}"
+        );
+    }
+
+    // `prog > dir`: the dup's cached stat is the `fstat(0)` stand-in
+    // `setup_stdio` gives every inherited stdio descriptor, so a getdents
+    // through it keyed every entry on stdin's device, and the maps, fdinfo
+    // and `/proc/<pid>/fd` views matched stdin's file as stdout
+    // (https://github.com/rrnewton/hermit/issues/3307).
+    #[tokio::test]
+    async fn stdio_descriptor_identity_is_its_own_fstat_cached_on_its_description() {
+        let (tool, mut guest) = ScriptedGuest::new(true, false);
+        let (fd, identity) = stdio_backed_by_a_file(&mut guest);
+
+        let device: Result<u64, Error> = tool.directory_device(&mut guest, fd).await;
+        let again = tool.descriptor_identity_stat(&mut guest, fd).await;
+        // In the guest's table descriptor 1 shares the dup's open file
+        // description, as every alias of one does, so it finds the identity
+        // the dup's lookup cached.
+        let alias = tool
+            .descriptor_identity_stat(&mut guest, libc::STDOUT_FILENO)
+            .await;
+        close_unless_detcore_did(&guest, fd);
+
+        assert_eq!(
+            device.ok(),
+            Some(identity.dev),
+            "a getdents through a stdio dup must key its entries on the file's own device"
+        );
+        assert_eq!(
+            again.ok().flatten().map(|stat| stat.raw_inode()),
+            Some(identity),
+            "a stdio descriptor's identity must be the file's own fstat, not the stand-in"
+        );
+        assert_eq!(
+            alias.ok().flatten().map(|stat| stat.raw_inode()),
+            Some(identity),
+            "every alias of the description must find the one cached identity"
+        );
+        assert_eq!(
+            guest.injected,
+            [Sysno::fstat],
+            "one fstat for the description; every later lookup, through any alias, \
+             must use the cached identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_descriptor_identity_keeps_the_stand_in_without_virtualized_metadata() {
+        // `hermit record` and `hermit replay`: at replay an fstat would
+        // describe the replayer's descriptor rather than the recorded one.
+        let (tool, mut guest) = ScriptedGuest::new(true, false);
+        guest.config.virtualize_metadata = false;
+        let (fd, _) = stdio_backed_by_a_file(&mut guest);
+        let stand_in = guest
+            .thread
+            .with_detfd(fd, |detfd| detfd.stat().map(|stat| stat.raw_inode()))
+            .unwrap();
+
+        let identity = tool.descriptor_identity_stat(&mut guest, fd).await;
+        close_unless_detcore_did(&guest, fd);
+
+        assert!(
+            stand_in.is_some(),
+            "precondition: the dup carries the stand-in"
+        );
+        assert_eq!(
+            identity.ok().flatten().map(|stat| stat.raw_inode()),
+            stand_in
+        );
+        assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
+    }
+
+    #[tokio::test]
+    async fn stdio_descriptor_identity_refuses_what_it_could_not_ask() {
+        // No writable stack scratch and no transient page. Answering with the
+        // stand-in here would key the descriptor on stdin's file again.
+        let (tool, mut guest) = ScriptedGuest::new(false, true);
+        let (fd, _) = stdio_backed_by_a_file(&mut guest);
+
+        let result = tool.descriptor_identity_stat(&mut guest, fd).await;
+        let cached = guest
+            .thread
+            .with_detfd(fd, |detfd| detfd.identity_stat().is_some())
+            .unwrap();
+        close_unless_detcore_did(&guest, fd);
+
+        assert_typed_refusal("stdio identity", result.map(|_| ()), Errno::ENOMEM);
+        assert!(!cached, "a refused lookup must cache nothing");
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap],
+            "only the failed transient page for the fstat"
+        );
+    }
+
+    /// One byte written through `fd` by the write-family call `name`, through
+    /// that call's own handler; `sendfile` copies it from `source`.
+    async fn write_one_byte(
+        tool: &Detcore,
+        guest: &mut ScriptedGuest,
+        name: &str,
+        fd: RawFd,
+        source: RawFd,
+    ) -> Result<i64, Error> {
+        static BYTE: [u8; 1] = *b"x";
+        let buf = Addr::from_ptr(BYTE.as_ptr());
+        let iovec = [libc::iovec {
+            iov_base: BYTE.as_ptr() as *mut libc::c_void,
+            iov_len: BYTE.len(),
+        }];
+        let iov = Addr::from_ptr(iovec.as_ptr());
+        match name {
+            "write" => {
+                let call = syscalls::Write::new().with_fd(fd).with_buf(buf).with_len(1);
+                tool.handle_write(guest, call).await
+            }
+            "pwrite64" => {
+                let call = syscalls::Pwrite64::new()
+                    .with_fd(fd)
+                    .with_buf(buf)
+                    .with_len(1)
+                    .with_offset(0);
+                tool.handle_pwrite64(guest, call).await
+            }
+            "writev" => {
+                let call = syscalls::Writev::new()
+                    .with_fd(fd)
+                    .with_iov(iov)
+                    .with_len(1);
+                tool.handle_writev(guest, call).await
+            }
+            "pwritev" => {
+                let call = syscalls::Pwritev::new()
+                    .with_fd(fd)
+                    .with_iov(iov)
+                    .with_iov_len(1)
+                    .with_pos_l(0)
+                    .with_pos_h(0);
+                tool.handle_pwritev(guest, call).await
+            }
+            "pwritev2" => {
+                let call = syscalls::Pwritev2::new()
+                    .with_fd(fd)
+                    .with_iov(iov)
+                    .with_iov_len(1)
+                    .with_pos_l(0)
+                    .with_pos_h(0)
+                    .with_flags(0);
+                tool.handle_pwritev2(guest, call).await
+            }
+            "sendfile" => {
+                let call = syscalls::Sendfile::new()
+                    .with_out_fd(fd)
+                    .with_in_fd(source)
+                    .with_offset(None)
+                    .with_count(1);
+                tool.handle_sendfile(guest, call).await
+            }
+            other => panic!("not a write-family call: {other}"),
+        }
+    }
+
+    // A write bumps the virtual mtime of the file it changes, which a later
+    // `stat` of that file looks up under the file's own (device, inode). The
+    // cached stat of an inherited stdio descriptor, and of every dup of one,
+    // is the `fstat(0)` stand-in all three share, so with stdin and stdout on
+    // different devices that share a raw inode number,
+    // `stat(B); write(1, ...); stat(B)` touched stdin's identity and the
+    // guest saw no change. The scripted fstat gives the stdout dup the
+    // stand-in's inode number on another device, a pair the test process
+    // cannot make. Each write-family call writes twice: the second must use
+    // the identity the first cached on the open file description.
+    #[tokio::test]
+    async fn a_stdio_write_touches_the_descriptors_own_file_not_the_stand_in() {
+        let mut observed = Vec::new();
+        let mut expected = Vec::new();
+        for name in [
+            "write", "pwrite64", "writev", "pwritev", "pwritev2", "sendfile",
+        ] {
+            let (tool, mut guest) = ScriptedGuest::new(true, false);
+            guest.config.sequentialize_threads = false;
+            guest.answers_touch_file = true;
+            let (source, _) = open_file();
+            assert_eq!(
+                unsafe { libc::pwrite(source, b"xx".as_ptr().cast(), 2, 0) },
+                2
+            );
+            tool.add_fd(&mut guest, source, OFlag::O_RDONLY, FdType::Regular)
+                .await
+                .expect("precondition: Detcore tracks the sendfile source");
+            let (fd, _) = stdio_backed_by_a_file(&mut guest);
+            let stand_in = guest
+                .thread
+                .with_detfd(fd, |detfd| detfd.stat().map(|stat| stat.raw_inode()))
+                .unwrap()
+                .expect("precondition: the dup carries the stand-in");
+            let mut answer: libc::stat = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::fstat(fd, &mut answer) }, 0);
+            answer.st_dev = stand_in.dev ^ 1;
+            answer.st_ino = stand_in.ino;
+            guest.fstat_answers.push((fd, answer));
+            let own = RawInode::new(answer.st_dev, answer.st_ino);
+            guest.injected.clear();
+
+            let first = write_one_byte(&tool, &mut guest, name, fd, source).await;
+            let second = write_one_byte(&tool, &mut guest, name, fd, source).await;
+            close_unless_detcore_did(&guest, fd);
+            close_unless_detcore_did(&guest, source);
+
+            let fstats = guest
+                .injected
+                .iter()
+                .filter(|&&sysno| sysno == Sysno::fstat)
+                .count();
+            let touched = guest.touched.lock().unwrap().clone();
+            observed.push((name, first.ok(), second.ok(), touched, fstats));
+            // Both writes succeed and bump the file the descriptor names; one
+            // fstat for the description, whose identity the second write
+            // finds cached.
+            expected.push((name, Some(1), Some(1), vec![own, own], 1));
+        }
+        assert_eq!(
+            observed, expected,
+            "(call, first write, second write, identities touched, fstats injected): a \
+             write through a stdio dup must bump the mtime of the file the descriptor \
+             names, not of the stand-in"
+        );
+    }
+
+    // With no writable stack scratch and no transient page, Detcore cannot
+    // ask a stdio descriptor's own identity. A write must then refuse before
+    // the kernel writes anything: touching the stand-in instead would bump
+    // stdin's file again. Without virtualized metadata (`hermit record` and
+    // `hermit replay`) no mtime is bumped and nothing is asked.
+    #[tokio::test]
+    async fn a_stdio_write_refuses_before_writing_when_it_cannot_ask_the_identity() {
+        let writes = [
+            Sysno::write,
+            Sysno::pwrite64,
+            Sysno::writev,
+            Sysno::pwritev,
+            Sysno::pwritev2,
+            Sysno::sendfile,
+        ];
+        for virtualize_metadata in [true, false] {
+            for name in [
+                "write", "pwrite64", "writev", "pwritev", "pwritev2", "sendfile",
+            ] {
+                let (tool, mut guest) = ScriptedGuest::new(false, true);
+                guest.config.sequentialize_threads = false;
+                guest.config.virtualize_metadata = virtualize_metadata;
+                guest.answers_touch_file = true;
+                let (source, _) = open_file();
+                assert_eq!(
+                    unsafe { libc::pwrite(source, b"x".as_ptr().cast(), 1, 0) },
+                    1
+                );
+                // Tracked directly: with no stack scratch, the fstat
+                // `add_fd` injects could not be asked either.
+                let mut source_stat: libc::stat = unsafe { std::mem::zeroed() };
+                assert_eq!(unsafe { libc::fstat(source, &mut source_stat) }, 0);
+                guest
+                    .thread
+                    .add_fd(
+                        source,
+                        OFlag::O_RDONLY,
+                        FdType::Regular,
+                        Some(DetStat::from(source_stat)),
+                    )
+                    .unwrap();
+                let (fd, _) = stdio_backed_by_a_file(&mut guest);
+
+                let result = write_one_byte(&tool, &mut guest, name, fd, source).await;
+                let length = unsafe {
+                    let mut stat: libc::stat = std::mem::zeroed();
+                    assert_eq!(libc::fstat(fd, &mut stat), 0);
+                    stat.st_size
+                };
+                close_unless_detcore_did(&guest, fd);
+                close_unless_detcore_did(&guest, source);
+
+                if virtualize_metadata {
+                    assert_typed_refusal(name, result.map(|_| ()), Errno::ENOMEM);
+                    assert_eq!(
+                        guest.injected,
+                        [Sysno::mmap],
+                        "{name}: only the failed transient page for the fstat; the write \
+                         must not reach the kernel"
+                    );
+                    assert_eq!(length, 0, "{name}: the refused write wrote nothing");
+                } else {
+                    assert_eq!(result.ok(), Some(1), "{name}: the write succeeds");
+                    assert!(
+                        guest.injected.iter().all(|sysno| writes.contains(sysno)),
+                        "{name}: nothing but the write is injected: {:?}",
+                        guest.injected
+                    );
+                    assert_eq!(length, 1, "{name}: the write reached the file");
+                }
+                assert!(
+                    guest.touched.lock().unwrap().is_empty(),
+                    "{name}: no mtime is bumped for a refused write or without \
+                     virtualized metadata"
+                );
+            }
+        }
+    }
+
+    // The table the maps and `/proc/<pid>/fd` views match stdio objects
+    // against: each inherited descriptor's own identity, here the test
+    // process's own descriptors 0 to 2, where the stand-in gave all three
+    // the identity of its stdin.
+    #[tokio::test]
+    async fn inherited_stdio_identities_are_each_descriptors_own() {
+        let expected: Vec<Option<RawInode>> = (libc::STDIN_FILENO..=libc::STDERR_FILENO)
+            .map(|fd| {
+                let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+                (unsafe { libc::fstat(fd, &mut stat) } == 0)
+                    .then(|| RawInode::new(stat.st_dev, stat.st_ino))
+            })
+            .collect();
+        assert!(
+            expected.iter().all(Option::is_some),
+            "precondition: the test process's descriptors 0 to 2 are open: {expected:?}"
+        );
+        let (tool, mut guest) = ScriptedGuest::new(true, false);
+
+        let first = tool.inherited_stdio_identity_stats(&mut guest).await;
+        let injected_first = std::mem::take(&mut guest.injected);
+        let second = tool.inherited_stdio_identity_stats(&mut guest).await;
+
+        let identities = |stats: Result<[Option<crate::stat::DetStat>; 3], Error>| {
+            stats
+                .expect("the test process's descriptors can be asked")
+                .map(|stat| stat.map(|stat| stat.raw_inode()))
+                .to_vec()
+        };
+        assert_eq!(identities(first), expected);
+        assert_eq!(identities(second), expected);
+        assert_eq!(
+            injected_first,
+            [Sysno::fstat, Sysno::fstat, Sysno::fstat],
+            "one fstat per inherited descriptor"
+        );
+        assert!(
+            guest.injected.is_empty(),
+            "a second lookup must use the cached identities: injected {:?}",
+            guest.injected
+        );
+
+        // Without virtualize_metadata the stand-ins, as before, and no fstat.
+        let (tool, mut guest) = ScriptedGuest::new(true, false);
+        guest.config.virtualize_metadata = false;
+        let stand_ins: Vec<Option<RawInode>> = (libc::STDIN_FILENO..=libc::STDERR_FILENO)
+            .map(|fd| {
+                guest
+                    .thread
+                    .with_detfd(fd, |detfd| detfd.stat().map(|stat| stat.raw_inode()))
+                    .ok()
+                    .flatten()
+            })
+            .collect();
+        assert!(
+            stand_ins.iter().all(Option::is_some),
+            "precondition: the scripted guest tracks descriptors 0 to 2: {stand_ins:?}"
+        );
+        let recorded = tool.inherited_stdio_identity_stats(&mut guest).await;
+        assert_eq!(identities(recorded), stand_ins);
+        assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
+    }
+
+    #[tokio::test]
+    async fn handle_mmap_records_no_stdio_identity_without_virtualized_metadata() {
+        let (tool, mut guest) = ScriptedGuest::new(true, false);
+        guest.config.virtualize_metadata = false;
+        let (fd, _) = stdio_backed_by_a_file(&mut guest);
+
+        let start = map_and_unmap(&tool, &mut guest, fd).await;
+        close_unless_detcore_did(&guest, fd);
+
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap],
+            "no fstat without virtualize_metadata"
+        );
+        assert_eq!(guest.thread.mapped_file_at(start), None);
+    }
+
+    #[tokio::test]
+    async fn handle_mmap_records_an_ordinary_descriptor_from_its_cached_stat() {
+        let (fd, _) = open_file();
+        let identity = fd_identity(fd);
+        let (tool, mut guest) = ScriptedGuest::new(true, false);
+        tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
+            .await
+            .unwrap();
+        guest.injected.clear();
+
+        let start = map_and_unmap(&tool, &mut guest, fd).await;
+        close_unless_detcore_did(&guest, fd);
+
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap],
+            "an ordinary descriptor's mapping must cost no extra syscall"
+        );
+        assert_eq!(guest.thread.mapped_file_at(start), Some(identity));
+    }
+
+    /// A maps header's device for the tests below: not the device `stat`
+    /// reports for any file they use, as on btrfs, where maps prints the
+    /// superblock's device and `stat` the subvolume's.
+    const HEADER_DEVICE: u64 = 0xdead_0001;
+    /// The device a seeded mapping record names: neither the header's nor
+    /// any file's.
+    const RECORD_DEVICE: u64 = 0xdead_0002;
+    /// The start of a seeded mapping record. Nothing is mapped there: the
+    /// record alone is under test.
+    const RECORDED_START: usize = 0x7e00_0000_0000;
+
+    /// While alive, `guest_mountinfo` reads this mount table instead of the
+    /// guest's, and an injected `statmount` answers from the superblocks
+    /// set with it, if any, instead of running.
+    struct ScriptedMountinfo;
+
+    impl ScriptedMountinfo {
+        fn set(mountinfo: impl Into<Vec<u8>>) -> Self {
+            SCRIPTED_MOUNTINFO.with(|scripted| *scripted.borrow_mut() = Some(mountinfo.into()));
+            Self
+        }
+
+        /// ... and an injected `statmount` of unique mount id `id` reports
+        /// superblock `device` for each `(id, device)`, and `ENOENT` for
+        /// any other id.
+        fn with_superblocks(self, superblocks: Vec<(u64, u64)>) -> Self {
+            SCRIPTED_SUPERBLOCKS.with(|scripted| *scripted.borrow_mut() = Some(superblocks));
+            self
+        }
+
+        /// The mount of `path`, as the test process's own `statx` reports
+        /// it, on a superblock with `device`: the only row of the mount
+        /// table, and the only mount `statmount` reports.
+        fn proving(path: &Path, device: u64) -> Self {
+            Self::set(mount_row(mount_id_of(path), device)).with_superblocks(
+                unique_mount_id_of(path)
+                    .map(|id| (id, device))
+                    .into_iter()
+                    .collect(),
+            )
+        }
+    }
+
+    impl Drop for ScriptedMountinfo {
+        fn drop(&mut self) {
+            SCRIPTED_MOUNTINFO.with(|scripted| *scripted.borrow_mut() = None);
+            SCRIPTED_SUPERBLOCKS.with(|scripted| *scripted.borrow_mut() = None);
+        }
+    }
+
+    /// The unique mount id of `path` from the test process's own `statx`,
+    /// or `None` on a kernel before Linux 6.8, which does not report one.
+    fn unique_mount_id_of(path: &Path) -> Option<u64> {
+        let raw_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let mut statx = std::mem::MaybeUninit::<libc::statx>::zeroed();
+        // SAFETY: a NUL-terminated path and a buffer of the size statx writes.
+        let raw = unsafe {
+            libc::syscall(
+                libc::SYS_statx,
+                libc::AT_FDCWD,
+                raw_path.as_ptr(),
+                0,
+                STATX_MNT_ID_UNIQUE,
+                statx.as_mut_ptr(),
+            )
+        };
+        assert_eq!(
+            raw,
+            0,
+            "statx of {path:?} failed: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: statx succeeded, so it wrote the buffer.
+        let statx = unsafe { statx.assume_init() };
+        (statx.stx_mask & STATX_MNT_ID_UNIQUE != 0).then_some(statx.stx_mnt_id)
+    }
+
+    /// The calls a device proof injects on this kernel: a page, the
+    /// `statx`, then `statmount` when the kernel reports unique mount ids,
+    /// and the page's unmapping. Before Linux 6.8 the proof reads the
+    /// guest's mountinfo instead, which injects nothing.
+    fn proof_calls() -> Vec<Sysno> {
+        if unique_mount_id_of(Path::new("/")).is_some() {
+            vec![Sysno::mmap, Sysno::statx, Sysno::statmount, Sysno::munmap]
+        } else {
+            vec![Sysno::mmap, Sysno::statx, Sysno::munmap]
+        }
+    }
+
+    /// The mount id of `path`, from the test process's own `statx`.
+    fn mount_id_of(path: &Path) -> u64 {
+        let raw_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let mut statx = std::mem::MaybeUninit::<libc::statx>::zeroed();
+        // SAFETY: a NUL-terminated path and a buffer of the size statx writes.
+        let raw = unsafe {
+            libc::syscall(
+                libc::SYS_statx,
+                libc::AT_FDCWD,
+                raw_path.as_ptr(),
+                0,
+                StatxMask::STATX_MNT_ID.bits(),
+                statx.as_mut_ptr(),
+            )
+        };
+        assert_eq!(
+            raw,
+            0,
+            "statx of {path:?} failed: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: statx succeeded, so it wrote the buffer.
+        let statx = unsafe { statx.assume_init() };
+        assert_ne!(
+            statx.stx_mask & StatxMask::STATX_MNT_ID.bits(),
+            0,
+            "precondition: this kernel reports mount ids"
+        );
+        statx.stx_mnt_id
+    }
+
+    /// A mountinfo row for mount `mount_id` on a superblock with `device`.
+    fn mount_row(mount_id: u64, device: u64) -> String {
+        format!(
+            "{mount_id} 1 {}:{} / /scripted rw,relatime shared:1 - scripted scripted rw\n",
+            libc::major(device),
+            libc::minor(device)
+        )
+    }
+
+    /// A live file, its raw identity, and a maps header naming it by path
+    /// with its inode and `HEADER_DEVICE`.
+    fn mapped_path() -> (tempfile::NamedTempFile, RawInode, crate::procfs::MappingKey) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let metadata = file.as_file().metadata().unwrap();
+        let identity = RawInode::new(metadata.dev(), metadata.ino());
+        assert!(
+            ![HEADER_DEVICE, RECORD_DEVICE].contains(&identity.dev),
+            "precondition: the file's device {:#x} must differ from the header's and the record's",
+            identity.dev
+        );
+        let key = crate::procfs::MappingKey {
+            device: HEADER_DEVICE,
+            inode: identity.ino,
+            pathname: file.path().to_str().unwrap().to_owned(),
+        };
+        (file, identity, key)
+    }
+
+    // A record whose inode is not the header's describes another file -- it is
+    // stale (see `mapping_stat_identity`) -- so the path decides. Without the
+    // inode check the record would key the line on that other file.
+    #[tokio::test]
+    async fn mapping_stat_identity_discards_a_record_with_another_inode() {
+        let (file, identity, key) = mapped_path();
+        let _mounts = ScriptedMountinfo::proving(file.path(), HEADER_DEVICE);
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        let stale = RawInode::new(RECORD_DEVICE, identity.ino + 1);
+        guest.thread.map_file(RECORDED_START, page_size(), stale);
+
+        let result = tool
+            .mapping_stat_identity(&mut guest, &key, &[RECORDED_START], MappingSubject::Reader)
+            .await;
+
+        assert_eq!(
+            result.expect("mapping_stat_identity failed"),
+            identity,
+            "a record with inode {} must not key a header with inode {}; the path's stat must",
+            stale.ino,
+            key.inode
+        );
+        assert_eq!(
+            guest.injected,
+            [&[Sysno::newfstatat][..], &proof_calls()].concat()
+        );
+        assert_eq!(guest.fstatat_paths, [key.pathname.as_bytes().to_vec()]);
+        assert_eq!(guest.statx_paths, [key.pathname.as_bytes().to_vec()]);
+    }
+
+    // The split pair of https://github.com/rrnewton/hermit/pull/3255's sixth
+    // review: a path whose `stat` has the header's inode on another device,
+    // as every file on btrfs does. Its identity is the one `fstat` gives the
+    // file only when the mount `statx` names is on the header's superblock;
+    // the same inode number on another filesystem keeps the header's pair,
+    // and so does a mount the guest cannot see. Each case runs twice: with
+    // the unique mount id and `statmount` (Linux 6.8 and later), and as a
+    // kernel before 6.8 answers, through the guest's mountinfo.
+    #[tokio::test]
+    async fn a_path_with_the_headers_inode_needs_the_headers_superblock() {
+        let (file, identity, key) = mapped_path();
+        let header = RawInode::new(HEADER_DEVICE, key.inode);
+        let scratch = Pages::map(1, 1);
+        let listed = mount_id_of(file.path());
+        let unique = unique_mount_id_of(file.path())
+            .expect("precondition: this kernel reports unique mount ids (Linux 6.8)");
+        let unseen = (u64::MAX - 1, u64::MAX - 1);
+        for ((listed, unique), device, expected, why) in [
+            (
+                (listed, unique),
+                RECORD_DEVICE,
+                header,
+                "another superblock: the same inode number names another file",
+            ),
+            (
+                unseen,
+                HEADER_DEVICE,
+                header,
+                "a mount the guest cannot see proves nothing",
+            ),
+            (
+                (listed, unique),
+                HEADER_DEVICE,
+                identity,
+                "the header's superblock: the identity fstat gives the file",
+            ),
+        ] {
+            for before_6_8 in [false, true] {
+                let _mounts = ScriptedMountinfo::set(mount_row(listed, device))
+                    .with_superblocks(vec![(unique, device)]);
+                let (tool, mut guest) =
+                    ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+                // As on ptrace and KVM, where the mountinfo fallback is made.
+                guest.config.tool_opens_outside_guest_descriptor_table = true;
+                guest.statx_without_unique_mount_id = before_6_8;
+                let resolved = tool
+                    .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
+                    .await;
+                assert_eq!(
+                    resolved.expect("mapping_stat_identity failed"),
+                    expected,
+                    "{why} (before Linux 6.8: {before_6_8})"
+                );
+                let (proof, asked): (&[Sysno], Vec<u64>) = if before_6_8 {
+                    (&[Sysno::mmap, Sysno::statx, Sysno::munmap], vec![])
+                } else {
+                    (
+                        &[Sysno::mmap, Sysno::statx, Sysno::statmount, Sysno::munmap],
+                        vec![file_unique(&file)],
+                    )
+                };
+                assert_eq!(
+                    guest.injected,
+                    [&[Sysno::newfstatat][..], proof].concat(),
+                    "{why} (before Linux 6.8: {before_6_8})"
+                );
+                assert_eq!(
+                    guest.statmount_mounts, asked,
+                    "{why}: statmount must ask for the unique id statx reported"
+                );
+            }
+        }
+    }
+
+    // https://github.com/rrnewton/hermit/pull/3255's ninth review: where a
+    // file Detcore opens for itself takes a number in the guest's descriptor
+    // table (DBT, SaBRe, LiteInst), the proof must not fall back to reading
+    // the guest's mountinfo. That read holds a guest descriptor while it
+    // runs, so another guest thread's `open` or `SCM_RIGHTS` receipt could be
+    // given another number, and at the guest's descriptor limit the read
+    // fails. Both ways into the fallback -- a kernel before Linux 6.8, and a
+    // `statmount` that answers `ENOSYS` -- refuse with the typed refusal,
+    // read no mountinfo, and unmap the page. The scripted mountinfo proves
+    // the header's superblock, so a read would show as a proof.
+    #[tokio::test]
+    async fn a_maps_proof_refuses_rather_than_read_mountinfo_in_the_guests_table() {
+        let (file, _identity, key) = mapped_path();
+        let scratch = Pages::map(1, 1);
+        let mut outcomes = Vec::new();
+        for (before_6_8, statmount_error, proof) in [
+            (true, None, &[Sysno::mmap, Sysno::statx, Sysno::munmap][..]),
+            (
+                false,
+                Some(Errno::ENOSYS),
+                &[
+                    Sysno::mmap,
+                    Sysno::statx,
+                    Sysno::statmount,
+                    Sysno::statx,
+                    Sysno::munmap,
+                ][..],
+            ),
+        ] {
+            let _mounts = ScriptedMountinfo::proving(file.path(), HEADER_DEVICE);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            let shares_table = !guest.config.tool_opens_outside_guest_descriptor_table;
+            guest.statx_without_unique_mount_id = before_6_8;
+            guest.statmount_error = statmount_error;
+            let reads = MOUNTINFO_READS.with(|reads| reads.get());
+            let resolved = tool
+                .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
+                .await;
+            let reads = MOUNTINFO_READS.with(|reads| reads.get()) - reads;
+            outcomes.push((
+                before_6_8,
+                shares_table,
+                resolved,
+                reads,
+                guest.injected,
+                proof,
+            ));
+        }
+        for (before_6_8, shares_table, resolved, reads, injected, proof) in outcomes {
+            assert!(
+                shares_table,
+                "precondition: the default config assumes the guest's descriptor table"
+            );
+            let refused = resolved
+                .as_ref()
+                .err()
+                .and_then(IdentityLookupRefused::carried_by);
+            assert!(
+                refused.is_some_and(|refused| refused.to_string().contains("mountinfo")),
+                "before Linux 6.8: {before_6_8}: the fallback must refuse with an \
+                 IdentityLookupRefused naming mountinfo: {resolved:?}"
+            );
+            assert_eq!(
+                reads, 0,
+                "before Linux 6.8: {before_6_8}: no mountinfo may be read"
+            );
+            assert_eq!(
+                injected,
+                [&[Sysno::newfstatat][..], proof].concat(),
+                "before Linux 6.8: {before_6_8}"
+            );
+        }
+    }
+
+    /// The unique mount id of `file`'s mount.
+    fn file_unique(file: &tempfile::NamedTempFile) -> u64 {
+        unique_mount_id_of(file.path()).expect("precondition: unique mount ids")
+    }
+
+    // `statmount` answers that decide nothing, and the proof's response to
+    // each: a mount outside the guest's namespace (`ENOENT`) or root
+    // (`EPERM`) is the guest's own configuration, so no proof; `ENOSYS`, as
+    // a seccomp policy can answer, falls back to the guest's mountinfo after
+    // a second `statx` for the reusable id, where the launcher allows that
+    // read (ptrace and KVM; see the test above); anything else could not be asked
+    // and refuses, as does an answer without the superblock it was asked
+    // for. The page is unmapped on every path.
+    #[tokio::test]
+    async fn a_statmount_that_decides_nothing_proves_nothing_falls_back_or_refuses() {
+        let (file, identity, key) = mapped_path();
+        let header = RawInode::new(HEADER_DEVICE, key.inode);
+        let scratch = Pages::map(1, 1);
+        let unique = file_unique(&file);
+        let asked = [
+            Sysno::newfstatat,
+            Sysno::mmap,
+            Sysno::statx,
+            Sysno::statmount,
+        ];
+        for (errno, expected) in [(Errno::ENOENT, header), (Errno::EPERM, header)] {
+            let _mounts = ScriptedMountinfo::proving(file.path(), HEADER_DEVICE);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.statmount_error = Some(errno);
+            let resolved = tool
+                .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
+                .await;
+            assert_eq!(
+                resolved.expect("mapping_stat_identity failed"),
+                expected,
+                "{errno}"
+            );
+            assert_eq!(
+                guest.injected,
+                [&asked[..], &[Sysno::munmap]].concat(),
+                "{errno}"
+            );
+            assert_eq!(guest.statmount_mounts, [unique], "{errno}");
+        }
+
+        // ENOSYS: the reusable id, then the guest's mountinfo, proves it, as
+        // on ptrace and KVM, where the fallback is made.
+        let _mounts = ScriptedMountinfo::proving(file.path(), HEADER_DEVICE);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        guest.config.tool_opens_outside_guest_descriptor_table = true;
+        guest.statmount_error = Some(Errno::ENOSYS);
+        let resolved = tool
+            .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
+            .await;
+        assert_eq!(resolved.expect("mapping_stat_identity failed"), identity);
+        assert_eq!(
+            guest.injected,
+            [&asked[..], &[Sysno::statx, Sysno::munmap]].concat()
+        );
+        assert_eq!(guest.statx_paths.len(), 2);
+        drop(_mounts);
+
+        // ENOSYS with a mountinfo row on another superblock: no proof.
+        let _mounts = ScriptedMountinfo::set(mount_row(mount_id_of(file.path()), RECORD_DEVICE))
+            .with_superblocks(vec![(unique, HEADER_DEVICE)]);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        guest.config.tool_opens_outside_guest_descriptor_table = true;
+        guest.statmount_error = Some(Errno::ENOSYS);
+        let resolved = tool
+            .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
+            .await;
+        assert_eq!(
+            resolved.expect("mapping_stat_identity failed"),
+            header,
+            "after ENOSYS the mountinfo row decides, not the statmount table"
+        );
+        drop(_mounts);
+
+        for (errno, omits, cause) in [
+            (Some(Errno::EINVAL), false, Errno::EINVAL.to_string()),
+            (Some(Errno::EFAULT), false, Errno::EFAULT.to_string()),
+            (None, true, "no superblock".to_owned()),
+        ] {
+            let _mounts = ScriptedMountinfo::proving(file.path(), HEADER_DEVICE);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.statmount_error = errno;
+            guest.statmount_omits_superblock = omits;
+            let refused = tool
+                .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
+                .await;
+            assert!(
+                matches!(&refused, Err(Error::Tool(error))
+                    if error.to_string().contains("statmount")
+                        && error.to_string().contains(&cause)),
+                "a statmount that could not be asked must refuse ({cause}): {refused:?}"
+            );
+            assert_eq!(
+                guest.injected,
+                [&asked[..], &[Sysno::munmap]].concat(),
+                "{cause}"
+            );
+        }
+
+        // ESRCH: the guest is gone, which every injection reports as itself.
+        let _mounts = ScriptedMountinfo::proving(file.path(), HEADER_DEVICE);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        guest.statmount_error = Some(Errno::ESRCH);
+        let gone = tool
+            .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
+            .await;
+        assert!(
+            matches!(gone, Err(Error::Errno(Errno::ESRCH))),
+            "a guest that is gone must report ESRCH: {gone:?}"
+        );
+    }
+
+    // Against the test host's real kernel, with nothing scripted: the
+    // superblock device `statmount` reports for the mount `statx` names is
+    // the device the test process's own mountinfo lists for that mount,
+    // which is the device a maps line prints. This checks the offsets of
+    // `struct mnt_id_req` and `struct statmount` against the kernel.
+    #[tokio::test]
+    async fn statmount_reports_the_superblock_mountinfo_lists() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mountinfo = std::fs::read("/proc/self/mountinfo").unwrap();
+        for path in [file.path(), Path::new("/proc/self/exe"), Path::new("/")] {
+            unique_mount_id_of(path)
+                .expect("precondition: this kernel reports unique mount ids (Linux 6.8)");
+            let metadata = std::fs::metadata(path).unwrap();
+            // SAFETY: an all-zero stat is a valid value.
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            stat.st_dev = metadata.dev();
+            stat.st_ino = metadata.ino();
+            let scratch = Pages::map(1, 1);
+            let (_tool, mut guest) =
+                ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            let superblock =
+                Detcore::guest_superblock_of(&mut guest, path.as_os_str().as_bytes(), &stat)
+                    .await
+                    .expect("guest_superblock_of failed");
+            let listed = mountinfo_superblock_device(&mountinfo, mount_id_of(path))
+                .expect("malformed mountinfo")
+                .expect("the test process's mountinfo lists its own mount");
+            assert_eq!(
+                superblock,
+                MountSuperblock::Device(listed),
+                "{path:?}: statmount's superblock must be the one mountinfo lists"
+            );
+            assert_eq!(
+                guest.injected,
+                [Sysno::mmap, Sysno::statx, Sysno::statmount, Sysno::munmap],
+                "{path:?}"
+            );
+            assert_eq!(guest.mapped.len(), 1);
+            assert_eq!(
+                guest.unmapped, guest.mapped,
+                "{path:?}: the page is unmapped"
+            );
+        }
+    }
+
+    // A device proof that could not be asked refuses, as a stat that could
+    // not be asked does: without it the header's pair would key a file whose
+    // identity is fstat's on a host where the page can be mapped.
+    #[tokio::test]
+    async fn a_device_proof_that_cannot_be_asked_refuses() {
+        let (file, _identity, key) = mapped_path();
+        let _mounts = ScriptedMountinfo::proving(file.path(), HEADER_DEVICE);
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        guest.mmap_fails = true;
+
+        let refused = tool
+            .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
+            .await;
+
+        assert!(
+            matches!(&refused, Err(Error::Tool(error))
+                if error.to_string().contains(&Errno::ENOMEM.to_string())),
+            "a device proof that could not be asked must refuse: {refused:?}"
+        );
+        assert_eq!(guest.injected, [Sysno::newfstatat, Sysno::mmap]);
+    }
+
+    // On the test host's own filesystem, through the kernel's real maps line,
+    // statx and mountinfo: a mapped file's line resolves to the identity
+    // fstat gives it. On btrfs (and overlayfs) the line's device is not
+    // stat's, so this runs the mount proof; elsewhere they agree at once.
+    #[tokio::test]
+    async fn a_real_maps_line_resolves_to_its_files_fstat_identity() {
+        use std::os::fd::AsRawFd;
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file()
+            .set_len(u64::try_from(page_size()).unwrap())
+            .unwrap();
+        let metadata = file.as_file().metadata().unwrap();
+        let identity = RawInode::new(metadata.dev(), metadata.ino());
+        // SAFETY: a fresh shared read-only mapping of the whole file.
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page_size(),
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_file().as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(address, libc::MAP_FAILED);
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        let prefix = format!("{:x}-", address as usize);
+        let line = maps
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .expect("no maps line for the mapping")
+            .to_owned();
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let (major, minor) = fields[3].split_once(':').unwrap();
+        let header_device = libc::makedev(
+            u32::from_str_radix(major, 16).unwrap(),
+            u32::from_str_radix(minor, 16).unwrap(),
+        );
+        let key = crate::procfs::MappingKey {
+            device: header_device,
+            inode: fields[4].parse().unwrap(),
+            pathname: fields[5..].join(" "),
+        };
+        assert_eq!(key.inode, identity.ino, "{line}");
+        // Only the fallback reads this, with the pid-1 guest standing in.
+        let _mounts = ScriptedMountinfo::set(std::fs::read("/proc/self/mountinfo").unwrap());
+        let scratch = Pages::map(1, 1);
+        let mut outcomes = Vec::new();
+        for before_6_8 in [false, true] {
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            // As on ptrace and KVM, where the mountinfo fallback is made.
+            guest.config.tool_opens_outside_guest_descriptor_table = true;
+            guest.statx_without_unique_mount_id = before_6_8;
+            let resolved = tool
+                .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
+                .await;
+            outcomes.push((before_6_8, resolved, guest.injected));
+        }
+        // SAFETY: the mapping made above.
+        unsafe { libc::munmap(address, page_size()) };
+
+        for (before_6_8, resolved, injected) in outcomes {
+            eprintln!(
+                "maps device {header_device:#x}, stat device {:#x}; before 6.8: {before_6_8}; \
+                 injected {injected:?}",
+                identity.dev
+            );
+            assert_eq!(
+                resolved.expect("mapping_stat_identity failed"),
+                identity,
+                "{line}: a mapped file's line must take the identity fstat gives it \
+                 (before Linux 6.8: {before_6_8})"
+            );
+            let proof = if header_device == identity.dev {
+                vec![]
+            } else if before_6_8 {
+                vec![Sysno::mmap, Sysno::statx, Sysno::munmap]
+            } else {
+                proof_calls()
+            };
+            assert_eq!(injected, [&[Sysno::newfstatat][..], &proof].concat());
+        }
+    }
+
+    // Control for the test above: a record with the header's inode keys the
+    // line, and no stat is made.
+    #[tokio::test]
+    async fn mapping_stat_identity_uses_a_record_with_the_headers_inode() {
+        let (_file, identity, key) = mapped_path();
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        let recorded = RawInode::new(RECORD_DEVICE, identity.ino);
+        guest.thread.map_file(RECORDED_START, page_size(), recorded);
+
+        let result = tool
+            .mapping_stat_identity(&mut guest, &key, &[RECORDED_START], MappingSubject::Reader)
+            .await;
+
+        assert_eq!(result.expect("mapping_stat_identity failed"), recorded);
+        assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
+    }
+
+    // A lookup that could not be asked must refuse rather than step to the
+    // next source or to the header: here neither the stack scratch nor a
+    // transient page is available, as when the guest has used up its address
+    // space or its mapping count. On a host where the page can be mapped the
+    // path's stat keys the line, so a fallback would let host resources
+    // choose the identity. A path the guest's filesystem reports missing is an
+    // answer, and still falls back to the header.
+    #[tokio::test]
+    async fn mapping_stat_identity_refuses_when_a_lookup_cannot_be_asked() {
+        let (_file, _identity, key) = mapped_path();
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) =
+            ScriptedGuest::with_scratch(scratch.address, scratch.len, Some(Errno::EFAULT));
+        guest.mmap_fails = true;
+
+        let refused = tool
+            .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Reader)
+            .await;
+
+        assert!(
+            matches!(&refused, Err(Error::Tool(error))
+                if error.to_string().contains(&Errno::ENOMEM.to_string())),
+            "a lookup that could not be asked must refuse, never key the line on the \
+             header or another source: {refused:?}"
+        );
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap],
+            "nothing may be asked after the refusal"
+        );
+
+        // Control: a missing path is the filesystem's answer.
+        let directory = tempfile::tempdir().unwrap();
+        let missing = crate::procfs::MappingKey {
+            device: HEADER_DEVICE,
+            inode: key.inode,
+            pathname: directory.path().join("absent").to_str().unwrap().to_owned(),
+        };
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        let fallback = tool
+            .mapping_stat_identity(&mut guest, &missing, &[], MappingSubject::Unknown)
+            .await;
+        assert_eq!(
+            fallback.expect("a missing path must not be an error"),
+            RawInode::new(HEADER_DEVICE, key.inode)
+        );
+        assert_eq!(guest.injected, [Sysno::newfstatat]);
+    }
+
+    /// Asserts that `result` is a refusal carrying [`IdentityLookupRefused`]
+    /// whose message names `errno`.
+    fn assert_typed_refusal(path: &str, result: Result<(), Error>, errno: Errno) {
+        let refused = result
+            .as_ref()
+            .err()
+            .and_then(IdentityLookupRefused::carried_by);
+        assert!(
+            refused.is_some_and(|refused| refused.to_string().contains(&errno.to_string())),
+            "the {path} path's refusal must reach the dispatcher as an IdentityLookupRefused \
+             naming {errno}: {result:?}"
+        );
+    }
+
+    // A refusal must reach Detcore's dispatcher, and the DBT glue, as the
+    // typed `IdentityLookupRefused`, because that type is what stops the
+    // refusing process: an untyped tool error is still EIO to the guest on
+    // DBT. One refusal from each path that asks the guest before it keys an
+    // identity, each with neither a stack scratch nor a transient page to ask
+    // in: a `maps` snapshot, through `mint_mapping_identities` as the read
+    // handler calls it; the stdio identity of an `mmap`; and the directory
+    // device of a `getdents64`, which is resolved before the real call.
+    #[tokio::test]
+    async fn refusals_from_maps_mmap_and_getdents_reach_the_dispatcher_typed() {
+        let (_file, _identity, key) = mapped_path();
+        let line = format!(
+            "{:x}-{:x} r--p 00000000 {:02x}:{:02x} {} {}",
+            RECORDED_START,
+            RECORDED_START + page_size(),
+            libc::major(key.device),
+            libc::minor(key.device),
+            key.inode,
+            key.pathname
+        );
+        assert_eq!(
+            crate::procfs::mapping_header_key(&line),
+            Some(key.clone()),
+            "precondition: the scripted maps line names the file"
+        );
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) =
+            ScriptedGuest::with_scratch(scratch.address, scratch.len, Some(Errno::EFAULT));
+        guest.mmap_fails = true;
+        let maps = crate::procfs::mint_mapping_identities(
+            line.as_bytes(),
+            &BTreeMap::new(),
+            &mut GuestMappingMinter::new(&tool, &mut guest, MappingSubject::Unknown),
+        )
+        .await;
+        assert_typed_refusal("maps", maps.map(|_| ()), Errno::ENOMEM);
+        assert_eq!(guest.injected, [Sysno::mmap], "maps: only the failed page");
+
+        let (tool, mut guest) = ScriptedGuest::new(false, true);
+        let (fd, _) = stdio_backed_by_a_file(&mut guest);
+        let mmap = tool
+            .handle_mmap(
+                &mut guest,
+                syscalls::Mmap::new()
+                    .with_addr(None)
+                    .with_len(page_size())
+                    .with_prot(ProtFlags::PROT_READ)
+                    .with_flags(MapFlags::MAP_PRIVATE)
+                    .with_fd(fd)
+                    .with_offset(0),
+            )
+            .await;
+        close_unless_detcore_did(&guest, fd);
+        assert_typed_refusal("mmap", mmap.map(|_| ()), Errno::ENOMEM);
+
+        let (tool, mut guest) = ScriptedGuest::new(false, true);
+        let (fd, _) = open_file();
+        let getdents = tool
+            .handle_getdents64(
+                &mut guest,
+                syscalls::Getdents64::new()
+                    .with_fd(u32::try_from(fd).unwrap())
+                    .with_dirent(AddrMut::from_raw(scratch.address))
+                    .with_count(u32::try_from(page_size()).unwrap()),
+            )
+            .await;
+        close_unless_detcore_did(&guest, fd);
+        assert_typed_refusal("getdents64", getdents.map(|_| ()), Errno::ENOMEM);
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap],
+            "getdents64: the refusal comes before the real call"
+        );
+    }
+
+    /// Enables every event at INFO and above, as `--log info` does, and keeps
+    /// the memory-map DETLOG records. INFO is what makes that DETLOG read the
+    /// guest at all.
+    #[derive(Clone, Default)]
+    struct MemoryRecords(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl MemoryRecords {
+        fn taken(&self) -> Vec<String> {
+            std::mem::take(&mut *self.0.lock().unwrap())
+        }
+    }
+
+    struct MessageText(Option<String>);
+
+    impl tracing::field::Visit for MessageText {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl tracing::Subscriber for MemoryRecords {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::INFO
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut text = MessageText(None);
+            event.record(&mut text);
+            if let Some(text) = text.0
+                && text.contains("[memory]")
+            {
+                self.0.lock().unwrap().push(text);
+            }
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// A guest for calls dispatched through the whole `handle_syscall_event`,
+    /// and the Detcore a backend builds from that guest's config. With
+    /// `heap`, the run has `--detlog-heap` and the backend reports `heap` as
+    /// the guest's heap, for the memory-map DETLOG to hash after each call.
+    /// The harness reads no clock and no registers, so the config has no PMU
+    /// timeslice and the backend owns the syscall-clobbered registers, as DBT
+    /// does.
+    fn dispatched_guest(
+        stack_writable: bool,
+        mmap_fails: bool,
+        heap: Option<&Pages>,
+    ) -> (Detcore, ScriptedGuest) {
+        let (_, mut guest) = ScriptedGuest::new(stack_writable, mmap_fails);
+        guest.config.max_timeslice = None;
+        guest.config.sequentialize_threads = false;
+        guest.config.backend.virtualizes_syscall_clobbers = true;
+        if let Some(heap) = heap {
+            guest.config.detlog_heap = true;
+            guest.detlog_regions = Some(vec![reverie::DetlogMemoryRegion {
+                kind: reverie::DetlogRegionKind::Heap,
+                start: heap.address as u64,
+                end: (heap.address + heap.len) as u64,
+            }]);
+        }
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+        (tool, guest)
+    }
+
+    /// A private read-only `mmap` of `fd`, a regular file the guest has as
+    /// stdout, whose handler asks the guest for the file's own identity.
+    fn stdio_file_mmap(fd: RawFd) -> Syscall {
+        Syscall::Mmap(
+            syscalls::Mmap::new()
+                .with_addr(None)
+                .with_len(page_size())
+                .with_prot(ProtFlags::PROT_READ)
+                .with_flags(MapFlags::MAP_PRIVATE)
+                .with_fd(fd)
+                .with_offset(0),
+        )
+    }
+
+    fn unmap_file_mappings(guest: &ScriptedGuest) {
+        for &(address, len) in &guest.file_mapped {
+            assert_eq!(
+                unsafe { libc::munmap(address as *mut libc::c_void, len) },
+                0
+            );
+        }
+    }
+
+    // A refusal is the call's result through the whole dispatcher, whatever
+    // an observer that runs after the handler does. Here the memory-map
+    // DETLOG (`--detlog-heap` under INFO logging) fails on its own, reading a
+    // heap page the guest cannot read, while the `mmap` handler refuses (no
+    // stack scratch, no transient page for the stdio identity). Were the
+    // observer to run, its EFAULT would take the refusal's place: an errno
+    // DBT hands the guest, which then runs on.
+    #[tokio::test]
+    async fn a_refusal_outlives_a_failing_observer_in_the_dispatcher() {
+        let records = MemoryRecords::default();
+        let _info = tracing::subscriber::set_default(records.clone());
+        let unreadable = Pages::map(1, 0);
+        let (tool, mut guest) = dispatched_guest(false, true, Some(&unreadable));
+        let observed = tool.detlog_memory_maps(&mut guest);
+        assert!(
+            matches!(observed, Err(Error::Errno(Errno::EFAULT))),
+            "precondition: the memory-map DETLOG fails on its own: {observed:?}"
+        );
+        let (fd, _) = stdio_backed_by_a_file(&mut guest);
+
+        let result = tool
+            .handle_syscall_event(&mut guest, stdio_file_mmap(fd))
+            .await;
+        unmap_file_mappings(&guest);
+        close_unless_detcore_did(&guest, fd);
+
+        assert_typed_refusal("dispatched mmap", result.map(|_| ()), Errno::ENOMEM);
+        assert_eq!(records.taken(), Vec::<String>::new());
+    }
+
+    // The control: a call that is not refused still runs the observers after
+    // its handler. Same guest and call, with a stack scratch to ask in and a
+    // readable heap page, so the handler maps the file and the memory-map
+    // DETLOG records the heap.
+    #[tokio::test]
+    async fn an_unrefused_call_still_runs_the_observers_in_the_dispatcher() {
+        let records = MemoryRecords::default();
+        let _info = tracing::subscriber::set_default(records.clone());
+        let readable = Pages::map(1, 1);
+        let (tool, mut guest) = dispatched_guest(true, false, Some(&readable));
+        let (fd, _) = stdio_backed_by_a_file(&mut guest);
+
+        let result = tool
+            .handle_syscall_event(&mut guest, stdio_file_mmap(fd))
+            .await;
+        unmap_file_mappings(&guest);
+        close_unless_detcore_did(&guest, fd);
+
+        assert!(result.is_ok(), "the dispatched mmap failed: {result:?}");
+        assert_eq!(guest.file_mapped.len(), 1, "the handler mapped the file");
+        let records = records.taken();
+        assert!(
+            records.len() == 1 && records[0].contains("Heap"),
+            "the memory-map DETLOG must record the heap once after the call: {records:?}"
+        );
+    }
+
+    // A refused call takes no turn after its handler: the post-hook would end
+    // an expired timeslice and hand the turn to another thread before the
+    // backend stops the refusing process. Threads are sequentialized, as in a
+    // `hermit run`, so ending a slice asks the scheduler for the next turn,
+    // an RPC the harness panics on. The thread's slice ends 1 ns after its
+    // current time, so the call's own charge expires it.
+    #[tokio::test]
+    async fn a_refused_call_leaves_the_dispatcher_before_the_post_hook_takes_a_turn() {
+        let (_, mut guest) = dispatched_guest(false, true, None);
+        guest.config.sequentialize_threads = true;
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+        assert!(
+            crate::syscall_time::cost_ns(Sysno::mmap) > 0,
+            "precondition: the call's charge advances the thread's time"
+        );
+        let slice_end = guest.thread.thread_logical_time.as_nanos() + LogicalTime::from_nanos(1);
+        guest.thread.end_of_timeslice = Some(slice_end);
+        let slices = guest.thread.stats.timeslice_count;
+        let (fd, _) = stdio_backed_by_a_file(&mut guest);
+
+        let result = tool
+            .handle_syscall_event(&mut guest, stdio_file_mmap(fd))
+            .await;
+        unmap_file_mappings(&guest);
+        close_unless_detcore_did(&guest, fd);
+
+        assert_typed_refusal("dispatched mmap", result.map(|_| ()), Errno::ENOMEM);
+        assert!(
+            guest.thread.timeslice_expired(),
+            "precondition: the call's charge expired the slice"
+        );
+        assert_eq!(
+            (
+                guest.thread.end_of_timeslice,
+                guest.thread.stats.timeslice_count
+            ),
+            (Some(slice_end), slices),
+            "the refused call must leave the expired slice for the backend's stop"
+        );
+    }
+
+    // Step 3 of `mapping_stat_identity`: the reader's own executable after it
+    // was unlinked -- ` (deleted)`, so no path candidate -- and with no record,
+    // as `execve` maps it, is keyed on the guest's `stat` of `/proc/self/exe`,
+    // not on the header's device. For another address space (no recorded
+    // starts) `/proc/self` is not that process, and the header decides.
+    #[tokio::test]
+    async fn mapping_stat_identity_keys_the_readers_deleted_executable_on_proc_self_exe() {
+        let exe = std::fs::metadata("/proc/self/exe").unwrap();
+        let identity = RawInode::new(exe.dev(), exe.ino());
+        assert_ne!(identity.dev, HEADER_DEVICE);
+        let key = crate::procfs::MappingKey {
+            device: HEADER_DEVICE,
+            inode: identity.ino,
+            pathname: "/usr/bin/replaced-executable (deleted)".to_owned(),
+        };
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        // The test binary is not deleted, so its link's text is scripted.
+        guest.readlink_answers.push((
+            b"/proc/self/exe".to_vec(),
+            key.pathname.clone().into_bytes(),
+        ));
+        let _mounts = ScriptedMountinfo::proving(Path::new("/proc/self/exe"), HEADER_DEVICE);
+        let exe_proof = [
+            &[
+                Sysno::newfstatat,
+                Sysno::mmap,
+                Sysno::readlinkat,
+                Sysno::munmap,
+            ][..],
+            &proof_calls(),
+        ]
+        .concat();
+
+        let own = tool
+            .mapping_stat_identity(&mut guest, &key, &[RECORDED_START], MappingSubject::Reader)
+            .await;
+        assert_eq!(own.expect("mapping_stat_identity failed"), identity);
+        assert_eq!(guest.injected, exe_proof);
+        assert_eq!(guest.fstatat_paths, [b"/proc/self/exe".to_vec()]);
+        assert_eq!(guest.readlink_paths, [b"/proc/self/exe".to_vec()]);
+        assert_eq!(guest.statx_paths, [b"/proc/self/exe".to_vec()]);
+
+        let other = tool
+            .mapping_stat_identity(&mut guest, &key, &[RECORDED_START], MappingSubject::Unknown)
+            .await;
+        assert_eq!(
+            other.expect("mapping_stat_identity failed"),
+            RawInode::new(HEADER_DEVICE, identity.ino),
+            "an unknown address space's line must not borrow the reader's executable"
+        );
+        assert_eq!(guest.injected, exe_proof, "no second stat");
+    }
+
+    // The reader's mapping records describe only its own address space. For a
+    // snapshot of another one, even a record with the header's inode -- the
+    // same inode number on another device -- must not key the line.
+    #[tokio::test]
+    async fn another_address_spaces_maps_line_ignores_the_readers_record() {
+        use crate::procfs::MappingIdentityMinter;
+
+        let (file, identity, key) = mapped_path();
+        let _mounts = ScriptedMountinfo::proving(file.path(), HEADER_DEVICE);
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        let recorded = RawInode::new(RECORD_DEVICE, identity.ino);
+        guest.thread.map_file(RECORDED_START, page_size(), recorded);
+        let path_proof = [&[Sysno::newfstatat][..], &proof_calls()].concat();
+
+        let own = GuestMappingMinter::new(&tool, &mut guest, MappingSubject::Reader)
+            .stat_identity(&key, &[RECORDED_START])
+            .await;
+        assert_eq!(
+            own.expect("stat_identity failed for the reader's own address space"),
+            recorded,
+            "control: the reader's own snapshot is keyed on its record"
+        );
+        assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
+
+        let other = GuestMappingMinter::new(&tool, &mut guest, MappingSubject::Unknown)
+            .stat_identity(&key, &[RECORDED_START])
+            .await;
+        assert_eq!(
+            other.expect("stat_identity failed for another address space"),
+            identity,
+            "another address space's line must be keyed on the path's stat, not the reader's record"
+        );
+        assert_eq!(guest.injected, path_proof);
+        assert_eq!(guest.fstatat_paths, [key.pathname.as_bytes().to_vec()]);
+
+        let numbered = GuestMappingMinter::new(&tool, &mut guest, MappingSubject::Process(1))
+            .stat_identity(&key, &[RECORDED_START])
+            .await;
+        assert_eq!(
+            numbered.expect("stat_identity failed for a numbered address space"),
+            identity,
+            "a numbered task's line must be keyed on the path's stat, not the reader's record"
+        );
+        assert_eq!(guest.injected, path_proof.repeat(2));
+    }
+
+    /// A running process other than the test's, whose executable stands in
+    /// for another guest process's. Killed and reaped on drop.
+    struct OtherProcess(std::process::Child);
+
+    impl OtherProcess {
+        fn spawn() -> Self {
+            Self(
+                std::process::Command::new("sleep")
+                    .arg("600")
+                    .spawn()
+                    .expect("cannot spawn sleep"),
+            )
+        }
+
+        fn pid(&self) -> i32 {
+            i32::try_from(self.0.id()).unwrap()
+        }
+
+        /// The raw identity of its executable, as `stat` of
+        /// `/proc/<pid>/exe` reports it.
+        fn executable(&self) -> RawInode {
+            let exe = std::fs::metadata(format!("/proc/{}/exe", self.pid())).unwrap();
+            RawInode::new(exe.dev(), exe.ino())
+        }
+    }
+
+    impl Drop for OtherProcess {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A running copy of `sleep` whose file was unlinked once it ran, so its
+    /// exe link and its maps line both read `<copy> (deleted)`. The copy sits
+    /// beside the test binary, where executing is allowed.
+    struct DeletedExecutable {
+        process: OtherProcess,
+        directory: tempfile::TempDir,
+    }
+
+    impl DeletedExecutable {
+        fn spawn() -> Self {
+            let beside = std::env::current_exe().unwrap();
+            let directory = tempfile::tempdir_in(beside.parent().unwrap()).unwrap();
+            let copy = directory.path().join("sleep");
+            {
+                let original = OtherProcess::spawn();
+                std::fs::copy(format!("/proc/{}/exe", original.pid()), &copy).unwrap();
+            }
+            // Another test's fork can briefly hold the copy's write
+            // descriptor, and executing a file open for writing is ETXTBSY.
+            let mut attempts = 0;
+            let child = loop {
+                match std::process::Command::new(&copy).arg("600").spawn() {
+                    Ok(child) => break child,
+                    Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && attempts < 100 => {
+                        attempts += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("cannot run {copy:?}: {error}"),
+                }
+            };
+            // `spawn` returns once the child has executed the copy.
+            std::fs::remove_file(&copy).unwrap();
+            Self {
+                process: OtherProcess(child),
+                directory,
+            }
+        }
+
+        fn link(&self) -> String {
+            format!("/proc/{}/exe", self.process.pid())
+        }
+
+        /// Its maps pathname, which its exe link also reads.
+        fn pathname(&self) -> String {
+            format!(
+                "{}/sleep (deleted)",
+                self.directory.path().to_str().unwrap()
+            )
+        }
+    }
+
+    // Step 3 for a task the maps file names by number: its executable after
+    // it was unlinked -- ` (deleted)`, so no path candidate -- is keyed on the
+    // guest's `stat` of `/proc/<pid>/exe`, not on the header's device. Before
+    // https://github.com/rrnewton/hermit/pull/3255's fifth round no number
+    // reached this function, and the header decided.
+    #[tokio::test]
+    async fn mapping_stat_identity_keys_a_numbered_tasks_deleted_executable_on_its_exe_link() {
+        let other = DeletedExecutable::spawn();
+        let identity = other.process.executable();
+        assert_ne!(identity.dev, HEADER_DEVICE);
+        let link = other.link();
+        let key = crate::procfs::MappingKey {
+            device: HEADER_DEVICE,
+            inode: identity.ino,
+            pathname: other.pathname(),
+        };
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        let _mounts = ScriptedMountinfo::proving(Path::new(&link), HEADER_DEVICE);
+
+        let numbered = tool
+            .mapping_stat_identity(
+                &mut guest,
+                &key,
+                &[RECORDED_START],
+                MappingSubject::Process(other.process.pid()),
+            )
+            .await;
+        assert_eq!(
+            numbered.expect("mapping_stat_identity failed"),
+            identity,
+            "another task's deleted executable must be keyed on its /proc/<pid>/exe"
+        );
+        assert_eq!(
+            guest.injected,
+            [
+                &[
+                    Sysno::newfstatat,
+                    Sysno::mmap,
+                    Sysno::readlinkat,
+                    Sysno::munmap,
+                ][..],
+                &proof_calls(),
+            ]
+            .concat()
+        );
+        assert_eq!(guest.fstatat_paths, [link.clone().into_bytes()]);
+        assert_eq!(guest.readlink_paths, [link.clone().into_bytes()]);
+        assert_eq!(guest.statx_paths, [link.into_bytes()]);
+    }
+
+    // Step 3 borrows the executable's identity only with proof that the
+    // line's file IS the executable: the link must read as the line's
+    // pathname, and the executable must lie on the header's superblock. An
+    // equal inode number alone -- on another filesystem, in a non-executable
+    // mapping, or for a live file literally named `x (deleted)` -- keeps the
+    // header's pair.
+    #[tokio::test]
+    async fn step_three_needs_the_executables_pathname_and_superblock() {
+        let other = DeletedExecutable::spawn();
+        let identity = other.process.executable();
+        let link = other.link();
+        let header = RawInode::new(HEADER_DEVICE, identity.ino);
+        let literal = tempfile::tempdir().unwrap();
+        let literal_path = literal.path().join("x (deleted)");
+        std::fs::write(&literal_path, b"not the executable").unwrap();
+        let scratch = Pages::map(1, 1);
+        let text_mismatch = [
+            Sysno::newfstatat,
+            Sysno::mmap,
+            Sysno::readlinkat,
+            Sysno::munmap,
+        ];
+        let device_mismatch = [&text_mismatch[..], &proof_calls()].concat();
+        for (pathname, superblock, expected_calls, why) in [
+            (
+                other.pathname(),
+                RECORD_DEVICE,
+                &device_mismatch[..],
+                "the executable on another superblock",
+            ),
+            (
+                literal_path.to_str().unwrap().to_owned(),
+                HEADER_DEVICE,
+                &text_mismatch[..],
+                "a live file literally named `x (deleted)`",
+            ),
+            (
+                format!("{}/libgone.so (deleted)", literal.path().to_str().unwrap()),
+                HEADER_DEVICE,
+                &text_mismatch[..],
+                "a non-executable mapping with the executable's inode number",
+            ),
+        ] {
+            let key = crate::procfs::MappingKey {
+                device: HEADER_DEVICE,
+                inode: identity.ino,
+                pathname,
+            };
+            let _mounts = ScriptedMountinfo::proving(Path::new(&link), superblock);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            let resolved = tool
+                .mapping_stat_identity(
+                    &mut guest,
+                    &key,
+                    &[],
+                    MappingSubject::Process(other.process.pid()),
+                )
+                .await;
+            assert_eq!(
+                resolved.expect("mapping_stat_identity failed"),
+                header,
+                "{why} must not borrow the executable's identity"
+            );
+            assert_eq!(guest.injected, expected_calls, "{why}");
+            assert_eq!(guest.fstatat_paths, [link.clone().into_bytes()], "{why}");
+        }
+    }
+
+    // Through the numeric spelling's classification at open time, with the
+    // opener's ids from the guest's injected `getpid` and `gettid`: the
+    // reader's own thread-group id or thread id binds its own address space,
+    // whose record keys a deleted file; another task's number keys that task's
+    // deleted executable on its exe link and never consults the reader's
+    // record.
+    #[tokio::test]
+    async fn numeric_maps_spellings_resolve_through_the_task_they_name() {
+        use crate::procfs::MappingIdentityMinter;
+
+        let own_tgid = i32::try_from(std::process::id()).unwrap();
+        // SAFETY: gettid has no preconditions.
+        let own_tid = i32::try_from(unsafe { libc::syscall(libc::SYS_gettid) }).unwrap();
+        let deleted = DeletedExecutable::spawn();
+        let other = &deleted.process;
+        let other_executable = other.executable();
+        let _mounts = ScriptedMountinfo::proving(Path::new(&deleted.link()), HEADER_DEVICE);
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        let reader_mm = guest.thread.mm_id;
+
+        // A file the reader mapped and then unlinked: only its record names it.
+        let (_file, identity, mut key) = mapped_path();
+        key.pathname.push_str(" (deleted)");
+        let recorded = RawInode::new(RECORD_DEVICE, identity.ino);
+        guest.thread.map_file(RECORDED_START, page_size(), recorded);
+
+        for own in [own_tgid, own_tid] {
+            let path = format!("/proc/{own}/maps");
+            let mut file = ProcfsFile::from_path(Path::new(&path)).unwrap();
+            guest.injected.clear();
+            Detcore::bind_procfs_mapping_subject(&mut guest, &mut file)
+                .await
+                .expect("binding failed");
+            assert_eq!(guest.injected, [Sysno::getpid, Sysno::gettid], "{path}");
+            let subject = file.mapping_subject(reader_mm);
+            assert_eq!(subject, MappingSubject::Reader, "{path}");
+            guest.injected.clear();
+            let resolved = GuestMappingMinter::new(&tool, &mut guest, subject)
+                .stat_identity(&key, &[RECORDED_START])
+                .await;
+            assert_eq!(
+                resolved.expect("stat_identity failed"),
+                recorded,
+                "{path}: the reader's own deleted file must be keyed on its record"
+            );
+            assert!(guest.injected.is_empty(), "{path}: {:?}", guest.injected);
+        }
+
+        let path = format!("/proc/{}/maps", other.pid());
+        let mut file = ProcfsFile::from_path(Path::new(&path)).unwrap();
+        guest.injected.clear();
+        Detcore::bind_procfs_mapping_subject(&mut guest, &mut file)
+            .await
+            .expect("binding failed");
+        let subject = file.mapping_subject(reader_mm);
+        assert_eq!(subject, MappingSubject::Process(other.pid()), "{path}");
+        let other_key = crate::procfs::MappingKey {
+            device: HEADER_DEVICE,
+            inode: other_executable.ino,
+            pathname: deleted.pathname(),
+        };
+        // The reader's record at the same address has the same inode number
+        // and must not be used for another task's line.
+        guest.thread.map_file(
+            RECORDED_START,
+            page_size(),
+            RawInode::new(RECORD_DEVICE, other_executable.ino),
+        );
+        guest.injected.clear();
+        guest.fstatat_paths.clear();
+        let resolved = GuestMappingMinter::new(&tool, &mut guest, subject)
+            .stat_identity(&other_key, &[RECORDED_START])
+            .await;
+        assert_eq!(
+            resolved.expect("stat_identity failed"),
+            other_executable,
+            "{path}: another task's deleted executable must be keyed on its exe link"
+        );
+        assert_eq!(
+            guest.fstatat_paths,
+            [format!("/proc/{}/exe", other.pid()).into_bytes()]
         );
     }
 }

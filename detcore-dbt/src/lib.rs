@@ -40,6 +40,7 @@ use detcore::Config;
 use detcore::DetTid;
 use detcore::Detcore;
 use detcore::GlobalState;
+use detcore::IdentityLookupRefused;
 use detcore::UnsupportedSyscallError;
 use detcore::prepare_exec;
 use rand::RngExt as _;
@@ -953,12 +954,20 @@ fn error_result(error: Error) -> i64 {
 fn guest_errno_or_failure(error: Error) -> Result<i64, String> {
     match error {
         Error::Errno(errno) => Ok(-(errno.into_raw() as i64)),
-        Error::Tool(error) => match error.downcast_ref::<UnsupportedSyscallError>() {
-            Some(unsupported) => Err(format!("detcore-dbt: {unsupported}\n")),
-            None => Err(format!(
-                "detcore-dbt: Detcore failed handling a syscall: {error:#}\n"
-            )),
-        },
+        Error::Tool(error) => {
+            if let Some(unsupported) = error.downcast_ref::<UnsupportedSyscallError>() {
+                Err(format!("detcore-dbt: {unsupported}\n"))
+            } else if let Some(refused) = error.downcast_ref::<IdentityLookupRefused>() {
+                // A refused identity lookup already names the call Detcore
+                // could not make in the guest, so it is reported as it
+                // stands, as an unsupported syscall is.
+                Err(format!("detcore-dbt: {refused}\n"))
+            } else {
+                Err(format!(
+                    "detcore-dbt: Detcore failed handling a syscall: {error:#}\n"
+                ))
+            }
+        }
         Error::Io(error) => Err(format!(
             "detcore-dbt: Detcore failed handling a syscall: {error}\n"
         )),
@@ -2472,10 +2481,42 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
             outcome = Ok(DbtSyscallOutcome::Suppress(value));
         }
     }
+    // SAFETY: the callback's caller guarantees these pointers and `emit`.
+    unsafe {
+        complete_tool_syscall(
+            outcome,
+            result,
+            deferred_sysnum,
+            deferred_args,
+            emit,
+            &TOTAL_REWRITTEN,
+        )
+    }
+}
+
+/// Hands Detcore's outcome for one system call back to the native client:
+/// `1` when `result` holds what the guest's call returns (counted in
+/// `rewritten`), `2` when the deferred system call written for the client is
+/// to run instead, and `-1` when the client must end the runtime tree, after
+/// the reason is emitted.
+///
+/// # Safety
+///
+/// `result` must be writable, `deferred_sysnum` and `deferred_args` must be
+/// valid for [`write_deferred_syscall`], and `emit` must be callable with a
+/// byte buffer and its length.
+unsafe fn complete_tool_syscall(
+    outcome: Result<DbtSyscallOutcome, Error>,
+    result: *mut i64,
+    deferred_sysnum: *mut i64,
+    deferred_args: *mut u64,
+    emit: unsafe extern "C" fn(*const u8, usize),
+    rewritten: &AtomicU64,
+) -> i32 {
     match outcome {
         Ok(DbtSyscallOutcome::Suppress(value)) => {
             unsafe { result.write(value) };
-            TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+            rewritten.fetch_add(1, Ordering::Relaxed);
             1
         }
         Ok(DbtSyscallOutcome::ExecuteOriginal(syscall)) => {
@@ -2484,6 +2525,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         }
         Err(error) => handler_error_action(
             error,
+            rewritten,
             |value| unsafe { result.write(value) },
             |message| unsafe { emit(message.as_ptr(), message.len()) },
         ),
@@ -2491,17 +2533,18 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
 }
 
 /// The pre-syscall action for a Detcore handler error: 1 after writing a guest
-/// errno, or -1 after reporting a failure, which makes the native client end
-/// the run with exit code 101.
+/// errno, counted in `rewritten`, or -1 after reporting a failure, which makes
+/// the native client end the run with exit code 101.
 fn handler_error_action(
     error: Error,
+    rewritten: &AtomicU64,
     write_result: impl FnOnce(i64),
     emit: impl FnOnce(&[u8]),
 ) -> i32 {
     match guest_errno_or_failure(error) {
         Ok(value) => {
             write_result(value);
-            TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+            rewritten.fetch_add(1, Ordering::Relaxed);
             1
         }
         Err(message) => {
@@ -2610,6 +2653,7 @@ mod tests {
         let mut reported = None;
         let action = handler_error_action(
             error,
+            &AtomicU64::new(0),
             |value| written = Some(value),
             |message| reported = Some(String::from_utf8(message.to_vec()).unwrap()),
         );
@@ -2779,6 +2823,114 @@ mod tests {
         let mut expected = backend_capabilities();
         expected.tracks_process_children = true;
         assert_eq!(config.backend, expected);
+    }
+
+    thread_local! {
+        static EMITTED: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    unsafe extern "C" fn capture_emit(bytes: *const u8, length: usize) {
+        let bytes = unsafe { std::slice::from_raw_parts(bytes, length) };
+        EMITTED.with(|emitted| emitted.borrow_mut().extend_from_slice(bytes));
+    }
+
+    /// What `complete_tool_syscall` does with `outcome`: its return code, the
+    /// result slot (`i64::MIN` when unwritten), the deferred system call
+    /// number (`0` when unwritten), the rewrite count, and what it emitted.
+    fn complete(outcome: Result<DbtSyscallOutcome, Error>) -> (i32, i64, i64, u64, String) {
+        EMITTED.with(|emitted| emitted.borrow_mut().clear());
+        let mut result = i64::MIN;
+        let mut deferred_sysnum = 0;
+        let mut deferred_args = [0u64; 6];
+        let rewritten = AtomicU64::new(0);
+        // SAFETY: every pointer addresses a live local of the right size.
+        let code = unsafe {
+            complete_tool_syscall(
+                outcome,
+                &mut result,
+                &mut deferred_sysnum,
+                deferred_args.as_mut_ptr(),
+                capture_emit,
+                &rewritten,
+            )
+        };
+        let emitted = EMITTED.with(|emitted| String::from_utf8(emitted.take()).unwrap());
+        (
+            code,
+            result,
+            deferred_sysnum,
+            rewritten.load(Ordering::Relaxed),
+            emitted,
+        )
+    }
+
+    #[test]
+    fn a_refused_identity_lookup_ends_the_runtime_tree_without_a_guest_result() {
+        let refused = detcore::IdentityLookupRefused(
+            "could not ask the guest to stat \"/x\": EMFILE".to_owned(),
+        );
+        assert_eq!(
+            complete(Err(refused.into_error())),
+            (
+                -1,
+                i64::MIN,
+                0,
+                0,
+                "detcore-dbt: could not ask the guest to stat \"/x\": EMFILE\n".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn an_unsupported_syscall_still_ends_the_runtime_tree() {
+        let unsupported = Error::Tool(UnsupportedSyscallError(Sysno::read).into());
+        assert_eq!(
+            complete(Err(unsupported)),
+            (
+                -1,
+                i64::MIN,
+                0,
+                0,
+                "detcore-dbt: unsupported syscall: read\n".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn any_other_tool_error_ends_the_runtime_tree_without_a_guest_result() {
+        let other = Error::Tool(io::Error::other("some other tool error").into());
+        assert_eq!(
+            complete(Err(other)),
+            (
+                -1,
+                i64::MIN,
+                0,
+                0,
+                "detcore-dbt: Detcore failed handling a syscall: some other tool error\n"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn an_errno_is_its_negative_value_to_the_guest_and_counted() {
+        assert_eq!(
+            complete(Err(Error::Errno(Errno::ENOENT))),
+            (1, -(Errno::ENOENT.into_raw() as i64), 0, 1, String::new())
+        );
+    }
+
+    #[test]
+    fn suppressed_and_deferred_outcomes_complete_as_before() {
+        assert_eq!(
+            complete(Ok(DbtSyscallOutcome::Suppress(7))),
+            (1, 7, 0, 1, String::new())
+        );
+        let getpid = Syscall::from_raw(Sysno::getpid, SyscallArgs::new(0, 0, 0, 0, 0, 0));
+        assert_eq!(
+            complete(Ok(DbtSyscallOutcome::ExecuteOriginal(getpid))),
+            (2, i64::MIN, Sysno::getpid.id() as i64, 0, String::new())
+        );
     }
 
     #[test]

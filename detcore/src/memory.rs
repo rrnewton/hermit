@@ -6,7 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Process-local memory mapping metadata used to resolve shared futex keys.
+//! Process-local memory mapping metadata used to resolve shared futex keys,
+//! and to name the file behind a file-backed mapping.
 
 use std::collections::BTreeMap;
 
@@ -15,6 +16,7 @@ use serde::Serialize;
 
 use crate::types::FutexID;
 use crate::types::MmId;
+use crate::types::RawInode;
 use crate::types::SharedMemoryObjectId;
 
 const PAGE_SIZE: usize = 4096;
@@ -49,11 +51,31 @@ impl SharedMapping {
     }
 }
 
+/// A file mapping the guest made through a descriptor Detcore tracks.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct FileMapping {
+    len: usize,
+    /// The raw identity `fstat` reported for the descriptor.
+    file: RawInode,
+}
+
+impl FileMapping {
+    fn end(self, start: usize) -> usize {
+        start
+            .checked_add(self.len)
+            .expect("a successful memory mapping must fit in the address space")
+    }
+}
+
 /// Shared mappings visible in one Linux memory address space.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct MemoryMetadata {
     next_anonymous_sequence: u64,
     shared_mappings: BTreeMap<usize, SharedMapping>,
+    /// File mappings, shared or private, made through tracked descriptors, by
+    /// start address. See `mapped_file_at`.
+    #[serde(default)]
+    file_mappings: BTreeMap<usize, FileMapping>,
     /// The guest's program break when it was first observed, i.e. the base of
     /// the brk heap.
     #[serde(default)]
@@ -124,6 +146,33 @@ impl MemoryMetadata {
         self.insert_mapping(start, len, object, 0);
     }
 
+    /// Record a file mapping, shared or private, made through a descriptor
+    /// whose `fstat` reported the raw identity `file`.
+    pub(crate) fn map_file(&mut self, start: usize, len: usize, file: RawInode) {
+        let len = page_aligned_len(len);
+        if len == 0 {
+            return;
+        }
+        start
+            .checked_add(len)
+            .expect("a successful memory mapping must fit in the address space");
+        self.unmap_files(start, len);
+        self.file_mappings.insert(start, FileMapping { len, file });
+    }
+
+    /// The raw identity `fstat` reported for the file mapped at `address`,
+    /// when the guest mapped it there through a descriptor Detcore tracks.
+    ///
+    /// This names the file even after the file is unlinked or replaced and
+    /// its descriptor closed, when `/proc/*/maps` shows ` (deleted)` in place
+    /// of a path. `None` for anything else, including the executable and the
+    /// ELF interpreter, which `execve` maps without a system call Detcore
+    /// sees.
+    pub(crate) fn mapped_file_at(&self, address: usize) -> Option<RawInode> {
+        let (&start, &mapping) = self.file_mappings.range(..=address).next_back()?;
+        (address < mapping.end(start)).then_some(mapping.file)
+    }
+
     /// Record a mapping with a resolved backing object.
     pub(crate) fn map_object(
         &mut self,
@@ -149,7 +198,7 @@ impl MemoryMetadata {
         start
             .checked_add(len)
             .expect("a successful memory mapping must fit in the address space");
-        self.unmap(start, len);
+        self.unmap_shared(start, len);
         self.shared_mappings.insert(
             start,
             SharedMapping {
@@ -162,6 +211,54 @@ impl MemoryMetadata {
 
     /// Remove a range, retaining any mapped portions on either side.
     pub(crate) fn unmap(&mut self, start: usize, len: usize) {
+        self.unmap_shared(start, len);
+        self.unmap_files(start, len);
+    }
+
+    /// Remove a range from the file mappings, retaining any mapped portions on
+    /// either side.
+    fn unmap_files(&mut self, start: usize, len: usize) {
+        let len = page_aligned_len(len);
+        if len == 0 {
+            return;
+        }
+        let end = start
+            .checked_add(len)
+            .expect("a successful memory range operation must fit in the address space");
+        let overlapping = self
+            .file_mappings
+            .range(..end)
+            .filter_map(|(&mapping_start, &mapping)| {
+                (mapping.end(mapping_start) > start).then_some((mapping_start, mapping))
+            })
+            .collect::<Vec<_>>();
+        for (mapping_start, mapping) in overlapping {
+            self.file_mappings.remove(&mapping_start);
+            let mapping_end = mapping.end(mapping_start);
+            if mapping_start < start {
+                self.file_mappings.insert(
+                    mapping_start,
+                    FileMapping {
+                        len: start - mapping_start,
+                        ..mapping
+                    },
+                );
+            }
+            if mapping_end > end {
+                self.file_mappings.insert(
+                    end,
+                    FileMapping {
+                        len: mapping_end - end,
+                        ..mapping
+                    },
+                );
+            }
+        }
+    }
+
+    /// Remove a range from the shared mappings, retaining any mapped portions
+    /// on either side.
+    fn unmap_shared(&mut self, start: usize, len: usize) {
         let len = page_aligned_len(len);
         if len == 0 {
             return;
@@ -223,11 +320,20 @@ impl MemoryMetadata {
                 (mapping.end(mapping_start) >= old_end)
                     .then_some((mapping.object, mapping.offset_at(mapping_start, old_start)))
             });
+        let file_source = self.file_mappings.range(..=old_start).next_back().and_then(
+            |(&mapping_start, &mapping)| {
+                let mapping_end = mapping.end(mapping_start);
+                (old_start < mapping_end && mapping_end >= old_end).then_some(mapping.file)
+            },
+        );
 
         self.unmap(old_start, old_len);
         self.unmap(new_start, new_len);
         if let Some((object, object_offset)) = source {
             self.insert_mapping(new_start, new_len, object, object_offset);
+        }
+        if let Some(file) = file_source {
+            self.map_file(new_start, new_len, file);
         }
     }
 }
@@ -361,5 +467,71 @@ mod tests {
             "mremap must retain the backing-object offset"
         );
         assert_ne!(original, before_remap);
+    }
+
+    #[test]
+    fn file_mappings_name_their_file_until_unmapped() {
+        let file = RawInode::new(0x21, 257);
+        let other = RawInode::new(0x2f, 257);
+        let mut mappings = MemoryMetadata::new();
+        // Lengths round up to whole pages, as the kernel's do.
+        mappings.map_file(0x1000, 0x2001, file);
+        assert_eq!(mappings.mapped_file_at(0x0fff), None);
+        assert_eq!(mappings.mapped_file_at(0x1000), Some(file));
+        assert_eq!(mappings.mapped_file_at(0x3fff), Some(file));
+        assert_eq!(mappings.mapped_file_at(0x4000), None);
+
+        // munmap of the middle page leaves both ends naming the file.
+        mappings.unmap(0x2000, 0x1000);
+        assert_eq!(mappings.mapped_file_at(0x1000), Some(file));
+        assert_eq!(mappings.mapped_file_at(0x2000), None);
+        assert_eq!(mappings.mapped_file_at(0x3000), Some(file));
+
+        // A new mapping over a range replaces the file there.
+        mappings.map_file(0x3000, 0x1000, other);
+        assert_eq!(mappings.mapped_file_at(0x3000), Some(other));
+        assert_eq!(mappings.mapped_file_at(0x1000), Some(file));
+    }
+
+    #[test]
+    fn file_mappings_follow_mremap_and_survive_fork() {
+        let file = RawInode::new(0x21, 257);
+        let mut mappings = MemoryMetadata::new();
+        mappings.map_file(0x1000, 0x2000, file);
+        mappings.remap(0x1000, 0x2000, 0x8000, 0x3000);
+        assert_eq!(mappings.mapped_file_at(0x1000), None);
+        assert_eq!(mappings.mapped_file_at(0x8000), Some(file));
+        assert_eq!(mappings.mapped_file_at(0xafff), Some(file));
+
+        // A fork's child inherits its parent's mappings, and they part ways.
+        let mut child = mappings.clone();
+        child.unmap(0x8000, 0x3000);
+        assert_eq!(child.mapped_file_at(0x8000), None);
+        assert_eq!(mappings.mapped_file_at(0x8000), Some(file));
+    }
+
+    #[test]
+    fn a_shared_file_mapping_keeps_its_file_record() {
+        // handle_mmap records the shared backing object and the file for one
+        // range; neither record may evict the other.
+        let file = RawInode::new(0x21, 257);
+        let object = SharedMemoryObjectId::File {
+            device: 0x21,
+            inode: 257,
+        };
+        let mut mappings = MemoryMetadata::new();
+        mappings.map_file(0x1000, 0x1000, file);
+        mappings.map_object(0x1000, 0x1000, object, 0);
+        assert_eq!(mappings.mapped_file_at(0x1000), Some(file));
+        assert!(matches!(
+            mappings.futex_id(mm(10), 0x1010),
+            FutexID::Shared { .. }
+        ));
+        mappings.unmap(0x1000, 0x1000);
+        assert_eq!(mappings.mapped_file_at(0x1000), None);
+        assert_eq!(
+            mappings.futex_id(mm(10), 0x1010),
+            FutexID::private(mm(10), 0x1010)
+        );
     }
 }

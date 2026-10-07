@@ -85,6 +85,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+pub use config::AnonymousObjectDevices;
 pub use config::BlockingMode;
 pub use config::CONFIG_FINGERPRINT_ENV;
 pub use config::Config;
@@ -130,6 +131,7 @@ pub use scheduler::Priority;
 pub use scheduler::runqueue::DEFAULT_PRIORITY;
 pub use scheduler::runqueue::FIRST_PRIORITY;
 pub use scheduler::runqueue::LAST_PRIORITY;
+pub use syscalls::probe_anonymous_object_devices;
 pub use tool_global::BackendFailureCleanup;
 pub use tool_global::GlobalState;
 use tool_global::ThreadDeregistration;
@@ -184,6 +186,91 @@ pub use shared_open_files::ChunkedOpenFileChannel;
 pub use shared_open_files::OpenFileControl;
 pub use shared_open_files::OpenFileControlReply;
 pub use shared_open_files::OpenFileControlTransport;
+
+/// A file identity Detcore could not establish, so it refused rather than key
+/// the file on another source: the lookup the guest makes for it (`stat`,
+/// `statx`, `readlink`, `fstat`) failed for a reason that is not the file's
+/// own answer, or what that answer is checked against (the guest's
+/// mountinfo, the pipefs and sockfs devices) could not be read.
+///
+/// It travels inside [`Error::Tool`], never as an errno, and the process
+/// that made the call must not run on past it: the call may have changed the
+/// guest in a way it could not undo, as an `mmap` over an existing range
+/// does. Each backend stops that process. Ptrace, which e9patch
+/// preprocessing also runs under, and KVM end execution on any tool error
+/// that is not an errno, and in-guest LiteInst ends the process on one.
+/// `detcore-dbt` recognizes this type and ends the runtime tree, as for
+/// [`UnsupportedSyscallError`]. A backend that would hand the error to the
+/// guest as an errno sets the Config's
+/// `exit_process_on_identity_lookup_refusal`, and Detcore ends the process
+/// itself.
+///
+/// On the other backends Detcore's dispatcher returns the refusal as the
+/// call's result before any observer or post-hook of that call runs, so no
+/// later error can take its place and no other thread is given a turn
+/// before the backend acts on it.
+#[derive(Debug)]
+pub struct IdentityLookupRefused(pub String);
+
+impl std::fmt::Display for IdentityLookupRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for IdentityLookupRefused {}
+
+impl IdentityLookupRefused {
+    /// The tool error that carries this refusal.
+    pub fn into_error(self) -> Error {
+        Error::Tool(anyhow::Error::new(self))
+    }
+
+    /// The refusal `error` carries, if it carries one.
+    pub fn carried_by(error: &Error) -> Option<&Self> {
+        match error {
+            Error::Tool(inner) => inner.downcast_ref::<Self>(),
+            _ => None,
+        }
+    }
+}
+
+/// The status of a process Detcore ends for a refused identity lookup: the
+/// status the in-guest tool hosts end a process with on a tool error.
+const IDENTITY_LOOKUP_REFUSED_EXIT_STATUS: libc::c_long = 125;
+
+/// The refusal a syscall's result carries, when the Config asks Detcore to
+/// end the refusing process itself; see [`IdentityLookupRefused`].
+fn refusal_to_exit_on<'a>(
+    cfg: &Config,
+    res: &'a Result<i64, Error>,
+) -> Option<&'a IdentityLookupRefused> {
+    if !cfg.exit_process_on_identity_lookup_refusal {
+        return None;
+    }
+    res.as_ref()
+        .err()
+        .and_then(IdentityLookupRefused::carried_by)
+}
+
+/// Ends the calling process with a raw `exit_group` after one write of the
+/// refusal to stderr. Nothing unwinds and no exit handler runs, so nothing of
+/// the guest's runs after the refused call.
+fn exit_refusing_process(refused: &IdentityLookupRefused) -> ! {
+    let message = format!("detcore: {refused}\n");
+    // SAFETY: two system calls on a buffer that outlives them; `exit_group`
+    // does not return.
+    unsafe {
+        libc::write(
+            libc::STDERR_FILENO,
+            message.as_ptr().cast::<libc::c_void>(),
+            message.len(),
+        );
+        libc::syscall(libc::SYS_exit_group, IDENTITY_LOOKUP_REFUSED_EXIT_STATUS);
+    }
+    unreachable!("exit_group returned")
+}
+
 pub use tool_local::Detcore;
 pub use tool_local::FileMetadata;
 /// Returns whether the audited runtime policy classifies `sysno` as unsupported.
@@ -1471,10 +1558,20 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // policy, refuse.
             detlog::require_forwarding(policy);
         }
-        // Read before any guest syscall, so a readlink of another process's
-        // pipe or socket never depends on the tracer's descriptors then. The
-        // outcome is kept; a failure is reported only if a guest needs it.
-        let _ = syscalls::anonymous_object_devices();
+        // Runs launched through hermit-cli on every backend but DBT carry the
+        // pipefs and sockfs devices the Hermit process probed, so this probes
+        // nothing. A Config without them, which every DBT run with virtualized
+        // metadata has, probes here, before any guest syscall, so a readlink
+        // of another process's pipe or socket never depends on the descriptors
+        // Detcore's host process has then. The outcome is kept; a failure is
+        // reported only if a guest needs it. On the in-guest backends this
+        // probe uses the guest's descriptor table, and on in-guest LiteInst
+        // and e9patch other threads may already exist; see
+        // `anonymous_object_devices`. Without virtualized metadata nothing
+        // reads the devices, so nothing is probed.
+        if cfg.virtualize_metadata && cfg.anonymous_object_devices.is_none() {
+            let _ = syscalls::anonymous_object_devices();
+        }
         Self {
             detpid,
             cfg: cfg.clone(),
@@ -3472,6 +3569,27 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             return res;
         }
 
+        // A refused identity lookup ends the refusing process before anything
+        // else of this call runs, on a backend that would otherwise return the
+        // tool error to the guest as an errno.
+        if let Some(refused) = refusal_to_exit_on(&self.cfg, &res) {
+            exit_refusing_process(refused);
+        }
+        // On every other backend the refusal is this call's result, and it
+        // leaves here as it is, like a copy failure above: an observer below
+        // could fail and put its own error in the refusal's place, which DBT
+        // would give the guest as an errno and let it run on, and the
+        // post-hook could end the timeslice and hand the turn to another
+        // thread before the backend stops the refusing process.
+        if res
+            .as_ref()
+            .err()
+            .and_then(IdentityLookupRefused::carried_by)
+            .is_some()
+        {
+            return res;
+        }
+
         if res.is_ok() && !removed_inodes.is_empty() {
             self.retire_removed_inodes(guest, removed_inodes).await;
         }
@@ -4705,5 +4823,60 @@ mod finished_syscall_display_tests {
         for result in [Ok(0), Err(Errno::EBADF.into())] {
             assert_no_struct_rendered(&finish_line(&call, result));
         }
+    }
+}
+
+#[cfg(test)]
+mod identity_lookup_refusal_tests {
+    use super::*;
+
+    fn refused() -> Result<i64, Error> {
+        Err(
+            IdentityLookupRefused("could not ask the guest to stat \"/x\": EMFILE".into())
+                .into_error(),
+        )
+    }
+
+    fn exiting_config() -> Config {
+        Config {
+            exit_process_on_identity_lookup_refusal: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_refusal_is_carried_inside_a_tool_error_with_its_message() {
+        let res = refused();
+        let error = res.as_ref().unwrap_err();
+        assert!(matches!(error, Error::Tool(_)), "{error:?}");
+        assert_eq!(
+            IdentityLookupRefused::carried_by(error).map(|refused| refused.to_string()),
+            Some("could not ask the guest to stat \"/x\": EMFILE".to_owned())
+        );
+    }
+
+    #[test]
+    fn detcore_exits_on_a_refusal_only_when_the_config_asks() {
+        assert!(refusal_to_exit_on(&exiting_config(), &refused()).is_some());
+        assert!(refusal_to_exit_on(&Config::default(), &refused()).is_none());
+    }
+
+    #[test]
+    fn detcore_does_not_exit_on_any_other_result() {
+        let config = exiting_config();
+        let other_tool_error: Result<i64, Error> =
+            Err(Error::Tool(anyhow::anyhow!("some other tool error")));
+        let unsupported: Result<i64, Error> = Err(Error::Tool(anyhow::Error::new(
+            UnsupportedSyscallError(Sysno::read),
+        )));
+        let errno: Result<i64, Error> = Err(Error::Errno(Errno::EIO));
+        for res in [Ok(0), errno, other_tool_error, unsupported] {
+            assert!(refusal_to_exit_on(&config, &res).is_none(), "{res:?}");
+        }
+    }
+
+    #[test]
+    fn no_backend_exits_on_a_refusal_by_default() {
+        assert!(!Config::default().exit_process_on_identity_lookup_refusal);
     }
 }

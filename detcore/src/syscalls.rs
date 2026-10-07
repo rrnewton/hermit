@@ -23,6 +23,10 @@ mod namespace;
 pub(crate) use namespace::anonymous_object_devices;
 pub(crate) use network_trace::received_descriptors;
 mod network_trace;
+// Public so hermit-cli can probe the pipefs and sockfs devices in the Hermit
+// process before launch, rather than Detcore probing in a guest's descriptor
+// table when it constructs the tool.
+pub use namespace::probe_anonymous_object_devices;
 pub(crate) mod robust_list;
 mod signal;
 /// The guest's virtual SIGALRM blocked bit (signal phase 1).

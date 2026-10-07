@@ -2821,6 +2821,11 @@ const LEGACY_DBT_DETCONFIG_KEYS: [(&str, bool, &str); 3] = [
 /// The output is byte-identical to what the same config produced before
 /// either change. That is pinned by golden bytes in the tests below.
 ///
+/// Fields added since are the reverse case. Those DBT's launcher leaves at
+/// their serde defaults are left out by [`detcore::to_legacy_backend_json`]
+/// while they hold those defaults, so they keep those bytes too; a non-default
+/// value is still serialized.
+///
 /// Remove this shim when the config reaches the DBT runtime through a private
 /// channel that is stripped before the guest starts. SaBRe already works that
 /// way: its plugin receives the config over the coordinator RPC handshake and
@@ -3076,6 +3081,234 @@ mod dbt_detconfig_tests {
     }
 }
 
+/// The DBT config leaves each field DBT's launcher holds at its serde default
+/// out of `HERMIT_DBT_DETCONFIG` ([`detcore::to_legacy_backend_json`] does),
+/// carries a value that is not the default, and decodes back either way.
+#[cfg(test)]
+mod dbt_detconfig_omit_tests {
+    use std::path::PathBuf;
+
+    use clap::Parser;
+    use detcore_model::config::MountInfoRootRewrite;
+
+    use super::Backend;
+    use super::DetConfig;
+    use super::dbt_detconfig_json;
+    use super::prepare_backend_config;
+
+    /// Require the DBT runtime to decode exactly `config` from
+    /// [`dbt_detconfig_json`]'s output.
+    ///
+    /// The output is parsed back into [`DetConfig`] the way the runtime parses
+    /// `HERMIT_DBT_DETCONFIG`, with [`detcore::from_legacy_backend_json`], and
+    /// the parsed config must serialize to the same
+    /// bytes as `config` ([`DetConfig`] has no `PartialEq`). A key the encoder
+    /// leaves out therefore has to come back as the value it held, which proves
+    /// that it was left out only at its serde default and that a missing key
+    /// decodes to that default. Each field the encoder can leave out is checked
+    /// here at its default and at another value.
+    fn assert_dbt_detconfig_round_trips(config: &DetConfig) {
+        let encoded = dbt_detconfig_json(config)
+            .unwrap_or_else(|error| panic!("DBT config does not serialize: {error}"));
+        let decoded = detcore::from_legacy_backend_json(&encoded)
+            .unwrap_or_else(|error| panic!("DBT config does not decode: {error}\n{encoded}"));
+        assert_eq!(
+            serde_json::to_string(&decoded).unwrap(),
+            serde_json::to_string(config).unwrap(),
+            "the DBT runtime would decode a different config from HERMIT_DBT_DETCONFIG"
+        );
+    }
+
+    /// `Config::default()` with its three environment-backed fields
+    /// (`HERMIT_EPOCH`, `HERMIT_PRNG`, `HERMIT_SCHED_SEED`) pinned, so the
+    /// result does not depend on the test process's environment.
+    fn env_free(epoch: &str, seed: &str) -> DetConfig {
+        let mut config = DetConfig::parse_from(["hermit", epoch, seed, "--sched-seed=0"]);
+        config.sched_seed = None;
+        config
+    }
+
+    fn default_config() -> DetConfig {
+        env_free("--epoch=2026-01-01T00:00:00Z", "--seed=0")
+    }
+
+    /// Non-default values in fields that serialize as strings, floats,
+    /// options, and nested arrays. The path holds quoted top-level key names,
+    /// commas and a brace, so a substring-based omission would cut into it.
+    fn rich_config() -> DetConfig {
+        let mut config = env_free("--epoch=2000-12-31T23:59:59Z", "--seed=7");
+        config.rng_seed = Some(13);
+        config.sched_seed = Some(11);
+        config.clock_multiplier = Some(1.5);
+        config.chaos = true;
+        config.record_preemptions_to = Some(PathBuf::from(
+            "/tmp/a,\"chaos\":false,\"sched_seed\":null,\"clock_multiplier\":{",
+        ));
+        config.mountinfo_root_rewrites = vec![MountInfoRootRewrite {
+            raw_mount_id: 41,
+            deterministic_root: b"/".to_vec(),
+            raw_root_prefix: Some(b"/tmp/x".to_vec()),
+            deterministic_root_prefix: Some(b"/tmp".to_vec()),
+            raw_mountpoint_prefix: None,
+            deterministic_mountpoint_prefix: None,
+        }];
+        config.stacktrace_event = vec![(3, Some(PathBuf::from("/s")))];
+        config
+    }
+
+    /// `Config::default()`, and configs prepared the way `hermit run --backend
+    /// dbt` prepares the config it exports.
+    fn real_configs() -> [(&'static str, DetConfig); 3] {
+        [
+            ("default", DetConfig::default()),
+            (
+                "dbt",
+                prepare_backend_config(default_config(), Backend::Dbt),
+            ),
+            (
+                "rich_dbt",
+                prepare_backend_config(rich_config(), Backend::Dbt),
+            ),
+        ]
+    }
+
+    /// Every real config's full `HERMIT_DBT_DETCONFIG` value, legacy keys
+    /// included, decodes back to the config. The golden test in
+    /// `dbt_detconfig_tests` pins the bytes of that value.
+    #[test]
+    fn real_configs_round_trip_through_the_dbt_config() {
+        for (_, config) in real_configs() {
+            assert_dbt_detconfig_round_trips(&config);
+        }
+    }
+
+    /// With the field `None`, which is what `prepare_backend_config` gives
+    /// DBT, the key is absent from `HERMIT_DBT_DETCONFIG`, so the value the
+    /// guest can read keeps its baseline bytes.
+    #[test]
+    fn anonymous_object_devices_none_is_absent_from_the_dbt_config() {
+        for (name, config) in [
+            ("default", default_config()),
+            (
+                "dbt",
+                prepare_backend_config(default_config(), Backend::Dbt),
+            ),
+        ] {
+            assert_eq!(config.anonymous_object_devices, None, "{name}");
+            let encoded = dbt_detconfig_json(&config).unwrap();
+            assert!(
+                !encoded.contains("anonymous_object_devices"),
+                "{name}: {encoded}"
+            );
+        }
+    }
+
+    /// The DBT config decodes back to the same config with the field `None`,
+    /// whose key is omitted, and with it `Some`, whose key is emitted.
+    #[test]
+    fn anonymous_object_devices_round_trip_through_the_dbt_config() {
+        let mut config = default_config();
+        config.anonymous_object_devices = None;
+        assert_dbt_detconfig_round_trips(&config);
+
+        config.anonymous_object_devices = Some(detcore::AnonymousObjectDevices {
+            pipe: 0x0e,
+            socket: 0x08,
+        });
+        let encoded = dbt_detconfig_json(&config).unwrap();
+        assert_eq!(
+            encoded
+                .matches(r#""anonymous_object_devices":{"pipe":14,"socket":8}"#)
+                .count(),
+            1,
+            "{encoded}"
+        );
+        assert_dbt_detconfig_round_trips(&config);
+    }
+
+    /// With the field false, which is what `prepare_backend_config` gives
+    /// DBT, the key is absent from `HERMIT_DBT_DETCONFIG`, so the value the
+    /// guest can read keeps its baseline bytes.
+    #[test]
+    fn exit_process_on_identity_lookup_refusal_false_is_absent_from_the_dbt_config() {
+        for (name, config) in [
+            ("default", default_config()),
+            (
+                "dbt",
+                prepare_backend_config(default_config(), Backend::Dbt),
+            ),
+        ] {
+            assert!(!config.exit_process_on_identity_lookup_refusal, "{name}");
+            let encoded = dbt_detconfig_json(&config).unwrap();
+            assert!(
+                !encoded.contains("exit_process_on_identity_lookup_refusal"),
+                "{name}: {encoded}"
+            );
+        }
+    }
+
+    /// The DBT config decodes back to the same config with the field false,
+    /// whose key is omitted, and with it true, whose key is emitted.
+    #[test]
+    fn exit_process_on_identity_lookup_refusal_round_trips_through_the_dbt_config() {
+        let mut config = default_config();
+        config.exit_process_on_identity_lookup_refusal = false;
+        assert_dbt_detconfig_round_trips(&config);
+
+        config.exit_process_on_identity_lookup_refusal = true;
+        let encoded = dbt_detconfig_json(&config).unwrap();
+        assert_eq!(
+            encoded
+                .matches(r#""exit_process_on_identity_lookup_refusal":true"#)
+                .count(),
+            1,
+            "{encoded}"
+        );
+        assert_dbt_detconfig_round_trips(&config);
+    }
+
+    /// With the field false, which is what `prepare_backend_config` gives
+    /// DBT, the key is absent from `HERMIT_DBT_DETCONFIG`, so the value the
+    /// guest can read keeps its baseline bytes.
+    #[test]
+    fn tool_opens_outside_guest_descriptor_table_false_is_absent_from_the_dbt_config() {
+        for (name, config) in [
+            ("default", default_config()),
+            (
+                "dbt",
+                prepare_backend_config(default_config(), Backend::Dbt),
+            ),
+        ] {
+            assert!(!config.tool_opens_outside_guest_descriptor_table, "{name}");
+            let encoded = dbt_detconfig_json(&config).unwrap();
+            assert!(
+                !encoded.contains("tool_opens_outside_guest_descriptor_table"),
+                "{name}: {encoded}"
+            );
+        }
+    }
+
+    /// The DBT config decodes back to the same config with the field false,
+    /// whose key is omitted, and with it true, whose key is emitted.
+    #[test]
+    fn tool_opens_outside_guest_descriptor_table_round_trips_through_the_dbt_config() {
+        let mut config = default_config();
+        config.tool_opens_outside_guest_descriptor_table = false;
+        assert_dbt_detconfig_round_trips(&config);
+
+        config.tool_opens_outside_guest_descriptor_table = true;
+        let encoded = dbt_detconfig_json(&config).unwrap();
+        assert_eq!(
+            encoded
+                .matches(r#""tool_opens_outside_guest_descriptor_table":true"#)
+                .count(),
+            1,
+            "{encoded}"
+        );
+        assert_dbt_detconfig_round_trips(&config);
+    }
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-737): Review public DBT dispatch and child environment ownership.
 /// Dispatch a command onto the Detcore-linked reverie-dbt runtime.
@@ -3311,6 +3544,23 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // TODO-HUMAN-REVIEW(PR-1122): Review concurrent KVM process-child scheduling.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-3635): Review in-guest LiteInst killed-thread RPC cancellation.
+    // A refused identity lookup must end the refusing process. Ptrace (which
+    // e9patch preprocessing also runs under) and KVM end execution on any tool
+    // error that is not an errno, in-guest LiteInst ends the process on one,
+    // and detcore-dbt ends the runtime tree on this refusal. Reverie's SaBRe
+    // adapter would instead return the error to the guest as EIO, so on SaBRe
+    // Detcore, which runs inside the guest process there, ends the process
+    // itself.
+    config.exit_process_on_identity_lookup_refusal = backend == Backend::Sabre;
+    // A file Detcore opens for itself takes a tracer descriptor on ptrace,
+    // which `hermit run --backend=e9patch` also selects, and a VMM descriptor
+    // on KVM, which translates guest descriptors. On DBT, SaBRe and LiteInst
+    // Detcore runs in the guest process, so such a file would take a number
+    // in the guest's descriptor table, and Detcore refuses a lookup that needs
+    // one. A direct caller's `Backend::E9patch` keeps that refusal too: this
+    // helper cannot tell where that caller's tool runs.
+    config.tool_opens_outside_guest_descriptor_table =
+        matches!(backend, Backend::Ptrace | Backend::Kvm);
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1152): KVM defers the vfork child spawn, so the child
     // registers its vfork barrier only after the parent posts BlockedExternalContinue. ptrace keeps
@@ -3335,6 +3585,32 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // host is asked only for them.
     config.guest_may_inherit_a_terminal =
         config.backend_supports_blocked_wait_signal_interruption && launcher_may_pass_a_terminal();
+    // Probe the pipefs and sockfs devices here, in the Hermit process, for
+    // every backend except DBT. Detcore otherwise probes them when it
+    // constructs the tool, which on SaBRe, LiteInst and e9patch's in-guest
+    // host allocates descriptors in the guest's table, and a failure there (a
+    // full table at construction) would make a later readlink of another
+    // process's pipe or socket link fail. DBT receives `None`: its config
+    // travels in HERMIT_DBT_DETCONFIG, which the guest can read and which must
+    // stay byte-identical to the baseline, so the devices stay out of it and
+    // Detcore probes in the guest when it constructs the tool. Always
+    // re-probed, never carried over, because the devices are numbered at boot.
+    // A failure here leaves `None`, and Detcore probes at construction as
+    // before.
+    config.anonymous_object_devices = if config.virtualize_metadata && backend != Backend::Dbt {
+        match detcore::probe_anonymous_object_devices() {
+            Ok(devices) => Some(devices),
+            Err(error) => {
+                tracing::warn!(
+                    "could not probe the pipefs and sockfs devices ({error}); Detcore will probe \
+                     when it constructs the tool"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     config
 }
 
@@ -5762,6 +6038,51 @@ mod tests {
         );
     }
 
+    /// Only SaBRe returns a tool error to the guest as an errno, so only
+    /// SaBRe asks Detcore to end a process whose identity lookup it refused;
+    /// every other backend's own tool-error path stops that process.
+    #[test]
+    fn only_sabre_asks_detcore_to_exit_on_a_refused_identity_lookup() {
+        for backend in [
+            Backend::Ptrace,
+            Backend::Dbt,
+            Backend::Kvm,
+            Backend::Sabre,
+            Backend::Liteinst,
+            Backend::E9patch,
+        ] {
+            assert_eq!(
+                prepare_backend_config(super::DetConfig::default(), backend)
+                    .exit_process_on_identity_lookup_refusal,
+                backend == Backend::Sabre,
+                "{backend:?}"
+            );
+        }
+    }
+
+    /// Only ptrace and KVM give a file Detcore opens for itself a descriptor
+    /// outside the guest's table; every other backend keeps the default,
+    /// under which Detcore refuses a lookup that would open one.
+    #[test]
+    fn only_ptrace_and_kvm_let_detcore_open_outside_the_guest_descriptor_table() {
+        for backend in [
+            Backend::Ptrace,
+            Backend::Dbt,
+            Backend::Kvm,
+            Backend::Sabre,
+            Backend::Liteinst,
+            Backend::E9patch,
+        ] {
+            assert_eq!(
+                prepare_backend_config(super::DetConfig::default(), backend)
+                    .tool_opens_outside_guest_descriptor_table,
+                matches!(backend, Backend::Ptrace | Backend::Kvm),
+                "{backend:?}"
+            );
+        }
+        assert!(!super::DetConfig::default().tool_opens_outside_guest_descriptor_table);
+    }
+
     #[test]
     fn sabre_backend_configures_process_local_capabilities() {
         let config = super::DetConfig::default();
@@ -6153,6 +6474,59 @@ mod tests {
         assert!(!config.backend.runs_exit_robust_list);
         assert!(config.backend.requires_thread_directed_process_signals);
         assert!(!config.backend.defers_vfork_child_registration);
+    }
+
+    /// Every backend except DBT receives the pipefs and sockfs devices the
+    /// Hermit process probed, so, when that probe succeeds, none of them
+    /// probes in a guest's descriptor table. DBT receives `None`, which keeps
+    /// the key out of the guest-visible HERMIT_DBT_DETCONFIG, and Detcore
+    /// probes in the guest when it constructs the tool. Without virtualized
+    /// metadata nothing reads the devices and nothing is probed.
+    #[test]
+    fn every_backend_but_dbt_receives_the_hermit_process_anonymous_object_devices() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (reader, _writer) = std::io::pipe().unwrap();
+        let pipe = std::fs::File::from(std::os::fd::OwnedFd::from(reader))
+            .metadata()
+            .unwrap()
+            .dev();
+        let (left, _right) = std::os::unix::net::UnixStream::pair().unwrap();
+        let socket = std::fs::File::from(std::os::fd::OwnedFd::from(left))
+            .metadata()
+            .unwrap()
+            .dev();
+        let expected = detcore::AnonymousObjectDevices { pipe, socket };
+        for backend in [
+            Backend::Ptrace,
+            Backend::Dbt,
+            Backend::Kvm,
+            Backend::Sabre,
+            Backend::Liteinst,
+            Backend::E9patch,
+        ] {
+            let config = prepare_backend_config(super::DetConfig::default(), backend);
+            if backend == Backend::Dbt {
+                assert_eq!(
+                    config.anonymous_object_devices, None,
+                    "DBT must not carry devices in its guest-visible config"
+                );
+            } else {
+                assert_eq!(
+                    config.anonymous_object_devices,
+                    Some(expected),
+                    "{backend:?} must carry the probed devices"
+                );
+            }
+            let raw = super::DetConfig {
+                virtualize_metadata: false,
+                ..super::DetConfig::default()
+            };
+            assert_eq!(
+                prepare_backend_config(raw, backend).anonymous_object_devices,
+                None
+            );
+        }
     }
 
     #[test]

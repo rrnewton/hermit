@@ -24,6 +24,7 @@ use serde::Serialize;
 
 use crate::dirents::DirEntry;
 use crate::dirents::DirectoryStream;
+use crate::procfs::MappingSubject;
 use crate::procfs::ProcfsFile;
 use crate::procfs::ProcfsSnapshotContext;
 use crate::procfs::TimerSlackReadPreview;
@@ -279,7 +280,21 @@ struct OpenFileDescription {
     ///  - dev, rdev, blksize
     ///
     /// This should always be `Some` for regular files, as we eagerly populate it.
+    ///
+    /// ⚠️ FOR THE INHERITED STDIO DESCRIPTORS THIS IS A STAND-IN, not their
+    /// own: on every backend but SaBRe, which discovers each descriptor with
+    /// its own `fstat`, `setup_stdio` gives descriptors 0, 1 and 2 one
+    /// `fstat(0)`. Their identity is `identity_stat`.
     stat: Option<DetStat>,
+    /// The descriptor's own `fstat`, cached by
+    /// `Detcore::descriptor_identity_stat` where `stat` is a stand-in: an
+    /// inherited stdio descriptor or a dup of one. Shared by every alias of
+    /// this open file description, as the object it refers to is. Only the
+    /// identity fields are read from it -- device, inode and file type --
+    /// which never change while the description is open, unlike its size or
+    /// times.
+    #[serde(default)]
+    identity_stat: Option<DetStat>,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1096): Review canonical random-device cursor sharing.
     /// Cursor into Hermit's backend-independent random-device byte stream.
@@ -425,6 +440,7 @@ impl DetFd {
                 inode: None,
                 dirty: false,
                 stat: None,
+                identity_stat: None,
                 random_device_offset: 0,
                 resource: None,
                 procfs: None,
@@ -721,6 +737,17 @@ impl DetFd {
         })
     }
 
+    /// Whose address space this `maps`/`smaps` snapshot shows to a reader in
+    /// `reader_mm`; see `ProcfsFile::mapping_subject`. `Unknown` for a
+    /// descriptor that is not a procfs file.
+    pub(crate) fn procfs_mapping_subject(&self, reader_mm: MmId) -> MappingSubject {
+        self.with_description(|d| {
+            d.procfs.as_ref().map_or(MappingSubject::Unknown, |procfs| {
+                procfs.mapping_subject(reader_mm)
+            })
+        })
+    }
+
     pub(crate) fn procfs_needs_mountinfo_identities(&self) -> bool {
         self.with_description(|d| {
             d.procfs
@@ -923,6 +950,18 @@ impl DetFd {
     /// Cached stat data attached to the backing object.
     pub fn stat(&self) -> Option<DetStat> {
         self.with_description(|d| d.stat)
+    }
+
+    /// The descriptor's own `fstat` where [`Self::stat`] is a stand-in, once
+    /// Detcore has asked for it (see `OpenFileDescription::identity_stat`).
+    pub(crate) fn identity_stat(&self) -> Option<DetStat> {
+        self.with_description(|d| d.identity_stat)
+    }
+
+    /// Record the descriptor's own `fstat` for every alias of this open file
+    /// description.
+    pub(crate) fn set_identity_stat(&self, stat: DetStat) {
+        self.with_description(|d| d.identity_stat = Some(stat));
     }
 
     /// Whether Detcore has made the open file description physically nonblocking.

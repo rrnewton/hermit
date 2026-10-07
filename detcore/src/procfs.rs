@@ -9,6 +9,7 @@
 //! Deterministic snapshots for volatile procfs and sysfs files.
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
@@ -16,6 +17,8 @@ use std::path::PathBuf;
 use chrono::DateTime;
 use chrono::Utc;
 use detcore_model::config::MountInfoRootRewrite;
+use detcore_model::fd::DetInode;
+use detcore_model::fd::RawInode;
 use detcore_model::procfs::MOUNT_PEER_PREFIXES;
 use detcore_model::procfs::MountInfoRow;
 pub(crate) use detcore_model::procfs::exclude_ephemeral_host_seed_mounts;
@@ -25,6 +28,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::syscalls::DETERMINISTIC_PIPE_CAPACITY_BYTES;
+use crate::types::MmId;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ProcfsKind {
@@ -343,8 +347,42 @@ pub(crate) struct ProcfsFile {
     bound_thread_identity: Option<(i32, i32, i32)>,
     #[serde(default)]
     timer_slack_identity: Option<(u64, u64)>,
+    /// True for a `maps`/`smaps` file the guest spelled through `/proc/self`
+    /// or `/proc/thread-self`, which therefore shows the address space of the
+    /// task that opened it.
+    #[serde(default)]
+    shows_opener_address_space: bool,
+    /// The number a `maps`/`smaps` file was spelled with: `N` in
+    /// `/proc/N/maps`, `/proc/N/smaps` and `/proc/N/task/T/maps`, a pid or tid
+    /// in the guest's pid namespace.
+    #[serde(default)]
+    numeric_mapping_subject: Option<i32>,
+    /// The opener's address space, bound at open time when the file shows it.
+    /// See `bind_mapping_subject` and `mapping_subject`.
+    #[serde(default)]
+    mapping_address_space: Option<MmId>,
+    /// The pid or tid, in the guest's pid namespace, of the task whose address
+    /// space this file shows, bound at open time. See `mapping_subject`.
+    #[serde(default)]
+    mapping_subject_pid: Option<i32>,
     contents: Option<Vec<u8>>,
     offset: usize,
+}
+
+/// Whose address space a `maps`/`smaps` snapshot shows, as far as its reader
+/// can tell (`ProcfsFile::mapping_subject`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MappingSubject {
+    /// The reader's own address space. The reader's mapping records
+    /// (`MemoryMetadata::mapped_file_at`) describe the snapshot, and
+    /// `/proc/self/exe` names the executable it shows.
+    Reader,
+    /// Another address space, of the task with this pid or tid in the guest's
+    /// pid namespace: `/proc/<pid>/exe` names the executable it shows, while
+    /// that task lives and has not called `execve`.
+    Process(i32),
+    /// Another address space, of a task not known by number.
+    Unknown,
 }
 
 /// A non-mutating candidate for one sequential timer-slack read.
@@ -639,8 +677,9 @@ pub(crate) struct ProcfsSnapshotContext {
     pub(crate) virtual_ppid: i32,
     pub(crate) virtual_pty_count: usize,
     pub(crate) fdinfo_identity: Option<(u64, i32, u64, u64)>,
-    /// Raw `(device, inode)` -> determinized `(device, inode)` for every backed
-    /// mapping in a `maps`/`smaps` snapshot.
+    /// Raw mapping header (`MappingKey`: device, inode and pathname columns) ->
+    /// determinized `(device, inode)` for every backed mapping in a
+    /// `maps`/`smaps` snapshot.
     ///
     /// ⚠️ BUILT BY THE CALLER, NEVER HERE. The sanitizers in this module are
     /// pure functions of content and have no guest handle, so they cannot reach
@@ -650,7 +689,23 @@ pub(crate) struct ProcfsSnapshotContext {
     /// `determinize_inode`/`determinize_device` that `determinize_stat` uses,
     /// exactly as `fdinfo_identity` above is built, and this table is only a
     /// lookup for rendering.
-    pub(crate) mapping_identities: BTreeMap<(u64, u64), (u64, u64)>,
+    ///
+    /// ⚠️ THE MAPS DEVICE IS NOT ALWAYS `st_dev`. On btrfs, maps prints the
+    /// superblock's device (`0:32` for `/` on the machine this was measured on)
+    /// while `stat` prints the subvolume's anonymous device (`0:33`, and `0:50`
+    /// for `/var/tmp` on the same filesystem); overlayfs prints the lower
+    /// file's device in maps and its own in `stat`. The inode pool is keyed on
+    /// device AND inode (<https://github.com/rrnewton/hermit/issues/3307>), so
+    /// determinizing the maps pair as-is gives the maps inode column a
+    /// different value from `st_ino` for the same file, where Linux prints the
+    /// same number in both. The caller therefore determinizes the inode from
+    /// the raw identity `stat` reports for the mapped file (see
+    /// `mapping_stat_identity` in `syscalls/files.rs`, and the limits it
+    /// documents), and only the DEVICE column from the maps device -- which
+    /// disagrees with `st_dev` on native Linux too. The pathname is part of
+    /// the key because two btrfs subvolumes number their inodes independently,
+    /// so one maps `(device, inode)` pair can name two different files.
+    pub(crate) mapping_identities: MappingIdentities,
     pub(crate) mountinfo: Option<MountInfoSnapshot>,
     pub(crate) random_uuid: Option<[u8; 16]>,
 }
@@ -854,11 +909,28 @@ impl ProcfsFile {
             _ if is_irq_per_cpu_count_path(&path) => ProcfsKind::IrqPerCpuCount,
             _ => sysfs_rtc_kind(&path)?,
         };
+        let mapping_task = if matches!(kind, ProcfsKind::Maps | ProcfsKind::Smaps) {
+            path_text
+                .strip_prefix("/proc/")
+                .and_then(|relative| relative.split('/').next())
+        } else {
+            None
+        };
+        let shows_opener_address_space =
+            mapping_task.is_some_and(|task| matches!(task, "self" | "thread-self"));
+        let numeric_mapping_subject = mapping_task
+            .filter(|task| is_numeric_id(task))
+            .and_then(|task| task.parse::<i32>().ok())
+            .filter(|subject| *subject > 0);
         Some(Self {
             kind,
             target_fd,
             bound_thread_identity: None,
             timer_slack_identity: None,
+            shows_opener_address_space,
+            numeric_mapping_subject,
+            mapping_address_space: None,
+            mapping_subject_pid: None,
             contents: None,
             offset: 0,
         })
@@ -878,6 +950,60 @@ impl ProcfsFile {
             self.kind,
             ProcfsKind::Maps | ProcfsKind::Smaps | ProcfsKind::NumaMaps | ProcfsKind::SmapsRollup
         )
+    }
+
+    /// Whether binding this file's subject (`bind_mapping_subject`) needs the
+    /// opener's thread-group id and thread id: true for every `maps`/`smaps`
+    /// file, whose subject is the opener or a task named by number.
+    pub(crate) fn needs_mapping_opener_ids(&self) -> bool {
+        self.shows_opener_address_space || self.numeric_mapping_subject.is_some()
+    }
+
+    /// Records, at open time, whose address space this `maps`/`smaps` file
+    /// shows, as Linux binds it then (`proc_mem_open`); other kinds ignore it.
+    ///
+    /// `opener_mm` is the opening task's address space and `opener_ids` its
+    /// thread-group id and thread id as the guest's own `getpid` and `gettid`
+    /// report them, or `None` when they were not asked for.
+    ///
+    /// A file spelled through `/proc/self` or `/proc/thread-self`, or through
+    /// the opener's own thread-group id or thread id, shows the opener's
+    /// address space. A file spelled with another number shows that task's,
+    /// which may share the opener's address space -- a sibling thread's tid,
+    /// or a `CLONE_VM` child -- but is not recognized as doing so.
+    pub(crate) fn bind_mapping_subject(&mut self, opener_mm: MmId, opener_ids: Option<(i32, i32)>) {
+        if self.shows_opener_address_space {
+            self.mapping_address_space = Some(opener_mm);
+            self.mapping_subject_pid = opener_ids.map(|(tgid, _)| tgid);
+        } else if let Some(subject) = self.numeric_mapping_subject {
+            if opener_ids.is_some_and(|(tgid, tid)| subject == tgid || subject == tid) {
+                self.mapping_address_space = Some(opener_mm);
+            }
+            self.mapping_subject_pid = Some(subject);
+        }
+    }
+
+    /// Whose address space this `maps`/`smaps` file shows to a reader whose
+    /// address space is `reader_mm`.
+    ///
+    /// A mapping's recorded file (`MemoryMetadata::mapped_file_at`) belongs to
+    /// ONE address space, and the reader's record describes the snapshot only
+    /// when the file shows the reader's address space. It does not in
+    /// general: the kind matches `/proc/<any pid>/maps`, a descriptor opened
+    /// through `/proc/self` still shows the opener after a `fork` hands it to
+    /// the child, and an `execve` replaces the opener's address space.
+    /// Without this check another file with the same inode number at the same
+    /// address in the reader -- for example a file of another btrfs subvolume,
+    /// whose inode numbers repeat, in a guest without address randomization --
+    /// would key the line on the wrong file.
+    pub(crate) fn mapping_subject(&self, reader_mm: MmId) -> MappingSubject {
+        if self.mapping_address_space == Some(reader_mm) {
+            MappingSubject::Reader
+        } else if let Some(pid) = self.mapping_subject_pid {
+            MappingSubject::Process(pid)
+        } else {
+            MappingSubject::Unknown
+        }
     }
 
     pub(crate) fn needs_mountinfo_identities(&self) -> bool {
@@ -1228,6 +1354,25 @@ fn parse_timer_slack_target(path: &str) -> Option<Option<i32>> {
     }
     let target = task.parse::<i32>().ok().filter(|target| *target > 0)?;
     Some(Some(target))
+}
+
+/// The inode number on the `ino:` line of `/proc/<pid>/fdinfo/<fd>` bytes, or
+/// `None` unless there is exactly one such line holding only decimal digits.
+pub(crate) fn parse_fdinfo_inode(contents: &[u8]) -> Option<u64> {
+    let mut inode = None;
+    for line in contents.split(|byte| *byte == b'\n') {
+        let Some(value) = line.strip_prefix(b"ino:") else {
+            continue;
+        };
+        let value = value
+            .strip_prefix(b"\t")
+            .or_else(|| value.strip_prefix(b" "))?;
+        if value.is_empty() || value.iter().any(|byte| !byte.is_ascii_digit()) || inode.is_some() {
+            return None;
+        }
+        inode = Some(std::str::from_utf8(value).ok()?.parse().ok()?);
+    }
+    inode
 }
 
 fn parse_fdinfo_target(path: &str) -> Option<i32> {
@@ -3069,7 +3214,7 @@ fn sanitize_arch_status(contents: &[u8]) -> Vec<u8> {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-949): Review the /proc/self/smaps accounting field policy.
-fn sanitize_smaps(contents: &[u8], table: &BTreeMap<(u64, u64), (u64, u64)>) -> Vec<u8> {
+fn sanitize_smaps(contents: &[u8], table: &MappingIdentities) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
     };
@@ -3150,11 +3295,266 @@ pub(crate) fn mapping_header_identity(line: &str) -> Option<(u64, u64)> {
     Some((libc::makedev(major, minor), inode))
 }
 
+/// One backed mapping as its `maps`/`smaps` header names it: the raw device
+/// and inode columns and the pathname column, byte for byte.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct MappingKey {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) pathname: String,
+}
+
+/// Mapping header -> determinized `(device, inode)`; see
+/// `ProcfsSnapshotContext::mapping_identities`.
+///
+/// This is a LOOKUP table for rendering only. Its sorted iteration order is
+/// never used to mint: [`mint_mapping_identities`] visits the headers in
+/// [`mapping_keys_in_text_order`].
+pub(crate) type MappingIdentities = BTreeMap<MappingKey, (u64, u64)>;
+
+/// Parse the device, inode and pathname of a backed mapping header.
+///
+/// The pathname is everything after the padding that follows the inode, and
+/// may itself contain spaces. It is empty for a backed mapping the kernel
+/// prints without a name.
+pub(crate) fn mapping_header_key(line: &str) -> Option<MappingKey> {
+    let (device, inode) = mapping_header_identity(line)?;
+    let mut rest = line;
+    for _ in 0..5 {
+        rest = rest.trim_start();
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        rest = &rest[end..];
+    }
+    Some(MappingKey {
+        device,
+        inode,
+        pathname: rest.trim_start().to_string(),
+    })
+}
+
+/// Every distinct backed mapping header of one `maps`/`smaps` snapshot, in the
+/// order its FIRST line appears in the text, with the start address of every
+/// line that carries it (in text order too).
+///
+/// This is the order in which [`mint_mapping_identities`] mints deterministic
+/// identities for files the run has not seen before, so it must be a function
+/// of bytes the guest already observes. The text qualifies: `sanitize_maps`
+/// renders every raw line -- addresses, permissions, offsets and pathnames
+/// included -- in its original order and rewrites only the device and inode
+/// columns, so the line order is already guest-visible output. Minting in that
+/// order therefore adds no dependence on host state beyond what the guest
+/// already reads.
+///
+/// Whether those bytes are the same from run to run depends on the backend.
+/// Every Linux-process backend Hermit launches except LiteInst sets
+/// `ADDR_NO_RANDOMIZE` before the guest execs:
+///
+/// - ptrace: `init_tracee` in `reverie/reverie-ptrace/src/tracer.rs` calls
+///   `personality(PER_LINUX | ADDR_NO_RANDOMIZE)` in the child's `pre_exec`
+///   closure installed by `TracerBuilder::spawn`;
+/// - DBT ORs `ADDR_NO_RANDOMIZE` into the current personality in its own
+///   `pre_exec` (`reverie/reverie-dbt/src/launcher.rs`, the
+///   `libc::personality` calls in the launch command);
+/// - SaBRe does the same in `spawn_tracee` (`hermit-cli/src/sabre_ptrace.rs`).
+///
+/// That flag does not make every address reproducible. On DBT, DynamoRIO's
+/// own regions appear in the guest's maps, and it can place them at a base
+/// jittered by its PRNG (`vmm_place_vmcode` in the vendored
+/// `dynamorio/core/heap.c`), which is seeded from `/dev/urandom` because the
+/// launcher passes no `-prng_seed`. Their address columns, and with them
+/// where their lines fall among the other mappings, can then differ between
+/// runs. That is nondeterministic guest-visible output that already exists
+/// without this ordering, and the mint order still follows the bytes the
+/// guest sees.
+///
+/// LiteInst runs Detcore only in the guest. Its `launch` in
+/// `reverie-liteinst/src/backend.rs` spawns the guest with a plain
+/// `std::process::Command` that preloads the runtime, and neither it nor
+/// Hermit changes the personality, so the guest gets whatever address-space
+/// randomization the host's `kernel.randomize_va_space` setting gives it. Its
+/// address columns can then differ between runs in the same way, and the mint
+/// order still follows the bytes the guest sees.
+///
+/// `personality(2)` is classified `PassThrough`
+/// (`crate::syscall_classification`), so a guest can also turn ASLR back on
+/// and re-exec. The address columns are then nondeterministic guest output in
+/// the same way.
+///
+/// The raw numbers are not guest-controlled: Linux hands out shmem and memfd
+/// inodes from per-CPU batches, so two memfds created in the same guest order
+/// can get raw inodes in either numeric order, and raw device numbers are
+/// assigned in host mount order. Visiting the headers in their sorted order (a
+/// `BTreeMap` of keys, which sorts by raw device, then raw inode, then
+/// pathname) would let that host numbering decide which file got the lower
+/// deterministic inode, and which raw device got the lower deterministic
+/// device.
+///
+/// Splits on `\n` exactly as `sanitize_maps`/`sanitize_smaps` do, so each key
+/// is the one `rewrite_mapping_header` will look up for the same line. A line
+/// whose address range does not parse still contributes its key, without a
+/// start address.
+pub(crate) fn mapping_keys_in_text_order(contents: &[u8]) -> Vec<(MappingKey, Vec<usize>)> {
+    let mut keys: Vec<(MappingKey, Vec<usize>)> = Vec::new();
+    // Position of each key in `keys`; consulted only to deduplicate, never
+    // iterated, so its order cannot reach the result.
+    let mut positions: HashMap<MappingKey, usize> = HashMap::new();
+    let Ok(text) = std::str::from_utf8(contents) else {
+        // The sanitizers pass non-UTF-8 content through unchanged, so no key
+        // built from it would ever be looked up.
+        return keys;
+    };
+    for line in text.split('\n') {
+        let Some(key) = mapping_header_key(line) else {
+            continue;
+        };
+        let start = line
+            .split_whitespace()
+            .next()
+            .and_then(|range| range.split_once('-'))
+            .and_then(|(start, _)| usize::from_str_radix(start, 16).ok());
+        let position = match positions.get(&key) {
+            Some(&position) => position,
+            None => {
+                positions.insert(key.clone(), keys.len());
+                keys.push((key, Vec::new()));
+                keys.len() - 1
+            }
+        };
+        keys[position].1.extend(start);
+    }
+    keys
+}
+
+/// The run-global identity pools a `maps`/`smaps` snapshot mints from, and the
+/// resolution of a mapping header to the file identity `stat` reports.
+///
+/// Production implements this over the guest's RPCs to the global
+/// `InodePool`/`DevicePool` (the same pools `stat` uses) and over
+/// `mapping_stat_identity` in `syscalls/files.rs`; unit tests implement it
+/// over the pools directly. Both then run the one minting loop in
+/// [`mint_mapping_identities`], so the ORDER of the mint calls -- the thing
+/// that decides which file gets which deterministic number -- is tested as
+/// production executes it rather than through a copy.
+pub(crate) trait MappingIdentityMinter {
+    /// Why a header could not be resolved to a file identity.
+    type Error;
+    /// The raw identity `stat` reports for the file `key` names. `starts`
+    /// are the start addresses of every snapshot line carrying `key`.
+    ///
+    /// This is not always the header's own `(device, inode)`: btrfs prints
+    /// the superblock's device in maps and the subvolume's in `stat`, and
+    /// overlayfs prints the lower file's device in maps.
+    async fn stat_identity(
+        &mut self,
+        key: &MappingKey,
+        starts: &[usize],
+    ) -> Result<RawInode, Self::Error>;
+    /// The deterministic inode of each of `raw_files`, in order, minting one
+    /// on first sight, as ONE request. The pool consumes one number per entry
+    /// whether or not it mints (`InodePool::add_inode` in `tool_global`).
+    async fn inodes(&mut self, raw_files: Vec<RawInode>) -> Vec<DetInode>;
+    /// The deterministic device for `raw_device`, minting one on first sight.
+    async fn device(&mut self, raw_device: u64) -> u64;
+}
+
+/// Mint the deterministic `(device, inode)` of every backed mapping in one
+/// `maps`/`smaps` snapshot, keyed by its header, for
+/// `sanitize_maps`/`sanitize_smaps` to render.
+///
+/// Headers are visited strictly in [`mapping_keys_in_text_order`], and each
+/// one first resolves the raw identity `stat` reports for its file. All
+/// resolution finishes before any number is requested.
+///
+/// Then ONE batched request asks for the inode of every backed LINE, in text
+/// order, keyed on its header's resolved identity: repeated headers and
+/// stdio-backed lines included. The pool consumes a number per request
+/// whether or not it mints, so the number a read consumes must be the number
+/// of backed lines, which the guest sees in the text. Requesting once per
+/// distinct file, or skipping a file that matches stdio, would let host
+/// identity decide it: two mapped names that are one host file (a hard link)
+/// are one file on one host and two on another
+/// (<https://github.com/rrnewton/hermit/issues/2897>). A file whose `stat`
+/// identity is listed in `stdio_by_raw_file` then reports that fixed stdio
+/// identity (the one fdinfo reports for the same fd): the stdio match chooses
+/// only the rendering.
+///
+/// Last, each header asks for the device keyed on its own device column --
+/// which on btrfs and overlayfs differs from `st_dev` on native Linux as
+/// well, while the inode numbers agree. The device pool numbers first
+/// sightings only, so asking once per header consumes nothing a repeated
+/// request would not.
+pub(crate) async fn mint_mapping_identities<M: MappingIdentityMinter>(
+    contents: &[u8],
+    stdio_by_raw_file: &BTreeMap<RawInode, DetInode>,
+    minter: &mut M,
+) -> Result<MappingIdentities, M::Error> {
+    let headers = mapping_keys_in_text_order(contents);
+    // Consulted by lookup only, never iterated, so its order cannot reach the
+    // result.
+    let mut resolved: HashMap<&MappingKey, RawInode> = HashMap::new();
+    for (key, starts) in &headers {
+        let raw_file = minter.stat_identity(key, starts).await?;
+        resolved.insert(key, raw_file);
+    }
+    // Every backed line, in text order. `mapping_keys_in_text_order` split the
+    // same text the same way, so each line's header has been resolved.
+    let line_keys: Vec<MappingKey> = match std::str::from_utf8(contents) {
+        Ok(text) => text.split('\n').filter_map(mapping_header_key).collect(),
+        Err(_) => Vec::new(),
+    };
+    let line_files: Vec<RawInode> = line_keys.iter().map(|key| resolved[key]).collect();
+    let pooled = minter.inodes(line_files).await;
+    // The number of each header's first line. Every line of a header has the
+    // same resolved identity, so the pool gave each of them the same number.
+    let mut header_inodes: HashMap<&MappingKey, DetInode> = HashMap::new();
+    for (key, inode) in line_keys.iter().zip(pooled) {
+        header_inodes.entry(key).or_insert(inode);
+    }
+    let mut identities = MappingIdentities::new();
+    for (key, _) in &headers {
+        let raw_file = resolved[key];
+        let det_inode = match stdio_by_raw_file.get(&raw_file) {
+            Some(inode) => *inode,
+            None => header_inodes[key],
+        };
+        let det_dev = minter.device(key.device).await;
+        identities.insert(key.clone(), (det_dev, det_inode.as_raw()));
+    }
+    Ok(identities)
+}
+
+/// Paths under which the guest can `stat` the file a mapping names, most
+/// likely first. Empty when the pathname cannot name it.
+///
+/// The kernel prints the path relative to the READER's root (`d_path`), with
+/// `\n` escaped as `\012` and ` (deleted)` appended once the file is unlinked.
+/// A deleted file has no path left, and a name that does not start with `/`
+/// (`[heap]`, `[vdso]`, an anonymous `[anon:...]` name) is not a path. The
+/// escape is ambiguous against a file whose name really contains the four
+/// characters `\012`, so both spellings are offered.
+///
+/// A candidate only ever PROPOSES an identity. The caller accepts it only if
+/// the inode `stat` returns is the inode this mapping reports, so a path that
+/// names some other file (renamed in between, or a literal ` (deleted)` name)
+/// is not used to borrow another file's identity. A file with no candidate is
+/// found, if at all, by where the guest mapped it (`mapping_stat_identity`).
+pub(crate) fn mapping_path_candidates(pathname: &str) -> Vec<String> {
+    if !pathname.starts_with('/') || pathname.ends_with(" (deleted)") {
+        return Vec::new();
+    }
+    let unescaped = pathname.replace("\\012", "\n");
+    if unescaped == pathname {
+        vec![unescaped]
+    } else {
+        vec![unescaped, pathname.to_string()]
+    }
+}
+
 /// Rewrite the device and inode of one mapping header from the caller-supplied
 /// table, preserving every other byte of the line and the COLUMN its pathname
 /// starts in.
 ///
-/// A raw pair absent from the table is left ALONE rather than guessed at: the
+/// A header absent from the table is left ALONE rather than guessed at: the
 /// table is built from this same snapshot, so a miss means the pair was not
 /// determinizable (an anonymous mapping), and inventing a value here is the
 /// precise failure this design exists to avoid.
@@ -3178,8 +3578,8 @@ pub(crate) fn mapping_header_identity(line: &str) -> Option<(u64, u64)> {
 ///
 /// Padding to the column the RAW line used keeps this in step with the kernel
 /// rather than hard-coding 73, and that column does not depend on the inode.
-fn rewrite_mapping_header(line: &str, table: &BTreeMap<(u64, u64), (u64, u64)>) -> String {
-    let Some(raw) = mapping_header_identity(line) else {
+fn rewrite_mapping_header(line: &str, table: &MappingIdentities) -> String {
+    let Some(raw) = mapping_header_key(line) else {
         return line.to_string();
     };
     let Some((det_dev, det_inode)) = table.get(&raw).copied() else {
@@ -3244,7 +3644,7 @@ fn rewrite_mapping_header(line: &str, table: &BTreeMap<(u64, u64), (u64, u64)>) 
 }
 
 /// `/proc/*/maps`: rewrite only the device and inode columns.
-fn sanitize_maps(contents: &[u8], table: &BTreeMap<(u64, u64), (u64, u64)>) -> Vec<u8> {
+pub(crate) fn sanitize_maps(contents: &[u8], table: &MappingIdentities) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
     };
@@ -3999,6 +4399,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fdinfo_inode_needs_exactly_one_numeric_ino_line() {
+        assert_eq!(
+            parse_fdinfo_inode(b"pos:\t0\nflags:\t02\nmnt_id:\t15\nino:\t4026\n"),
+            Some(4026)
+        );
+        assert_eq!(parse_fdinfo_inode(b"pos:\t0\nino: 7"), Some(7));
+        assert_eq!(
+            parse_fdinfo_inode(b"pos:\t0\nflags:\t02\nmnt_id:\t15\n"),
+            None
+        );
+        assert_eq!(parse_fdinfo_inode(b"ino:\t1\nino:\t2\n"), None);
+        assert_eq!(parse_fdinfo_inode(b"ino:\t12a\n"), None);
+        assert_eq!(parse_fdinfo_inode(b"ino:\t\n"), None);
+        assert_eq!(parse_fdinfo_inode(b"ino:12\n"), None);
+    }
+
+    #[test]
     fn recognizes_only_normalized_procfs_paths() {
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/self/stat"))
@@ -4381,7 +4798,7 @@ mod tests {
         let raw =
             b"7f0000000000-7f0000001000 r-xp 00000000 08:02 1234567 /lib/libc.so.6\n" as &[u8];
         let table = BTreeMap::from([(
-            (libc::makedev(0x08, 0x02), 1_234_567u64),
+            mapping_key(libc::makedev(0x08, 0x02), 1_234_567, "/lib/libc.so.6"),
             (libc::makedev(0x00, 0x2a), 99u64),
         )]);
         let out = String::from_utf8(sanitize_maps(raw, &table)).unwrap();
@@ -4426,7 +4843,7 @@ mod tests {
         };
         let table = |inode: u64| {
             BTreeMap::from([(
-                (libc::makedev(0x00, 0x06), inode),
+                mapping_key(libc::makedev(0x00, 0x06), inode, NAME),
                 (libc::makedev(0x00, 0x06), 8u64),
             )])
         };
@@ -4491,7 +4908,7 @@ mod tests {
 Size:                  4 kB\n\
 Rss:                   4 kB\n" as &[u8];
         let table = BTreeMap::from([(
-            (libc::makedev(0x08, 0x02), 1_234_567u64),
+            mapping_key(libc::makedev(0x08, 0x02), 1_234_567, "/lib/libc.so.6"),
             (libc::makedev(0x00, 0x2a), 99u64),
         )]);
         let out = String::from_utf8(sanitize_smaps(raw, &table)).unwrap();
@@ -4500,6 +4917,257 @@ Rss:                   4 kB\n" as &[u8];
             !out.contains("1234567"),
             "raw inode must not survive smaps: {out}"
         );
+    }
+
+    fn mapping_key(device: u64, inode: u64, pathname: &str) -> MappingKey {
+        MappingKey {
+            device,
+            inode,
+            pathname: pathname.to_string(),
+        }
+    }
+
+    /// The key carries the pathname column verbatim: spaces inside it, the
+    /// ` (deleted)` suffix, and nothing of the padding in front of it.
+    #[test]
+    fn mapping_header_key_reads_the_pathname_column() {
+        let line = "7f0000000000-7f0000001000 r--p 00000000 00:20 4242                       /opt/my lib/libx.so (deleted)";
+        assert_eq!(
+            mapping_header_key(line),
+            Some(mapping_key(
+                libc::makedev(0x00, 0x20),
+                4242,
+                "/opt/my lib/libx.so (deleted)"
+            ))
+        );
+        let unnamed = "7f0000000000-7f0000001000 r--p 00000000 00:20 4242";
+        assert_eq!(
+            mapping_header_key(unnamed),
+            Some(mapping_key(libc::makedev(0x00, 0x20), 4242, ""))
+        );
+        assert_eq!(
+            mapping_header_key("7ffd00000000-7ffd00021000 rw-p 00000000 00:00 0 [stack]"),
+            None
+        );
+    }
+
+    /// ⚠️ ONE MAPS `(device, inode)` PAIR CAN NAME TWO FILES. btrfs numbers
+    /// inodes per subvolume but prints the superblock's device in maps, so two
+    /// subvolumes' files can share the pair while `stat` gives them different
+    /// devices. Each must keep the identity the caller resolved for its own
+    /// pathname rather than whichever one the table happened to hold.
+    #[test]
+    fn maps_keeps_two_files_that_share_a_maps_device_and_inode_apart() {
+        let raw = b"7f0000000000-7f0000001000 r-xp 00000000 00:20 257 /usr/lib/a.so\n\
+7f0000002000-7f0000003000 r-xp 00000000 00:20 257 /home/u/b.so\n" as &[u8];
+        let keys = mapping_keys_in_text_order(raw);
+        assert_eq!(keys.len(), 2, "both headers keyed separately: {keys:?}");
+        let table = BTreeMap::from([
+            (
+                mapping_key(libc::makedev(0x00, 0x20), 257, "/usr/lib/a.so"),
+                (libc::makedev(0x00, 0x2a), 11u64),
+            ),
+            (
+                mapping_key(libc::makedev(0x00, 0x20), 257, "/home/u/b.so"),
+                (libc::makedev(0x00, 0x2a), 12u64),
+            ),
+        ]);
+        let out = String::from_utf8(sanitize_maps(raw, &table)).unwrap();
+        let inodes: Vec<_> = out
+            .lines()
+            .map(|line| line.split_whitespace().nth(4).unwrap())
+            .collect();
+        assert_eq!(inodes, ["11", "12"], "{out}");
+    }
+
+    /// The keys the caller builds must be exactly the keys the sanitizers look
+    /// up, smaps accounting lines and the trailing newline included.
+    #[test]
+    fn mapping_keys_are_the_keys_the_sanitizers_look_up() {
+        let raw = b"7f0000000000-7f0000001000 r-xp 00000000 08:02 1234567 /lib/libc.so.6\n\
+Size:                  4 kB\n\
+VmFlags: rd ex mr mw me\n\
+7f0000001000-7f0000002000 rw-p 00000000 00:00 0 \n" as &[u8];
+        let keys = mapping_keys_in_text_order(raw);
+        assert_eq!(
+            keys,
+            [(
+                mapping_key(libc::makedev(0x08, 0x02), 1_234_567, "/lib/libc.so.6"),
+                vec![0x7f00_0000_0000]
+            )]
+        );
+        assert!(mapping_keys_in_text_order(b"\xff\xfe not utf-8 08:02 1 /x\n").is_empty());
+    }
+
+    /// Each key carries the start address of every line with that header, so
+    /// the caller can look the file up by where it is mapped; a deleted file's
+    /// lines keep their own key.
+    #[test]
+    fn mapping_keys_carry_the_start_of_every_line() {
+        let raw = b"7f0000000000-7f0000001000 r--p 00000000 00:20 257 /d/x\n\
+7f0000001000-7f0000002000 r-xp 00001000 00:20 257 /d/x\n\
+7f0000005000-7f0000006000 r--p 00000000 00:20 258 /d/y (deleted)\n\
+not-a-range r--p 00000000 00:20 259 /d/z\n" as &[u8];
+        let keys = mapping_keys_in_text_order(raw);
+        assert_eq!(
+            keys,
+            [
+                (
+                    mapping_key(libc::makedev(0x00, 0x20), 257, "/d/x"),
+                    vec![0x7f00_0000_0000, 0x7f00_0000_1000]
+                ),
+                (
+                    mapping_key(libc::makedev(0x00, 0x20), 258, "/d/y (deleted)"),
+                    vec![0x7f00_0000_5000]
+                ),
+                (mapping_key(libc::makedev(0x00, 0x20), 259, "/d/z"), vec![]),
+            ]
+        );
+    }
+
+    /// Keys come out in the order their FIRST line appears, not in sorted key
+    /// order. Sorted order compares the raw device first, then the raw inode,
+    /// so here it would put `/a` (device `00:15`) before `/z` (device `00:2a`)
+    /// and `/m` (inode 1000) before `/a` (inode 8000). Both numbers are
+    /// host-assigned; the line order is what the guest reads.
+    #[test]
+    fn mapping_keys_are_in_text_order_not_sorted_order() {
+        let raw = b"7f0000000000-7f0000001000 r--p 00000000 00:2a 9000 /z/lib.so\n\
+7f0000002000-7f0000003000 r--p 00000000 00:15 8000 /a/lib.so\n\
+7f0000004000-7f0000005000 r-xp 00001000 00:2a 9000 /z/lib.so\n\
+7f0000006000-7f0000007000 r--p 00000000 00:15 1000 /m/lib.so\n" as &[u8];
+        assert_eq!(
+            mapping_keys_in_text_order(raw),
+            [
+                (
+                    mapping_key(libc::makedev(0x00, 0x2a), 9000, "/z/lib.so"),
+                    vec![0x7f00_0000_0000, 0x7f00_0000_4000]
+                ),
+                (
+                    mapping_key(libc::makedev(0x00, 0x15), 8000, "/a/lib.so"),
+                    vec![0x7f00_0000_2000]
+                ),
+                (
+                    mapping_key(libc::makedev(0x00, 0x15), 1000, "/m/lib.so"),
+                    vec![0x7f00_0000_6000]
+                ),
+            ]
+        );
+    }
+
+    /// Only a live absolute path is offered for resolution; the `\n` escape is
+    /// offered in both spellings because a name can contain a literal `\012`.
+    #[test]
+    fn mapping_path_candidates_offer_only_live_paths() {
+        assert_eq!(
+            mapping_path_candidates("/usr/lib/libc.so.6"),
+            ["/usr/lib/libc.so.6"]
+        );
+        assert!(mapping_path_candidates("/tmp/x (deleted)").is_empty());
+        assert!(mapping_path_candidates("/memfd:liteinst2-trampoline (deleted)").is_empty());
+        assert!(mapping_path_candidates("[heap]").is_empty());
+        assert!(mapping_path_candidates("[anon:glibc]").is_empty());
+        assert!(mapping_path_candidates("").is_empty());
+        assert_eq!(
+            mapping_path_candidates("/tmp/a\\012b"),
+            ["/tmp/a\nb", "/tmp/a\\012b"]
+        );
+    }
+
+    /// A maps file spelled through `/proc/self` or `/proc/thread-self`, or
+    /// through the opener's own thread-group id or thread id, shows its
+    /// opener's address space and keeps the one bound at open time, so only
+    /// the opener's reads are the reader's own (see `mapping_subject`). A
+    /// file spelled with another number shows that task, named by number.
+    #[test]
+    fn maps_bind_the_subject_their_spelling_names_at_open() {
+        use crate::types::DetTid;
+
+        const TGID: i32 = 7;
+        const TID: i32 = 9;
+        let opener = MmId::initial(DetTid::from_raw(TGID));
+        let other = MmId::initial(DetTid::from_raw(70));
+        let bound = |path: &str, ids: Option<(i32, i32)>| {
+            let mut file = ProcfsFile::from_path(Path::new(path)).unwrap();
+            assert!(file.needs_mapping_identities(), "{path}");
+            assert!(file.needs_mapping_opener_ids(), "{path}");
+            assert_eq!(
+                file.mapping_subject(opener),
+                MappingSubject::Unknown,
+                "{path}: unbound"
+            );
+            file.bind_mapping_subject(opener, ids);
+            file
+        };
+        for path in [
+            "/proc/self/maps",
+            "/proc/thread-self/maps",
+            "/proc/self/task/8/maps",
+            "/proc/self/smaps",
+            "/proc/./self/maps",
+            // The opener's own numbers, as its getpid and gettid report them.
+            "/proc/7/maps",
+            "/proc/7/smaps",
+            "/proc/7/task/9/maps",
+            "/proc/9/maps",
+        ] {
+            let file = bound(path, Some((TGID, TID)));
+            assert_eq!(
+                file.mapping_subject(opener),
+                MappingSubject::Reader,
+                "{path}"
+            );
+            let expected_elsewhere = if path.starts_with("/proc/9/") {
+                MappingSubject::Process(TID)
+            } else {
+                MappingSubject::Process(TGID)
+            };
+            assert_eq!(
+                file.mapping_subject(other),
+                expected_elsewhere,
+                "{path}: read in another address space, as by a forked child"
+            );
+        }
+        // Without the opener's numbers a self spelling still shows the
+        // opener, whose process is then not known by number.
+        let file = bound("/proc/self/maps", None);
+        assert_eq!(file.mapping_subject(opener), MappingSubject::Reader);
+        assert_eq!(file.mapping_subject(other), MappingSubject::Unknown);
+        // Another task's number never shows the reader's records, even when
+        // read in the opener's address space.
+        for (path, subject) in [
+            ("/proc/12/maps", 12),
+            ("/proc/12/smaps", 12),
+            ("/proc/12/task/13/maps", 12),
+            ("/proc/8/maps", 8),
+        ] {
+            for ids in [Some((TGID, TID)), None] {
+                let file = bound(path, ids);
+                assert_eq!(
+                    file.mapping_subject(opener),
+                    MappingSubject::Process(subject),
+                    "{path} {ids:?}"
+                );
+            }
+        }
+        // The opener's own number is recognized only from its ids.
+        let file = bound("/proc/7/maps", None);
+        assert_eq!(file.mapping_subject(opener), MappingSubject::Process(TGID));
+        for path in [
+            "/proc/self/stat",
+            "/proc/self/smaps_rollup",
+            "/proc/self/numa_maps",
+            "/proc/7/stat",
+        ] {
+            let mut file = ProcfsFile::from_path(Path::new(path)).unwrap();
+            assert!(!file.needs_mapping_opener_ids(), "{path}");
+            file.bind_mapping_subject(opener, Some((TGID, TID)));
+            assert_eq!(
+                file.mapping_subject(opener),
+                MappingSubject::Unknown,
+                "{path}"
+            );
+        }
     }
 
     #[test]

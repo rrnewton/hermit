@@ -9,6 +9,9 @@
 #[path = "common/dispatch_stats.rs"]
 mod dispatch_stats;
 
+#[path = "common/inode_identity_views.rs"]
+mod inode_identity_views;
+
 #[path = "common/run2_log.rs"]
 mod run2_log;
 
@@ -1931,4 +1934,65 @@ fn sabre_names_no_host_input_change_for_a_guest_that_replaced_a_file_after_diver
     );
     assert_eq!(report.infrastructure_error, None, "{stderr}"); // Refused by the position rule, before the backend is considered.
     assert!(!stderr.contains("HERMIT_HOST_INPUT_CHANGE"), "{stderr}");
+}
+
+// SaBRe embeds Detcore in the guest process, as DBT does. Keying another
+// process's pipe:[N] or socket:[N] link needs the pipefs or sockfs device
+// (https://github.com/rrnewton/hermit/issues/3307), and learning it must not
+// need a free slot in the guest's descriptor table. This guards that: the
+// fixture's child fills its table before reading the parent's links, and each
+// link must name the inode the child's own fstat of the inherited descriptor
+// reports.
+#[test]
+fn sabre_other_process_links_resolve_with_a_full_descriptor_table() {
+    // With HERMIT_SABRE_BINARY set, as the validation gate sets it, a missing
+    // artifact panics inside sabre_loader, as for every test here. Unlike the
+    // parity cases above, this case also fails when HERMIT_SABRE_BINARY is
+    // unset and no artifacts are built: sabre_loader prints its "skipping"
+    // line and returns None, and a test that returned here would be counted
+    // as a pass for a check it never ran.
+    let loader = sabre_loader().unwrap_or_else(|| {
+        panic!(
+            "this case needs the SaBRe loader and libdetcore_sabre.so (see the \"skipping\" \
+             line above): build them, or set HERMIT_SABRE_BINARY; it fails rather than \
+             report a pass for a check it did not run"
+        )
+    });
+    let guest = inode_identity_views::compile_guest("sabre-proc-fd-links");
+    let mut command = Command::new(hermit_binary());
+    command
+        .env("HERMIT_SABRE_BINARY", &loader)
+        .args([
+            "--log=error",
+            "--backend",
+            "sabre",
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--",
+        ])
+        .arg(&guest)
+        .arg("proc-fd-links")
+        .stdin(Stdio::null());
+    inode_identity_views::limit_host_nofile(
+        &mut command,
+        inode_identity_views::PROC_FD_LINKS_HOST_NOFILE,
+    );
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    assert!(
+        output.status.success(),
+        "{rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "proc-fd-links pipe=agrees socket=agrees\n"
+    );
 }

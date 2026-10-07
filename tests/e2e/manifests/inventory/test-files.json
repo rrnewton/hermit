@@ -440,6 +440,18 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/fixtures/cross_device_inode_identity.c",
+      "runner": "hermit-cli/tests/procfs_determinism.rs",
+      "why": "tests/c/fixtures/cross_device_inode_identity.c is owned by hermit-cli/tests/procfs_determinism.rs: The procfs integration suite mounts two fresh tmpfs filesystems for this guest, first proves the raw inode collision under --no-virtualize-metadata, then asserts that the two files keep separate modification times and that each /proc/self/maps line agrees with stat; the mounts are setup a generic manifest cell does not express."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/fixtures/inode_identity_views.c",
+      "runner": "hermit-cli/tests/procfs_determinism.rs",
+      "why": "tests/c/fixtures/inode_identity_views.c is owned by hermit-cli/tests/procfs_determinism.rs: The procfs integration suite compiles this guest and runs its scm-getdents, maps-stat and proc-fd-links modes under ptrace (and proc-fd-links under the DBT backend), feeding a mapped file on standard input and lowering the host RLIMIT_NOFILE before Hermit starts; hermit-cli/tests/cli.rs runs the scm-getdents and maps-stat modes under in-guest LiteInst (hermit-cli/tests/common/liteinst_in_guest_programs.rs, without --verify, which in-guest LiteInst refuses) and hermit-cli/tests/sabre_examples.rs runs proc-fd-links under SaBRe. The descriptor setup and host limits are not something a generic manifest cell expresses."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/fixtures/stdio_inode_identity.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/fixtures/stdio_inode_identity.c is owned by hermit-cli/tests/cli.rs: The CLI integration suite compiles this fixture and controls descriptor replacement so it can assert ordinary inode identity on inherited standard streams; that setup is owned by the dedicated integration test."
