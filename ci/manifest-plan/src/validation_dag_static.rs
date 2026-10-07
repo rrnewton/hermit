@@ -121,6 +121,7 @@ pub(super) const NEXTEST_RESULT_PRODUCERS: &[&str] = &[
     "privileged-test.pmu_buck_chaos_cases",
     "privileged-test.pmu_cli_cases",
     "privileged-test.pmu_detcore_time_cases",
+    "privileged-test.pmu_integration_cases",
     "privileged-test.pmu_ptrace_completion_cases",
     "quick.detcore_unit",
     "super.chaos_hello_race_verification_diagnostic",
@@ -1483,7 +1484,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // all 283 (286).
     // external_signal_interrupt's cells_give_the_guest_a_minimal_environment
     // retains all 286 (287, measured with cargo nextest list).
-    ("test.hermit_integration", 287),
+    // The 25 external_signal_interrupt ptrace cases that need the PMU timer
+    // move to privileged-test.pmu_integration_cases: 287 - 25 = 262, listed
+    // with this node's filter.
+    ("test.hermit_integration", 262),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -1734,6 +1738,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // twin (https://github.com/rrnewton/hermit/issues/3663); measured with the
     // node's exact filter, 29 run and the 2 PMU-free cases are filtered out.
     ("privileged-test.pmu_detcore_time_cases", 29),
+    // The 25 external_signal_interrupt ptrace cases that need the PMU timer,
+    // moved out of test.hermit_integration and its hosted twin; listed with
+    // the node's exact filter, 25 run.
+    ("privileged-test.pmu_integration_cases", 25),
     // Exec timer and nonleader-exec refusal regressions extend 33 KVM cases
     // plus the unchanged setup control.
     // Two KVM gettimeofday EFAULT regressions retain all 36 prior identities.
@@ -1934,7 +1942,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the agreed-guest-stdout signal-report test (283).
     // And the three stdout-file tests (286).
     // And the minimal-environment test (287, measured).
-    ("test.hermit_integration_on_host", 287),
+    // The host twin skips the same 25 PMU-timer cases: 262.
+    ("test.hermit_integration_on_host", 262),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -4557,13 +4566,13 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"test"########,
         job: r########"hermit_integration"########,
         desc: r########"Portable Hermit integration targets (batched compile, serial test binaries)"########,
-        description: r########"MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): all five current full-population runs were red for existing test failures, so their partial peaks are censored and do not lower the estimate. The last successful historical peak was 5351632896 bytes and an older 4-GiB run OOMed. The 6-GiB baseline rounds above the successful floor and the 8-GiB hard cap preserves 2 GiB more headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md. REGISTRATION 2026-10-05 (https://github.com/rrnewton/hermit/issues/3146): external_signal_interrupt runs here on the ptrace backend. A signal that Linux would deliver must end the tests/c/external_signal_interrupt.c guest's blocked futex, poll, epoll, select or child wait, and an ignored, blocked or default-ignored signal must leave the wait running to its deadline. test.liteinst_strict, where earlier rounds of https://github.com/rrnewton/hermit/pull/3361 registered the binary, no longer exists, and the binary's LiteInst cells are restoration targets (https://github.com/rrnewton/hermit/issues/3745)."########,
+        description: r########"MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): all five current full-population runs were red for existing test failures, so their partial peaks are censored and do not lower the estimate. The last successful historical peak was 5351632896 bytes and an older 4-GiB run OOMed. The 6-GiB baseline rounds above the successful floor and the 8-GiB hard cap preserves 2 GiB more headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md. REGISTRATION 2026-10-05 (https://github.com/rrnewton/hermit/issues/3146): external_signal_interrupt runs here on the ptrace backend. A signal that Linux would deliver must end the tests/c/external_signal_interrupt.c guest's blocked futex, poll, epoll, select or child wait, and an ignored, blocked or default-ignored signal must leave the wait running to its deadline. test.liteinst_strict, where earlier rounds of https://github.com/rrnewton/hermit/pull/3361 registered the binary, no longer exists, and the binary's LiteInst cells are restoration targets (https://github.com/rrnewton/hermit/issues/3745). PMU CASES MOVED 2026-10-07: 25 external_signal_interrupt ptrace cases assert guest-observed virtual-time bounds (a 300 ms timed wait must end within 300-350 virtual ms) or watchdog progress that hold only with the PMU preemption timer. GitHub-hosted runners have no PMU, so hermit falls back to --max-timeslice=disabled, and in https://github.com/rrnewton/hermit/actions/runs/37631051557 exactly these 25 failed in test.hermit_integration_on_host (300 ms waits took 454-895 virtual ms). Forcing --max-timeslice=disabled locally fails the same 25 of 69 and no other; with the timer all 69 pass. This node and its hosted twin skip them by exact name and privileged-test.pmu_integration_cases runs them after privileged-pmu.preemption has shown the PMU works; the two filters are exact complements over this selection, so the full label runs each case once."########,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test child_time_rpc --test chown_virtual_root_identity --test cli_owned_lifecycle --test clock_determinism --test clock_discipline_determinism --test clock_passthrough --test container_init_deadline --test cpufreq_avg_determinism --test dispatch_stats --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test external_signal_interrupt --test file_nr_determinism --test first_seen_mtime --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test reopened_pipe_progress --test robust_futex_owner_death --test run_evidence --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test utimensat_mtime --test verification_report_cli --test verification_report_consumers --test verify_claim_names_its_limit --test writev_determinism --test zero_copy_pipe_fallback -j 1"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test child_time_rpc --test chown_virtual_root_identity --test cli_owned_lifecycle --test clock_determinism --test clock_discipline_determinism --test clock_passthrough --test container_init_deadline --test cpufreq_avg_determinism --test dispatch_stats --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test external_signal_interrupt --test file_nr_determinism --test first_seen_mtime --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test reopened_pipe_progress --test robust_futex_owner_death --test run_evidence --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test utimensat_mtime --test verification_report_cli --test verification_report_consumers --test verify_claim_names_its_limit --test writev_determinism --test zero_copy_pipe_fallback -j 1 -E 'not (test(=ptrace_a_handlers_first_restart_syscall_resumes_the_interrupted_timed_futex_wait) | test(=ptrace_child_waits_restart_under_sa_restart) | test(=ptrace_futex_wait_is_ended_by_a_caught_signal_pending_with_a_default_ignored_sigchld) | test(=ptrace_futex_wait_is_ended_by_a_signal_caught_after_it_parked) | test(=ptrace_futex_wait_is_not_ended_by_a_signal_ignored_after_it_parked) | test(=ptrace_futex_wait_of_the_thread_that_forked_the_child_holds_its_sigchld_until_it_returns) | test(=ptrace_other_waits_take_a_discarded_default_stop_as_on_linux) | test(=ptrace_poll_and_epoll_hold_the_sigchld_of_an_exiting_child_until_they_return) | test(=ptrace_polling_futex_wait_holds_a_sigchld_caught_after_it_parked_until_it_returns) | test(=ptrace_polling_futex_wait_holds_the_sigchld_of_an_exiting_child_until_it_returns) | test(=ptrace_polling_timed_futex_wait_keeps_its_deadline_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_polling_untimed_futex_wait_keeps_waiting_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_precise_futex_wait_holds_a_sigchld_caught_after_it_parked_until_it_returns) | test(=ptrace_precise_futex_wait_holds_the_sigchld_of_an_exiting_child_until_it_returns) | test(=ptrace_precise_futex_wait_leaves_its_childs_sigchld_to_a_running_sibling) | test(=ptrace_precise_timed_futex_wait_keeps_its_deadline_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_precise_timed_futex_wait_leaves_its_childs_sigchld_to_a_running_sibling) | test(=ptrace_precise_untimed_futex_wait_keeps_waiting_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_readiness_waits_are_not_ended_by_non_interrupting_process_signals) | test(=ptrace_readiness_waits_are_not_ended_by_non_interrupting_thread_signals) | test(=ptrace_selects_are_ended_by_a_caught_sigchld_from_an_exiting_child) | test(=ptrace_selects_are_not_ended_by_non_interrupting_process_signals) | test(=ptrace_selects_are_not_ended_by_non_interrupting_thread_signals) | test(=ptrace_timed_futex_wait_and_poll_keep_their_deadline_through_a_discarded_default_stop) | test(=ptrace_timed_futex_wait_is_not_ended_by_non_interrupting_signals))'"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[
@@ -5290,6 +5299,39 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         networkonly: false,
         engine_only: false,
         timeout: 720,
+        cpu_timeout: 7200,
+        jobs_flag: None,
+        jobs_env: None,
+    },
+    StaticStepSpec {
+        group: r########"privileged-test"########,
+        job: r########"pmu_integration_cases"########,
+        desc: r########"Run the 25 external_signal_interrupt ptrace cases that need the PMU timer"########,
+        description: r########"The 25 external_signal_interrupt ptrace cases whose assertions hold only with the PMU preemption timer: each bounds a guest-observed virtual time (a 300 ms timed wait must end within 300-350 virtual ms, a wait ended by a signal within its slack) or requires a spinning guest thread to make progress before a watchdog. GitHub-hosted runners have no PMU, so hermit continues with --max-timeslice=disabled; in https://github.com/rrnewton/hermit/actions/runs/37631051557 at hermit ccbe5ae8 test.hermit_integration_on_host failed exactly these 25, with 300 ms waits taking 454-895 virtual ms. Forcing --max-timeslice=disabled into the cells locally fails the same 25 of the binary's 69 and no other; with the timer all 69 pass. The overshoot without the timer is a product defect of its own, not a test defect, and these assertions keep full force here. test.hermit_integration and its hosted twin skip the 25 by exact name; this node runs the same prepared selection with the complementary filter, so the full label runs each case once, after privileged-pmu.preemption has shown the PMU works. Like the other privileged-test PMU nodes it carries only the full label: local scripts/validate.rs full runs it, .github/workflows/ci-privileged.yml does not. Memory hints are test.hermit_integration's, whose selection this is. Measured on the measurement host recorded in docs/TESTING_ENVIRONMENTS.md, 2026-10-07: cargo nextest run --profile ci with this selection and filter, -j 1, ran 25 of 25 passing in 76.3-94.2 s of nextest time over three runs at one-minute load averages of 21-31, so the estimate is 80 s and the wall limit 600 s."########,
+        labels: &[r########"full"########],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test child_time_rpc --test chown_virtual_root_identity --test cli_owned_lifecycle --test clock_determinism --test clock_discipline_determinism --test clock_passthrough --test container_init_deadline --test cpufreq_avg_determinism --test dispatch_stats --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test external_signal_interrupt --test file_nr_determinism --test first_seen_mtime --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test reopened_pipe_progress --test robust_futex_owner_death --test run_evidence --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test utimensat_mtime --test verification_report_cli --test verification_report_consumers --test verify_claim_names_its_limit --test writev_determinism --test zero_copy_pipe_fallback -j 1 -E 'test(=ptrace_a_handlers_first_restart_syscall_resumes_the_interrupted_timed_futex_wait) | test(=ptrace_child_waits_restart_under_sa_restart) | test(=ptrace_futex_wait_is_ended_by_a_caught_signal_pending_with_a_default_ignored_sigchld) | test(=ptrace_futex_wait_is_ended_by_a_signal_caught_after_it_parked) | test(=ptrace_futex_wait_is_not_ended_by_a_signal_ignored_after_it_parked) | test(=ptrace_futex_wait_of_the_thread_that_forked_the_child_holds_its_sigchld_until_it_returns) | test(=ptrace_other_waits_take_a_discarded_default_stop_as_on_linux) | test(=ptrace_poll_and_epoll_hold_the_sigchld_of_an_exiting_child_until_they_return) | test(=ptrace_polling_futex_wait_holds_a_sigchld_caught_after_it_parked_until_it_returns) | test(=ptrace_polling_futex_wait_holds_the_sigchld_of_an_exiting_child_until_it_returns) | test(=ptrace_polling_timed_futex_wait_keeps_its_deadline_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_polling_untimed_futex_wait_keeps_waiting_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_precise_futex_wait_holds_a_sigchld_caught_after_it_parked_until_it_returns) | test(=ptrace_precise_futex_wait_holds_the_sigchld_of_an_exiting_child_until_it_returns) | test(=ptrace_precise_futex_wait_leaves_its_childs_sigchld_to_a_running_sibling) | test(=ptrace_precise_timed_futex_wait_keeps_its_deadline_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_precise_timed_futex_wait_leaves_its_childs_sigchld_to_a_running_sibling) | test(=ptrace_precise_untimed_futex_wait_keeps_waiting_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_readiness_waits_are_not_ended_by_non_interrupting_process_signals) | test(=ptrace_readiness_waits_are_not_ended_by_non_interrupting_thread_signals) | test(=ptrace_selects_are_ended_by_a_caught_sigchld_from_an_exiting_child) | test(=ptrace_selects_are_not_ended_by_non_interrupting_process_signals) | test(=ptrace_selects_are_not_ended_by_non_interrupting_thread_signals) | test(=ptrace_timed_futex_wait_and_poll_keep_their_deadline_through_a_discarded_default_stop) | test(=ptrace_timed_futex_wait_is_not_ended_by_non_interrupting_signals)'"########,
+        cmdtype: CmdType::Unknown,
+        manifest: None,
+        integration_test_binaries: None,
+        deps: &[
+            r########"build.e2e_artifact"########,
+            r########"privileged-build.privileged_tests"########,
+            r########"privileged-pmu.preemption"########,
+        ],
+        env: &[],
+        hint: HintSpec {
+            resources: &[],
+            est_duration_s: 80.0,
+            rss_baseline_bytes: Some(6442450944),
+            hard_mem_max_bytes: Some(8589934592),
+            classification: StepClass::LatencyBound,
+            preferred_inner_jobs: None,
+            measured_effective_cores: None,
+            measured_cpu_utilization: None,
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 600,
         cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
