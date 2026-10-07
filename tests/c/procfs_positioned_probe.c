@@ -18,6 +18,10 @@
  *      than a live, run-varying kernel value.
  *   2. sendfile() with a procfs input must be refused with ENOSYS so callers
  *      fall back to the mediated read()/write() path.
+ *   3. readv(), preadv() and preadv2() of /proc/self/mounts must serve the same
+ *      bytes as read(), with Linux's shared and explicit position semantics,
+ *      flag checks and fault behaviour.
+ *      TODO-HUMAN-REVIEW(PR-3712): Review vectored /proc/self/mounts coverage.
  *
  * The probe prints only fixed strings, so a --strict --verify run is bitwise
  * identical across the two executions.
@@ -30,7 +34,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/sendfile.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 /* Returns the 1-based proc stat field `index` (>= 3), or NULL on parse error.
@@ -117,11 +123,186 @@ static int check_sendfile_refused(void) {
   return 1;
 }
 
+#define MOUNTS_CAPACITY (1 << 20)
+static char mounts_by_read[MOUNTS_CAPACITY];
+static char mounts_by_vector[MOUNTS_CAPACITY];
+
+/* Reads `fd` to end of file with read(); returns the length, or -1. */
+static ssize_t read_to_end(int fd, char* buf, size_t capacity) {
+  size_t total = 0;
+  for (;;) {
+    if (total == capacity) {
+      fprintf(stderr, "/proc/self/mounts exceeds %zu bytes\n", capacity);
+      return -1;
+    }
+    ssize_t n = read(fd, buf + total, capacity - total);
+    if (n < 0) {
+      perror("read /proc/self/mounts");
+      return -1;
+    }
+    if (n == 0) {
+      return (ssize_t)total;
+    }
+    total += (size_t)n;
+  }
+}
+
+static int expect_bytes(
+    const char* what,
+    ssize_t got,
+    ssize_t want,
+    const char* bytes,
+    const char* expected) {
+  if (got != want) {
+    fprintf(
+        stderr,
+        "%s: returned %zd (errno %d), expected %zd\n",
+        what,
+        got,
+        errno,
+        want);
+    return 1;
+  }
+  if (want > 0 && memcmp(bytes, expected, (size_t)want) != 0) {
+    fprintf(stderr, "%s: bytes differ from read()\n", what);
+    return 1;
+  }
+  return 0;
+}
+
+static int expect_errno(const char* what, ssize_t got, int want) {
+  int saved = errno;
+  if (got != -1 || saved != want) {
+    fprintf(
+        stderr,
+        "%s: returned %zd (errno %d), expected -1 (errno %d)\n",
+        what,
+        got,
+        saved,
+        want);
+    return 1;
+  }
+  return 0;
+}
+
+static int check_mounts_vectored(void) {
+  int fd = open("/proc/self/mounts", O_RDONLY);
+  if (fd < 0) {
+    perror("open /proc/self/mounts");
+    return 1;
+  }
+  ssize_t length = read_to_end(fd, mounts_by_read, MOUNTS_CAPACITY);
+  close(fd);
+  if (length < 32) {
+    fprintf(stderr, "/proc/self/mounts read %zd bytes\n", length);
+    return 1;
+  }
+  const char* m = mounts_by_read;
+  int failed = 0;
+
+  /* readv takes its first bytes, through an empty middle vector, from the
+   * shared position, and read() then continues from where readv stopped. */
+  fd = open("/proc/self/mounts", O_RDONLY);
+  if (fd < 0) {
+    perror("open /proc/self/mounts");
+    return 1;
+  }
+  char* v = mounts_by_vector;
+  struct iovec first[3] = {{v, 5}, {v + 5, 0}, {v + 5, 6}};
+  failed |= expect_bytes("readv", readv(fd, first, 3), 11, v, m);
+  ssize_t rest = read_to_end(fd, v + 11, MOUNTS_CAPACITY - 11);
+  failed |= expect_bytes("read after readv", rest, length - 11, v + 11, m + 11);
+  failed |= expect_bytes("readv at end of file", readv(fd, first, 3), 0, v, m);
+  close(fd);
+
+  fd = open("/proc/self/mounts", O_RDONLY);
+  if (fd < 0) {
+    perror("open /proc/self/mounts");
+    return 1;
+  }
+  char a[3];
+  char b[8];
+  char head[4];
+  char c[6];
+  struct iovec positioned[2] = {{a, sizeof(a)}, {b, sizeof(b)}};
+  struct iovec current[1] = {{c, sizeof(c)}};
+
+  /* preadv reads at its own offset ... */
+  ssize_t n = preadv(fd, positioned, 2, 4);
+  char joined[sizeof(a) + sizeof(b)];
+  memcpy(joined, a, sizeof(a));
+  memcpy(joined + sizeof(a), b, sizeof(b));
+  failed |= expect_bytes("preadv", n, 11, joined, m + 4);
+  /* ... and leaves the shared position at 0. */
+  failed |= expect_bytes("read after preadv", read(fd, head, 4), 4, head, m);
+  /* preadv2 at offset -1 reads from, and advances, the shared position. */
+  failed |= expect_bytes(
+      "preadv2 at -1", preadv2(fd, current, 1, -1, 0), 6, c, m + 4);
+  failed |=
+      expect_bytes("read after preadv2", read(fd, head, 4), 4, head, m + 10);
+  /* RWF_HIPRI is accepted at an explicit offset, which reads to the end. */
+  n = preadv2(fd, positioned, 2, length - 2, RWF_HIPRI);
+  failed |= expect_bytes("preadv2 HIPRI near the end", n, 2, a, m + length - 2);
+  failed |= expect_bytes(
+      "preadv at end of file", preadv(fd, positioned, 2, length), 0, a, m);
+  /* This seq_file description refuses RWF_NOWAIT; a vector total of zero
+   * returns zero before any flag check. */
+  errno = 0;
+  failed |= expect_errno(
+      "preadv2 NOWAIT", preadv2(fd, current, 1, 0, RWF_NOWAIT), EOPNOTSUPP);
+  struct iovec empty[1] = {{c, 0}};
+  failed |= expect_bytes(
+      "preadv2 NOWAIT of nothing",
+      preadv2(fd, empty, 1, 0, RWF_NOWAIT),
+      0,
+      c,
+      m);
+  /* A fault at the first byte is EFAULT; a fault later returns the bytes
+   * copied before it. Neither moves the shared position. */
+  long page_size = sysconf(_SC_PAGESIZE);
+  char* pages = mmap(
+      NULL,
+      (size_t)page_size * 2,
+      PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS,
+      -1,
+      0);
+  if (pages == MAP_FAILED ||
+      mprotect(pages + page_size, (size_t)page_size, PROT_NONE) != 0) {
+    perror("mmap guard page");
+    return 1;
+  }
+  struct iovec unwritable[1] = {{pages + page_size, 8}};
+  errno = 0;
+  failed |=
+      expect_errno("readv into a guard page", readv(fd, unwritable, 1), EFAULT);
+  struct iovec straddle[1] = {{pages + page_size - 5, 10}};
+  failed |= expect_bytes(
+      "preadv across a guard page",
+      preadv(fd, straddle, 1, 2),
+      5,
+      pages + page_size - 5,
+      m + 2);
+  failed |=
+      expect_bytes("read after the faults", read(fd, head, 4), 4, head, m + 14);
+  munmap(pages, (size_t)page_size * 2);
+  close(fd);
+
+  if (failed) {
+    return 1;
+  }
+  puts("procfs-mounts-vectored-ok");
+  return 0;
+}
+
 int main(void) {
   if (check_pread_sanitized() != 0) {
     return 1;
   }
   if (check_sendfile_refused() != 0) {
+    return 1;
+  }
+  if (check_mounts_vectored() != 0) {
     return 1;
   }
   return 0;

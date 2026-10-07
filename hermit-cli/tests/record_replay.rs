@@ -793,7 +793,7 @@ fn canonical_record_replay_command(name: &str, program: &Path, args: &[&OsStr]) 
     );
 }
 
-fn record_then_replay_command(name: &str, program: &Path, args: &[&OsStr]) {
+fn record_then_replay_command(name: &str, program: &Path, args: &[&OsStr]) -> Vec<u8> {
     let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
     let mut record = Command::new("timeout");
     record
@@ -818,6 +818,7 @@ fn record_then_replay_command(name: &str, program: &Path, args: &[&OsStr]) {
         record_output.stdout, replay_output.stdout,
         "replayed guest stdout did not match the recording for {name}"
     );
+    record_output.stdout
 }
 
 fn record_then_mutate_and_replay_command<F>(
@@ -1100,6 +1101,105 @@ fn record_proc_mountinfo_replays_the_captured_read_buffer() {
         Path::new("/bin/cat"),
         &[OsStr::new("/proc/self/mountinfo")],
     );
+}
+
+/// Splits `stdout` into `parts` equal pieces and requires them to be
+/// identical: each piece is one file `cat` printed, all naming the same
+/// procfs object.
+fn assert_identical_parts(stdout: &[u8], parts: usize, label: &str) {
+    assert!(
+        !stdout.is_empty() && stdout.len() % parts == 0,
+        "{label}: {} bytes do not split into {parts} non-empty copies:\n{}",
+        stdout.len(),
+        String::from_utf8_lossy(stdout)
+    );
+    let size = stdout.len() / parts;
+    let first = &stdout[..size];
+    for (index, part) in stdout.chunks(size).enumerate() {
+        assert_eq!(
+            part,
+            first,
+            "{label}: copy {index} differs from copy 0:\n{}",
+            String::from_utf8_lossy(stdout)
+        );
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-3712): Review the recorded procfs alias classification.
+#[test]
+fn record_etc_mtab_replays_the_recorded_mounts_classification() {
+    let _guard = hermit_record_lock();
+    // `/etc/mtab` names `/proc/self/mounts` only through a symlink, so its
+    // spelling does not classify and Detcore asks what the descriptor
+    // resolved to. Replayer's descriptor is a placeholder, so that question
+    // must be answered from the recording or replay classifies differently.
+    // 7-byte reads make the difference fatal rather than cosmetic: a
+    // classified descriptor records its whole snapshot at the first read,
+    // so an unclassified replay would consume those reads one at a time and
+    // diverge at dd's first write.
+    let mtab = fs::read_link("/etc/mtab").expect("this test needs /etc/mtab to be a symlink");
+    assert!(
+        mtab.ends_with("proc/self/mounts"),
+        "this test needs /etc/mtab to name /proc/self/mounts, found {}",
+        mtab.display()
+    );
+    record_then_replay_command(
+        "etc mtab 7-byte reads",
+        Path::new("/bin/dd"),
+        &[
+            OsStr::new("if=/etc/mtab"),
+            OsStr::new("bs=7"),
+            OsStr::new("count=4"),
+            OsStr::new("status=none"),
+        ],
+    );
+    let stdout = record_then_replay_command(
+        "etc mtab beside proc self mounts",
+        Path::new("/bin/cat"),
+        &[OsStr::new("/proc/self/mounts"), OsStr::new("/etc/mtab")],
+    );
+    assert_identical_parts(&stdout, 2, "/proc/self/mounts then /etc/mtab");
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-3712): Review the recorded procfs alias classification.
+#[test]
+fn record_symlinked_mounts_alias_replays_the_recorded_classification() {
+    let _guard = hermit_record_lock();
+    // An arbitrary symlink, and a symlink to that symlink, reach the same
+    // procfs object as `/proc/self/mounts`. The replay root does not contain
+    // the fixture directory at all, so only the recording can classify them.
+    let fixture = tempfile::tempdir().expect("failed to create mounts alias fixture");
+    let alias = fixture.path().join("alias");
+    let chain = fixture.path().join("chain");
+    std::os::unix::fs::symlink("/proc/self/mounts", &alias).expect("failed to create mounts alias");
+    std::os::unix::fs::symlink(&alias, &chain).expect("failed to create chained mounts alias");
+    let chain_if = {
+        let mut argument = std::ffi::OsString::from("if=");
+        argument.push(&chain);
+        argument
+    };
+    record_then_replay_command(
+        "chained mounts alias 7-byte reads",
+        Path::new("/bin/dd"),
+        &[
+            chain_if.as_os_str(),
+            OsStr::new("bs=7"),
+            OsStr::new("count=4"),
+            OsStr::new("status=none"),
+        ],
+    );
+    let stdout = record_then_replay_command(
+        "mounts aliases beside proc self mounts",
+        Path::new("/bin/cat"),
+        &[
+            OsStr::new("/proc/self/mounts"),
+            alias.as_os_str(),
+            chain.as_os_str(),
+        ],
+    );
+    assert_identical_parts(&stdout, 3, "/proc/self/mounts, alias, chained alias");
 }
 
 #[test]

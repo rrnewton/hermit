@@ -779,7 +779,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // canonical_verdict::tests::the_exact_branch_counter_verdict_is_optional_and_strictly_typed,
     // which manifest-plan path-includes, retains all 975 (976, measured with
     // cargo nextest list).
-    ("test.regular_crates", 976),
+    // detcore-model's two /proc/mounts seed-class tests
+    // (https://github.com/rrnewton/hermit/issues/3719),
+    // procfs::tests::mounts_file_rows_use_the_same_seed_class and
+    // procfs::tests::mounts_file_seed_filter_drops_only_seed_rows_and_keeps_order,
+    // retain all 976 prior identities: 976 + 2 = 978, measured with cargo
+    // nextest list --profile ci --workspace --exclude hermit-detcore
+    // --exclude hermit --exclude hermetic_infra_hermit_flaky-tests
+    // (detcore-model 156).
+    ("test.regular_crates", 978),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1138,7 +1146,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/3686) retains all 970 prior
     // identities: 970 + 1 = 971, measured with cargo nextest list --profile ci
     // -p hermit-detcore --lib --bins.
-    ("test.detcore_unit", 971),
+    // The four /proc/mounts snapshot tests
+    // (https://github.com/rrnewton/hermit/issues/3719),
+    // procfs::tests::mounts_mount_points_take_the_mountinfo_prefix_rewrites,
+    // procfs::tests::mounts_reads_do_not_depend_on_the_private_tmp_name,
+    // procfs::tests::proven_mountpoint_prefix_rewrites_order_and_refusals and
+    // procfs::tests::seed_churn_does_not_change_guest_mounts, retain all 971
+    // prior identities: 971 + 4 = 975, measured with cargo nextest list
+    // --profile ci -p hermit-detcore --lib --bins.
+    ("test.detcore_unit", 975),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1506,7 +1522,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the three untraced-code tests (970).
     // The host twin selects the same
     // https://github.com/rrnewton/hermit/pull/3686 logdiff test: 970 + 1 = 971.
-    ("test.detcore_unit_on_host", 971),
+    // The four /proc/mounts snapshot tests listed there retain all 971: 975.
+    ("test.detcore_unit_on_host", 975),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -1633,7 +1650,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The two network trace codec tests listed there retain all 972: 974.
     // The row-recording exact-branch-counter test listed there retains all 974: 975.
     // The report exact-branch-counter test listed there retains all 975: 976.
-    ("test.regular_crates_on_host", 976),
+    // The two /proc/mounts seed-class tests listed there retain all 976: 978.
+    ("test.regular_crates_on_host", 978),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

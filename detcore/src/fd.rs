@@ -502,6 +502,21 @@ impl DetFd {
             .is_some_and(ProcfsFile::needs_mountinfo_identities)
     }
 
+    pub(crate) fn procfs_needs_mounts_rewrites(&self) -> bool {
+        self.description()
+            .procfs
+            .as_ref()
+            .is_some_and(ProcfsFile::needs_mounts_rewrites)
+    }
+
+    /// Whether this procfs snapshot serves readv, preadv and preadv2.
+    pub(crate) fn procfs_serves_vectored_reads(&self) -> bool {
+        self.description()
+            .procfs
+            .as_ref()
+            .is_some_and(ProcfsFile::serves_vectored_reads)
+    }
+
     pub(crate) fn procfs_needs_random_uuid(&self) -> bool {
         self.description()
             .procfs
