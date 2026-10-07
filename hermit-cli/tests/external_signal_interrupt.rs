@@ -1470,28 +1470,44 @@ fn ptrace_timed_futex_wait_and_poll_keep_their_deadline_through_a_discarded_defa
     assert_discarded_default_stop_leaves_rearming_waits("ptrace");
 }
 
-/// How many SIGCHLDs the `chldflood` cells send after their SIGUSR1.
+/// How many SIGCHLDs the `chldflood` cells send before their SIGUSR1.
 const SIGCHLD_FLOOD: usize = 20_000;
 
-/// `poll` and a timed polling `FUTEX_WAIT` keep their deadline while a flood of
-/// default-ignored SIGCHLD from outside Hermit arrives as they start (the
-/// guest's `chldflood` option). Linux neither ends nor restarts either call for
-/// that signal, so both return their timeout result at 300 ms. The flood keeps
-/// a SIGCHLD arriving after Detcore's `/proc` read and before its injection,
-/// where the stop cannot be identified; that stop used to end the wait with a
-/// restart code that, with no handler to run, restarted the call with its
-/// relative timeout started again (round-8 High 1 on
-/// https://github.com/rrnewton/hermit/pull/3361). The unit tests
-/// `a_stop_that_cannot_be_identified_keeps_a_timed_wait_and_its_deadline` and
-/// `a_timed_wait_keeps_its_deadline_past_a_held_sigchld` pin the decision and
-/// are the tests that fail without it. This test also passed at round-7 head
-/// 3032cd65 when measured: the unidentified stop falls in the call's first
-/// turn, where a restart costs microseconds of virtual time, well inside the
-/// 50 ms overshoot. It guards the deadline, and the liveness of a deadline
-/// wait's unbounded retry, end to end.
+/// `poll` and a timed polling `FUTEX_WAIT` keep their deadline after a flood of
+/// default-ignored SIGCHLD from outside Hermit (the guest's `chldflood`
+/// option). Linux neither ends nor restarts either call for that signal, so
+/// both return their timeout result at 300 ms. The harness sends the whole
+/// flood first and SIGUSR1 last, and the guest starts its wait only once its
+/// SIGUSR1 handler has run. `kill` returns once the signal is queued, so every
+/// SIGCHLD has been sent before the wait starts and none arrives while it runs.
+/// Standard signals merge, so at most one may still be pending in the kernel
+/// then; if one is, the first `/proc` read shows it, and the stop it makes is
+/// identified and held to the call's return (`HeldKind::Precious`). Nothing
+/// here requires that a SIGCHLD is still pending, so this test covers the
+/// deadline after a flood, not arrivals during the wait.
+///
+/// The flood used to follow the SIGUSR1, so it raced the wait's first probe and
+/// its mask change, the two injections that run under the guest's own mask. A
+/// SIGCHLD that arrives after Detcore's `/proc` read and before such an
+/// injection stops it in a way `/proc` cannot identify, because the backend
+/// does not say which signal it holds. A second SIGCHLD pending before the
+/// next injection would replace that unidentified held signal, which may be
+/// one whose loss matters, so since round 10 of
+/// https://github.com/rrnewton/hermit/pull/3361 the wait is refused there,
+/// fail-closed, before the injection (`KernelSignalWait::inject_absorbing`,
+/// `HeldSignalLoss::Replaced`), and the run ends with HERMIT_POLICY_REFUSAL.
+/// Whether two flood signals land in that window is host timing, so the cell
+/// was refused intermittently, most often on a loaded host, and a refused run
+/// also made the harness's remaining `kill` calls fail with ESRCH. The Detcore
+/// unit tests pin each decision of that path:
+/// `a_stop_that_cannot_be_identified_keeps_a_timed_wait_and_its_deadline`, and
+/// `a_sigchld_after_an_unidentified_stop_is_refused_before_it_replaces_it` for
+/// the refusal. A racing flood can pass every run only once Detcore no longer
+/// has to guess the held signal: for example if the backend names it, keeps
+/// every held signal, or lets Detcore change the mask without an injection.
 fn assert_sigchld_flood_leaves_timed_waits_their_deadline(backend: &str) {
-    let mut signals = vec![libc::SIGUSR1];
-    signals.extend(std::iter::repeat_n(libc::SIGCHLD, SIGCHLD_FLOOD));
+    let mut signals = vec![libc::SIGCHLD; SIGCHLD_FLOOD];
+    signals.push(libc::SIGUSR1);
     let cells: [(&[&str], &str); 2] = [
         (
             &["poll", "external", "chldflood"],
@@ -1524,7 +1540,7 @@ fn assert_sigchld_flood_leaves_timed_waits_their_deadline(backend: &str) {
 }
 
 #[test]
-fn ptrace_timed_futex_wait_and_poll_keep_their_deadline_through_a_sigchld_flood() {
+fn ptrace_timed_futex_wait_and_poll_keep_their_deadline_after_a_sigchld_flood() {
     assert_sigchld_flood_leaves_timed_waits_their_deadline("ptrace");
 }
 

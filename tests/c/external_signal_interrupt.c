@@ -173,10 +173,10 @@
  * SIGCHLD stays at SIG_DFL, which ignores it. After READY the guest naps in
  * 1 ms sleeps until its SIGUSR1 handler has run, then takes the start stamp and
  * makes the call with the 300 ms timeout of a must-not-wake option. The harness
- * sends SIGUSR1 followed by a flood of SIGCHLD, so the wait starts while
- * SIGCHLD keeps arriving. A default-ignored SIGCHLD neither ends nor restarts
- * the wait on Linux, so poll returns 0 and the futex wait ETIMEDOUT at 300 ms,
- * and the ELAPSED line reports it.
+ * sends a flood of SIGCHLD followed by SIGUSR1, so every SIGCHLD has been sent
+ * when the wait starts, and at most one is still pending. A default-ignored
+ * SIGCHLD neither ends nor restarts the wait on Linux, so poll returns 0 and
+ * the futex wait ETIMEDOUT at 300 ms, and the ELAPSED line reports it.
  *
  * `sigsuspend creator` is a mode of its own. The main thread installs a
  * SIGCHLD handler (flags 0), blocks SIGCHLD, prints READY and waits in
@@ -1603,9 +1603,9 @@ int main(int argc, char **argv) {
   say("READY\n");
   if (chldflood) {
     /* The wait starts once the handler for the harness's SIGUSR1 has run,
-     * while the SIGCHLD flood that follows it is still arriving. The guest
-     * naps rather than pausing: a pause with no runnable thread is a
-     * deadlock to Hermit before the host signal arrives. */
+     * after the SIGCHLD flood that precedes it has been sent. The guest naps
+     * rather than pausing: a pause with no runnable thread is a deadlock to
+     * Hermit before the host signal arrives. */
     while (!handled) sleep_ms(1);
     clock_gettime(CLOCK_MONOTONIC, &start);
   }
