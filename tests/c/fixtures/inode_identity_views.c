@@ -14,6 +14,7 @@
 //        inode_identity_views stdio-getdents > DIR
 //        inode_identity_views stdout-alias-maps PATH 1<> PATH
 //        inode_identity_views stdout-pipe-links | READER
+//        inode_identity_views listed-inodes DIR
 //
 // Detcore keys its deterministic inodes on a raw device and inode together
 // (https://github.com/rrnewton/hermit/issues/3307). Every interface that
@@ -118,6 +119,15 @@
 //   where N is the st_ino the child's fstat of the alias reports. The result
 //   goes to stderr, on a line beginning "stdout-pipe-links ": one field per
 //   view, "agrees" or "differs".
+//
+// listed-inodes DIR
+//   Lists DIR with getdents64 and prints one line per entry, "NAME D_INO", in
+//   the order the call returns them. Every entry other than "." and ".." must
+//   report the st_ino fstatat (AT_SYMLINK_NOFOLLOW) reports for its name
+//   relative to DIR. The program calls neither fstatfs nor statx itself, so
+//   the owning test can start Hermit under a seccomp filter that refuses a
+//   call Detcore may inject to choose how it numbers the entries, and compare
+//   what each run lists.
 
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -1123,6 +1133,45 @@ static int stdout_pipe_links(void) {
   return WEXITSTATUS(status);
 }
 
+// ---------------------------------------------------------------------------
+// listed-inodes
+
+static int listed_inodes(const char* path) {
+  int directory = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  CHECK(directory >= 0);
+  char buffer[4096] __attribute__((aligned(8)));
+  for (;;) {
+    long count = syscall(SYS_getdents64, directory, buffer, sizeof(buffer));
+    CHECK(count >= 0);
+    if (count == 0) {
+      break;
+    }
+    for (long offset = 0; offset < count;) {
+      struct linux_dirent64_header* entry =
+          (struct linux_dirent64_header*)(buffer + offset);
+      if (strcmp(entry->d_name, ".") != 0 &&
+          strcmp(entry->d_name, "..") != 0) {
+        struct stat st;
+        CHECK(
+            fstatat(directory, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) == 0);
+        if ((uint64_t)st.st_ino != entry->d_ino) {
+          fprintf(
+              stderr,
+              "listed-inodes: d_ino of %s is %llu but fstatat reports %llu\n",
+              entry->d_name,
+              (unsigned long long)entry->d_ino,
+              (unsigned long long)st.st_ino);
+          return 1;
+        }
+      }
+      printf("%s %llu\n", entry->d_name, (unsigned long long)entry->d_ino);
+      offset += entry->d_reclen;
+    }
+  }
+  CHECK(close(directory) == 0);
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc == 3 && strcmp(argv[1], "scm-getdents") == 0) {
     return scm_getdents(argv[2]);
@@ -1148,11 +1197,14 @@ int main(int argc, char** argv) {
   if (argc == 2 && strcmp(argv[1], "stdout-pipe-links") == 0) {
     return stdout_pipe_links();
   }
+  if (argc == 3 && strcmp(argv[1], "listed-inodes") == 0) {
+    return listed_inodes(argv[2]);
+  }
   fprintf(
       stderr,
       "usage: %s scm-getdents DIR | maps-stat [DIR] | maps-stat-full-table | "
       "proc-fd-links | stdio-mmap-sentinel | stdio-getdents | "
-      "stdout-alias-maps PATH | stdout-pipe-links\n",
+      "stdout-alias-maps PATH | stdout-pipe-links | listed-inodes DIR\n",
       argv[0]);
   return 2;
 }

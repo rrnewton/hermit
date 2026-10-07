@@ -1962,6 +1962,203 @@ fn untracked_directory_descriptor_lists_entries_with_stat_inodes() {
     assert_eq!(stdout, inode_identity_views::scm_getdents_expected_stdout());
 }
 
+#[cfg(target_arch = "x86_64")]
+const AUDIT_ARCH_NATIVE: u32 = 0xc000_003e; // AUDIT_ARCH_X86_64
+#[cfg(target_arch = "aarch64")]
+const AUDIT_ARCH_NATIVE: u32 = 0xc000_00b7; // AUDIT_ARCH_AARCH64
+
+/// A seccomp program that answers `verdict` for system call `nr` and allows
+/// every other call; a call made through another architecture's calling
+/// convention kills the process.
+fn seccomp_program(nr: libc::c_long, verdict: u32) -> [libc::sock_filter; 7] {
+    let statement = |code: u32, k: u32| libc::sock_filter {
+        code: code as u16,
+        jt: 0,
+        jf: 0,
+        k,
+    };
+    let jump_if_equal = |k: u32, jt: u8, jf: u8| libc::sock_filter {
+        code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+        jt,
+        jf,
+        k,
+    };
+    let load_word = |offset: u32| statement(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, offset);
+    let ret = |verdict: u32| statement(libc::BPF_RET | libc::BPF_K, verdict);
+    [
+        // struct seccomp_data: nr at offset 0, arch at offset 4.
+        load_word(4),
+        jump_if_equal(AUDIT_ARCH_NATIVE, 1, 0),
+        ret(libc::SECCOMP_RET_KILL_PROCESS),
+        load_word(0),
+        jump_if_equal(u32::try_from(nr).unwrap(), 0, 1),
+        ret(verdict),
+        ret(libc::SECCOMP_RET_ALLOW),
+    ]
+}
+
+/// List `directory` with the listed-inodes mode of
+/// tests/c/fixtures/inode_identity_views.c, failing on any unsuccessful exit,
+/// and return what it printed with Hermit's log. With `filter`, the process
+/// that becomes Hermit installs it (after no_new_privs) before it executes
+/// Hermit, so Hermit, every thread it starts and every guest inherit it, as
+/// they would a container runtime's filter.
+fn run_listed_inodes(
+    guest: &Path,
+    directory: &Path,
+    filter: Option<[libc::sock_filter; 7]>,
+) -> (String, String) {
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command.args([
+        // Debug logs the configuration Detcore starts the guest with.
+        "--log=debug",
+        "run",
+        "--base-env=minimal",
+        "--no-virtualize-cpuid",
+        "--max-timeslice=disabled",
+        "--",
+    ]);
+    command.arg(guest).arg("listed-inodes").arg(directory);
+    hermit_test::configure_guest_execution(&mut command);
+    // After configure_guest_execution, which rebuilds the command.
+    if let Some(program) = filter {
+        // SAFETY: prctl and seccomp are async-signal-safe, and the program
+        // was copied into the closure before the fork; the kernel copies it
+        // again, so nothing is allocated after the fork.
+        unsafe {
+            command.pre_exec(move || {
+                let fprog = libc::sock_fprog {
+                    len: program.len() as u16,
+                    filter: program.as_ptr() as *mut libc::sock_filter,
+                };
+                if libc::prctl(
+                    libc::PR_SET_NO_NEW_PRIVS,
+                    1 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                ) == 0
+                    && libc::syscall(
+                        libc::SYS_seccomp,
+                        libc::SECCOMP_SET_MODE_FILTER as libc::c_long,
+                        0 as libc::c_long,
+                        &fprog as *const libc::sock_fprog as libc::c_long,
+                    ) == 0
+                {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+    }
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    assert!(
+        output.status.success(),
+        "listed-inodes guest failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    (
+        String::from_utf8(output.stdout).expect("listed-inodes output should be UTF-8"),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// The launcher's answer as Detcore logged it in the configuration it started
+/// the guest with: true when an inherited filter may refuse a lookup call, so
+/// Detcore numbers every entry from its own lstat.
+fn logged_seccomp_answer(log: &str) -> bool {
+    let field = "seccomp_may_refuse_entry_lookup_syscalls";
+    let falses = log.matches(&format!("{field}: false,")).count();
+    let trues = log.matches(&format!("{field}: true,")).count();
+    match (falses, trues) {
+        (0, 0) => panic!("Hermit logged no {field} in its configuration:\n{log}"),
+        (_, 0) => false,
+        (0, _) => true,
+        _ => panic!("Hermit logged both answers for {field}:\n{log}"),
+    }
+}
+
+// The launcher asks whether a seccomp filter Hermit inherits may refuse a call
+// Detcore injects to choose how getdents numbers a directory's entries
+// (`fstatfs`, and on an overlay `mmap`, `statx` and `munmap`). Where one may,
+// Detcore numbers every entry from its own lstat and injects none of those
+// calls (`seccomp_may_refuse_entry_lookup_syscalls`). The numbers a guest
+// lists must not depend on which way was chosen. This lists one directory
+// three times: with no filter; under a filter that refuses only swapon, where
+// the launcher's child finds the lookup calls allowed; and under a filter that
+// fails statx with EPERM, as an allowlist profile does for a call it does not
+// list, so the launcher answers that a lookup call may be refused. Every run
+// must succeed, report the answer expected under its filter, so that the
+// comparison covers both ways of numbering entries, and print the same lines.
+//
+// No run here traps or fails fstatfs itself. The ptrace backend calls fstatfs
+// on a /proc descriptor when it takes over the guest's first process, so under
+// such a filter Hermit stops before the guest starts, whichever way the
+// launcher answered. The launcher's answer to those filters is tested in
+// hermit-cli/src/lib.rs.
+#[test]
+fn listed_inode_numbers_do_not_depend_on_an_inherited_seccomp_filter() {
+    let _guard = hermit_run_lock();
+    let guest = inode_identity_views::compile_guest("listed-inodes");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("directory to list");
+    for name in ["alpha", "beta", "gamma"] {
+        fs::write(directory.path().join(name), name).expect("create a file to list");
+    }
+    fs::create_dir(directory.path().join("delta")).expect("create a directory to list");
+    std::os::unix::fs::symlink("alpha", directory.path().join("epsilon"))
+        .expect("create a symlink to list");
+
+    let (unfiltered, log) = run_listed_inodes(&guest, directory.path(), None);
+    let mut names: Vec<&str> = unfiltered
+        .lines()
+        .map(|line| line.split(' ').next().unwrap_or(line))
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [".", "..", "alpha", "beta", "delta", "epsilon", "gamma"],
+        "listing without a filter:\n{unfiltered}"
+    );
+    assert!(
+        !logged_seccomp_answer(&log),
+        "with no filter of the test's own the launcher answered that a lookup call may be \
+         refused; does this test run under an inherited seccomp filter?"
+    );
+
+    for (description, filter, answer) in [
+        (
+            "a filter that refuses only swapon",
+            seccomp_program(
+                libc::SYS_swapon,
+                libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+            ),
+            false,
+        ),
+        (
+            "a filter that fails statx with EPERM",
+            seccomp_program(
+                libc::SYS_statx,
+                libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+            ),
+            true,
+        ),
+    ] {
+        let (listing, log) = run_listed_inodes(&guest, directory.path(), Some(filter));
+        assert_eq!(
+            logged_seccomp_answer(&log),
+            answer,
+            "the launcher's answer under {description}"
+        );
+        assert_eq!(listing, unfiltered, "{description} changed the listing");
+    }
+}
+
 // Detcore gives the guest's descriptors 0, 1 and 2 one cached stat when it
 // starts, an fstat of descriptor 0 (Hermit's own on the ptrace backend), and
 // getdents keys each entry's deterministic inode on the device of the
