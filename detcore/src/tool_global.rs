@@ -1972,14 +1972,38 @@ impl GlobalTool for GlobalState {
                     .process_signal_targets(dpid),
             ),
             GlobalRequest::NotifySignalPending(dettid, SigWrapper(signal), target_process) => {
-                let mut scheduler = self.lock_rpc_scheduler(false).await;
-                scheduler.notify_signal_pending(dettid, SigWrapper(signal));
-                if signal == libc::SIGKILL {
+                let (exit_report, failure) = {
+                    let mut scheduler = self.lock_rpc_scheduler(false).await;
+                    scheduler.notify_signal_pending(dettid, SigWrapper(signal));
                     // `dtid` is the authenticated sender. This RPC is sent
                     // from the sender's own turn after its kill syscall
                     // succeeded, so the backend-specific SIGKILL edge below
                     // is a deterministic point in the run.
-                    scheduler.note_sigkill_sent(dtid, dettid, target_process);
+                    let exit_report = (signal == libc::SIGKILL)
+                        .then(|| scheduler.note_sigkill_sent(dtid, dettid, target_process))
+                        .flatten();
+                    (exit_report, scheduler.backend_failure_waiter())
+                };
+                if let Some(exit_report) = exit_report {
+                    // The killed process's parent is owed its exit signal, and
+                    // the supervisor has not reported the reap that queues
+                    // it. Reply only after that report, with the scheduler
+                    // lock released, so that the signal is pending before the
+                    // sender returns from `kill` and is taken before its next
+                    // request on every run (`Scheduler::retire_sigkilled_process`).
+                    futures::pin_mut!(exit_report, failure);
+                    if let futures::future::Either::Left(_) =
+                        futures::future::select(failure, exit_report).await
+                    {
+                        // As in `lock_rpc_scheduler`, a callback that loses to
+                        // terminal publication stays pending and is dropped
+                        // with the backend; no normal reply is invented. The
+                        // epilogue's scheduler lock withholds the reply for
+                        // most senders too, but it is skipped for an exec
+                        // caller after its local mm swap, so this handler does
+                        // not rely on it.
+                        std::future::pending::<()>().await;
+                    }
                 }
                 R::NotifySignalPending(())
             }
@@ -6961,9 +6985,12 @@ mod tests {
     /// successful `kill` is the deterministic edge: it retires the child there,
     /// whether the supervisor's report of the death reached Detcore before the
     /// edge or arrives after it. Either way the child's exit completes exactly
-    /// once and its parent is owed one `SIGCHLD` wakeup. A non-fatal signal
-    /// retires nothing. Before the fix the notification retired nothing, and
-    /// the dead child stayed registered for the rest of the run.
+    /// once and its parent is owed one `SIGCHLD` wakeup. When the report comes
+    /// after the edge, the notification's reply waits for it, because the
+    /// kernel queues the parent's real `SIGCHLD` at that reap and the sender
+    /// must not run on before it is pending. A non-fatal signal retires
+    /// nothing and never waits. Before the fix the notification retired
+    /// nothing, and the dead child stayed registered for the rest of the run.
     #[tokio::test]
     async fn sigkill_rpc_retires_a_sabre_child_at_its_edge_in_either_report_order() {
         for report_first in [false, true] {
@@ -7019,17 +7046,15 @@ mod tests {
                 state.complete_physical_process_exit(child.as_raw());
             }
 
-            let killed = state
-                .receive_rpc(
-                    reverie::Tid::from_raw(parent.as_raw()),
-                    rpc(GlobalRequest::NotifySignalPending(
-                        child,
-                        SigWrapper(libc::SIGKILL),
-                        Some(child_pid),
-                    )),
-                )
-                .await;
-            assert_eq!(killed.1, GlobalResponse::NotifySignalPending(()));
+            let mut killed = std::pin::pin!(state.receive_rpc(
+                reverie::Tid::from_raw(parent.as_raw()),
+                rpc(GlobalRequest::NotifySignalPending(
+                    child,
+                    SigWrapper(libc::SIGKILL),
+                    Some(child_pid),
+                )),
+            ));
+            let early = futures::poll!(killed.as_mut());
             {
                 let mut sched = state.sched.lock().unwrap();
                 assert!(sched.thread_is_logically_killed(child), "{report_first}");
@@ -7046,9 +7071,18 @@ mod tests {
                     "report first: {report_first}"
                 );
             }
-            if !report_first {
+            let killed = if report_first {
+                match early {
+                    std::task::Poll::Ready(killed) => killed,
+                    std::task::Poll::Pending => panic!("a reported exit must not delay the edge"),
+                }
+            } else {
+                assert!(early.is_pending(), "the edge must wait for the reap report");
+                assert!(futures::poll!(killed.as_mut()).is_pending());
                 state.complete_physical_process_exit(child.as_raw());
-            }
+                killed.await
+            };
+            assert_eq!(killed.1, GlobalResponse::NotifySignalPending(()));
             assert_eq!(
                 state
                     .sched
@@ -7061,11 +7095,79 @@ mod tests {
         }
     }
 
+    /// A `SIGKILL` edge waiting for the reap report must not invent a normal
+    /// reply when the backend fails first. Like every RPC that loses to
+    /// terminal publication (`lock_rpc_scheduler`), it stays pending for the
+    /// backend to drop, and a report that arrives after the failure does not
+    /// complete it either.
+    #[tokio::test]
+    async fn sigkill_edge_waiting_for_the_reap_invents_no_reply_on_backend_failure() {
+        let config = sabre_profile(Config {
+            sequentialize_threads: false,
+            ..Config::default()
+        });
+        let state = GlobalState::initialize(&config, false);
+        let parent = DetTid::from_raw(17);
+        let parent_pid = DetPid::from_raw(17);
+        let child = DetTid::from_raw(18);
+        let child_pid = DetPid::from_raw(18);
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .thread_tree
+            .add_child(parent, parent, true);
+        install_test_registration(&state, parent, Ivar::new());
+        let rpc = |request| (DetTime::new(&config), MmId::initial(parent_pid), request);
+        let created = state
+            .receive_rpc(
+                reverie::Tid::from_raw(parent.as_raw()),
+                rpc(GlobalRequest::CreateChildThread(
+                    child,
+                    parent_pid,
+                    0,
+                    Some(CloneFlags::empty()),
+                    libc::SIGCHLD,
+                    None,
+                    Some(DEFAULT_PRIORITY),
+                )),
+            )
+            .await;
+        assert_eq!(created.1, GlobalResponse::CreateChildThread(None));
+
+        let mut killed = std::pin::pin!(state.receive_rpc(
+            reverie::Tid::from_raw(parent.as_raw()),
+            rpc(GlobalRequest::NotifySignalPending(
+                child,
+                SigWrapper(libc::SIGKILL),
+                Some(child_pid),
+            )),
+        ));
+        assert!(futures::poll!(killed.as_mut()).is_pending());
+        assert!(
+            state
+                .sched
+                .lock()
+                .unwrap()
+                .thread_is_logically_killed(child)
+        );
+        state.report_backend_failure(reverie::BackendFailure {
+            pid: Tid::from_raw(child.as_raw()),
+            tid: Tid::from_raw(child.as_raw()),
+            phase: "SIGKILL edge awaiting reap",
+        });
+        assert!(futures::poll!(killed.as_mut()).is_pending());
+        state.complete_physical_process_exit(child.as_raw());
+        assert!(futures::poll!(killed.as_mut()).is_pending());
+    }
+
     /// A SaBRe child's successful exec is in flight (its preparation is
     /// recorded) when its parent's `SIGKILL` edge retires the child. The new
     /// image's reconnect must not resurrect the retired caller: it is refused,
     /// consumes the preparation, and commits neither the exec's exit-signal
-    /// reset nor its generation change.
+    /// reset nor its generation change. The reconnect arrives while the
+    /// parent's edge still waits for the supervisor's reap report, which then
+    /// lets the edge complete.
     #[tokio::test]
     async fn sigkill_before_exec_reconnect_refuses_to_resurrect_the_caller() {
         let config = sabre_profile(Config {
@@ -7106,21 +7208,19 @@ mod tests {
             },
         );
 
-        let killed = state
-            .receive_rpc(
-                reverie::Tid::from_raw(parent.as_raw()),
-                (
-                    DetTime::new(&config),
-                    MmId::initial(parent_pid),
-                    GlobalRequest::NotifySignalPending(
-                        child,
-                        SigWrapper(libc::SIGKILL),
-                        Some(child_pid),
-                    ),
+        let mut killed = std::pin::pin!(state.receive_rpc(
+            reverie::Tid::from_raw(parent.as_raw()),
+            (
+                DetTime::new(&config),
+                MmId::initial(parent_pid),
+                GlobalRequest::NotifySignalPending(
+                    child,
+                    SigWrapper(libc::SIGKILL),
+                    Some(child_pid),
                 ),
-            )
-            .await;
-        assert_eq!(killed.1, GlobalResponse::NotifySignalPending(()));
+            ),
+        ));
+        assert!(futures::poll!(killed.as_mut()).is_pending());
         assert!(
             state
                 .sched
@@ -7149,14 +7249,19 @@ mod tests {
             .await;
         assert_eq!(reconnected.1, GlobalResponse::ThreadExited);
         assert!(state.pending_exec_states.lock().unwrap().is_empty());
-        let sched = state.sched.lock().unwrap();
-        assert!(!sched.next_turns.contains_key(&child));
-        assert!(sched.thread_is_logically_killed(child));
-        assert_eq!(sched.thread_tree.exec_generation(child_pid), Some(0));
-        assert_eq!(
-            sched.thread_tree.child_exit_notification_signal(child_pid),
-            Some(libc::SIGUSR1)
-        );
+        {
+            let sched = state.sched.lock().unwrap();
+            assert!(!sched.next_turns.contains_key(&child));
+            assert!(sched.thread_is_logically_killed(child));
+            assert_eq!(sched.thread_tree.exec_generation(child_pid), Some(0));
+            assert_eq!(
+                sched.thread_tree.child_exit_notification_signal(child_pid),
+                Some(libc::SIGUSR1)
+            );
+        }
+        assert!(futures::poll!(killed.as_mut()).is_pending());
+        state.complete_physical_process_exit(child.as_raw());
+        assert_eq!(killed.await.1, GlobalResponse::NotifySignalPending(()));
     }
 
     /// A reloading backend (SaBRe) consumes the exec preparation when the new

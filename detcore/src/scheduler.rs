@@ -754,6 +754,15 @@ pub struct Scheduler {
     /// when the raw TID is registered again.
     physically_completed_live_processes: BTreeSet<DetPid>,
 
+    /// Guest `SIGKILL` edges waiting for their victim's final physical exit,
+    /// keyed by the victim process. `retire_sigkilled_process` adds one when it
+    /// owes the victim's parent its exit signal before the supervisor has
+    /// reported the reap; the sender's `NotifySignalPending` reply waits on it.
+    /// Every path that removes the process from
+    /// `pending_physical_process_exits` sends to and removes its waiters, so a
+    /// waiter never outlives its barrier.
+    sigkill_exit_waiters: BTreeMap<DetPid, Vec<oneshot::Sender<()>>>,
+
     /// Ac table of "locks held": which action is using which resources.
     /// A given resource can be held by at most one action at a given time.
     #[allow(dead_code)]
@@ -1950,6 +1959,7 @@ impl Scheduler {
             child_exit_signals_owed: Default::default(),
             registered_mms: Default::default(),
             physically_completed_live_processes: Default::default(),
+            sigkill_exit_waiters: Default::default(),
             resources: Default::default(),
             started_up: Default::default(),
             thread_tree: Default::default(),
@@ -2072,23 +2082,29 @@ impl Scheduler {
     /// outright there runs no exit hook and would otherwise stay registered
     /// until the end of the run, with its blockers and owed state deciding
     /// later admissions according to host-timed death reports.
+    ///
+    /// Returns a receiver when the sender's edge must not complete until the
+    /// supervisor reports the target's final physical exit; see
+    /// `retire_sigkilled_process`. The caller replies to the sender only after
+    /// the receiver resolves.
     pub(crate) fn note_sigkill_sent(
         &mut self,
         sender: DetTid,
         target: DetTid,
         target_process: Option<DetPid>,
-    ) {
+    ) -> Option<oneshot::Receiver<()>> {
         if self.backend.requires_thread_directed_process_signals {
             if let Some(detpid) = target_process {
                 self.note_process_sigkill(target, detpid);
             }
-            return;
+            return None;
         }
         if self.backend.reports_physical_process_exits
             && self.backend.needs_killed_thread_rpc_cancellation
         {
-            self.retire_sigkilled_process(sender, target, target_process);
+            return self.retire_sigkilled_process(sender, target, target_process);
         }
+        None
     }
 
     /// Retire every live thread of the process that a guest `SIGKILL` from
@@ -2106,21 +2122,32 @@ impl Scheduler {
     /// A `SIGKILL` the sender sends to its own process kills the sender too
     /// and is left to the existing paths, as is any death this edge does not
     /// see (a process-group or external kill, or another fatal signal).
+    ///
+    /// When the parent is owed its exit signal and the supervisor has not yet
+    /// reported the reap, this returns a receiver that resolves at that report
+    /// (or when every barrier is released at teardown), and the sender's edge
+    /// waits for it. The kernel queues the parent's one real `SIGCHLD` when the
+    /// supervisor reaps the child, before the supervisor reports it, so the
+    /// signal is pending before the sender returns from its `kill`. Without the
+    /// wait, the sender (often the parent itself) ran on and the signal landed
+    /// before or after its next request according to host timing, which put
+    /// the parent's `SIGCHLD` request before or after, say, its next sleep.
+    /// The wait adds no liveness dependency: while the entry is owed,
+    /// `step2_deliver_owed_child_exit_signals` already holds every turn for the
+    /// same report, and the supervisor reaps a killed process without a turn.
     fn retire_sigkilled_process(
         &mut self,
         sender: DetTid,
         target: DetTid,
         target_process: Option<DetPid>,
-    ) {
-        let Some(process) = target_process.or_else(|| self.registered_process(target)) else {
-            return;
-        };
+    ) -> Option<oneshot::Receiver<()>> {
+        let process = target_process.or_else(|| self.registered_process(target))?;
         if self.registered_process(sender) == Some(process) {
-            return;
+            return None;
         }
         let live = self.process_signal_targets(process);
         if live.is_empty() {
-            return;
+            return None;
         }
         let mut mms = Vec::with_capacity(live.len());
         for tid in &live {
@@ -2131,7 +2158,7 @@ impl Scheduler {
                         tid,
                     )
                 });
-                return;
+                return None;
             };
             mms.push((*tid, mm));
         }
@@ -2161,7 +2188,16 @@ impl Scheduler {
             && self.should_synthesize_child_exit_signal(parent)
         {
             self.child_exit_signals_owed.insert(process, parent);
+            if self.pending_physical_process_exits.contains(&process) {
+                let (report, reported) = oneshot::channel();
+                self.sigkill_exit_waiters
+                    .entry(process)
+                    .or_default()
+                    .push(report);
+                return Some(reported);
+            }
         }
+        None
     }
 
     fn should_synthesize_child_exit_signal(&self, parent: DetTid) -> bool {
@@ -2756,6 +2792,7 @@ impl Scheduler {
         self.physically_exited_threads.remove(&new_leader);
         self.deregistration_accounted.remove(&new_leader);
         self.pending_physical_process_exits.remove(&detpid);
+        self.release_sigkill_exit_waiters(detpid);
         assert!(
             self.next_turns
                 .insert(
@@ -2996,6 +3033,7 @@ impl Scheduler {
         if removed {
             self.completed_physical_process_exits.insert(detpid);
             self.wake_physical_child_waiters(detpid);
+            self.release_sigkill_exit_waiters(detpid);
         } else if self.backend.reports_physical_process_exits
             && !self.process_signal_targets(detpid).is_empty()
         {
@@ -3011,8 +3049,22 @@ impl Scheduler {
         for child in children {
             self.completed_physical_process_exits.insert(child);
             self.wake_physical_child_waiters(child);
+            self.release_sigkill_exit_waiters(child);
         }
         released
+    }
+
+    /// Let every `SIGKILL` edge waiting for `detpid`'s physical exit complete.
+    /// Called wherever `detpid` leaves `pending_physical_process_exits`.
+    fn release_sigkill_exit_waiters(&mut self, detpid: DetPid) {
+        for report in self
+            .sigkill_exit_waiters
+            .remove(&detpid)
+            .unwrap_or_default()
+        {
+            // A dropped receiver is a sender whose RPC was abandoned.
+            let _ = report.send(());
+        }
     }
 
     /// Remove entries from everywhere that non-runnable threads lurk.

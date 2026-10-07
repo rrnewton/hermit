@@ -3480,6 +3480,95 @@ fn sigkill_edge_retires_every_thread_of_the_target_process() {
     );
 }
 
+/// The `SIGKILL` edge completes only once the parent's one real `SIGCHLD` is
+/// queued. The kernel queues it when the supervisor reaps the child, before
+/// the supervisor reports the reap, so an edge that owes the parent that
+/// signal while the report is outstanding returns a receiver that resolves at
+/// exactly that report: not at an unrelated report, and once. Teardown, which
+/// releases every physical-exit barrier, releases a waiting edge too, so no
+/// sender is left waiting for a report that will never come.
+#[test]
+fn sigkill_edge_waits_for_the_reap_report_that_queues_the_parents_sigchld() {
+    let child_process = DetPid::from_raw(200);
+
+    let mut s = sabre_scheduler();
+    let (parent, _, _) = add(&mut s, 100, 100);
+    let (child, _, _) = add_process_child(&mut s, 100, 200);
+    queue_ordinary_work(&mut s, parent);
+    let mut reported = s
+        .note_sigkill_sent(parent, child, Some(child_process))
+        .expect("an owed SIGCHLD makes the edge wait for the reap report");
+    assert!(matches!(reported.try_recv(), Ok(None)));
+    assert!(s.step2_drain_prefix().is_err());
+    assert!(!s.complete_physical_process_exit(DetPid::from_raw(999)));
+    assert!(matches!(reported.try_recv(), Ok(None)));
+    assert!(s.complete_physical_process_exit(child_process));
+    assert!(matches!(reported.try_recv(), Ok(Some(()))));
+    assert!(s.sigkill_exit_waiters.is_empty());
+    assert!(!s.complete_physical_process_exit(child_process));
+    assert!(s.step2_drain_prefix().is_ok());
+    assert_eq!(s.owed_child_exit_wakeups, 1);
+
+    let mut s = sabre_scheduler();
+    let (parent, _, _) = add(&mut s, 100, 100);
+    let (child, _, _) = add_process_child(&mut s, 100, 200);
+    let mut reported = s
+        .note_sigkill_sent(parent, child, Some(child_process))
+        .expect("an owed SIGCHLD makes the edge wait for the reap report");
+    assert_eq!(s.release_all_physical_process_exits(), 1);
+    assert!(matches!(reported.try_recv(), Ok(Some(()))));
+    assert!(s.sigkill_exit_waiters.is_empty());
+}
+
+/// The edge waits only when it owes a `SIGCHLD` whose reap is unreported. A
+/// report that reached Detcore before the edge has already queued the signal,
+/// so the edge completes the exit and returns at once; a kill of the sender's
+/// own process and a backend without SaBRe's whole profile retire nothing and
+/// never wait.
+#[test]
+fn sigkill_edge_does_not_wait_without_an_unreported_owed_sigchld() {
+    let child_process = DetPid::from_raw(200);
+
+    let mut s = sabre_scheduler();
+    let (parent, _, _) = add(&mut s, 100, 100);
+    let (child, _, _) = add_process_child(&mut s, 100, 200);
+    assert!(!s.complete_physical_process_exit(child_process));
+    assert!(
+        s.note_sigkill_sent(parent, child, Some(child_process))
+            .is_none()
+    );
+    assert_eq!(
+        s.test_process_exit_state(child_process),
+        (false, true, Some(DetPid::from_raw(100)))
+    );
+    assert!(s.sigkill_exit_waiters.is_empty());
+
+    let mut s = sabre_scheduler();
+    add(&mut s, 100, 100);
+    let (child, _, _) = add_process_child(&mut s, 100, 200);
+    let (child_sibling, _, _) = add(&mut s, 200, 201);
+    assert!(
+        s.note_sigkill_sent(child_sibling, child, Some(child_process))
+            .is_none()
+    );
+    assert!(s.sigkill_exit_waiters.is_empty());
+
+    for mut s in [
+        physical_exit_reporting_scheduler(),
+        Scheduler::new(&Config::default().with_backend(|backend| {
+            backend.needs_killed_thread_rpc_cancellation = true;
+        })),
+    ] {
+        let (parent, _, _) = add(&mut s, 100, 100);
+        let (child, _, _) = add_process_child(&mut s, 100, 200);
+        assert!(
+            s.note_sigkill_sent(parent, child, Some(child_process))
+                .is_none()
+        );
+        assert!(s.sigkill_exit_waiters.is_empty());
+    }
+}
+
 #[test]
 fn exit_boundary_reservation_failure_has_no_local_effect() {
     let (mut s, backend) = fixture();

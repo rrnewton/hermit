@@ -1192,7 +1192,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (sigkill_rpc_retires_a_sabre_child_at_its_edge_in_either_report_order,
     // sigkill_before_exec_reconnect_refuses_to_resurrect_the_caller)
     // retain all 1002: 1002 + 6 = 1008, measured the same way.
-    ("test.detcore_unit", 1008),
+    // Two scheduler::parked_tests SIGKILL reap-wait tests
+    // (sigkill_edge_waits_for_the_reap_report_that_queues_the_parents_sigchld,
+    // sigkill_edge_does_not_wait_without_an_unreported_owed_sigchld) and one
+    // tool_global::tests test
+    // (sigkill_edge_waiting_for_the_reap_invents_no_reply_on_backend_failure)
+    // retain all 1008: 1008 + 3 = 1011, measured the same way.
+    ("test.detcore_unit", 1011),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1576,7 +1582,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same three exec-edge tests retain all 993: 996.
     // The same six rt_sigsuspend death and pending-waker tests retain all 996: 1002.
     // The same six SIGKILL-edge and publication tests retain all 1002: 1008.
-    ("test.detcore_unit_on_host", 1008),
+    // The same three SIGKILL reap-wait tests retain all 1008: 1011.
+    ("test.detcore_unit_on_host", 1011),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
