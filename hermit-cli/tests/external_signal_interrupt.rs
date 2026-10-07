@@ -549,6 +549,54 @@ fn run_cell_with_external_signals(
 
 /// Run one cell as `run_cell_with_external_signals` does, observed as `observe`
 /// says.
+/// The arguments every cell passes to `hermit` after its global options.
+/// `--backend` is a global option and goes before the subcommand. The guest
+/// gets a minimal environment instead of the test's: under Cargo and Nextest,
+/// LD_LIBRARY_PATH names the build's deps directory, which concurrent builds
+/// write to while a cell runs, so the guest's dynamic loader stat'ed a
+/// directory whose size could change between `--verify`'s two runs, and the
+/// cell failed bitwise parity on a host input, not on Hermit.
+fn cell_run_args(backend: &str) -> [&str; 5] {
+    [
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        "--base-env=minimal",
+    ]
+}
+
+/// The guest of every cell runs without the test's environment, so a
+/// directory on the test's LD_LIBRARY_PATH never reaches its dynamic loader
+/// (`cell_run_args`).
+#[test]
+fn cells_give_the_guest_a_minimal_environment() {
+    const MARKER: &str = "/hermit-esi-ld-library-path-marker";
+    let output = Command::new(hermit_binary::hermit_binary())
+        .args(cell_run_args("ptrace"))
+        .arg("--")
+        .arg("/usr/bin/env")
+        .env("LD_LIBRARY_PATH", MARKER)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run hermit");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "hermit env failed: {}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.lines().any(|line| line.starts_with("PATH=")),
+        "the minimal environment sets PATH:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(MARKER),
+        "the guest inherited the test's LD_LIBRARY_PATH:\n{stdout}"
+    );
+}
+
 fn run_cell_observed(
     backend: &str,
     mode: FutexMode,
@@ -579,8 +627,7 @@ fn run_cell_observed(
     if let Some(log) = &info_log {
         command.arg("--log=info").arg("--log-file").arg(log);
     }
-    // `--backend` is a global option and goes before the subcommand.
-    command.args(["--backend", backend, "run", "--strict"]);
+    command.args(cell_run_args(backend));
     if let FutexMode::Polling = mode {
         command.arg("--debug-futex-mode=polling");
     }

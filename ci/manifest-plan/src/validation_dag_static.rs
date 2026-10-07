@@ -1470,7 +1470,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // verify_signal_report_cannot_hold_agreed_guest_stdout all 282 (283), and
     // the three stdout-file tests (one control, two at the file-size limit)
     // all 283 (286).
-    ("test.hermit_integration", 286),
+    // external_signal_interrupt's cells_give_the_guest_a_minimal_environment
+    // retains all 286 (287, measured with cargo nextest list).
+    ("test.hermit_integration", 287),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -1918,7 +1920,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the blocking-stderr signal-report test (282).
     // And the agreed-guest-stdout signal-report test (283).
     // And the three stdout-file tests (286).
-    ("test.hermit_integration_on_host", 286),
+    // And the minimal-environment test (287, measured).
+    ("test.hermit_integration_on_host", 287),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
