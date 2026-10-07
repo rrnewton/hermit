@@ -1309,7 +1309,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     //   only_unblocked_caught_or_fatal_signals_interrupt_a_wait;
     // The 1002 pinned before https://github.com/rrnewton/hermit/pull/3361 and its 66 tests above,
     // re-listed together: 1068 (measured with cargo nextest list --profile ci).
-    ("test.detcore_unit", 1068),
+    // syscalls::time::tests::failed_gettimeofday_repair_is_skipped_only_for_kvm
+    // is deleted with the capability it tested, which reverie-kvm's time(2)
+    // and Guest::storable_memory_ranges replace: 1068 - 1 = 1067, measured with
+    // cargo nextest list --profile ci -p hermit-detcore --lib --bins.
+    ("test.detcore_unit", 1067),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1821,7 +1825,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same 66 https://github.com/rrnewton/hermit/pull/3361 signal tests
     // listed for test.detcore_unit (1041, measured).
     // The host twin selects the same tests, re-listed together: 1068.
-    ("test.detcore_unit_on_host", 1068),
+    // The host twin loses the same deleted time test: 1067.
+    ("test.detcore_unit_on_host", 1067),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

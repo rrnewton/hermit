@@ -203,11 +203,10 @@ fn fixture_with_control(installed: bool) -> (Scheduler, Arc<Backend>) {
     let mut s = Scheduler::new(&Config {
         sequentialize_threads: true,
         ..Config::default().with_backend(|backend| {
-            // The four behaviours the old `backend_is_kvm` identity flag
+            // The three behaviours the old `backend_is_kvm` identity flag
             // selected that remain capabilities.
             backend.provides_process_signal_control = true;
             backend.emulates_child_waits = true;
-            backend.failed_gettimeofday_may_store_host_time = false;
             backend.user_address_limit = Some(reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT);
             backend.needs_killed_thread_rpc_cancellation = true;
         })
