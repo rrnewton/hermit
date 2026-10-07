@@ -455,6 +455,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         kill_daemons: default_config.kill_daemons,
         max_timeslice: default_config.max_timeslice,
         target_timeslice: default_config.target_timeslice,
+        target_timeslice_syscalls_only: default_config.target_timeslice_syscalls_only,
         seed: default_config.seed,
         rng_seed: default_config.rng_seed,
         imprecise_timers: false,

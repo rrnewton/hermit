@@ -1189,6 +1189,91 @@ fn max_timeslice_preempts_cpu_bound_code_without_rcb_logical_time() {
     );
 }
 
+/// With `--target-timeslice-syscalls-only`, a thread that reads the TSC inside
+/// a spinlock must not yield there when its target timeslice expires. QEMU's `cpu_get_ticks` reads the host TSC under its
+/// `vm_clock_lock` spinlock; a vCPU that yielded at every expired target while
+/// reading the TSC held the lock at every yield, and the other vCPU never got it.
+///
+/// The holder's only check-in is the `rdtsc` inside the lock, so a trap that
+/// ends the expired target (the default) always yields with the lock held, and
+/// without the flag this test fails with the contender starved. The holder's syscall-free work outside the
+/// lock varies, so a PMU-maximum preemption lands outside the lock almost always.
+#[test]
+fn rdtsc_inside_a_spinlock_does_not_end_a_target_timeslice() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        sequentialize_threads: true,
+        target_timeslice: std::num::NonZeroU64::new(100_000),
+        target_timeslice_syscalls_only: true,
+        max_timeslice: std::num::NonZeroU64::new(2_000_000),
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || {
+            let monotonic_ns = || {
+                let mut now = MaybeUninit::<libc::timespec>::uninit();
+                let result = unsafe {
+                    libc::syscall(
+                        libc::SYS_clock_gettime,
+                        libc::CLOCK_MONOTONIC,
+                        now.as_mut_ptr(),
+                    )
+                };
+                assert_eq!(result, 0);
+                let now = unsafe { now.assume_init() };
+                now.tv_sec as i128 * 1_000_000_000 + now.tv_nsec as i128
+            };
+
+            let lock = Arc::new(AtomicBool::new(false));
+            let acquired = Arc::new(AtomicBool::new(false));
+            let holder_lock = Arc::clone(&lock);
+            let holder_acquired = Arc::clone(&acquired);
+            let holder = thread::spawn(move || {
+                let mut round: u64 = 0;
+                while !holder_acquired.load(Ordering::Acquire) {
+                    round += 1;
+                    let mut work = 0u64;
+                    for i in 0..(50 + round % 37) {
+                        work = std::hint::black_box(work.wrapping_add(i));
+                    }
+                    while holder_lock.swap(true, Ordering::Acquire) {
+                        std::hint::spin_loop();
+                    }
+                    // SAFETY: rdtsc has no preconditions on x86_64.
+                    std::hint::black_box(unsafe { core::arch::x86_64::_rdtsc() });
+                    holder_lock.store(false, Ordering::Release);
+                }
+            });
+
+            let start = monotonic_ns();
+            let mut attempts: u64 = 0;
+            while lock.swap(true, Ordering::Acquire) {
+                attempts += 1;
+                if attempts.is_multiple_of(1_000) {
+                    let elapsed = monotonic_ns() - start;
+                    if elapsed >= 1_000_000_000 {
+                        // The forked-test harness reports a guest panic without
+                        // its message, and libtest captures `eprintln!`, so write
+                        // the reason to fd 2 directly.
+                        let why = format!(
+                            "contender starved for {elapsed} virtual ns ({attempts} attempts): \
+                             the holder yielded inside its spinlock\n"
+                        );
+                        unsafe { libc::write(2, why.as_ptr().cast(), why.len()) };
+                        panic!("contender starved");
+                    }
+                }
+                std::hint::spin_loop();
+            }
+            acquired.store(true, Ordering::Release);
+            lock.store(false, Ordering::Release);
+            holder.join().unwrap();
+        },
+        config,
+        true,
+    );
+}
+
 #[test]
 fn tod_clock_getres() {
     let mut tp: MaybeUninit<libc::timespec> = MaybeUninit::uninit();

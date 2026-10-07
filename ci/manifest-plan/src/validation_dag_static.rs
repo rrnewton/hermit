@@ -856,7 +856,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 992 + 2 = 994 (the same listing gives 729).
     // main::tests::rejects_io_buffer_comparison_relaxation_with_reason, for the
     // refusal of compare_io_buffers=false with a reason, retains all 995: 996.
-    ("test.regular_crates", 996),
+    // config::tests::target_timeslice_syscalls_only_never_enters_the_legacy_form
+    // (lane qemu-rcb, https://github.com/rrnewton/hermit/pull/3859) retains
+    // all 996: 997.
+    ("test.regular_crates", 997),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1429,7 +1432,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // I1a), re-listed: 1110.
     // Five SIGALRM ledger control tests (three in scheduler::parked_tests, two
     // in tool_global; signal phase 1 step I1b), re-listed: 1123.
-    ("test.detcore_unit", 1123),
+    // tool_local::timeslice_tests::instruction_trap_* (four tests, lane
+    // qemu-rcb, https://github.com/rrnewton/hermit/pull/3859) retain all 1123:
+    // 1127.
+    ("test.detcore_unit", 1127),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1815,7 +1821,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PMU-backed RCB clock/timer, moved out of test.detcore_time and its hosted
     // twin (https://github.com/rrnewton/hermit/issues/3663); measured with the
     // node's exact filter, 29 run and the 2 PMU-free cases are filtered out.
-    ("privileged-test.pmu_detcore_time_cases", 29),
+    // rdtsc_inside_a_spinlock_does_not_end_a_target_timeslice (lane qemu-rcb,
+    // https://github.com/rrnewton/hermit/pull/3859) sets max_timeslice, so this
+    // node selects it and retains all 29: 30.
+    ("privileged-test.pmu_detcore_time_cases", 30),
     // The 25 external_signal_interrupt ptrace cases that need the PMU timer,
     // moved out of test.hermit_integration and its hosted twin; listed with
     // the node's exact filter, 25 run.
@@ -2000,7 +2009,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same seven B5a tests, re-listed: 1096.
     // And the same thirteen SIGALRM ledger tests, re-listed: 1110.
     // And the same five SIGALRM ledger control tests, re-listed: 1123.
-    ("test.detcore_unit_on_host", 1123),
+    // The host twin selects the same four instruction_trap tests: 1127.
+    ("test.detcore_unit_on_host", 1127),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -2168,7 +2178,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // keep the count at 991, its not-sampled test listed there makes 992, and
     // the two review-fix tests listed there make 994.
     // The compare_io_buffers refusal test listed there retains all 995: 996.
-    ("test.regular_crates_on_host", 996),
+    // The host twin selects the same detcore-model legacy-form test: 997.
+    ("test.regular_crates_on_host", 997),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
@@ -4619,7 +4630,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"test"########,
         job: r########"detcore_time"########,
         desc: r########"Detcore time integration cases that need no PMU (tests_time, serial execution)"########,
-        description: r########"Runs, selected by exact name, the two tests_time cases that construct a Config with max_timeslice disabled: proc_stat_btime_is_fixed_for_a_fractional_epoch and target_timeslice_yields_at_syscall_boundaries_without_pmu. The other 29 cases enable max_timeslice and therefore exercise ptrace's perf_event_open-backed RCB clock/timer: 24 inherit the 200000000 default through ..Default::default(), the four tod_gettimeofday_delta variants use the testutils BOTTOM, MIDDLE, and TOP configs (5000000) or the default, and max_timeslice_preempts_cpu_bound_code_without_rcb_logical_time sets 1000000. Without a PMU each of the 29 fails with Perf support required; the hosted runner has none, and the hosted twin failed exactly those 29 of 31 there (https://github.com/rrnewton/hermit/actions/runs/37143469197, https://github.com/rrnewton/hermit/issues/3663). They run in privileged-test.pmu_detcore_time_cases, whose filter is the exact complement of this one, so the full label still runs all 31 cases once each; a case added to tests_time later is selected by that PMU node, whose expected count then fails until the new case is placed deliberately. MEASURED 2026-10-03 at hermit c3f7b2bcfa00 on the measurement host recorded for test.detcore_time in docs/TESTING_ENVIRONMENTS.md ("Named measurement hosts"): five runs of this selection with cargo nextest run -p hermit-detcore --test tests_time -j 1 and this filter, invoked directly rather than through run-nextest-counted.sh, each ran 2 tests with 29 filtered out, in 1.09-1.20 s of wall time (0.56-0.72 s of nextest time), the largest process peaking at 96-106 MB RSS. The hint keeps the whole-target budget measured 2026-09-29 at hermit 905903e0a7ed, which bounds this subset from above: five serial runs of all 28 then-existing cases, each in its own systemd-run --user --scope unit, peaked at 111661056-115081216 bytes of cgroup memory.peak and took 5.32-6.12 s of wall time, and a sixth used 7.12 CPU-seconds. The 256-MiB scheduling baseline is the next power of two at or above the 115081216-byte maximum plus 20%, the 1-GiB hard cap supplies headroom, and est_duration_s rounds the maximum wall time up to 7 seconds."########,
+        description: r########"Runs, selected by exact name, the two tests_time cases that construct a Config with max_timeslice disabled: proc_stat_btime_is_fixed_for_a_fractional_epoch and target_timeslice_yields_at_syscall_boundaries_without_pmu. The other 30 cases enable max_timeslice and therefore exercise ptrace's perf_event_open-backed RCB clock/timer: 24 inherit the 200000000 default through ..Default::default(), the four tod_gettimeofday_delta variants use the testutils BOTTOM, MIDDLE, and TOP configs (5000000) or the default, max_timeslice_preempts_cpu_bound_code_without_rcb_logical_time sets 1000000, and rdtsc_inside_a_spinlock_does_not_end_a_target_timeslice sets 2000000. Without a PMU each of the 30 fails with Perf support required; the hosted runner has none, and the hosted twin failed exactly those 29 of 31 there (https://github.com/rrnewton/hermit/actions/runs/37143469197, https://github.com/rrnewton/hermit/issues/3663). They run in privileged-test.pmu_detcore_time_cases, whose filter is the exact complement of this one, so the full label still runs all 32 cases once each; a case added to tests_time later is selected by that PMU node, whose expected count then fails until the new case is placed deliberately. MEASURED 2026-10-03 at hermit c3f7b2bcfa00 on the measurement host recorded for test.detcore_time in docs/TESTING_ENVIRONMENTS.md ("Named measurement hosts"): five runs of this selection with cargo nextest run -p hermit-detcore --test tests_time -j 1 and this filter, invoked directly rather than through run-nextest-counted.sh, each ran 2 tests with 29 filtered out, in 1.09-1.20 s of wall time (0.56-0.72 s of nextest time), the largest process peaking at 96-106 MB RSS. The hint keeps the whole-target budget measured 2026-09-29 at hermit 905903e0a7ed, which bounds this subset from above: five serial runs of all 28 then-existing cases, each in its own systemd-run --user --scope unit, peaked at 111661056-115081216 bytes of cgroup memory.peak and took 5.32-6.12 s of wall time, and a sixth used 7.12 CPU-seconds. The 256-MiB scheduling baseline is the next power of two at or above the 115081216-byte maximum plus 20%, the 1-GiB hard cap supplies headroom, and est_duration_s rounds the maximum wall time up to 7 seconds."########,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,
@@ -5363,8 +5374,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
     StaticStepSpec {
         group: r########"privileged-test"########,
         job: r########"pmu_detcore_time_cases"########,
-        desc: r########"Run the 29 Detcore time cases that need the PMU (tests_time, serial execution)"########,
-        description: r########"The 29 tests_time cases that construct a Config with max_timeslice enabled and therefore exercise ptrace's perf_event_open-backed RCB clock/timer: 24 inherit the 200000000 default through ..Default::default(), the four tod_gettimeofday_delta variants use the testutils BOTTOM, MIDDLE, and TOP configs (5000000) or the default, and max_timeslice_preempts_cpu_bound_code_without_rcb_logical_time sets 1000000. Without a PMU each fails with Perf support required. The hosted runner has none, and test.detcore_time_on_host failed exactly these 29 of 31 there (https://github.com/rrnewton/hermit/actions/runs/37143469197, https://github.com/rrnewton/hermit/issues/3663), so they moved here, after privileged-pmu.preemption has shown the PMU works. The filter is the exact complement of test.detcore_time's, which keeps the two cases that disable max_timeslice, so the full label still runs all 31 cases once each, and a case added to tests_time later is selected here until it is placed deliberately. tod_gettimeofday_faulting_tz_pkey_write_disabled_leaves_tv_unchanged also needs memory protection keys: on a host whose CPU flags lack pku or ospke, pkey_alloc returns -1 and the test fails rather than skips. MEASURED 2026-10-03 at hermit c3f7b2bcfa00 on the measurement host recorded for privileged-test.pmu_detcore_time_cases in docs/TESTING_ENVIRONMENTS.md ("Named measurement hosts"): five runs of this selection with cargo nextest run -p hermit-detcore --test tests_time -j 1 and this filter, invoked directly rather than through run-nextest-counted.sh, each ran 29 tests with 2 filtered out, in 4.72-5.90 s of wall time (4.15-5.00 s of nextest time), the largest process peaking at 68-76 MB RSS. The hint keeps test.detcore_time's measured whole-target budget (256-MiB scheduling baseline, 1-GiB hard cap, 7 s estimate, 720 s wall limit), which these runs fit inside."########,
+        desc: r########"Run the 30 Detcore time cases that need the PMU (tests_time, serial execution)"########,
+        description: r########"The 30 tests_time cases that construct a Config with max_timeslice enabled and therefore exercise ptrace's perf_event_open-backed RCB clock/timer: 24 inherit the 200000000 default through ..Default::default(), the four tod_gettimeofday_delta variants use the testutils BOTTOM, MIDDLE, and TOP configs (5000000) or the default, max_timeslice_preempts_cpu_bound_code_without_rcb_logical_time sets 1000000, and rdtsc_inside_a_spinlock_does_not_end_a_target_timeslice sets 2000000. Without a PMU each fails with Perf support required. The hosted runner has none, and test.detcore_time_on_host failed exactly these 29 of 31 there (https://github.com/rrnewton/hermit/actions/runs/37143469197, https://github.com/rrnewton/hermit/issues/3663), so they moved here, after privileged-pmu.preemption has shown the PMU works. The filter is the exact complement of test.detcore_time's, which keeps the two cases that disable max_timeslice, so the full label still runs all 32 cases once each, and a case added to tests_time later is selected here until it is placed deliberately. tod_gettimeofday_faulting_tz_pkey_write_disabled_leaves_tv_unchanged also needs memory protection keys: on a host whose CPU flags lack pku or ospke, pkey_alloc returns -1 and the test fails rather than skips. MEASURED 2026-10-03 at hermit c3f7b2bcfa00 on the measurement host recorded for privileged-test.pmu_detcore_time_cases in docs/TESTING_ENVIRONMENTS.md ("Named measurement hosts"): five runs of this selection with cargo nextest run -p hermit-detcore --test tests_time -j 1 and this filter, invoked directly rather than through run-nextest-counted.sh, each ran 29 tests with 2 filtered out, in 4.72-5.90 s of wall time (4.15-5.00 s of nextest time), the largest process peaking at 68-76 MB RSS. The hint keeps test.detcore_time's measured whole-target budget (256-MiB scheduling baseline, 1-GiB hard cap, 7 s estimate, 720 s wall limit), which these runs fit inside."########,
         labels: &[r########"full"########],
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-detcore --test tests_time -j 1 -E 'not (test(=proc_stat_btime_is_fixed_for_a_fractional_epoch) | test(=target_timeslice_yields_at_syscall_boundaries_without_pmu))' || status=$?; exit "$status""########,
         cmdtype: CmdType::Unknown,

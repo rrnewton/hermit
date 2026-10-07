@@ -340,6 +340,16 @@ fn choose_rcb_timer(
     (max_rcbs_remaining, true)
 }
 
+/// What returned control to Detcore, as far as ending a timeslice is concerned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckIn {
+    /// A syscall, signal, timer, exec or thread start: any expired slice ends.
+    Event,
+    /// A trapped `rdtsc` or `cpuid` in the middle of user code: see
+    /// [`ThreadState::instruction_trap_ends_timeslice`].
+    InstructionTrap,
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     /// Registers a child whose native backend executed the clone syscall.
     ///
@@ -640,7 +650,12 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// A common hook called at the start of *every* handler, just after we receive
     /// control from the guest.
-    async fn pre_handler_hook<G: Guest<Self>>(&self, guest: &mut G, precise_branch: bool) {
+    async fn pre_handler_hook<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        precise_branch: bool,
+        boundary: CheckIn,
+    ) {
         // A handler that left early (an error return) may not have cleared
         // this; no request made by this new handler belongs to that syscall.
         guest.thread_state_mut().in_uncharged_bootstrap_syscall = false;
@@ -665,17 +680,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         }
 
-        self.end_timeslice_if_needed(guest).await;
+        self.end_timeslice_if_needed(guest, boundary).await;
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     /// Yield when accumulated logical time reaches the syscall-boundary target deadline.
-    async fn end_timeslice_if_needed<G: Guest<Self>>(&self, guest: &mut G) {
+    async fn end_timeslice_if_needed<G: Guest<Self>>(&self, guest: &mut G, boundary: CheckIn) {
         let thread_state = guest.thread_state();
         let Some(slice_end) = thread_state.end_of_timeslice else {
             return;
         };
-        if !thread_state.timeslice_expired() {
+        let ends = match boundary {
+            CheckIn::Event => thread_state.timeslice_expired(),
+            CheckIn::InstructionTrap => thread_state.instruction_trap_ends_timeslice(&self.cfg),
+        };
+        if !ends {
             return;
         }
 
@@ -693,8 +712,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///
     /// However, note that the thread's timeslice (turn) may have expired DURING this handler.
     /// Therefore the timeslice can end in the posthook as well as in the prehook.
-    async fn post_handler_hook<G: Guest<Self>>(&self, guest: &mut G) {
-        self.end_timeslice_if_needed(guest).await;
+    async fn post_handler_hook<G: Guest<Self>>(&self, guest: &mut G, boundary: CheckIn) {
+        self.end_timeslice_if_needed(guest, boundary).await;
 
         let dettid = guest.thread_state().dettid;
         let mut current_time = guest.thread_state().thread_logical_time.as_nanos();
@@ -1483,7 +1502,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         ecx: u32,
     ) -> Result<CpuIdResult, Errno> {
         trace!("handle_cpuid_event: eax: {}, ecx: {}", eax, ecx);
-        self.pre_handler_hook(guest, false).await;
+        self.pre_handler_hook(guest, false, CheckIn::InstructionTrap)
+            .await;
         let res = if self.cfg.virtualize_cpuid {
             let dettid = guest.thread_state().dettid;
             let time = &mut guest.thread_state_mut().thread_logical_time;
@@ -1524,7 +1544,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         } else {
             cpuid!(eax, ecx)
         };
-        self.post_handler_hook(guest).await;
+        self.post_handler_hook(guest, CheckIn::InstructionTrap)
+            .await;
         Ok(res)
     }
 
@@ -1534,7 +1555,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         request: Rdtsc,
     ) -> Result<RdtscResult, Errno> {
         trace!("handle_rdtsc_event: {:?}", request);
-        self.pre_handler_hook(guest, false).await;
+        self.pre_handler_hook(guest, false, CheckIn::InstructionTrap)
+            .await;
         let result = if guest.config().virtualize_time {
             let dettid = guest.thread_state().dettid;
             guest.thread_state_mut().thread_logical_time.add_rdtsc();
@@ -1578,7 +1600,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 .handle_rdtsc_event(&mut guest.into_guest(), request)
                 .await
         };
-        self.post_handler_hook(guest).await;
+        self.post_handler_hook(guest, CheckIn::InstructionTrap)
+            .await;
         result
     }
 
@@ -1595,7 +1618,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // other tool reports for this, and it keeps 122 meaning one thing.
             unrecoverable_shutdown(guest, detcore_model::HERMIT_SIGINT_DEATH_EXIT).await
         } else {
-            self.pre_handler_hook(guest, false).await;
+            self.pre_handler_hook(guest, false, CheckIn::Event).await;
 
             // For `hermit run --verify`: a guest that faulted on an illegal
             // instruction may have run code that made syscalls Detcore never
@@ -1655,7 +1678,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 dettid, mycount, signal
             );
 
-            self.post_handler_hook(guest).await;
+            self.post_handler_hook(guest, CheckIn::Event).await;
             Ok(Some(signal))
         }
     }
@@ -1915,7 +1938,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
         // The prehook is a noop for a thread just starting.  Can't end the timeslice.  There's no
         // RCB progress to record.  However, we call it for consistency with all the other handlers.
-        self.pre_handler_hook(guest, true).await;
+        self.pre_handler_hook(guest, true, CheckIn::Event).await;
         // ^ precise_branch=true: There should have been ZERO prior instructions before this,
         // because the thread hasn't done anything yet.
 
@@ -1923,7 +1946,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .handle_thread_start(&mut guest.into_guest())
             .await?;
 
-        self.post_handler_hook(guest).await;
+        self.post_handler_hook(guest, CheckIn::Event).await;
         Ok(())
     }
 
@@ -1965,7 +1988,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
 
         tool_global::mark_past_first_execve(guest).await;
-        self.pre_handler_hook(guest, false).await;
+        self.pre_handler_hook(guest, false, CheckIn::Event).await;
 
         let auxv = guest.auxv();
         let initialized = guest
@@ -2006,7 +2029,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .handle_post_exec(&mut guest.into_guest())
             .await?;
 
-        self.post_handler_hook(guest).await;
+        self.post_handler_hook(guest, CheckIn::Event).await;
         Ok(())
     }
 
@@ -2050,7 +2073,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // This may LOOK like a noop, but actually all of the logic for ending the timeslice is in
         // the prehook.  All the timer has to do is interrupt the guest and generate an extra call
         // to this prehook.
-        self.pre_handler_hook(guest, true).await;
+        self.pre_handler_hook(guest, true, CheckIn::Event).await;
         if guest.config().no_rcb_time && guest.thread_state().last_rcb_timer_is_max {
             let max_timeslice_end = guest
                 .thread_state()
@@ -2097,7 +2120,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 self.end_timeslice(guest).await;
             }
         }
-        self.post_handler_hook(guest).await;
+        self.post_handler_hook(guest, CheckIn::Event).await;
     }
 
     async fn handle_syscall_event<G: Guest<Self>>(
@@ -2105,7 +2128,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         guest: &mut G,
         call: Syscall,
     ) -> Result<i64, Error> {
-        self.pre_handler_hook(guest, false).await;
+        self.pre_handler_hook(guest, false, CheckIn::Event).await;
 
         // Linux's restart of an interrupted wait is the thread's very next syscall,
         // so the record a wait kept for it lives only until then
@@ -3209,7 +3232,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // The syscall is finished; a turn the post-hook takes (a timeslice
         // end) is the thread's own and advances global time as usual.
         guest.thread_state_mut().in_uncharged_bootstrap_syscall = false;
-        self.post_handler_hook(guest).await;
+        self.post_handler_hook(guest, CheckIn::Event).await;
 
         // Defense-in-depth: unless the backend already owns this guarantee,
         // force the syscall-clobbered registers (%rcx/%r11 on x86-64) to

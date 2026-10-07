@@ -2953,6 +2953,31 @@ impl<T> ThreadState<T> {
         &mut self.prng
     }
 
+    /// Whether a trapped instruction (`rdtsc`, `cpuid`) should end the current
+    /// timeslice.
+    ///
+    /// By default it ends an expired target, as a syscall does. A trapped
+    /// instruction can sit inside a user-space spinlock critical section,
+    /// though, and a thread that yields there leaves every thread that wants
+    /// the lock spinning until the PMU maximum preempts it. QEMU's
+    /// `cpu_get_ticks` reads the host TSC under its `vm_clock_lock` spinlock,
+    /// so a multi-threaded TCG vCPU that yielded at every expired target while
+    /// reading the TSC held that lock at every yield, and the other vCPU never
+    /// acquired it. With `--target-timeslice-syscalls-only`, a trapped
+    /// instruction ends the slice only at the PMU maximum, as a branch would.
+    /// With no PMU maximum it is the only way out of a busy-wait on the TSC,
+    /// and it still ends the expired target. Replay of recorded preemptions or
+    /// schedules keeps its recorded boundaries.
+    pub(crate) fn instruction_trap_ends_timeslice(&self, cfg: &Config) -> bool {
+        let replaying = self.preemption_points.is_some() || cfg.replay_schedule_from.is_some();
+        match self.max_timeslice_end {
+            Some(max_end) if cfg.target_timeslice_syscalls_only && !replaying => {
+                self.thread_logical_time.as_nanos() >= max_end
+            }
+            _ => self.timeslice_expired(),
+        }
+    }
+
     /// Whether this thread has consumed its current logical timeslice.
     pub(crate) fn timeslice_expired(&self) -> bool {
         if let Some(replay_rcb_end) = self.replay_rcb_end {
@@ -4123,6 +4148,97 @@ mod timeslice_tests {
         assert!(!state.timeslice_expired());
         state.end_of_timeslice = Some(now);
         assert!(state.timeslice_expired());
+    }
+
+    #[test]
+    fn instruction_trap_ends_an_expired_target_only_at_the_pmu_maximum() {
+        let config = Config {
+            target_timeslice: nz(1_000),
+            target_timeslice_syscalls_only: true,
+            max_timeslice: nz(20_000),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        state.next_timeslice(&config);
+
+        // Past the target: a syscall would end the slice, an rdtsc must not.
+        state.thread_logical_time.add_rcbs(500);
+        assert!(state.timeslice_expired());
+        assert!(!state.instruction_trap_ends_timeslice(&config));
+
+        // At the PMU maximum the trap ends it, as a branch would.
+        state.thread_logical_time.add_rcbs(1_500);
+        assert!(state.instruction_trap_ends_timeslice(&config));
+    }
+
+    #[test]
+    fn instruction_trap_ends_an_expired_target_by_default() {
+        let config = Config {
+            target_timeslice: nz(1_000),
+            max_timeslice: nz(20_000),
+            ..Default::default()
+        };
+        assert!(!config.target_timeslice_syscalls_only);
+        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        state.next_timeslice(&config);
+        state.thread_logical_time.add_rcbs(99);
+        assert!(!state.instruction_trap_ends_timeslice(&config));
+        state.thread_logical_time.add_rcbs(1);
+        assert!(state.instruction_trap_ends_timeslice(&config));
+    }
+
+    #[test]
+    fn instruction_trap_ends_an_expired_target_without_a_pmu_maximum() {
+        // With PMU preemption disabled nothing else can break a busy-wait on
+        // the TSC, so the trap keeps ending the expired target.
+        let config = Config {
+            target_timeslice: nz(1_000),
+            target_timeslice_syscalls_only: true,
+            max_timeslice: None,
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        state.next_timeslice(&config);
+        assert_eq!(state.max_timeslice_end, None);
+
+        // 1,000 ns is 100 RCBs at the default 10 ns per RCB.
+        state.thread_logical_time.add_rcbs(99);
+        assert!(!state.instruction_trap_ends_timeslice(&config));
+        state.thread_logical_time.add_rcbs(1);
+        assert!(state.instruction_trap_ends_timeslice(&config));
+    }
+
+    #[test]
+    fn instruction_trap_keeps_replayed_and_untargeted_boundaries() {
+        // Without a target the slice end is the PMU maximum itself, and a
+        // replayed preemption record keeps its recorded boundaries: in both
+        // cases a trap ends exactly the slices it ended before.
+        let untargeted = Config {
+            max_timeslice: nz(20_000),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(1), &untargeted, ());
+        state.next_timeslice(&untargeted);
+        state.thread_logical_time.add_rcbs(1_999);
+        assert_eq!(
+            state.instruction_trap_ends_timeslice(&untargeted),
+            state.timeslice_expired()
+        );
+        state.thread_logical_time.add_rcbs(1);
+        assert!(state.instruction_trap_ends_timeslice(&untargeted));
+
+        let targeted = Config {
+            target_timeslice: nz(1_000),
+            target_timeslice_syscalls_only: true,
+            max_timeslice: nz(20_000),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(1), &targeted, ());
+        state.next_timeslice(&targeted);
+        state.preemption_points = Some(ThreadHistory::new().into_iter());
+        state.thread_logical_time.add_rcbs(500);
+        assert!(state.timeslice_expired());
+        assert!(state.instruction_trap_ends_timeslice(&targeted));
     }
 
     #[test]

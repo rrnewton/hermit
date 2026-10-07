@@ -469,12 +469,25 @@ pub struct Config {
                 value_parser = parse_timeslice)]
     pub max_timeslice: MaybeTimeslice,
 
-    /// Target logical timeslice checked at syscall boundaries, in virtual nanoseconds. This avoids
-    /// PMU preemption for workloads that enter the kernel frequently. Omit this option to use only
-    /// `--max-timeslice`.
+    /// Target logical timeslice, in virtual nanoseconds, checked at syscall boundaries and the
+    /// other points where the guest returns control to Detcore: signals, timer events, and
+    /// trapped `rdtsc` and `cpuid` instructions unless `--target-timeslice-syscalls-only` is given.
+    /// This avoids PMU preemption for workloads that enter the kernel frequently. Omit this option
+    /// to use only `--max-timeslice`.
     #[serde(default)]
     #[clap(long, value_name = "virtual-nanoseconds")]
     pub target_timeslice: Option<NonZeroU64>,
+
+    /// Do not end an expired `--target-timeslice` at a trapped `rdtsc` or `cpuid` while a PMU
+    /// maximum (`--max-timeslice`) is armed; end it at the next syscall, signal or timer event,
+    /// or at the PMU maximum. A trapped instruction can sit inside a user-space spinlock: QEMU's
+    /// multi-threaded TCG reads the host TSC while holding its `vm_clock_lock`, and a vCPU that
+    /// yields there leaves the other vCPUs spinning for whole PMU slices. Has no effect without
+    /// `--target-timeslice`, or with `--max-timeslice disabled`, where the trap is the only way
+    /// out of a busy-wait on the TSC.
+    #[serde(default)]
+    #[clap(long, requires = "target_timeslice")]
+    pub target_timeslice_syscalls_only: bool,
 
     /// Shut down immediately upon SIGINT, rather than letting the guest handle it.
     #[clap(long)]
@@ -1009,6 +1022,9 @@ impl fmt::Display for Config {
         if let Some(target_timeslice) = self.target_timeslice {
             write!(f, " --target-timeslice={}", target_timeslice)?;
         }
+        if self.target_timeslice_syscalls_only {
+            write!(f, " --target-timeslice-syscalls-only")?;
+        }
         if self.sigint_instakill {
             write!(f, " --sigint-instakill")?;
         }
@@ -1456,7 +1472,9 @@ impl Default for Config {
 /// only DBT, whose launcher collects no host inputs. So is
 /// [`Config::backend_supports_blocked_wait_signal_interruption`], which
 /// is false for DBT, and [`Config::guest_may_inherit_a_terminal`], which only
-/// that capability reads. Every other field is serialized exactly as
+/// that capability reads. So is [`Config::target_timeslice_syscalls_only`],
+/// added after this form froze; DBT runs without a PMU maximum, where the
+/// option has no effect. Every other field is serialized exactly as
 /// `serde_json::to_string(config)` serializes it.
 ///
 /// Use this wherever the JSON is visible to the guest. `hermit run
@@ -1780,11 +1798,15 @@ mod legacy_backend_json {
     /// `backend_supports_blocked_wait_signal_interruption` is the same: it is
     /// false for DBT, so it is never written and always reads as false.
     /// So is `guest_may_inherit_a_terminal`, which only that capability reads.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 4] = [
+    /// `target_timeslice_syscalls_only` came after the legacy form froze; the
+    /// legacy form never carried it, so it is never written and reads as false,
+    /// the behaviour every legacy reader already has.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 5] = [
         "backend",
         "record_host_inputs",
         "backend_supports_blocked_wait_signal_interruption",
         "guest_may_inherit_a_terminal",
+        "target_timeslice_syscalls_only",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -1874,8 +1896,9 @@ mod legacy_backend_json {
     /// declaration order; at [`Config::backend`] this reads up to fifteen
     /// elements as the legacy backend keys, and neither the field it asks for
     /// there nor [`Config::record_host_inputs`],
-    /// [`Config::backend_supports_blocked_wait_signal_interruption`] or
-    /// [`Config::guest_may_inherit_a_terminal`] takes an element. Each gets a
+    /// [`Config::backend_supports_blocked_wait_signal_interruption`],
+    /// [`Config::guest_may_inherit_a_terminal`] or
+    /// [`Config::target_timeslice_syscalls_only`] takes an element. Each gets a
     /// placeholder; [`super::from_legacy_backend_json`] replaces the first.
     struct LegacyPositions<'f, 'l, A> {
         inner: A,
@@ -1908,7 +1931,8 @@ mod legacy_backend_json {
                 Some(
                     "record_host_inputs"
                     | "backend_supports_blocked_wait_signal_interruption"
-                    | "guest_may_inherit_a_terminal",
+                    | "guest_may_inherit_a_terminal"
+                    | "target_timeslice_syscalls_only",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 _ => self.inner.next_element_seed(seed),
             }
@@ -2151,7 +2175,8 @@ mod legacy_backend_json {
                 // No legacy key; see FIELDS_WITHOUT_A_LEGACY_KEY.
                 "record_host_inputs"
                 | "backend_supports_blocked_wait_signal_interruption"
-                | "guest_may_inherit_a_terminal" => Ok(()),
+                | "guest_may_inherit_a_terminal"
+                | "target_timeslice_syscalls_only" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -2609,9 +2634,9 @@ mod tests {
 
     /// The legacy form's positions are `Config`'s fields in declaration order
     /// with the fifteen legacy keys where `backend` stands and no
-    /// `record_host_inputs`, `backend_supports_blocked_wait_signal_interruption`
-    /// or `guest_may_inherit_a_terminal`, which is the key order the encoder
-    /// writes.
+    /// `record_host_inputs`, `backend_supports_blocked_wait_signal_interruption`,
+    /// `guest_may_inherit_a_terminal` or `target_timeslice_syscalls_only`, which
+    /// is the key order the encoder writes.
     #[test]
     fn legacy_positions_are_the_encoded_key_order() {
         let names = legacy_backend_keys(&Config::default()).map(|(name, _)| name);
@@ -2628,7 +2653,8 @@ mod tests {
                 "backend" => expected.extend(names.map(str::to_owned)),
                 "record_host_inputs"
                 | "backend_supports_blocked_wait_signal_interruption"
-                | "guest_may_inherit_a_terminal" => {}
+                | "guest_may_inherit_a_terminal"
+                | "target_timeslice_syscalls_only" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -2639,10 +2665,11 @@ mod tests {
             .collect();
         assert_eq!(keys, expected);
         // `backend` becomes fifteen keys; `record_host_inputs`,
-        // `backend_supports_blocked_wait_signal_interruption` and
-        // `guest_may_inherit_a_terminal` none.
+        // `backend_supports_blocked_wait_signal_interruption`,
+        // `guest_may_inherit_a_terminal` and `target_timeslice_syscalls_only`
+        // none.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len() + 11, keys.len());
+        assert_eq!(fields.len() + 10, keys.len());
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -2769,6 +2796,40 @@ mod tests {
             !from_legacy_backend_json(&array)
                 .unwrap()
                 .guest_may_inherit_a_terminal
+        );
+    }
+
+    /// `target_timeslice_syscalls_only` never enters the legacy form, whatever
+    /// its value: the guest-visible string stays the legacy bytes, and it reads
+    /// back as false from both the object and the array form.
+    #[test]
+    fn target_timeslice_syscalls_only_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            target_timeslice: NonZeroU64::new(1_000_000),
+            ..Config::default()
+        };
+        let on = Config {
+            target_timeslice_syscalls_only: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("target_timeslice_syscalls_only"), "{json}");
+        assert!(
+            !from_legacy_backend_json(&json)
+                .unwrap()
+                .target_timeslice_syscalls_only
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(
+            !from_legacy_backend_json(&array)
+                .unwrap()
+                .target_timeslice_syscalls_only
         );
     }
 

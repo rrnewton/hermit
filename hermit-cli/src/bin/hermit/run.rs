@@ -2885,6 +2885,37 @@ fn timeslice_flags_parse_and_round_trip() {
         reparsed.det_opts.det_config.target_timeslice,
         ro.det_opts.det_config.target_timeslice
     );
+    assert!(!reparsed.det_opts.det_config.target_timeslice_syscalls_only);
+
+    // --target-timeslice-syscalls-only parses, is rendered into the reproduce
+    // command, round-trips, and is refused without --target-timeslice.
+    let mut syscalls_only = RunOpts::parse_from([
+        "fakehermit",
+        "--target-timeslice=20000",
+        "--target-timeslice-syscalls-only",
+        "fakeprog",
+    ]);
+    syscalls_only.validate_args_with_perf_support(true).unwrap();
+    assert!(
+        syscalls_only
+            .det_opts
+            .det_config
+            .target_timeslice_syscalls_only
+    );
+    let rendered = format!("{}", syscalls_only);
+    assert!(
+        rendered.contains(" --target-timeslice=20000 --target-timeslice-syscalls-only"),
+        "{rendered}"
+    );
+    let mut reparsed_args = vec!["fakehermit".to_owned()];
+    reparsed_args.extend(shell_words::split(&rendered).unwrap());
+    let reparsed = RunOpts::parse_from(reparsed_args);
+    assert!(reparsed.det_opts.det_config.target_timeslice_syscalls_only);
+    assert!(
+        RunOpts::try_parse_from(["fakehermit", "--target-timeslice-syscalls-only", "fakeprog"])
+            .is_err(),
+        "--target-timeslice-syscalls-only must require --target-timeslice"
+    );
 }
 
 #[test]
