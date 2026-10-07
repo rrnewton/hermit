@@ -14,6 +14,17 @@
 # and stores nothing. Eviction keeps the newest HERMIT_RUST_DEPS_CACHE_KEEP
 # entries by last use. Damage: an entry whose vendored crates are gone is
 # discarded, the run vendors, and the replacement entry serves the next run.
+#
+# Stale and partial entries: a run whose Reindeer rewrites Cargo.lock fails and
+# stores nothing, so the original lock vendors again; a keyed input that changes
+# while Reindeer runs stores nothing; a fixup Git ignores, a fixup reached
+# through a directory link (its referent edited), a workspace member manifest
+# Git ignores, and the compiler's target cfg and version each change the key, and
+# RUSTC names the compiler queried; reindeer.toml settings the key cannot cover (fixups_dir,
+# rustc, cargo, gitignore_checksum_exclude, no platform table, a target in a
+# multi-line or escaped string) vendor without storing, while a multi-line string
+# elsewhere and Hermit's own reindeer.toml keep the cache; an eviction whose removal fails part-way leaves no entry a restore
+# accepts; and an entry without its raw BUCK is replaced by the next publish.
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -42,17 +53,70 @@ cat >"$tmp/bin/cargo" <<'EOF'
 #!/usr/bin/env bash
 case $1 in
   --version) echo "${FIXTURE_CARGO_VERSION:-cargo 1.0.0 (fixture)}" ;;
-  metadata) ;;
+  # A workspace member, when the fixture has one, as `cargo metadata` names it.
+  metadata)
+    if [[ -f member/Cargo.toml ]]; then
+      printf '{"packages":[{"name":"member","manifest_path":"%s/member/Cargo.toml"}]}\n' "$PWD"
+    else
+      echo '{"packages":[]}'
+    fi
+    ;;
   *) echo "fixture cargo: unexpected $*" >&2; exit 2 ;;
 esac
 EOF
+cat >"$tmp/bin/rustc" <<'EOF'
+#!/usr/bin/env bash
+case $1 in
+  -vV) echo "${FIXTURE_RUSTC_VERSION:-rustc 1.0.0 (fixture)}" ;;
+  --print=cfg)
+    echo 'debug_assertions'
+    echo "target_arch=\"${3%%-*}\""
+    [[ -z ${FIXTURE_RUSTC_CFG:-} ]] || echo "$FIXTURE_RUSTC_CFG"
+    ;;
+  *) echo "fixture rustc: unexpected $*" >&2; exit 2 ;;
+esac
+EOF
+# A RUSTC wrapper that adds a target feature, as a -C target-feature flag would.
+cat >"$tmp/rustc-wrapper" <<EOF
+#!/usr/bin/env bash
+FIXTURE_RUSTC_CFG='target_feature="avx2"' exec "$tmp/bin/rustc" "\$@"
+EOF
+# An rm that, given a path in the cache, deletes one vendored file and fails,
+# as an interrupted or failing recursive removal leaves an entry.
+mkdir -p "$tmp/rmbin"
+cat >"$tmp/rmbin/rm" <<EOF
+#!/usr/bin/env bash
+for arg; do
+  case \$arg in
+    "$tmp/cache/rust-deps/"*)
+      victim=\$(/usr/bin/find "\$arg" -type f -name source -print -quit 2>/dev/null)
+      [[ -z \$victim ]] || "$(type -P rm)" -f -- "\$victim"
+      echo "fixture rm: failed part-way through \$arg" >&2
+      exit 1
+      ;;
+  esac
+done
+exec "$(type -P rm)" "\$@"
+EOF
 # Reindeer stub: --third-party-dir DIR --manifest-path PATH vendor|buckify [--stdout].
+# Its BUCK names the lock, the fixups it reads through links, and the target cfg
+# the compiler reports. FIXTURE_REWRITE_LOCK=REV makes vendor resolve the lock
+# to REV, as pinned Reindeer may (it vendors with locked: false);
+# FIXTURE_EDIT_FIXUP=1 makes it edit a fixup while it runs.
 cat >"$repo/bootstrap/reindeer" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 dir=$2
 echo "$5" >>"$FIXTURE_REINDEER_LOG"
+if [[ $5 == vendor && -n ${FIXTURE_REWRITE_LOCK:-} ]]; then
+  sed -i -E "s/rev=[0-9a-f]{40}#[0-9a-f]{40}/rev=$FIXTURE_REWRITE_LOCK#$FIXTURE_REWRITE_LOCK/" Cargo.lock
+fi
+if [[ $5 == vendor && -n ${FIXTURE_EDIT_FIXUP:-} ]]; then
+  echo '# edited while vendoring' >>"$dir/fixups/one/fixups.toml"
+fi
 lock=$(sha256sum <Cargo.lock | cut -c1-64)
+fixups=$(find -L "$dir/fixups" -type f -print0 | LC_ALL=C sort -z | xargs -0 cat | sha256sum | cut -c1-64)
+cfg=$("${RUSTC-rustc}" --print=cfg --target x86_64-unknown-linux-gnu | grep '^target_' | sha256sum | cut -c1-64)
 case $5 in
   vendor)
     mkdir -p "$dir/vendor/crate" "$dir/.cargo/registry/cache"
@@ -61,8 +125,9 @@ case $5 in
     printf '[source.vendored-sources]\ndirectory = "vendor"\n' >"$dir/.cargo/config.toml"
     ;;
   buckify)
-    if [[ ${6:-} == --stdout ]]; then echo "# raw BUCK for $lock"
-    else echo "# raw BUCK for $lock" >"$dir/BUCK"; fi
+    raw="# raw BUCK for $lock; fixups $fixups; cfg $cfg"
+    if [[ ${6:-} == --stdout ]]; then echo "$raw"
+    else echo "$raw" >"$dir/BUCK"; fi
     ;;
 esac
 EOF
@@ -71,9 +136,11 @@ cat >"$repo/scripts/patch-reverie-dbt-buck.rs" <<'EOF'
 #!/usr/bin/env bash
 echo "# patched" >>"$1"
 EOF
-chmod +x "$tmp/bin/cargo" "$repo/bootstrap/reindeer" "$repo/scripts/"*.rs
+chmod +x "$tmp/bin/cargo" "$tmp/bin/rustc" "$tmp/rustc-wrapper" "$tmp/rmbin/rm" \
+  "$repo/bootstrap/reindeer" "$repo/scripts/"*.rs
 echo '# none' >"$repo/shim/third-party/rust/shared-cell-aliases.txt"
-echo '[cargo]' >"$repo/shim/third-party/rust/reindeer.toml"
+reindeer_toml=$repo/shim/third-party/rust/reindeer.toml
+printf '[cargo]\n\n[platform.linux-x86_64]\ntarget = "x86_64-unknown-linux-gnu"\n' >"$reindeer_toml"
 echo 'extra_srcs = []' >"$repo/shim/third-party/rust/fixups/one/fixups.toml"
 echo 'buck' >"$repo/reverie/BUCK"
 printf '[workspace]\nmembers = []\n' >"$repo/Cargo.toml"
@@ -117,8 +184,16 @@ regen() {
     LC_ALL=C sort -z | xargs -0 sha256sum) >"$tmp/$name.tree" 2>&1 || true
 }
 calls() { cat "$tmp/$1.calls"; }
-entries() { find "$cache/rust-deps" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended \
-  -regex '.*/[0-9a-f]{64}' | wc -l; }
+# entries [CACHE] counts the entries under a key in CACHE (default the shared one).
+entries() {
+  local root=${1:-$cache}/rust-deps
+  [[ -d $root ]] || { echo 0; return; }
+  find "$root" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended \
+    -regex '.*/[0-9a-f]{64}' | wc -l
+}
+expect_rc() {
+  [[ $(cat "$tmp/$1.rc") == "$2" ]] || fail "$1: expected exit $2, got $(cat "$tmp/$1.rc"): $(cat "$tmp/$1.err")"
+}
 expect_ok() {
   [[ $(cat "$tmp/$1.rc") == 0 ]] || { fail "$1: exit $(cat "$tmp/$1.rc"): $(cat "$tmp/$1.err")"; return 0; }
 }
@@ -203,6 +278,146 @@ grep -q 'discarding it and generating' "$tmp/damaged.err" || fail "damaged: no d
 cmp -s "$tmp/first.tree" "$tmp/damaged.tree" || fail "damaged: tree differs from the first run's"
 regen repaired
 expect_restored repaired
+lock_a_hash=$(sha256sum <"$repo/Cargo.lock" | cut -c1-64)
+
+# A Reindeer that rewrites Cargo.lock fails the run and stores nothing, so the
+# original lock vendors again rather than restoring the rewritten lock's output.
+regen lock_rewrite HERMIT_BUCK2_SHARED_TOOL_CACHE="$tmp/cache-lock" FIXTURE_REWRITE_LOCK="$rev_b"
+expect_rc lock_rewrite 1
+[[ $(entries "$tmp/cache-lock") == 0 ]] || fail "lock_rewrite: stored $(entries "$tmp/cache-lock") entries"
+fixture_git -C "$repo" checkout -q -- Cargo.lock
+regen lock_retry HERMIT_BUCK2_SHARED_TOOL_CACHE="$tmp/cache-lock"
+expect_vendored lock_retry
+grep -q "raw BUCK for $lock_a_hash" "$buck" || fail "lock_retry: BUCK is not the original lock's"
+
+# A keyed input that changes while Reindeer runs: the output is kept, not stored.
+regen input_moved HERMIT_BUCK2_SHARED_TOOL_CACHE="$tmp/cache-moved" FIXTURE_EDIT_FIXUP=1
+expect_vendored input_moved
+grep -q 'inputs changed while Reindeer ran' "$tmp/input_moved.err" || fail "input_moved: no warning"
+[[ $(entries "$tmp/cache-moved") == 0 ]] || fail "input_moved: stored $(entries "$tmp/cache-moved") entries"
+fixture_git -C "$repo" checkout -q -- shim/third-party/rust/fixups/one/fixups.toml
+
+# A new fixup Git ignores through .git/info/exclude; Reindeer reads it anyway.
+fixups=$repo/shim/third-party/rust/fixups
+echo '/shim/third-party/rust/fixups/excluded/' >>"$repo/.git/info/exclude"
+mkdir -p "$fixups/excluded"
+echo 'cfgs = ["one"]' >"$fixups/excluded/fixups.toml"
+[[ -z $(fixture_git -C "$repo" ls-files --others --exclude-standard -- shim/third-party/rust/fixups/excluded) ]] ||
+  fail "excluded_fixup: the fixture's fixup is not excluded"
+regen excluded_fixup
+expect_vendored excluded_fixup
+regen excluded_again
+expect_restored excluded_again
+echo 'cfgs = ["two"]' >"$fixups/excluded/fixups.toml"
+regen excluded_edit
+expect_vendored excluded_edit
+rm -rf -- "${fixups:?}/excluded"
+
+# A fixup reached through a directory link, then its referent edited.
+mkdir -p "$tmp/outside-fixup"
+echo 'cfgs = ["one"]' >"$tmp/outside-fixup/fixups.toml"
+ln -s -- "$tmp/outside-fixup" "$fixups/linked"
+regen link_new
+expect_vendored link_new
+regen link_again
+expect_restored link_again
+echo 'cfgs = ["two"]' >"$tmp/outside-fixup/fixups.toml"
+regen link_edit
+expect_vendored link_edit
+rm -f -- "$fixups/linked"
+
+# A workspace member whose manifest Git ignores, then edited.
+echo '/member/' >>"$repo/.git/info/exclude"
+mkdir -p "$repo/member"
+printf '[package]\nname = "member"\n' >"$repo/member/Cargo.toml"
+regen member_new
+expect_vendored member_new
+regen member_again
+expect_restored member_again
+echo 'edition = "2021"' >>"$repo/member/Cargo.toml"
+regen member_edit
+expect_vendored member_edit
+rm -rf -- "${repo:?}/member"
+
+# The compiler Reindeer queries, with the cargo version unchanged: another
+# target cfg, the same again, and another version. A RUSTC wrapper that reports
+# the same cfg restores that entry; with RUSTC not followed it would restore the
+# plain compiler's.
+regen rustc_cfg FIXTURE_RUSTC_CFG='target_feature="avx2"'
+expect_vendored rustc_cfg
+cmp -s "$tmp/first.tree" "$tmp/rustc_cfg.tree" && fail "rustc_cfg: BUCK did not change with the target cfg"
+regen rustc_cfg_again FIXTURE_RUSTC_CFG='target_feature="avx2"'
+expect_restored rustc_cfg_again
+regen rustc_version FIXTURE_RUSTC_VERSION="rustc 1.0.1 (fixture)"
+expect_vendored rustc_version
+regen rustc_wrapper RUSTC="$tmp/rustc-wrapper"
+expect_restored rustc_wrapper
+cmp -s "$tmp/rustc_cfg.tree" "$tmp/rustc_wrapper.tree" || fail "rustc_wrapper: tree differs from the same cfg's"
+
+# Settings the key cannot cover vendor, warn, and store nothing.
+before=$(entries)
+for setting in fixups_dir rustc cargo gitignore_checksum_exclude; do
+  { echo "$setting = \"elsewhere\""; fixture_git -C "$repo" show HEAD:shim/third-party/rust/reindeer.toml; } >"$reindeer_toml"
+  regen "declined_$setting"
+  expect_vendored "declined_$setting"
+  grep -q "not using the rust-deps cache: .*sets a path" "$tmp/declined_$setting.err" ||
+    fail "declined_$setting: no warning"
+done
+echo '[cargo]' >"$reindeer_toml"
+regen declined_no_platform
+expect_vendored declined_no_platform
+grep -q 'not using the rust-deps cache: .*no platform table' "$tmp/declined_no_platform.err" ||
+  fail "declined_no_platform: no warning"
+for value in '"""x86_64-unknown-linux-musl"""' "'''x86_64-unknown-linux-musl'''" '"x86_64\u002dunknown-linux-musl"'; do
+  { fixture_git -C "$repo" show HEAD:shim/third-party/rust/reindeer.toml
+    printf '\n[platform.musl]\ntarget = %s\n' "$value"; } >"$reindeer_toml"
+  regen declined_quoting
+  expect_vendored declined_quoting
+  grep -q 'not using the rust-deps cache: .*quotes a value' "$tmp/declined_quoting.err" ||
+    fail "declined_quoting: no warning for target = $value"
+done
+[[ $(entries) == "$before" ]] || fail "declined: cache changed from $before to $(entries) entries"
+fixture_git -C "$repo" checkout -q -- shim/third-party/rust/reindeer.toml
+
+# A multi-line string elsewhere, as Hermit's buckfile_imports is, keeps the
+# cache; and Hermit's own reindeer.toml is one the cache accepts.
+{ fixture_git -C "$repo" show HEAD:shim/third-party/rust/reindeer.toml
+  printf '\n[buck]\nbuckfile_imports = """\nload("@prelude//rust:cargo_package.bzl", "cargo")\n"""\n'; } >"$reindeer_toml"
+regen multiline_new
+expect_vendored multiline_new
+grep -q 'not using the rust-deps cache' "$tmp/multiline_new.err" && fail "multiline_new: cache declined"
+regen multiline_again
+expect_restored multiline_again
+fixture_git -C "$repo" checkout -q -- shim/third-party/rust/reindeer.toml
+# shellcheck source=bootstrap/rust-deps-cache.sh
+if reason=$(cd -- "$script_dir/.." && source ./bootstrap/rust-deps-cache.sh && rust_deps_cache_unsupported); then
+  fail "the cache declines Hermit's reindeer.toml: $reason"
+fi
+
+# An eviction whose removal fails part-way: no restore may serve what is left.
+regen evict_setup
+expect_restored evict_setup
+regen evict_fail PATH="$tmp/rmbin:$tmp/bin:$PATH" HERMIT_RUST_DEPS_CACHE_KEEP=1 \
+  FIXTURE_CARGO_VERSION="cargo 1.0.3 (fixture)"
+expect_vendored evict_fail
+grep -q 'fixture rm: failed part-way' "$tmp/evict_fail.err" || fail "evict_fail: the failing rm never ran"
+grep -q 'could not remove the retired entry' "$tmp/evict_fail.err" || fail "evict_fail: the failed removal was not reported"
+[[ $(entries) == 1 ]] || fail "evict_fail: expected 1 cache entry, found $(entries)"
+regen evict_after
+expect_vendored evict_after
+cmp -s "$tmp/first.tree" "$tmp/evict_after.tree" || fail "evict_after: tree differs from the first run's"
+leftover=$(find "$cache/rust-deps" -mindepth 1 -maxdepth 1 -name '.evict-*' | wc -l)
+[[ $leftover == 0 ]] || fail "evict_after: $leftover retired entries were not removed"
+
+# An entry without its raw BUCK is replaced by the next publish.
+regen marker_setup
+expect_restored marker_setup
+marker_key=$(sed -n 's/^restored .* from .*\/\([0-9a-f]\{64\}\)$/\1/p' "$tmp/marker_setup.err")
+rm -f -- "$cache/rust-deps/${marker_key:?}/BUCK.reindeer"
+regen markerless
+expect_vendored markerless
+regen marker_replaced
+expect_restored marker_replaced
 
 if [[ $failures -ne 0 ]]; then
   echo "test-rust-deps-cache: $failures failure(s)" >&2

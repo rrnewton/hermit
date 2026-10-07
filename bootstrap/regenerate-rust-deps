@@ -65,6 +65,10 @@ source "$script_dir/rust-deps-cache.sh"
 cache_root=$(rust_deps_cache_root)
 cache_key=
 restored=1
+if [[ -n $cache_root ]] && unsupported=$(rust_deps_cache_unsupported); then
+  echo "warning: not using the rust-deps cache: $unsupported" >&2
+  cache_root=
+fi
 if [[ -n $cache_root ]]; then
   cache_key=$(rust_deps_cache_key)
   [[ $cache_key =~ ^[0-9a-f]{64}$ ]] || { echo "rust-deps cache key is malformed: '$cache_key'" >&2; exit 1; }
@@ -92,8 +96,16 @@ else
   # vendored-sources configuration is. Removing them gives a generated and a
   # restored checkout the same tree.
   find "$third_party_dir/.cargo" -mindepth 1 -maxdepth 1 ! -name config.toml -exec rm -rf -- {} +
+  # Reindeer resolves the lock itself and can rewrite it. Output a refused run
+  # generated is never stored, and neither is output whose inputs moved during
+  # generation, which a later run with the original inputs would restore.
+  git diff --exit-code -- Cargo.lock
   if [[ -n $cache_key ]]; then
-    rust_deps_cache_publish "$cache_root" "$cache_key" "$third_party_dir" "$first_output"
+    if [[ $(rust_deps_cache_key) == "$cache_key" ]]; then
+      rust_deps_cache_publish "$cache_root" "$cache_key" "$third_party_dir" "$first_output"
+    else
+      echo "warning: the rust-deps cache inputs changed while Reindeer ran; not storing its output" >&2
+    fi
   fi
 fi
 
