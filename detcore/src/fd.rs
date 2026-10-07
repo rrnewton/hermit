@@ -24,6 +24,7 @@ use serde::Serialize;
 
 use crate::dirents::DirEntry;
 use crate::dirents::DirectoryStream;
+use crate::dirents::EntryLookup;
 use crate::procfs::MappingSubject;
 use crate::procfs::ProcfsFile;
 use crate::procfs::ProcfsSnapshotContext;
@@ -318,6 +319,15 @@ struct OpenFileDescription {
     /// to 0 clears it.
     #[serde(default)]
     directory_host_order: bool,
+    /// Which entries of this directory `getdents` `lstat`s for the device
+    /// their inode number is on, learned from the first `fstatfs` that
+    /// answered (see `Detcore::directory_entry_lookup`), and on overlayfs
+    /// narrowed by the first entry that shows how the overlay numbers its
+    /// files (see `EntryLookup::learn`). The filesystem an open file is on,
+    /// and how an overlay numbers its files, never change, so every alias
+    /// shares it.
+    #[serde(default)]
+    directory_entry_lookup: Option<EntryLookup>,
     /// Held across a whole `getdents` or `lseek` on this open file
     /// description. Reading the host directory takes several injected
     /// syscalls on the shared kernel position, and the kernel's own per-file
@@ -447,6 +457,7 @@ impl DetFd {
                 sigalrm_phase1: None,
                 directory: None,
                 directory_host_order: false,
+                directory_entry_lookup: None,
                 directory_lock: Default::default(),
                 socket_receive_timestamp: None,
                 sock_diag: false,
@@ -962,6 +973,19 @@ impl DetFd {
     /// description.
     pub(crate) fn set_identity_stat(&self, stat: DetStat) {
         self.with_description(|d| d.identity_stat = Some(stat));
+    }
+
+    /// Which entries `getdents` asks for their device, once an `fstatfs` of
+    /// this open file has answered (see
+    /// `OpenFileDescription::directory_entry_lookup`).
+    pub(crate) fn directory_entry_lookup(&self) -> Option<EntryLookup> {
+        self.with_description(|d| d.directory_entry_lookup)
+    }
+
+    /// Record which entries `getdents` asks for their device, for every alias
+    /// of this open file description.
+    pub(crate) fn set_directory_entry_lookup(&self, lookup: EntryLookup) {
+        self.with_description(|d| d.directory_entry_lookup = Some(lookup));
     }
 
     /// Whether Detcore has made the open file description physically nonblocking.
