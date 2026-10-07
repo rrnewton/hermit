@@ -2117,6 +2117,9 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         // execve(2) doesn't return upon success.
         let errno = self.record_or_replay(guest, call).await.unwrap_err();
+        // Ask before anything else is injected: the next injection replaces
+        // the backend's record.
+        let refusal = guest.take_unsupported_refusal();
 
         {
             let thread_state = guest.thread_state_mut();
@@ -2132,17 +2135,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await;
         }
 
-        // A backend that refuses nonleader exec with ENOSYS (today KVM)
-        // validates the replacement image before refusing a worker's promotion
-        // to group leader. Diagnose that refusal only after normal failed-exec
-        // rollback, preserving errors such as ENOENT and ENOEXEC.
-        if self.cfg.backend.refuses_nonleader_exec_with_enosys
-            && dettid != detpid
-            && errno == Errno::ENOSYS
-        {
+        // A backend that cannot perform this exec says so with a typed
+        // refusal: for example one that cannot promote a worker thread to
+        // group leader, which refuses after validating the replacement image,
+        // and also when a host syscall its exec preflight makes (such as the
+        // KVM backend's faccessat2 permission check) fails with ENOSYS.
+        // Diagnose it only after normal failed-exec rollback. Any other
+        // failure, including an ENOSYS the backend did not report as a
+        // refusal, is the guest's ordinary exec error.
+        if let Some(refusal) = refusal {
             tracing::error!(
-                "[detcore, dtid {dettid}] KVM nonleader exec is unsupported; \
-                 the replacement image did not run"
+                "[detcore, dtid {dettid}] {}; the replacement image did not run",
+                refusal.diagnostic
             );
             if !self.cfg.panic_on_unsupported_syscalls {
                 crate::tool_global::report_unsupported_syscall(guest, call.number()).await;
@@ -3315,7 +3319,8 @@ mod tests {
         }
     }
 
-    // Inject only the backend's errno. Preparation, rollback, cancellation,
+    // Inject only the backend's errno and, when the backend refuses the exec
+    // as unsupported, its typed refusal. Preparation, rollback, cancellation,
     // unsupported reporting and the configured refusal policy are real code.
     struct FailedExecGuest<'a> {
         config: &'a Config,
@@ -3325,6 +3330,9 @@ mod tests {
         process: Tid,
         old_mm: MmId,
         errno: Errno,
+        backend_refuses: bool,
+        refusal: Option<reverie::UnsupportedRefusal>,
+        refusal_takes: usize,
         injections: usize,
         requests: Mutex<Vec<GlobalRequest>>,
     }
@@ -3384,7 +3392,24 @@ mod tests {
             );
             assert_eq!(self.thread.robust_list_head, None);
             self.injections += 1;
+            // As reverie-kvm does, every injection replaces the record.
+            self.refusal = self.backend_refuses.then(|| {
+                reverie::UnsupportedRefusal::new(
+                    reverie::UnsupportedOperation::NonLeaderExec,
+                    self.errno,
+                    "KVM nonleader exec is unsupported",
+                )
+            });
             Err(self.errno)
+        }
+        fn take_unsupported_refusal(&mut self) -> Option<reverie::UnsupportedRefusal> {
+            assert_eq!(
+                self.thread.mm_id,
+                self.old_mm.for_exec(self.thread.detpid.unwrap()),
+                "the refusal is taken before the failed exec is rolled back"
+            );
+            self.refusal_takes += 1;
+            self.refusal.take()
         }
         async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> reverie::Never {
             panic!("failed exec must not retire a live guest")
@@ -3401,19 +3426,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kvm_nonleader_exec_refusal_preserves_failed_exec_rollback_and_policy() {
+    async fn backend_exec_refusal_preserves_failed_exec_rollback_and_policy() {
         let process = DetPid::from_raw(17);
         let worker = DetTid::from_raw(18);
-        for (kvm_behaviours, caller, errno, fail_closed, refused, reported) in [
-            (true, worker, Errno::ENOSYS, true, true, false),
-            (true, worker, Errno::ENOSYS, false, false, true),
-            (true, worker, Errno::ENOENT, true, false, false),
-            (true, worker, Errno::ENOEXEC, true, false, false),
-            (true, worker, Errno::EFAULT, true, false, false),
-            (true, worker, Errno::EACCES, true, false, false),
-            (true, worker, Errno::EOPNOTSUPP, true, false, false),
-            (true, process, Errno::ENOSYS, true, false, false),
-            (false, worker, Errno::ENOSYS, true, false, false),
+        // `backend_refuses` is whether the backend reports a typed refusal for
+        // the exec. reverie-kvm reports one for every worker exec that returns
+        // ENOSYS, whether its own refusal after preflight or an ENOSYS from a
+        // host syscall the preflight makes: the first two rows. The last row
+        // is a worker ENOSYS for which a backend with KVM's other behaviours
+        // reports no refusal (as KvmGuest::inject's early admission refusals
+        // do); Detcore must not infer a refusal from the errno, so it is an
+        // ordinary exec failure.
+        for (kvm_behaviours, caller, errno, backend_refuses, fail_closed, refused, reported) in [
+            (true, worker, Errno::ENOSYS, true, true, true, false),
+            (true, worker, Errno::ENOSYS, true, false, false, true),
+            (true, worker, Errno::ENOENT, false, true, false, false),
+            (true, worker, Errno::ENOEXEC, false, true, false, false),
+            (true, worker, Errno::EFAULT, false, true, false, false),
+            (true, worker, Errno::EACCES, false, true, false, false),
+            (true, worker, Errno::EOPNOTSUPP, false, true, false, false),
+            (true, process, Errno::ENOSYS, false, true, false, false),
+            (false, worker, Errno::ENOSYS, false, true, false, false),
+            (true, worker, Errno::ENOSYS, false, true, false, false),
         ] {
             let mut report = tempfile::tempfile().unwrap();
             let config = Config {
@@ -3424,10 +3458,11 @@ mod tests {
                 unsupported_syscall_report_fd: Some(report.as_raw_fd()),
                 ..Config::default().with_backend(|backend| {
                     if kvm_behaviours {
-                        // The five behaviours the old `backend_is_kvm` identity flag selected.
+                        // The behaviours the old `backend_is_kvm` identity flag
+                        // selected, other than the exec refusal, which the
+                        // backend now reports per exec (`backend_refuses`).
                         backend.provides_process_signal_control = true;
                         backend.emulates_child_waits = true;
-                        backend.refuses_nonleader_exec_with_enosys = true;
                         backend.failed_gettimeofday_may_store_host_time = false;
                         backend.user_address_limit =
                             Some(reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT);
@@ -3453,6 +3488,9 @@ mod tests {
                 process: Tid::from_raw(process.as_raw()),
                 old_mm,
                 errno,
+                backend_refuses,
+                refusal: None,
+                refusal_takes: 0,
                 injections: 0,
                 requests: Mutex::new(Vec::new()),
             };
@@ -3471,6 +3509,8 @@ mod tests {
                 result => panic!("wrong failed-exec policy: {result:?}"),
             }
             assert_eq!(guest.injections, 1, "backend preflight must run first");
+            assert_eq!(guest.refusal_takes, 1, "the refusal must be asked for once");
+            assert_eq!(guest.refusal, None, "a reported refusal must be taken");
             assert_eq!(guest.thread.dettid, caller);
             assert_eq!(guest.thread.detpid, Some(process));
             assert_eq!(guest.thread.mm_id, old_mm);

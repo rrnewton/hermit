@@ -5828,7 +5828,9 @@ mod tests {
     /// identity check became the capability it selected:
     /// `discover_live_file_metadata` split into the first four fields, the old
     /// `backend_reports_physical_process_exits` became two, and
-    /// `backend_is_kvm` became the last five. Two fields are newer than that
+    /// `backend_is_kvm` became five, of which the last four remain here:
+    /// `refuses_nonleader_exec_with_enosys` became the backend's typed exec
+    /// refusal (Reverie d78f770f). Two fields are newer than that
     /// transcription: `process_exits_complete_asynchronously` (Reverie
     /// 056c8cac), true only for in-guest LiteInst, whose process exits complete
     /// some time after the tool grants them, and
@@ -5868,7 +5870,6 @@ mod tests {
             "provides_process_signal_control": kvm,
             "emulates_child_waits": kvm,
             "failed_gettimeofday_may_store_host_time": !kvm,
-            "refuses_nonleader_exec_with_enosys": kvm,
             "user_address_limit":
                 kvm.then_some(reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT),
         })

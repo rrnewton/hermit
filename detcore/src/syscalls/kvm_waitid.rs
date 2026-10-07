@@ -654,10 +654,10 @@ mod tests {
     // Use the actual child-state initializer, including its emulated-wait/serial gate,
     // rather than manufacturing a ready notification in the component.
     fn unpublished_child(guest: &mut CompletionGuest) -> crate::ThreadState<()> {
-        // The five behaviours the old `backend_is_kvm` identity flag selected.
+        // The four behaviours the old `backend_is_kvm` identity flag selected
+        // that remain capabilities.
         guest.config.backend.provides_process_signal_control = true;
         guest.config.backend.emulates_child_waits = true;
-        guest.config.backend.refuses_nonleader_exec_with_enosys = true;
         guest.config.backend.failed_gettimeofday_may_store_host_time = false;
         guest.config.backend.user_address_limit =
             Some(reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT);
