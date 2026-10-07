@@ -3702,8 +3702,9 @@ fn prepare_run_config(config: DetConfig, backend: Backend) -> DetConfig {
     // on every backend, before any guest exists to install one of its own. A
     // caller's true is kept without asking: record mode sets it, and so does a
     // caller whose command installs a filter in the child, which nothing here
-    // can see. An answer a `LauncherSeccompAnswer` holds, asked before the
-    // container this runs in was cloned, is used instead of asking here.
+    // can see. An answer a `LauncherSeccompAnswer` made on this thread holds,
+    // asked before the container this runs in was cloned from this thread, is
+    // used instead of asking here (see `held_launcher_seccomp_answer`).
     if !config.seccomp_may_refuse_entry_lookup_syscalls {
         config.seccomp_may_refuse_entry_lookup_syscalls =
             held_launcher_seccomp_answer().unwrap_or_else(seccomp_may_refuse_entry_lookup_syscalls);
@@ -3711,49 +3712,75 @@ fn prepare_run_config(config: DetConfig, backend: Backend) -> DetConfig {
     config
 }
 
-/// The answer the live [`LauncherSeccompAnswer`] guards hold.
-static HELD_LAUNCHER_SECCOMP_ANSWER: HeldSeccompAnswer = HeldSeccompAnswer::new();
+thread_local! {
+    /// The answer the live [`LauncherSeccompAnswer`] guards made on this
+    /// thread hold, with this thread's seccomp state when the last of them
+    /// asked. Per thread, not per process: a seccomp filter belongs to the
+    /// thread that installed it, and a guest inherits the filters of the
+    /// thread that clones it, so an answer asked on one thread says nothing
+    /// about a guest cloned from another, which may be filtered unlike it
+    /// with the same filter count (Codex review round 11 of
+    /// https://github.com/rrnewton/hermit/pull/3255). A container cloned from
+    /// this thread without `CLONE_VM` starts as a copy of this thread, its
+    /// thread-local storage and its filters included, so a config prepared in
+    /// it finds the answer and forks no probe child in the guest's PID
+    /// namespace.
+    static HELD_LAUNCHER_SECCOMP_ANSWER: HeldLauncherSeccompAnswer =
+        const { HeldLauncherSeccompAnswer::new() };
+}
+
+/// What [`HELD_LAUNCHER_SECCOMP_ANSWER`] keeps for one thread.
+struct HeldLauncherSeccompAnswer {
+    /// The answer the thread's live guards hold.
+    answer: HeldSeccompAnswer,
+    /// The thread's seccomp state read just before the last guard asked;
+    /// `None` when it could not be read.
+    asked_under: std::cell::Cell<Option<SeccompStatus>>,
+}
+
+impl HeldLauncherSeccompAnswer {
+    const fn new() -> Self {
+        Self {
+            answer: HeldSeccompAnswer::new(),
+            asked_under: std::cell::Cell::new(None),
+        }
+    }
+}
 
 /// An answer held by any number of guards at once: the number of guards times
 /// 4, plus 0 when none lives, 1 for false, 2 for true. Guards that overlap hold
 /// true when any of them answered true, and the answer is forgotten with the
 /// last guard, whatever order they are dropped in, so no answer outlives every
-/// guard. An atomic, not a lock: a container is cloned from this process's
-/// memory, and a lock another thread held at that moment would stay held in
-/// the container.
-struct HeldSeccompAnswer(std::sync::atomic::AtomicU64);
+/// guard. Only the thread it belongs to reads or changes it (see
+/// [`HELD_LAUNCHER_SECCOMP_ANSWER`]), so it needs neither an atomic nor a lock.
+struct HeldSeccompAnswer(std::cell::Cell<u64>);
 
 impl HeldSeccompAnswer {
     const fn new() -> Self {
-        Self(std::sync::atomic::AtomicU64::new(0))
+        Self(std::cell::Cell::new(0))
     }
 
     /// Count one more guard, holding true if it or a guard still counted
     /// answered true.
     fn hold(&self, answer: bool) {
-        let ordering = std::sync::atomic::Ordering::SeqCst;
-        // The closure always returns `Some`, so the update cannot fail.
-        let _ = self.0.try_update(ordering, ordering, |state| {
-            let answer = answer || state & 3 == 2;
-            Some(((state >> 2) + 1) << 2 | if answer { 2 } else { 1 })
-        });
+        let state = self.0.get();
+        let answer = answer || state & 3 == 2;
+        self.0
+            .set(((state >> 2) + 1) << 2 | if answer { 2 } else { 1 });
     }
 
     /// Count one guard fewer, forgetting the answer with the last.
     fn release(&self) {
-        let ordering = std::sync::atomic::Ordering::SeqCst;
-        // The closure always returns `Some`, so the update cannot fail.
-        let _ = self.0.try_update(ordering, ordering, |state| {
-            Some(match state >> 2 {
-                0 | 1 => 0,
-                guards => (guards - 1) << 2 | state & 3,
-            })
+        let state = self.0.get();
+        self.0.set(match state >> 2 {
+            0 | 1 => 0,
+            guards => (guards - 1) << 2 | state & 3,
         });
     }
 
     /// The answer held, if any guard lives.
     fn get(&self) -> Option<bool> {
-        match self.0.load(std::sync::atomic::Ordering::SeqCst) {
+        match self.0.get() {
             0 => None,
             state => Some(state & 3 == 2),
         }
@@ -3763,9 +3790,10 @@ impl HeldSeccompAnswer {
 /// The launcher's answer for
 /// [`DetConfig::seccomp_may_refuse_entry_lookup_syscalls`]
 /// ([`seccomp_may_refuse_entry_lookup_syscalls`]), asked once when the guard
-/// is made, in the process that launches the run, and used by every run whose
-/// config is prepared while the guard lives, including runs in a container
-/// cloned meanwhile, whose memory is a copy of this process's.
+/// is made, on the thread that will clone the run's container, and used by
+/// every run whose config is prepared on that thread while the guard lives,
+/// including runs in a container cloned from it meanwhile, which start as a
+/// copy of that thread.
 ///
 /// Make one before cloning a container with a PID namespace: asking forks a
 /// probe child when every thread runs under the same filter, and a child
@@ -3775,34 +3803,105 @@ impl HeldSeccompAnswer {
 /// `run_uses_readonly_proc_after_permission_denial` in hermit-cli's CLI
 /// tests, where the guest saw PID 4 instead of 3).
 ///
-/// Once the last live guard is dropped, the answer is not kept for runs
-/// prepared later in this process: a filter installed in between would change
-/// it. Guards that overlap hold true when any of them answered true.
+/// The answer is about the filters of the thread that asked, which a guest
+/// cloned from that thread inherits, and only while they are unchanged. A
+/// config prepared on another thread asks for itself. One prepared on the
+/// asking thread, or in a container cloned from it, after that thread's
+/// seccomp mode or filter count changed, or when either cannot be read or
+/// compared, is answered true without forking (Codex review round 11 of
+/// https://github.com/rrnewton/hermit/pull/3255; see
+/// [`held_answer_applies`]).
+///
+/// Once the last live guard of a thread is dropped, the answer is not kept
+/// for runs prepared later on it. Guards that overlap hold true when any of
+/// them answered true. A guard cannot be sent to another thread, so it is
+/// dropped on the thread whose answer it holds.
 #[doc(hidden)]
 #[must_use = "the answer is held only while the guard lives"]
 pub struct LauncherSeccompAnswer {
     /// Only [`LauncherSeccompAnswer::ask`] makes a guard, so every drop
-    /// releases a hold.
-    _held: (),
+    /// releases a hold; the raw pointer type keeps the guard on its thread.
+    _held: std::marker::PhantomData<*const ()>,
 }
 
 impl LauncherSeccompAnswer {
-    /// Ask now and hold the answer until the guard is dropped.
+    /// Ask now and hold the answer on this thread until the guard is
+    /// dropped.
     pub fn ask() -> Self {
-        HELD_LAUNCHER_SECCOMP_ANSWER.hold(seccomp_may_refuse_entry_lookup_syscalls());
-        Self { _held: () }
+        // Read before asking: a filter that another thread synchronizes onto
+        // this one meanwhile (`SECCOMP_FILTER_FLAG_TSYNC`) then makes the state
+        // at use differ from the one recorded, which sets the answer aside.
+        let asked_under = this_thread_seccomp_status();
+        let answer = seccomp_may_refuse_entry_lookup_syscalls();
+        HELD_LAUNCHER_SECCOMP_ANSWER.with(|held| {
+            held.answer.hold(answer);
+            // The latest state: filters are only added, and a true held from
+            // an earlier guard stays true, so a held false is always the
+            // answer asked under this state.
+            held.asked_under.set(asked_under);
+        });
+        Self {
+            _held: std::marker::PhantomData,
+        }
     }
 }
 
 impl Drop for LauncherSeccompAnswer {
     fn drop(&mut self) {
-        HELD_LAUNCHER_SECCOMP_ANSWER.release();
+        HELD_LAUNCHER_SECCOMP_ANSWER.with(|held| held.answer.release());
     }
 }
 
-/// The answer the live [`LauncherSeccompAnswer`] guards hold, if one lives.
+/// The answer the live [`LauncherSeccompAnswer`] guards of this thread hold,
+/// if one lives: a held true, or a held false while this thread's seccomp
+/// state is the one it was asked under ([`held_answer_applies`]). Otherwise a
+/// guard lives but its false may no longer hold, and the answer is true,
+/// without forking a probe child, which in a container cloned from this
+/// thread would take a process ID in the guest's PID namespace.
 fn held_launcher_seccomp_answer() -> Option<bool> {
-    HELD_LAUNCHER_SECCOMP_ANSWER.get()
+    HELD_LAUNCHER_SECCOMP_ANSWER.with(|held| {
+        if held.answer.get()? {
+            return Some(true);
+        }
+        let asked_under = held.asked_under.get();
+        let now = this_thread_seccomp_status();
+        if held_answer_applies(asked_under, now) {
+            return Some(false);
+        }
+        tracing::debug!(
+            "this thread's seccomp state is {now:?}, not the {asked_under:?} the held answer \
+             was asked under; assuming a seccomp filter the guest inherits may refuse what \
+             Detcore asks while listing a directory"
+        );
+        Some(true)
+    })
+}
+
+/// This thread's [`SeccompStatus`] (`/proc/thread-self/status`); `None` when
+/// it cannot be read.
+fn this_thread_seccomp_status() -> Option<SeccompStatus> {
+    std::fs::read_to_string("/proc/thread-self/status")
+        .ok()
+        .map(|status| parse_seccomp_status(&status))
+}
+
+/// Whether an answer asked when this thread's seccomp state was `asked_under`
+/// still holds now that it is `now`: both were read and are equal, and the
+/// state tells filters apart. A thread's filters are only ever added to, and
+/// `Seccomp_filters:` (Linux 5.9) counts them, including a filter another
+/// thread synchronizes onto this one, which Linux allows only when this
+/// thread's filters are a prefix of the caller's and which therefore leaves
+/// more of them than before; so on one thread an equal mode and count mean
+/// the same filters. Without a count, only mode 0, no filter at all, says
+/// that.
+fn held_answer_applies(asked_under: Option<SeccompStatus>, now: Option<SeccompStatus>) -> bool {
+    match (asked_under, now) {
+        (Some(asked_under), Some(now)) => {
+            asked_under == now
+                && (now.mode == Some(0) || (now.mode.is_some() && now.filters.is_some()))
+        }
+        _ => false,
+    }
 }
 
 /// Whether a seccomp filter that a guest of this process inherits may refuse
@@ -7168,13 +7267,19 @@ mod tests {
         }
     }
 
-    /// While a `LauncherSeccompAnswer` lives, a run's config carries the
-    /// answer it asked for, not one asked when the config is prepared: a
-    /// filter that fails `fstatfs`, installed after the guard asked, does not
-    /// change it. Once the guard is dropped the config asks again and sees
-    /// the filter. A container cloned while the guard lives prepares its
-    /// config this way, so it forks no probe child in the guest's PID
-    /// namespace.
+    /// While a `LauncherSeccompAnswer` lives, a run's config prepared on the
+    /// thread that made it carries the answer it asked for, not one asked
+    /// when the config is prepared, as long as that thread's own filters are
+    /// unchanged: here another thread's filter that fails `fstatfs` makes a
+    /// fresh answer true, but a container cloned from the asking thread
+    /// inherits that thread's filters, not the other's. A container cloned
+    /// while the guard lives prepares its config this way, so it forks no
+    /// probe child in the guest's PID namespace. A filter that fails
+    /// `fstatfs`, installed on the asking thread after it asked, makes the
+    /// held answer true: that thread's guests inherit the filter (Codex
+    /// review round 11 of https://github.com/rrnewton/hermit/pull/3255;
+    /// before, this test required the stale false). Once the guard is
+    /// dropped the config asks again and sees the filter.
     #[test]
     fn a_run_config_carries_the_held_answer_until_its_guard_is_dropped() {
         let name = "a_run_config_carries_the_held_answer_until_its_guard_is_dropped";
@@ -7189,21 +7294,198 @@ mod tests {
             super::prepare_run_config(config.clone(), Backend::Ptrace)
                 .seccomp_may_refuse_entry_lookup_syscalls
         };
+        let fails_fstatfs = seccomp_program(
+            libc::SYS_fstatfs,
+            libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        );
         assert!(
             !super::seccomp_may_refuse_entry_lookup_syscalls(),
             "this test needs a process whose own answer is false"
         );
         let held = super::LauncherSeccompAnswer::ask();
-        install_seccomp(
-            &seccomp_program(
-                libc::SYS_fstatfs,
-                libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
-            ),
-            true,
+        let (installed_tx, installed_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let other = std::thread::spawn(move || {
+            install_seccomp(&fails_fstatfs, false);
+            installed_tx.send(()).unwrap();
+            done_rx.recv().unwrap();
+        });
+        installed_rx.recv().unwrap();
+        assert!(
+            super::seccomp_may_refuse_entry_lookup_syscalls(),
+            "precondition: with another thread filtered, a fresh answer is true"
         );
-        assert!(!carried(), "the run config should carry the held answer");
+        assert!(
+            !carried(),
+            "the run config should carry the held answer while the asking thread's filters are \
+             unchanged"
+        );
+        done_tx.send(()).unwrap();
+        other.join().unwrap();
+        install_seccomp(&fails_fstatfs, true);
+        assert!(
+            carried(),
+            "a filter installed on the asking thread after it asked makes the held answer true"
+        );
         drop(held);
         assert!(carried(), "without a guard the run config should ask again");
+    }
+
+    /// Run `body` in a child forked from this thread, whose only thread at
+    /// the start is a copy of this one, and require that `body` returns
+    /// within a minute. A scenario that needs every thread of a process
+    /// filtered alike cannot run in the process libtest runs it in, whose
+    /// main thread waits unfiltered for the test's thread. The child leaves
+    /// by `_exit`: 0 when `body` returned, 1 when it panicked, after
+    /// printing the panic's message.
+    fn in_a_one_thread_child(body: impl FnOnce()) {
+        // SAFETY: the child runs `body` and leaves by `_exit`, never
+        // returning into libtest. The only other thread of this process,
+        // libtest's main thread, waits for this one and holds no lock that
+        // `body` takes.
+        let pid = unsafe { libc::fork() };
+        assert!(
+            pid >= 0,
+            "precondition: fork: {}",
+            std::io::Error::last_os_error()
+        );
+        if pid == 0 {
+            let returned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_ok();
+            // SAFETY: ends this child at once, without running the exit
+            // handlers it copied from the parent.
+            unsafe { libc::_exit(if returned { 0 } else { 1 }) };
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut status = 0;
+        loop {
+            // SAFETY: waits for the child forked above, without blocking,
+            // into a valid out pointer.
+            let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if waited == pid {
+                break;
+            }
+            assert_eq!(waited, 0, "waitpid: {}", std::io::Error::last_os_error());
+            if std::time::Instant::now() >= deadline {
+                // SAFETY: ends and reaps the child forked above.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                    libc::waitpid(pid, &mut status, 0);
+                }
+                panic!("the one-thread child did not finish within a minute");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "the one-thread child failed, as it printed above: wait status {status:#x}"
+        );
+    }
+
+    /// A thread that did not ask does not use the answer another thread
+    /// holds. Thread A, whose filter fails only `swapon`, holds false, and
+    /// thread B, whose filter traps `fstatfs`, prepares a run config. Both
+    /// report one filter and neither filter was synchronized to the other
+    /// thread, so the threads look alike to the launcher; a guest cloned
+    /// from B inherits B's filter, and with A's false Detcore would inject
+    /// the `fstatfs` that ends that guest by `SIGSYS` (Codex review round 11
+    /// of https://github.com/rrnewton/hermit/pull/3255). The scenario runs
+    /// in a child forked from one thread, so that A and B are its only
+    /// threads.
+    #[test]
+    fn a_held_answer_is_not_used_by_another_thread_filtered_unlike_the_asker() {
+        let name = "a_held_answer_is_not_used_by_another_thread_filtered_unlike_the_asker";
+        if !in_seccomp_scenario(name) {
+            return run_seccomp_scenario(name);
+        }
+        fn carried() -> bool {
+            super::prepare_run_config(
+                super::DetConfig {
+                    virtualize_metadata: false,
+                    ..super::DetConfig::default()
+                },
+                Backend::Ptrace,
+            )
+            .seccomp_may_refuse_entry_lookup_syscalls
+        }
+        in_a_one_thread_child(|| {
+            let (installed_tx, installed_rx) = std::sync::mpsc::channel();
+            let (prepare_tx, prepare_rx) = std::sync::mpsc::channel::<()>();
+            let (carried_tx, carried_rx) = std::sync::mpsc::channel();
+            let thread_b = std::thread::spawn(move || {
+                install_seccomp(
+                    &seccomp_program(libc::SYS_fstatfs, libc::SECCOMP_RET_TRAP),
+                    false,
+                );
+                installed_tx.send(()).unwrap();
+                prepare_rx.recv().unwrap();
+                carried_tx.send(carried()).unwrap();
+            });
+            installed_rx.recv().unwrap();
+            install_seccomp(
+                &seccomp_program(
+                    libc::SYS_swapon,
+                    libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+                ),
+                false,
+            );
+            assert_eq!(
+                this_launcher_seccomp(),
+                super::LauncherSeccomp::Uniform,
+                "precondition: A and B report the same filter count"
+            );
+            let held = super::LauncherSeccompAnswer::ask();
+            assert!(!carried(), "precondition: A holds false");
+            prepare_tx.send(()).unwrap();
+            assert!(
+                carried_rx.recv().unwrap(),
+                "B, whose filter traps fstatfs, must not use the false A holds"
+            );
+            thread_b.join().unwrap();
+            drop(held);
+        });
+    }
+
+    /// A held answer is used only while the asking thread's seccomp state is
+    /// the one it was asked under and that state tells filters apart: equal
+    /// modes and filter counts, or mode 0 (no filter) where the kernel prints
+    /// no count. A state that changed, one without a count under a filter,
+    /// and one that could not be read or parsed all set the answer aside
+    /// (Codex review round 11 of https://github.com/rrnewton/hermit/pull/3255).
+    #[test]
+    fn a_held_answer_applies_only_to_an_unchanged_comparable_thread_state() {
+        let status =
+            |mode: Option<u32>, filters: Option<u32>| Some(super::SeccompStatus { mode, filters });
+        let applies = super::held_answer_applies;
+        assert!(applies(status(Some(0), Some(0)), status(Some(0), Some(0))));
+        assert!(
+            applies(status(Some(0), None), status(Some(0), None)),
+            "no filter, on a kernel that prints no count"
+        );
+        assert!(applies(status(Some(2), Some(3)), status(Some(2), Some(3))));
+        assert!(
+            !applies(status(Some(2), Some(3)), status(Some(2), Some(4))),
+            "a filter was added"
+        );
+        assert!(
+            !applies(status(Some(0), Some(0)), status(Some(2), Some(1))),
+            "the first filter was added"
+        );
+        assert!(
+            !applies(status(Some(2), None), status(Some(2), None)),
+            "under a filter, without a count, an added filter cannot be seen"
+        );
+        assert!(
+            !applies(status(None, Some(1)), status(None, Some(1))),
+            "an unparsed mode"
+        );
+        assert!(
+            !applies(None, status(Some(0), Some(0))),
+            "the state when asked could not be read"
+        );
+        assert!(
+            !applies(status(Some(0), Some(0)), None),
+            "the state now cannot be read"
+        );
     }
 
     /// Guards that overlap hold true when any of them answered true, and the
