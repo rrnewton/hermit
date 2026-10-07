@@ -61,6 +61,7 @@ pub mod random;
 mod record_or_replay;
 mod resources;
 mod scheduler;
+mod shared_open_files;
 mod sock_diag;
 mod stat;
 mod syscall_classification;
@@ -137,6 +138,8 @@ pub use tool_global::format_unsupported_syscall_warning;
 pub use tool_global::prepare_exec;
 use tool_global::report_unsupported_syscall;
 use tool_global::robust_list_wakes_after_exit;
+pub use tool_global::shared_open_file_reply;
+pub use tool_global::shared_open_file_request;
 
 fn select_thread_exit_detpid(
     thread_detpid: Option<DetPid>,
@@ -174,6 +177,10 @@ pub use fd::OpenFileModel;
 pub use fd::SharedOpenFileChannel;
 pub use fd::SharedOpenFileError;
 pub use fd::install_shared_open_file_channel;
+pub use shared_open_files::ChunkedOpenFileChannel;
+pub use shared_open_files::OpenFileControl;
+pub use shared_open_files::OpenFileControlReply;
+pub use shared_open_files::OpenFileControlTransport;
 pub use tool_local::Detcore;
 pub use tool_local::FileMetadata;
 /// Returns whether the audited runtime policy classifies `sysno` as unsupported.

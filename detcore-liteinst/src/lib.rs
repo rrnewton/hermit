@@ -130,6 +130,36 @@ pub unsafe extern "C" fn detcore_liteinst_initialize() {
     if let Err(error) = unsafe { reverie_liteinst::install_tool::<detcore::Detcore>(socket) } {
         fail(&error.to_string());
     }
+    // A description a fork shares is reached through the coordinator, over
+    // this process's one existing connection. The first installation in a
+    // process image is the only one, and a forked child inherits it.
+    let _ = detcore::install_shared_open_file_channel(Box::new(
+        detcore::ChunkedOpenFileChannel::new(CoordinatorOpenFiles),
+    ));
+}
+
+/// Carries shared open file control messages to Detcore's global state from
+/// inside a Tool callback, through `reverie_liteinst::blocking_global_rpc`.
+/// A `DetFd` method is synchronous code inside a callback's poll, so no other
+/// request of this process is in flight when it runs; if one is, the call is
+/// refused rather than interleaved.
+struct CoordinatorOpenFiles;
+
+impl detcore::OpenFileControlTransport for CoordinatorOpenFiles {
+    fn call(
+        &self,
+        control: detcore::OpenFileControl,
+    ) -> Result<detcore::OpenFileControlReply, detcore::SharedOpenFileError> {
+        let response = reverie_liteinst::blocking_global_rpc::<detcore::GlobalState>(
+            detcore::shared_open_file_request(control),
+        )
+        .map_err(|error| {
+            detcore::SharedOpenFileError(format!(
+                "the coordinator connection refused a shared open file message: {error}"
+            ))
+        })?;
+        detcore::shared_open_file_reply(response)
+    }
 }
 
 /// Sends one Detcore record on the reserved socket. Its number can move when the

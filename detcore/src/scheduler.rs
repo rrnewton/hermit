@@ -2902,6 +2902,13 @@ impl Scheduler {
         )
     }
 
+    /// Records `dettid` as the thread holding the serial grant, as
+    /// `unblock_guest` does when it grants a turn.
+    #[cfg(test)]
+    pub(crate) fn set_running_for_test(&mut self, dettid: DetTid) {
+        self.parked.running = Some(dettid);
+    }
+
     #[cfg(test)]
     pub(crate) fn select_test_turn(
         &mut self,
@@ -2913,6 +2920,31 @@ impl Scheduler {
     pub(crate) fn thread_is_logically_killed(&self, dettid: DetTid) -> bool {
         self.backend.needs_killed_thread_rpc_cancellation
             && self.logically_killed_threads.contains(&dettid)
+    }
+
+    /// Whether `dettid` is running in a turn the scheduler granted it, now:
+    /// - it is the thread last granted a turn (`parked.running`, set only by
+    ///   `unblock_guest`), and neither a backend failure nor a logical kill
+    ///   has ended its run;
+    /// - it has not filed its next request yet. `unblock_guest` installs a
+    ///   fresh, empty request slot at the grant, and the thread's next
+    ///   request fills it, which surrenders the turn;
+    /// - the grant did not release it into the background. A thread running a
+    ///   blocking call outside the runnable set (`external_io_blockers`, which
+    ///   includes a copying vfork's parent, or `rt_sigsuspend_blockers`), or
+    ///   one woken there by a signal (`signaled_background`), does not hold
+    ///   the turn even before the next grant moves `parked.running` away.
+    pub(crate) fn holds_serial_grant(&self, dettid: DetTid) -> bool {
+        !self.backend_failed()
+            && !self.thread_is_logically_killed(dettid)
+            && self.parked.running == Some(dettid)
+            && self
+                .next_turns
+                .get(&dettid)
+                .is_some_and(|turn| turn.req.try_read().is_none())
+            && !self.blocked.external_io_blockers.contains_key(&dettid)
+            && !self.blocked.rt_sigsuspend_blockers.contains_key(&dettid)
+            && !self.blocked.signaled_background.contains(&dettid)
     }
 
     pub(crate) fn rpc_incarnation_matches(&self, dettid: DetTid, mm: MmId) -> bool {

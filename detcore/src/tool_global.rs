@@ -73,6 +73,7 @@ use tracing::warn;
 
 use crate::config::Config;
 use crate::consts::ROOT_DETPID;
+use crate::fd::SharedOpenFileError;
 use crate::ivar::Ivar;
 use crate::preemptions::PreemptionReader;
 use crate::preemptions::ThreadHistory;
@@ -106,6 +107,9 @@ use crate::scheduler::runqueue::REPLAY_FOREGROUND_PRIORITY;
 use crate::scheduler::runqueue::is_ordinary_priority;
 use crate::scheduler::sched_loop;
 use crate::scheduler::sched_loop_external;
+use crate::shared_open_files::OpenFileControl;
+use crate::shared_open_files::OpenFileControlReply;
+use crate::shared_open_files::SharedOpenFileStore;
 use crate::tool_local::Detcore;
 use crate::tool_local::ExecFdBlockingOverrides;
 use crate::tool_local::RobustListWake;
@@ -648,6 +652,11 @@ pub struct GlobalState {
     // `host_inputs`.
     host_mutations: Mutex<BTreeSet<String>>,
 
+    // The canonical models of open file descriptions that several guest
+    // processes share (see `crate::shared_open_files`). Locked after `sched`,
+    // never before it.
+    shared_open_files: Mutex<SharedOpenFileStore>,
+
     // Optional append-only sink shared by DBT fork descendants.
     unsupported_syscall_report_fd: Option<Mutex<File>>,
 
@@ -805,6 +814,7 @@ impl GlobalState {
             unsupported_syscalls: Mutex::new(BTreeSet::new()),
             host_inputs: Mutex::new(Vec::new()),
             host_mutations: Mutex::new(BTreeSet::new()),
+            shared_open_files: Mutex::new(SharedOpenFileStore::default()),
             unsupported_syscall_report_fd,
             port_start_range: AtomicU16::new(range[0]),
             port_end_range: AtomicU16::new(range[1]),
@@ -936,6 +946,9 @@ impl GlobalState {
             let mut sched = self.sched.lock().unwrap();
             let consumed = self.cfg.backend.process_exits_complete_asynchronously
                 && sched.consume_unreported_exit(detpid);
+            // In the same locked step as the retirement: a dead process's
+            // leases end, and their unpublished changes are discarded.
+            self.shared_open_files.lock().unwrap().end_leases_of(detpid);
             (sched.complete_physical_process_exit(detpid), consumed)
         };
         if completed {
@@ -949,6 +962,62 @@ impl GlobalState {
                 "process {detpid} exited without deregistering; its exit was not scheduled"
             ));
         }
+    }
+
+    /// Answers a control message about a shared open file description. Only
+    /// the thread that holds the scheduler's serial grant may send one, so
+    /// access to a shared description is exclusive and happens in canonical
+    /// order (`crate::shared_open_files`).
+    ///
+    /// A refusal is an infrastructure failure, not something the guest's
+    /// syscall can report: the caller's process stops, and this reports a
+    /// backend failure, which ends the whole run before any further grant.
+    fn shared_open_file_control(
+        &self,
+        thread: DetTid,
+        control: OpenFileControl,
+    ) -> Result<OpenFileControlReply, SharedOpenFileError> {
+        // The refusal and the failure it reports are one locked step, so the
+        // scheduler can grant no other thread in between.
+        let (result, wakes) = {
+            let mut sched = self.sched.lock().unwrap();
+            let process = sched.registered_process(thread);
+            let result = if !sched.holds_serial_grant(thread) {
+                Err(SharedOpenFileError(format!(
+                    "thread {thread} sent {control:?} without holding the serial grant"
+                )))
+            } else if let Some(process) = process {
+                self.shared_open_files
+                    .lock()
+                    .unwrap()
+                    .handle(process, thread, control)
+            } else {
+                Err(SharedOpenFileError(format!(
+                    "thread {thread} belongs to no registered process"
+                )))
+            };
+            let wakes = result.as_ref().err().map(|error| {
+                tracing::error!("[detcore] shared open file control refused: {error}");
+                let wake = sched.report_backend_failure(reverie::BackendFailure {
+                    pid: reverie::Pid::from_raw(process.unwrap_or(thread).as_raw()),
+                    tid: Tid::from_raw(thread.as_raw()),
+                    phase: "shared open file control",
+                });
+                (wake, sched.take_signal_failure_wakes())
+            });
+            (result, wakes)
+        };
+        // Notified after the lock is released, as `report_backend_failure`
+        // does.
+        if let Some((wake, deferred)) = wakes {
+            for wake in deferred {
+                let _ = wake.send(());
+            }
+            if let Some(wake) = wake {
+                let _ = wake.send(());
+            }
+        }
+        result
     }
 
     /// Releases all physical-process-exit barriers after a backend supervisor has drained every
@@ -1370,6 +1439,15 @@ impl GlobalTool for GlobalState {
             self.host_mutations.lock().unwrap().insert(path);
             return (None, R::RecordHostMutation(()));
         }
+        // Control traffic for a shared open file description: like the
+        // observations above, it carries no logical time, changes no
+        // scheduler state, and its answer carries no time back.
+        if let GlobalRequest::SharedOpenFile(control) = request {
+            return (
+                None,
+                R::SharedOpenFile(self.shared_open_file_control(dtid, control)),
+            );
+        }
         if let GlobalRequest::SignalDequeued {
             detpid,
             identity,
@@ -1571,6 +1649,9 @@ impl GlobalTool for GlobalState {
             }
             GlobalRequest::RecordHostInput { .. } | GlobalRequest::RecordHostMutation { .. } => {
                 unreachable!("host-input observation answered before clock accounting")
+            }
+            GlobalRequest::SharedOpenFile(_) => {
+                unreachable!("shared open file control answered before clock accounting")
             }
             GlobalRequest::ParkedRequest(rs, pid, capability) => {
                 let (response, _) = self
@@ -3578,6 +3659,11 @@ pub enum GlobalRequest {
     /// [`host_timed_signals`]. Appended after `RecordHostTimedSignals`, for the
     /// same reason.
     HostTimedSignals(DetTid),
+    /// A control message about a shared open file description, answered
+    /// before any clock or scheduler accounting (see
+    /// `crate::shared_open_files`). Appended after `HostTimedSignals`, for the
+    /// same reason.
+    SharedOpenFile(OpenFileControl),
 }
 
 /// Responses from the global object
@@ -3664,6 +3750,34 @@ pub enum GlobalResponse {
     /// Appended after `RecordHostMutation`, so that adding it left every
     /// earlier variant's tag unchanged.
     HostTimedSignals(u64),
+    /// Appended after `HostTimedSignals`, for the same reason.
+    SharedOpenFile(Result<OpenFileControlReply, SharedOpenFileError>),
+}
+
+/// The global request that carries one shared open file control message. It
+/// is answered before any clock accounting, so its clock and address-space
+/// fields are placeholders. The sender is the thread the backend's transport
+/// names for the request; for in-guest LiteInst that is the runtime's own
+/// envelope, checked against the connecting process at admission, on a
+/// connection the guest cannot write to.
+pub fn shared_open_file_request(control: OpenFileControl) -> (DetTime, MmId, GlobalRequest) {
+    (
+        DetTime::default(),
+        MmId::initial(DetTid::from_raw(0)),
+        GlobalRequest::SharedOpenFile(control),
+    )
+}
+
+/// The answer to a [`shared_open_file_request`].
+pub fn shared_open_file_reply(
+    response: (Option<LogicalTime>, GlobalResponse),
+) -> Result<OpenFileControlReply, SharedOpenFileError> {
+    match response {
+        (None, GlobalResponse::SharedOpenFile(reply)) => reply,
+        other => Err(SharedOpenFileError(format!(
+            "unexpected answer to a shared open file control message: {other:?}"
+        ))),
+    }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -8178,6 +8292,135 @@ mod tests {
             later_files(&mut skipped),
             "a host-dependent mtime update renumbered later files"
         );
+    }
+
+    /// The serial grant follows the scheduler's real transitions: a granted
+    /// thread holds it; filing its next request surrenders it; and a grant
+    /// that releases the thread into a background call does not confer it,
+    /// although that grant is the last one (`parked.running`).
+    #[tokio::test]
+    async fn the_serial_grant_ends_at_the_next_request_and_is_not_a_background_grant() {
+        let (_config, state, tid, _) = cancellation_test_state();
+        let first = Ivar::new();
+        first.put(Ok(Resources::new(tid)));
+        install_test_registration(&state, tid, first);
+        assert!(!state.sched.lock().unwrap().holds_serial_grant(tid));
+
+        let grant = |state: &GlobalState| {
+            let (chosen, request, response) =
+                state.sched.lock().unwrap().select_test_turn().unwrap();
+            assert_eq!(chosen, tid);
+            crate::scheduler::finish_selected_turn(
+                state.sched.clone(),
+                state.global_time.clone(),
+                chosen,
+                request,
+                response,
+            )
+        };
+        grant(&state).await.unwrap();
+        assert!(state.sched.lock().unwrap().holds_serial_grant(tid));
+
+        // The thread files its next request: a blocking external call.
+        let next = state.sched.lock().unwrap().next_turns[&tid].req.clone();
+        let mut background = Resources::new(tid);
+        background.insert(
+            ResourceID::BlockingExternalIO(ExternalOpId::new(tid, 1)),
+            Permission::RW,
+        );
+        next.put(Ok(background));
+        assert!(!state.sched.lock().unwrap().holds_serial_grant(tid));
+
+        // The scheduler releases it into the background. A background grant
+        // unblocks the thread in step 4 and then skips the rest of the turn.
+        assert!(grant(&state).await.is_err());
+        let sched = state.sched.lock().unwrap();
+        assert!(sched.blocked.external_io_blockers.contains_key(&tid));
+        assert!(!sched.holds_serial_grant(tid));
+    }
+
+    /// Only the thread holding the serial grant reaches a shared open file
+    /// description. Its control messages move no clock, and the death of the
+    /// lease holder's process ends the lease. A refused message fails the run.
+    #[tokio::test]
+    async fn shared_open_file_control_needs_the_serial_grant() {
+        use nix::fcntl::OFlag;
+
+        use crate::fd::DetFd;
+        use crate::fd::FdType;
+        use crate::shared_open_files::OpenFileControl;
+        use crate::shared_open_files::OpenFileControlReply;
+        use crate::types::OpenFileId;
+
+        let config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let granted = DetTid::from_raw(21);
+        let other = DetTid::from_raw(22);
+        let id = OpenFileId::new(granted, 0);
+        {
+            let mut sched = state.sched.lock().unwrap();
+            for tid in [granted, other] {
+                sched.thread_tree.add_child(tid, tid, true);
+                sched.next_turns.insert(
+                    tid,
+                    ThreadNextTurn {
+                        dettid: tid,
+                        child_tid_addr: 0,
+                        req: Ivar::new(),
+                        resp: Ivar::new(),
+                        protocol: Default::default(),
+                    },
+                );
+            }
+            sched.set_running_for_test(granted);
+        }
+        state
+            .shared_open_files
+            .lock()
+            .unwrap()
+            .insert(DetFd::new(3, OFlag::O_RDWR, FdType::Regular, id).model_for_test())
+            .unwrap();
+        let global_before = state.global_time.lock().unwrap().as_nanos();
+        let take = |tid: DetTid| {
+            state.receive_rpc(
+                reverie::Tid::from_raw(tid.as_raw()),
+                (
+                    DetTime::new(&config),
+                    MmId::initial(tid),
+                    GlobalRequest::SharedOpenFile(OpenFileControl::Take { id }),
+                ),
+            )
+        };
+
+        assert!(matches!(
+            take(granted).await,
+            (
+                None,
+                GlobalResponse::SharedOpenFile(Ok(OpenFileControlReply::Taken { .. }))
+            )
+        ));
+        assert!(state.shared_open_files.lock().unwrap().is_leased(id));
+        {
+            let global_time = state.global_time.lock().unwrap();
+            assert_eq!(global_time.as_nanos(), global_before, "no clock accounting");
+            assert!(!global_time.contains_thread(granted));
+        }
+
+        state.complete_physical_process_exit(granted.as_raw());
+        assert!(!state.shared_open_files.lock().unwrap().is_leased(id));
+        assert!(!state.sched.lock().unwrap().backend_failed());
+
+        // A thread that does not hold the grant is refused, takes nothing,
+        // and the refusal is a backend failure.
+        assert!(matches!(
+            take(other).await,
+            (None, GlobalResponse::SharedOpenFile(Err(_)))
+        ));
+        assert!(!state.shared_open_files.lock().unwrap().is_leased(id));
+        assert!(state.sched.lock().unwrap().backend_failed());
     }
 
     /// A host-input observation, and a report of a path the guest rebound,
