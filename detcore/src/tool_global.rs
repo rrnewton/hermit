@@ -146,12 +146,32 @@ struct InodePool {
     /// [`Self::set_mtime`]), so they must not consume counter values. The
     /// file's first numbering request takes the pending mtime.
     pending_mtimes: HashMap<RawInode, LogicalTime>,
+    /// Mappings whose file lost its last name (see [`Self::retire`]), kept
+    /// for the descriptors that can still reach it.
+    retired: HashMap<RawInode, DetInode>,
+    /// How many retired mappings a later sighting showed the host had given to
+    /// another file (see [`Self::forget_retired`]). Diagnostic only: it
+    /// follows host state and never reaches the guest.
+    reused: u64,
+}
+
+/// How a numbering request reached its file, which decides whether a retired
+/// mapping (see `InodePool::retire`) answers it.
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
+pub enum InodeSighting {
+    /// Through a descriptor, or through a path to a file that has no link
+    /// left (`/proc/self/fd/N` of an unlinked file). Either can reach the file
+    /// a retired mapping describes.
+    Descriptor,
+    /// Through a name of a file that has a link: a directory entry, or a stat
+    /// by path that reports a nonzero `st_nlink`. A retired file has no name,
+    /// so this is another file that the host gave the freed inode.
+    Name,
 }
 
 /// Everything we know (globally) about a DetInode.
 #[derive(Debug)]
 struct DetInodeInfo {
-    raw: RawInode,
     /// The virtual mtime, or `None` while no stat has observed the file and no
     /// write or explicit time update has set it. Many paths (open, read,
     /// getdents) mint a DetInode before any stat, so the first-seen policy is
@@ -270,6 +290,8 @@ impl InodePool {
             // pooled number can never collide with one of them.
             next_inode: crate::consts::DET_INODE_OFFSET.as_raw(),
             pending_mtimes: HashMap::new(),
+            retired: HashMap::new(),
+            reused: 0,
         }
     }
 
@@ -278,10 +300,16 @@ impl InodePool {
     // new deterministic inode. Minted numbers are strictly increasing and
     // never handed out twice.
     //
-    // Host inode reuse is contained, not handled: nothing removes a mapping
-    // when its file is unlinked (`unlink_inode` has no caller), so a new file
-    // that the host gives a freed `(dev, ino)` (ext4 does) inherits the old
-    // file's number and mtime. Only that file is affected.
+    // Host inode reuse: a filesystem such as ext4 or XFS gives a freed
+    // `(dev, ino)` to a new file, and whether it does differs between runs
+    // (https://github.com/rrnewton/hermit/issues/3840). A mapping is retired
+    // when its file loses its last name (`Self::retire`), and a `Name`
+    // sighting of a retired `(dev, ino)` discards it, so the new file is
+    // numbered by this request in every run, reused or not. A `Descriptor`
+    // sighting still gets the retired number: an unlinked file reached through
+    // a descriptor keeps its inode number, as on Linux, and a descriptor to a
+    // new file was opened by name, which discarded the retired mapping
+    // (`Self::forget_retired`).
     //
     // Every call consumes the next counter value, whether or not it mints.
     // Whether a host inode is "new" depends on host state the guest does not
@@ -296,15 +324,23 @@ impl InodePool {
     // Also return the virtual mtime. When it is still unresolved, `observed`
     // resolves it under the first-seen policy (see `ObservedMtime`); an
     // unresolved mtime reads as `epoch`.
-    fn add_inode(
+    fn add_sighted_inode(
         &mut self,
         raw_inode: RawInode,
         observed: ObservedMtime,
         epoch: LogicalTime,
+        sighting: InodeSighting,
     ) -> (DetInode, LogicalTime) {
         let ordinal = self.next_inode;
         self.next_inode += 1;
-        let dino = match self.inodes.get(&raw_inode) {
+        if sighting == InodeSighting::Name {
+            self.forget_retired(raw_inode);
+        }
+        let dino = match self
+            .inodes
+            .get(&raw_inode)
+            .or_else(|| self.retired.get(&raw_inode))
+        {
             Some(dino) => *dino,
             None => {
                 // THE determinization boundary: the single place a host inode
@@ -316,7 +352,6 @@ impl InodePool {
                 let prev = self.detinodes_info.insert(
                     new,
                     DetInodeInfo {
-                        raw: raw_inode,
                         mtime: self.pending_mtimes.remove(&raw_inode),
                     },
                 );
@@ -334,6 +369,16 @@ impl InodePool {
         (dino, info.mtime.unwrap_or(epoch))
     }
 
+    /// [`Self::add_sighted_inode`] for a [`InodeSighting::Descriptor`].
+    fn add_inode(
+        &mut self,
+        raw_inode: RawInode,
+        observed: ObservedMtime,
+        epoch: LogicalTime,
+    ) -> (DetInode, LogicalTime) {
+        self.add_sighted_inode(raw_inode, observed, epoch, InodeSighting::Descriptor)
+    }
+
     // Set a file's virtual mtime, replacing whatever the first-seen policy
     // chose or would choose. This never consumes a counter value: its callers
     // (a write's mtime bump, `utimensat`) reach the pool or not depending on
@@ -342,7 +387,14 @@ impl InodePool {
     // every file numbered after it. A file not yet numbered keeps the mtime
     // pending until its first numbering request.
     fn set_mtime(&mut self, raw_inode: RawInode, mtime: LogicalTime) {
-        match self.inodes.get(&raw_inode) {
+        // A retired file is written through a descriptor opened before its
+        // last name went away; a new file's descriptor was opened by name,
+        // which discarded the retired mapping.
+        match self
+            .inodes
+            .get(&raw_inode)
+            .or_else(|| self.retired.get(&raw_inode))
+        {
             Some(dino) => {
                 self.detinodes_info
                     .get_mut(dino)
@@ -356,10 +408,26 @@ impl InodePool {
         }
     }
 
-    // remove a det inode
-    fn remove_inode(&mut self, det_inode: DetInode) {
-        if let Some(info) = self.detinodes_info.remove(&det_inode) {
-            self.inodes.remove(&info.raw);
+    /// The file behind `raw_inode` lost its last name (an `unlink`,
+    /// `rmdir` or replacing `rename` removed it). Its number stays for the
+    /// descriptors that can still reach it, but a later [`InodeSighting::Name`]
+    /// of `raw_inode` is another file. Consumes no counter value: whether a
+    /// removal reaches here follows host state (its `st_nlink`), and must not
+    /// shift other files' numbers.
+    fn retire(&mut self, raw_inode: RawInode) {
+        if let Some(dino) = self.inodes.remove(&raw_inode) {
+            self.retired.insert(raw_inode, dino);
+        }
+    }
+
+    /// `raw_inode` names a file that has a name, or that was just created
+    /// (an `open` that found it linked, or `O_TMPFILE`), so a retired mapping
+    /// of it described a file the host has freed: discard it. Consumes no
+    /// counter value.
+    fn forget_retired(&mut self, raw_inode: RawInode) {
+        if let Some(dino) = self.retired.remove(&raw_inode) {
+            self.detinodes_info.remove(&dino);
+            self.reused += 1;
         }
     }
 }
@@ -748,6 +816,30 @@ impl GlobalState {
             }
         })
         .await
+    }
+
+    /// The deterministic numbers of the files whose last name the run removed
+    /// while they were numbered and that no later name showed to be reused
+    /// (see `InodePool::retire`), in increasing order. Diagnostic, for tests
+    /// of the removal paths (<https://github.com/rrnewton/hermit/issues/3840>).
+    pub fn retired_inodes(&self) -> Vec<DetInode> {
+        let mut retired: Vec<DetInode> = self
+            .inodes
+            .lock()
+            .unwrap()
+            .retired
+            .values()
+            .copied()
+            .collect();
+        retired.sort();
+        retired
+    }
+
+    /// How many retired inode numbers a later name or `open` showed the host
+    /// had given to another file. Diagnostic, for tests that make a host reuse
+    /// an inode (<https://github.com/rrnewton/hermit/issues/3840>).
+    pub fn reused_inode_count(&self) -> u64 {
+        self.inodes.lock().unwrap().reused
     }
 
     /// Return the producer-observed mount identity order after a run.
@@ -2024,9 +2116,10 @@ impl GlobalTool for GlobalState {
             GlobalRequest::RobustListWakes(wakes) => {
                 R::RobustListWakes(self.recv_robust_list_wakes(wakes))
             }
-            GlobalRequest::DeterminizeInode(ino, observed) => {
-                R::DeterminizeInode(self.recv_determinize_inode(from, ino, observed).await)
-            }
+            GlobalRequest::DeterminizeInode(ino, observed, sighting) => R::DeterminizeInode(
+                self.recv_determinize_inode(from, ino, observed, sighting)
+                    .await,
+            ),
             GlobalRequest::DeterminizeMappingInodes(inodes) => R::DeterminizeMappingInodes(
                 self.recv_determinize_mapping_inodes(from, inodes).await,
             ),
@@ -2047,8 +2140,11 @@ impl GlobalTool for GlobalState {
                         .await,
                 )
             }
-            GlobalRequest::UnlinkInode(d_ino) => {
-                R::UnlinkInode(self.recv_unlink_inode(from, d_ino).await)
+            GlobalRequest::RetireInode(ino) => {
+                R::RetireInode(self.recv_retire_inode(from, ino).await)
+            }
+            GlobalRequest::ForgetRetiredInode(ino) => {
+                R::ForgetRetiredInode(self.recv_forget_retired_inode(from, ino).await)
             }
             GlobalRequest::TouchFile(ino) => R::TouchFile(self.recv_touch_file(from, ino).await),
             GlobalRequest::SetFileMtime(ino, mtime) => {
@@ -3045,13 +3141,18 @@ impl GlobalState {
         from: Tid,
         ino: RawInode,
         observed: ObservedMtime,
+        sighting: InodeSighting,
     ) -> (DetInode, LogicalTime) {
         let _sched = self.lock_rpc_scheduler(false).await;
         // Here we establish a policy that when we first see a file its mtime is
         // the epoch, unless its host mtime is one of the canonical values in
         // `CANONICAL_FILE_MTIME_SECONDS`, which it keeps.
         let epoch = self.epoch_logical_time();
-        let (dino, ns) = self.inodes.lock().unwrap().add_inode(ino, observed, epoch);
+        let (dino, ns) = self
+            .inodes
+            .lock()
+            .unwrap()
+            .add_sighted_inode(ino, observed, epoch, sighting);
         trace!(
             "[detcore, dtid {}] resolved (raw) inode {:?} to {:?}, mtime {}",
             from, ino, dino, ns
@@ -3128,10 +3229,19 @@ impl GlobalState {
         virtual_mount_ids
     }
 
-    async fn recv_unlink_inode(&self, from: Tid, d_ino: DetInode) {
+    async fn recv_retire_inode(&self, from: Tid, ino: RawInode) {
         let _sched = self.lock_rpc_scheduler(false).await;
-        trace!("[detcore, dtid {}] unlink (det) inode {:?}", from, d_ino);
-        self.inodes.lock().unwrap().remove_inode(d_ino);
+        trace!("[detcore, dtid {}] retire (raw) inode {:?}", from, ino);
+        self.inodes.lock().unwrap().retire(ino);
+    }
+
+    async fn recv_forget_retired_inode(&self, from: Tid, ino: RawInode) {
+        let _sched = self.lock_rpc_scheduler(false).await;
+        trace!(
+            "[detcore, dtid {}] forget retired (raw) inode {:?}",
+            from, ino
+        );
+        self.inodes.lock().unwrap().forget_retired(ino);
     }
 
     async fn recv_touch_file(&self, from: Tid, ino: RawInode) {
@@ -3529,8 +3639,9 @@ pub enum GlobalRequest {
     FutexAction(DetTid, FutexAction, FutexID, i32, u32),
 
     /// Translate nondeterministic to deterministic inode, and report what the
-    /// caller observed of the host mtime (see `ObservedMtime`).
-    DeterminizeInode(RawInode, ObservedMtime),
+    /// caller observed of the host mtime (see `ObservedMtime`) and how it
+    /// reached the file (see `InodeSighting`).
+    DeterminizeInode(RawInode, ObservedMtime, InodeSighting),
 
     /// Translate the inode of every file-backed line of one `/proc/*/maps`
     /// read, in line order, repeats included: one numbering request per line.
@@ -3553,8 +3664,13 @@ pub enum GlobalRequest {
     /// numbering unseen entries in that observation order.
     ResolveMountinfoIds(Vec<u64>, Vec<u64>),
 
-    /// unlink an inode
-    UnlinkInode(DetInode),
+    /// The file behind this host inode lost its last name (see
+    /// `InodePool::retire`).
+    RetireInode(RawInode),
+
+    /// An `open` found this host inode linked or freshly created (see
+    /// `InodePool::forget_retired`).
+    ForgetRetiredInode(RawInode),
 
     /// Bump mtime
     TouchFile(RawInode),
@@ -3706,7 +3822,8 @@ pub enum GlobalResponse {
     DeterminizeDevice(u64),
     DeterminizeMountId(Option<u64>),
     ResolveMountinfoIds(Option<Vec<u64>>),
-    UnlinkInode(()),
+    RetireInode(()),
+    ForgetRetiredInode(()),
     TouchFile(()),
     SetFileMtime(()),
     GlobalTimeLowerBound(LogicalTime),
@@ -4391,7 +4508,27 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    determinize_inode_observing_mtime(guest, inode, ObservedMtime::Unobserved).await
+    determinize_inode_observing_mtime(
+        guest,
+        inode,
+        ObservedMtime::Unobserved,
+        InodeSighting::Descriptor,
+    )
+    .await
+}
+
+/// [`determinize_inode`] for a directory entry, which names a linked file
+/// (see [`InodeSighting::Name`]).
+pub async fn determinize_named_inode<G, T>(
+    guest: &mut G,
+    inode: RawInode,
+) -> (DetInode, LogicalTime)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    determinize_inode_observing_mtime(guest, inode, ObservedMtime::Unobserved, InodeSighting::Name)
+        .await
 }
 
 /// Like [`determinize_inode`], for a caller that observed the file's host
@@ -4402,12 +4539,17 @@ pub async fn determinize_inode_observing_mtime<G, T>(
     guest: &mut G,
     inode: RawInode,
     observed: ObservedMtime,
+    sighting: InodeSighting,
 ) -> (DetInode, LogicalTime)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    let resp = send_and_update_time(guest, GlobalRequest::DeterminizeInode(inode, observed)).await;
+    let resp = send_and_update_time(
+        guest,
+        GlobalRequest::DeterminizeInode(inode, observed, sighting),
+    )
+    .await;
     match resp.1 {
         GlobalResponse::DeterminizeInode(x) => x,
         _ => unreachable!(),
@@ -4492,16 +4634,29 @@ where
     }
 }
 
-/// unlink a detfd, i.e. When `unlink` a file
-#[allow(unused)]
-pub async fn unlink_inode<G, T>(guest: &mut G, d_ino: DetInode)
+/// The file behind `inode` lost its last name (see `InodePool::retire`).
+pub async fn retire_inode<G, T>(guest: &mut G, inode: RawInode)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    let resp = send_and_update_time(guest, GlobalRequest::UnlinkInode(d_ino)).await;
+    let resp = send_and_update_time(guest, GlobalRequest::RetireInode(inode)).await;
     match resp.1 {
-        GlobalResponse::UnlinkInode(x) => x,
+        GlobalResponse::RetireInode(x) => x,
+        _ => unreachable!(),
+    }
+}
+
+/// An `open` found `inode` linked or freshly created (see
+/// `InodePool::forget_retired`).
+pub async fn forget_retired_inode<G, T>(guest: &mut G, inode: RawInode)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let resp = send_and_update_time(guest, GlobalRequest::ForgetRetiredInode(inode)).await;
+    match resp.1 {
+        GlobalResponse::ForgetRetiredInode(x) => x,
         _ => unreachable!(),
     }
 }
@@ -8195,6 +8350,115 @@ mod tests {
         // Re-determinizing the same host inode is stable, not a fresh mint.
         let (a_again, _) = pool.add_inode(host_a, seen, t);
         assert_eq!(a, a_again, "mapping must be stable per host inode");
+    }
+
+    /// <https://github.com/rrnewton/hermit/issues/3840>: a filesystem such as
+    /// ext4 or XFS gives a freed inode to a new file, and whether it does
+    /// differs between runs. The same guest steps (number a file, remove its
+    /// last name, create another file, look it up) must number the new file,
+    /// and every file after it, the same way whether or not the host reused
+    /// the inode, however the new file is first reached.
+    #[test]
+    fn a_host_reusing_a_freed_inode_does_not_renumber_the_new_file() {
+        use super::InodeSighting::Descriptor;
+        use super::InodeSighting::Name;
+        use crate::types::DetInode;
+        use crate::types::RawInode;
+
+        let t = LogicalTime::from_nanos(0);
+        let seen = super::ObservedMtime::Unobserved;
+        const EXT4: u64 = 2049;
+        let old = RawInode::new(EXT4, 12);
+        let fresh = RawInode::new(EXT4, 13);
+        // `opened` says whether the new file is created by an `open`, which
+        // discards a retired mapping, before its first numbering request.
+        let steps = |new: RawInode, opened: bool, first: super::InodeSighting| {
+            let mut pool = super::InodePool::new();
+            let old_number = pool.add_sighted_inode(old, seen, t, Name).0;
+            pool.retire(old);
+            if opened {
+                pool.forget_retired(new);
+            }
+            let new_number = pool.add_sighted_inode(new, seen, t, first).0;
+            let listed = pool.add_sighted_inode(new, seen, t, Name).0;
+            let later: Vec<DetInode> = [RawInode::new(EXT4, 40), RawInode::new(EXT4, 41)]
+                .into_iter()
+                .map(|raw| pool.add_sighted_inode(raw, seen, t, Name).0)
+                .collect();
+            (old_number, new_number, listed, later)
+        };
+        for (opened, first) in [(true, Descriptor), (true, Name), (false, Name)] {
+            let reused = steps(old, opened, first);
+            let not_reused = steps(fresh, opened, first);
+            assert_eq!(
+                reused, not_reused,
+                "opened={opened} first={first:?}: reuse changed a number"
+            );
+            let (old_number, new_number, listed, _) = reused;
+            assert_ne!(old_number, new_number, "the new file took the old number");
+            assert_eq!(new_number, listed, "the new file's number is stable");
+        }
+    }
+
+    /// An unlinked file reached through a descriptor (open, unlink, fstat)
+    /// keeps its number and its mtime updates, as on Linux, until a name shows
+    /// that the host gave its inode to another file. A path that finds no
+    /// link (`/proc/self/fd/N`) is a `Descriptor` sighting.
+    #[test]
+    fn an_unlinked_file_keeps_its_number_through_its_descriptors() {
+        use super::InodeSighting::Descriptor;
+        use super::InodeSighting::Name;
+        use crate::types::RawInode;
+
+        let t = LogicalTime::from_nanos(0);
+        let seen = super::ObservedMtime::Unobserved;
+        let raw = RawInode::new(2049, 12);
+        let mut pool = super::InodePool::new();
+        let (number, _) = pool.add_sighted_inode(raw, seen, t, Name);
+        pool.retire(raw);
+        assert_eq!(pool.add_sighted_inode(raw, seen, t, Descriptor).0, number);
+        let written = LogicalTime::from_nanos(7_000);
+        pool.set_mtime(raw, written);
+        assert_eq!(
+            pool.add_sighted_inode(raw, seen, t, Descriptor),
+            (number, written),
+            "a write through the descriptor reached the retired file"
+        );
+        let (reused, _) = pool.add_sighted_inode(raw, seen, t, Name);
+        assert_ne!(reused, number, "a name of a retired inode is another file");
+        assert_eq!(
+            pool.add_sighted_inode(raw, seen, t, Descriptor).0,
+            reused,
+            "descriptors now reach the new file"
+        );
+        // Without a retire, a name finds the live mapping, as before.
+        let other = RawInode::new(2049, 99);
+        let (live, _) = pool.add_sighted_inode(other, seen, t, Descriptor);
+        assert_eq!(pool.add_sighted_inode(other, seen, t, Name).0, live);
+    }
+
+    /// Retiring and discarding follow host state (a link count, whether the
+    /// host reused an inode), so they must not consume counter values: files
+    /// numbered after them get the same numbers either way.
+    #[test]
+    fn retiring_and_forgetting_consume_no_counter_values() {
+        use crate::types::RawInode;
+
+        let t = LogicalTime::from_nanos(0);
+        let seen = super::ObservedMtime::Unobserved;
+        let raw = RawInode::new(2049, 12);
+        let numbers = |retire: bool| {
+            let mut pool = super::InodePool::new();
+            pool.add_inode(raw, seen, t);
+            if retire {
+                pool.retire(raw);
+                pool.forget_retired(raw);
+                pool.forget_retired(RawInode::new(2049, 77));
+            }
+            [RawInode::new(2049, 20), RawInode::new(2049, 21)]
+                .map(|raw| pool.add_inode(raw, seen, t).0)
+        };
+        assert_eq!(numbers(true), numbers(false));
     }
 
     /// Whether a host inode is new to the pool depends on host state the guest

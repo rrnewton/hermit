@@ -748,6 +748,30 @@ fn resolved_at_fdcwd_path(pid: i32, path: &Path) -> Option<PathBuf> {
     Some(Path::new("/").join(guest_cwd).join(path))
 }
 
+/// Whether removing a name of the file `stat` describes leaves it with no
+/// name: a directory has only one, and a non-directory with one link loses
+/// its last. A host may then give its inode to another file
+/// (<https://github.com/rrnewton/hermit/issues/3840>).
+fn retires_on_removal(stat: &libc::stat) -> bool {
+    stat.st_mode & libc::S_IFMT == libc::S_IFDIR || stat.st_nlink == 1
+}
+
+/// Whether a `*at` call with `path` and `flags` looks the file up by a path,
+/// rather than operating on `dirfd` itself (`AT_EMPTY_PATH` with an empty
+/// path). A path that cannot be read counts as a path.
+fn names_a_path<M: MemoryAccess>(
+    memory: &M,
+    path: Option<syscalls::PathPtr<'_>>,
+    flags: AtFlags,
+) -> bool {
+    if !flags.contains(AtFlags::AT_EMPTY_PATH) {
+        return true;
+    }
+    !path
+        .and_then(|path| path.read(memory).ok())
+        .is_some_and(|path: PathBuf| path.as_os_str().is_empty())
+}
+
 /// The path to report for one operand of a successful namespace change (see
 /// `Detcore::record_host_namespace_change`): the operand made absolute, or
 /// `/` when it could not be read or made absolute. A tracer that may not read
@@ -1276,14 +1300,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             "Injecting additional fstat to retrieve file metadata on fd {}.",
             raw_fd
         );
-        let copied = match self.inject_fstat_on_stack(guest, raw_fd).await {
+        let fstat = move |statptr: StatPtr<'_>| {
+            Syscall::Fstat(
+                syscalls::Fstat::new()
+                    .with_fd(raw_fd)
+                    .with_stat(Some(statptr)),
+            )
+        };
+        let copied = match Self::inject_stat_on_stack(guest, fstat).await {
             Err(Errno::EFAULT) => {
                 info!(
                     "Guest stack scratch cannot hold the fstat buffer for fd {}; \
                      using a transient page instead.",
                     raw_fd
                 );
-                self.inject_fstat_in_transient_page(guest, raw_fd).await?
+                Self::inject_stat_in_transient_page(guest, fstat).await?
             }
             result => result?,
         };
@@ -1291,12 +1322,35 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(copied)
     }
 
-    /// The fast path of [`Self::inject_fstat`]: the buffer lives in the guest
-    /// stack scratch. Returns `EFAULT` when that scratch is not writable.
-    async fn inject_fstat_on_stack<G: Guest<Self>>(
-        &self,
+    /// `fstatat(dirfd, path, AT_SYMLINK_NOFOLLOW)` for a path the guest named
+    /// in its own call, staged like [`Self::inject_fstat`]: in the guest stack
+    /// scratch, else in a transient private page.
+    async fn inject_lstatat<G: Guest<Self>>(
         guest: &mut G,
-        raw_fd: RawFd,
+        dirfd: RawFd,
+        path: syscalls::PathPtr<'_>,
+    ) -> Result<libc::stat, Errno> {
+        let lstatat = move |statptr: StatPtr<'_>| {
+            Syscall::Newfstatat(
+                syscalls::Newfstatat::new()
+                    .with_dirfd(dirfd)
+                    .with_path(Some(path))
+                    .with_stat(Some(statptr))
+                    .with_flags(AtFlags::AT_SYMLINK_NOFOLLOW),
+            )
+        };
+        match Self::inject_stat_on_stack(guest, lstatat).await {
+            Err(Errno::EFAULT) => Self::inject_stat_in_transient_page(guest, lstatat).await,
+            result => result,
+        }
+    }
+
+    /// The fast path of [`Self::inject_fstat`] and [`Self::inject_lstatat`]:
+    /// the buffer lives in the guest stack scratch. Returns `EFAULT` when that
+    /// scratch is not writable.
+    async fn inject_stat_on_stack<G: Guest<Self>>(
+        guest: &mut G,
+        stat_call: impl Fn(StatPtr<'_>) -> Syscall,
     ) -> Result<libc::stat, Errno> {
         let mut stack = guest.stack().await;
         let statptr: StatPtr = StatPtr(stack.reserve());
@@ -1305,7 +1359,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // drops, so dropping it before the injected fstat would let the kernel
         // write into freed memory.
         let _stack_guard = stack.commit()?;
-        let copied = Self::inject_fstat_into(guest, raw_fd, statptr).await?;
+        let copied = Self::inject_stat_into(guest, stat_call(statptr), statptr).await?;
         // clear stack memory used for fstat allocation
         guest
             .memory()
@@ -1313,14 +1367,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(copied)
     }
 
-    /// The fallback of [`Self::inject_fstat`]: the buffer lives in a private
+    /// The fallback of [`Self::inject_fstat`] and [`Self::inject_lstatat`]:
+    /// the buffer lives in a private
     /// anonymous page mapped for this call only. The guest never learns its
     /// address, and it is unmapped before the guest resumes, so the guest's
     /// address space is the same as before the call.
-    async fn inject_fstat_in_transient_page<G: Guest<Self>>(
-        &self,
+    async fn inject_stat_in_transient_page<G: Guest<Self>>(
         guest: &mut G,
-        raw_fd: RawFd,
+        stat_call: impl Fn(StatPtr<'_>) -> Syscall,
     ) -> Result<libc::stat, Errno> {
         let len = std::mem::size_of::<libc::stat>();
         let mapped = guest
@@ -1338,7 +1392,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .ok()
             .and_then(AddrMut::<libc::stat>::from_raw)
             .unwrap_or_else(|| panic!("transient fstat page mmap returned {mapped}"));
-        let copied = Self::inject_fstat_into(guest, raw_fd, StatPtr(page)).await;
+        let copied = Self::inject_stat_into(guest, stat_call(StatPtr(page)), StatPtr(page)).await;
         if let Err(errno) = guest
             .inject_with_retry(Syscall::Munmap(
                 syscalls::Munmap::new()
@@ -1351,28 +1405,23 @@ impl<T: RecordOrReplay> Detcore<T> {
             // never reached the guest. The metadata is still valid, so a
             // leftover page is no reason to fail the guest's syscall.
             warn!(
-                "[detcore] could not unmap the transient fstat page for fd {}: {}",
-                raw_fd, errno
+                "[detcore] could not unmap the transient stat page: {}",
+                errno
             );
         }
         copied
     }
 
-    /// Inject `fstat(raw_fd, statptr)` and read back what the kernel wrote.
-    async fn inject_fstat_into<G: Guest<Self>>(
+    /// Inject `stat_call`, which writes a `struct stat` at `statptr`, and read
+    /// back what the kernel wrote.
+    async fn inject_stat_into<G: Guest<Self>>(
         guest: &mut G,
-        raw_fd: RawFd,
+        stat_call: Syscall,
         statptr: StatPtr<'_>,
     ) -> Result<libc::stat, Errno> {
         // NOTE: Must retry the injection here. This could get interrupted and
         // we don't want to rerun the entire syscall handler twice.
-        guest
-            .inject_with_retry(Syscall::Fstat(
-                syscalls::Fstat::new()
-                    .with_fd(raw_fd)
-                    .with_stat(Some(statptr)),
-            ))
-            .await?;
+        guest.inject_with_retry(stat_call).await?;
         statptr.read(&guest.memory())
     }
 
@@ -1525,6 +1574,78 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// The host inodes whose last name `call` would remove: the name an
+    /// `unlink`, `unlinkat` or `rmdir` removes, or the target a `rename`,
+    /// `renameat` or `renameat2` replaces (not with `RENAME_EXCHANGE`), when
+    /// it is a directory or a file with one link (see [`retires_on_removal`]).
+    /// Each name is stat'ed with an injected `fstatat(AT_SYMLINK_NOFOLLOW)`
+    /// before the call runs; a name that does not resolve removes nothing.
+    /// Pass the result to [`Self::retire_removed_inodes`] if the call
+    /// succeeds. Only with virtualized metadata, the only mode that numbers
+    /// inodes.
+    pub(crate) async fn last_names_removed_by<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &Syscall,
+    ) -> Vec<RawInode> {
+        if !guest.config().virtualize_metadata {
+            return Vec::new();
+        }
+        let at = libc::AT_FDCWD;
+        // The name removed, and for a rename the source, which replaces
+        // nothing when it is the target's own file (`rename(a, a)`, or two
+        // links of one file).
+        let (removed, source) = match call {
+            #[cfg(not(target_arch = "aarch64"))]
+            Syscall::Unlink(c) => ((at, c.path()), None),
+            Syscall::Unlinkat(c) => ((c.dirfd(), c.path()), None),
+            #[cfg(not(target_arch = "aarch64"))]
+            Syscall::Rmdir(c) => ((at, c.path()), None),
+            #[cfg(not(target_arch = "aarch64"))]
+            Syscall::Rename(c) => ((at, c.newpath()), Some((at, c.oldpath()))),
+            Syscall::Renameat(c) => (
+                (c.newdirfd(), c.newpath()),
+                Some((c.olddirfd(), c.oldpath())),
+            ),
+            Syscall::Renameat2(c) if c.flags() & libc::RENAME_EXCHANGE == 0 => (
+                (c.newdirfd(), c.newpath()),
+                Some((c.olddirfd(), c.oldpath())),
+            ),
+            _ => return Vec::new(),
+        };
+        let lstat = async |guest: &mut G, (dirfd, path): (i32, Option<syscalls::PathPtr>)| {
+            Self::inject_lstatat(guest, dirfd, path?).await.ok()
+        };
+        let Some(stat) = lstat(guest, removed).await else {
+            return Vec::new();
+        };
+        let inode = RawInode::new(stat.st_dev, stat.st_ino);
+        if let Some(source) = source
+            && lstat(guest, source)
+                .await
+                .is_some_and(|source| RawInode::new(source.st_dev, source.st_ino) == inode)
+        {
+            return Vec::new();
+        }
+        if retires_on_removal(&stat) {
+            vec![inode]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Retire the mappings of `inodes`, whose last names a successful call
+    /// removed (see [`Self::last_names_removed_by`] and `InodePool::retire`).
+    pub(crate) async fn retire_removed_inodes<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        inodes: Vec<RawInode>,
+    ) {
+        for inode in inodes {
+            retire_inode(guest, inode).await;
+        }
+    }
+
     /// For `hermit run --verify` on a backend whose guest holds code that
     /// makes untraced syscalls (`Config::untraced_code_range`): report `/`
     /// when `call` may change the memory holding it (see
@@ -1635,6 +1756,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                         detcore_model::host_input::HostFileIdentity::from_stat(stat),
                     )
                     .await;
+                }
+                // An open that finds its file linked, or creates it
+                // (`O_TMPFILE`), reaches a file that has a name or never had
+                // one, so a retired mapping of its inode described a file the
+                // host has freed (https://github.com/rrnewton/hermit/issues/3840).
+                // Reopening an unlinked file through `/proc/self/fd/N` finds no
+                // link and keeps it.
+                if let Some(stat) = &host_stat
+                    && (stat.st_nlink > 0 || call.flags().contains(OFlag::O_TMPFILE))
+                {
+                    forget_retired_inode(guest, RawInode::new(stat.st_dev, stat.st_ino)).await;
                 }
                 // A descriptor that writes process memory can rewrite the
                 // untraced code (see `record_untraced_code_change`). Reported
@@ -3873,11 +4005,16 @@ impl<T: RecordOrReplay> Detcore<T> {
     //   - atime, ctime and btime always report the epoch: the kernel sets ctime
     //     and btime itself, so even for a Nix store file they are real
     //     timestamps, and Hermit keeps no per-file atime.
+    ///
+    /// `by_path` says the caller reached the file by a path rather than a
+    /// descriptor; with a nonzero link count that is a name sighting (see
+    /// `InodeSighting`).
     async fn determinize_stat<G, S>(
         &self,
         guest: &mut G,
         stat: S,
         inode_override: Option<DetInode>,
+        by_path: bool,
     ) -> Result<DetStat, Error>
     where
         G: Guest<Self>,
@@ -3905,7 +4042,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                 } else {
                     ObservedMtime::Unobserved
                 };
-                determinize_inode_observing_mtime(guest, stat.raw_inode(), observed).await
+                // A path to a file with no link left, such as
+                // `/proc/self/fd/N` of an unlinked file, still reaches the
+                // file a retired mapping describes.
+                let sighting =
+                    if by_path && stat.mask.contains(StatxMask::STATX_NLINK) && stat.nlink > 0 {
+                        InodeSighting::Name
+                    } else {
+                        InodeSighting::Descriptor
+                    };
+                determinize_inode_observing_mtime(guest, stat.raw_inode(), observed, sighting).await
             }
         };
         stat.inode = d_ino.as_raw(); // Reveal only the deterministic inode.
@@ -3946,6 +4092,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             // filesystem (squashfs_ll).
             guest.inject(Syscall::from(call)).await?;
             let statptr = call.stat().ok_or(Errno::EFAULT)?;
+            let by_path = match call {
+                StatFamily::Fstat(_) => false,
+                StatFamily::Fstatat(call) => {
+                    names_a_path(&guest.memory(), call.path(), call.flags())
+                }
+                _ => true,
+            };
             let described_fd = match call {
                 StatFamily::Fstat(call) => Some(call.fd()),
                 StatFamily::Fstatat(call) => {
@@ -3957,7 +4110,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             let inode_override = described_fd.and_then(|fd| stdio_inode_override(guest, fd));
             let mut memory = guest.memory();
             let stat = memory.read_value(statptr.0)?;
-            let stat = self.determinize_stat(guest, stat, inode_override).await?;
+            let stat = self
+                .determinize_stat(guest, stat, inode_override, by_path)
+                .await?;
             memory.write_value(statptr.0, &stat.into())?;
             Ok(0)
         } else {
@@ -3977,12 +4132,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             // may cause tracer to hang under certain fuse filesystem (squashfs_ll).
             guest.inject(call).await?;
             let statptr = call.statx().ok_or(Errno::EFAULT)?;
+            let by_path = names_a_path(&guest.memory(), call.path(), call.flags());
             let inode_override =
                 empty_path_fd(&guest.memory(), call.dirfd(), call.path(), call.flags())
                     .and_then(|fd| stdio_inode_override(guest, fd));
             let mut memory = guest.memory();
             let stat = memory.read_value(statptr.0)?;
-            let stat = self.determinize_stat(guest, stat, inode_override).await?;
+            let stat = self
+                .determinize_stat(guest, stat, inode_override, by_path)
+                .await?;
             memory.write_value(statptr.0, &stat.into())?;
             Ok(0)
         } else {
@@ -5924,7 +6082,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let mut names = Vec::with_capacity(batch.len());
                 for (index, entry) in batch.iter().enumerate() {
                     let (d_ino, _) =
-                        determinize_inode(guest, RawInode::new(device, entry.ino)).await;
+                        determinize_named_inode(guest, RawInode::new(device, entry.ino)).await;
                     let d_off = i64::try_from(start + index as u64 + 1).unwrap_or(i64::MAX);
                     call.format
                         .encode(entry, d_ino.as_raw(), d_off, &mut records);
@@ -6016,7 +6174,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let device = self.directory_device(guest, call.fd).await?;
         let mut records = Vec::with_capacity(len);
         for entry in &entries {
-            let (d_ino, _) = determinize_inode(guest, RawInode::new(device, entry.ino)).await;
+            let (d_ino, _) = determinize_named_inode(guest, RawInode::new(device, entry.ino)).await;
             call.format
                 .encode(entry, d_ino.as_raw(), entry.off, &mut records);
         }

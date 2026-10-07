@@ -2268,6 +2268,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             self.record_untraced_code_change(guest, &call).await;
         }
 
+        // The inodes whose last name this call removes, stat'ed before it runs
+        // and retired once it succeeds, so that a host reusing one cannot hand
+        // a new file the old file's number
+        // (https://github.com/rrnewton/hermit/issues/3840).
+        let removed_inodes = self.last_names_removed_by(guest, &call).await;
+
         // Only an emulated RNG readv supplies authoritative imported geometry.
         // A generic pre-dispatch snapshot would become stale across pipe waits.
         let mut rng_readv_output = None;
@@ -3126,6 +3132,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // backend failure owner, not to this observer fence.
         if res.as_ref().is_err_and(crate::random::is_copy_failure) {
             return res;
+        }
+
+        if res.is_ok() && !removed_inodes.is_empty() {
+            self.retire_removed_inodes(guest, removed_inodes).await;
         }
 
         // With asynchronous exit completion, a descriptor that would make this

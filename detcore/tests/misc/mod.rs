@@ -8,6 +8,7 @@
 
 //! misc syscall tests
 
+mod inode_reuse;
 mod notification_fds;
 mod procfs_caller_buffer;
 mod readdir_order;
