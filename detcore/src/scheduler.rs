@@ -3758,10 +3758,19 @@ impl Scheduler {
                 }
                 Some(None) => match hold.entry {
                     Some(RtSigsuspendEntry::Asleep { blocked }) => {
-                        if let Some(warning) =
-                            rt_sigsuspend_mask_warning(thread, hold.granted, blocked)
+                        if let Some(granted) = hold.granted
+                            && let Some(warning) =
+                                rt_sigsuspend_mask_warning(thread, Some(granted), blocked)
                         {
                             tracing::warn!("{}", warning);
+                            // `--verify` compares INFO records only
+                            // (`logdiff::is_info`), so the difference is also
+                            // recorded at INFO with the same fields: the
+                            // thread and both masks, all read from the guest.
+                            info!(
+                                "[step1b] dtid {} rt_sigsuspend mask {:#x} differs from the {:#x} recorded at its grant",
+                                thread, blocked, granted
+                            );
                         }
                         self.blocked
                             .out_of_scheduler_masks
@@ -11372,6 +11381,64 @@ mod test {
                 "[step1b] dtid 101 sleeps in rt_sigsuspend under mask 0x200, not the 0x0 \
                  recorded at its grant; using the kernel's"
             )
+        );
+    }
+
+    /// The mismatch above is also an INFO record, emitted where the hold ends
+    /// and carrying the same deterministic fields: the thread and both masks.
+    /// `--verify` compares INFO records only (`logdiff::is_info`), so the WARN
+    /// alone never reached the compared log. A mask that agrees with the grant
+    /// adds no record. Round 9 emitted the WARN only
+    /// (https://github.com/rrnewton/hermit/pull/3224).
+    #[test]
+    fn a_sigsuspend_mask_that_differs_from_its_grant_is_recorded_at_info() {
+        if !super::exec_teardown_tests::in_isolated_log_test(
+            module_path!(),
+            "a_sigsuspend_mask_that_differs_from_its_grant_is_recorded_at_info",
+        ) {
+            return;
+        }
+        let log = SchedulerInfoLog::default();
+        let _subscriber = tracing::subscriber::set_default(log.clone());
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        let mut records = Vec::new();
+        for installed in [0, usr1] {
+            let (mut scheduler, _parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+            let op = ExternalOpId::new(creator, 1);
+            commit_out_of_scheduler_call(
+                &mut scheduler,
+                creator,
+                ResourceID::BlockingRtSigsuspend(op),
+                Some(0),
+            );
+            assert!(scheduler.step1b_hold_for_rt_sigsuspend_entry().is_err());
+            scheduler.report_rt_sigsuspend_entry(
+                creator,
+                op,
+                RtSigsuspendEntry::Asleep { blocked: installed },
+            );
+            assert!(scheduler.step1b_hold_for_rt_sigsuspend_entry().is_ok());
+            assert_eq!(
+                scheduler.blocked.out_of_scheduler_masks.get(&creator),
+                Some(&Some(installed))
+            );
+            records.push((
+                creator,
+                log.0
+                    .lock()
+                    .unwrap()
+                    .drain(..)
+                    .filter(|record| record.contains("rt_sigsuspend mask"))
+                    .collect::<Vec<_>>(),
+            ));
+        }
+        assert_eq!(records[0].1, Vec::<String>::new());
+        assert_eq!(
+            records[1].1,
+            vec![format!(
+                "[step1b] dtid {} rt_sigsuspend mask 0x200 differs from the 0x0 recorded at its grant",
+                records[1].0
+            )]
         );
     }
 

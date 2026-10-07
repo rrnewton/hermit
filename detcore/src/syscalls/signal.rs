@@ -465,12 +465,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             {
                 return Ok(KernelSigset::from_ne_bytes(mask));
             }
-            // The probe makes the real call an injection again, so say so in
-            // the compared log, as `blocked_pending_signals` does. Only a
-            // pointer the direct read refuses gets here: an invalid size was
-            // refused before the read.
+            // The probe makes the real call an injection again, so say so, as
+            // `blocked_pending_signals` does: a WARN for whoever reads the
+            // log, and an INFO record with the same deterministic field, the
+            // thread, because `--verify` compares INFO records only
+            // (`logdiff::is_info`). Only a pointer the direct read refuses
+            // gets here: an invalid size was refused before the read.
             tracing::warn!(
                 "[dtid {}] could not read the rt_sigsuspend mask directly; checking it with an injected rt_sigprocmask",
+                guest.thread_state().dettid
+            );
+            tracing::info!(
+                "[dtid {}] rt_sigsuspend mask checked with an injected rt_sigprocmask after the direct read was refused",
                 guest.thread_state().dettid
             );
         }
@@ -495,17 +501,26 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// pending syscall lets the kernel see the signal and return
     /// `ERESTARTNOHAND` either way. A stopped tracee's status is always
     /// readable; if it is not, this falls back to asking the kernel and says
-    /// so in the compared log.
+    /// so, in a WARN and in an INFO record that the compared log keeps.
     async fn blocked_pending_signals<G: Guest<Self>>(&self, guest: &mut G) -> Result<u64, Error> {
         if self.cfg.backend_supports_blocked_wait_signal_interruption {
             match read_kernel_signal_state(guest.pid(), guest.tid()) {
                 Ok(state) => return Ok(state.pending & state.blocked),
-                Err(errno) => tracing::warn!(
-                    "[dtid {}] could not read the pending signals of thread {} ({}); asking the kernel",
-                    guest.thread_state().dettid,
-                    guest.tid(),
-                    errno
-                ),
+                Err(errno) => {
+                    tracing::warn!(
+                        "[dtid {}] could not read the pending signals of thread {} ({}); asking the kernel",
+                        guest.thread_state().dettid,
+                        guest.tid(),
+                        errno
+                    );
+                    // `--verify` compares INFO records only. This one carries
+                    // the deterministic field alone: not the host thread id
+                    // or the errno of the failed read.
+                    tracing::info!(
+                        "[dtid {}] pending signals asked of the kernel with an injected rt_sigpending after the thread status was not readable",
+                        guest.thread_state().dettid
+                    );
+                }
             }
         }
         let mut stack = guest.stack().await;

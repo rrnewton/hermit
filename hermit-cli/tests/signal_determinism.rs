@@ -289,37 +289,105 @@ fn sigsuspend_invalid_arguments_preserve_linux_error_order() {
 
 /// A mask the tool cannot read directly is checked with an injected probe,
 /// which makes the real call an injection again, so the fallback must say so
-/// in the log that `--verify` compares. The invalid pointer in this scenario
-/// is the one input that always takes it.
+/// in the log that `--verify` compares. That comparison keeps INFO records
+/// only (`detcore::logdiff::is_info`), so the WARN is not enough: this runs
+/// strict verification, keeps run 1's log, renders it with the comparator's
+/// own `write_bitwise_info_v1_bytes`, and requires the fallback's INFO record
+/// exactly once among the compared records and the WARN exactly once in the
+/// log itself. The invalid pointer in this scenario is the one input that
+/// always takes the fallback. Round 9 counted the WARN on stderr only, which
+/// showed emission but not comparison
+/// (https://github.com/rrnewton/hermit/pull/3224).
 #[test]
-fn sigsuspend_mask_fallback_warns_in_the_compared_log() {
+fn sigsuspend_mask_fallback_is_recorded_in_the_compared_log() {
+    const WARNING: &str = "could not read the rt_sigsuspend mask directly; checking it with an injected rt_sigprocmask";
+    const RECORD: &str = "rt_sigsuspend mask checked with an injected rt_sigprocmask after the direct read was refused";
     let _guard = hermit_signal_lock();
+    let directory = tempfile::Builder::new()
+        .prefix("sigsuspend-mask-fallback-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the verification directory");
+    let logs = directory.path().join("logs");
+    fs::create_dir_all(&logs).expect("failed to create the log directory");
+    let report_path = directory.path().join("verification.json");
     let mut command = Command::new(hermit_test::hermit_binary());
-    command.args([
-        "--log=warn",
-        "run",
-        "--base-env=minimal",
-        "--no-virtualize-cpuid",
-        "--max-timeslice=disabled",
-        "--",
-    ]);
     command
+        .args([
+            "run",
+            "--base-env=minimal",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+        ])
+        .arg(&report_path)
+        .args(["--keep-logs", "--verify-log-dir"])
+        .arg(&logs)
+        .arg("--")
         .arg(signal_guest())
         .arg("sigsuspend-invalid-arguments");
-    let output = command_output(command, "sigsuspend mask fallback scenario");
+    let output = command_output(command, "sigsuspend mask fallback verification");
     assert_eq!(
         output.stdout,
         b"rt_sigsuspend invalid size=EINVAL invalid pointer=EFAULT\n"
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let warnings = stderr
-        .matches(
-            "could not read the rt_sigsuspend mask directly; checking it with an injected rt_sigprocmask",
-        )
-        .count();
+
+    let report = hermit::canonical_verdict::VerificationReport::from_current_json_slice(
+        &fs::read(&report_path).expect("failed to read the verification report"),
+    )
+    .expect("a complete current verification report");
+    report
+        .require_canonical_match()
+        .expect("a nonempty canonical INFO match");
+    report
+        .require_exact_output_match()
+        .expect("an exact status, stdout and stderr match");
+    assert_eq!(
+        report
+            .comparison
+            .as_ref()
+            .and_then(|policy| policy.display_name.as_deref()),
+        Some("BitwiseInfoV1")
+    );
+
+    // After a match `--keep-logs` keeps run 1's log only.
+    let golden: Vec<PathBuf> = fs::read_dir(&logs)
+        .expect("failed to list the kept logs")
+        .map(|entry| entry.expect("failed to read a kept log entry").path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("run1_log_"))
+        })
+        .collect();
+    assert_eq!(golden.len(), 1, "kept logs: {golden:?}");
+    let captured = fs::read(&golden[0]).expect("failed to read run 1's log");
+    let mut compared = Vec::new();
+    let records = detcore::logdiff::write_bitwise_info_v1_bytes(&captured, "run 1", &mut compared)
+        .expect("failed to render run 1's compared records");
+    let compared = String::from_utf8(compared).expect("compared records are UTF-8");
+    assert_eq!(
+        report
+            .compared_log_messages
+            .as_ref()
+            .map(|counts| counts.left),
+        Some(records as u64),
+        "the rendered records are the ones the report counted"
+    );
+    assert_eq!(compared.matches(RECORD).count(), 1, "compared:\n{compared}");
+    assert_eq!(
+        compared.matches(WARNING).count(),
+        0,
+        "a WARN is never a compared record:\n{compared}"
+    );
     // Only the invalid pointer reaches the read; the invalid size is refused
     // first.
-    assert_eq!(warnings, 1, "stderr:\n{stderr}");
+    let captured = String::from_utf8_lossy(&captured);
+    assert_eq!(
+        captured.matches(WARNING).count(),
+        1,
+        "run 1's log:\n{captured}"
+    );
 }
 
 /// On ptrace the tool reads the suspend mask and the blocked pending set
