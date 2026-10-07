@@ -27,6 +27,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
+use hermit::HERMIT_VERIFICATION_DIVERGENCE_EXIT;
 
 const DETERMINISM_RUNS: usize = 5;
 const DEADLOCK_RUNS: usize = 3;
@@ -643,7 +644,7 @@ fn verify_signal_report_cannot_hold_agreed_guest_stdout() {
     );
     assert_eq!(
         status.code(),
-        Some(1),
+        Some(HERMIT_VERIFICATION_DIVERGENCE_EXIT),
         "the report replaced the rejected runs' status\ndelivered:\n{delivered}"
     );
     let heading = ":: The run 1 guest was terminated by signal 10 (SIGUSR1).";
@@ -727,7 +728,7 @@ fn verify_keeps_the_rejected_status_when_stdout_is_at_its_size_limit() {
     );
     assert_eq!(
         status.code(),
-        Some(1),
+        Some(HERMIT_VERIFICATION_DIVERGENCE_EXIT),
         "hermit's own write replaced the rejected runs' status: {status:?}\nstderr:\n{stderr}"
     );
     assert!(
