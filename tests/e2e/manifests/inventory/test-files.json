@@ -1672,7 +1672,7 @@
       "disposition": "manifest-test",
       "path": "tests/c/sigsuspend_alarm_wake.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
-      "why": "tests/c/sigsuspend_alarm_wake.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and runs in blocking GitHub CI; it asserts that a scheduler-fired SIGALRM ends an rt_sigsuspend wait exactly once with EINTR and restores the blocked mask, so the scheduler must release the parked waiter and await its own report rather than fabricate one; a second phase requires an alarm that the arming thread's suspend mask blocks to reach the worker whose suspend mask admits it"
+      "why": "tests/c/sigsuspend_alarm_wake.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and runs in blocking GitHub CI; it asserts that a scheduler-fired SIGALRM ends an rt_sigsuspend wait exactly once with EINTR and restores the blocked mask, so the scheduler must release the parked waiter and await its own report rather than fabricate one; a second phase requires an alarm that the arming thread's suspend mask blocks to reach the worker whose suspend mask admits it; a third phase requires every expiry of a periodic POSIX timer to end the main thread's sigsuspend wait on time and run the handler there while the sibling that armed the timer sleeps and then exits, so the scheduler must not send the signal to that sibling alone"
     },
     {
       "disposition": "manifest-test",
