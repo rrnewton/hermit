@@ -1129,7 +1129,15 @@ fi
 # reverie-dbt, the root Cargo.toml, third-party or rust-toolchain.toml
 # changes, so the four budget inputs are unchanged. Carry, not recalibration:
 # no new timing sample or >=5-sample replacement claim is made.
-expected_pin=6f75cc4c50449ddde9334a311f7a2860c7217aee
+# CARRY TO 689d7f0bafa7c315450eaa75518274e65b8a13d3 (2026-10-07): from
+# 6f75cc4c50449ddde9334a311f7a2860c7217aee. The one commit changes two things:
+# an optional in-guest process-creation hook API (B3b, inert until a hook is
+# registered) and a LiteInst launch that ends the run when Detcore reports a
+# backend failure; no file under reverie-dbt, the root Cargo.toml, third-party
+# or rust-toolchain.toml changes, so the four budget inputs are unchanged.
+# Carry, not recalibration: no new timing sample or >=5-sample replacement
+# claim is made.
+expected_pin=689d7f0bafa7c315450eaa75518274e65b8a13d3
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
