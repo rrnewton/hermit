@@ -6459,6 +6459,11 @@ impl RunOpts {
             .map(GuestRunCaptureSession::try_clone_for_child)
             .transpose()?;
         let timeout = self.run_timeout();
+        // Asked here, before the container is cloned, and held while it runs:
+        // asking can fork a probe child, which inside the container would take
+        // a process ID in the guest's PID namespace and shift every guest
+        // process ID by one (see `hermit::LauncherSeccompAnswer`).
+        let _launcher_seccomp = hermit::LauncherSeccompAnswer::ask();
         if self.no_namespace {
             let mut process = Container::new();
             apply_affinity(&mut process, self.pin_threads);
@@ -7129,6 +7134,10 @@ impl RunOpts {
         let mut options = self.clone();
         let network_trace = options.open_network_trace()?;
         let global = global.clone();
+        // Asked before the container is cloned, as `run_with_guest_capture`
+        // explains, so that both verification runs see the same process IDs a
+        // plain run does.
+        let _launcher_seccomp = hermit::LauncherSeccompAnswer::ask();
         if self.no_namespace {
             let mut process = Container::new();
             apply_affinity(&mut process, self.pin_threads);

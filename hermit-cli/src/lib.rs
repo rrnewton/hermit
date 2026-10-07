@@ -3702,12 +3702,107 @@ fn prepare_run_config(config: DetConfig, backend: Backend) -> DetConfig {
     // on every backend, before any guest exists to install one of its own. A
     // caller's true is kept without asking: record mode sets it, and so does a
     // caller whose command installs a filter in the child, which nothing here
-    // can see.
+    // can see. An answer a `LauncherSeccompAnswer` holds, asked before the
+    // container this runs in was cloned, is used instead of asking here.
     if !config.seccomp_may_refuse_entry_lookup_syscalls {
         config.seccomp_may_refuse_entry_lookup_syscalls =
-            seccomp_may_refuse_entry_lookup_syscalls();
+            held_launcher_seccomp_answer().unwrap_or_else(seccomp_may_refuse_entry_lookup_syscalls);
     }
     config
+}
+
+/// The answer the live [`LauncherSeccompAnswer`] guards hold.
+static HELD_LAUNCHER_SECCOMP_ANSWER: HeldSeccompAnswer = HeldSeccompAnswer::new();
+
+/// An answer held by any number of guards at once: the number of guards times
+/// 4, plus 0 when none lives, 1 for false, 2 for true. Guards that overlap hold
+/// true when any of them answered true, and the answer is forgotten with the
+/// last guard, whatever order they are dropped in, so no answer outlives every
+/// guard. An atomic, not a lock: a container is cloned from this process's
+/// memory, and a lock another thread held at that moment would stay held in
+/// the container.
+struct HeldSeccompAnswer(std::sync::atomic::AtomicU64);
+
+impl HeldSeccompAnswer {
+    const fn new() -> Self {
+        Self(std::sync::atomic::AtomicU64::new(0))
+    }
+
+    /// Count one more guard, holding true if it or a guard still counted
+    /// answered true.
+    fn hold(&self, answer: bool) {
+        let ordering = std::sync::atomic::Ordering::SeqCst;
+        // The closure always returns `Some`, so the update cannot fail.
+        let _ = self.0.try_update(ordering, ordering, |state| {
+            let answer = answer || state & 3 == 2;
+            Some(((state >> 2) + 1) << 2 | if answer { 2 } else { 1 })
+        });
+    }
+
+    /// Count one guard fewer, forgetting the answer with the last.
+    fn release(&self) {
+        let ordering = std::sync::atomic::Ordering::SeqCst;
+        // The closure always returns `Some`, so the update cannot fail.
+        let _ = self.0.try_update(ordering, ordering, |state| {
+            Some(match state >> 2 {
+                0 | 1 => 0,
+                guards => (guards - 1) << 2 | state & 3,
+            })
+        });
+    }
+
+    /// The answer held, if any guard lives.
+    fn get(&self) -> Option<bool> {
+        match self.0.load(std::sync::atomic::Ordering::SeqCst) {
+            0 => None,
+            state => Some(state & 3 == 2),
+        }
+    }
+}
+
+/// The launcher's answer for
+/// [`DetConfig::seccomp_may_refuse_entry_lookup_syscalls`]
+/// ([`seccomp_may_refuse_entry_lookup_syscalls`]), asked once when the guard
+/// is made, in the process that launches the run, and used by every run whose
+/// config is prepared while the guard lives, including runs in a container
+/// cloned meanwhile, whose memory is a copy of this process's.
+///
+/// Make one before cloning a container with a PID namespace: asking forks a
+/// probe child when every thread runs under the same filter, and a child
+/// forked inside the container takes a process ID in the guest's PID
+/// namespace, which shifts the ID of every guest process by one, and only
+/// when the launcher runs under a filter (found by
+/// `run_uses_readonly_proc_after_permission_denial` in hermit-cli's CLI
+/// tests, where the guest saw PID 4 instead of 3).
+///
+/// Once the last live guard is dropped, the answer is not kept for runs
+/// prepared later in this process: a filter installed in between would change
+/// it. Guards that overlap hold true when any of them answered true.
+#[doc(hidden)]
+#[must_use = "the answer is held only while the guard lives"]
+pub struct LauncherSeccompAnswer {
+    /// Only [`LauncherSeccompAnswer::ask`] makes a guard, so every drop
+    /// releases a hold.
+    _held: (),
+}
+
+impl LauncherSeccompAnswer {
+    /// Ask now and hold the answer until the guard is dropped.
+    pub fn ask() -> Self {
+        HELD_LAUNCHER_SECCOMP_ANSWER.hold(seccomp_may_refuse_entry_lookup_syscalls());
+        Self { _held: () }
+    }
+}
+
+impl Drop for LauncherSeccompAnswer {
+    fn drop(&mut self) {
+        HELD_LAUNCHER_SECCOMP_ANSWER.release();
+    }
+}
+
+/// The answer the live [`LauncherSeccompAnswer`] guards hold, if one lives.
+fn held_launcher_seccomp_answer() -> Option<bool> {
+    HELD_LAUNCHER_SECCOMP_ANSWER.get()
 }
 
 /// Whether a seccomp filter that a guest of this process inherits may refuse
@@ -7071,6 +7166,72 @@ mod tests {
                 "{backend:?}"
             );
         }
+    }
+
+    /// While a `LauncherSeccompAnswer` lives, a run's config carries the
+    /// answer it asked for, not one asked when the config is prepared: a
+    /// filter that fails `fstatfs`, installed after the guard asked, does not
+    /// change it. Once the guard is dropped the config asks again and sees
+    /// the filter. A container cloned while the guard lives prepares its
+    /// config this way, so it forks no probe child in the guest's PID
+    /// namespace.
+    #[test]
+    fn a_run_config_carries_the_held_answer_until_its_guard_is_dropped() {
+        let name = "a_run_config_carries_the_held_answer_until_its_guard_is_dropped";
+        if !in_seccomp_scenario(name) {
+            return run_seccomp_scenario(name);
+        }
+        let config = super::DetConfig {
+            virtualize_metadata: false,
+            ..super::DetConfig::default()
+        };
+        let carried = || {
+            super::prepare_run_config(config.clone(), Backend::Ptrace)
+                .seccomp_may_refuse_entry_lookup_syscalls
+        };
+        assert!(
+            !super::seccomp_may_refuse_entry_lookup_syscalls(),
+            "this test needs a process whose own answer is false"
+        );
+        let held = super::LauncherSeccompAnswer::ask();
+        install_seccomp(
+            &seccomp_program(
+                libc::SYS_fstatfs,
+                libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+            ),
+            true,
+        );
+        assert!(!carried(), "the run config should carry the held answer");
+        drop(held);
+        assert!(carried(), "without a guard the run config should ask again");
+    }
+
+    /// Guards that overlap hold true when any of them answered true, and the
+    /// answer is forgotten with the last of them in whatever order they are
+    /// dropped, so no answer outlives every guard.
+    #[test]
+    fn an_answer_held_by_overlapping_guards_is_forgotten_with_the_last() {
+        let held = super::HeldSeccompAnswer::new();
+        assert_eq!(held.get(), None);
+        held.hold(false);
+        assert_eq!(held.get(), Some(false));
+        held.hold(true);
+        assert_eq!(held.get(), Some(true));
+        held.hold(false);
+        assert_eq!(held.get(), Some(true), "a later false does not undo a true");
+        held.release();
+        held.release();
+        assert_eq!(held.get(), Some(true), "one guard still lives");
+        held.release();
+        assert_eq!(held.get(), None);
+        held.hold(false);
+        assert_eq!(
+            held.get(),
+            Some(false),
+            "a true from guards that are gone is not kept"
+        );
+        held.release();
+        assert_eq!(held.get(), None);
     }
 
     #[test]
