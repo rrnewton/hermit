@@ -610,14 +610,14 @@ mod tests {
                     .iter()
                     .any(|binary| binary == "child_time_rpc")
             );
-            // 298 listed, less the 25 external_signal_interrupt ptrace cases
+            // 299 listed, less the 25 external_signal_interrupt ptrace cases
             // that need the PMU timer, which test.pmu_integration_cases
             // runs. The hosted twin also leaves out the btrfs maps-proof case
             // (HOSTED_PORTABLE_BTRFS_INTEGRATION_TESTS in validation_dag.rs).
             let expected = if tag == "test.hermit_integration" {
-                "273"
+                "274"
             } else {
-                "272"
+                "273"
             };
             assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], expected);
             // The explicit utimensat mtime regression

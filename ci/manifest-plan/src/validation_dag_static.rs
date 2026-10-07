@@ -1567,10 +1567,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 25 external_signal_interrupt ptrace cases that need the PMU timer
     // move to test.pmu_integration_cases: 287 - 25 = 262, listed
     // with this node's filter.
-    // Adds eleven https://github.com/rrnewton/hermit/pull/3255 tests
-    // (hermit::procfs_determinism (top level): 11); all 262 prior identities are
-    // retained: 273, measured with cargo nextest list --profile ci.
-    ("test.hermit_integration", 273),
+    // Adds twelve https://github.com/rrnewton/hermit/pull/3255 tests
+    // (hermit::procfs_determinism (top level): 12); all 262 prior identities are
+    // retained: 274, measured with cargo nextest list --profile ci.
+    ("test.hermit_integration", 274),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -2053,9 +2053,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test.hermit_integration except
     // dbt_maps_lines_prove_their_device_with_a_full_descriptor_table, which this host
     // twin leaves out by exact name (HOSTED_PORTABLE_BTRFS_INTEGRATION_TESTS); all 262
-    // prior identities are retained: 272, measured with cargo nextest list --profile
+    // prior identities are retained: 273, measured with cargo nextest list --profile
     // ci.
-    ("test.hermit_integration_on_host", 272),
+    ("test.hermit_integration_on_host", 273),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
