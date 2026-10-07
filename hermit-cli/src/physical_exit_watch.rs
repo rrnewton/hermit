@@ -66,6 +66,45 @@ struct Entry {
     /// Shared with the entry's task in runtime mode.
     pidfd: Arc<OwnedFd>,
     raw_pid: i32,
+    /// The process's birth identity, if the kernel provides one; see
+    /// [`birth_identity`].
+    identity: Option<u64>,
+}
+
+/// What [`PhysicalExitWatch::watch`] did with a registration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Watched {
+    /// The process is now watched.
+    New,
+    /// A process with the same birth identity is already watched; this
+    /// registration joined it, and its exit is reported once.
+    Joined,
+    /// A process with the same birth identity was already seen to exit; its
+    /// exit was (or is being) reported, and is not reported again.
+    AlreadyReported,
+}
+
+/// The filesystem magic of pidfs (`PIDFS_MAGIC`), Linux 6.9 and later.
+const PIDFS_MAGIC: i64 = 0x5049_4446;
+
+/// A process's birth identity: the inode number of a pidfd for it, when that
+/// is a pidfs inode (Linux 6.9 and later), which is one per process and never
+/// reused while the kernel runs. Before pidfs every pidfd shares one
+/// anonymous inode, which names no process, so there is none. Every pidfd for
+/// the same process has the same inode, however it was obtained
+/// (`pidfd_open`, `SO_PEERPIDFD`, `CLONE_PIDFD`).
+pub fn birth_identity(pidfd: &OwnedFd) -> Option<u64> {
+    let mut filesystem: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatfs(pidfd.as_raw_fd(), &mut filesystem) } != 0 {
+        return None;
+    }
+    // `f_type`'s width differs between targets.
+    #[allow(clippy::unnecessary_cast)]
+    if filesystem.f_type as i64 != PIDFS_MAGIC {
+        return None;
+    }
+    let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+    (unsafe { libc::fstat(pidfd.as_raw_fd(), &mut metadata) } == 0).then_some(metadata.st_ino)
 }
 
 /// Returns once `entry`'s exit has been published to its parent; see the
@@ -115,6 +154,9 @@ struct State {
     /// Set by `fail_and_kill_all`: the run has failed, so a process watched
     /// from now on is killed as soon as it is registered.
     killing: bool,
+    /// Birth identities whose exit was observed, for the rest of the run, so
+    /// that a late registration for an exited process is recognized.
+    exited: std::collections::HashSet<u64>,
 }
 
 impl State {
@@ -272,15 +314,36 @@ impl PhysicalExitWatch {
 
     /// Watches one process. `pidfd` must refer to it; `raw_pid` is the id the
     /// callback reports. A process that has already exited is reported at once.
-    pub fn watch(&self, pidfd: OwnedFd, raw_pid: i32) -> io::Result<()> {
+    ///
+    /// Registrations are keyed by birth identity where the kernel provides
+    /// one: a second registration for the same process (for example its
+    /// admission and its parent's creation report, in either order) joins the
+    /// first and is reported once, and one for a process already seen to exit
+    /// is not reported again. So a report can never come from, or be taken
+    /// for, a different process that reused the pid.
+    pub fn watch(&self, pidfd: OwnedFd, raw_pid: i32) -> io::Result<Watched> {
+        let identity = birth_identity(&pidfd);
         let mut state = self.shared.state.lock().unwrap();
         if let Some(failure) = &state.failure {
             return Err(io::Error::new(failure.kind(), failure.to_string()));
+        }
+        if let Some(identity) = identity {
+            if state.exited.contains(&identity) {
+                return Ok(Watched::AlreadyReported);
+            }
+            if state
+                .live
+                .iter()
+                .any(|entry| entry.identity == Some(identity))
+            {
+                return Ok(Watched::Joined);
+            }
         }
         let pidfd = Arc::new(pidfd);
         state.live.push(Entry {
             pidfd: Arc::clone(&pidfd),
             raw_pid,
+            identity,
         });
         let killing = state.killing;
         drop(state);
@@ -309,7 +372,7 @@ impl PhysicalExitWatch {
                 tasks.push(task);
             }
         }
-        Ok(())
+        Ok(Watched::New)
     }
 
     /// The watcher's terminal failure, if it has stopped observing exits.
@@ -465,6 +528,7 @@ async fn watch_one(
             return Ok(());
         };
         let entry = state.live.remove(index);
+        state.exited.extend(entry.identity);
         state.delivering.push(raw_pid);
         entry
     };
@@ -530,6 +594,9 @@ fn watch_loop(shared: &Shared, on_exit: &impl Fn(i32)) -> io::Result<()> {
                 .into_iter()
                 .partition(|entry| exited.contains(&entry.pidfd.as_raw_fd()));
             state.live = live;
+            state
+                .exited
+                .extend(reported.iter().filter_map(|entry| entry.identity));
             state
                 .delivering
                 .extend(reported.iter().map(|entry| entry.raw_pid));
@@ -624,6 +691,85 @@ mod tests {
             receiver.try_recv().is_err(),
             "the exit was reported more than once"
         );
+    }
+
+    /// Every pidfd for one process has the same birth identity, two processes
+    /// have different ones, and a non-pidfd has none. Before pidfs (Linux
+    /// 6.9) no pidfd has one.
+    #[test]
+    fn a_birth_identity_names_one_process() {
+        let first = Reaped::spawn(Command::new("sleep").arg("60"));
+        let second = Reaped::spawn(Command::new("sleep").arg("60"));
+        let (a, b) = (pidfd_open(first.pid()), pidfd_open(first.pid()));
+        let other = pidfd_open(second.pid());
+        let anonymous = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+        assert!(anonymous >= 0);
+        let anonymous = unsafe { OwnedFd::from_raw_fd(anonymous) };
+        assert_eq!(birth_identity(&anonymous), None);
+        let Some(identity) = birth_identity(&a) else {
+            assert_eq!(birth_identity(&other), None, "pidfs is all or nothing");
+            return;
+        };
+        assert_eq!(birth_identity(&b), Some(identity));
+        assert_ne!(birth_identity(&other), Some(identity));
+        assert!(birth_identity(&other).is_some());
+    }
+
+    /// A second registration of the same process joins the first, and its
+    /// exit is reported once.
+    #[test]
+    fn a_second_registration_of_a_process_joins_the_first() {
+        let (sender, receiver) = mpsc::channel();
+        let watch = PhysicalExitWatch::new(move |pid| sender.send(pid).unwrap()).unwrap();
+        let mut child = Reaped::spawn(Command::new("sleep").arg("60"));
+        let pid = child.pid();
+        let keyed = birth_identity(&pidfd_open(pid)).is_some();
+        assert_eq!(
+            watch.watch(pidfd_open(pid), pid as i32).unwrap(),
+            Watched::New
+        );
+        let second = watch.watch(pidfd_open(pid), pid as i32).unwrap();
+        assert_eq!(second, if keyed { Watched::Joined } else { Watched::New });
+        child.0.kill().unwrap();
+        watch.drain(Duration::from_secs(30)).unwrap();
+        let reports = receiver.try_iter().collect::<Vec<i32>>();
+        let expected = if keyed {
+            vec![pid as i32]
+        } else {
+            vec![pid as i32; 2]
+        };
+        assert_eq!(reports, expected);
+    }
+
+    /// A registration that arrives after the process's exit was observed is
+    /// recognized and not reported again, even after the process was reaped.
+    #[test]
+    fn a_registration_after_the_exit_was_observed_is_not_reported_again() {
+        let (sender, receiver) = mpsc::channel();
+        let watch = PhysicalExitWatch::new(move |pid| sender.send(pid).unwrap()).unwrap();
+        let mut child = Reaped::spawn(Command::new("sh").args(["-c", "exit 0"]));
+        let pid = child.pid();
+        let late = pidfd_open(pid);
+        let Some(_) = birth_identity(&late) else {
+            return;
+        };
+        assert_eq!(
+            watch.watch(pidfd_open(pid), pid as i32).unwrap(),
+            Watched::New
+        );
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(30)).unwrap(),
+            pid as i32
+        );
+        watch.drain(Duration::from_secs(30)).unwrap();
+        child.0.wait().unwrap();
+        assert_eq!(
+            watch.watch(late, pid as i32).unwrap(),
+            Watched::AlreadyReported
+        );
+        watch.drain(Duration::from_secs(30)).unwrap();
+        drop(watch);
+        assert!(receiver.try_recv().is_err(), "the exit was reported again");
     }
 
     #[test]

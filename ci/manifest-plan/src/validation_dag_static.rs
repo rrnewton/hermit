@@ -1091,7 +1091,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // analyze::rundata::tests::{trials_refuse_outputs_they_overwrite,
     // trials_refuse_a_timeout_their_backend_cannot_enforce} (rel-041's review
     // of https://github.com/rrnewton/hermit/pull/3836) retain all 948: 950.
-    ("test.hermit_unit", 950),
+    // The three birth-identity exit-watch tests retain all 950: 953, re-listed.
+    ("test.hermit_unit", 953),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1970,7 +1971,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests (905, measured).
     // The host twin selects the same tests, re-listed together: 936.
     // The host twin selects the same six signal-report tests: 942.
-    ("test.hermit_unit_on_host", 950),
+    // The host twin selects the three exit-watch tests too: 953.
+    ("test.hermit_unit_on_host", 953),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
