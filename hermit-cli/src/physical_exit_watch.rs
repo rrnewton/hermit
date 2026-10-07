@@ -319,8 +319,10 @@ impl PhysicalExitWatch {
     /// one: a second registration for the same process (for example its
     /// admission and its parent's creation report, in either order) joins the
     /// first and is reported once, and one for a process already seen to exit
-    /// is not reported again. So a report can never come from, or be taken
-    /// for, a different process that reused the pid.
+    /// is not reported again. So a second registration cannot add a watch
+    /// for a process already watched or already reported, even when its pid
+    /// has been reused. (The report itself still carries only `raw_pid`;
+    /// carrying the identity through to the completion is later work.)
     pub fn watch(&self, pidfd: OwnedFd, raw_pid: i32) -> io::Result<Watched> {
         let identity = birth_identity(&pidfd);
         let mut state = self.shared.state.lock().unwrap();
@@ -693,11 +695,27 @@ mod tests {
         );
     }
 
+    /// Whether this kernel's pidfds are pidfs inodes, decided from raw
+    /// filesystem metadata rather than by [`birth_identity`], the function
+    /// under test.
+    fn pidfs_by_metadata() -> bool {
+        let pidfd = pidfd_open(std::process::id());
+        let mut filesystem: libc::statfs = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::fstatfs(pidfd.as_raw_fd(), &mut filesystem) },
+            0
+        );
+        #[allow(clippy::unnecessary_cast)]
+        let magic = filesystem.f_type as i64;
+        magic == 0x5049_4446
+    }
+
     /// Every pidfd for one process has the same birth identity, two processes
     /// have different ones, and a non-pidfd has none. Before pidfs (Linux
     /// 6.9) no pidfd has one.
     #[test]
     fn a_birth_identity_names_one_process() {
+        let pidfs = pidfs_by_metadata();
         let first = Reaped::spawn(Command::new("sleep").arg("60"));
         let second = Reaped::spawn(Command::new("sleep").arg("60"));
         let (a, b) = (pidfd_open(first.pid()), pidfd_open(first.pid()));
@@ -706,10 +724,15 @@ mod tests {
         assert!(anonymous >= 0);
         let anonymous = unsafe { OwnedFd::from_raw_fd(anonymous) };
         assert_eq!(birth_identity(&anonymous), None);
-        let Some(identity) = birth_identity(&a) else {
-            assert_eq!(birth_identity(&other), None, "pidfs is all or nothing");
+        if !pidfs {
+            assert_eq!(birth_identity(&a), None);
+            assert_eq!(birth_identity(&other), None);
             return;
-        };
+        }
+        let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(a.as_raw_fd(), &mut metadata) }, 0);
+        let identity = metadata.st_ino;
+        assert_eq!(birth_identity(&a), Some(identity));
         assert_eq!(birth_identity(&b), Some(identity));
         assert_ne!(birth_identity(&other), Some(identity));
         assert!(birth_identity(&other).is_some());
@@ -723,7 +746,7 @@ mod tests {
         let watch = PhysicalExitWatch::new(move |pid| sender.send(pid).unwrap()).unwrap();
         let mut child = Reaped::spawn(Command::new("sleep").arg("60"));
         let pid = child.pid();
-        let keyed = birth_identity(&pidfd_open(pid)).is_some();
+        let keyed = pidfs_by_metadata();
         assert_eq!(
             watch.watch(pidfd_open(pid), pid as i32).unwrap(),
             Watched::New
@@ -750,9 +773,9 @@ mod tests {
         let mut child = Reaped::spawn(Command::new("sh").args(["-c", "exit 0"]));
         let pid = child.pid();
         let late = pidfd_open(pid);
-        let Some(_) = birth_identity(&late) else {
+        if !pidfs_by_metadata() {
             return;
-        };
+        }
         assert_eq!(
             watch.watch(pidfd_open(pid), pid as i32).unwrap(),
             Watched::New
