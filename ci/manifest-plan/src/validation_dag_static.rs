@@ -1144,7 +1144,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_seccomp_filter_on_any_task_counts_as_an_inherited_filter,
     // a_filter_on_a_thread_other_than_the_leader_counts) retain all 970: 972,
     // listed the same way.
-    ("test.hermit_unit", 972),
+    // The launcher's seccomp probe (same pull request) replaces those two and
+    // the two hermit seccomp-state tests (a_seccomp_mode_other_than_zero_counts_as_an_inherited_filter,
+    // the_run_config_carries_the_launchers_seccomp_state) with twelve hermit
+    // tests (seccomp_status_reads_the_mode_and_the_filter_count,
+    // launcher_seccomp_compares_every_thread_with_the_calling_thread,
+    // only_threads_filtered_alike_are_probed, eight real-filter scenarios and
+    // the_run_config_carries_the_launchers_seccomp_answer): 972 - 4 + 12 =
+    // 980, listed the same way.
+    ("test.hermit_unit", 980),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2105,7 +2113,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same twelve tests: 966.
     // The host twin selects the same four seccomp-state tests: 970.
     // The host twin selects the same two thread-seccomp tests: 972.
-    ("test.hermit_unit_on_host", 972),
+    // And the same twelve seccomp-probe tests in place of four: 980.
+    ("test.hermit_unit_on_host", 980),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
