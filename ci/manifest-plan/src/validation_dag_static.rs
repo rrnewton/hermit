@@ -1403,7 +1403,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retiring_and_forgetting_consume_no_counter_values}
     // (https://github.com/rrnewton/hermit/issues/3840) retain all 1097 (1100,
     // measured with cargo nextest list).
-    ("test.detcore_unit", 1100),
+    // tool_global::tests::{a_pending_mtime_stays_with_its_file_after_the_last_name_goes,
+    // a_stale_directory_entry_does_not_renumber_a_held_file} (the reviews of
+    // https://github.com/rrnewton/hermit/pull/3849) retain all 1100 (1102,
+    // measured with cargo nextest list).
+    ("test.detcore_unit", 1102),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1447,7 +1451,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_reused_inode_gets_a_fresh_number_however_it_is_first_reached}
     // (https://github.com/rrnewton/hermit/issues/3840) retain all 85 (measured
     // 87).
-    ("test.detcore_misc", 87),
+    // inode_reuse::nothing_is_retired_without_sequentialized_threads (the same
+    // reviews) retains all 87 (measured 88).
+    ("test.detcore_misc", 88),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -1900,7 +1906,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
     // The host node carries the identical 85-test tests_misc selection.
-    ("test.detcore_misc_on_host", 87),
+    ("test.detcore_misc_on_host", 88),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -1966,7 +1972,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same unidentified-stop SIGCHLD refusal test: 1088 + 1 = 1089.
     // The host twin selects the same background-signal test, re-listed: 1090.
     // The host twin selects the same seven B5a tests, re-listed: 1096.
-    ("test.detcore_unit_on_host", 1100),
+    ("test.detcore_unit_on_host", 1102),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

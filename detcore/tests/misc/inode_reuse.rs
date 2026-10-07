@@ -45,7 +45,7 @@ fn ino_of_path(path: &Path) -> u64 {
         .ino()
 }
 
-fn renameat2_exchange(a: &Path, b: &Path) {
+fn renameat2(a: &Path, b: &Path, flags: libc::c_uint) -> Result<(), i32> {
     let a = CString::new(a.as_os_str().as_bytes()).unwrap();
     let b = CString::new(b.as_os_str().as_bytes()).unwrap();
     let rc = unsafe {
@@ -54,10 +54,71 @@ fn renameat2_exchange(a: &Path, b: &Path) {
             a.as_ptr(),
             libc::AT_FDCWD,
             b.as_ptr(),
-            libc::RENAME_EXCHANGE,
+            flags,
         )
     };
-    assert_eq!(rc, 0, "renameat2(RENAME_EXCHANGE)");
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().raw_os_error().unwrap())
+    }
+}
+
+fn renameat2_exchange(a: &Path, b: &Path) {
+    renameat2(a, b, libc::RENAME_EXCHANGE).expect("renameat2(RENAME_EXCHANGE)");
+}
+
+/// `fstatat(AT_FDCWD, "", AT_EMPTY_PATH)`: the working directory, reached
+/// without a path.
+fn ino_of_working_directory() -> u64 {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstatat(libc::AT_FDCWD, c"".as_ptr(), &mut stat, libc::AT_EMPTY_PATH) };
+    assert_eq!(
+        rc,
+        0,
+        "fstatat(AT_EMPTY_PATH): {}",
+        std::io::Error::last_os_error()
+    );
+    stat.st_ino
+}
+
+/// `getdents64(fd, buffer)`, returning each entry's name and `d_ino`.
+fn getdents64(fd: i32, buffer: &mut [u8]) -> Vec<(String, u64)> {
+    let read =
+        unsafe { libc::syscall(libc::SYS_getdents64, fd, buffer.as_mut_ptr(), buffer.len()) };
+    assert!(read >= 0, "getdents64: {}", std::io::Error::last_os_error());
+    let mut entries = Vec::new();
+    let mut offset = 0;
+    while offset < read as usize {
+        let record = &buffer[offset..];
+        let ino = u64::from_ne_bytes(record[0..8].try_into().unwrap());
+        let length = usize::from(u16::from_ne_bytes(record[16..18].try_into().unwrap()));
+        let name = &record[19..length];
+        let name = &name[..name.iter().position(|byte| *byte == 0).unwrap()];
+        entries.push((String::from_utf8_lossy(name).into_owned(), ino));
+        offset += length;
+    }
+    entries
+}
+
+/// Run one raw syscall with `stack` as its stack pointer, as a guest that
+/// keeps its operands below its own red zone would.
+unsafe fn syscall_on_stack(stack: *mut u8, number: i64, first: usize, second: usize) -> i64 {
+    let result: i64;
+    unsafe {
+        std::arch::asm!(
+            "xchg rsp, r12",
+            "syscall",
+            "xchg rsp, r12",
+            inout("r12") stack => _,
+            inlateout("rax") number => result,
+            in("rdi") first,
+            in("rsi") second,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    result
 }
 
 /// Each removal kind, printing the inode numbers whose number must be retired
@@ -130,11 +191,113 @@ fn removals_guest(root: &tempfile::TempDir) {
     assert_eq!(ino_of_path(&left), right_number);
     assert_eq!(ino_of_path(&right), left_number);
 
+    // RENAME_NOREPLACE removes nothing: it fails onto an existing name, and
+    // otherwise has no target to replace.
+    assert_eq!(
+        renameat2(&left, &right, libc::RENAME_NOREPLACE),
+        Err(libc::EEXIST)
+    );
+    let fresh_name = dir.join("fresh-name");
+    renameat2(&left, &fresh_name, libc::RENAME_NOREPLACE).unwrap();
+    assert_eq!(ino_of_path(&fresh_name), right_number);
+
+    // A file that never has a name keeps its number through its descriptor.
+    let tmpfile = CString::new(dir.as_os_str().as_bytes()).unwrap();
+    let tmpfile = unsafe { libc::open(tmpfile.as_ptr(), libc::O_TMPFILE | libc::O_RDWR, 0o600) };
+    assert!(
+        tmpfile >= 0,
+        "O_TMPFILE: {}",
+        std::io::Error::last_os_error()
+    );
+    let unnamed = ino_of_fd(tmpfile);
+    assert_eq!(
+        std::fs::metadata(Path::new("/proc/self/fd").join(tmpfile.to_string()))
+            .unwrap()
+            .ino(),
+        unnamed,
+        "stat of an O_TMPFILE file through /proc/self/fd/N"
+    );
+    assert_eq!(ino_of_fd(tmpfile), unnamed, "a second fstat");
+    unsafe { libc::close(tmpfile) };
+
+    // A directory stream snapshots the directory at its first `getdents`, so
+    // the rest of a listing can name a file whose last name has gone since.
+    // That entry, and the descriptor that holds the file, keep its number
+    // (codex review of https://github.com/rrnewton/hermit/pull/3849, P1).
+    let listed = dir.join("listed");
+    std::fs::create_dir(&listed).unwrap();
+    let held_path = listed.join("held");
+    let held = File::create(&held_path).unwrap();
+    let held_number = ino_of_fd(held.as_raw_fd());
+    let listing = File::open(&listed).unwrap();
+    // One 24-byte record: `.`, the first entry of the sorted stream.
+    let first = getdents64(listing.as_raw_fd(), &mut [0u8; 24]);
+    assert_eq!(first.len(), 1, "{first:?}");
+    std::fs::remove_file(&held_path).unwrap();
+    let rest = getdents64(listing.as_raw_fd(), &mut [0u8; 4096]);
+    let cached = rest
+        .iter()
+        .find(|(name, _)| name == "held")
+        .unwrap_or_else(|| panic!("the snapshot names the held file: {rest:?}"));
+    assert_eq!(cached.1, held_number, "the snapshot's entry");
+    assert_eq!(
+        ino_of_fd(held.as_raw_fd()),
+        held_number,
+        "fstat of the held file"
+    );
+    drop(listing);
+    drop(held);
+
+    // The lookup before a removal must leave the call's own paths intact,
+    // even where a raw call keeps them below the red zone, inside the stack
+    // scratch the lookup would use (the review's P2, and claude's P3-2).
+    let mut stack = vec![0u8; 64 * 1024];
+    let top = (stack.as_mut_ptr() as usize + stack.len()) & !15;
+    let place = |at: usize, path: &Path| -> Vec<u8> {
+        let bytes = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let bytes = bytes.as_bytes_with_nul().to_vec();
+        assert!(
+            at + bytes.len() <= top - 128,
+            "{} is too long",
+            path.display()
+        );
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len()) };
+        bytes
+    };
+    let read_back = |at: usize, len: usize| unsafe {
+        std::slice::from_raw_parts(at as *const u8, len).to_vec()
+    };
+    let victim = dir.join("v");
+    File::create(&victim).unwrap();
+    let victim_bytes = place(top - 200, &victim);
+    let unlinked_raw = unsafe { syscall_on_stack(top as *mut u8, libc::SYS_unlink, top - 200, 0) };
+    assert_eq!(unlinked_raw, 0, "unlink with its path in the stack scratch");
+    assert!(!victim.exists(), "the raw unlink removed its file");
+    assert_eq!(read_back(top - 200, victim_bytes.len()), victim_bytes);
+    let (from, to) = (dir.join("f"), dir.join("t"));
+    File::create(&from).unwrap();
+    File::create(&to).unwrap();
+    let from_bytes = place(top - 200, &from);
+    let to_bytes = place(top - 260, &to);
+    let renamed_raw =
+        unsafe { syscall_on_stack(top as *mut u8, libc::SYS_rename, top - 200, top - 260) };
+    assert_eq!(
+        renamed_raw, 0,
+        "rename with both paths in the stack scratch"
+    );
+    assert!(
+        !from.exists() && to.exists(),
+        "the raw rename moved its file"
+    );
+    assert_eq!(read_back(top - 200, from_bytes.len()), from_bytes);
+    assert_eq!(read_back(top - 260, to_bytes.len()), to_bytes);
+    drop(stack);
+
     // Straight to descriptor 1: `println!` in a test thread goes to the
     // harness's capture buffer, which the forked guest cannot hand back.
     let report = format!(
-        "retired {number} {removed_directory} {replaced}\n\
-         kept {linked} {moved} {left_number} {right_number}\n"
+        "retired {number} {removed_directory} {replaced} {held_number}\n\
+         kept {linked} {moved} {left_number} {right_number} {unnamed}\n"
     );
     std::io::Write::write_all(&mut std::io::stdout(), report.as_bytes()).unwrap();
     drop(reopened);
@@ -192,6 +355,38 @@ fn removing_a_last_name_retires_its_number_and_nothing_else() {
     }
 }
 
+/// Without sequentialized threads another thread could link or rename a file
+/// between the lookup before a removal and the removal itself, so nothing is
+/// retired (codex review of https://github.com/rrnewton/hermit/pull/3849, P2).
+#[test]
+fn nothing_is_retired_without_sequentialized_threads() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config {
+        sequentialize_threads: false,
+        max_timeslice: None,
+        virtualize_metadata: true,
+        ..Default::default()
+    };
+    let (output, state) = detcore_testutils::test_fn_with_config::<Detcore, _>(
+        || {
+            let path = root.path().join("removed");
+            File::create(&path).unwrap();
+            ino_of_path(&path);
+            std::fs::remove_file(&path).unwrap();
+        },
+        config,
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        output.status,
+        ExitStatus::Exited(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(state.retired_inodes(), Vec::new());
+}
+
 /// Set in the re-executed test process, which runs as root in a user and mount
 /// namespace of its own and so may mount tmpfs.
 const REUSE_INNER: &str = "HERMIT_INODE_REUSE_TEST_INNER";
@@ -217,6 +412,14 @@ enum FirstReach {
     DirectoryListing,
     /// A stat of the new directory's path.
     PathStat,
+    /// `fstatat(AT_FDCWD, "", AT_EMPTY_PATH)` after `chdir` into the new
+    /// directory (claude review of https://github.com/rrnewton/hermit/pull/3849,
+    /// P3-1).
+    WorkingDirectory,
+    /// The removed file was written and never numbered, and the new
+    /// directory must not inherit its mtime: it must read the same as a
+    /// directory made with no reuse (the same review, P2-2).
+    WrittenThenRemoved,
 }
 
 /// Mount a fresh tmpfs at `mount_point`, replacing the one there, if any.
@@ -275,11 +478,27 @@ fn reuse_guest(mount_point: &Path, fifos: &Path, reach: FirstReach) {
                 std::fs::remove_file(&old).unwrap();
                 number
             }
-            FirstReach::DirectoryListing | FirstReach::PathStat => {
+            FirstReach::DirectoryListing | FirstReach::PathStat | FirstReach::WorkingDirectory => {
                 std::fs::create_dir(&old).unwrap();
                 let number = ino_of_path(&old);
                 std::fs::remove_dir(&old).unwrap();
                 number
+            }
+            FirstReach::WrittenThenRemoved => {
+                std::io::Write::write_all(&mut File::create(&old).unwrap(), b"x").unwrap();
+                std::fs::remove_file(&old).unwrap();
+                remount(request, done);
+                std::fs::create_dir(&new).unwrap();
+                let control = mount_point.join(format!("control-{cycle}"));
+                std::fs::create_dir(&control).unwrap();
+                let mtime = |path: &Path| std::fs::metadata(path).unwrap().mtime_nsec();
+                let seconds = |path: &Path| std::fs::metadata(path).unwrap().mtime();
+                assert_eq!(
+                    (seconds(&new), mtime(&new)),
+                    (seconds(&control), mtime(&control)),
+                    "{reach:?}, cycle {cycle}: the new directory took the removed file's mtime"
+                );
+                continue;
             }
         };
         remount(request, done);
@@ -301,6 +520,16 @@ fn reuse_guest(mount_point: &Path, fifos: &Path, reach: FirstReach) {
                 std::fs::create_dir(&new).unwrap();
                 ino_of_path(&new)
             }
+            FirstReach::WorkingDirectory => {
+                std::fs::create_dir(&new).unwrap();
+                let previous = std::env::current_dir().unwrap();
+                std::env::set_current_dir(&new).unwrap();
+                let number = ino_of_working_directory();
+                // Out again, or the next remount would find the mount busy.
+                std::env::set_current_dir(previous).unwrap();
+                number
+            }
+            FirstReach::WrittenThenRemoved => unreachable!(),
         };
         assert_ne!(
             new_number, old_number,
@@ -396,7 +625,7 @@ fn a_reused_inode_gets_a_fresh_number_however_it_is_first_reached() {
             "the re-executed test failed: {stdout}{stderr}"
         );
         assert!(
-            stdout.contains("inode reuse: checked 3 ways"),
+            stdout.contains("inode reuse: checked 5 ways"),
             "the re-executed test did not run: {stdout}{stderr}"
         );
         return;
@@ -409,6 +638,8 @@ fn a_reused_inode_gets_a_fresh_number_however_it_is_first_reached() {
         FirstReach::CreatingDescriptor,
         FirstReach::DirectoryListing,
         FirstReach::PathStat,
+        FirstReach::WorkingDirectory,
+        FirstReach::WrittenThenRemoved,
     ] {
         let reused = run_reuse_guest(reach);
         assert!(
@@ -416,5 +647,5 @@ fn a_reused_inode_gets_a_fresh_number_however_it_is_first_reached() {
             "{reach:?}: the host reused no inode in {REUSE_CYCLES} cycles, so nothing was checked"
         );
     }
-    writeln!(std::io::stdout(), "inode reuse: checked 3 ways").unwrap();
+    writeln!(std::io::stdout(), "inode reuse: checked 5 ways").unwrap();
 }

@@ -756,22 +756,6 @@ fn retires_on_removal(stat: &libc::stat) -> bool {
     stat.st_mode & libc::S_IFMT == libc::S_IFDIR || stat.st_nlink == 1
 }
 
-/// Whether a `*at` call with `path` and `flags` looks the file up by a path,
-/// rather than operating on `dirfd` itself (`AT_EMPTY_PATH` with an empty
-/// path). A path that cannot be read counts as a path.
-fn names_a_path<M: MemoryAccess>(
-    memory: &M,
-    path: Option<syscalls::PathPtr<'_>>,
-    flags: AtFlags,
-) -> bool {
-    if !flags.contains(AtFlags::AT_EMPTY_PATH) {
-        return true;
-    }
-    !path
-        .and_then(|path| path.read(memory).ok())
-        .is_some_and(|path: PathBuf| path.as_os_str().is_empty())
-}
-
 /// The path to report for one operand of a successful namespace change (see
 /// `Detcore::record_host_namespace_change`): the operand made absolute, or
 /// `/` when it could not be read or made absolute. A tracer that may not read
@@ -861,11 +845,34 @@ pub(crate) fn may_write_process_memory(flags: OFlag, descriptor: Option<(&Path, 
         })
 }
 
-/// Writes back the guest bytes that the utimensat lookup buffer covered.
+/// Writes back the guest bytes that a pre-call lookup buffer (utimensat's, or
+/// the removal lookup's) covered.
 fn restore_lookup_buffer<M: MemoryAccess>(memory: &mut M, buffer: StatPtr, saved: &[u8]) {
     if memory.write_exact(buffer.0.cast(), saved).is_err() {
-        info!("Could not restore the guest bytes under the utimensat lookup buffer.");
+        info!("Could not restore the guest bytes under a pre-call lookup buffer.");
     }
+}
+
+/// Whether a lookup `buffer` overlaps `path` through its NUL, which a guest
+/// call still has to read. A path that cannot be read counts as overlapping,
+/// so that the kernel, not a lookup, reports the fault.
+fn path_overlaps_buffer<M: MemoryAccess>(
+    memory: &M,
+    path: Option<syscalls::PathPtr<'_>>,
+    buffer: StatPtr,
+) -> bool {
+    use reverie::syscalls::FromToRaw;
+
+    let start = buffer.0.as_raw();
+    let end = start + std::mem::size_of::<libc::stat>();
+    path.is_some_and(|ptr| match ptr.read(memory) {
+        Ok(read) => {
+            let addr = Some(ptr).into_raw();
+            let read: PathBuf = read;
+            addr < end && start < addr.saturating_add(read.as_os_str().len() + 1)
+        }
+        Err(_) => true,
+    })
 }
 
 /// Whether the utimensat lookup buffer overlaps the guest memory Linux reads
@@ -878,15 +885,10 @@ fn utimensat_input_overlaps<M: MemoryAccess>(
     guest_times: bool,
     buffer: StatPtr,
 ) -> bool {
-    use reverie::syscalls::FromToRaw;
-
     let start = buffer.0.as_raw();
     let end = start + std::mem::size_of::<libc::stat>();
     let overlaps = |addr: usize, len: usize| addr < end && start < addr.saturating_add(len);
-    let path = call.path().is_some_and(|path| match path.read(memory) {
-        Ok(path) => overlaps(call.path().into_raw(), path.as_os_str().len() + 1),
-        Err(_) => true,
-    });
+    let path = path_overlaps_buffer(memory, call.path(), buffer);
     let times = guest_times
         && call
             .times()
@@ -1323,12 +1325,20 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// `fstatat(dirfd, path, AT_SYMLINK_NOFOLLOW)` for a path the guest named
-    /// in its own call, staged like [`Self::inject_fstat`]: in the guest stack
-    /// scratch, else in a transient private page.
+    /// in a call that has not run yet and must still read `inputs`, its paths.
+    ///
+    /// The buffer is staged as the utimensat target lookup stages its own: in
+    /// the guest stack scratch, below the red zone, where a raw syscall may
+    /// keep its own path, so only when it overlaps none of `inputs`, and with
+    /// the bytes under it saved and put back after the commit and after the
+    /// lookup, so that the call reads its inputs unchanged (claude review of
+    /// <https://github.com/rrnewton/hermit/pull/3849>, P3-2). Otherwise it is
+    /// a transient private page, unmapped before the guest resumes.
     async fn inject_lstatat<G: Guest<Self>>(
         guest: &mut G,
         dirfd: RawFd,
         path: syscalls::PathPtr<'_>,
+        inputs: [Option<syscalls::PathPtr<'_>>; 2],
     ) -> Result<libc::stat, Errno> {
         let lstatat = move |statptr: StatPtr<'_>| {
             Syscall::Newfstatat(
@@ -1339,15 +1349,42 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .with_flags(AtFlags::AT_SYMLINK_NOFOLLOW),
             )
         };
-        match Self::inject_stat_on_stack(guest, lstatat).await {
-            Err(Errno::EFAULT) => Self::inject_stat_in_transient_page(guest, lstatat).await,
-            result => result,
+        // The scratch starts 128 bytes below the stack pointer, at addresses
+        // computed by subtraction.
+        let scratch = 128 + std::mem::size_of::<libc::stat>();
+        if usize::try_from(guest.regs().await.rsp).map_or(true, |rsp| rsp <= scratch) {
+            return Self::inject_stat_in_transient_page(guest, lstatat).await;
         }
+        let mut stack = guest.stack().await;
+        let statptr: StatPtr = StatPtr(stack.reserve());
+        let mut saved = [0u8; std::mem::size_of::<libc::stat>()];
+        let staged_on_stack = !inputs
+            .iter()
+            .any(|input| path_overlaps_buffer(&guest.memory(), *input, statptr))
+            && guest
+                .memory()
+                .read_exact(statptr.0.cast(), &mut saved)
+                .is_ok();
+        if !staged_on_stack {
+            drop(stack);
+            return Self::inject_stat_in_transient_page(guest, lstatat).await;
+        }
+        let guard = match stack.commit() {
+            Ok(guard) => guard,
+            Err(_) => {
+                restore_lookup_buffer(&mut guest.memory(), statptr, &saved);
+                return Self::inject_stat_in_transient_page(guest, lstatat).await;
+            }
+        };
+        restore_lookup_buffer(&mut guest.memory(), statptr, &saved);
+        let looked_up = Self::inject_stat_into(guest, lstatat(statptr), statptr).await;
+        restore_lookup_buffer(&mut guest.memory(), statptr, &saved);
+        drop(guard);
+        looked_up
     }
 
-    /// The fast path of [`Self::inject_fstat`] and [`Self::inject_lstatat`]:
-    /// the buffer lives in the guest stack scratch. Returns `EFAULT` when that
-    /// scratch is not writable.
+    /// The fast path of [`Self::inject_fstat`]: the buffer lives in the guest
+    /// stack scratch. Returns `EFAULT` when that scratch is not writable.
     async fn inject_stat_on_stack<G: Guest<Self>>(
         guest: &mut G,
         stat_call: impl Fn(StatPtr<'_>) -> Syscall,
@@ -1583,12 +1620,19 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Pass the result to [`Self::retire_removed_inodes`] if the call
     /// succeeds. Only with virtualized metadata, the only mode that numbers
     /// inodes.
+    ///
+    /// Nothing is retired without sequentialized threads. Only then do the
+    /// lookups, the call and the retirement run in one turn; otherwise another
+    /// thread can link, unlink or rename the file in between, and a file that
+    /// keeps a name could be retired and renumbered (codex review of
+    /// <https://github.com/rrnewton/hermit/pull/3849>, P2). Without them inode
+    /// numbers behave as before retirement existed.
     pub(crate) async fn last_names_removed_by<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: &Syscall,
     ) -> Vec<RawInode> {
-        if !guest.config().virtualize_metadata {
+        if !guest.config().virtualize_metadata || !guest.config().sequentialize_threads {
             return Vec::new();
         }
         let at = libc::AT_FDCWD;
@@ -1613,17 +1657,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             ),
             _ => return Vec::new(),
         };
-        let lstat = async |guest: &mut G, (dirfd, path): (i32, Option<syscalls::PathPtr>)| {
-            Self::inject_lstatat(guest, dirfd, path?).await.ok()
+        // Every path the call reads, which the lookups must leave unchanged.
+        let inputs = [removed.1, source.and_then(|source| source.1)];
+        let Some(path) = removed.1 else {
+            return Vec::new();
         };
-        let Some(stat) = lstat(guest, removed).await else {
+        let Ok(stat) = Self::inject_lstatat(guest, removed.0, path, inputs).await else {
             return Vec::new();
         };
         let inode = RawInode::new(stat.st_dev, stat.st_ino);
-        if let Some(source) = source
-            && lstat(guest, source)
+        if let Some((dirfd, Some(path))) = source
+            && Self::inject_lstatat(guest, dirfd, path, inputs)
                 .await
-                .is_some_and(|source| RawInode::new(source.st_dev, source.st_ino) == inode)
+                .is_ok_and(|source| RawInode::new(source.st_dev, source.st_ino) == inode)
         {
             return Vec::new();
         }
@@ -4005,16 +4051,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     //   - atime, ctime and btime always report the epoch: the kernel sets ctime
     //     and btime itself, so even for a Nix store file they are real
     //     timestamps, and Hermit keeps no per-file atime.
-    ///
-    /// `by_path` says the caller reached the file by a path rather than a
-    /// descriptor; with a nonzero link count that is a name sighting (see
-    /// `InodeSighting`).
     async fn determinize_stat<G, S>(
         &self,
         guest: &mut G,
         stat: S,
         inode_override: Option<DetInode>,
-        by_path: bool,
     ) -> Result<DetStat, Error>
     where
         G: Guest<Self>,
@@ -4042,15 +4083,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                 } else {
                     ObservedMtime::Unobserved
                 };
-                // A path to a file with no link left, such as
-                // `/proc/self/fd/N` of an unlinked file, still reaches the
-                // file a retired mapping describes.
-                let sighting =
-                    if by_path && stat.mask.contains(StatxMask::STATX_NLINK) && stat.nlink > 0 {
-                        InodeSighting::Name
-                    } else {
-                        InodeSighting::Descriptor
-                    };
+                // A file with a link cannot be one a retired mapping describes:
+                // Linux refuses to link an unlinked file again (only an
+                // `O_TMPFILE` file, which is never retired, may get a name).
+                // So a nonzero link count is a name sighting however the file
+                // was reached, by path, descriptor or working directory, and a
+                // zero count (`fstat` after `unlink`, `/proc/self/fd/N`) is not.
+                let sighting = if stat.mask.contains(StatxMask::STATX_NLINK) && stat.nlink > 0 {
+                    InodeSighting::Name
+                } else {
+                    InodeSighting::Descriptor
+                };
                 determinize_inode_observing_mtime(guest, stat.raw_inode(), observed, sighting).await
             }
         };
@@ -4092,13 +4135,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             // filesystem (squashfs_ll).
             guest.inject(Syscall::from(call)).await?;
             let statptr = call.stat().ok_or(Errno::EFAULT)?;
-            let by_path = match call {
-                StatFamily::Fstat(_) => false,
-                StatFamily::Fstatat(call) => {
-                    names_a_path(&guest.memory(), call.path(), call.flags())
-                }
-                _ => true,
-            };
             let described_fd = match call {
                 StatFamily::Fstat(call) => Some(call.fd()),
                 StatFamily::Fstatat(call) => {
@@ -4110,9 +4146,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             let inode_override = described_fd.and_then(|fd| stdio_inode_override(guest, fd));
             let mut memory = guest.memory();
             let stat = memory.read_value(statptr.0)?;
-            let stat = self
-                .determinize_stat(guest, stat, inode_override, by_path)
-                .await?;
+            let stat = self.determinize_stat(guest, stat, inode_override).await?;
             memory.write_value(statptr.0, &stat.into())?;
             Ok(0)
         } else {
@@ -4132,15 +4166,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             // may cause tracer to hang under certain fuse filesystem (squashfs_ll).
             guest.inject(call).await?;
             let statptr = call.statx().ok_or(Errno::EFAULT)?;
-            let by_path = names_a_path(&guest.memory(), call.path(), call.flags());
             let inode_override =
                 empty_path_fd(&guest.memory(), call.dirfd(), call.path(), call.flags())
                     .and_then(|fd| stdio_inode_override(guest, fd));
             let mut memory = guest.memory();
             let stat = memory.read_value(statptr.0)?;
-            let stat = self
-                .determinize_stat(guest, stat, inode_override, by_path)
-                .await?;
+            let stat = self.determinize_stat(guest, stat, inode_override).await?;
             memory.write_value(statptr.0, &stat.into())?;
             Ok(0)
         } else {
@@ -5972,11 +6003,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !needs_snapshot {
             return self.serve_next_batch(guest, call).await;
         }
+        let retirements = retirement_count(guest).await;
         match self.snapshot_directory_privately(guest, call).await {
             Ok(Some(entries)) => {
                 let mut entries = Some(entries);
                 guest.thread_state().with_detfd(call.fd, |detfd| {
-                    detfd.install_directory_snapshot(entries.take().unwrap_or_default())
+                    detfd
+                        .install_directory_snapshot(entries.take().unwrap_or_default(), retirements)
                 })?;
                 self.serve_next_batch(guest, call).await
             }
@@ -6034,19 +6067,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         match stream {
             None | Some((0, true)) => return Ok(kernel.map(|_| 0)?),
-            Some((_, true)) => match self.snapshot_directory_privately(guest, call).await {
-                Ok(Some(entries)) => {
-                    let mut entries = Some(entries);
-                    let target = guest.thread_state().with_detfd(call.fd, |detfd| {
-                        detfd.install_directory_snapshot(entries.take().unwrap_or_default());
-                        detfd.with_directory_stream(|stream| stream.kernel_target())
-                    })??;
-                    self.move_directory_kernel_position(guest, call.fd, target)
-                        .await;
+            Some((_, true)) => {
+                let retirements = retirement_count(guest).await;
+                match self.snapshot_directory_privately(guest, call).await {
+                    Ok(Some(entries)) => {
+                        let mut entries = Some(entries);
+                        let target = guest.thread_state().with_detfd(call.fd, |detfd| {
+                            detfd.install_directory_snapshot(
+                                entries.take().unwrap_or_default(),
+                                retirements,
+                            );
+                            detfd.with_directory_stream(|stream| stream.kernel_target())
+                        })??;
+                        self.move_directory_kernel_position(guest, call.fd, target)
+                            .await;
+                    }
+                    Ok(None) => return Ok(kernel.map(|_| 0)?),
+                    Err(error) => return Err(error),
                 }
-                Ok(None) => return Ok(kernel.map(|_| 0)?),
-                Err(error) => return Err(error),
-            },
+            }
             Some((_, false)) => {}
         }
         let batch = guest.thread_state().with_detfd(call.fd, |detfd| {
@@ -6067,11 +6106,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: GetdentsCall<'_>,
     ) -> Result<i64, Error> {
-        let (start, batch) = guest.thread_state().with_detfd(call.fd, |detfd| {
+        let (start, batch, retirements) = guest.thread_state().with_detfd(call.fd, |detfd| {
             detfd.with_directory_stream(|stream| {
                 (
                     stream.position(),
                     stream.next_batch(call.format, call.capacity),
+                    stream.snapshot_retirements(),
                 )
             })
         })??;
@@ -6081,8 +6121,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let mut records = Vec::new();
                 let mut names = Vec::with_capacity(batch.len());
                 for (index, entry) in batch.iter().enumerate() {
-                    let (d_ino, _) =
-                        determinize_named_inode(guest, RawInode::new(device, entry.ino)).await;
+                    let (d_ino, _) = determinize_listed_inode(
+                        guest,
+                        RawInode::new(device, entry.ino),
+                        retirements,
+                    )
+                    .await;
                     let d_off = i64::try_from(start + index as u64 + 1).unwrap_or(i64::MAX);
                     call.format
                         .encode(entry, d_ino.as_raw(), d_off, &mut records);

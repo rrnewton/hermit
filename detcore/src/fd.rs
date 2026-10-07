@@ -838,11 +838,14 @@ impl DetFd {
 
     /// Install a snapshot freshly read in host order, creating the stream at
     /// position 0 if this is the open file's first `getdents`.
-    pub(crate) fn install_directory_snapshot(&self, entries: Vec<DirEntry>) {
+    ///
+    /// `retirements` is the inode retirement count read just before the host
+    /// directory was (see `InodeSighting::Listed`).
+    pub(crate) fn install_directory_snapshot(&self, entries: Vec<DirEntry>, retirements: u64) {
         self.with_description(|d| {
-            d.directory
-                .get_or_insert_with(DirectoryStream::default)
-                .install(entries)
+            let stream = d.directory.get_or_insert_with(DirectoryStream::default);
+            stream.install(entries);
+            stream.note_snapshot_retirements(retirements);
         });
     }
 

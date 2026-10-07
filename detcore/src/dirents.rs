@@ -400,9 +400,23 @@ pub(crate) struct DirectoryStream {
     resume: Vec<i64>,
     /// Index of the next entry to return.
     position: u64,
+    /// How many inode retirements there had been when the snapshot was taken
+    /// (`InodeSighting::Listed`): an entry can be returned after its file's
+    /// last name is gone.
+    retirements: u64,
 }
 
 impl DirectoryStream {
+    /// Record how many inode retirements preceded the snapshot just installed.
+    pub(crate) fn note_snapshot_retirements(&mut self, retirements: u64) {
+        self.retirements = retirements;
+    }
+
+    /// How many inode retirements preceded the current snapshot.
+    pub(crate) fn snapshot_retirements(&self) -> u64 {
+        self.retirements
+    }
+
     pub(crate) fn needs_snapshot(&self) -> bool {
         self.entries.is_none()
     }
