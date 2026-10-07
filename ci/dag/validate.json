@@ -1774,6 +1774,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/external-io-signal-interrupt",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/faccessat2-flags",
           "mode": "verify",
           "backend": "kvm"
@@ -5277,6 +5284,20 @@
           "test": "c-programs/sigprocmask-state",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigsuspend-alarm-wake",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigsuspend-sibling-signal-wake",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -15499,6 +15520,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/external-io-signal-interrupt",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/faccessat2-flags",
           "mode": "verify",
           "backend": "ptrace"
@@ -16767,6 +16795,20 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/sigprocmask-state",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigsuspend-alarm-wake",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigsuspend-sibling-signal-wake",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -20856,6 +20898,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/external-io-signal-interrupt",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/faccessat2-flags",
           "mode": "verify",
           "backend": "ptrace"
@@ -23400,6 +23449,20 @@
           "test": "c-programs/sigprocmask-state",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigsuspend-alarm-wake",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigsuspend-sibling-signal-wake",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -35728,6 +35791,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/external-io-signal-interrupt",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/faccessat2-flags",
           "mode": "verify",
           "backend": "kvm"
@@ -39231,6 +39301,20 @@
           "test": "c-programs/sigprocmask-state",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigsuspend-alarm-wake",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigsuspend-sibling-signal-wake",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",
