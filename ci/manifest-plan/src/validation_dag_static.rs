@@ -1356,7 +1356,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // -> guest_reported_user_address_limit_is_the_one_enforced and
     // rng_iovecs_native_oracle_failures_keep_their_tool_identity ->
     // rng_iovecs_limit_query_failures_keep_their_tool_identity), count unchanged.
-    ("test.detcore_unit", 1083),
+    // Five open file description tests in detcore fd.rs (shared-OFD step B2:
+    // four on shared handles, one on argument conversion order), re-listed: 1088.
+    ("test.detcore_unit", 1088),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1901,7 +1903,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin loses the same deleted time test: 1082.
     // The host twin also selects the same procfs user-address-limit ordering
     // test and the two renamed iovecs tests: 1082 + 1 = 1083.
-    ("test.detcore_unit_on_host", 1083),
+    // The host twin selects the same five fd.rs tests, re-listed: 1088.
+    ("test.detcore_unit_on_host", 1088),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

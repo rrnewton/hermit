@@ -15,7 +15,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::MutexGuard;
+use std::sync::OnceLock;
 
 use nix::fcntl::OFlag;
 use reverie::syscalls::Errno;
@@ -100,7 +100,133 @@ pub struct DetFd {
     /// Per-slot descriptor flags, currently only `O_CLOEXEC`.
     fd_flags: i32,
     /// State shared by every descriptor referring to the same Linux `struct file`.
-    open_file: Arc<Mutex<OpenFileDescription>>,
+    open_file: Arc<Mutex<OpenFileState>>,
+}
+
+/// Where the model of one open file description lives.
+///
+/// Every `DetFd` method reaches the model through `DetFd::with_description`,
+/// so a handle's state can change from `Local` to `Shared` under every alias
+/// at once, escaped clones included, because they all hold the same `Arc`.
+// The state always lives inside the one `Arc` allocation its aliases share,
+// and `Local` is every description today, so boxing it would only add a
+// second allocation to every open.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Serialize, Deserialize)]
+enum OpenFileState {
+    /// Only this process can reach the open file description, so the model
+    /// lives here. This is every description today.
+    Local(OpenFileDescription),
+    /// Several guest processes share the open file description, so the one
+    /// canonical model lives in Detcore's global state and this handle holds
+    /// none. Each access takes the model through the installed
+    /// [`SharedOpenFileChannel`] and publishes it back. Nothing creates this
+    /// state yet; the cross-process promotion that does is a later step of
+    /// https://github.com/rrnewton/hermit/issues/3520.
+    Shared(SharedOpenFile),
+}
+
+/// The process-local part of a shared open file description: its identity,
+/// and the runtime lock that is never part of the model.
+#[derive(Debug, Serialize, Deserialize)]
+struct SharedOpenFile {
+    id: OpenFileId,
+    /// Serves `DetFd::directory_lock` for this process's aliases, as the
+    /// description's own lock does for a local description.
+    #[serde(skip)]
+    directory_lock: Arc<futures::lock::Mutex<()>>,
+}
+
+/// The canonical model of an open file description that several guest
+/// processes share. Detcore's global state stores it, and a
+/// [`SharedOpenFileChannel`] carries it to and from the process that holds
+/// the lease. Its contents are private to Detcore.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OpenFileModel(OpenFileDescription);
+
+/// The canonical model of one shared open file description, taken by one
+/// process for the length of one synchronous `DetFd` method call.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OpenFileLease {
+    /// The open file description the lease covers.
+    pub id: OpenFileId,
+    /// Names this lease, so that the global state can refuse a late,
+    /// duplicate or foreign publish.
+    pub sequence: u64,
+    /// The canonical model as of the take.
+    pub model: OpenFileModel,
+}
+
+/// A failure to take or publish a shared open file description.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedOpenFileError(pub String);
+
+impl fmt::Display for SharedOpenFileError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SharedOpenFileError {}
+
+/// Synchronous access to the canonical models of shared open file
+/// descriptions.
+///
+/// A `DetFd` method on a shared handle calls `take`, runs its synchronous
+/// body on the model, and calls `publish`, all while it holds the handle's
+/// local lock and without awaiting. So a lease never outlives one method
+/// call. Detcore names no backend here: the backend that runs Detcore inside
+/// each guest process installs an implementation with
+/// [`install_shared_open_file_channel`].
+pub trait SharedOpenFileChannel: Send + Sync {
+    /// Takes the canonical model of `id` and starts a lease on it.
+    fn take(&self, id: OpenFileId) -> Result<OpenFileLease, SharedOpenFileError>;
+
+    /// Stores `lease.model` as the canonical model of `lease.id` and ends the
+    /// lease. A publish that does not name the current lease is refused.
+    fn publish(&self, lease: OpenFileLease) -> Result<(), SharedOpenFileError>;
+}
+
+static SHARED_OPEN_FILE_CHANNEL: OnceLock<Box<dyn SharedOpenFileChannel>> = OnceLock::new();
+
+/// Installs this process's channel to shared open file descriptions. Only the
+/// first channel installed in a process is retained; a later one is returned.
+pub fn install_shared_open_file_channel(
+    channel: Box<dyn SharedOpenFileChannel>,
+) -> Result<(), Box<dyn SharedOpenFileChannel>> {
+    SHARED_OPEN_FILE_CHANNEL.set(channel)
+}
+
+/// Runs `f` on the canonical model of the shared open file description `id`.
+///
+/// A missing channel, a failed take or publish, or a lease for another
+/// description is an infrastructure failure, not something the guest's
+/// syscall can report, so it panics. The model is published even when `f`
+/// returns an error value, so the lease always ends; `f` itself decides what
+/// it changed. If `f` panics, the lease is never published and the process
+/// is lost with it.
+fn with_shared_description<R>(id: OpenFileId, f: impl FnOnce(&mut OpenFileDescription) -> R) -> R {
+    let channel = SHARED_OPEN_FILE_CHANNEL.get().unwrap_or_else(|| {
+        panic!(
+            "open file description {id:?} is shared, but no shared open file channel is installed"
+        )
+    });
+    let mut lease = channel.take(id).unwrap_or_else(|error| {
+        panic!("taking shared open file description {id:?} failed: {error}")
+    });
+    assert_eq!(
+        lease.id, id,
+        "the shared open file channel returned a lease for another description"
+    );
+    assert_eq!(
+        lease.model.0.id, id,
+        "the shared open file channel returned the model of another description"
+    );
+    let result = f(&mut lease.model.0);
+    channel.publish(lease).unwrap_or_else(|error| {
+        panic!("publishing shared open file description {id:?} failed: {error}")
+    });
+    result
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -264,7 +390,7 @@ impl DetFd {
         DetFd {
             fd,
             fd_flags: bits & OFlag::O_CLOEXEC.bits(),
-            open_file: Arc::new(Mutex::new(OpenFileDescription {
+            open_file: Arc::new(Mutex::new(OpenFileState::Local(OpenFileDescription {
                 id,
                 ty,
                 pidfd_target: None,
@@ -291,12 +417,21 @@ impl DetFd {
                 flock_mode_ever_known: true,
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
-            })),
+            }))),
         }
     }
 
-    fn description(&self) -> MutexGuard<'_, OpenFileDescription> {
-        self.open_file.lock().expect("open file mutex poisoned")
+    /// Runs `f` on this open file description's model while holding the lock
+    /// every alias shares. One call is one atomic step on the model, whether
+    /// the model is local or shared (see [`OpenFileState`]). `f` must not
+    /// access this description through another `DetFd` method or alias, and
+    /// must not await.
+    fn with_description<R>(&self, f: impl FnOnce(&mut OpenFileDescription) -> R) -> R {
+        let mut state = self.open_file.lock().expect("open file mutex poisoned");
+        match &mut *state {
+            OpenFileState::Local(description) => f(description),
+            OpenFileState::Shared(shared) => with_shared_description(shared.id, f),
+        }
     }
 
     /// update fd
@@ -306,7 +441,7 @@ impl DetFd {
     }
     /// change fd type
     pub fn with_type(self, ty: FdType) -> Self {
-        self.description().ty = ty;
+        self.with_description(|d| d.ty = ty);
         self
     }
     /// Set per-slot descriptor flags on a newly duplicated fd.
@@ -316,38 +451,42 @@ impl DetFd {
     }
     /// set path associated with `fd`
     pub fn with_path<P: AsRef<Path>>(self, path: P) -> Self {
-        self.description().path = Some(PathBuf::from(path.as_ref()));
+        let path = Some(PathBuf::from(path.as_ref()));
+        self.with_description(|d| d.path = path);
         self
     }
     /// set virtual inode
     pub fn with_inode(self, inode: DetInode) -> Self {
-        self.description().inode = Some(inode);
+        self.with_description(|d| d.inode = Some(inode));
         self
     }
     /// set dirty flag
     pub fn with_dirty(self, dirty: bool) -> Self {
-        self.description().dirty = dirty;
+        self.with_description(|d| d.dirty = dirty);
         self
     }
     /// update statbuf
     pub fn with_stat<S: Into<Option<DetStat>>>(self, stat: S) -> Self {
-        self.description().stat = stat.into();
+        let stat = stat.into();
+        self.with_description(|d| d.stat = stat);
         self
     }
     /// set resource id
     pub fn with_resource<S: Into<Option<ResourceID>>>(self, resource: S) -> Self {
-        self.description().resource = resource.into();
+        let resource = resource.into();
+        self.with_description(|d| d.resource = resource);
         self
     }
 
     /// Update the scheduler resource shared by aliases of this open file.
     pub(crate) fn set_resource<S: Into<Option<ResourceID>>>(&self, resource: S) {
-        self.description().resource = resource.into();
+        let resource = resource.into();
+        self.with_description(|d| d.resource = resource);
     }
 
     /// If fd is non blocking
     pub fn is_nonblocking(&self) -> bool {
-        oflags_nonblocking(self.description().status_flags)
+        self.with_description(|d| oflags_nonblocking(d.status_flags))
     }
 
     /// Whether close-on-exec is set for this descriptor slot.
@@ -366,13 +505,14 @@ impl DetFd {
     /// Detcore forces the fd physically nonblocking for the scheduler, update the
     /// logical view alone via [`Self::set_logical_nonblocking`].
     pub fn set_nonblocking(&self, enabled: bool) {
-        let mut description = self.description();
-        if enabled {
-            description.status_flags |= OFlag::O_NONBLOCK.bits();
-        } else {
-            description.status_flags &= !OFlag::O_NONBLOCK.bits();
-        }
-        description.physically_nonblocking = enabled;
+        self.with_description(|description| {
+            if enabled {
+                description.status_flags |= OFlag::O_NONBLOCK.bits();
+            } else {
+                description.status_flags &= !OFlag::O_NONBLOCK.bits();
+            }
+            description.physically_nonblocking = enabled;
+        })
     }
 
     /// Update only the logical (guest-visible) O_NONBLOCK status flag, leaving
@@ -380,12 +520,13 @@ impl DetFd {
     /// clear O_NONBLOCK while Detcore keeps the fd physically nonblocking, which
     /// the scheduler relies on for nonblockize-and-retry.
     pub fn set_logical_nonblocking(&self, enabled: bool) {
-        let mut description = self.description();
-        if enabled {
-            description.status_flags |= OFlag::O_NONBLOCK.bits();
-        } else {
-            description.status_flags &= !OFlag::O_NONBLOCK.bits();
-        }
+        self.with_description(|description| {
+            if enabled {
+                description.status_flags |= OFlag::O_NONBLOCK.bits();
+            } else {
+                description.status_flags &= !OFlag::O_NONBLOCK.bits();
+            }
+        })
     }
 
     /// Makes this descriptor refer to `other`'s open file description object.
@@ -393,9 +534,13 @@ impl DetFd {
         self.open_file = Arc::clone(&other.open_file);
     }
 
-    /// Stable identity shared by dup and fork aliases.
+    /// Stable identity shared by dup and fork aliases. A shared handle keeps
+    /// its identity locally, so this never takes the canonical model.
     pub fn open_file_id(&self) -> OpenFileId {
-        self.description().id
+        match &*self.open_file.lock().expect("open file mutex poisoned") {
+            OpenFileState::Local(description) => description.id,
+            OpenFileState::Shared(shared) => shared.id,
+        }
     }
 
     /// Number of modeled descriptor slots that retain this open file description.
@@ -405,24 +550,25 @@ impl DetFd {
 
     /// File type attached to the open file description.
     pub fn ty(&self) -> FdType {
-        self.description().ty
+        self.with_description(|d| d.ty)
     }
 
     /// Record the process identity carried by a newly created pidfd.
     pub(crate) fn set_pidfd_target(&self, target: DetPid) {
-        let mut description = self.description();
-        debug_assert_eq!(description.ty, FdType::Pidfd);
-        description.pidfd_target = Some(target);
+        self.with_description(|description| {
+            debug_assert_eq!(description.ty, FdType::Pidfd);
+            description.pidfd_target = Some(target);
+        })
     }
 
     /// Return the process identity carried by this pidfd, when known.
     pub(crate) fn pidfd_target(&self) -> Option<DetPid> {
-        self.description().pidfd_target
+        self.with_description(|d| d.pidfd_target)
     }
 
     /// Resource attached to the open file description.
     pub fn resource(&self) -> Option<ResourceID> {
-        self.description().resource.clone()
+        self.with_description(|d| d.resource.clone())
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -430,7 +576,7 @@ impl DetFd {
     /// Return the cursor shared by aliases of this random-device open file.
     #[cfg(test)]
     pub(crate) fn random_device_offset(&self) -> u64 {
-        self.description().random_device_offset
+        self.with_description(|d| d.random_device_offset)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -438,10 +584,11 @@ impl DetFd {
     /// Advance the cursor shared by aliases of this random-device open file.
     #[cfg(test)]
     pub(crate) fn advance_random_device_offset(&self, count: usize) {
-        let mut description = self.description();
-        description.random_device_offset = description
-            .random_device_offset
-            .saturating_add(count as u64);
+        self.with_description(|description| {
+            description.random_device_offset = description
+                .random_device_offset
+                .saturating_add(count as u64);
+        })
     }
 
     /// Copy from the shared random-device cursor and commit the returned byte count.
@@ -457,44 +604,44 @@ impl DetFd {
         &self,
         copy: impl FnOnce(u64) -> Result<usize, R>,
     ) -> Result<usize, R> {
-        let mut description = self.description();
-        let copied = copy(description.random_device_offset)?;
-        description.random_device_offset = description
-            .random_device_offset
-            .saturating_add(copied as u64);
-        Ok(copied)
+        self.with_description(|description| {
+            let copied = copy(description.random_device_offset)?;
+            description.random_device_offset = description
+                .random_device_offset
+                .saturating_add(copied as u64);
+            Ok(copied)
+        })
     }
 
     /// Path used to open this file description, when it was observable.
     pub(crate) fn path(&self) -> Option<PathBuf> {
-        self.description().path.clone()
+        self.with_description(|d| d.path.clone())
     }
 
     /// Record the resolved path used to open this file description.
     pub(crate) fn set_path<P: AsRef<Path>>(&self, path: P) {
-        self.description().path = Some(path.as_ref().to_path_buf());
+        let path = Some(path.as_ref().to_path_buf());
+        self.with_description(|d| d.path = path);
     }
 
     /// Attach deterministic procfs snapshot state to this open file description.
     pub(crate) fn set_procfs(&self, procfs: ProcfsFile) {
-        self.description().procfs = Some(procfs);
+        self.with_description(|d| d.procfs = Some(procfs));
     }
 
     /// Whether this procfs open file description still needs its initial snapshot.
     pub(crate) fn procfs_needs_snapshot(&self) -> bool {
-        self.description()
-            .procfs
-            .as_ref()
-            .is_some_and(ProcfsFile::needs_snapshot)
+        self.with_description(|d| d.procfs.as_ref().is_some_and(ProcfsFile::needs_snapshot))
     }
 
     /// Whether reads of this open file description are served from a procfs
     /// snapshot, already taken or still to be taken.
     pub(crate) fn procfs_serves_snapshot(&self) -> bool {
-        self.description()
-            .procfs
-            .as_ref()
-            .is_some_and(|procfs| procfs.needs_snapshot() || procfs.position().1.is_some())
+        self.with_description(|d| {
+            d.procfs
+                .as_ref()
+                .is_some_and(|procfs| procfs.needs_snapshot() || procfs.position().1.is_some())
+        })
     }
 
     /// Whether this procfs snapshot consumes deterministic random bytes.
@@ -503,85 +650,83 @@ impl DetFd {
     /// Whether this snapshot has maps-format headers needing determinized
     /// device and inode columns.
     pub(crate) fn procfs_needs_mapping_identities(&self) -> bool {
-        self.description()
-            .procfs
-            .as_ref()
-            .is_some_and(ProcfsFile::needs_mapping_identities)
+        self.with_description(|d| {
+            d.procfs
+                .as_ref()
+                .is_some_and(ProcfsFile::needs_mapping_identities)
+        })
     }
 
     /// Whether this procfs file lists the guest's own address space, so
     /// its capture must not create a mapping that the listing would show.
     pub(crate) fn procfs_lists_address_space(&self) -> bool {
-        self.description()
-            .procfs
-            .as_ref()
-            .is_some_and(ProcfsFile::lists_address_space)
+        self.with_description(|d| {
+            d.procfs
+                .as_ref()
+                .is_some_and(ProcfsFile::lists_address_space)
+        })
     }
 
     pub(crate) fn procfs_needs_mountinfo_identities(&self) -> bool {
-        self.description()
-            .procfs
-            .as_ref()
-            .is_some_and(ProcfsFile::needs_mountinfo_identities)
+        self.with_description(|d| {
+            d.procfs
+                .as_ref()
+                .is_some_and(ProcfsFile::needs_mountinfo_identities)
+        })
     }
 
     pub(crate) fn procfs_needs_random_uuid(&self) -> bool {
-        self.description()
-            .procfs
-            .as_ref()
-            .is_some_and(ProcfsFile::needs_random_uuid)
+        self.with_description(|d| d.procfs.as_ref().is_some_and(ProcfsFile::needs_random_uuid))
     }
 
     pub(crate) fn procfs_needs_boot_time(&self) -> bool {
-        self.description()
-            .procfs
-            .as_ref()
-            .is_some_and(ProcfsFile::needs_boot_time)
+        self.with_description(|d| d.procfs.as_ref().is_some_and(ProcfsFile::needs_boot_time))
     }
 
     /// Initialize the deterministic snapshot shared by all aliases.
     // TODO-HUMAN-REVIEW(PR-723): Review procfs snapshot identity parameters.
     // TODO-HUMAN-REVIEW(PR-955): Review deterministic UUID snapshot input.
     pub(crate) fn initialize_procfs(&self, contents: Vec<u8>, context: ProcfsSnapshotContext) {
-        self.description()
-            .procfs
-            .as_mut()
-            .expect("procfs fd disappeared while taking its snapshot")
-            .initialize(contents, context);
+        self.with_description(|d| {
+            d.procfs
+                .as_mut()
+                .expect("procfs fd disappeared while taking its snapshot")
+                .initialize(contents, context)
+        });
     }
 
     /// Preview the snapshot bytes at its shared offset, with that offset,
     /// without consuming them.
     pub(crate) fn preview_procfs(&self, maximum: usize) -> Option<(usize, Vec<u8>)> {
-        let description = self.description();
-        let procfs = description.procfs.as_ref()?;
-        let (offset, _) = procfs.position();
-        procfs.take_at(offset, maximum).map(|bytes| (offset, bytes))
+        self.with_description(|description| {
+            let procfs = description.procfs.as_ref()?;
+            let (offset, _) = procfs.position();
+            procfs.take_at(offset, maximum).map(|bytes| (offset, bytes))
+        })
     }
 
     /// Advance the shared offset by the bytes a read copied to the guest.
     pub(crate) fn commit_procfs_read(&self, offset: usize, copied: usize) {
-        self.description()
-            .procfs
-            .as_mut()
-            .expect("procfs fd disappeared while committing a read")
-            .commit_read(offset, copied);
+        self.with_description(|d| {
+            d.procfs
+                .as_mut()
+                .expect("procfs fd disappeared while committing a read")
+                .commit_read(offset, copied)
+        });
     }
 
     /// Read a deterministic procfs snapshot without changing its shared cursor.
     pub(crate) fn take_procfs_at(&self, offset: usize, maximum: usize) -> Option<Vec<u8>> {
-        self.description()
-            .procfs
-            .as_ref()
-            .and_then(|procfs| procfs.take_at(offset, maximum))
+        self.with_description(|d| {
+            d.procfs
+                .as_ref()
+                .and_then(|procfs| procfs.take_at(offset, maximum))
+        })
     }
 
     /// Namespace-visible task id and stable proc inode bound at open time.
     pub(crate) fn procfs_timer_slack_binding(&self) -> Option<(i32, u64, u64)> {
-        self.description()
-            .procfs
-            .as_ref()
-            .and_then(ProcfsFile::timer_slack_binding)
+        self.with_description(|d| d.procfs.as_ref().and_then(ProcfsFile::timer_slack_binding))
     }
 
     /// Preview bytes without consuming the snapshot shared by dup/fork aliases.
@@ -590,10 +735,11 @@ impl DetFd {
         value: u64,
         maximum: usize,
     ) -> Option<TimerSlackReadPreview> {
-        self.description()
-            .procfs
-            .as_ref()
-            .and_then(|procfs| procfs.preview_timer_slack(value, maximum))
+        self.with_description(|d| {
+            d.procfs
+                .as_ref()
+                .and_then(|procfs| procfs.preview_timer_slack(value, maximum))
+        })
     }
 
     /// Commit bytes only after their guest-memory copy succeeds.
@@ -602,11 +748,12 @@ impl DetFd {
         preview: &TimerSlackReadPreview,
         copied: usize,
     ) {
-        self.description()
-            .procfs
-            .as_mut()
-            .expect("timer-slack procfs state disappeared")
-            .commit_timer_slack_read(preview, copied);
+        self.with_description(|d| {
+            d.procfs
+                .as_mut()
+                .expect("timer-slack procfs state disappeared")
+                .commit_timer_slack_read(preview, copied)
+        });
     }
 
     /// Read a fresh timer-slack value at an explicit offset.
@@ -616,29 +763,36 @@ impl DetFd {
         offset: usize,
         maximum: usize,
     ) -> Option<Vec<u8>> {
-        self.description()
-            .procfs
-            .as_ref()
-            .and_then(|procfs| procfs.take_timer_slack_at(value, offset, maximum))
+        self.with_description(|d| {
+            d.procfs
+                .as_ref()
+                .and_then(|procfs| procfs.take_timer_slack_at(value, offset, maximum))
+        })
     }
 
     /// The lock serializing `getdents` and `lseek` on this open file
-    /// description across every alias of it.
+    /// description across every alias of it. For a shared description it
+    /// covers only this process's aliases: the lock protects unsequentialized
+    /// threads, and a description is shared only where threads are
+    /// sequentialized.
     pub(crate) fn directory_lock(&self) -> Arc<futures::lock::Mutex<()>> {
-        Arc::clone(&self.description().directory_lock)
+        match &*self.open_file.lock().expect("open file mutex poisoned") {
+            OpenFileState::Local(description) => Arc::clone(&description.directory_lock),
+            OpenFileState::Shared(shared) => Arc::clone(&shared.directory_lock),
+        }
     }
 
     /// Whether a `getdents` call has created a directory stream here. Only a
     /// successful read of the host directory creates one, so this also proves
     /// the open file is a directory.
     pub(crate) fn has_directory_stream(&self) -> bool {
-        self.description().directory.is_some()
+        self.with_description(|d| d.directory.is_some())
     }
 
     /// Whether `getdents` on this open file reads the host directory one
     /// kernel buffer at a time instead of from a sorted stream.
     pub(crate) fn directory_in_host_order(&self) -> bool {
-        self.description().directory_host_order
+        self.with_description(|d| d.directory_host_order)
     }
 
     /// Read this open file's directory one kernel buffer at a time until it
@@ -649,32 +803,35 @@ impl DetFd {
     /// with `EINVAL`, as Linux does. Any stream is dropped, so `lseek`
     /// reaches the kernel again.
     pub(crate) fn use_host_directory_order(&self) {
-        let mut description = self.description();
-        description.directory_host_order = true;
-        description.directory = None;
+        self.with_description(|description| {
+            description.directory_host_order = true;
+            description.directory = None;
+        })
     }
 
     /// Serve this open file's directory as a sorted stream again, from its
     /// next `getdents`: its kernel position is back at 0.
     pub(crate) fn use_directory_stream(&self) {
-        self.description().directory_host_order = false;
+        self.with_description(|d| d.directory_host_order = false);
     }
 
     /// Whether the next `getdents` must read the host directory.
     pub(crate) fn directory_needs_snapshot(&self) -> bool {
-        self.description()
-            .directory
-            .as_ref()
-            .is_none_or(DirectoryStream::needs_snapshot)
+        self.with_description(|d| {
+            d.directory
+                .as_ref()
+                .is_none_or(DirectoryStream::needs_snapshot)
+        })
     }
 
     /// Install a snapshot freshly read in host order, creating the stream at
     /// position 0 if this is the open file's first `getdents`.
     pub(crate) fn install_directory_snapshot(&self, entries: Vec<DirEntry>) {
-        self.description()
-            .directory
-            .get_or_insert_with(DirectoryStream::default)
-            .install(entries);
+        self.with_description(|d| {
+            d.directory
+                .get_or_insert_with(DirectoryStream::default)
+                .install(entries)
+        });
     }
 
     /// Run `f` on the directory stream shared by every alias of this open file.
@@ -684,78 +841,73 @@ impl DetFd {
         &self,
         f: impl FnOnce(&mut DirectoryStream) -> R,
     ) -> Result<R, Errno> {
-        self.description()
-            .directory
-            .as_mut()
-            .map(f)
-            .ok_or(Errno::EBADF)
+        self.with_description(|d| d.directory.as_mut().map(f).ok_or(Errno::EBADF))
     }
 
     /// Return the shared procfs cursor and initialized snapshot length.
     pub(crate) fn procfs_position(&self) -> Option<(usize, Option<usize>)> {
-        self.description().procfs.as_ref().map(ProcfsFile::position)
+        self.with_description(|d| d.procfs.as_ref().map(ProcfsFile::position))
     }
 
     pub(crate) fn procfs_target_fd(&self) -> Option<i32> {
-        self.description()
-            .procfs
-            .as_ref()
-            .and_then(ProcfsFile::target_fd)
+        self.with_description(|d| d.procfs.as_ref().and_then(ProcfsFile::target_fd))
     }
 
     /// Update the cursor shared by every alias of a procfs open file.
     pub(crate) fn set_procfs_offset(&self, offset: usize) {
-        self.description()
-            .procfs
-            .as_mut()
-            .expect("procfs fd disappeared while updating its offset")
-            .set_offset(offset);
+        self.with_description(|d| {
+            d.procfs
+                .as_mut()
+                .expect("procfs fd disappeared while updating its offset")
+                .set_offset(offset)
+        });
     }
 
     /// Cached stat data attached to the backing object.
     pub fn stat(&self) -> Option<DetStat> {
-        self.description().stat
+        self.with_description(|d| d.stat)
     }
 
     /// Whether Detcore has made the open file description physically nonblocking.
     pub fn physically_nonblocking(&self) -> bool {
-        self.description().physically_nonblocking
+        self.with_description(|d| d.physically_nonblocking)
     }
 
     pub(crate) fn status_flags(&self) -> i32 {
-        self.description().status_flags
+        self.with_description(|d| d.status_flags)
     }
 
     /// Mark every alias of this open file description physically nonblocking.
     pub fn set_physically_nonblocking(&self) {
-        self.description().physically_nonblocking = true;
+        self.with_description(|d| d.physically_nonblocking = true);
     }
 
     /// Update file status flags for every alias of this open file description.
     pub fn set_status_flags(&self, flags: i32) {
-        let mut description = self.description();
-        // F_SETFL cannot change how this description was opened. Access
-        // checks must retain these bits even when an alias passes only
-        // O_NONBLOCK (whose access-mode bits happen to spell O_RDONLY).
-        let mutable = (OFlag::O_APPEND
-            | OFlag::O_ASYNC
-            | OFlag::O_DIRECT
-            | OFlag::O_NOATIME
-            | OFlag::O_NONBLOCK)
-            .bits();
-        description.status_flags = (description.status_flags & !mutable) | (flags & mutable);
-        description.physically_nonblocking = oflags_nonblocking(description.status_flags);
+        self.with_description(|description| {
+            // F_SETFL cannot change how this description was opened. Access
+            // checks must retain these bits even when an alias passes only
+            // O_NONBLOCK (whose access-mode bits happen to spell O_RDONLY).
+            let mutable = (OFlag::O_APPEND
+                | OFlag::O_ASYNC
+                | OFlag::O_DIRECT
+                | OFlag::O_NOATIME
+                | OFlag::O_NONBLOCK)
+                .bits();
+            description.status_flags = (description.status_flags & !mutable) | (flags & mutable);
+            description.physically_nonblocking = oflags_nonblocking(description.status_flags);
+        })
     }
 
     // TODO-HUMAN-REVIEW(PR-912): Review open-file sharing of socket receive timestamps.
     /// Record the logical time at which a socket delivered its most recent packet.
     pub(crate) fn set_socket_receive_timestamp(&self, timestamp: LogicalTime) {
-        self.description().socket_receive_timestamp = Some(timestamp);
+        self.with_description(|d| d.socket_receive_timestamp = Some(timestamp));
     }
 
     /// Return the last receive timestamp shared by every alias of this socket.
     pub(crate) fn socket_receive_timestamp(&self) -> Option<LogicalTime> {
-        self.description().socket_receive_timestamp
+        self.with_description(|d| d.socket_receive_timestamp)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -763,67 +915,67 @@ impl DetFd {
     /// Mark this open file as a `NETLINK_SOCK_DIAG` socket. Shared across every
     /// dup/fork alias of the same open file description.
     pub(crate) fn set_sock_diag(&self) {
-        self.description().sock_diag = true;
+        self.with_description(|d| d.sock_diag = true);
     }
 
     // TODO-HUMAN-REVIEW(PR-1064)
     /// Whether this open file is a `NETLINK_SOCK_DIAG` socket whose dump replies
     /// must have their socket inode numbers determinized.
     pub(crate) fn is_sock_diag(&self) -> bool {
-        self.description().sock_diag
+        self.with_description(|d| d.sock_diag)
     }
 
     /// Mark this open file as a `NETLINK_ROUTE` socket. Like `set_sock_diag`
     /// this applies to the open file description, so a dup or fork alias of the
     /// same socket is covered too.
     pub(crate) fn set_netlink_route(&self) {
-        self.description().netlink_route = true;
+        self.with_description(|d| d.netlink_route = true);
     }
 
     /// Whether this open file is a `NETLINK_ROUTE` socket whose link-dump
     /// replies carry live interface counters.
     pub(crate) fn is_netlink_route(&self) -> bool {
-        self.description().netlink_route
+        self.with_description(|d| d.netlink_route)
     }
 
     /// Update whether this open file is connected to a loopback peer.
     pub(crate) fn set_loopback_peer(&self, loopback_peer: bool) {
-        self.description().loopback_peer = loopback_peer;
+        self.with_description(|d| d.loopback_peer = loopback_peer);
     }
 
     /// Whether this open file is a socket connected to a loopback peer.
     pub(crate) fn is_loopback_peer(&self) -> bool {
-        self.description().loopback_peer
+        self.with_description(|d| d.loopback_peer)
     }
 
     /// Mark this open file as an external network trace channel.
     pub(crate) fn set_network_channel(&self) {
-        self.description().network_channel = true;
+        self.with_description(|d| d.network_channel = true);
     }
 
     /// Whether this open file is an external network trace channel.
     pub(crate) fn is_network_channel(&self) -> bool {
-        self.description().network_channel
+        self.with_description(|d| d.network_channel)
     }
 
     /// Record the socket's `SO_RCVLOWAT`.
     pub(crate) fn set_network_lowat(&self, lowat: usize) {
-        self.description().network_lowat = Some(lowat);
+        self.with_description(|d| d.network_lowat = Some(lowat));
     }
 
     /// The socket's `SO_RCVLOWAT`.
     pub(crate) fn network_lowat(&self) -> usize {
-        self.description().network_lowat.unwrap_or(1)
+        self.with_description(|d| d.network_lowat.unwrap_or(1))
     }
 
     /// Record the socket's family and type for the network trace.
     pub(crate) fn set_network_socket(&self, kind: NetworkSocketKind) {
-        self.description().network_socket = kind;
+        self.with_description(|d| d.network_socket = kind);
     }
 
     /// The socket's family and type as the network trace classified it.
     pub(crate) fn network_socket(&self) -> NetworkSocketKind {
-        self.description().network_socket
+        self.with_description(|d| d.network_socket)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -834,10 +986,11 @@ impl DetFd {
     /// `Some(None)` means known-unlocked; `Some(Some(mode))` means the kernel
     /// granted `LOCK_SH` or `LOCK_EX` through this handler.
     pub(crate) fn known_flock_mode(&self) -> Option<Option<i32>> {
-        let description = self.description();
-        description
-            .flock_mode_known
-            .then_some(description.flock_mode)
+        self.with_description(|description| {
+            description
+                .flock_mode_known
+                .then_some(description.flock_mode)
+        })
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -846,35 +999,39 @@ impl DetFd {
     /// `dup`/`fork` alias observes the change, matching the kernel, where one
     /// `flock` lock belongs to the whole open file description.
     pub(crate) fn set_flock_mode(&self, mode: Option<i32>) {
-        let mut description = self.description();
-        if description.flock_mode_known {
-            description.flock_mode = mode;
-        }
+        self.with_description(|description| {
+            if description.flock_mode_known {
+                description.flock_mode = mode;
+            }
+        })
     }
 
     /// Mark the kernel lock state unknown without changing the kernel lock.
     /// This is required for live-discovered and externally received file
     /// descriptions, whose history Detcore did not observe.
     pub(crate) fn forget_flock_mode(&self) {
-        let mut description = self.description();
-        description.flock_mode = None;
-        description.flock_mode_known = false;
+        self.with_description(|description| {
+            description.flock_mode = None;
+            description.flock_mode_known = false;
+        })
     }
 
     /// Record that Detcore never observed this description's lock history, as
     /// opposed to having known it and then invalidated it. Used for descriptors
     /// that existed before Detcore began observing the guest.
     pub(crate) fn mark_flock_mode_unobserved(&self) {
-        let mut description = self.description();
-        description.flock_mode = None;
-        description.flock_mode_known = false;
-        description.flock_mode_ever_known = false;
+        self.with_description(|description| {
+            description.flock_mode = None;
+            description.flock_mode_known = false;
+            description.flock_mode_ever_known = false;
+        })
     }
 
     /// True when a cached lock claim existed and may now be wrong.
     pub(crate) fn flock_mode_may_be_stale(&self) -> bool {
-        let description = self.description();
-        description.flock_mode_ever_known && !description.flock_mode_known
+        self.with_description(|description| {
+            description.flock_mode_ever_known && !description.flock_mode_known
+        })
     }
 }
 
@@ -906,6 +1063,29 @@ pub(crate) fn intern_open_files(handles: &mut std::collections::HashMap<RawFd, D
                 first.insert(detfd.open_file_id(), detfd.clone());
             }
         }
+    }
+}
+
+impl DetFd {
+    /// Moves this open file description's model out to a test's canonical
+    /// store and makes every alias a shared handle, keeping this process's
+    /// directory lock. The real promotion is a later step.
+    #[cfg(test)]
+    fn share_for_test(&self) -> OpenFileModel {
+        let mut state = self.open_file.lock().expect("open file mutex poisoned");
+        let OpenFileState::Local(description) = &*state else {
+            panic!("open file description is already shared");
+        };
+        let shared = SharedOpenFile {
+            id: description.id,
+            directory_lock: Arc::clone(&description.directory_lock),
+        };
+        let OpenFileState::Local(description) =
+            std::mem::replace(&mut *state, OpenFileState::Shared(shared))
+        else {
+            unreachable!("checked above");
+        };
+        OpenFileModel(description)
     }
 }
 
@@ -1242,8 +1422,8 @@ mod tests {
         for initial in [u64::MAX - 2, u64::MAX] {
             let whole = DetFd::new(3, OFlag::empty(), FdType::Rng, OpenFileId::new(owner, 0));
             let split = DetFd::new(4, OFlag::empty(), FdType::Rng, OpenFileId::new(owner, 1));
-            whole.description().random_device_offset = initial;
-            split.description().random_device_offset = initial;
+            whole.with_description(|d| d.random_device_offset = initial);
+            split.with_description(|d| d.random_device_offset = initial);
 
             assert_eq!(
                 whole.with_random_device_stream(|offset| {
@@ -1300,6 +1480,41 @@ mod tests {
         assert_eq!(original.random_device_offset(), 5);
     }
 
+    /// A path argument whose conversion checks that no alias's description
+    /// lock is held while it converts.
+    struct PathProbe {
+        alias: DetFd,
+    }
+
+    impl AsRef<Path> for PathProbe {
+        fn as_ref(&self) -> &Path {
+            assert!(
+                self.alias.open_file.try_lock().is_ok(),
+                "an argument conversion ran under the description lock"
+            );
+            Path::new("/probe")
+        }
+    }
+
+    #[test]
+    fn argument_conversions_run_before_the_description_lock() {
+        let original = DetFd::new(
+            3,
+            OFlag::O_RDONLY,
+            FdType::Regular,
+            OpenFileId::new(DetTid::from_raw(11), 0),
+        );
+        let alias = original.clone().with_fd(4);
+        original.set_path(PathProbe {
+            alias: alias.clone(),
+        });
+        let original = original.with_path(PathProbe {
+            alias: alias.clone(),
+        });
+        assert_eq!(alias.path(), Some(PathBuf::from("/probe")));
+        drop(original);
+    }
+
     #[test]
     fn separate_opens_have_distinct_identity() {
         let owner = DetTid::from_raw(10);
@@ -1317,5 +1532,184 @@ mod tests {
         );
 
         assert_ne!(first.open_file_id(), second.open_file_id());
+    }
+
+    /// The canonical store of the tests' shared open file descriptions, and
+    /// the channel installed for this test process. Each test uses its own
+    /// creator task, so tests running in parallel never share a description.
+    #[derive(Default)]
+    struct MemoryChannel {
+        store: Mutex<std::collections::HashMap<OpenFileId, Canonical>>,
+    }
+
+    struct Canonical {
+        /// `None` while a lease holds the model.
+        model: Option<OpenFileModel>,
+        sequence: u64,
+        takes: usize,
+    }
+
+    struct InstalledMemoryChannel(&'static MemoryChannel);
+
+    impl SharedOpenFileChannel for InstalledMemoryChannel {
+        fn take(&self, id: OpenFileId) -> Result<OpenFileLease, SharedOpenFileError> {
+            let mut store = self.0.store.lock().unwrap();
+            let canonical = store
+                .get_mut(&id)
+                .ok_or_else(|| SharedOpenFileError(format!("{id:?} is not shared")))?;
+            let model = canonical
+                .model
+                .take()
+                .ok_or_else(|| SharedOpenFileError(format!("{id:?} is already leased")))?;
+            canonical.sequence += 1;
+            canonical.takes += 1;
+            Ok(OpenFileLease {
+                id,
+                sequence: canonical.sequence,
+                model,
+            })
+        }
+
+        fn publish(&self, lease: OpenFileLease) -> Result<(), SharedOpenFileError> {
+            let mut store = self.0.store.lock().unwrap();
+            let canonical = store
+                .get_mut(&lease.id)
+                .ok_or_else(|| SharedOpenFileError(format!("{:?} is not shared", lease.id)))?;
+            if canonical.model.is_some() || canonical.sequence != lease.sequence {
+                return Err(SharedOpenFileError(format!(
+                    "{:?}: publish names no current lease",
+                    lease.id
+                )));
+            }
+            canonical.model = Some(lease.model);
+            Ok(())
+        }
+    }
+
+    impl MemoryChannel {
+        fn installed() -> &'static MemoryChannel {
+            static CHANNEL: OnceLock<MemoryChannel> = OnceLock::new();
+            let channel = CHANNEL.get_or_init(MemoryChannel::default);
+            // Only the first installation is kept, and it is this channel.
+            let _ = install_shared_open_file_channel(Box::new(InstalledMemoryChannel(channel)));
+            channel
+        }
+
+        fn share(&self, detfd: &DetFd) {
+            let model = detfd.share_for_test();
+            let previous = self.store.lock().unwrap().insert(
+                model.0.id,
+                Canonical {
+                    model: Some(model),
+                    sequence: 0,
+                    takes: 0,
+                },
+            );
+            assert!(previous.is_none());
+        }
+
+        fn takes(&self, id: OpenFileId) -> usize {
+            self.store.lock().unwrap()[&id].takes
+        }
+
+        /// Runs `f` on the canonical model, which must not be leased.
+        fn canonical<R>(&self, id: OpenFileId, f: impl FnOnce(&OpenFileDescription) -> R) -> R {
+            let store = self.store.lock().unwrap();
+            f(&store[&id]
+                .model
+                .as_ref()
+                .expect("a lease outlived its method call")
+                .0)
+        }
+    }
+
+    #[test]
+    fn a_shared_handle_reaches_the_canonical_model_through_every_alias() {
+        let channel = MemoryChannel::installed();
+        let id = OpenFileId::new(DetTid::from_raw(9001), 0);
+        let original = DetFd::new(3, OFlag::O_RDWR, FdType::Regular, id);
+        let alias = original.clone().with_fd(4);
+        // A clone that escaped the descriptor table before the promotion.
+        let escaped = original.clone();
+        channel.share(&original);
+
+        alias.set_status_flags(OFlag::O_NONBLOCK.bits());
+        assert_eq!(channel.takes(id), 1);
+        assert!(channel.canonical(id, |model| oflags_nonblocking(model.status_flags)));
+        assert!(original.is_nonblocking());
+        assert!(escaped.is_nonblocking());
+        assert_eq!(
+            escaped.status_flags() & OFlag::O_ACCMODE.bits(),
+            OFlag::O_RDWR.bits()
+        );
+        assert_eq!(channel.takes(id), 4);
+        assert_eq!(original.open_file_alias_count(), 3);
+    }
+
+    #[test]
+    fn identity_and_directory_lock_never_take_the_shared_model() {
+        let channel = MemoryChannel::installed();
+        let id = OpenFileId::new(DetTid::from_raw(9002), 0);
+        let original = DetFd::new(3, OFlag::O_RDONLY, FdType::Regular, id);
+        let local_lock = original.directory_lock();
+        channel.share(&original);
+
+        assert_eq!(original.open_file_id(), id);
+        assert!(Arc::ptr_eq(&original.directory_lock(), &local_lock));
+        assert!(Arc::ptr_eq(
+            &original.clone().with_fd(4).directory_lock(),
+            &local_lock
+        ));
+        assert_eq!(channel.takes(id), 0);
+    }
+
+    #[test]
+    fn a_shared_handle_serializes_only_its_identity() {
+        let channel = MemoryChannel::installed();
+        let id = OpenFileId::new(DetTid::from_raw(9003), 0);
+        let original = DetFd::new(3, OFlag::O_RDONLY, FdType::Regular, id).with_path("/a");
+        channel.share(&original);
+
+        let encoded = serde_json::to_string(&original).unwrap();
+        assert!(encoded.contains("Shared"), "{encoded}");
+        assert!(!encoded.contains("status_flags"), "{encoded}");
+        assert!(!encoded.contains("/a"), "{encoded}");
+        assert_eq!(channel.takes(id), 0);
+
+        // A restored table interns its shared handles by identity, as it
+        // does local ones, without taking the model.
+        let mut handles = std::collections::HashMap::new();
+        for fd in [3, 4] {
+            let restored: DetFd = serde_json::from_str(&encoded).unwrap();
+            handles.insert(fd, restored.with_fd(fd));
+        }
+        intern_open_files(&mut handles);
+        assert_eq!(handles[&4].open_file_alias_count(), 2);
+        assert_eq!(channel.takes(id), 0);
+        assert_eq!(handles[&4].path(), Some(PathBuf::from("/a")));
+        assert_eq!(channel.takes(id), 1);
+    }
+
+    #[test]
+    fn a_failed_random_device_copy_still_ends_the_lease() {
+        let channel = MemoryChannel::installed();
+        let id = OpenFileId::new(DetTid::from_raw(9004), 0);
+        let original = DetFd::new(3, OFlag::empty(), FdType::Rng, id);
+        channel.share(&original);
+
+        assert_eq!(
+            original.with_random_device_stream(|_| Err::<usize, _>(())),
+            Err(())
+        );
+        assert_eq!(channel.canonical(id, |model| model.random_device_offset), 0);
+        assert_eq!(
+            original.with_random_device_stream(|offset| {
+                assert_eq!(offset, 0);
+                Ok::<_, ()>(5)
+            }),
+            Ok(5)
+        );
+        assert_eq!(channel.canonical(id, |model| model.random_device_offset), 5);
+        assert_eq!(channel.takes(id), 2);
     }
 }

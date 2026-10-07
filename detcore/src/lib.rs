@@ -169,6 +169,11 @@ impl std::fmt::Display for UnsupportedSyscallError {
 }
 
 impl std::error::Error for UnsupportedSyscallError {}
+pub use fd::OpenFileLease;
+pub use fd::OpenFileModel;
+pub use fd::SharedOpenFileChannel;
+pub use fd::SharedOpenFileError;
+pub use fd::install_shared_open_file_channel;
 pub use tool_local::Detcore;
 pub use tool_local::FileMetadata;
 /// Returns whether the audited runtime policy classifies `sysno` as unsupported.
