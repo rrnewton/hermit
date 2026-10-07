@@ -113,41 +113,57 @@ pub const PROCFS_MOUNTINFO_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// scheduler's signals to threads waiting outside the run queue: `fire_alarm`
 /// signals a thread parked in the scheduler's `rt_sigsuspend` pool, which must
 /// be released to report its own interrupted syscall, and an alarm the arming
-/// thread's suspend mask blocks must go to a waiter whose mask admits it. The
-/// guest is added by the commit that selects it, so the SHA names the
-/// scheduler source the evidence binary was built from; the ten consecutive
-/// strict verify runs used guest source sha256
-/// 3f017b5c2a38b388301e0528f6c54296e2a9906bf69f23b9fe1cc5d70fa70ba2.
+/// thread's suspend mask blocks must go to a waiter whose mask admits it. A
+/// third phase arms a periodic POSIX timer from a sibling that cannot take its
+/// signal and then exits; every expiry must wake the main thread's
+/// `rt_sigsuspend` within a bound of the expiry, so a copy sent to the
+/// sleeping or exiting sibling alone fails it. The cell passed ten consecutive
+/// strict verify runs (`run --strict --verify --verify-strict`, default log
+/// level, no relaxations), each on its first attempt with bitwise parity, with
+/// a stamped release build of the evidence SHA. That SHA contains every
+/// Hermit, Detcore and guest change of the series that added the cell; the
+/// series' later commits change only CI records. The runs used guest source
+/// sha256 d7a1c8e274ebc389bcea19d63c1e7021b9a238998f356c5e94b2b7e43a479222.
 pub const SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_SHA: &str =
-    "d3c13a40a243715c1688cb9ba3baa01ce37aed89";
-pub const SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T10:52:42Z";
+    "e1e53c5934652df03a8f93b4f3a9283feb9dfaf7";
+pub const SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-10-07T22:22:50Z";
 pub const SIGSUSPEND_ALARM_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// `c-programs/external-io-signal-interrupt` verify on ptrace, a new guest for
-/// https://github.com/rrnewton/hermit/issues/3222: an alarm must interrupt a
-/// thread blocked in `select` or `poll` outside the run queue with EINTR, even
-/// under SA_RESTART, and the interruption must be committed at a
-/// deterministic turn while a sibling keeps the scheduler busy. The cell
-/// passed ten consecutive strict verify runs, each on its first attempt, with
-/// a build of the evidence SHA, which is the last commit that changes how the
-/// scheduler sends signals; guest source sha256
-/// 498b0cc606dba6549c0805ddea281538eeae8d21ec314151bbec416e4d42362b.
+/// <https://github.com/rrnewton/hermit/issues/3222>: an alarm must interrupt a
+/// thread blocked in `select` outside the run queue with EINTR, even under
+/// SA_RESTART, and the interruption must be committed at a deterministic turn
+/// while a sibling keeps the scheduler busy; a `poll` phase, which Hermit
+/// services inside the run queue, is the control. The cell passed ten
+/// consecutive strict verify runs (`run --strict --verify --verify-strict`,
+/// default log level, no relaxations), each on its first attempt with bitwise
+/// parity, with a stamped release build of the evidence SHA. That SHA contains
+/// every Hermit, Detcore and guest change of the series that added the cell;
+/// the series' later commits change only CI records. The runs used guest source
+/// sha256 e8babb4316082311cdbb50cfce2128d58b0d7482e5de7d0c29dbeaca066afa40.
 pub const EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_SHA: &str =
-    "4a30a8a40d3c1ad1cfc74ee141de6605057a6c7d";
-pub const EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T14:00:39Z";
+    "e1e53c5934652df03a8f93b4f3a9283feb9dfaf7";
+pub const EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-10-07T22:23:05Z";
 pub const EXTERNAL_IO_SIGNAL_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// `c-programs/sigsuspend-sibling-signal-wake` verify on ptrace, a new guest
-/// for the defects fixed at the evidence SHA: a sibling's `tgkill` must end an
+/// for the defects its series fixes: a sibling's `tgkill` must end an
 /// `rt_sigsuspend` wait after a signal the process ignores reached the waiter
 /// first. The scheduler must requeue a waiter another guest's signal released
 /// instead of reporting a deadlock, and the real `rt_sigsuspend` must run in
-/// place rather than behind injected probe syscalls. The cell passed ten
-/// consecutive strict verify runs, each on its first attempt, with a build of
-/// the evidence SHA, which is the last commit that changes how the scheduler
-/// handles these waiters. Guest source sha256
-/// 96bcc5e240133faae7db68b7316744bd543913f4cfc7abda380f4a6f15410c0e.
+/// place rather than behind injected probe syscalls. Later phases pass a raw
+/// mask word that a sibling may rewrite, end the wait through a handler
+/// installed with SA_RESTART, and end a child's wait with a default-fatal
+/// SIGTERM. Each phase whose first signal must not end the wait also requires
+/// the wait to last its full delay and end less than 50 ms after it. The cell
+/// passed ten consecutive strict verify runs (`run --strict --verify
+/// --verify-strict`, default log level, no relaxations), each on its first
+/// attempt with bitwise parity, with a stamped release build of the evidence
+/// SHA. That SHA contains every Hermit, Detcore and guest change of the series
+/// that added the cell; the series' later commits change only CI records. The
+/// runs used guest source sha256
+/// 551031c3380b6bb7981699390db17d5d9d8deee05b035dc474d87d056ce85831.
 pub const SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_SHA: &str =
-    "3af2a07119b1cb2593255c02c064cdb8dbc76f44";
-pub const SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T15:21:13Z";
+    "e1e53c5934652df03a8f93b4f3a9283feb9dfaf7";
+pub const SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-10-07T22:23:43Z";
 pub const SIGSUSPEND_SIBLING_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// Cells slice S13 of <https://github.com/rrnewton/hermit/issues/3301> selected
 /// when it replaced `tests/backend-parity/run_matrix.py --backend dbt` with
@@ -2054,29 +2070,29 @@ mod tests {
         assert_eq!(PROCFS_MOUNTINFO_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(
             SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_SHA,
-            "d3c13a40a243715c1688cb9ba3baa01ce37aed89"
+            "e1e53c5934652df03a8f93b4f3a9283feb9dfaf7"
         );
         assert_eq!(
             SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_COMPLETED_UTC,
-            "2026-09-25T10:52:42Z"
+            "2026-10-07T22:22:50Z"
         );
         assert_eq!(SIGSUSPEND_ALARM_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(
             EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_SHA,
-            "4a30a8a40d3c1ad1cfc74ee141de6605057a6c7d"
+            "e1e53c5934652df03a8f93b4f3a9283feb9dfaf7"
         );
         assert_eq!(
             EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_COMPLETED_UTC,
-            "2026-09-25T14:00:39Z"
+            "2026-10-07T22:23:05Z"
         );
         assert_eq!(EXTERNAL_IO_SIGNAL_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(
             SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_SHA,
-            "3af2a07119b1cb2593255c02c064cdb8dbc76f44"
+            "e1e53c5934652df03a8f93b4f3a9283feb9dfaf7"
         );
         assert_eq!(
             SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_COMPLETED_UTC,
-            "2026-09-25T15:21:13Z"
+            "2026-10-07T22:23:43Z"
         );
         assert_eq!(SIGSUSPEND_SIBLING_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(
