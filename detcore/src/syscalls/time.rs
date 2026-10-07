@@ -347,6 +347,20 @@ fn timeval_word_addr<'a>(
         .ok_or_else(|| tv_repair_error(field, TvRepairFailureKind::AddressOverflow))
 }
 
+/// The address of `tv`'s word at `offset` for checking that a stopped
+/// `gettimeofday` left it alone, or `None` when the address is past the end of
+/// the address space. No store can reach such a word, so it needs no check.
+/// (A probe needs a real address, so `timeval_word_addr` fails closed instead.)
+fn stopped_timeval_word_addr<'a>(
+    tv_addr: AddrMut<'a, Timeval>,
+    offset: usize,
+) -> Option<AddrMut<'a, libc::time_t>> {
+    tv_addr
+        .as_raw()
+        .checked_add(offset)
+        .and_then(AddrMut::<libc::time_t>::from_raw)
+}
+
 fn require_complete_time_word_overwrite(
     field: &'static str,
     expected: usize,
@@ -460,7 +474,9 @@ where
                 require_native_time_control_probe(field, guest.inject(control).await)?;
                 for (stopped, (field, offset)) in TIMEVAL_WORDS.into_iter().enumerate().skip(index)
                 {
-                    let addr = timeval_word_addr(field, tv_addr, offset)?;
+                    let Some(addr) = stopped_timeval_word_addr(tv_addr, offset) else {
+                        continue;
+                    };
                     let after = guest.memory().read_value(addr);
                     match require_unchanged_stopped_word(field, before[stopped], after)? {
                         StoppedWord::Unchanged => {}
@@ -1262,7 +1278,7 @@ mod tests {
         }
 
         #[test]
-        fn timeval_word_addresses_follow_kernel_order_and_overflow_fails_closed() {
+        fn timeval_word_addresses_follow_kernel_order_and_overflow_fails_closed_only_for_probes() {
             assert_eq!(TIMEVAL_WORDS, [("tv_sec", 0), ("tv_usec", 8)]);
             let tv_addr = AddrMut::<Timeval>::from_raw(0x10_0000).unwrap();
             assert_eq!(
@@ -1288,6 +1304,24 @@ mod tests {
                     kind: TvRepairFailureKind::AddressOverflow,
                 }
             );
+
+            // Checking a stopped word needs no probe, so a word past the end of
+            // the address space is simply one no store reached.
+            for (_, offset) in TIMEVAL_WORDS {
+                assert_eq!(
+                    stopped_timeval_word_addr(tv_addr, offset).map(|addr| addr.as_raw()),
+                    Some(tv_addr.as_raw() + offset)
+                );
+            }
+            // `gettimeofday((void *)-1, NULL)`: `tv_sec` is the last byte of
+            // the address space and `tv_usec` has no address at all.
+            let last = AddrMut::<Timeval>::from_raw(usize::MAX).unwrap();
+            assert_eq!(
+                stopped_timeval_word_addr(last, 0).map(|addr| addr.as_raw()),
+                Some(usize::MAX)
+            );
+            assert!(stopped_timeval_word_addr(last, 8).is_none());
+            assert!(stopped_timeval_word_addr(overflowing, 8).is_none());
         }
     }
 }
