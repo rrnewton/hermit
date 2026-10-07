@@ -875,6 +875,18 @@ mod tests {
         assert!(std::mem::size_of::<libc::sigset_t>() > KERNEL_SIGSET_SIZE);
     }
 
+    /// The mask `rt_sigsuspend` (and the scheduler's record of it) sleeps
+    /// under can never block SIGKILL or SIGSTOP; every other bit is kept.
+    #[test]
+    fn the_installed_mask_cannot_block_kill_or_stop() {
+        let kill = 1_u64 << (libc::SIGKILL - 1);
+        let stop = 1_u64 << (libc::SIGSTOP - 1);
+        assert_eq!(kernel_installed_signal_mask(u64::MAX), !(kill | stop));
+        assert_eq!(kernel_installed_signal_mask(kill | stop), 0);
+        let alrm_and_rt64 = (1_u64 << (libc::SIGALRM - 1)) | (1_u64 << 63);
+        assert_eq!(kernel_installed_signal_mask(alrm_and_rt64), alrm_and_rt64);
+    }
+
     #[test]
     fn raw_signal_size_validation_rejects_before_pointer_processing() {
         assert_eq!(validate_kernel_sigset_size(7), Err(Errno::EINVAL));
