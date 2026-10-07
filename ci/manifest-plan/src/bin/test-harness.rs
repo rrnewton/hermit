@@ -5653,6 +5653,42 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
         serde_json::json!({"test": "imported/control", "mode": mode, "backend": backend})
     }
 
+    /// The evidence [`host_capabilities_hermit`] reports for its
+    /// `exact_branch_counter` verdict.
+    const PLANTED_COUNTER_EVIDENCE: &str = "planted: Reverie performance-counter validation failed";
+
+    /// A Hermit in `dir` that answers only `host-capabilities --json`, with a
+    /// complete report whose `exact_branch_counter` verdict is `present`.
+    fn host_capabilities_hermit(dir: &std::path::Path, present: bool) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        use hermit_manifest_plan::host_capability::HostCapabilitiesReport;
+
+        let verdict = |present| HostCapabilityVerdict {
+            present,
+            evidence: PLANTED_COUNTER_EVIDENCE.into(),
+        };
+        let report = HostCapabilitiesReport {
+            schema: HostCapabilitiesReport::SCHEMA,
+            host_capabilities: HostCapability::ALL
+                .into_iter()
+                .map(|capability| (capability, verdict(true)))
+                .collect(),
+            exact_branch_counter: verdict(present),
+        };
+        let hermit = dir.join("hermit");
+        fs::write(
+            &hermit,
+            format!(
+                "#!/bin/sh\ntest \"$*\" = 'host-capabilities --json' || exit 2\ncat <<'EOF'\n{}\nEOF\n",
+                serde_json::to_string(&report).unwrap()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&hermit, fs::Permissions::from_mode(0o755)).unwrap();
+        hermit
+    }
+
     /// The `evidence_complete_executions` entry of the execution that wrote
     /// `row`.
     fn import_execution(row: &CellResult) -> serde_json::Value {
@@ -5673,7 +5709,9 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
     /// run would not have made, after an infrastructure ERROR or under
     /// `--no-retry`; a host-inapplicable claim this machine does not confirm,
     /// or one alongside rows; and a PASS whose own execution has no
-    /// evidence-complete record.
+    /// evidence-complete record. A claim that a strict ptrace cell cannot run
+    /// stands when this machine's Hermit reports an inexact branch counter,
+    /// and not when it reports an exact one or cannot be asked.
     #[test]
     fn import_mode_republishes_rows_and_a_missing_cell_is_an_error() {
         use std::path::PathBuf;
@@ -5740,9 +5778,13 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
             "host-inapplicable-row",
             "unconfirmed",
             "conflict",
+            "counter-confirmed",
+            "counter-unconfirmed",
+            "counter-unprobed",
             "evidence",
             "evidence-elsewhere",
         ] {
+            let counter_claim = scenario.starts_with("counter-");
             let fixture = std::env::temp_dir().join(format!(
                 "hermit-harness-import-{}-{:?}-{scenario}",
                 std::process::id(),
@@ -5771,6 +5813,9 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                 let ptrace = cell.id.backend.as_deref() == Some("ptrace");
                 let verify_kvm = cell.id.mode == "verify" && !ptrace;
                 if verify_kvm && matches!(scenario, "missing" | "unconfirmed") {
+                    continue;
+                }
+                if ptrace && counter_claim {
                     continue;
                 }
                 // (attempt, outcome), in file order.
@@ -5847,16 +5892,28 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
             fs::create_dir_all(&bucket).unwrap();
             fs::write(bucket.join("results.jsonl"), rows.join("\n") + "\n").unwrap();
             let host_inapplicable_cells = match scenario {
-                "unconfirmed" => vec![import_summary_cell("verify", "kvm")],
-                "conflict" => vec![import_summary_cell("verify", "ptrace")],
+                "unconfirmed" => vec![("verify", "kvm", "kvm")],
+                "conflict" => vec![("verify", "ptrace", "kvm")],
+                // The producer reran verify@ptrace on a host whose retired-
+                // branch counter is inexact, where the binary refuses --strict.
+                _ if counter_claim => vec![("verify", "ptrace", "exact-branch-counter")],
                 _ => vec![],
             }
             .into_iter()
-            .map(|mut cell| {
-                cell["reason"] = "producer: this machine lacks kvm".into();
+            .map(|(mode, backend, capability)| {
+                let mut cell = import_summary_cell(mode, backend);
+                cell["reason"] = format!("producer: this machine lacks {capability}").into();
                 cell
             })
             .collect::<Vec<_>>();
+            // No cell launches Hermit: the import asks it only for this
+            // machine's exact_branch_counter verdict, which the counter
+            // scenarios plant and an absent binary cannot give.
+            let hermit = match scenario {
+                "counter-confirmed" => host_capabilities_hermit(path, false),
+                "counter-unconfirmed" => host_capabilities_hermit(path, true),
+                _ => path.join("absent-hermit"),
+            };
             fs::write(
                 bucket.join("summary.json"),
                 serde_json::to_vec(&json!({
@@ -5878,7 +5935,7 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                 .env("E2E_IMPORT_RESULTS", &import)
                 // This machine can run every fixture cell, whatever the host.
                 .env("HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT", "kvm")
-                .env("HERMIT_BIN", path.join("no-hermit-is-launched"))
+                .env("HERMIT_BIN", &hermit)
                 .env("E2E_RESULT_ROOT", path.join("artifacts"))
                 .env("E2E_BUILD_ROOT", path.join("build"))
                 .env("E2E_RUN_ID", "import-consumer")
@@ -5894,9 +5951,10 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                 String::from_utf8_lossy(&result.stdout),
                 String::from_utf8_lossy(&result.stderr)
             );
+            let confirmed = scenario == "counter-confirmed";
             assert_eq!(
                 result.status.code(),
-                Some(if scenario == "complete" { 0 } else { 1 }),
+                Some(if scenario == "complete" || confirmed { 0 } else { 1 }),
                 "{context}"
             );
             let published = fs::read_to_string(path.join("out/results.jsonl"))
@@ -5954,6 +6012,12 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                     Some("import-host-inapplicable-unconfirmed"),
                 )),
                 "conflict" => Some(("verify", Some("ptrace"), Some("import-conflict"))),
+                "counter-confirmed" => None,
+                "counter-unconfirmed" | "counter-unprobed" => Some((
+                    "verify",
+                    Some("ptrace"),
+                    Some("import-host-inapplicable-unconfirmed"),
+                )),
                 "evidence" => Some(("verify", Some("kvm"), Some("import-evidence-incomplete"))),
                 "evidence-elsewhere" => {
                     Some(("custom", Some("kvm"), Some("import-evidence-incomplete")))
@@ -6033,13 +6097,48 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                 // Both custom@kvm attempts are published, in order.
                 _ => assert_eq!(custom, vec![(1, "FAIL"), (2, "PASS")], "{context}"),
             }
+            // The confirmed claim publishes this machine's reason and its
+            // verdict, not the producer's words.
+            let inapplicable = published
+                .iter()
+                .filter(|row| row.outcome == "HOST-INAPPLICABLE")
+                .collect::<Vec<_>>();
+            if confirmed {
+                let [row] = inapplicable[..] else {
+                    panic!("one HOST-INAPPLICABLE row\n{context}");
+                };
+                assert_eq!(
+                    (row.mode.as_str(), row.backend.as_deref()),
+                    ("verify", Some("ptrace")),
+                    "{context}"
+                );
+                let reason = row.reason.as_deref().unwrap_or_default();
+                assert!(
+                    reason.contains(&format!(
+                        "lacks exact-branch-counter ({PLANTED_COUNTER_EVIDENCE})"
+                    )) && !reason.contains("producer:"),
+                    "{reason}\n{context}"
+                );
+                assert_eq!(
+                    row.exact_branch_counter,
+                    Some(HostCapabilityVerdict {
+                        present: false,
+                        evidence: PLANTED_COUNTER_EVIDENCE.into(),
+                    }),
+                    "{context}"
+                );
+            } else {
+                assert_eq!(inapplicable.len(), 0, "{context}");
+            }
+            let host_inapplicable = u64::from(confirmed);
+            assert_eq!(summary["host_inapplicable"], host_inapplicable, "{context}");
             // JUnit and the dagrun counts report the same final outcomes, and
-            // the counts each cell's published attempts.
+            // the counts each executed cell's published attempts.
             let failed = u64::from(scenario == "no-retry");
             assert_eq!(summary["failed"], failed, "{context}");
             let junit = fs::read_to_string(path.join("out/junit.xml")).unwrap();
             let header = format!(
-                "tests=\"3\" failures=\"{failed}\" errors=\"{}\" skipped=\"0\"",
+                "tests=\"3\" failures=\"{failed}\" errors=\"{}\" skipped=\"{host_inapplicable}\"",
                 u64::from(expected_error.is_some())
             );
             assert!(junit.contains(&header), "{junit}\n{context}");
@@ -6052,12 +6151,16 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
             };
             let expected_counts = cells
                 .iter()
-                .map(|cell| {
+                .filter_map(|cell| {
                     let history = published
                         .iter()
                         .filter(|row| row.mode == cell.id.mode && row.backend == cell.id.backend)
                         .collect::<Vec<_>>();
-                    json!({
+                    // A cell that did not run is no executed test.
+                    if history.last().unwrap().outcome == "HOST-INAPPLICABLE" {
+                        return None;
+                    }
+                    Some(json!({
                         "id": format!(
                             "imported/control [{}/{}]",
                             cell.id.backend.as_deref().unwrap_or("native"),
@@ -6065,11 +6168,15 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                         ),
                         "result": if history.last().unwrap().outcome == "PASS" { "pass" } else { "fail" },
                         "attempts": history.len(),
-                    })
+                    }))
                 })
                 .collect::<serde_json::Value>();
             assert_eq!(counts["schema"], 2, "{context}");
-            assert_eq!(counts["executed_tests"], 3, "{context}");
+            assert_eq!(
+                counts["executed_tests"],
+                3 - host_inapplicable,
+                "{context}"
+            );
             assert_eq!(
                 by_id(&counts["results"]),
                 by_id(&expected_counts),
