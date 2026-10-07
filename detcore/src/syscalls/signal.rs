@@ -127,15 +127,18 @@ fn validate_kernel_sigset_size(sigsetsize: usize) -> Result<(), Errno> {
 /// Signals that a backend whose signals interrupt real blocking syscalls
 /// holds pending while Detcore's own code runs on the guest thread.
 ///
-/// Such a signal cannot be consumed between the scheduler's grant and the real
-/// `rt_sigsuspend`: if it arrives in that window the backend makes the call
-/// return `EINTR` at once, and if it arrives during the call the kernel does.
-/// That is what lets the scheduler count on the wake. The list mirrors the
-/// signals the SaBRe backend's central handler mediates (the standard signals
-/// except the synchronous SIGILL and SIGSEGV, the uncatchable SIGKILL and
-/// SIGSTOP, and its own SIGSTKFLT) in reverie's
-/// `experimental/reverie-sabre/src/signal.rs`. A signal missing from this list
-/// only keeps the scheduler's older behavior for it.
+/// The backend's handler queues such a signal instead of running the guest's
+/// handler, and its `rt_sigsuspend` returns `EINTR` without sleeping when it
+/// finds one of them queued. That alone does not make the wake certain: the
+/// backend tests its queue and only then enters the real `rt_sigsuspend`, and a
+/// signal queued between the two is consumed without waking the call.
+/// `Detcore::rt_sigsuspend_with_held_wakers` closes that gap by blocking these
+/// signals in the real mask first. The list mirrors the signals the SaBRe
+/// backend's central handler mediates (the standard signals except the
+/// synchronous SIGILL and SIGSEGV, the uncatchable SIGKILL and SIGSTOP, and its
+/// own SIGSTKFLT) in reverie's `experimental/reverie-sabre/src/signal.rs`. A
+/// signal missing from this list only keeps the scheduler's older behavior for
+/// it.
 fn backend_holds_signal_during_tool_code(signal: i32) -> bool {
     (1..=31).contains(&signal)
         && !matches!(
@@ -484,15 +487,79 @@ impl<T: RecordOrReplay> Detcore<T> {
             // out of the terminal-wait classification; the real syscall still
             // performs delivery and restores the old mask.
             self.record_or_replay_blocking(guest, call.into()).await
+        } else if guest.config().backend.signal_interrupts_external_syscalls {
+            self.rt_sigsuspend_with_held_wakers(guest, call, temporary_mask)
+                .await
         } else {
-            let wakers = if guest.config().backend.signal_interrupts_external_syscalls {
-                rt_sigsuspend_wakers(guest, temporary_mask).await?
-            } else {
-                RtSigsuspendWakers::default()
-            };
-            self.record_or_replay_rt_sigsuspend(guest, call, wakers)
+            self.record_or_replay_rt_sigsuspend(guest, call, RtSigsuspendWakers::default())
                 .await
         }
+    }
+
+    /// Run `rt_sigsuspend` on a backend whose signals interrupt real blocking
+    /// syscalls, so that the scheduler may count on any signal in the computed
+    /// waker set ending the call.
+    ///
+    /// Two things make that promise hold.
+    ///
+    /// The backend and the kernel must test the same mask the waker set was
+    /// computed from. The guest's mask buffer can change after Detcore copied
+    /// it, for example when another process shares the page, so the real call
+    /// reads a private copy of the classified mask rather than the guest's
+    /// buffer. Linux likewise copies the mask once, at entry.
+    ///
+    /// No waker may be consumed without ending the call. The SaBRe backend
+    /// tests its queue of held signals and then enters the real
+    /// `rt_sigsuspend`; a signal arriving between those two steps is queued
+    /// while the call goes to sleep. Blocking the wakers in the real mask first
+    /// orders every waker before or after that test. One that arrives before
+    /// the block is queued and found by the test, which returns `EINTR`. One
+    /// that arrives after the block stays pending in the kernel until the real
+    /// `rt_sigsuspend` installs the temporary mask, which does not contain it,
+    /// so the kernel delivers it at once and returns `EINTR`. The original mask
+    /// is restored once the call has returned, as Linux restores it.
+    ///
+    /// SaBRe is the only backend that sets `signal_interrupts_external_syscalls`.
+    /// Its `guest.stack()` is a private heap arena, not the guest stack, so the
+    /// signal frame the kernel pushes for the interrupting signal cannot
+    /// overwrite the scratch buffers. SaBRe runs only `run` and `strace`, never
+    /// record or replay, so the substituted mask pointer is never compared
+    /// against a recording.
+    async fn rt_sigsuspend_with_held_wakers<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::RtSigsuspend,
+        temporary_mask: KernelSigset,
+    ) -> Result<i64, Error> {
+        let wakers = rt_sigsuspend_wakers(guest, temporary_mask).await?;
+        let mut stack = guest.stack().await;
+        let mask_copy = stack.push(temporary_mask);
+        let block_set = stack.push(wakers.0);
+        let old_mask = stack.reserve::<KernelSigset>();
+        let guard = stack.commit()?;
+        let holds_wakers = wakers.0 != 0;
+        if holds_wakers {
+            let block = syscalls::RtSigprocmask::new()
+                .with_how(libc::SIG_BLOCK)
+                .with_set(Some(block_set.cast()))
+                .with_oldset(Some(old_mask.cast()))
+                .with_sigsetsize(KERNEL_SIGSET_SIZE);
+            guest.inject_with_retry(block).await?;
+        }
+        let result = self
+            .record_or_replay_rt_sigsuspend(guest, call.with_mask(Some(mask_copy.cast())), wakers)
+            .await;
+        if holds_wakers {
+            let old_mask: Addr<'_, KernelSigset> = old_mask.into();
+            let restore = syscalls::RtSigprocmask::new()
+                .with_how(libc::SIG_SETMASK)
+                .with_set(Some(old_mask.cast()))
+                .with_oldset(None)
+                .with_sigsetsize(KERNEL_SIGSET_SIZE);
+            guest.inject_with_retry(restore).await?;
+        }
+        drop(guard);
+        result
     }
 
     /// rt_sigaction

@@ -1643,6 +1643,10 @@ impl GlobalTool for GlobalState {
                 // POSIX deadlines before the replacement image can yield or run.
                 // Failed exec takes CancelExec and never reaches this point.
                 sched.blocked.timed_waiters.remove_posix_timers(detpid);
+                // Every backend reports each successful exec here, before the
+                // new image runs, so its own exit and its parent's waits see
+                // the exit signal the exec reset.
+                sched.thread_tree.note_successful_exec(detpid);
                 // Reloading backends consumed the preparation in their
                 // registration reconnect; state-preserving leaders consume it
                 // here after the terminal exec notification was authenticated.
@@ -4951,6 +4955,9 @@ mod tests {
     use crate::scheduler::SchedValue;
     use crate::scheduler::ThreadNextTurn;
     use crate::tool_local::ExecFdBlockingOverrides;
+    use crate::types::ChildWaitExitClass;
+    use crate::types::ChildWaitSelector;
+    use crate::types::ChildWaitSpec;
     use crate::types::DetPid;
     use crate::types::DetTid;
     use crate::types::DetTime;
@@ -6778,6 +6785,71 @@ mod tests {
             Some((deadline, LogicalTime::ZERO))
         );
         assert_eq!(sched.blocked.timed_waiters.iter().count(), 1);
+    }
+
+    /// Linux resets a process's exit signal to SIGCHLD on a successful exec
+    /// only. Drive the production exec notifications: a failed exec
+    /// (`CancelExec`) must leave a clone child in the `__WCLONE` population
+    /// with its own exit signal; the successful-exec notification must move it
+    /// to the ordinary population, notifying its parent with SIGCHLD.
+    #[tokio::test]
+    async fn only_successful_exec_resets_the_exit_signal() {
+        let (config, state, parent, parent_pid) = cancellation_test_state();
+        let child = DetTid::from_raw(parent.as_raw() + 1);
+        let child_pid = DetPid::from_raw(child.as_raw());
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .thread_tree
+            .add_child_with_wait_metadata(parent, child, true, false, libc::SIGUSR1);
+        install_test_registration(&state, child, Ivar::new());
+        let clock = DetTime::new(&config);
+        let mm = MmId::initial(child_pid);
+        let wait = |exit_class| ChildWaitSpec {
+            selector: ChildWaitSelector::Exact(child_pid),
+            owner: None,
+            exit_class,
+        };
+        let observe = |state: &GlobalState| {
+            let sched = state.sched.lock().unwrap();
+            (
+                sched.thread_tree.child_exit_notification_signal(child_pid),
+                sched.has_child_wait_target(parent_pid, wait(ChildWaitExitClass::Clone)),
+                sched.has_child_wait_target(parent_pid, wait(ChildWaitExitClass::Sigchld)),
+            )
+        };
+        assert_eq!(observe(&state), (Some(libc::SIGUSR1), true, false));
+
+        for request in [
+            GlobalRequest::PrepareExec(child_pid, mm, Default::default()),
+            GlobalRequest::CancelExec(child_pid),
+            GlobalRequest::PrepareExec(child_pid, mm, Default::default()),
+        ] {
+            state
+                .receive_rpc(
+                    reverie::Tid::from_raw(child.as_raw()),
+                    (clock.clone(), mm, request),
+                )
+                .await;
+            assert_eq!(observe(&state), (Some(libc::SIGUSR1), true, false));
+        }
+
+        let response = state
+            .receive_rpc(
+                reverie::Tid::from_raw(child.as_raw()),
+                (
+                    clock,
+                    mm.for_exec(child_pid),
+                    GlobalRequest::MarkPastFirstExecve(child_pid, None),
+                ),
+            )
+            .await;
+        assert_eq!(
+            response.1,
+            GlobalResponse::MarkPastFirstExecve(Default::default())
+        );
+        assert_eq!(observe(&state), (Some(libc::SIGCHLD), false, true));
     }
 
     #[tokio::test]

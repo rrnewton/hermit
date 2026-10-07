@@ -1159,7 +1159,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // resources::tests::rt_sigsuspend_wakers_use_the_kernel_mask_layout
     // retain all 975: 975 + 11 = 986, measured with cargo nextest list
     // --profile ci -p hermit-detcore --lib --bins.
-    ("test.detcore_unit", 986),
+    // Three scheduler::test exec tests
+    // (successful_exec_moves_a_clone_child_into_the_sigchld_wait_class,
+    // parent_exec_after_clone_notifies_with_sigchld_without_changing_wait_class,
+    // clone_parent_inherits_the_creators_exit_signal_and_parent_exec_count),
+    // scheduler::parked_tests::child_exit_wake_follows_the_signal_after_exec
+    // and tool_global::tests::only_successful_exec_resets_the_exit_signal
+    // retain all 986: 986 + 5 = 991, measured the same way.
+    ("test.detcore_unit", 991),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1538,7 +1545,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/pull/3686 logdiff test: 970 + 1 = 971.
     // The same four signal-control tests retain all 971: 975.
     // The same four SIGCHLD and seven rt_sigsuspend tests retain all 975: 986.
-    ("test.detcore_unit_on_host", 986),
+    // The same five exec exit-signal tests retain all 986: 991.
+    ("test.detcore_unit_on_host", 991),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

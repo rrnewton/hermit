@@ -835,8 +835,9 @@ pub struct ThreadTree {
 
     /// Linux child-wait identity for each process leader. Unlike the thread
     /// tree edge, this records the effective wait parent after CLONE_PARENT,
-    /// the exact creating task for __WNOTHREAD, clone exit-signal class, and
-    /// mutable process-group/session membership.
+    /// the exact creating task for __WNOTHREAD, the exit signal, the exec
+    /// counts Linux compares when it notifies a parent, and mutable
+    /// process-group/session membership.
     process_wait: HashMap<DetPid, ProcessWaitMetadata>,
 }
 
@@ -844,7 +845,17 @@ pub struct ThreadTree {
 struct ProcessWaitMetadata {
     wait_parent: Option<DetPid>,
     wait_owner: DetTid,
+    /// Linux's `exit_signal`: the clone exit signal, inherited from the
+    /// creator under CLONE_PARENT and reset to SIGCHLD by a successful exec.
+    /// It selects the `__WCLONE` wait class.
     exit_signal: libc::c_int,
+    /// Successful execs made by this process (Linux's `self_exec_id` changes
+    /// on exactly these events, and every live thread of a process carries
+    /// the same value because exec leaves a single thread).
+    exec_generation: u64,
+    /// The wait parent's `exec_generation` when this process was created
+    /// (Linux's `parent_exec_id`).
+    parent_exec_generation: u64,
     process_group: DetPid,
     session: DetPid,
 }
@@ -1003,6 +1014,8 @@ impl ThreadTree {
                         wait_parent: None,
                         wait_owner: child_dettid,
                         exit_signal: libc::SIGCHLD,
+                        exec_generation: 0,
+                        parent_exec_generation: 0,
                         process_group: child_dettid,
                         session: child_dettid,
                     },
@@ -1018,14 +1031,30 @@ impl ThreadTree {
                         wait_parent: None,
                         wait_owner: parent_dettid,
                         exit_signal: libc::SIGCHLD,
+                        exec_generation: 0,
+                        parent_exec_generation: 0,
                         process_group: parent_process,
                         session: parent_process,
                     },
                 );
-                let (wait_parent, wait_owner) = if clone_parent {
-                    (parent_metadata.wait_parent, parent_metadata.wait_owner)
+                // Linux `copy_process`: CLONE_PARENT shares the creator's
+                // parent, so the child also takes the creator's exit signal
+                // and parent exec count and ignores the clone's exit signal.
+                let (wait_parent, wait_owner, exit_signal, parent_exec_generation) = if clone_parent
+                {
+                    (
+                        parent_metadata.wait_parent,
+                        parent_metadata.wait_owner,
+                        parent_metadata.exit_signal,
+                        parent_metadata.parent_exec_generation,
+                    )
                 } else {
-                    (Some(parent_process), parent_dettid)
+                    (
+                        Some(parent_process),
+                        parent_dettid,
+                        exit_signal,
+                        parent_metadata.exec_generation,
+                    )
                 };
                 if let Some(wait_parent) = wait_parent {
                     self.process_parent.insert(child_dettid, wait_parent);
@@ -1036,6 +1065,8 @@ impl ThreadTree {
                         wait_parent,
                         wait_owner,
                         exit_signal,
+                        exec_generation: 0,
+                        parent_exec_generation,
                         process_group: parent_metadata.process_group,
                         session: parent_metadata.session,
                     },
@@ -1072,6 +1103,36 @@ impl ThreadTree {
             if metadata.wait_parent == Some(process) && metadata.wait_owner == former {
                 metadata.wait_owner = leader;
             }
+        }
+    }
+
+    /// Apply Linux's successful-exec changes to the process's wait identity:
+    /// the exit signal becomes SIGCHLD ("we have changed execution domain",
+    /// `de_thread` in `fs/exec.c`) and the exec count advances, as
+    /// `begin_new_exec` advances `self_exec_id`. A failed exec changes
+    /// neither.
+    pub fn note_successful_exec(&mut self, process: DetPid) {
+        if let Some(metadata) = self.process_wait.get_mut(&process) {
+            metadata.exit_signal = libc::SIGCHLD;
+            metadata.exec_generation += 1;
+        }
+    }
+
+    /// The signal Linux sends the wait parent when `child` exits, or `None`
+    /// when `child` is unknown. This is the exit signal, except that
+    /// `do_notify_parent` sends SIGCHLD instead when the parent has exec'd
+    /// since creating the child. An exit signal of 0 sends nothing; the
+    /// result is then 0.
+    pub fn child_exit_notification_signal(&self, child: DetPid) -> Option<libc::c_int> {
+        let metadata = self.process_wait.get(&child)?;
+        let parent_execed = metadata
+            .wait_parent
+            .and_then(|parent| self.process_wait.get(&parent))
+            .is_some_and(|parent| parent.exec_generation != metadata.parent_exec_generation);
+        if metadata.exit_signal != libc::SIGCHLD && parent_execed {
+            Some(libc::SIGCHLD)
+        } else {
+            Some(metadata.exit_signal)
         }
     }
 
@@ -3011,13 +3072,9 @@ impl Scheduler {
             .map(|(child, parent)| (*child, *parent))
             .collect();
         for (child, parent) in ready {
-            // The kernel sends the parent the child's clone exit signal, which
-            // is not always SIGCHLD (and is none at all for an exit signal of 0).
-            let exit_signal = self
-                .thread_tree
-                .process_wait
-                .get(&child)
-                .map(|metadata| metadata.exit_signal);
+            // The kernel sends the parent the child's exit signal, which is not
+            // always SIGCHLD (and is none at all for an exit signal of 0).
+            let exit_signal = self.thread_tree.child_exit_notification_signal(child);
             self.child_exit_signals_owed.remove(&child);
             #[cfg(test)]
             {
@@ -8865,6 +8922,176 @@ mod test {
         assert_eq!(tree.parent_process(&child), Some(grandparent));
         let metadata = tree.process_wait.get(&child).expect("child metadata");
         assert_eq!(metadata.wait_owner, grandparent);
+    }
+
+    fn exact_wait(child: DetPid, exit_class: ChildWaitExitClass) -> ChildWaitSpec {
+        ChildWaitSpec {
+            selector: ChildWaitSelector::Exact(child),
+            owner: None,
+            exit_class,
+        }
+    }
+
+    /// Linux `de_thread` sets `exit_signal = SIGCHLD` on every successful exec,
+    /// so a clone child that exec'd leaves the `__WCLONE` population, joins the
+    /// ordinary one, and its exit notifies its parent with SIGCHLD.
+    #[test]
+    fn successful_exec_moves_a_clone_child_into_the_sigchld_wait_class() {
+        for exit_signal in [libc::SIGUSR1, 0] {
+            let mut scheduler = Scheduler::new(&Config::default());
+            let parent = DetPid::from_raw(10);
+            let child = DetPid::from_raw(20);
+            scheduler.thread_tree.add_child(parent, parent, true);
+            scheduler.thread_tree.add_child_with_wait_metadata(
+                parent,
+                child,
+                true,
+                false,
+                exit_signal,
+            );
+            let clone = exact_wait(child, ChildWaitExitClass::Clone);
+            let normal = exact_wait(child, ChildWaitExitClass::Sigchld);
+            assert!(scheduler.has_child_wait_target(parent, clone));
+            assert!(!scheduler.has_child_wait_target(parent, normal));
+            assert_eq!(
+                scheduler.thread_tree.child_exit_notification_signal(child),
+                Some(exit_signal)
+            );
+
+            scheduler.thread_tree.note_successful_exec(child);
+
+            assert!(
+                !scheduler.has_child_wait_target(parent, clone),
+                "exit signal {exit_signal}"
+            );
+            assert!(
+                scheduler.has_child_wait_target(parent, normal),
+                "exit signal {exit_signal}"
+            );
+            assert_eq!(
+                scheduler.thread_tree.child_exit_notification_signal(child),
+                Some(libc::SIGCHLD)
+            );
+        }
+    }
+
+    /// Linux `do_notify_parent` sends SIGCHLD in place of a non-SIGCHLD exit
+    /// signal when the parent has exec'd since creating the child, but the
+    /// child stays in the `__WCLONE` wait class. Must not: a parent that exec'd
+    /// only BEFORE creating the child still receives the clone exit signal.
+    #[test]
+    fn parent_exec_after_clone_notifies_with_sigchld_without_changing_wait_class() {
+        for (exit_signal, exec_before, exec_after, expected) in [
+            (libc::SIGUSR1, false, true, libc::SIGCHLD),
+            (0, false, true, libc::SIGCHLD),
+            (libc::SIGUSR1, true, false, libc::SIGUSR1),
+            (0, true, false, 0),
+            (libc::SIGUSR1, true, true, libc::SIGCHLD),
+        ] {
+            let case = format!(
+                "exit signal {exit_signal}, parent exec before {exec_before}, after {exec_after}"
+            );
+            let mut scheduler = Scheduler::new(&Config::default());
+            let parent = DetPid::from_raw(10);
+            let child = DetPid::from_raw(20);
+            scheduler.thread_tree.add_child(parent, parent, true);
+            if exec_before {
+                scheduler.thread_tree.note_successful_exec(parent);
+            }
+            scheduler.thread_tree.add_child_with_wait_metadata(
+                parent,
+                child,
+                true,
+                false,
+                exit_signal,
+            );
+            if exec_after {
+                scheduler.thread_tree.note_successful_exec(parent);
+            }
+
+            assert_eq!(
+                scheduler.thread_tree.child_exit_notification_signal(child),
+                Some(expected),
+                "{case}"
+            );
+            assert!(
+                scheduler
+                    .has_child_wait_target(parent, exact_wait(child, ChildWaitExitClass::Clone)),
+                "{case}"
+            );
+            assert!(
+                !scheduler
+                    .has_child_wait_target(parent, exact_wait(child, ChildWaitExitClass::Sigchld)),
+                "{case}"
+            );
+        }
+        let tree = ThreadTree::default();
+        assert_eq!(
+            tree.child_exit_notification_signal(DetPid::from_raw(99)),
+            None
+        );
+    }
+
+    /// Linux `copy_process` under CLONE_PARENT takes the creator's own exit
+    /// signal and parent exec count, ignoring the clone's exit signal, because
+    /// the child shares the creator's parent.
+    #[test]
+    fn clone_parent_inherits_the_creators_exit_signal_and_parent_exec_count() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let grandparent = DetPid::from_raw(10);
+        let creator = DetPid::from_raw(20);
+        let sibling = DetPid::from_raw(30);
+        scheduler
+            .thread_tree
+            .add_child(grandparent, grandparent, true);
+        // The grandparent exec'd before creating `creator`, so the creator's
+        // parent exec count is 1; a sibling that took the creator's OWN exec
+        // count (0) would wrongly look like its parent had exec'd since.
+        scheduler.thread_tree.note_successful_exec(grandparent);
+        scheduler.thread_tree.add_child_with_wait_metadata(
+            grandparent,
+            creator,
+            true,
+            false,
+            libc::SIGUSR1,
+        );
+        scheduler.thread_tree.add_child_with_wait_metadata(
+            creator,
+            sibling,
+            true,
+            true,
+            libc::SIGUSR2,
+        );
+
+        assert_eq!(
+            scheduler.thread_tree.parent_process(&sibling),
+            Some(grandparent)
+        );
+        assert_eq!(
+            scheduler
+                .thread_tree
+                .child_exit_notification_signal(sibling),
+            Some(libc::SIGUSR1)
+        );
+        assert!(
+            scheduler
+                .has_child_wait_target(grandparent, exact_wait(sibling, ChildWaitExitClass::Clone))
+        );
+
+        // The grandparent's next exec postdates both creations.
+        scheduler.thread_tree.note_successful_exec(grandparent);
+        assert_eq!(
+            scheduler
+                .thread_tree
+                .child_exit_notification_signal(sibling),
+            Some(libc::SIGCHLD)
+        );
+        assert_eq!(
+            scheduler
+                .thread_tree
+                .child_exit_notification_signal(creator),
+            Some(libc::SIGCHLD)
+        );
     }
 
     #[test]

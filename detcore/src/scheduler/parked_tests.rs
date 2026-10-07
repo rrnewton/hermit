@@ -2671,6 +2671,52 @@ fn child_exit_owes_an_rt_sigsuspend_wake_only_for_its_exit_signal() {
     }
 }
 
+/// The wake owed for a child's exit follows the signal Linux actually sends,
+/// after exec changes it. A clone child created with SIGUSR1 sends SIGCHLD once
+/// it has exec'd (`de_thread`) or once its parent has exec'd since creating it
+/// (`do_notify_parent`). Must wake: a parent waiting for SIGCHLD. Must not: a
+/// parent waiting only for SIGUSR1, which the kernel no longer sends; owing
+/// that wake would leave the waiter unwoken and hang the scheduler.
+#[test]
+fn child_exit_wake_follows_the_signal_after_exec() {
+    for (child_execs, parent_execs, wakers, owed) in [
+        (true, false, libc::SIGCHLD, true),
+        (true, false, libc::SIGUSR1, false),
+        (false, true, libc::SIGCHLD, true),
+        (false, true, libc::SIGUSR1, false),
+        (false, false, libc::SIGUSR1, true),
+        (false, false, libc::SIGCHLD, false),
+    ] {
+        let case = format!("child exec {child_execs}, parent exec {parent_execs}, waker {wakers}");
+        let mut s = physical_exit_reporting_scheduler();
+        let (parent, _, _) = add(&mut s, 100, 100);
+        let (child, child_mm, _) = add_process_child(&mut s, 100, 200);
+        let child_process = DetPid::from_raw(200);
+        s.thread_tree
+            .process_wait
+            .get_mut(&child_process)
+            .unwrap()
+            .exit_signal = libc::SIGUSR1;
+        if child_execs {
+            s.thread_tree.note_successful_exec(child_process);
+        }
+        if parent_execs {
+            s.thread_tree.note_successful_exec(DetPid::from_raw(100));
+        }
+        grant_rt_sigsuspend(&mut s, parent, rt_sigsuspend_wakers(&[wakers]));
+
+        grant_child_exit_and_remove_thread(&mut s, child, child_mm);
+        assert!(s.complete_physical_process_exit(child_process), "{case}");
+        assert!(s.step2_drain_prefix().is_ok(), "{case}");
+        assert_eq!(s.owed_child_exit_wakeups, 1, "{case}");
+        assert_eq!(
+            s.blocked.rt_sigsuspend_wake_owed.contains(&parent),
+            owed,
+            "{case}"
+        );
+    }
+}
+
 #[test]
 fn exit_boundary_reservation_failure_has_no_local_effect() {
     let (mut s, backend) = fixture();
