@@ -856,6 +856,11 @@ struct ProcessWaitMetadata {
     /// The wait parent's `exec_generation` when this process was created
     /// (Linux's `parent_exec_id`).
     parent_exec_generation: u64,
+    /// A successful exec was committed at an authenticated edge that runs
+    /// before the new image's post-exec callback (the identity-transfer or
+    /// reloading-registration reconnect). That callback consumes this flag
+    /// instead of committing the same exec a second time.
+    exec_committed_before_callback: bool,
     process_group: DetPid,
     session: DetPid,
 }
@@ -1016,6 +1021,7 @@ impl ThreadTree {
                         exit_signal: libc::SIGCHLD,
                         exec_generation: 0,
                         parent_exec_generation: 0,
+                        exec_committed_before_callback: false,
                         process_group: child_dettid,
                         session: child_dettid,
                     },
@@ -1033,6 +1039,7 @@ impl ThreadTree {
                         exit_signal: libc::SIGCHLD,
                         exec_generation: 0,
                         parent_exec_generation: 0,
+                        exec_committed_before_callback: false,
                         process_group: parent_process,
                         session: parent_process,
                     },
@@ -1067,6 +1074,7 @@ impl ThreadTree {
                         exit_signal,
                         exec_generation: 0,
                         parent_exec_generation,
+                        exec_committed_before_callback: false,
                         process_group: parent_metadata.process_group,
                         session: parent_metadata.session,
                     },
@@ -1116,6 +1124,38 @@ impl ThreadTree {
             metadata.exit_signal = libc::SIGCHLD;
             metadata.exec_generation += 1;
         }
+    }
+
+    /// Commit a successful exec at an authenticated edge that precedes the
+    /// new image's post-exec callback, before that edge admits the image or
+    /// another task can observe it. The callback's
+    /// [`Self::note_post_exec_callback`] then does not count it again.
+    pub fn note_successful_exec_before_callback(&mut self, process: DetPid) {
+        self.note_successful_exec(process);
+        if let Some(metadata) = self.process_wait.get_mut(&process) {
+            metadata.exec_committed_before_callback = true;
+        }
+    }
+
+    /// The post-exec callback's report of a successful exec. It commits the
+    /// exec unless an earlier authenticated edge already did, so every
+    /// successful exec is committed exactly once.
+    pub fn note_post_exec_callback(&mut self, process: DetPid) {
+        let committed = self
+            .process_wait
+            .get_mut(&process)
+            .is_some_and(|metadata| std::mem::take(&mut metadata.exec_committed_before_callback));
+        if !committed {
+            self.note_successful_exec(process);
+        }
+    }
+
+    /// Successful execs committed for `process`, or `None` when unknown.
+    #[cfg(test)]
+    pub(crate) fn exec_generation(&self, process: DetPid) -> Option<u64> {
+        self.process_wait
+            .get(&process)
+            .map(|metadata| metadata.exec_generation)
     }
 
     /// The signal Linux sends the wait parent when `child` exits, or `None`

@@ -205,6 +205,11 @@ impl Fixture {
     }
 
     async fn configured(retire_leader: bool) -> Self {
+        Self::with_exit_signal(retire_leader, libc::SIGCHLD).await
+    }
+
+    /// The exec'ing process was cloned with `exit_signal` rather than SIGCHLD.
+    async fn with_exit_signal(retire_leader: bool, exit_signal: libc::c_int) -> Self {
         let config = Config {
             sequentialize_threads: true,
             max_timeslice: std::num::NonZeroU64::new(200_000_000),
@@ -250,7 +255,13 @@ impl Fixture {
         {
             let mut sched = state.sched.lock().unwrap();
             sched.thread_tree.add_child(PARENT, PARENT, true);
-            sched.thread_tree.add_child(PARENT, LEADER, true);
+            sched.thread_tree.add_child_with_wait_metadata(
+                PARENT,
+                LEADER,
+                true,
+                false,
+                exit_signal,
+            );
             sched.thread_tree.add_child(LEADER, WORKER, false);
         }
         for thread in [&leader, &worker] {
@@ -1666,4 +1677,154 @@ async fn reused_exec_worker_vfork_registration_requires_creation_mode(
         fixture.state.global_time.lock().unwrap().as_nanos(),
         before_total
     );
+}
+
+/// The parent's view of the exec'ing process: its exit notification signal,
+/// whether a `__WCLONE` wait and an ordinary wait each have it as a target
+/// (wait4(WNOHANG) returns ECHILD without one), and its exec count.
+fn exec_wait_identity(state: &GlobalState) -> (Option<libc::c_int>, bool, bool, Option<u64>) {
+    let sched = state.sched.lock().unwrap();
+    let wait = |exit_class| ChildWaitSpec {
+        selector: ChildWaitSelector::Exact(LEADER),
+        owner: None,
+        exit_class,
+    };
+    (
+        sched.thread_tree.child_exit_notification_signal(LEADER),
+        sched.has_child_wait_target(PARENT, wait(ChildWaitExitClass::Clone)),
+        sched.has_child_wait_target(PARENT, wait(ChildWaitExitClass::Sigchld)),
+        sched.thread_tree.exec_generation(LEADER),
+    )
+}
+
+const CLONED_WITH_SIGUSR1: (Option<libc::c_int>, bool, bool, Option<u64>) =
+    (Some(libc::SIGUSR1), true, false, Some(0));
+const AFTER_ONE_EXEC: (Option<libc::c_int>, bool, bool, Option<u64>) =
+    (Some(libc::SIGCHLD), false, true, Some(1));
+
+/// Linux resets the exit signal inside the exec syscall. The identity
+/// transfer commits the exec, and `ResumeExec` then waits for an ordinary
+/// grant: the scheduler may admit another task, such as the parent calling
+/// wait4(WNOHANG), before the replacement's post-exec callback runs. That
+/// observer must already see the exec. The callback must not count it again,
+/// and must still count a later exec that only it reports.
+#[tokio::test]
+async fn transferred_exec_commits_its_exit_signal_before_the_replacement_is_admitted() {
+    let fixture = Fixture::with_exit_signal(true, libc::SIGUSR1).await;
+    assert_eq!(exec_wait_identity(&fixture.state), CLONED_WITH_SIGUSR1);
+    let mut guest = fixture.guest(Gate::None);
+    {
+        let mut reconnect = Box::pin(super::super::reconnect_exec(&mut guest));
+        assert!(futures::poll!(&mut reconnect).is_pending());
+        assert!(futures::poll!(&mut reconnect).is_pending());
+        // Committed, not yet admitted: no turn has been granted.
+        fixture.assert_running();
+        assert!(fixture.state.pending_exec_states.lock().unwrap().is_empty());
+        assert_eq!(exec_wait_identity(&fixture.state), AFTER_ONE_EXEC);
+        let turn = crate::scheduler::do_a_turn_blocking(
+            fixture.state.sched.clone(),
+            fixture.state.global_time.clone(),
+            &Err(crate::scheduler::SkipTurn),
+        )
+        .await
+        .expect("replacement must receive its continuation grant");
+        assert_eq!(turn.tid, LEADER);
+        assert_eq!(reconnect.await, Ok(()));
+    }
+    assert_eq!(guest.thread.dettid, LEADER);
+    let post_exec_mm = guest.thread.mm_id;
+    assert_eq!(post_exec_mm, MmId::initial(LEADER).for_exec(LEADER));
+    let marked = fixture
+        .state
+        .receive_rpc(
+            Tid::from_raw(LEADER.as_raw()),
+            (
+                guest.thread.thread_logical_time.clone(),
+                post_exec_mm,
+                GlobalRequest::MarkPastFirstExecve(LEADER, None),
+            ),
+        )
+        .await;
+    assert_eq!(
+        marked,
+        (
+            None,
+            GlobalResponse::MarkPastFirstExecve(Default::default())
+        )
+    );
+    assert_eq!(exec_wait_identity(&fixture.state), AFTER_ONE_EXEC);
+
+    // The new leader execs again; this state-preserving leader exec has only
+    // its callback as a successful-exec edge.
+    for (mm, request) in [
+        (
+            post_exec_mm,
+            GlobalRequest::PrepareExec(LEADER, post_exec_mm, Default::default()),
+        ),
+        (
+            post_exec_mm.for_exec(LEADER),
+            GlobalRequest::MarkPastFirstExecve(LEADER, None),
+        ),
+    ] {
+        let response = fixture
+            .state
+            .receive_rpc(
+                Tid::from_raw(LEADER.as_raw()),
+                (guest.thread.thread_logical_time.clone(), mm, request),
+            )
+            .await;
+        assert!(
+            matches!(
+                response.1,
+                GlobalResponse::PrepareExec(()) | GlobalResponse::MarkPastFirstExecve(_)
+            ),
+            "{response:?}"
+        );
+    }
+    assert_eq!(
+        exec_wait_identity(&fixture.state),
+        (Some(libc::SIGCHLD), false, true, Some(2))
+    );
+}
+
+/// Ptrace can observe a successful nonleader exec and then the survivor's
+/// SIGKILL before its post-exec callback, whether or not the identity
+/// transfer committed first. Terminal cleanup must leave a zombie in the
+/// ordinary wait population, with the exec counted exactly once.
+#[tokio::test]
+async fn exec_death_before_its_callback_still_commits_the_exec_once() {
+    for gate in [Gate::BeforeCommit, Gate::AfterCommit] {
+        let fixture = Fixture::with_exit_signal(true, libc::SIGUSR1).await;
+        let mut guest = fixture.guest(gate);
+        {
+            let mut reconnect = Box::pin(super::super::reconnect_exec(&mut guest));
+            assert!(futures::poll!(&mut reconnect).is_pending());
+        }
+        assert!(guest.rpc.reached.load(Ordering::SeqCst));
+        let committed = gate == Gate::AfterCommit;
+        assert_eq!(
+            exec_wait_identity(&fixture.state),
+            if committed {
+                AFTER_ONE_EXEC
+            } else {
+                CLONED_WITH_SIGUSR1
+            }
+        );
+        consume_with_status(
+            &fixture.state,
+            &fixture.tool,
+            LEADER,
+            guest.thread,
+            ExitStatus::Signaled(Signal::SIGKILL, false),
+        )
+        .await;
+        assert!(fixture.state.pending_exec_states.lock().unwrap().is_empty());
+        assert_eq!(exec_wait_identity(&fixture.state), AFTER_ONE_EXEC);
+        let mut sched = fixture.state.sched.lock().unwrap();
+        assert_eq!(
+            sched.exact_child_wait_state(PARENT, LEADER),
+            ExactChildWaitState::LogicallyExited
+        );
+        assert_eq!(sched.ready_child_wait(PARENT, child_wait()), Some(LEADER));
+    }
 }

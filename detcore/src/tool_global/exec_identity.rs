@@ -65,6 +65,13 @@ impl GlobalState {
         // Account its final pre-exec work and publish the entire replacement
         // before retiring that request, under the same mutex as turn grants.
         let prepared = pending.remove(&process).unwrap();
+        // The authenticated transfer is the successful-exec edge. `ResumeExec`
+        // can admit other tasks before the post-exec callback runs, so commit
+        // the exit-signal and generation changes before anything observes the
+        // replacement.
+        sched
+            .thread_tree
+            .note_successful_exec_before_callback(process);
         let mut global_time = self.global_time.lock().unwrap();
         global_time.update_global_time(former, time.as_nanos(), time.inherited_nanos());
         sched.reconnect_transferred_exec(ExecReconnect {
@@ -169,8 +176,13 @@ impl GlobalState {
         if let Some(prepared) = pending.remove(&process) {
             // The authenticated backend sender has already taken over the
             // leader TID: kernel exec succeeded even if cancellation prevented
-            // the reconnect reply. Retire the complete proven-dead cohort,
-            // including peers whose physical cleanup callbacks arrive later.
+            // the reconnect reply. No post-exec callback will run, so commit
+            // the exec's exit-signal and generation changes here, before the
+            // teardown can expose the dying process to its parent's waits.
+            // A committed transfer (the receipt branch) already did so.
+            sched.thread_tree.note_successful_exec(process);
+            // Retire the complete proven-dead cohort, including peers whose
+            // physical cleanup callbacks arrive later.
             sched.finish_exec_teardown(prepared.caller, process, prepared.mm, true);
         }
         completed.remove(&process);

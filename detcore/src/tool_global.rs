@@ -1645,8 +1645,11 @@ impl GlobalTool for GlobalState {
                 sched.blocked.timed_waiters.remove_posix_timers(detpid);
                 // Every backend reports each successful exec here, before the
                 // new image runs, so its own exit and its parent's waits see
-                // the exit signal the exec reset.
-                sched.thread_tree.note_successful_exec(detpid);
+                // the exit signal the exec reset. A reconnect that admits the
+                // image before this callback (identity transfer, reloading
+                // registration) has already committed the exec; the callback
+                // then does not count it again.
+                sched.thread_tree.note_post_exec_callback(detpid);
                 // Reloading backends consumed the preparation in their
                 // registration reconnect; state-preserving leaders consume it
                 // here after the terminal exec notification was authenticated.
@@ -1702,6 +1705,14 @@ impl GlobalTool for GlobalState {
                         (pending, post_exec_mm)
                     };
                     assert_eq!(pending.process, parent_detpid);
+                    // Consuming the preparation authenticates the successful
+                    // exec. The startup grant can admit other tasks before
+                    // this image's post-exec callback runs, so commit the
+                    // exit-signal and generation changes now, under the same
+                    // scheduler lock, before any of them can observe it.
+                    sched
+                        .thread_tree
+                        .note_successful_exec_before_callback(parent_detpid);
                     if let Some((physical_pid, physical_tid)) = physical_ids
                         && let Err(open_error) = sched.register_physical_thread(
                             dettid,
@@ -6850,6 +6861,121 @@ mod tests {
             GlobalResponse::MarkPastFirstExecve(Default::default())
         );
         assert_eq!(observe(&state), (Some(libc::SIGCHLD), false, true));
+    }
+
+    /// A reloading backend (SaBRe) consumes the exec preparation when the new
+    /// image re-registers, then waits for its startup grant before the
+    /// post-exec callback. The scheduler may admit another task first, such as
+    /// the parent calling wait4(WNOHANG), which must already see the exec's
+    /// SIGCHLD exit signal. The callback must not count the exec again.
+    #[tokio::test]
+    async fn reloading_exec_commits_its_exit_signal_before_startup_admission() {
+        let (config, state, parent, parent_pid) = cancellation_test_state();
+        let child = DetTid::from_raw(parent.as_raw() + 1);
+        let child_pid = DetPid::from_raw(child.as_raw());
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .thread_tree
+            .add_child_with_wait_metadata(parent, child, true, false, libc::SIGUSR1);
+        install_test_registration(&state, child, Ivar::new());
+        let old_mm = MmId::initial(child_pid).for_exec(child_pid);
+        let post_exec_mm = old_mm.for_exec(child_pid);
+        {
+            let mut scheduler = state.sched.lock().unwrap();
+            scheduler.install_test_exec_incarnation(child, old_mm);
+            scheduler.next_turns.get_mut(&child).unwrap().resp =
+                Ivar::full(SchedResponse::Go(None));
+        }
+        let mut existing_time = DetTime::new(&config);
+        existing_time.add_syscall();
+        state.global_time.lock().unwrap().update_global_time(
+            child,
+            existing_time.as_nanos(),
+            LogicalTime::ZERO,
+        );
+        state.pending_exec_states.lock().unwrap().insert(
+            child_pid,
+            PendingExecState {
+                caller: child,
+                process: child_pid,
+                mm: old_mm,
+                fd_blocking: Default::default(),
+            },
+        );
+        let wait = |exit_class| ChildWaitSpec {
+            selector: ChildWaitSelector::Exact(child_pid),
+            owner: None,
+            exit_class,
+        };
+        let observe = |state: &GlobalState| {
+            let sched = state.sched.lock().unwrap();
+            (
+                sched.thread_tree.child_exit_notification_signal(child_pid),
+                sched.has_child_wait_target(parent_pid, wait(ChildWaitExitClass::Clone)),
+                sched.has_child_wait_target(parent_pid, wait(ChildWaitExitClass::Sigchld)),
+                sched.thread_tree.exec_generation(child_pid),
+            )
+        };
+        assert_eq!(observe(&state), (Some(libc::SIGUSR1), true, false, Some(0)));
+        let after_exec = (Some(libc::SIGCHLD), false, true, Some(1));
+
+        let fresh_local_time = DetTime::new(&config);
+        let created = state
+            .receive_rpc(
+                reverie::Tid::from_raw(child.as_raw()),
+                (
+                    fresh_local_time.clone(),
+                    MmId::initial(child),
+                    GlobalRequest::CreateChildThread(
+                        child,
+                        child_pid,
+                        0,
+                        None,
+                        libc::SIGCHLD,
+                        None,
+                        Some(DEFAULT_PRIORITY),
+                    ),
+                ),
+            )
+            .await;
+        assert_eq!(
+            created.1,
+            GlobalResponse::CreateChildThread(Some(post_exec_mm))
+        );
+        assert!(state.pending_exec_states.lock().unwrap().is_empty());
+        // Re-registered, not yet admitted.
+        assert_eq!(observe(&state), after_exec);
+
+        let started = state
+            .receive_rpc(
+                reverie::Tid::from_raw(child.as_raw()),
+                (
+                    fresh_local_time.clone(),
+                    post_exec_mm,
+                    GlobalRequest::StartNewThread(child, child_pid, None, None),
+                ),
+            )
+            .await;
+        assert_eq!(started.1, GlobalResponse::StartNewThread(None));
+        assert_eq!(observe(&state), after_exec);
+        // The reconnect responses restored the image's absolute clock.
+        let marked = state
+            .receive_rpc(
+                reverie::Tid::from_raw(child.as_raw()),
+                (
+                    existing_time,
+                    post_exec_mm,
+                    GlobalRequest::MarkPastFirstExecve(child_pid, None),
+                ),
+            )
+            .await;
+        assert_eq!(
+            marked.1,
+            GlobalResponse::MarkPastFirstExecve(Default::default())
+        );
+        assert_eq!(observe(&state), after_exec);
     }
 
     #[tokio::test]
