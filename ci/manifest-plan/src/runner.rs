@@ -1980,15 +1980,22 @@ fn validate_mode_with_cpu(
             ));
         }
     }
+    // `compare_io_buffers=false` is refused with or without a reason: the
+    // runner would pass `--no-detlog-io-buffers`, under which Hermit never
+    // reports `bitwise_parity` (`is_bitwise_parity` in
+    // hermit-cli/src/bin/hermit/verify.rs), so the cell could never reach a
+    // canonical match. Every reason is therefore refused as well.
     match (
         mode,
         recipe.compare_io_buffers,
         recipe.compare_io_buffers_disabled_reason.as_deref(),
     ) {
-        ("verify", None | Some(true), None) | ("verify", Some(false), Some(_)) => {}
-        ("verify", Some(false), None) => {
+        ("verify", None | Some(true), None) => {}
+        ("verify", Some(false), _) => {
             return Err(format!(
-                "{id}: verify compare_io_buffers=false requires compare_io_buffers_disabled_reason"
+                "{id}: verify compare_io_buffers=false is refused, with or without a reason: \
+                 under --no-detlog-io-buffers Hermit never reports bitwise_parity, so the cell \
+                 could never reach a canonical match"
             ));
         }
         ("verify", None | Some(true), Some(_)) => {
@@ -2002,15 +2009,6 @@ fn validate_mode_with_cpu(
                 "{id}: compare_io_buffers is supported only by verify mode"
             ));
         }
-    }
-    if recipe
-        .compare_io_buffers_disabled_reason
-        .as_deref()
-        .is_some_and(|reason| reason.trim().is_empty())
-    {
-        return Err(format!(
-            "{id}: compare_io_buffers_disabled_reason must be substantive"
-        ));
     }
     match (
         mode,
@@ -4733,6 +4731,9 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
     }
     // Validation admits these relaxations only on a verify recipe, and a
     // replay cell does not inherit them: `record start` has no such flags.
+    // Validation refuses `compare_io_buffers=false` outright; the flag is
+    // still rendered for a recipe built without validation, such as one that
+    // reproduces a retained row recorded before the refusal.
     argv.extend(cell_hermit_args(mode_recipe, backend).iter().cloned());
     if mode_recipe.compare_io_buffers == Some(false) {
         argv.push("--no-detlog-io-buffers".into());
@@ -15017,15 +15018,28 @@ backends_disabled:
     fn verify_relaxations_are_explicit_and_recorded() {
         let mut test = recipe(true);
         let mode = test.modes.get_mut("verify").unwrap();
-        mode.compare_io_buffers = Some(false);
-        mode.compare_io_buffers_disabled_reason = Some(
-            "guest assertions validate sanitizer-specific invariants while whole files may vary"
-                .into(),
-        );
         mode.rcb_time = Some(false);
         mode.rcb_time_disabled_reason =
             Some("data-dependent assertion work must not perturb virtual time".into());
         validate_mode("fixture/test", "verify", mode, 15).unwrap();
+        // Without the I/O-buffer comparison Hermit never reports bitwise
+        // parity, so validation refuses the relaxation whatever the reason.
+        let io_reason =
+            "guest assertions validate sanitizer-specific invariants while whole files may vary";
+        for reason in [None, Some(io_reason)] {
+            let mut io_off = mode.clone();
+            io_off.compare_io_buffers = Some(false);
+            io_off.compare_io_buffers_disabled_reason = reason.map(String::from);
+            let error = validate_mode("fixture/test", "verify", &io_off, 15).unwrap_err();
+            assert!(
+                error.contains("compare_io_buffers=false is refused, with or without a reason"),
+                "{reason:?}: {error}"
+            );
+        }
+        // A recipe built without validation, as for a row recorded before the
+        // refusal, still renders and records the relaxation.
+        mode.compare_io_buffers = Some(false);
+        mode.compare_io_buffers_disabled_reason = Some(io_reason.into());
         let cell = SelectedCell {
             category: "fixture".into(),
             id: CellId {
@@ -15096,14 +15110,6 @@ backends_disabled:
                     "--no-rcb-time: data-dependent assertion work must not perturb virtual time",
                 ),
             ]
-        );
-
-        let mut missing_reason = recipe(true).modes.remove("verify").unwrap();
-        missing_reason.compare_io_buffers = Some(false);
-        assert!(
-            validate_mode("fixture/test", "verify", &missing_reason, 15)
-                .unwrap_err()
-                .contains("requires compare_io_buffers_disabled_reason")
         );
 
         assert!(

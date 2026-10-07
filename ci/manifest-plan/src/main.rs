@@ -1404,10 +1404,17 @@ fn validate_mode_with_cpu(
                 ))
             })
         });
+        // `compare_io_buffers: false` is refused with or without a reason. The
+        // runner would pass `--no-detlog-io-buffers`, and Hermit then never
+        // reports `bitwise_parity` (`is_bitwise_parity` in
+        // hermit-cli/src/bin/hermit/verify.rs), so the cell could never reach
+        // a canonical match. The reason key stays known so that a manifest
+        // naming it gets this explanation rather than "unknown keys".
         match (compare_io_buffers, disabled_reason) {
-            (Some(false), Some(reason)) if !reason.trim().is_empty() => {}
             (Some(false), _) => die(format!(
-                "{id}: modes.verify.compare_io_buffers=false requires a substantive compare_io_buffers_disabled_reason"
+                "{id}: modes.verify.compare_io_buffers=false is refused, with or without a reason: \
+                 under --no-detlog-io-buffers Hermit never reports bitwise_parity, so the cell \
+                 could never reach a canonical match; fix the divergence or disable the cell with its reason"
             )),
             (None | Some(true), Some(_)) => die(format!(
                 "{id}: modes.verify comparison reason is stale while I/O-buffer comparison is enabled"
@@ -2182,12 +2189,40 @@ liteinst = "unsupported"
     }
 
     #[test]
-    #[should_panic(expected = "compare_io_buffers=false requires a substantive")]
+    #[should_panic(expected = "compare_io_buffers=false is refused, with or without a reason")]
     fn rejects_io_buffer_comparison_relaxation_without_reason() {
         let spec = parse_mode(
             r#"
 ci = true
 compare_io_buffers = false
+backends_enabled = ["ptrace"]
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#,
+        );
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            90,
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "compare_io_buffers=false is refused, with or without a reason")]
+    fn rejects_io_buffer_comparison_relaxation_with_reason() {
+        let spec = parse_mode(
+            r#"
+ci = true
+compare_io_buffers = false
+compare_io_buffers_disabled_reason = "guest assertions validate the output while whole buffers may vary"
 backends_enabled = ["ptrace"]
 
 [backends_disabled]
