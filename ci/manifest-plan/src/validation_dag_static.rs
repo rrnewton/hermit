@@ -1140,7 +1140,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The four seccomp-state tests of the same pull request (hermit
     // dbt_detconfig_omit_tests: 2, hermit tests: 2) retain all 966: 970, listed
     // the same way.
-    ("test.hermit_unit", 970),
+    // The two thread-seccomp tests of the same pull request (hermit tests:
+    // a_seccomp_filter_on_any_task_counts_as_an_inherited_filter,
+    // a_filter_on_a_thread_other_than_the_leader_counts) retain all 970: 972,
+    // listed the same way.
+    ("test.hermit_unit", 972),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1423,7 +1427,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (the same pull request) retains all 1205: 1206, listed the same way.
     // syscalls::files::inject_fstat_scratch::getdents_keys_an_overlay_entry_alike_whatever_was_read_before
     // (the same pull request) retains all 1206: 1207, listed the same way.
-    ("test.detcore_unit", 1207),
+    // syscalls::files::inject_fstat_scratch::getdents_settles_an_overlay_alike_whichever_directory_is_read_first
+    // and ::getdents_takes_a_candidates_answer_where_the_kernel_cannot_tell_a_mount
+    // (the same pull request) retain all 1207: 1209, listed the same way.
+    ("test.detcore_unit", 1209),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2008,7 +2015,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the non-UTF-8 maps numbering test (1193).
     // And the inherited-seccomp getdents test (1194).
     // And the overlay read-order getdents test (1195).
-    ("test.detcore_unit_on_host", 1195),
+    // And the two overlay mount-root getdents tests (1197).
+    ("test.detcore_unit_on_host", 1197),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -2096,7 +2104,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the signal-report pipe-page test: 954.
     // The host twin selects the same twelve tests: 966.
     // The host twin selects the same four seccomp-state tests: 970.
-    ("test.hermit_unit_on_host", 970),
+    // The host twin selects the same two thread-seccomp tests: 972.
+    ("test.hermit_unit_on_host", 972),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
