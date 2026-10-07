@@ -820,14 +820,20 @@ fn run_stress_standin(root: &Path, dir: &Path) -> Result<String, String> {
         ),
     )?;
     // The node calls `timeout --verbose --kill-after=G T <command...>`; the
-    // shim drops its own directory from PATH and keeps only the command.
+    // shim drops its own directory from PATH and keeps only the command. Only
+    // repetitions 5 and 6 are meant to outlive the bound, so only they get the
+    // 1 s one; the rest get 30 s, so a loaded host cannot time out a
+    // repetition that should exit on its own (9's own 124 then read as
+    // timeout's, at load average 300 on 2026-10-07).
     let shim_dir = dir.join("bin");
     std::fs::create_dir_all(&shim_dir)
         .map_err(|error| format!("cannot create super stand-in shim dir: {error}"))?;
     write_executable(
         &shim_dir.join("timeout"),
         "#!/usr/bin/env bash\n\
-         PATH=${PATH#*:} exec timeout --verbose --kill-after=1 1 \"${@:4}\"\n",
+         rep=${!#}; rep=${rep##*-}\n\
+         case $rep in 5|6) bound=1;; *) bound=30;; esac\n\
+         PATH=${PATH#*:} exec timeout --verbose --kill-after=1 \"$bound\" \"${@:4}\"\n",
     )?;
     let path = format!(
         "{}:{}",
