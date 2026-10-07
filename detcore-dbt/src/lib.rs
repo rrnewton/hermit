@@ -940,6 +940,29 @@ fn error_result(error: Error) -> i64 {
     }
 }
 
+/// Splits a Detcore handler error into a guest result or a run failure.
+///
+/// Only a Linux error belongs to the guest. Any other error means Detcore
+/// cannot continue faithfully: an invariant failed, evidence it needs is
+/// missing, or the syscall is unsupported. ptrace and KVM fail the run on
+/// such an error. Writing an invented `EIO` instead would let the guest
+/// catch it and continue, so an internal failure would look like guest
+/// behaviour. `Err` carries the diagnostic for the run's stderr.
+fn guest_errno_or_failure(error: Error) -> Result<i64, String> {
+    match error {
+        Error::Errno(errno) => Ok(-(errno.into_raw() as i64)),
+        Error::Tool(error) => match error.downcast_ref::<UnsupportedSyscallError>() {
+            Some(unsupported) => Err(format!("detcore-dbt: {unsupported}\n")),
+            None => Err(format!(
+                "detcore-dbt: Detcore failed handling a syscall: {error:#}\n"
+            )),
+        },
+        Error::Io(error) => Err(format!(
+            "detcore-dbt: Detcore failed handling a syscall: {error}\n"
+        )),
+    }
+}
+
 /// Returns the Detcore DBT cdylib built beside the running Hermit binary or in Cargo's deps directory.
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-738): Review native-client linkage to the minimal DBT runtime.
@@ -1993,6 +2016,8 @@ unsafe fn start_thread_runtime(
         );
         let Some(open_file_creator) = runtime.abi.open_file_creator(scratch.virtual_tid, tid)
         else {
+            let message = b"detcore-dbt: no open-file creator identity for a new thread\n";
+            unsafe { emit(message.as_ptr(), message.len()) };
             return Err(-(Errno::EIO.into_raw() as i64));
         };
         state.set_open_file_creator(open_file_creator);
@@ -2025,6 +2050,8 @@ unsafe fn start_thread_runtime(
             read_registers,
             write_registers,
         ) {
+            let message = format!("detcore-dbt: Detcore thread-start hook failed: {error:#}\n");
+            unsafe { emit(message.as_ptr(), message.len()) };
             return Err(error_result(error));
         }
         thread.initialized = true;
@@ -2277,11 +2304,10 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         )
     } {
         Ok(thread) => unsafe { &mut *thread },
-        Err(value) => {
-            unsafe { result.write(value) };
-            TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
-            return 1;
-        }
+        // Starting Detcore's thread state failed before this syscall ran, so
+        // no errno would be the syscall's own. The copied-child callback
+        // already ends the run here; so does this one.
+        Err(_) => return -1,
     };
     let det_tid = thread.tid;
 
@@ -2426,21 +2452,31 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
             unsafe { write_deferred_syscall(syscall, deferred_sysnum, deferred_args) };
             2
         }
-        Err(Error::Tool(error)) => {
-            if let Some(unsupported) = error.downcast_ref::<UnsupportedSyscallError>() {
-                let message = format!("detcore-dbt: {unsupported}\n");
-                unsafe { emit(message.as_ptr(), message.len()) };
-                -1
-            } else {
-                unsafe { result.write(error_result(Error::Tool(error))) };
-                TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
-                1
-            }
-        }
-        Err(error) => {
-            unsafe { result.write(error_result(error)) };
+        Err(error) => handler_error_action(
+            error,
+            |value| unsafe { result.write(value) },
+            |message| unsafe { emit(message.as_ptr(), message.len()) },
+        ),
+    }
+}
+
+/// The pre-syscall action for a Detcore handler error: 1 after writing a guest
+/// errno, or -1 after reporting a failure, which makes the native client end
+/// the run with exit code 101.
+fn handler_error_action(
+    error: Error,
+    write_result: impl FnOnce(i64),
+    emit: impl FnOnce(&[u8]),
+) -> i32 {
+    match guest_errno_or_failure(error) {
+        Ok(value) => {
+            write_result(value);
             TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
             1
+        }
+        Err(message) => {
+            emit(message.as_bytes());
+            -1
         }
     }
 }
@@ -2525,6 +2561,73 @@ mod tests {
     unsafe extern "C" fn test_emit_evidence(_bytes: *const u8, _length: usize) {}
 
     unsafe extern "C" fn test_idle() {}
+
+    #[derive(Debug)]
+    struct BrokenInvariant;
+
+    impl std::fmt::Display for BrokenInvariant {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("serial waitid invariant broken")
+        }
+    }
+
+    impl std::error::Error for BrokenInvariant {}
+
+    /// Runs `handler_error_action` and returns its action, the guest result it
+    /// wrote, and the diagnostic it reported.
+    fn handler_error_outcome(error: Error) -> (i32, Option<i64>, Option<String>) {
+        let mut written = None;
+        let mut reported = None;
+        let action = handler_error_action(
+            error,
+            |value| written = Some(value),
+            |message| reported = Some(String::from_utf8(message.to_vec()).unwrap()),
+        );
+        (action, written, reported)
+    }
+
+    #[test]
+    fn only_a_linux_error_from_a_handler_reaches_the_guest() {
+        assert_eq!(
+            handler_error_outcome(Error::Errno(Errno::ENOENT)),
+            (1, Some(-(Errno::ENOENT.into_raw() as i64)), None)
+        );
+        for (error, expected) in [
+            (
+                Error::Tool(BrokenInvariant.into()),
+                "detcore-dbt: Detcore failed handling a syscall: serial waitid invariant broken\n",
+            ),
+            (
+                Error::Io(io::Error::other("required evidence is missing")),
+                "detcore-dbt: Detcore failed handling a syscall: required evidence is missing\n",
+            ),
+            (
+                Error::Tool(UnsupportedSyscallError(reverie::syscalls::Sysno::kcmp).into()),
+                "detcore-dbt: unsupported syscall: kcmp\n",
+            ),
+        ] {
+            assert_eq!(
+                handler_error_outcome(error),
+                (-1, None, Some(expected.to_owned())),
+                "a non-errno handler error must end the run, never reach the guest"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_thread_start_ends_the_run_instead_of_failing_the_syscall() {
+        let source = include_str!("lib.rs");
+        let dispatch = source
+            .split_once("pub unsafe extern \"C\" fn reverie_dbt_runtime_pre_syscall")
+            .expect("pre-syscall callback")
+            .1;
+        let start = &dispatch[dispatch
+            .find("start_thread_runtime(")
+            .expect("thread start")..];
+        let arms = &start[..start.find("};").expect("end of the thread-start match")];
+        assert!(arms.contains("Err(_) => return -1,"), "{arms}");
+        assert!(!arms.contains("result.write"), "{arms}");
+    }
 
     /// The configuration `hermit run --backend=dbt` would send, encoded as it
     /// is put in the guest's environment.
