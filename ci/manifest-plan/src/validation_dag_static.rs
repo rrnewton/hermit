@@ -1368,7 +1368,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retains all 1088: 1088 + 1 = 1089, measured with cargo nextest list
     // --profile ci -p hermit-detcore --lib --bins.
     // The non-modelling-scheduler background-signal test (P0 flake fix), re-listed: 1090.
-    ("test.detcore_unit", 1090),
+    // Seven shared open file tests (shared-OFD step B5a: five in shared_open_files.rs, two in tool_global.rs), re-listed: 1096.
+    ("test.detcore_unit", 1097),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1926,7 +1927,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same five fd.rs tests, re-listed: 1088.
     // And the same unidentified-stop SIGCHLD refusal test: 1088 + 1 = 1089.
     // The host twin selects the same background-signal test, re-listed: 1090.
-    ("test.detcore_unit_on_host", 1090),
+    // The host twin selects the same seven B5a tests, re-listed: 1096.
+    ("test.detcore_unit_on_host", 1097),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

@@ -144,6 +144,18 @@ struct SharedOpenFile {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OpenFileModel(OpenFileDescription);
 
+impl OpenFileModel {
+    /// The open file description this model describes.
+    pub(crate) fn id(&self) -> OpenFileId {
+        self.0.id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn path_for_test(&self) -> Option<PathBuf> {
+        self.0.path.clone()
+    }
+}
+
 /// The canonical model of one shared open file description, taken by one
 /// process for the length of one synchronous `DetFd` method call.
 #[derive(Debug, Serialize, Deserialize)]
@@ -158,7 +170,7 @@ pub struct OpenFileLease {
 }
 
 /// A failure to take or publish a shared open file description.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedOpenFileError(pub String);
 
 impl fmt::Display for SharedOpenFileError {
@@ -1067,6 +1079,15 @@ pub(crate) fn intern_open_files(handles: &mut std::collections::HashMap<RawFd, D
 }
 
 impl DetFd {
+    /// A copy of this local description's model, for tests of the global
+    /// store.
+    #[cfg(test)]
+    pub(crate) fn model_for_test(&self) -> OpenFileModel {
+        self.with_description(|d| {
+            OpenFileModel(serde_json::from_value(serde_json::to_value(&*d).unwrap()).unwrap())
+        })
+    }
+
     /// Moves this open file description's model out to a test's canonical
     /// store and makes every alias a shared handle, keeping this process's
     /// directory lock. The real promotion is a later step.
