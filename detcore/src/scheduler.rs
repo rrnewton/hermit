@@ -275,6 +275,34 @@ fn kernel_signal_bit(raw_signal: i32) -> u64 {
     }
 }
 
+/// Whether the mask recorded at an `rt_sigsuspend` grant agrees with the mask
+/// the kernel installed (`SigBlk`). The kernel never blocks `SIGKILL` or
+/// `SIGSTOP` (`sigsuspend` removes them from the new mask), so those two bits
+/// are not compared.
+fn sigsuspend_masks_agree(granted: u64, installed: u64) -> bool {
+    let unblockable = kernel_signal_bit(libc::SIGKILL) | kernel_signal_bit(libc::SIGSTOP);
+    granted & !unblockable == installed & !unblockable
+}
+
+/// The warning logged when the mask the kernel installed for `thread`'s
+/// `rt_sigsuspend` (`installed`, its `SigBlk` once it was seen asleep in the
+/// call) differs from the mask recorded at the grant (`granted`) in a signal
+/// the thread can block (`sigsuspend_masks_agree`). `None` when they agree or
+/// no mask was recorded.
+fn rt_sigsuspend_mask_warning(
+    thread: DetTid,
+    granted: Option<u64>,
+    installed: u64,
+) -> Option<String> {
+    let granted = granted?;
+    (!sigsuspend_masks_agree(granted, installed)).then(|| {
+        format!(
+            "[step1b] dtid {thread} sleeps in rt_sigsuspend under mask {installed:#x}, not the \
+             {granted:#x} recorded at its grant; using the kernel's"
+        )
+    })
+}
+
 /// How a signal the scheduler sends reaches the host thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HostSignalSend {
@@ -856,8 +884,15 @@ pub struct Scheduler {
     /// continuations; `None` while the set is empty.
     signaled_background_since: Option<std::time::Instant>,
     /// Set when the release barrier's watchdog expires; the scheduler loop
-    /// ends the run with it (`exit_on_signaled_background_refusal`).
+    /// ends the run with it (`exit_on_scheduler_refusal`).
     signaled_background_refusal: Option<SignaledBackgroundRefusal>,
+    /// Threads that a grant released into `rt_sigsuspend` and that have not yet
+    /// been seen asleep there or reported back
+    /// (`step1b_hold_for_rt_sigsuspend_entry`).
+    rt_sigsuspend_entry_holds: BTreeMap<DetTid, RtSigsuspendEntryHold>,
+    /// Set when such a thread was not seen asleep within the observer's bound;
+    /// the scheduler loop ends the run with it (`exit_on_scheduler_refusal`).
+    rt_sigsuspend_entry_refusal: Option<RtSigsuspendEntryRefusal>,
     #[cfg(test)]
     host_signal_attempts: u64,
     /// When set, a signal the scheduler would send to a guest thread is
@@ -1654,12 +1689,80 @@ impl std::fmt::Display for SignaledBackgroundRefusal {
 
 impl std::error::Error for SignaledBackgroundRefusal {}
 
+/// What the syscall layer saw of a thread that a grant released into
+/// `rt_sigsuspend` (`Scheduler::step1b_hold_for_rt_sigsuspend_entry`). The
+/// observation itself, which reads `/proc` and waits in host time, lives in
+/// `syscalls::confirm_rt_sigsuspend_entry`; the scheduler only receives its
+/// result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RtSigsuspendEntry {
+    /// The thread was seen asleep inside the call, under the kernel mask
+    /// `blocked` (`SigBlk`).
+    Asleep { blocked: u64 },
+    /// The thread was neither seen asleep nor reported back within the
+    /// observer's bound. `observed` says what was last seen.
+    Unconfirmed { observed: String, waited: Duration },
+}
+
+/// A thread released into `rt_sigsuspend` whose entry the scheduler still
+/// waits for (`Scheduler::step1b_hold_for_rt_sigsuspend_entry`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RtSigsuspendEntryHold {
+    /// The operation the grant began.
+    op_id: ExternalOpId,
+    /// The mask recorded at the grant (`out_of_scheduler_masks`), if known.
+    granted: Option<u64>,
+    /// What the syscall layer reported, once it has.
+    entry: Option<RtSigsuspendEntry>,
+}
+
+/// The thread whose `rt_sigsuspend` entry the syscall layer should observe,
+/// with the operation the observation belongs to
+/// (`Scheduler::rt_sigsuspend_entry_probe`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RtSigsuspendEntryProbe {
+    pub(crate) op_id: ExternalOpId,
+    /// The thread's process, for its `/proc/<pid>/task/<tid>` directory.
+    pub(crate) process: reverie::Pid,
+    pub(crate) thread: reverie::Pid,
+}
+
+/// A thread released into `rt_sigsuspend` was neither seen asleep there nor
+/// reported back within the observer's bound
+/// (`Scheduler::step1b_hold_for_rt_sigsuspend_entry`). Letting other threads
+/// run anyway would make the mask it sleeps under, and the point at which they
+/// run, depend on host timing, so the run is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RtSigsuspendEntryRefusal {
+    /// The released thread.
+    pub thread: DetTid,
+    /// The task state and syscall the observer last saw.
+    pub observed: String,
+    /// How long, in host time, the observer had waited.
+    pub waited: Duration,
+}
+
+impl std::fmt::Display for RtSigsuspendEntryRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "hermit refused to continue the run: the rt_sigsuspend of thread {} was \
+             neither seen asleep nor reported within {:?} of its release (last seen: {}), \
+             so the mask it sleeps under and the point at which other threads run would \
+             depend on host timing",
+            self.thread, self.waited, self.observed
+        )
+    }
+}
+
+impl std::error::Error for RtSigsuspendEntryRefusal {}
+
 /// End the run on a scheduler refusal: write it to stderr and exit with
 /// `HERMIT_POLICY_REFUSAL_EXIT`, the status for "hermit examined the run and
 /// refused it", as the network replay refusal does. Only the ptrace backend
-/// arms the release barrier, and a ptrace guest does not outlive this process
-/// (Reverie sets `PTRACE_O_EXITKILL`).
-fn exit_on_signaled_background_refusal(refusal: &SignaledBackgroundRefusal) -> ! {
+/// arms the release barrier or holds an `rt_sigsuspend` entry, and a ptrace
+/// guest does not outlive this process (Reverie sets `PTRACE_O_EXITKILL`).
+fn exit_on_scheduler_refusal(refusal: &impl std::fmt::Display) -> ! {
     {
         use std::io::Write;
         let _ = writeln!(crate::util::RetryingStderr, "{refusal}");
@@ -1745,10 +1848,16 @@ async fn do_ordinary_turn_blocking(
         if sched.backend_failed() {
             return Err(SkipTurn);
         }
+        let held = sched.step1b_hold_for_rt_sigsuspend_entry();
+        if let Some(refusal) = sched.rt_sigsuspend_entry_refusal.take() {
+            drop(sched);
+            exit_on_scheduler_refusal(&refusal);
+        }
+        held?;
         let blocked = sched.step2_process_blocked(&global_time);
         if let Some(refusal) = sched.signaled_background_refusal.take() {
             drop(sched);
-            exit_on_signaled_background_refusal(&refusal);
+            exit_on_scheduler_refusal(&refusal);
         }
         blocked?;
         sched.step3_peek().ok_or(SkipTurn)?
@@ -2126,6 +2235,8 @@ impl Scheduler {
             backend: cfg.backend,
             signaled_background_since: None,
             signaled_background_refusal: None,
+            rt_sigsuspend_entry_holds: BTreeMap::new(),
+            rt_sigsuspend_entry_refusal: None,
             #[cfg(test)]
             host_signal_attempts: 0,
             #[cfg(test)]
@@ -3296,6 +3407,7 @@ impl Scheduler {
         self.blocked.sigchld_deferred.remove(dtid);
         self.blocked.sigchld_ready.remove(dtid);
         self.blocked.signaled_background.remove(dtid);
+        self.rt_sigsuspend_entry_holds.remove(dtid);
         self.blocked.child_waiters.remove(dtid);
         self.blocked.physical_child_ready.remove(dtid);
         self.blocked.physical_child_waiters.retain(|_, waiters| {
@@ -3558,6 +3670,147 @@ impl Scheduler {
         }
         self.step2a_wait_for_vfork_barrier()?;
         Ok(())
+    }
+
+    /// Hold every other guest thread while a thread that a grant released into
+    /// `rt_sigsuspend` has not yet been seen asleep there or reported back.
+    ///
+    /// The real call copies its mask from guest memory only once the thread
+    /// runs, at a host-timed moment after the grant. A sibling that ran in
+    /// between could rewrite that memory, and the kernel would then install a
+    /// mask chosen by host timing. While a hold lasts, the pass does nothing
+    /// else and returns `SkipTurn`: no guest turn, timer, or signal commits, and
+    /// a skipped pass does not advance logical time (`bump_global_time`). So the
+    /// mask the thread sleeps under is a function of guest memory at the grant,
+    /// and host timing decides only how many empty passes spin.
+    ///
+    /// A hold ends in one of three ways, each at this same fixed point:
+    /// * The syscall layer saw the thread asleep inside the call
+    ///   (`RtSigsuspendEntry::Asleep`). Its recorded mask becomes the kernel's
+    ///   `SigBlk`. If that differs from the mask recorded at the grant apart
+    ///   from `SIGKILL` and `SIGSTOP` (`sigsuspend_masks_agree`), a warning
+    ///   names both and the kernel's mask is used.
+    /// * The thread reported back without sleeping: its call returned at once
+    ///   (an invalid argument, or an already pending signal that its temporary
+    ///   mask admits), or it stopped for a signal. It is handed to the release
+    ///   barrier (`step2_release_signaled_background`), which requeues it
+    ///   before any other thread is selected.
+    /// * The thread left its pool or exited.
+    ///
+    /// If the syscall layer gives up (`RtSigsuspendEntry::Unconfirmed`), the
+    /// hold is kept, an `RtSigsuspendEntryRefusal` is recorded, and the
+    /// scheduler loop ends the run. The `/proc` reads and the host-time bound
+    /// live in the syscall layer (`syscalls::confirm_rt_sigsuspend_entry`);
+    /// this step reads neither. Holds exist only under `models_signal_targets`,
+    /// and KVM's controlled loop, which never calls this step, does not set it.
+    fn step1b_hold_for_rt_sigsuspend_entry(&mut self) -> Result<(), SkipTurn> {
+        if self.rt_sigsuspend_entry_holds.is_empty() {
+            return Ok(());
+        }
+        let held: Vec<DetTid> = self.rt_sigsuspend_entry_holds.keys().copied().collect();
+        for thread in held {
+            let hold = self.rt_sigsuspend_entry_holds[&thread].clone();
+            let in_pool = self.blocked.rt_sigsuspend_blockers.get(&thread) == Some(&hold.op_id);
+            if !in_pool || self.thread_is_logically_killed(thread) {
+                // It left the call's pool or was removed: nothing to hold for.
+                self.rt_sigsuspend_entry_holds.remove(&thread);
+                continue;
+            }
+            match self.next_turns.get(&thread).map(|nt| nt.req.try_read()) {
+                Some(Some(Ok(_))) => {
+                    debug!(
+                        "[step1b] dtid {} reported back from rt_sigsuspend without being seen asleep",
+                        thread
+                    );
+                    self.rt_sigsuspend_entry_holds.remove(&thread);
+                    self.blocked.signaled_background.insert(thread);
+                }
+                Some(None) => match hold.entry {
+                    Some(RtSigsuspendEntry::Asleep { blocked }) => {
+                        if let Some(warning) =
+                            rt_sigsuspend_mask_warning(thread, hold.granted, blocked)
+                        {
+                            tracing::warn!("{}", warning);
+                        }
+                        self.blocked
+                            .out_of_scheduler_masks
+                            .insert(thread, Some(blocked));
+                        self.rt_sigsuspend_entry_holds.remove(&thread);
+                    }
+                    Some(RtSigsuspendEntry::Unconfirmed { observed, waited })
+                        if self.rt_sigsuspend_entry_refusal.is_none() =>
+                    {
+                        let refusal = RtSigsuspendEntryRefusal {
+                            thread,
+                            observed,
+                            waited,
+                        };
+                        tracing::error!("[step1b] {}", refusal);
+                        self.rt_sigsuspend_entry_refusal = Some(refusal);
+                    }
+                    Some(RtSigsuspendEntry::Unconfirmed { .. }) | None => {}
+                },
+                // It exited or is no longer registered.
+                _ => {
+                    self.rt_sigsuspend_entry_holds.remove(&thread);
+                }
+            }
+        }
+        if self.rt_sigsuspend_entry_holds.is_empty() {
+            Ok(())
+        } else {
+            trace!(
+                "[step1b] holding for rt_sigsuspend entry of dtids {:?}",
+                self.rt_sigsuspend_entry_holds.keys().collect::<Vec<_>>()
+            );
+            Err(SkipTurn)
+        }
+    }
+
+    /// The thread whose `rt_sigsuspend` entry the syscall layer should watch,
+    /// when a grant has just released `thread` into that call
+    /// (`step1b_hold_for_rt_sigsuspend_entry`).
+    pub(crate) fn rt_sigsuspend_entry_probe(
+        &self,
+        thread: DetTid,
+    ) -> Option<RtSigsuspendEntryProbe> {
+        let hold = self.rt_sigsuspend_entry_holds.get(&thread)?;
+        if hold.entry.is_some() {
+            return None;
+        }
+        Some(RtSigsuspendEntryProbe {
+            op_id: hold.op_id,
+            process: reverie::Pid::from_raw(self.sigchld_process(thread).as_raw()),
+            thread: reverie::Pid::from_raw(thread.as_raw()),
+        })
+    }
+
+    /// Whether the syscall layer should keep watching `thread` enter the
+    /// `rt_sigsuspend` that operation `op_id` began.
+    pub(crate) fn rt_sigsuspend_entry_wanted(&self, thread: DetTid, op_id: ExternalOpId) -> bool {
+        !self.backend_failed()
+            && !self.thread_is_logically_killed(thread)
+            && self
+                .rt_sigsuspend_entry_holds
+                .get(&thread)
+                .is_some_and(|hold| hold.op_id == op_id && hold.entry.is_none())
+    }
+
+    /// Record what the syscall layer saw of `thread` entering the
+    /// `rt_sigsuspend` that operation `op_id` began. A report for a hold that
+    /// has already ended is dropped.
+    pub(crate) fn report_rt_sigsuspend_entry(
+        &mut self,
+        thread: DetTid,
+        op_id: ExternalOpId,
+        entry: RtSigsuspendEntry,
+    ) {
+        if let Some(hold) = self.rt_sigsuspend_entry_holds.get_mut(&thread)
+            && hold.op_id == op_id
+            && hold.entry.is_none()
+        {
+            hold.entry = Some(entry);
+        }
     }
 
     fn step2_process_blocked(
@@ -5800,6 +6053,20 @@ impl Scheduler {
                 assert!(old.is_none(), "thread started a second external operation");
                 if let Some(mask) = sleeping_mask {
                     self.blocked.out_of_scheduler_masks.insert(dettid, mask);
+                }
+                // The real `rt_sigsuspend` copies its mask from guest memory
+                // only once the thread runs. No other guest thread may run
+                // until the copy is made (`step1b_hold_for_rt_sigsuspend_entry`).
+                if self.models_signal_targets && matches!(rid, ResourceID::BlockingRtSigsuspend(_))
+                {
+                    self.rt_sigsuspend_entry_holds.insert(
+                        dettid,
+                        RtSigsuspendEntryHold {
+                            op_id: *op_id,
+                            granted: sleeping_mask.flatten(),
+                            entry: None,
+                        },
+                    );
                 }
                 Err(SkipTurn)
             }
@@ -10690,6 +10957,311 @@ mod test {
         assert!(scheduler.take_terminal_deadlock().is_none());
         assert!(scheduler.run_queue.contains_tid(creator));
         assert!(scheduler.blocked.rt_sigsuspend_blockers.is_empty());
+    }
+
+    /// A grant that releases a thread into `rt_sigsuspend` holds every other
+    /// thread until the syscall layer has seen it asleep in the call. The real
+    /// call copies its temporary mask from guest memory only once the thread
+    /// runs, and a sibling that ran first could rewrite that memory, so the
+    /// mask the thread sleeps under would be chosen by host timing. Here the
+    /// test plays the syscall layer: until it reports, every pass is empty and
+    /// the runnable sibling is neither selected nor answered. Once it reports
+    /// the thread asleep with `SIGUSR1` blocked, that kernel mask replaces the
+    /// one recorded at the grant, and the sibling's turn proceeds. Before, the
+    /// grant let the sibling run at once
+    /// (https://github.com/rrnewton/hermit/pull/3224).
+    #[tokio::test]
+    async fn no_thread_runs_before_a_released_rt_sigsuspend_waiter_is_seen_asleep() {
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        let (mut scheduler, parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+        let op = ExternalOpId::new(creator, 1);
+        commit_out_of_scheduler_call(
+            &mut scheduler,
+            creator,
+            ResourceID::BlockingRtSigsuspend(op),
+            Some(0),
+        );
+        assert_eq!(
+            scheduler.rt_sigsuspend_entry_probe(creator),
+            Some(RtSigsuspendEntryProbe {
+                op_id: op,
+                process: reverie::Pid::from_raw(parent.as_raw()),
+                thread: reverie::Pid::from_raw(creator.as_raw()),
+            })
+        );
+        assert!(scheduler.rt_sigsuspend_entry_wanted(creator, op));
+        let req = scheduler.next_turns[&parent].req.clone();
+        scheduler.request_put(&req, Resources::new(parent), &global_time);
+        scheduler.runqueue_push_back(parent);
+        let sched = Arc::new(Mutex::new(scheduler));
+        let last: Result<Resources, SkipTurn> = Err(SkipTurn);
+
+        for _ in 0..3 {
+            let pass = do_a_turn_blocking(sched.clone(), global_time.clone(), &last).await;
+            assert!(
+                pass.is_err(),
+                "a thread ran before the waiter was seen asleep"
+            );
+            let s = sched.lock().unwrap();
+            assert!(s.next_turns[&parent].resp.try_read().is_none());
+            assert!(s.run_queue.contains_tid(parent));
+            assert!(s.rt_sigsuspend_entry_probe(creator).is_some());
+        }
+
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        sched.lock().unwrap().report_rt_sigsuspend_entry(
+            creator,
+            op,
+            RtSigsuspendEntry::Asleep { blocked: usr1 },
+        );
+        let turn = do_a_turn_blocking(sched.clone(), global_time.clone(), &last)
+            .await
+            .expect("the sibling runs once the waiter is seen asleep");
+        assert_eq!(turn.tid, parent);
+        let s = sched.lock().unwrap();
+        assert!(s.rt_sigsuspend_entry_holds.is_empty());
+        assert_eq!(s.blocked.rt_sigsuspend_blockers.get(&creator), Some(&op));
+        assert_eq!(
+            s.blocked.out_of_scheduler_masks.get(&creator),
+            Some(&Some(usr1))
+        );
+    }
+
+    /// A signal a sibling committed while the waiter's `rt_sigsuspend` request
+    /// was posted but not yet granted (the released-before-entry case). The
+    /// send records nothing, because the waiter is in no pool yet, so only the
+    /// kernel holds the signal; the real call, entered after the grant, returns
+    /// at once on it, and the waiter's delivery stop is its report. That report
+    /// ends the hold, and the release barrier requeues the waiter ahead of the
+    /// runnable sibling, so no sibling runs between the grant and the waiter's
+    /// return. Round 8 pinned the mask in guest memory for this case; the hold
+    /// replaces the pin (https://github.com/rrnewton/hermit/pull/3224).
+    #[tokio::test]
+    async fn a_signal_sent_before_the_rt_sigsuspend_grant_requeues_the_waiter_before_its_sibling() {
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        let (mut scheduler, parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+        let op = ExternalOpId::new(creator, 1);
+        let rid = ResourceID::BlockingRtSigsuspend(op);
+        let mut request = Resources::new(creator);
+        request.insert(rid.clone(), Permission::RW);
+        let req = scheduler.next_turns[&creator].req.clone();
+        scheduler.request_put(&req, request, &global_time);
+
+        scheduler.notify_signal_pending(creator, SigWrapper(libc::SIGUSR1));
+        assert!(scheduler.pending_cross_task_signals.is_empty());
+        assert!(scheduler.blocked.signaled_background.is_empty());
+
+        commit_out_of_scheduler_call(&mut scheduler, creator, rid, Some(0));
+        let req = scheduler.next_turns[&parent].req.clone();
+        scheduler.request_put(&req, Resources::new(parent), &global_time);
+        scheduler.runqueue_push_back(parent);
+        let sched = Arc::new(Mutex::new(scheduler));
+        let last: Result<Resources, SkipTurn> = Err(SkipTurn);
+
+        let pass = do_a_turn_blocking(sched.clone(), global_time.clone(), &last).await;
+        assert!(pass.is_err(), "the sibling ran before the waiter reported");
+        post_inbound_signal(
+            &mut sched.lock().unwrap(),
+            creator,
+            libc::SIGUSR1,
+            &global_time,
+        );
+        let turn = do_a_turn_blocking(sched.clone(), global_time.clone(), &last)
+            .await
+            .expect("the waiter's delivery turn");
+        assert_eq!(turn.tid, creator);
+        assert!(
+            turn.resources
+                .contains_key(&ResourceID::InboundSignal(SigWrapper(libc::SIGUSR1)))
+        );
+        let s = sched.lock().unwrap();
+        assert!(s.next_turns[&parent].resp.try_read().is_none());
+        assert!(s.rt_sigsuspend_entry_holds.is_empty());
+        assert!(s.blocked.rt_sigsuspend_blockers.is_empty());
+        assert!(s.blocked.signaled_background.is_empty());
+    }
+
+    /// The kernel never blocks `SIGKILL` or `SIGSTOP`, and `rt_sigsuspend`
+    /// drops them from the mask it installs, so a mask recorded at the grant
+    /// and the kernel's agree when they differ only there. Any other difference
+    /// is reported with both masks; with no recorded mask there is nothing to
+    /// compare. Round 8 tested its mask pin's overlap helper here instead.
+    #[test]
+    fn a_kernel_sigsuspend_mask_is_compared_with_the_grant_apart_from_kill_and_stop() {
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        let unblockable = kernel_signal_bit(libc::SIGKILL) | kernel_signal_bit(libc::SIGSTOP);
+        let thread = DetTid::from_raw(101);
+        assert!(sigsuspend_masks_agree(usr1, usr1));
+        assert!(sigsuspend_masks_agree(usr1 | unblockable, usr1));
+        assert!(sigsuspend_masks_agree(!0, !unblockable));
+        assert!(!sigsuspend_masks_agree(0, usr1));
+        assert!(!sigsuspend_masks_agree(usr1, 0));
+        assert_eq!(
+            rt_sigsuspend_mask_warning(thread, Some(usr1 | unblockable), usr1),
+            None
+        );
+        assert_eq!(rt_sigsuspend_mask_warning(thread, None, usr1), None);
+        assert_eq!(
+            rt_sigsuspend_mask_warning(thread, Some(0), usr1).as_deref(),
+            Some(
+                "[step1b] dtid 101 sleeps in rt_sigsuspend under mask 0x200, not the 0x0 \
+                 recorded at its grant; using the kernel's"
+            )
+        );
+    }
+
+    /// When the syscall layer gives up on seeing a released `rt_sigsuspend`
+    /// waiter asleep, the hold stays, so no thread runs at a host-timed point,
+    /// and one refusal naming the thread, what was last seen and how long was
+    /// waited is recorded for the scheduler loop to exit on. A later report
+    /// does not replace the first.
+    #[test]
+    fn an_unconfirmed_rt_sigsuspend_entry_keeps_the_hold_and_records_one_refusal() {
+        let (mut scheduler, parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+        let op = ExternalOpId::new(creator, 1);
+        commit_out_of_scheduler_call(
+            &mut scheduler,
+            creator,
+            ResourceID::BlockingRtSigsuspend(op),
+            Some(0),
+        );
+        scheduler.runqueue_push_back(parent);
+        let observed = "state t, syscall 130 0x7ffc 0x8".to_owned();
+        let waited = Duration::from_secs(30);
+        scheduler.report_rt_sigsuspend_entry(
+            creator,
+            op,
+            RtSigsuspendEntry::Unconfirmed {
+                observed: observed.clone(),
+                waited,
+            },
+        );
+        scheduler.report_rt_sigsuspend_entry(creator, op, RtSigsuspendEntry::Asleep { blocked: 0 });
+        for _ in 0..2 {
+            assert!(scheduler.step1b_hold_for_rt_sigsuspend_entry().is_err());
+            assert!(scheduler.rt_sigsuspend_entry_holds.contains_key(&creator));
+            assert_eq!(
+                scheduler.rt_sigsuspend_entry_refusal,
+                Some(RtSigsuspendEntryRefusal {
+                    thread: creator,
+                    observed: observed.clone(),
+                    waited,
+                })
+            );
+        }
+        assert!(scheduler.blocked.out_of_scheduler_masks[&creator] == Some(0));
+        let refusal = scheduler.rt_sigsuspend_entry_refusal.take().unwrap();
+        assert!(
+            refusal.to_string().starts_with(
+                "hermit refused to continue the run: the rt_sigsuspend of thread 101 was \
+                 neither seen asleep nor reported within 30s of its release (last seen: \
+                 state t, syscall 130 0x7ffc 0x8)"
+            ),
+            "{refusal}"
+        );
+    }
+
+    /// A hold ends without a report when its thread leaves the call's pool,
+    /// when the thread's blocking entries are removed, or when the thread is
+    /// no longer registered. A report that names another operation, or comes
+    /// after the hold ended, changes nothing.
+    #[test]
+    fn an_rt_sigsuspend_entry_hold_ends_with_its_thread_and_ignores_stale_reports() {
+        let op = |thread| ExternalOpId::new(thread, 1);
+        let held = |scheduler: &mut Scheduler, thread| {
+            commit_out_of_scheduler_call(
+                scheduler,
+                thread,
+                ResourceID::BlockingRtSigsuspend(op(thread)),
+                Some(0),
+            );
+            assert!(scheduler.step1b_hold_for_rt_sigsuspend_entry().is_err());
+        };
+
+        let (mut scheduler, _parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+        held(&mut scheduler, creator);
+        scheduler.blocked.rt_sigsuspend_blockers.remove(&creator);
+        assert!(scheduler.step1b_hold_for_rt_sigsuspend_entry().is_ok());
+        assert!(scheduler.rt_sigsuspend_entry_holds.is_empty());
+        assert_eq!(scheduler.rt_sigsuspend_entry_probe(creator), None);
+        assert!(!scheduler.rt_sigsuspend_entry_wanted(creator, op(creator)));
+
+        let (mut scheduler, _parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+        held(&mut scheduler, creator);
+        scheduler.remove_blocking_entries(&creator);
+        assert!(scheduler.rt_sigsuspend_entry_holds.is_empty());
+        assert!(scheduler.step1b_hold_for_rt_sigsuspend_entry().is_ok());
+
+        let (mut scheduler, _parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+        held(&mut scheduler, creator);
+        scheduler.next_turns.remove(&creator);
+        assert!(scheduler.step1b_hold_for_rt_sigsuspend_entry().is_ok());
+        assert!(scheduler.rt_sigsuspend_entry_holds.is_empty());
+
+        let (mut scheduler, _parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+        held(&mut scheduler, creator);
+        let stale = ExternalOpId::new(creator, 0);
+        assert!(!scheduler.rt_sigsuspend_entry_wanted(creator, stale));
+        scheduler.report_rt_sigsuspend_entry(
+            creator,
+            stale,
+            RtSigsuspendEntry::Asleep { blocked: 0 },
+        );
+        assert!(scheduler.step1b_hold_for_rt_sigsuspend_entry().is_err());
+        assert!(scheduler.rt_sigsuspend_entry_probe(creator).is_some());
+        scheduler.report_rt_sigsuspend_entry(
+            creator,
+            op(creator),
+            RtSigsuspendEntry::Asleep { blocked: 0 },
+        );
+        assert!(!scheduler.rt_sigsuspend_entry_wanted(creator, op(creator)));
+        assert_eq!(scheduler.rt_sigsuspend_entry_probe(creator), None);
+        assert!(scheduler.step1b_hold_for_rt_sigsuspend_entry().is_ok());
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        scheduler.report_rt_sigsuspend_entry(
+            creator,
+            op(creator),
+            RtSigsuspendEntry::Asleep { blocked: usr1 },
+        );
+        assert!(scheduler.rt_sigsuspend_entry_holds.is_empty());
+        assert_eq!(
+            scheduler.blocked.out_of_scheduler_masks.get(&creator),
+            Some(&Some(0))
+        );
+    }
+
+    /// Only an `rt_sigsuspend` grant under `models_signal_targets` holds other
+    /// threads: not one on a backend without
+    /// `backend_supports_blocked_wait_signal_interruption`, and not an
+    /// external-IO grant, whose call reads no mask from guest memory.
+    #[test]
+    fn only_a_gated_rt_sigsuspend_grant_holds_other_threads() {
+        let mut scheduler = Scheduler::new(&Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        });
+        assert!(!scheduler.models_signal_targets);
+        let waiter = DetTid::from_raw(11);
+        register_known_thread(&mut scheduler, waiter);
+        commit_out_of_scheduler_call(
+            &mut scheduler,
+            waiter,
+            ResourceID::BlockingRtSigsuspend(ExternalOpId::new(waiter, 1)),
+            Some(0),
+        );
+        assert!(scheduler.rt_sigsuspend_entry_holds.is_empty());
+        assert_eq!(scheduler.rt_sigsuspend_entry_probe(waiter), None);
+        assert!(scheduler.step1b_hold_for_rt_sigsuspend_entry().is_ok());
+
+        let (mut scheduler, _parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+        commit_out_of_scheduler_call(
+            &mut scheduler,
+            creator,
+            ResourceID::BlockingExternalIO(ExternalOpId::new(creator, 2)),
+            Some(0),
+        );
+        assert!(scheduler.rt_sigsuspend_entry_holds.is_empty());
+        assert!(scheduler.step1b_hold_for_rt_sigsuspend_entry().is_ok());
     }
 
     /// The invariant that guards the counterfeit request still holds for every

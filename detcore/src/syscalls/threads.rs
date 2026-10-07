@@ -42,6 +42,7 @@ use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::scheduler::FutexSignalWatch;
 use crate::scheduler::HostTimedSignalScope;
+use crate::scheduler::RtSigsuspendEntry;
 use crate::scheduler::SchedValue;
 use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::RestartCall;
@@ -943,6 +944,174 @@ pub(crate) fn read_kernel_signal_state(pid: Pid, tid: Pid) -> Result<KernelSigna
     let path = format!("/proc/{}/task/{}/status", pid.as_raw(), tid.as_raw());
     let status = std::fs::read_to_string(path).map_err(|_| Errno::ESRCH)?;
     KernelSignalState::parse(&status).ok_or(Errno::EIO)
+}
+
+/// What one look at a thread that the scheduler released into `rt_sigsuspend`
+/// showed (`observe_rt_sigsuspend_entry`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SigsuspendObservation {
+    /// The thread sleeps inside `rt_sigsuspend` under the kernel mask `blocked`.
+    Asleep { blocked: KernelSigset },
+    /// The thread was not seen asleep inside `rt_sigsuspend`: `state` is the
+    /// task state letter of its second status read, and `syscall` is what its
+    /// syscall file said (or why it could not be read).
+    NotYet {
+        state: Option<char>,
+        syscall: String,
+    },
+}
+
+/// The task state letter of a `/proc/<pid>/task/<tid>/status` file.
+fn parse_status_state(status: &str) -> Option<char> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("State:"))
+        .and_then(|value| value.trim_start().chars().next())
+}
+
+/// The `voluntary_ctxt_switches` count of a status file. Linux adds one each
+/// time the thread blocks, and nothing else changes it.
+fn parse_voluntary_switches(status: &str) -> Option<u64> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+/// The syscall number in a `/proc/<pid>/task/<tid>/syscall` file. The file
+/// says `running` for a thread on a CPU and `-1 ...` for one stopped outside a
+/// system call.
+fn parse_syscall_number(syscall: &str) -> Option<i64> {
+    syscall.split_whitespace().next()?.parse().ok()
+}
+
+/// Classify three reads of a thread released into `rt_sigsuspend`: its status
+/// file, then its syscall file, then its status file again.
+///
+/// The thread is asleep in the call only when both status reads show an
+/// interruptible sleep (`S`) with the same voluntary context-switch count, and
+/// the syscall read between them names `rt_sigsuspend`. An unchanged count
+/// means the two status reads saw one sleep, because a thread that woke and
+/// slept again would have blocked once more, and the syscall read inside that
+/// sleep names the call it sleeps in. A ptrace stop reads `t`, not `S`. The
+/// kernel installs the temporary mask before that sleep begins
+/// (`sigsuspend` in `kernel/signal.c`), so `SigBlk` is the mask it sleeps under.
+fn classify_rt_sigsuspend_entry(before: &str, syscall: &str, after: &str) -> SigsuspendObservation {
+    let not_yet = || SigsuspendObservation::NotYet {
+        state: parse_status_state(after),
+        syscall: syscall.trim().to_owned(),
+    };
+    let asleep = |status: &str| parse_status_state(status) == Some('S');
+    if !asleep(before) || !asleep(after) {
+        return not_yet();
+    }
+    match (
+        parse_voluntary_switches(before),
+        parse_voluntary_switches(after),
+    ) {
+        (Some(first), Some(second)) if first == second => {}
+        _ => return not_yet(),
+    }
+    if parse_syscall_number(syscall) != Some(libc::SYS_rt_sigsuspend) {
+        return not_yet();
+    }
+    match (
+        KernelSignalState::parse(before),
+        KernelSignalState::parse(after),
+    ) {
+        (Some(first), Some(second)) if first.blocked == second.blocked => {
+            SigsuspendObservation::Asleep {
+                blocked: second.blocked,
+            }
+        }
+        _ => not_yet(),
+    }
+}
+
+/// Look once at thread `tid` of process `pid`, which the scheduler released
+/// into `rt_sigsuspend`. Reading these files has no effect on the thread. The
+/// syscall file needs ptrace access to the thread, which the tracer has.
+pub(crate) fn observe_rt_sigsuspend_entry(pid: Pid, tid: Pid) -> SigsuspendObservation {
+    let dir = format!("/proc/{}/task/{}", pid.as_raw(), tid.as_raw());
+    let read = |name: &str| std::fs::read_to_string(format!("{dir}/{name}"));
+    let reads = read("status").and_then(|before| {
+        let syscall = read("syscall")?;
+        Ok((before, syscall, read("status")?))
+    });
+    match reads {
+        Ok((before, syscall, after)) => classify_rt_sigsuspend_entry(&before, &syscall, &after),
+        Err(error) => SigsuspendObservation::NotYet {
+            state: None,
+            syscall: format!("unreadable ({error})"),
+        },
+    }
+}
+
+/// How long a thread released into `rt_sigsuspend` may take to be seen asleep
+/// there or to report back before the run is refused
+/// (`Scheduler::step1b_hold_for_rt_sigsuspend_entry`).
+///
+/// A released thread normally sleeps within microseconds to milliseconds. The
+/// bound is that long because the hosts that run Hermit's tests are loaded to
+/// 200-340 runnable threads on 316 CPUs, where a ready thread can wait seconds
+/// for a CPU, and it equals the release barrier's limit
+/// (`SIGNALED_BACKGROUND_VALVE`). It only decides when the run fails: no
+/// scheduling decision depends on how long the thread took.
+pub(crate) const RT_SIGSUSPEND_ENTRY_BOUND: Duration = Duration::from_secs(30);
+
+/// Watch thread `tid` of process `pid`, which the scheduler released into
+/// `rt_sigsuspend`, until it is seen asleep there or `wanted` returns false.
+/// After [`RT_SIGSUSPEND_ENTRY_BOUND`] it gives up and says what it last saw.
+pub(crate) async fn confirm_rt_sigsuspend_entry(
+    pid: Pid,
+    tid: Pid,
+    wanted: impl FnMut() -> bool,
+) -> Option<RtSigsuspendEntry> {
+    confirm_rt_sigsuspend_entry_with(
+        || observe_rt_sigsuspend_entry(pid, tid),
+        wanted,
+        RT_SIGSUSPEND_ENTRY_BOUND,
+    )
+    .await
+}
+
+/// [`confirm_rt_sigsuspend_entry`] with its observation and bound supplied.
+async fn confirm_rt_sigsuspend_entry_with(
+    mut observe: impl FnMut() -> SigsuspendObservation,
+    mut wanted: impl FnMut() -> bool,
+    bound: Duration,
+) -> Option<RtSigsuspendEntry> {
+    const SPINS: u32 = 64;
+    let start = tokio::time::Instant::now();
+    let mut spins = 0;
+    let mut pause = Duration::from_micros(100);
+    loop {
+        if !wanted() {
+            return None;
+        }
+        match observe() {
+            SigsuspendObservation::Asleep { blocked } => {
+                return Some(RtSigsuspendEntry::Asleep { blocked });
+            }
+            SigsuspendObservation::NotYet { state, syscall } => {
+                let waited = start.elapsed();
+                if waited >= bound {
+                    let state = state.map_or_else(|| "unknown".to_owned(), String::from);
+                    return Some(RtSigsuspendEntry::Unconfirmed {
+                        observed: format!("state {state}, syscall {syscall}"),
+                        waited,
+                    });
+                }
+            }
+        }
+        if spins < SPINS {
+            spins += 1;
+            tokio::task::yield_now().await;
+        } else {
+            tokio::time::sleep(pause).await;
+            pause = (pause * 2).min(Duration::from_millis(1));
+        }
+    }
 }
 
 /// Why a blocked wait ended the run instead of returning to the guest
@@ -3615,6 +3784,219 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    /// A `/proc/<pid>/task/<tid>/status` file with the lines
+    /// `classify_rt_sigsuspend_entry` reads.
+    fn sigsuspend_status(state: &str, switches: Option<u64>, blocked: KernelSigset) -> String {
+        let switches = switches
+            .map(|count| format!("voluntary_ctxt_switches:\t{count}\n"))
+            .unwrap_or_default();
+        format!(
+            "Name:\tguest\nState:\t{state}\nSigQ:\t0/1024\nSigPnd:\t0000000000000000\n\
+             ShdPnd:\t0000000000000000\nSigBlk:\t{blocked:016x}\n\
+             SigIgn:\t0000000000000000\nSigCgt:\t0000000000000200\n\
+             {switches}nonvoluntary_ctxt_switches:\t3\n"
+        )
+    }
+
+    /// A thread the scheduler released into `rt_sigsuspend` counts as asleep
+    /// there only when two status reads show one interruptible sleep (state
+    /// `S`, same voluntary context-switch count, same `SigBlk`) around a
+    /// syscall read naming `rt_sigsuspend`; its mask is then `SigBlk`. A
+    /// running thread, a ptrace stop (`t`), a sleep in another call, a sleep
+    /// that ended between the reads, or a missing count is not.
+    #[test]
+    fn a_released_rt_sigsuspend_thread_is_asleep_only_inside_one_sleep_in_the_call() {
+        let usr1 = kernel_sigset_bit(libc::SIGUSR1);
+        let sleeping = |switches| sigsuspend_status("S (sleeping)", Some(switches), usr1);
+        let in_sigsuspend = format!(
+            "{} 0x7ffc 0x8 0x0 0x0 0x0 0x0 0x7ffd 0x7f12\n",
+            libc::SYS_rt_sigsuspend
+        );
+        let not_yet = |state: char, syscall: &str| SigsuspendObservation::NotYet {
+            state: Some(state),
+            syscall: syscall.trim().to_owned(),
+        };
+
+        assert_eq!(
+            classify_rt_sigsuspend_entry(&sleeping(7), &in_sigsuspend, &sleeping(7)),
+            SigsuspendObservation::Asleep { blocked: usr1 }
+        );
+        assert_eq!(
+            classify_rt_sigsuspend_entry(&sleeping(7), &in_sigsuspend, &sleeping(8)),
+            not_yet('S', &in_sigsuspend)
+        );
+        let running = sigsuspend_status("R (running)", Some(7), 0);
+        assert_eq!(
+            classify_rt_sigsuspend_entry(&running, "running\n", &running),
+            not_yet('R', "running")
+        );
+        let stopped = sigsuspend_status("t (tracing stop)", Some(7), usr1);
+        assert_eq!(
+            classify_rt_sigsuspend_entry(&stopped, &in_sigsuspend, &stopped),
+            not_yet('t', &in_sigsuspend)
+        );
+        let in_futex = format!(
+            "{} 0x404110 0x80 0x0 0x0 0x0 0x0 0x7ffd 0x7f12\n",
+            libc::SYS_futex
+        );
+        assert_eq!(
+            classify_rt_sigsuspend_entry(&sleeping(7), &in_futex, &sleeping(7)),
+            not_yet('S', &in_futex)
+        );
+        let unmasked = sigsuspend_status("S (sleeping)", Some(7), 0);
+        assert_eq!(
+            classify_rt_sigsuspend_entry(&unmasked, &in_sigsuspend, &sleeping(7)),
+            not_yet('S', &in_sigsuspend)
+        );
+        let uncounted = sigsuspend_status("S (sleeping)", None, usr1);
+        assert_eq!(
+            classify_rt_sigsuspend_entry(&uncounted, &in_sigsuspend, &uncounted),
+            not_yet('S', &in_sigsuspend)
+        );
+    }
+
+    /// The watch over a released `rt_sigsuspend` thread looks until it sees
+    /// the thread asleep, stops without a verdict as soon as the scheduler no
+    /// longer wants it, and after its bound says what it last saw and how long
+    /// it waited.
+    #[tokio::test]
+    async fn the_rt_sigsuspend_entry_watch_ends_asleep_unwanted_or_out_of_time() {
+        let usr1 = kernel_sigset_bit(libc::SIGUSR1);
+        let not_yet = |state: Option<char>| SigsuspendObservation::NotYet {
+            state,
+            syscall: "130 0x7ffc 0x8".to_owned(),
+        };
+        let forever = Duration::from_secs(600);
+
+        let mut looks = 0;
+        let entry = confirm_rt_sigsuspend_entry_with(
+            || {
+                looks += 1;
+                if looks < 3 {
+                    not_yet(Some('R'))
+                } else {
+                    SigsuspendObservation::Asleep { blocked: usr1 }
+                }
+            },
+            || true,
+            forever,
+        )
+        .await;
+        assert_eq!(entry, Some(RtSigsuspendEntry::Asleep { blocked: usr1 }));
+        assert_eq!(looks, 3);
+
+        let mut looks = 0;
+        let entry = confirm_rt_sigsuspend_entry_with(
+            || {
+                looks += 1;
+                not_yet(Some('R'))
+            },
+            || false,
+            forever,
+        )
+        .await;
+        assert_eq!(entry, None);
+        assert_eq!(looks, 0);
+
+        let (mut looks, mut asks) = (0, 0);
+        let entry = confirm_rt_sigsuspend_entry_with(
+            || {
+                looks += 1;
+                not_yet(Some('R'))
+            },
+            || {
+                asks += 1;
+                asks < 4
+            },
+            forever,
+        )
+        .await;
+        assert_eq!(entry, None);
+        assert_eq!(looks, 3);
+
+        let bound = Duration::from_millis(20);
+        match confirm_rt_sigsuspend_entry_with(|| not_yet(Some('t')), || true, bound).await {
+            Some(RtSigsuspendEntry::Unconfirmed { observed, waited }) => {
+                assert_eq!(observed, "state t, syscall 130 0x7ffc 0x8");
+                assert!(waited >= bound, "{waited:?}");
+            }
+            other => panic!("expected an unconfirmed entry, got {other:?}"),
+        }
+        match confirm_rt_sigsuspend_entry_with(|| not_yet(None), || true, bound).await {
+            Some(RtSigsuspendEntry::Unconfirmed { observed, .. }) => {
+                assert_eq!(observed, "state unknown, syscall 130 0x7ffc 0x8");
+            }
+            other => panic!("expected an unconfirmed entry, got {other:?}"),
+        }
+    }
+
+    extern "C" fn ignore_wake_signal(_: libc::c_int) {}
+
+    /// A real thread in `rt_sigsuspend` is seen asleep there, under the mask
+    /// it passed minus `SIGKILL` and `SIGSTOP`, which the kernel never blocks.
+    /// The observing thread itself is running, and a thread that does not
+    /// exist is unreadable. The sleeper then takes a caught signal and the
+    /// call returns `EINTR`, as it does in a guest.
+    #[test]
+    fn a_thread_in_rt_sigsuspend_is_seen_asleep_under_its_temporary_mask() {
+        let wake = libc::SIGRTMAX() - 1;
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = ignore_wake_signal as extern "C" fn(libc::c_int) as usize;
+            libc::sigemptyset(&mut action.sa_mask);
+            assert_eq!(libc::sigaction(wake, &action, std::ptr::null_mut()), 0);
+        }
+        // Everything but the wake signal, including SIGKILL and SIGSTOP.
+        let mask: KernelSigset = !kernel_sigset_bit(wake);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let sleeper = std::thread::spawn(move || {
+            sender.send(unsafe { libc::gettid() }).unwrap();
+            let returned = unsafe {
+                libc::syscall(
+                    libc::SYS_rt_sigsuspend,
+                    &mask as *const KernelSigset,
+                    std::mem::size_of::<KernelSigset>(),
+                )
+            };
+            (returned, std::io::Error::last_os_error().raw_os_error())
+        });
+        let pid = Pid::from_raw(unsafe { libc::getpid() });
+        let tid = Pid::from_raw(receiver.recv().unwrap());
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let blocked = loop {
+            match observe_rt_sigsuspend_entry(pid, tid) {
+                SigsuspendObservation::Asleep { blocked } => break blocked,
+                seen if std::time::Instant::now() >= deadline => {
+                    panic!("the sleeper was not seen asleep in rt_sigsuspend: {seen:?}")
+                }
+                _ => std::thread::sleep(Duration::from_millis(1)),
+            }
+        };
+        assert_eq!(
+            blocked,
+            mask & !bits(&[libc::SIGKILL, libc::SIGSTOP]),
+            "{blocked:#x}"
+        );
+
+        let observer = Pid::from_raw(unsafe { libc::gettid() });
+        match observe_rt_sigsuspend_entry(pid, observer) {
+            SigsuspendObservation::NotYet { state, .. } => assert_eq!(state, Some('R')),
+            seen => panic!("the observing thread was seen asleep: {seen:?}"),
+        }
+        match observe_rt_sigsuspend_entry(pid, Pid::from_raw(i32::MAX)) {
+            SigsuspendObservation::NotYet {
+                state: None,
+                syscall,
+            } => assert!(syscall.starts_with("unreadable ("), "{syscall}"),
+            seen => panic!("a missing thread was readable: {seen:?}"),
+        }
+
+        let sent = unsafe { libc::syscall(libc::SYS_tgkill, pid.as_raw(), tid.as_raw(), wake) };
+        assert_eq!(sent, 0);
+        assert_eq!(sleeper.join().unwrap(), (-1, Some(libc::EINTR)));
     }
 
     #[test]

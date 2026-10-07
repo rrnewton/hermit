@@ -90,6 +90,8 @@ use crate::scheduler::FutexSignalWatch;
 use crate::scheduler::HostTimedSignalScope;
 use crate::scheduler::MaybePrintStack;
 use crate::scheduler::Priority;
+use crate::scheduler::RtSigsuspendEntry;
+use crate::scheduler::RtSigsuspendEntryProbe;
 use crate::scheduler::SchedResponse;
 use crate::scheduler::SchedValue;
 use crate::scheduler::Scheduler;
@@ -2252,6 +2254,50 @@ impl GlobalState {
             .await
     }
 
+    /// Watch `thread`, which a grant has just released into `rt_sigsuspend`,
+    /// until the syscall layer sees it asleep inside the call, and give the
+    /// scheduler what it saw (`Scheduler::step1b_hold_for_rt_sigsuspend_entry`).
+    /// The watch runs beside the reply that lets the thread make the call. It
+    /// never holds the scheduler lock across a wait, and it stops once the
+    /// scheduler no longer wants it.
+    fn watch_rt_sigsuspend_entry(&self, thread: DetTid, probe: RtSigsuspendEntryProbe) {
+        let sched = self.sched.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    let entry = crate::syscalls::confirm_rt_sigsuspend_entry(
+                        probe.process,
+                        probe.thread,
+                        || {
+                            sched
+                                .lock()
+                                .unwrap()
+                                .rt_sigsuspend_entry_wanted(thread, probe.op_id)
+                        },
+                    )
+                    .await;
+                    if let Some(entry) = entry {
+                        sched.lock().unwrap().report_rt_sigsuspend_entry(
+                            thread,
+                            probe.op_id,
+                            entry,
+                        );
+                    }
+                });
+            }
+            Err(_) => {
+                sched.lock().unwrap().report_rt_sigsuspend_entry(
+                    thread,
+                    probe.op_id,
+                    RtSigsuspendEntry::Unconfirmed {
+                        observed: "no async runtime to watch the thread".to_owned(),
+                        waited: std::time::Duration::ZERO,
+                    },
+                );
+            }
+        }
+    }
+
     async fn finish_resource_response(
         &self,
         from: Tid,
@@ -2261,11 +2307,17 @@ impl GlobalState {
         answer: SchedResponse,
     ) -> (SchedulerRpcResult<ResourceReply>, Option<LogicalTime>) {
         let dettid = DetTid::from_raw(from.as_raw());
-        let request_became_stale = {
+        let (request_became_stale, entry_probe) = {
             let sched = self.lock_rpc_scheduler(false).await;
-            sched.thread_is_logically_killed(dettid)
-                || request_mm.is_some_and(|mm| !sched.rpc_incarnation_matches(dettid, mm))
+            let stale = sched.thread_is_logically_killed(dettid)
+                || request_mm.is_some_and(|mm| !sched.rpc_incarnation_matches(dettid, mm));
+            (stale, sched.rt_sigsuspend_entry_probe(dettid))
         };
+        if let Some(probe) = entry_probe
+            && !request_became_stale
+        {
+            self.watch_rt_sigsuspend_entry(dettid, probe);
+        }
         if request_became_stale {
             // `logically_kill_thread` wakes an already-pending request with a
             // signal response.  Treat that wake-up as terminal: otherwise a

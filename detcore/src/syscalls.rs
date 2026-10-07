@@ -35,6 +35,9 @@ pub(crate) use threads::FutexDeadline;
 /// it commits a wake for a parked precise-mode futex waiter.
 #[cfg(test)]
 pub(crate) use threads::KernelSignalState;
+/// Watches a thread the scheduler released into `rt_sigsuspend` until it is
+/// seen asleep there (`Scheduler::step1b_hold_for_rt_sigsuspend_entry`).
+pub(crate) use threads::confirm_rt_sigsuspend_entry;
 pub(crate) use threads::read_kernel_signal_state;
 pub(crate) mod time;
 
