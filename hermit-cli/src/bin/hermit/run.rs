@@ -7089,7 +7089,7 @@ impl RunOpts {
     ///
     /// Fail-closed, so a NEW backend must be qualified deliberately rather than
     /// inheriting a guarantee nobody measured for it.
-    fn ensure_timeout_supported(&self) -> Result<(), Error> {
+    pub(crate) fn ensure_timeout_supported(&self) -> Result<(), Error> {
         if self.timeout.is_none() {
             return Ok(());
         }

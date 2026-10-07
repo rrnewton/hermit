@@ -746,6 +746,8 @@ impl AnalyzeOpts {
         // starts nothing.
         self.refuse_unsupervised_log_cap()?;
         self.refuse_options_trials_do_not_apply()?;
+        self.refuse_outputs_trials_overwrite()?;
+        self.refuse_unqualified_trial_timeout()?;
         self.install_trial_pmu_config()?;
         self.refuse_strict_with_inexact_branch_counter()?;
         // Not implemented yet:

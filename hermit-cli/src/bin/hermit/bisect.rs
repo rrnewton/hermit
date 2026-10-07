@@ -122,6 +122,8 @@ impl BisectOpts {
         // starts nothing.
         analyzer.refuse_unsupervised_log_cap()?;
         analyzer.refuse_options_trials_do_not_apply()?;
+        analyzer.refuse_outputs_trials_overwrite()?;
+        analyzer.refuse_unqualified_trial_timeout()?;
         analyzer.install_trial_pmu_config()?;
         analyzer.refuse_strict_with_inexact_branch_counter()?;
 
@@ -226,6 +228,8 @@ mod tests {
             (&["--namespace-only"][..], "--namespace-only"),
             (&["--lite"][..], "--namespace-only"),
             (&["--verify"][..], "--verify"),
+            (&["--save-config=requested.config"][..], "--save-config"),
+            (&["--summary-json=requested.summary"][..], "--summary-json"),
         ] {
             let error = bisect(run_args);
             assert!(
@@ -236,9 +240,40 @@ mod tests {
             );
             assert!(error.to_string().contains(named), "{run_args:?}: {error:#}");
         }
-        let error = bisect(&["--no-namespace"]);
+        for admitted in [&["--no-namespace"][..], &["--timeout=3"][..]] {
+            let error = bisect(admitted);
+            assert!(
+                error.to_string().contains("failed to read --good schedule"),
+                "{admitted:?}: {error:#}"
+            );
+        }
+
+        // A KVM replay with --timeout is refused as `hermit --backend=kvm run
+        // --timeout` is (rel-041's review of
+        // https://github.com/rrnewton/hermit/pull/3836).
+        let argv = [
+            "hermit",
+            "--backend=kvm",
+            "bisect",
+            "--good=/nonexistent/good.json",
+            "--bad=/nonexistent/bad.json",
+            "--",
+            "--timeout=3",
+            "/bin/true",
+        ];
+        let args = crate::Args::try_parse_from(argv).unwrap();
+        let crate::Subcommand::Bisect(options) = args.command else {
+            panic!("{argv:?} is not bisect")
+        };
+        let error = options.main(&args.global).unwrap_err();
         assert!(
-            error.to_string().contains("failed to read --good schedule"),
+            error
+                .downcast_ref::<crate::container::PolicyRefusal>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert!(
+            error.to_string().contains("--timeout is not qualified"),
             "{error:#}"
         );
     }

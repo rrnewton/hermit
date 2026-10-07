@@ -606,6 +606,44 @@ impl AnalyzeOpts {
         RunData::get_raw_runopts(self).install_pmu_config()
     }
 
+    /// Refuses (exit 122) `--save-config` and `--summary-json` in the run
+    /// arguments, before any workspace, schedule read or trial exists. Every
+    /// trial writes its configuration and summary into the workspace under
+    /// its own name (`RunData::new` replaces both paths), so the requested
+    /// files would never be written.
+    pub fn refuse_outputs_trials_overwrite(&self) -> anyhow::Result<()> {
+        let trial = RunData::get_raw_runopts(self);
+        let overwritten: Vec<&str> = [
+            (trial.save_config.is_some(), "--save-config"),
+            (trial.summary_json.is_some(), "--summary-json"),
+        ]
+        .into_iter()
+        .filter_map(|(set, option)| set.then_some(option))
+        .collect();
+        if overwritten.is_empty() {
+            return Ok(());
+        }
+        Err(
+            anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                "`hermit analyze` and `hermit bisect` write each trial's configuration and summary \
+             into their workspace, so {} would never be written. Remove {} from the run \
+             arguments; the workspace keeps both files for every trial.",
+                overwritten.join(" and "),
+                if overwritten.len() == 1 { "it" } else { "them" },
+            )),
+        )
+    }
+
+    /// Refuses `--timeout` (exit 122) on a trial backend where `hermit run`
+    /// refuses it (`RunOpts::ensure_timeout_supported`), before any workspace,
+    /// schedule read or trial exists. Trials never pass through
+    /// `RunOpts::main`, which makes that check for a run, so a KVM trial
+    /// accepted the bound that its printed `hermit --backend=kvm run
+    /// --timeout=N` reproducer is refused for.
+    pub fn refuse_unqualified_trial_timeout(&self) -> anyhow::Result<()> {
+        RunData::get_raw_runopts(self).ensure_timeout_supported()
+    }
+
     /// Refuses (exit 122) run arguments that a trial would accept and run
     /// without (`RunOpts::options_only_main_applies`), before any workspace,
     /// schedule read or trial exists. Accepting them would run every trial
@@ -917,21 +955,134 @@ mod tests {
         }
     }
 
+    /// rel-041's review of https://github.com/rrnewton/hermit/pull/3836: an
+    /// explicit `--save-config` or `--summary-json` is refused, each named,
+    /// because every trial writes both into the workspace under its own
+    /// name. Without them a trial still gets those workspace paths.
+    #[test]
+    fn trials_refuse_outputs_they_overwrite() {
+        let options = |run_args: &[&str]| {
+            let mut argv = vec!["analyze", "--"];
+            argv.extend(run_args);
+            argv.push("/bin/true");
+            AnalyzeOpts::try_parse_from(&argv).unwrap()
+        };
+        for (run_args, named) in [
+            (
+                &["--save-config=requested.config"][..],
+                &["--save-config"][..],
+            ),
+            (
+                &["--summary-json=requested.summary"][..],
+                &["--summary-json"][..],
+            ),
+            (
+                &["--save-config=c", "--summary-json=s"][..],
+                &["--save-config", "--summary-json"][..],
+            ),
+        ] {
+            let error = options(run_args)
+                .refuse_outputs_trials_overwrite()
+                .expect_err("an overwritten output");
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{run_args:?}: {error:#}"
+            );
+            let message = error.to_string();
+            for option in named {
+                assert!(
+                    message.contains(option),
+                    "{run_args:?}: {option}: {message}"
+                );
+            }
+        }
+        let mut admitted = options(&[]);
+        admitted.refuse_outputs_trials_overwrite().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        admitted.tmp_dir = Some(workspace.path().to_path_buf());
+        let run = RunData::new_baseline(&admitted, "outputs".to_owned()).unwrap();
+        for path in [&run.runopts.save_config, &run.runopts.summary_json] {
+            let path = path.as_ref().expect("the trial writes it");
+            assert!(path.starts_with(workspace.path()), "{}", path.display());
+        }
+    }
+
+    /// rel-041's review of https://github.com/rrnewton/hermit/pull/3836:
+    /// `--timeout` on a trial backend where `hermit run` refuses it (KVM) is
+    /// refused the same way, while the ptrace trial keeps it.
+    #[test]
+    fn trials_refuse_a_timeout_their_backend_cannot_enforce() {
+        let options = |argv: &[&str]| {
+            let args = crate::Args::try_parse_from(argv).unwrap();
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            options.apply_global(&args.global);
+            options
+        };
+        let error = options(&[
+            "hermit",
+            "--backend=kvm",
+            "analyze",
+            "--",
+            "--timeout=3",
+            "/bin/true",
+        ])
+        .refuse_unqualified_trial_timeout()
+        .expect_err("KVM does not enforce --timeout");
+        assert!(
+            error
+                .downcast_ref::<crate::container::PolicyRefusal>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert!(
+            error.to_string().contains("--timeout is not qualified"),
+            "{error:#}"
+        );
+        for admitted in [
+            &["hermit", "analyze", "--", "--timeout=3", "/bin/true"][..],
+            &[
+                "hermit",
+                "--backend=ptrace",
+                "analyze",
+                "--",
+                "--timeout=3",
+                "/bin/true",
+            ][..],
+            &["hermit", "--backend=kvm", "analyze", "--", "/bin/true"][..],
+        ] {
+            options(admitted)
+                .refuse_unqualified_trial_timeout()
+                .unwrap_or_else(|error| panic!("{admitted:?}: {error:#}"));
+        }
+    }
+
     /// Through `main`: the dropped-option refusal is in analyze's preflight,
     /// before the workspace and every trial (see the `--run1-schedule` note
     /// on the strict counter test below).
     #[test]
     fn trials_refuse_run_options_only_main_applies_before_their_workspace() {
-        for extra in ["--namespace-only", "--lite", "--verify"] {
-            let argv = [
-                "hermit",
+        for (backend, extra) in [
+            (None, "--namespace-only"),
+            (None, "--lite"),
+            (None, "--verify"),
+            (None, "--save-config=requested.config"),
+            (None, "--summary-json=requested.summary"),
+            (Some("--backend=kvm"), "--timeout=3"),
+        ] {
+            let mut argv = vec!["hermit"];
+            argv.extend(backend);
+            argv.extend([
                 "analyze",
                 "--run1-schedule=/nonexistent/schedule.json",
                 "--",
                 extra,
                 "/bin/true",
-            ];
-            let args = crate::Args::try_parse_from(argv).unwrap();
+            ]);
+            let args = crate::Args::try_parse_from(&argv).unwrap();
             let crate::Subcommand::Analyze(mut options) = args.command else {
                 panic!("{argv:?} is not analyze")
             };
