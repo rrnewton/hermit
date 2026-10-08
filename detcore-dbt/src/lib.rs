@@ -123,6 +123,8 @@ fn runtime_callback_channels(
 static DBT_TRACING_ACTIVE: AtomicBool = AtomicBool::new(false);
 static DBT_EVIDENCE_LOG_LEVEL: AtomicI32 = AtomicI32::new(0);
 static DBT_DIAGNOSTIC_EMITTER: OnceLock<Emitter> = OnceLock::new();
+/// The protected evidence channel, when this run asked for one.
+static DBT_EVIDENCE_EMITTER: OnceLock<Emitter> = OnceLock::new();
 static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
 
 struct DbtSubscriber {
@@ -1134,6 +1136,9 @@ unsafe fn runtime_background_init(callbacks: &reverie_dbt::DbtRuntimeCallbacks, 
         b"detcore-dbt: background client thread entered\n",
     );
     let protected_evidence_requested = protected_level != 0;
+    if protected_evidence_requested {
+        let _ = DBT_EVIDENCE_EMITTER.set(emit_evidence);
+    }
     let tracing_active = init_dbt_tracing(
         if protected_evidence_requested {
             emit_evidence
@@ -1279,6 +1284,31 @@ pub unsafe extern "C" fn reverie_dbt_runtime_background_init(argument: *mut c_vo
 pub extern "C" fn reverie_dbt_runtime_process_exit() {
     READY_IMAGE.store(0, Ordering::Release);
     RUNTIME_SHUTDOWN.store(true, Ordering::Release);
+    if let Some(&emit) = DBT_EVIDENCE_EMITTER.get() {
+        emit_determinism_loss_record(emit, detcore::detlog::determinism_loss());
+    }
+}
+
+/// Writes `loss`, this process's determinism-loss latch, into the protected
+/// evidence stream as one record with target
+/// [`detcore::detlog::DETERMINISM_LOSS_RECORD_TARGET`], in the canonical form of
+/// every other evidence record. The latch lives in this process, where hermit
+/// cannot read it; hermit's DBT adapter refuses to compare a run whose
+/// evidence holds this record, as its generic verifier refuses a run whose own
+/// latch is set. Nothing is written when no loss was recorded.
+fn emit_determinism_loss_record(emit: Emitter, loss: Option<String>) {
+    let Some(reason) = loss else {
+        return;
+    };
+    let mut fields = String::new();
+    push_escaped_record_text(&mut fields, &reason);
+    let record = format_dbt_log_record(
+        tracing::Level::ERROR.as_str(),
+        detcore::detlog::DETERMINISM_LOSS_RECORD_TARGET,
+        &fields,
+        true,
+    );
+    unsafe { emit(record.as_ptr(), record.len()) };
 }
 
 /// Reports whether the Detcore global scheduler is ready for this image.
@@ -2815,6 +2845,35 @@ mod tests {
         assert!(protected_evidence_capture_ready(level, true));
         assert!(!protected_evidence_capture_ready(level, false));
         assert!(protected_evidence_capture_ready(0, false));
+    }
+
+    static LOSS_RECORDS: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+    unsafe extern "C" fn capture_loss_record(bytes: *const u8, length: usize) {
+        let bytes = unsafe { std::slice::from_raw_parts(bytes, length) };
+        LOSS_RECORDS.lock().unwrap().extend_from_slice(bytes);
+    }
+
+    // The latch lives in the guest's client under DBT, so a recorded loss
+    // must leave the process as an evidence record, and nothing else must.
+    #[test]
+    fn a_recorded_determinism_loss_becomes_an_evidence_record() {
+        LOSS_RECORDS.lock().unwrap().clear();
+        emit_determinism_loss_record(capture_loss_record, None);
+        assert!(LOSS_RECORDS.lock().unwrap().is_empty());
+
+        emit_determinism_loss_record(
+            capture_loss_record,
+            Some("thread 3 of process 3 has a pending guest-handled SIGALRM\nbut".to_owned()),
+        );
+        assert_eq!(
+            String::from_utf8(LOSS_RECORDS.lock().unwrap().clone()).unwrap(),
+            format!(
+                "1970-01-01T00:00:00.000000Z ERROR {}: thread 3 of process 3 has a pending \
+                 guest-handled SIGALRM\\nbut\n",
+                detcore::detlog::DETERMINISM_LOSS_RECORD_TARGET
+            )
+        );
     }
 
     #[test]

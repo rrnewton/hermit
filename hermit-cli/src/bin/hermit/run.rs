@@ -716,17 +716,19 @@ impl Write for SharedLog {
 /// any comparison, independently of what reached the log: a lost or failed
 /// write can leave a log that reads complete.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
-struct RunLatches {
+pub(super) struct RunLatches {
     /// Detcore's determinism-loss latch (`detcore::detlog::determinism_loss`):
     /// a record was lost, or an event happened at a moment the host chose.
-    determinism_loss: Option<String>,
+    /// Under DBT it comes from the run's evidence instead
+    /// (`backends::dbt_run_latches`), since the latch is in the guest.
+    pub(super) determinism_loss: Option<String>,
     /// The first write or flush error of the run's log ([`SharedLog::failure`]).
-    log_sink_failure: Option<String>,
+    pub(super) log_sink_failure: Option<String>,
 }
 
 impl RunLatches {
     /// Refuses to compare `run` when either latch is set.
-    fn refuse_comparison(&self, run: &str) -> Result<(), Error> {
+    pub(super) fn refuse_comparison(&self, run: &str) -> Result<(), Error> {
         if let Some(reason) = &self.determinism_loss {
             anyhow::bail!("{run}: determinism loss recorded: {reason}");
         }

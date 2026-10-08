@@ -783,6 +783,28 @@ fn decode_dbt_evidence(file: &mut std::fs::File) -> Result<DbtEvidence, Error> {
     })
 }
 
+#[cfg(feature = "dbt")]
+/// The latches of one DBT run. Detcore runs in the guest's DynamoRIO client,
+/// so its determinism-loss latch is read from the run's evidence: the client
+/// writes a record with target [`detcore::detlog::DETERMINISM_LOSS_RECORD_TARGET`]
+/// at process exit when its latch is set. The reason is the record's text after
+/// the target, escaped as every evidence record is.
+fn dbt_run_latches(evidence: &DbtEvidence) -> super::run::RunLatches {
+    let marker = format!(
+        " ERROR {}: ",
+        detcore::detlog::DETERMINISM_LOSS_RECORD_TARGET
+    );
+    let determinism_loss = evidence.all_records().iter().find_map(|record| {
+        let text = String::from_utf8_lossy(record);
+        text.split_once(&marker)
+            .map(|(_, reason)| reason.trim_end_matches('\n').to_owned())
+    });
+    super::run::RunLatches {
+        determinism_loss,
+        log_sink_failure: None,
+    }
+}
+
 /// Write the comparison log for one DBT run from its decoded evidence.
 ///
 /// The log holds `DbtEvidence::all_records()`: every authenticated record in
@@ -1217,6 +1239,14 @@ pub(super) fn run_dbt(
     // verification ends unverified.
     let mut signal_reports = super::verify::SignalTerminationReports::default();
     signal_reports.prepare("run 1", process_status(first_raw.status), &log1_path);
+    // The generic verifier's check, before any comparison: a run that
+    // recorded a determinism loss is not compared.
+    if let Err(error) = dbt_run_latches(&first_evidence).refuse_comparison("run 1") {
+        if keep_logs {
+            retain_verification_logs([("run 1", log1_path)])?;
+        }
+        return Err(error);
+    }
     if print_verify_logs {
         std::io::stderr().write_all(&fs::read(&log1_path)?)?;
     }
@@ -1311,6 +1341,12 @@ pub(super) fn run_dbt(
         return Err(error);
     }
     signal_reports.prepare("run 2", process_status(second_raw.status), &log2_path);
+    if let Err(error) = dbt_run_latches(&second_evidence).refuse_comparison("run 2") {
+        if keep_logs {
+            retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
+        }
+        return Err(error);
+    }
     let second_stats = match stats2.finish() {
         Ok(stats) => stats,
         Err(error) => {
@@ -2750,6 +2786,33 @@ mod tests {
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(&encode_dbt_evidence(records)).unwrap();
         decode_dbt_evidence(&mut file).expect("fixture evidence must decode")
+    }
+
+    // Under DBT the determinism-loss latch is in the guest; the client
+    // reports it as an evidence record, and the run is refused by the same
+    // check the generic verifier uses, never compared.
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn a_dbt_run_whose_evidence_records_a_determinism_loss_is_not_compared() {
+        let record: &[u8] =
+            b"1970-01-01T00:00:00.000000Z INFO detcore: [dtid 3] DETLOG [syscall] getpid() = 3\n";
+        let clean = decoded_dbt_evidence(&[DBT_INITIALIZATION_RECORD, record]);
+        assert_eq!(dbt_run_latches(&clean).determinism_loss, None);
+        assert!(dbt_run_latches(&clean).refuse_comparison("run 1").is_ok());
+
+        let loss = format!(
+            "1970-01-01T00:00:00.000000Z ERROR {}: process 3 exited without deregistering\n",
+            detcore::detlog::DETERMINISM_LOSS_RECORD_TARGET
+        );
+        let lost = decoded_dbt_evidence(&[DBT_INITIALIZATION_RECORD, record, loss.as_bytes()]);
+        let refusal = dbt_run_latches(&lost)
+            .refuse_comparison("run 2")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            refusal,
+            "run 2: determinism loss recorded: process 3 exited without deregistering"
+        );
     }
 
     #[test]

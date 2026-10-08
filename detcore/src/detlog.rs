@@ -613,6 +613,13 @@ struct ForwardedSource {
 
 static FORWARDED_SOURCE: Mutex<Option<ForwardedSource>> = Mutex::new(None);
 
+/// The target of the evidence record that reports this process's
+/// [`determinism_loss`] where the verifier cannot read it: under the DBT
+/// backend Detcore runs in the guest's DynamoRIO client, so the client writes
+/// the reason into its protected evidence stream at process exit, and hermit's
+/// DBT adapter refuses the comparison when a run's evidence holds one.
+pub const DETERMINISM_LOSS_RECORD_TARGET: &str = "detcore::determinism_loss";
+
 /// The first determinism loss recorded in this process, never cleared: a run
 /// that recorded one must not be compared, whatever reached its log (see
 /// [`determinism_loss`]).

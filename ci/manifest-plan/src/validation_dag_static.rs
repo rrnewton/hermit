@@ -863,7 +863,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retains all 997: 998, listed with this node's arguments.
     // happens_before::tests::has_syscall_count_anchor_at_is_exact (detcore-model,
     // https://github.com/rrnewton/hermit/issues/3877) retains all 998: 999.
-    ("test.regular_crates", 999),
+    // detcore-dbt's tests::a_recorded_determinism_loss_becomes_an_evidence_record
+    // retains all 999: 1000, listed with this node's arguments.
+    ("test.regular_crates", 1000),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1151,7 +1153,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // measured with cargo nextest list.
     // metadata::tests::a_record_without_a_timer_has_no_timeslice retains
     // all 960: 961, listed with this node's arguments.
-    ("test.hermit_unit", 961),
+    // backends::tests::a_dbt_run_whose_evidence_records_a_determinism_loss_is_not_compared
+    // retains all 961: 962, listed with this node's arguments.
+    ("test.hermit_unit", 962),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2129,7 +2133,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same fatal-core cleanup test: 959.
     // And the analyze network-trace epoch test: 960.
     // And the record timer-support test: 961.
-    ("test.hermit_unit_on_host", 961),
+    // And the DBT determinism-loss evidence test: 962.
+    ("test.hermit_unit_on_host", 962),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -2218,7 +2223,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same detcore-model legacy-form test: 997.
     // And the same fork-window cgroup test: 998.
     // It selects the detcore-model checkpoint-filter test too: 999.
-    ("test.regular_crates_on_host", 999),
+    // And the detcore-dbt determinism-loss record test: 1000.
+    ("test.regular_crates_on_host", 1000),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
