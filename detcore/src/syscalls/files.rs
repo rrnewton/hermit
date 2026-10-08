@@ -851,19 +851,19 @@ pub(crate) fn may_write_process_memory(flags: OFlag, descriptor: Option<(&Path, 
         })
 }
 
-/// What Detcore fills the buffer of an `fstat` it injects with while a seccomp
-/// filter the guest inherited may apply to its calls, so that a call the
-/// filter answered without running it shows ([`Detcore::inject_fstat`]).
-/// Linux zeroes a `struct stat` before it fills the fields in, and the
-/// padding at its end stays zero, so a `stat` it wrote never has every byte
-/// equal to this one.
+/// What Detcore fills the buffer of a `stat` call it injects for file
+/// metadata with while a seccomp filter the guest inherited may apply to its
+/// calls, so that a call the filter answered without running it, which
+/// reports success and leaves the buffer as it was, shows
+/// ([`Detcore::inject_stat_into`]). Linux zeroes a `struct stat` before it
+/// fills the fields in, and the padding at its end stays zero, so a `stat` it
+/// wrote never has every byte equal to this one.
+///
+/// This tells only whether something wrote the buffer, not what did: a
+/// listener of the filter's user notifications (`SECCOMP_RET_USER_NOTIF`) can
+/// write a `stat` of its own there and answer success, which Detcore takes as
+/// the kernel's.
 const UNWRITTEN_STAT_BYTE: u8 = 0xa5;
-
-/// The `stat` a call staged without [`UNWRITTEN_STAT_BYTE`] wrote, which is
-/// all that can be told of it ([`Detcore::inject_stat_into`]).
-fn as_written(copied: Option<libc::stat>) -> libc::stat {
-    copied.expect("only a prefilled stat buffer can show that the call left it unwritten")
-}
 
 /// Writes back the guest bytes that a pre-call lookup buffer (utimensat's, or
 /// the removal lookup's) covered.
@@ -1087,18 +1087,30 @@ impl<T: RecordOrReplay> Detcore<T> {
         let path_address = stack.push(path_buffer).cast::<libc::c_char>();
         let statptr = StatPtr(stack.reserve());
         let stack_guard = stack.commit()?;
-        let call = syscalls::Fstatat::new()
-            .with_dirfd(libc::AT_FDCWD)
-            .with_path(PathPtr::from_ptr(
-                path_address.as_raw() as *const libc::c_char
+        let guest_path = PathPtr::from_ptr(path_address.as_raw() as *const libc::c_char);
+        let lookup = move |statptr: StatPtr<'_>| {
+            Syscall::from(StatFamily::Fstatat(
+                syscalls::Fstatat::new()
+                    .with_dirfd(libc::AT_FDCWD)
+                    .with_path(guest_path)
+                    .with_stat(Some(statptr))
+                    .with_flags(AtFlags::empty()),
             ))
-            .with_stat(Some(statptr))
-            .with_flags(AtFlags::empty());
-        let mut identity = match guest.inject_with_retry(call).await {
-            Ok(_) => {
-                let stat = statptr.read(&guest.memory())?;
-                Some((stat.st_dev, stat.st_ino))
-            }
+        };
+        // While a seccomp filter the guest inherited may apply to its calls,
+        // the lookup is checked in a transient page, and one the filter
+        // answered without running it (`None`, which records a determinism
+        // loss) names no task, so the descriptor is taken as bound to an
+        // exited one.
+        let looked_up = match Self::naming_seccomp_mode(guest) {
+            Some(mode) => Self::inject_checked_stat(guest, lookup, "an fstatat", mode).await,
+            None => match guest.inject_with_retry(lookup(statptr)).await {
+                Ok(_) => Ok(Some(statptr.read(&guest.memory())?)),
+                Err(error) => Err(error),
+            },
+        };
+        let mut identity = match looked_up {
+            Ok(stat) => stat.map(|stat| (stat.st_dev, stat.st_ino)),
             Err(Errno::ENOENT) | Err(Errno::ESRCH) => None,
             Err(error) => return Err(error.into()),
         };
@@ -1428,12 +1440,15 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// make this fstat return 0 without running it, which leaves the buffer as
     /// it was. While such a filter may apply ([`Self::naming_seccomp_mode`]),
     /// the buffer is filled with [`UNWRITTEN_STAT_BYTE`] before the call, and
-    /// a call that reports success with every byte still as filled wrote
-    /// nothing. Detcore then records a determinism loss that names the filter
-    /// mode and returns a zeroed `stat`, which describes no file: no procfs
-    /// file has a zero block size, and the open path retires no inode for a
-    /// file with no links. It does not fail, as the guest's own call has
-    /// already run, and the open path would close the descriptor it returned.
+    /// a call that reports success with every byte still as filled left it
+    /// unwritten, as does an mmap of the transient page that the filter
+    /// answered the same way. Detcore then records a determinism loss that
+    /// names the filter mode and returns a zeroed `stat`, which describes no
+    /// file: no procfs file has a zero block size, and the open path retires
+    /// no inode for a file with no links. It does not fail, as the guest's own
+    /// call has already run, and the open path would close the descriptor it
+    /// returned. A `stat` that a listener of the filter's user notifications
+    /// wrote is taken as the kernel's (see [`UNWRITTEN_STAT_BYTE`]).
     pub(crate) async fn inject_fstat<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1459,17 +1474,20 @@ impl<T: RecordOrReplay> Detcore<T> {
                      using a transient page instead.",
                     raw_fd
                 );
-                Self::inject_stat_in_transient_page(guest, fstat, prefill).await?
+                Self::inject_stat_in_transient_page(guest, fstat, filter_mode.as_deref()).await?
             }
             result => result?,
         };
         let Some(copied) = copied else {
             info!(
-                "A seccomp filter answered the fstat of fd {} without running it.",
+                "A seccomp filter answered a call Detcore injected to fstat fd {} without running it.",
                 raw_fd
             );
             let mode = filter_mode.expect("only a prefilled buffer can be left unwritten");
-            procfs_inode::preserving_errno(Self::record_unwritten_fstat_loss(guest, mode)).await;
+            procfs_inode::preserving_errno(Self::record_unwritten_stat_loss(
+                guest, "an fstat", mode,
+            ))
+            .await;
             // SAFETY: `libc::stat` is plain integers, for which zero is valid.
             return Ok(unsafe { std::mem::zeroed() });
         };
@@ -1485,18 +1503,26 @@ impl<T: RecordOrReplay> Detcore<T> {
         dirfd: RawFd,
         path: syscalls::PathPtr<'_>,
         inputs: [Option<syscalls::PathPtr<'_>>; 2],
-    ) -> Result<libc::stat, Errno> {
+    ) -> Result<Option<libc::stat>, Errno> {
         Self::inject_statat(guest, dirfd, path, inputs, AtFlags::AT_SYMLINK_NOFOLLOW).await
     }
 
     /// `fstatat(dirfd, path, flags)` for a path the guest named in a call that
-    /// has not run yet and must still read `inputs`, its paths.
+    /// has not run yet and must still read `inputs`, its paths. `None` is a
+    /// lookup that a seccomp filter the guest inherited answered without
+    /// running it, for which a determinism loss is recorded; it describes no
+    /// file, so the caller uses none of it.
     ///
-    /// The buffer is staged as the utimensat target lookup stages its own: in
-    /// the guest stack scratch, below the red zone, where a raw syscall may
-    /// keep its own path, so only when it overlaps none of `inputs`, and with
-    /// the bytes under it saved and put back after the commit and after the
-    /// lookup, so that the call reads its inputs unchanged (claude review of
+    /// While such a filter may apply ([`Self::naming_seccomp_mode`]), the
+    /// lookup is checked in a transient page ([`Self::inject_checked_stat`]):
+    /// the stack scratch cannot be checked, as filling it would change a path
+    /// that shares its pages through a second mapping before the lookup reads
+    /// it. Otherwise the buffer is staged as the utimensat target lookup
+    /// stages its own: in the guest stack scratch, below the red zone, where a
+    /// raw syscall may keep its own path, so only when it overlaps none of
+    /// `inputs`, and with the bytes under it saved and put back after the
+    /// commit and after the lookup, so that the call reads its inputs
+    /// unchanged (claude review of
     /// <https://github.com/rrnewton/hermit/pull/3849>, P3-2). Otherwise it is
     /// a transient private page, unmapped before the guest resumes.
     pub(crate) async fn inject_statat<G: Guest<Self>>(
@@ -1505,7 +1531,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         path: syscalls::PathPtr<'_>,
         inputs: [Option<syscalls::PathPtr<'_>>; 2],
         flags: AtFlags,
-    ) -> Result<libc::stat, Errno> {
+    ) -> Result<Option<libc::stat>, Errno> {
         let lstatat = move |statptr: StatPtr<'_>| {
             Syscall::Newfstatat(
                 syscalls::Newfstatat::new()
@@ -1515,13 +1541,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .with_flags(flags),
             )
         };
+        if let Some(mode) = Self::naming_seccomp_mode(guest) {
+            return Self::inject_checked_stat(guest, lstatat, "an fstatat", mode).await;
+        }
         // The scratch starts 128 bytes below the stack pointer, at addresses
         // computed by subtraction.
         let scratch = 128 + std::mem::size_of::<libc::stat>();
         if usize::try_from(guest.regs().await.rsp).map_or(true, |rsp| rsp <= scratch) {
-            return Self::inject_stat_in_transient_page(guest, lstatat, false)
-                .await
-                .map(as_written);
+            return Self::inject_stat_in_transient_page(guest, lstatat, None).await;
         }
         let mut stack = guest.stack().await;
         let statptr: StatPtr = StatPtr(stack.reserve());
@@ -1535,23 +1562,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .is_ok();
         if !staged_on_stack {
             drop(stack);
-            return Self::inject_stat_in_transient_page(guest, lstatat, false)
-                .await
-                .map(as_written);
+            return Self::inject_stat_in_transient_page(guest, lstatat, None).await;
         }
         let guard = match stack.commit() {
             Ok(guard) => guard,
             Err(_) => {
                 restore_lookup_buffer(&mut guest.memory(), statptr, &saved);
-                return Self::inject_stat_in_transient_page(guest, lstatat, false)
-                    .await
-                    .map(as_written);
+                return Self::inject_stat_in_transient_page(guest, lstatat, None).await;
             }
         };
         restore_lookup_buffer(&mut guest.memory(), statptr, &saved);
-        let looked_up = Self::inject_stat_into(guest, lstatat(statptr), statptr, false)
-            .await
-            .map(as_written);
+        let looked_up = Self::inject_stat_into(guest, lstatat(statptr), statptr, false).await;
         restore_lookup_buffer(&mut guest.memory(), statptr, &saved);
         drop(guard);
         looked_up
@@ -1579,15 +1600,24 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(copied)
     }
 
-    /// The fallback of [`Self::inject_fstat`] and [`Self::inject_lstatat`]:
-    /// the buffer lives in a private
-    /// anonymous page mapped for this call only. The guest never learns its
-    /// address, and it is unmapped before the guest resumes, so the guest's
-    /// address space is the same as before the call.
+    /// The fallback of [`Self::inject_fstat`] and [`Self::inject_statat`], and
+    /// the buffer of every lookup [`Self::inject_checked_stat`] checks: a
+    /// private anonymous page mapped for this call only. The guest never
+    /// learns its address, and it is unmapped before the guest resumes, so the
+    /// guest's address space is the same as before the call.
+    ///
+    /// With `filter_mode`, the mode of a seccomp filter the guest inherited
+    /// that may apply to its calls ([`Self::naming_seccomp_mode`]), the buffer
+    /// is filled before the call ([`Self::inject_stat_into`]), and an mmap
+    /// that returns no address, as one the filter answered without running it
+    /// returns 0, records a determinism loss and is `None`, as an unwritten
+    /// `stat` is. A munmap the filter answered that way leaves the page
+    /// mapped, which Detcore cannot tell without another call the filter may
+    /// answer too.
     async fn inject_stat_in_transient_page<G: Guest<Self>>(
         guest: &mut G,
         stat_call: impl Fn(StatPtr<'_>) -> Syscall,
-        prefill: bool,
+        filter_mode: Option<&str>,
     ) -> Result<Option<libc::stat>, Errno> {
         let len = std::mem::size_of::<libc::stat>();
         let mapped = guest
@@ -1601,12 +1631,31 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .with_offset(0),
             ))
             .await?;
-        let page = usize::try_from(mapped)
+        let Some(page) = usize::try_from(mapped)
             .ok()
             .and_then(AddrMut::<libc::stat>::from_raw)
-            .unwrap_or_else(|| panic!("transient fstat page mmap returned {mapped}"));
-        let copied =
-            Self::inject_stat_into(guest, stat_call(StatPtr(page)), StatPtr(page), prefill).await;
+        else {
+            let Some(mode) = filter_mode else {
+                panic!("transient fstat page mmap returned {mapped}");
+            };
+            info!(
+                "A seccomp filter answered the mmap of a transient stat page without running it."
+            );
+            procfs_inode::preserving_errno(Self::record_unwritten_stat_loss(
+                guest,
+                "an mmap",
+                mode.to_owned(),
+            ))
+            .await;
+            return Ok(None);
+        };
+        let copied = Self::inject_stat_into(
+            guest,
+            stat_call(StatPtr(page)),
+            StatPtr(page),
+            filter_mode.is_some(),
+        )
+        .await;
         if let Err(errno) = guest
             .inject_with_retry(Syscall::Munmap(
                 syscalls::Munmap::new()
@@ -1626,12 +1675,40 @@ impl<T: RecordOrReplay> Detcore<T> {
         copied
     }
 
+    /// Inject `stat_call`, named `call` in the loss it may record, with its
+    /// buffer in a transient page filled before the call
+    /// ([`Self::inject_stat_in_transient_page`]), while a seccomp filter the
+    /// guest inherited, in mode `mode`, may apply to its calls
+    /// ([`Self::naming_seccomp_mode`]). `None` is a call that reported success
+    /// and left the buffer unwritten, for which a determinism loss is
+    /// recorded; it describes no file, so the caller uses none of it. The page
+    /// is fresh, so it shares no bytes with a path the call reads, and neither
+    /// the fill nor the call changes guest memory: there is nothing to put
+    /// back.
+    async fn inject_checked_stat<G: Guest<Self>>(
+        guest: &mut G,
+        stat_call: impl Fn(StatPtr<'_>) -> Syscall,
+        call: &str,
+        mode: String,
+    ) -> Result<Option<libc::stat>, Errno> {
+        let copied = Self::inject_stat_in_transient_page(guest, stat_call, Some(&mode)).await?;
+        if copied.is_none() {
+            info!(
+                "A seccomp filter answered {} Detcore injected without running it.",
+                call
+            );
+            procfs_inode::preserving_errno(Self::record_unwritten_stat_loss(guest, call, mode))
+                .await;
+        }
+        Ok(copied)
+    }
+
     /// Inject `stat_call`, which writes a `struct stat` at `statptr`, and read
-    /// back what the kernel wrote. With `prefill`, the buffer is first filled
+    /// back what the call wrote. With `prefill`, the buffer is first filled
     /// with [`UNWRITTEN_STAT_BYTE`], and `None` is a call that reported
-    /// success yet left every byte as filled, so wrote nothing (see
-    /// [`Self::inject_fstat`]). A fill that faults is `EFAULT`, as the call's
-    /// own write would be.
+    /// success yet left every byte as filled, so left the buffer unwritten;
+    /// what this cannot tell is under [`UNWRITTEN_STAT_BYTE`]. A fill that
+    /// faults is `EFAULT`, as the call's own write would be.
     async fn inject_stat_into<G: Guest<Self>>(
         guest: &mut G,
         stat_call: Syscall,
@@ -1811,7 +1888,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// `renameat` or `renameat2` replaces (not with `RENAME_EXCHANGE`), when
     /// it is a directory or a file with one link (see [`retires_on_removal`]).
     /// Each name is stat'ed with an injected `fstatat(AT_SYMLINK_NOFOLLOW)`
-    /// before the call runs; a name that does not resolve removes nothing.
+    /// before the call runs; a name that does not resolve removes nothing, and
+    /// nothing is retired after a lookup that a seccomp filter the guest
+    /// inherited answered without running it ([`Self::inject_statat`]).
     /// Pass the result to [`Self::retire_removed_inodes`] if the call
     /// succeeds. Only with virtualized metadata, the only mode that numbers
     /// inodes.
@@ -1857,16 +1936,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         let Some(path) = removed.1 else {
             return Vec::new();
         };
-        let Ok(stat) = Self::inject_lstatat(guest, removed.0, path, inputs).await else {
+        // A lookup that a seccomp filter the guest inherited answered without
+        // running it (`None`, which records a determinism loss) tells nothing
+        // of either name, so nothing is retired on its account.
+        let Ok(Some(stat)) = Self::inject_lstatat(guest, removed.0, path, inputs).await else {
             return Vec::new();
         };
         let inode = RawInode::new(stat.st_dev, stat.st_ino);
-        if let Some((dirfd, Some(path))) = source
-            && Self::inject_lstatat(guest, dirfd, path, inputs)
-                .await
-                .is_ok_and(|source| RawInode::new(source.st_dev, source.st_ino) == inode)
-        {
-            return Vec::new();
+        if let Some((dirfd, Some(path))) = source {
+            match Self::inject_lstatat(guest, dirfd, path, inputs).await {
+                Ok(None) => return Vec::new(),
+                Ok(Some(source)) if RawInode::new(source.st_dev, source.st_ino) == inode => {
+                    return Vec::new();
+                }
+                Ok(Some(_)) | Err(_) => {}
+            }
         }
         if retires_on_removal(&stat) {
             vec![inode]
@@ -1947,6 +2031,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             && !call.flags().intersects(OFlag::O_DIRECTORY | OFlag::O_PATH)
             && let Some(path) = call.path()
             && crate::sigalrm_phase1::open_refused(
+                // A lookup that a seccomp filter the guest inherited answered
+                // without running it tells nothing of the file, so the open is
+                // refused as after a lookup that failed for a reason the open
+                // would not share.
                 Self::inject_statat(
                     guest,
                     call.dirfd(),
@@ -1954,7 +2042,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                     [Some(path), None],
                     AtFlags::empty(),
                 )
-                .await,
+                .await
+                .and_then(|stat| stat.ok_or(Errno::EIO)),
                 call.flags().contains(OFlag::O_NONBLOCK),
             )
         {
@@ -4340,9 +4429,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// injects anything, and records a determinism loss that names the filter
     /// mode. Whether the file may be a procfs one is read from `stat` alone,
     /// which injects nothing, so a file that cannot be costs nothing under a
-    /// filter. A `stat` from Detcore's own fstat is one the filter did not
-    /// answer unseen ([`Self::inject_fstat`]); one from the guest's own call
-    /// holds what that call left, which Detcore only reads.
+    /// filter. A `stat` from Detcore's own fstat is one that the call wrote,
+    /// not one it left unwritten ([`Self::inject_fstat`]), though a listener
+    /// of the filter's user notifications may have written it (see
+    /// [`UNWRITTEN_STAT_BYTE`]); one from the guest's own call holds what that
+    /// call left, which Detcore only reads.
     ///
     /// The guest's `errno` is what it was: under SaBRe, Detcore shares libc,
     /// and so `errno`, with the guest thread it handles (see
@@ -4371,7 +4462,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// for `guest`. Detcore then injects no call to learn how to number a
     /// procfs file, as the filter can answer it without running it or hold it
     /// until a listener replies (see [`Self::procfs_entry`]), and checks that
-    /// the fstat it injects ran ([`Self::inject_fstat`]).
+    /// each `stat` call it injects for file metadata did not report success
+    /// and leave its buffer unwritten: the fstat of an open file
+    /// ([`Self::inject_fstat`]), and the lookups of removals, of utimensat, of
+    /// an open in a process that handles SIGALRM and of a timer slack file
+    /// ([`Self::inject_checked_stat`]). A `stat` that a listener of the
+    /// filter's user notifications wrote is not caught (see
+    /// [`UNWRITTEN_STAT_BYTE`]).
     fn naming_seccomp_mode<G: Guest<Self>>(guest: &G) -> Option<String> {
         if Self::names_procfs_entries(guest) {
             guest.config().inherited_seccomp.filter_mode()
@@ -4603,15 +4700,16 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Records, once per process, the determinism loss of a file whose
     /// metadata Detcore does not know, as a seccomp filter the guest
-    /// inherited, in mode `mode`, answered the fstat Detcore injected to learn
-    /// it without running it ([`Self::inject_fstat`]).
-    async fn record_unwritten_fstat_loss<G: Guest<Self>>(guest: &mut G, mode: String) {
+    /// inherited, in mode `mode`, answered `call` ("an fstat", "an fstatat" or
+    /// "an mmap"), which Detcore injected to learn it, without running it
+    /// ([`Self::inject_fstat`], [`Self::inject_checked_stat`]).
+    async fn record_unwritten_stat_loss<G: Guest<Self>>(guest: &mut G, call: &str, mode: String) {
         static RECORDED: AtomicBool = AtomicBool::new(false);
         if !RECORDED.swap(true, Ordering::Relaxed) {
             report_determinism_loss(
                 guest,
                 format!(
-                    "file metadata: a seccomp filter the guest inherited answered an fstat \
+                    "file metadata: a seccomp filter the guest inherited answered {call} \
                      Detcore injected without running it (mode: {mode})"
                 ),
             )
@@ -5742,31 +5840,48 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// The metadata of the file a utimensat call targets, with the same target
     /// selection: the descriptor itself for `futimens` (a NULL path), else a
     /// path walk honoring the flags utimensat accepts. `None` if the lookup
-    /// fails.
+    /// fails, or if a seccomp filter the guest inherited answered it without
+    /// running it, which records a determinism loss: while such a filter may
+    /// apply ([`Self::naming_seccomp_mode`]), the lookup is checked in a
+    /// transient page ([`Self::inject_checked_stat`]) instead of `statptr`,
+    /// which filling would change for a path or times that share its pages
+    /// through a second mapping.
     async fn utimensat_target<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: &syscalls::Utimensat,
         statptr: StatPtr<'_>,
     ) -> Option<libc::stat> {
-        let lookup = match call.path() {
+        let dirfd = call.dirfd();
+        let path = call.path();
+        let allowed = libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH;
+        let flags = AtFlags::from_bits_truncate(call.flags() & allowed);
+        let lookup = move |statptr: StatPtr<'_>| match path {
             None => Syscall::Fstat(
                 syscalls::Fstat::new()
-                    .with_fd(call.dirfd())
+                    .with_fd(dirfd)
                     .with_stat(Some(statptr)),
             ),
-            Some(path) => {
-                let allowed = libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH;
-                Syscall::Newfstatat(
-                    syscalls::Newfstatat::new()
-                        .with_dirfd(call.dirfd())
-                        .with_path(Some(path))
-                        .with_stat(Some(statptr))
-                        .with_flags(AtFlags::from_bits_truncate(call.flags() & allowed)),
-                )
-            }
+            Some(path) => Syscall::Newfstatat(
+                syscalls::Newfstatat::new()
+                    .with_dirfd(dirfd)
+                    .with_path(Some(path))
+                    .with_stat(Some(statptr))
+                    .with_flags(flags),
+            ),
         };
-        self.record_or_replay(guest, lookup).await.ok()?;
+        if let Some(mode) = Self::naming_seccomp_mode(guest) {
+            let injected = if path.is_some() {
+                "an fstatat"
+            } else {
+                "an fstat"
+            };
+            return Self::inject_checked_stat(guest, lookup, injected, mode)
+                .await
+                .ok()
+                .flatten();
+        }
+        self.record_or_replay(guest, lookup(statptr)).await.ok()?;
         statptr.read(&guest.memory()).ok()
     }
 

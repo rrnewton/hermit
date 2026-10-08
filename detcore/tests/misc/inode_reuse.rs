@@ -31,6 +31,7 @@ use std::process::Command;
 
 use detcore::Config;
 use detcore::Detcore;
+use detcore::InheritedSeccomp;
 use reverie::ExitStatus;
 
 fn ino_of_fd(fd: i32) -> u64 {
@@ -314,13 +315,15 @@ fn numbers(stdout: &str, label: &str) -> BTreeSet<u64> {
         .collect()
 }
 
-#[test]
-fn removing_a_last_name_retires_its_number_and_nothing_else() {
+/// Run [`removals_guest`] with `inherited_seccomp`, and check that the
+/// numbers it reports retired are, and those it reports kept are not.
+fn check_removals(inherited_seccomp: InheritedSeccomp) {
     let root = tempfile::tempdir().unwrap();
     let config = Config {
         sequentialize_threads: true,
         max_timeslice: None,
         virtualize_metadata: true,
+        inherited_seccomp,
         ..Default::default()
     };
     let (output, state) = detcore_testutils::test_fn_with_config::<Detcore, _>(
@@ -353,6 +356,24 @@ fn removing_a_last_name_retires_its_number_and_nothing_else() {
             "{number} still has a name but is retired: {retired:?}"
         );
     }
+}
+
+/// With no seccomp filter inherited, the lookup before a removal stages its
+/// buffer in the guest's stack scratch where it can.
+#[test]
+fn removing_a_last_name_retires_its_number_and_nothing_else() {
+    check_removals(InheritedSeccomp::Disabled);
+}
+
+/// While a seccomp filter the guest inherited may apply to its calls, as
+/// Detcore assumes when nobody says, the lookup before a removal is checked
+/// in a transient page instead. It retires the same numbers, leaves the paths
+/// of the raw calls in the stack scratch intact, and records no determinism
+/// loss.
+#[test]
+fn removals_retire_the_same_numbers_while_a_filter_may_apply() {
+    check_removals(InheritedSeccomp::Unknown);
+    assert_eq!(detcore::detlog::determinism_loss(), None);
 }
 
 /// Without sequentialized threads another thread could link or rename a file

@@ -1590,7 +1590,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // an_inherited_filter_that_suspends_a_descriptor_stat_does_not_stop_the_guest}
     // (a faked fstat under an inherited filter is a recorded loss) retain all
     // 102 (measured 107).
-    ("test.detcore_misc", 107),
+    // procfs_inode::{an_inherited_filter_that_fakes_a_removal_lookup_records_a_loss_and_retires_nothing,
+    // an_inherited_filter_that_fakes_a_utimensat_lookup_records_a_determinism_loss,
+    // an_inherited_filter_records_no_loss_for_lookups_it_lets_run} and
+    // inode_reuse::removals_retire_the_same_numbers_while_a_filter_may_apply
+    // (a faked lookup before a removal or a utimensat is a recorded loss)
+    // retain all 107 (measured 111).
+    ("test.detcore_misc", 111),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -2104,7 +2110,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
     // The host node carries the identical tests_misc selection.
-    ("test.detcore_misc_on_host", 107),
+    ("test.detcore_misc_on_host", 111),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).

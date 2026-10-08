@@ -30,6 +30,7 @@ use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::IntoRawFd;
 use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::time::Duration;
 
 use detcore::Config;
@@ -50,12 +51,13 @@ fn config() -> Config {
 
 /// Run `guest` under Detcore and require that it exits 0.
 fn under_detcore(guest: impl FnOnce() + Send) {
-    under_detcore_with(config(), guest)
+    under_detcore_with(config(), guest);
 }
 
-/// Run `guest` under Detcore with `config` and require that it exits 0.
-fn under_detcore_with(config: Config, guest: impl FnOnce() + Send) {
-    let (output, _) =
+/// Run `guest` under Detcore with `config`, require that it exits 0, and
+/// return the run's global state.
+fn under_detcore_with(config: Config, guest: impl FnOnce() + Send) -> detcore::GlobalState {
+    let (output, state) =
         detcore_testutils::test_fn_with_config::<Detcore, _>(guest, config, true).unwrap();
     assert_eq!(
         output.status,
@@ -64,6 +66,7 @@ fn under_detcore_with(config: Config, guest: impl FnOnce() + Send) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    state
 }
 
 /// This process's procfs directory, by PID rather than through `self`.
@@ -588,6 +591,12 @@ const ONE_INHERITED_FILTER: &str = "procfs inode numbers: a seccomp filter the g
 /// answers an `fstat` that Detcore injects without running it.
 const ONE_FILTER_FAKED_AN_FSTAT: &str = "file metadata: a seccomp filter the guest inherited answered an fstat Detcore injected without running it (mode: filter, with 1 filter)";
 
+/// The determinism loss Detcore records when the one filter a test installed
+/// answers an `fstatat` that Detcore injects, to look a path up, without
+/// running it.
+#[cfg(target_arch = "x86_64")]
+const ONE_FILTER_FAKED_AN_FSTATAT: &str = "file metadata: a seccomp filter the guest inherited answered an fstatat Detcore injected without running it (mode: filter, with 1 filter)";
+
 /// Fill the guest's descriptors below `FILTERED_FD`, which must be free, so
 /// that the next descriptor the guest opens, or Detcore opens in it, is that
 /// one.
@@ -664,23 +673,42 @@ fn an_inherited_filter_that_suspends_an_open_does_not_stop_the_guest() {
     );
 }
 
-/// Give `action` to every `fstat(fd)`, and return what `seccomp(2)` returned
-/// for `flags`.
+/// Give `action` to every call of system call `number` whose first argument
+/// is `first`, and return what `seccomp(2)` returned for `flags`.
 #[cfg(target_arch = "x86_64")]
-fn filter_fstat(fd: i32, action: u32, flags: libc::c_ulong) -> libc::c_long {
+fn filter_first_argument(
+    number: libc::c_long,
+    first: i32,
+    action: u32,
+    flags: libc::c_ulong,
+) -> libc::c_long {
     // seccomp_data: nr at 0, arch at 4, and the low half of args[0] at 16.
     let mut program = [
         load(4),
         jump_if(AUDIT_ARCH_X86_64, 1, 0),
         ret(libc::SECCOMP_RET_ALLOW),
         load(0),
-        jump_if(libc::SYS_fstat as u32, 0, 3),
+        jump_if(number as u32, 0, 3),
         load(16),
-        jump_if(fd as u32, 0, 1),
+        jump_if(first as u32, 0, 1),
         ret(action),
         ret(libc::SECCOMP_RET_ALLOW),
     ];
     install(&mut program, flags)
+}
+
+/// Give `action` to every `fstat(fd)`, and return what `seccomp(2)` returned
+/// for `flags`.
+#[cfg(target_arch = "x86_64")]
+fn filter_fstat(fd: i32, action: u32, flags: libc::c_ulong) -> libc::c_long {
+    filter_first_argument(libc::SYS_fstat, fd, action, flags)
+}
+
+/// Give `action` to every `newfstatat(dirfd, ...)`, the call Detcore injects
+/// to look a path up before a removal or a utimensat.
+#[cfg(target_arch = "x86_64")]
+fn filter_newfstatat(dirfd: i32, action: u32) {
+    filter_first_argument(libc::SYS_newfstatat, dirfd, action, 0);
 }
 
 /// A filter the guest inherits can make the `fstat` Detcore injects, to learn
@@ -718,6 +746,116 @@ fn an_inherited_filter_records_no_loss_for_a_file_that_is_not_procfs() {
     under_detcore(|| {
         assert_ne!(read_dev_zero(), FILTERED_FD);
     });
+    assert_eq!(detcore::detlog::determinism_loss(), None);
+}
+
+/// Open the directory `root`, create files `a` and `b` in it and number both,
+/// apply `change` to `a` through the directory's descriptor, and check that
+/// `b` keeps its number. With `filtered` the guest first fills the
+/// descriptors below `FILTERED_FD`, so that the directory's is that one.
+#[cfg(target_arch = "x86_64")]
+fn change_a_file_through_a_directory_descriptor(
+    root: &Path,
+    filtered: bool,
+    change: fn(i32, &CStr) -> libc::c_int,
+) {
+    if filtered {
+        take_the_descriptors_below_the_filtered_one();
+    }
+    let directory = File::open(root).unwrap().into_raw_fd();
+    assert_eq!(
+        directory == FILTERED_FD,
+        filtered,
+        "the directory's descriptor is {directory}"
+    );
+    let number = |name: &str| std::fs::symlink_metadata(root.join(name)).unwrap().ino();
+    File::create(root.join("a")).unwrap();
+    File::create(root.join("b")).unwrap();
+    number("a");
+    let b = number("b");
+    assert_eq!(
+        change(directory, c"a"),
+        0,
+        "{}",
+        std::io::Error::last_os_error()
+    );
+    assert_eq!(number("b"), b, "b's number");
+}
+
+/// A filter the guest inherits can make the `fstatat` Detcore injects, to
+/// learn which file a removal takes the last name of, return 0 without
+/// running, which leaves its buffer as it was. Were the buffer the guest's
+/// stack scratch, Detcore would take the bytes it held for the file's device
+/// and inode, and could retire the number of another file they named, whose
+/// next stat would then show a new number, without a determinism loss. While
+/// a filter may apply, Detcore looks the path up in a filled transient page
+/// instead, so it sees that nothing was written, records the loss, and
+/// retires nothing.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn an_inherited_filter_that_fakes_a_removal_lookup_records_a_loss_and_retires_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    filter_newfstatat(FILTERED_FD, libc::SECCOMP_RET_ERRNO);
+    let state = under_detcore_with(config(), || {
+        change_a_file_through_a_directory_descriptor(root.path(), true, |directory, name| unsafe {
+            libc::unlinkat(directory, name.as_ptr(), 0)
+        });
+    });
+    assert_eq!(state.retired_inodes(), Vec::new());
+    assert_eq!(
+        detcore::detlog::determinism_loss().as_deref(),
+        Some(ONE_FILTER_FAKED_AN_FSTATAT)
+    );
+}
+
+/// A filter the guest inherits can likewise make the `fstatat` Detcore
+/// injects, to learn which file a utimensat changes, return 0 without
+/// running, which would leave the virtual mtime update to whatever the buffer
+/// held. While a filter may apply, Detcore looks the path up in a filled
+/// transient page, records the loss, and leaves the virtual mtime alone.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn an_inherited_filter_that_fakes_a_utimensat_lookup_records_a_determinism_loss() {
+    let root = tempfile::tempdir().unwrap();
+    filter_newfstatat(FILTERED_FD, libc::SECCOMP_RET_ERRNO);
+    under_detcore_with(config(), || {
+        change_a_file_through_a_directory_descriptor(root.path(), true, |directory, name| unsafe {
+            libc::utimensat(directory, name.as_ptr(), std::ptr::null(), 0)
+        });
+    });
+    assert_eq!(
+        detcore::detlog::determinism_loss().as_deref(),
+        Some(ONE_FILTER_FAKED_AN_FSTATAT)
+    );
+}
+
+/// While a filter the guest inherited may apply, the lookups before a
+/// utimensat and a removal that it lets run record no determinism loss, and
+/// the removal retires the number of the file whose last name it takes.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn an_inherited_filter_records_no_loss_for_lookups_it_lets_run() {
+    let root = tempfile::tempdir().unwrap();
+    filter_newfstatat(FILTERED_FD, libc::SECCOMP_RET_ERRNO);
+    assert!(
+        matches!(InheritedSeccomp::measure(), InheritedSeccomp::Filter(_)),
+        "the guest inherits no filter"
+    );
+    let state = under_detcore_with(config(), || {
+        change_a_file_through_a_directory_descriptor(
+            root.path(),
+            false,
+            |directory, name| unsafe {
+                let touched = libc::utimensat(directory, name.as_ptr(), std::ptr::null(), 0);
+                if touched != 0 {
+                    return touched;
+                }
+                libc::unlinkat(directory, name.as_ptr(), 0)
+            },
+        );
+    });
+    let retired = state.retired_inodes();
+    assert_eq!(retired.len(), 1, "retired: {retired:?}");
     assert_eq!(detcore::detlog::determinism_loss(), None);
 }
 
