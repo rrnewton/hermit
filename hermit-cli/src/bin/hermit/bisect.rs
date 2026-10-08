@@ -249,6 +249,30 @@ mod tests {
                 &["--record-networking=requested.trace"][..],
                 "refuse --record-networking=requested.trace",
             ),
+            (
+                &["--network=host"][..],
+                "refuse --network=host in the run arguments",
+            ),
+            (
+                &["--no-namespace"][..],
+                "refuse --no-namespace in the run arguments",
+            ),
+            (
+                &["--gdbserver"][..],
+                "refuse --gdbserver in the run arguments",
+            ),
+            (
+                &["--record-preemptions-to=requested.preempts"][..],
+                "refuse --record-preemptions-to in the run arguments",
+            ),
+            (
+                &["--stacktrace-event=5,requested.stack"][..],
+                "refuse --stacktrace-event with a path in the run arguments",
+            ),
+            (
+                &["--preemption-stacktrace-log-file=requested.log"][..],
+                "refuse --preemption-stacktrace-log-file in the run arguments",
+            ),
         ] {
             let error = bisect(run_args);
             assert!(
@@ -259,7 +283,9 @@ mod tests {
             );
             assert!(error.to_string().contains(named), "{run_args:?}: {error:#}");
         }
-        for admitted in [&["--no-namespace"][..], &["--timeout=3"][..]] {
+        // `--no-namespace` is refused above: schedule replay, which every
+        // bisect trial is, needs stable namespace PIDs.
+        for admitted in [&["--stacktrace-event=5"][..], &["--timeout=3"][..]] {
             let error = bisect(admitted);
             assert!(
                 error.to_string().contains("failed to read --good schedule"),

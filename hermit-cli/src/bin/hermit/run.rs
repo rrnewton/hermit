@@ -5472,6 +5472,58 @@ impl RunOpts {
         Ok(())
     }
 
+    /// The run options `hermit analyze` and `hermit bisect` cannot pass to
+    /// their trials, each with the reason, as given. Every trial would either
+    /// leave the deterministic, isolated setup the trials are compared in, or
+    /// write the same output path as every other trial. Options a trial sets
+    /// for itself afterwards (analyze's own preemption record and stack-trace
+    /// events) are not seen here.
+    pub(crate) fn options_trials_refuse(&self) -> Vec<(&'static str, &'static str)> {
+        let config = &self.det_opts.det_config;
+        const SHARED: &str = "every trial writes that same path, so only the last trial's output \
+                              would remain";
+        [
+            (
+                self.network == NetworkingMode::Host,
+                "--network=host",
+                "it puts every trial on the host network, so the trials are no longer reproducible",
+            ),
+            (
+                self.no_namespace,
+                "--no-namespace",
+                "every trial would share the host's processes, files and network, and schedule \
+                 and preemption replay, which the trials are, need stable namespace PIDs",
+            ),
+            (
+                config.gdbserver,
+                "--gdbserver",
+                "it moves every trial to the host network and makes each one wait for a debugger \
+                 on the same port",
+            ),
+            (
+                config.record_preemptions_to.is_some(),
+                "--record-preemptions-to",
+                SHARED,
+            ),
+            (
+                config
+                    .stacktrace_event
+                    .iter()
+                    .any(|(_, path)| path.is_some()),
+                "--stacktrace-event with a path",
+                SHARED,
+            ),
+            (
+                config.preemption_stacktrace_log_file.is_some(),
+                "--preemption-stacktrace-log-file",
+                SHARED,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(given, option, reason)| given.then_some((option, reason)))
+        .collect()
+    }
+
     /// The trace `--record-networking` names, as given. `hermit analyze` and
     /// `hermit bisect` refuse it in their run arguments
     /// (`AnalyzeOpts::refuse_outputs_trials_overwrite`).

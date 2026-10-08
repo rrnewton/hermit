@@ -727,7 +727,9 @@ impl AnalyzeOpts {
     /// its own name (`RunData::new` replaces both paths), so the requested
     /// files would never be written. `--record-networking` is refused too:
     /// it would put every trial on the host network and have every trial
-    /// write the same trace.
+    /// write the same trace. So are the options `RunOpts::options_trials_refuse`
+    /// lists: host-network and namespace-less routes, and output paths every
+    /// trial would share.
     pub fn refuse_outputs_trials_overwrite(&self) -> anyhow::Result<()> {
         let trial = RunData::get_raw_runopts(self);
         // A recording runs on the host network (`RunOpts::validate_args`), so
@@ -743,6 +745,26 @@ impl AnalyzeOpts {
                      --record-networking`, then pass the trace to the trials with \
                      --replay-networking.",
                     path.display()
+                )),
+            );
+        }
+        let refused = trial.options_trials_refuse();
+        if !refused.is_empty() {
+            return Err(
+                anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                    "`hermit analyze` and `hermit bisect` refuse {} in the run arguments: {}. \
+                     Remove {} from the run arguments.",
+                    refused
+                        .iter()
+                        .map(|(option, _)| *option)
+                        .collect::<Vec<_>>()
+                        .join(" and "),
+                    refused
+                        .iter()
+                        .map(|(option, reason)| format!("with {option}, {reason}"))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                    if refused.len() == 1 { "it" } else { "them" },
                 )),
             );
         }
@@ -1157,6 +1179,48 @@ mod tests {
                 && message.contains("--replay-networking"),
             "{message}"
         );
+        // Host-network and namespace-less routes, and output paths every
+        // trial would share (`RunOpts::options_trials_refuse`).
+        for (run_arg, named) in [
+            ("--network=host", "--network=host"),
+            ("--no-namespace", "--no-namespace"),
+            ("--gdbserver", "--gdbserver"),
+            (
+                "--record-preemptions-to=requested.preempts",
+                "--record-preemptions-to",
+            ),
+            (
+                "--stacktrace-event=5,requested.stack",
+                "--stacktrace-event with a path",
+            ),
+            (
+                "--preemption-stacktrace-log-file=requested.log",
+                "--preemption-stacktrace-log-file",
+            ),
+        ] {
+            let error = options(&[run_arg])
+                .refuse_outputs_trials_overwrite()
+                .expect_err("an option the trials cannot take");
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{run_arg}: {error:#}"
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!("refuse {named} in the run arguments"))
+                    && message.contains(&format!("with {named}, ")),
+                "{run_arg}: {message}"
+            );
+        }
+        // A stack-trace event without a path prints to stderr, and local
+        // networking is the default: both stay admitted.
+        for admitted in ["--stacktrace-event=5", "--network=local"] {
+            options(&[admitted])
+                .refuse_outputs_trials_overwrite()
+                .unwrap_or_else(|error| panic!("{admitted}: {error:#}"));
+        }
     }
 
     /// rel-041's review of https://github.com/rrnewton/hermit/pull/3836:
@@ -1233,6 +1297,36 @@ mod tests {
                 None,
                 "--record-networking=requested.trace",
                 "refuse --record-networking=requested.trace",
+            ),
+            (
+                None,
+                "--network=host",
+                "refuse --network=host in the run arguments",
+            ),
+            (
+                None,
+                "--no-namespace",
+                "refuse --no-namespace in the run arguments",
+            ),
+            (
+                None,
+                "--gdbserver",
+                "refuse --gdbserver in the run arguments",
+            ),
+            (
+                None,
+                "--record-preemptions-to=requested.preempts",
+                "refuse --record-preemptions-to in the run arguments",
+            ),
+            (
+                None,
+                "--stacktrace-event=5,requested.stack",
+                "refuse --stacktrace-event with a path in the run arguments",
+            ),
+            (
+                None,
+                "--preemption-stacktrace-log-file=requested.log",
+                "refuse --preemption-stacktrace-log-file in the run arguments",
             ),
         ] {
             let mut argv = vec!["hermit"];
