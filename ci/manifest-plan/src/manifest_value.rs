@@ -167,6 +167,7 @@ test:
         dbt: reason
         kvm: reason
         liteinst: reason
+        in-guest-trap: reason
 "#
         .parse()
         .unwrap();
