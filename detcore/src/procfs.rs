@@ -3047,10 +3047,14 @@ fn sanitize_arch_status(contents: &[u8]) -> Vec<u8> {
     for line in text.split_inclusive('\n') {
         let has_newline = line.ends_with('\n');
         let body = line.strip_suffix('\n').unwrap_or(line);
+        // The kernel prints -1 for a task that has never used AVX-512
+        // (arch/x86/kernel/fpu/xstate.c, avx512_status), so whether a guest
+        // sees -1 or a time depends on whether the host's libraries chose
+        // AVX-512 code. Both become 0, the same on every host.
         let elapsed = body
             .strip_prefix("AVX512_elapsed_ms:")
             .map(str::trim)
-            .and_then(|value| value.parse::<u64>().ok());
+            .filter(|value| *value == "-1" || value.parse::<u64>().is_ok());
         if elapsed.is_some() {
             normalized.extend_from_slice(b"AVX512_elapsed_ms:\t0");
         } else {
@@ -6161,6 +6165,16 @@ x86_Thread_features_locked:\t\n"
         assert_eq!(
             sanitize_arch_status(b"AVX512_elapsed_ms:\tunknown\n"),
             b"AVX512_elapsed_ms:\tunknown\n"
+        );
+        // A task that never used AVX-512 reads -1; it becomes 0 too.
+        assert_eq!(
+            sanitize_arch_status(b"AVX512_elapsed_ms:\t-1\n"),
+            b"AVX512_elapsed_ms:\t0\n"
+        );
+        // Any other negative value is not the kernel's format: left alone.
+        assert_eq!(
+            sanitize_arch_status(b"AVX512_elapsed_ms:\t-2\n"),
+            b"AVX512_elapsed_ms:\t-2\n"
         );
     }
 
