@@ -1488,7 +1488,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The two effective exit-signal tests of
     // https://github.com/rrnewton/hermit/issues/3895 retain all 1168: 1170,
     // listed with this node's arguments.
-    ("test.detcore_unit", 1170),
+    // scheduler::test::a_guest_signal_to_an_rt_sigsuspend_sleeper_arms_the_release_barrier
+    // retains all 1168: 1169, listed with this node's arguments.
+    ("test.detcore_unit", 1171),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2125,7 +2127,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the three happens-before parked-thread scheduler tests: 1167.
     // And the rt_sigsuspend scratch-alias test: 1157, listed.
     // And the two effective exit-signal tests: 1170, listed.
-    ("test.detcore_unit_on_host", 1170),
+    // And the rt_sigsuspend cross-task signal test: 1169, listed.
+    ("test.detcore_unit_on_host", 1171),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

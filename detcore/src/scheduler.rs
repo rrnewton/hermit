@@ -4779,7 +4779,8 @@ impl Scheduler {
 
     /// Record an unambiguous cross-task signal that was physically queued while
     /// its target was parked in waitid, restartable internal IO polling, or a
-    /// precise-mode futex wait. The
+    /// precise-mode futex wait, or slept in a real `rt_sigsuspend` or waited
+    /// for its grant (`in_rt_sigsuspend`). The
     /// request rewrite is deferred to step2 so an asynchronous backend cannot
     /// mutate beneath a tentative selection. A futex waiter is admitted on its mask
     /// alone; the drain, the commit point, decides on the dispositions.
@@ -4789,12 +4790,32 @@ impl Scheduler {
             || self
                 .parked_futex_unblocked_signals(dettid)
                 .is_some_and(|signals| signals & kernel_signal_bit(signal.raw()) != 0)
+            || self.in_rt_sigsuspend(dettid)
         {
             let signals = self.pending_cross_task_signals.entry(dettid).or_default();
             if !signals.contains(&signal) {
                 signals.push(signal);
             }
         }
+    }
+
+    /// Whether `dettid` sleeps in a real `rt_sigsuspend` outside the run queue
+    /// (`rt_sigsuspend_blockers`), or waits for the grant of that call's
+    /// request, where a signal sent now still reaches the call
+    /// (`BlockedPool::signaled_sigsuspend_requests`).
+    fn in_rt_sigsuspend(&self, dettid: DetTid) -> bool {
+        self.blocked.rt_sigsuspend_blockers.contains_key(&dettid)
+            || self
+                .next_turns
+                .get(&dettid)
+                .and_then(|turn| turn.req.try_read())
+                .and_then(Result::ok)
+                .is_some_and(|request| {
+                    request
+                        .resources
+                        .keys()
+                        .any(|rid| matches!(rid, ResourceID::BlockingRtSigsuspend(_)))
+                })
     }
 
     // Force a thread out blocking and into the runnable state, replacing its resource request.
@@ -6757,6 +6778,23 @@ impl Scheduler {
     fn drain_pending_cross_task_signals(&mut self) {
         let pending = std::mem::take(&mut self.pending_cross_task_signals);
         for (dettid, mut signals) in pending {
+            if self.in_rt_sigsuspend(dettid) {
+                // A guest's signal reached a thread asleep in a real
+                // `rt_sigsuspend`, or stopped at that call's request, at host
+                // speed. Linux wakes the call if its mask lets the signal
+                // through, and the wake's signal stop is posted when the host
+                // gets to it. Placing it here, at this fixed point, as for a
+                // signal the scheduler sends (`wake_signaled_guest`: the release
+                // barrier, or the record its grant arms), makes the scheduler
+                // wait for that stop. Before, nothing did, and on a slow host
+                // an empty run queue was reported as a deadlock first.
+                signals.sort_by_key(SigWrapper::raw);
+                signals.dedup();
+                for signal in signals.iter().filter_map(SigWrapper::signal) {
+                    self.wake_signaled_guest(dettid, signal);
+                }
+                continue;
+            }
             match self.waitid_signal_request(dettid) {
                 Some(WaitidSignalRequest::Parked) => {
                     // This legacy wake completes the child-wait resource and
@@ -10254,6 +10292,51 @@ mod test {
             assert_eq!(scheduler.blocked.sigchld_ready.contains(&creator), armed);
             assert!(scheduler.blocked.signaled_sigsuspend_requests.is_empty());
         }
+    }
+
+    /// A guest's signal to a thread asleep in a real `rt_sigsuspend`
+    /// (`kill`, `tgkill` and `tkill` report it with `notify_signal_pending`)
+    /// is placed at the next drain as a signal the scheduler sends is: the
+    /// thread is armed for the release barrier when its sleeping mask lets the
+    /// signal through, and not when it blocks it; a thread still stopped at
+    /// its `rt_sigsuspend` request gets the record its grant arms. Before, such
+    /// a signal was not recorded at all, the scheduler did not wait for the
+    /// wake's signal stop, and on a slow host it reported a deadlock first.
+    #[test]
+    fn a_guest_signal_to_an_rt_sigsuspend_sleeper_arms_the_release_barrier() {
+        let usr1 = SigWrapper::from(Signal::SIGUSR1);
+        for (sleeping_mask, armed) in [(0, true), (kernel_signal_bit(libc::SIGUSR1), false)] {
+            let (mut scheduler, _parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+            commit_out_of_scheduler_call(
+                &mut scheduler,
+                creator,
+                ResourceID::BlockingRtSigsuspend(ExternalOpId::new(creator, 5)),
+                Some(sleeping_mask),
+            );
+            scheduler.notify_signal_pending(creator, usr1);
+            scheduler.drain_pending_cross_task_signals();
+            assert_eq!(
+                scheduler.blocked.signaled_background.contains(&creator),
+                armed,
+                "sleeping mask {sleeping_mask:#x}"
+            );
+        }
+
+        let (mut scheduler, _parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+        let mut request = Resources::new(creator);
+        request.insert(
+            ResourceID::BlockingRtSigsuspend(ExternalOpId::new(creator, 6)),
+            Permission::RW,
+        );
+        request.blocked_signal_mask = Some(0);
+        scheduler.next_turns.get_mut(&creator).unwrap().req = Ivar::full(Ok(request));
+        scheduler.runqueue_push_back(creator);
+        scheduler.notify_signal_pending(creator, usr1);
+        scheduler.drain_pending_cross_task_signals();
+        assert_eq!(
+            scheduler.blocked.signaled_sigsuspend_requests.get(&creator),
+            Some(&Signal::SIGUSR1)
+        );
     }
 
     /// A scheduler that does not model signal targets (`models_signal_targets`)
