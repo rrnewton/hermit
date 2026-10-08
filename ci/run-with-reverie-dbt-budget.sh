@@ -1174,7 +1174,15 @@ fi
 # Cargo.toml, third-party or rust-toolchain.toml changes, so the four budget
 # inputs are unchanged. Carry, not recalibration: no new timing sample or
 # >=5-sample replacement claim is made.
-expected_pin=762fa7cf2e861552811878c2ac11c0dbdaa940f1
+# CARRY TO 5a05e039fd71b64f8108667b589cbf22ebb3ea97 (2026-10-08): from
+# 762fa7cf2e861552811878c2ac11c0dbdaa940f1. The two commits change reverie-liteinst (getters
+# for the site-patching and statistics settings the runtime captured) and
+# experimental/reverie-sabre's vendored SaBRe loader (RDTSC entry points routed
+# through the plugin boundary, as syscalls already were); no file under
+# reverie-dbt, the root Cargo.toml, third-party or rust-toolchain.toml
+# changes, so the four budget inputs are unchanged. Carry, not recalibration:
+# no new timing sample or >=5-sample replacement claim is made.
+expected_pin=5a05e039fd71b64f8108667b589cbf22ebb3ea97
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
