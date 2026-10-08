@@ -5472,6 +5472,13 @@ impl RunOpts {
         Ok(())
     }
 
+    /// The trace `--record-networking` names, as given. `hermit analyze` and
+    /// `hermit bisect` refuse it in their run arguments
+    /// (`AnalyzeOpts::refuse_outputs_trials_overwrite`).
+    pub(crate) fn record_networking_trace(&self) -> Option<&Path> {
+        self.record_networking.as_deref()
+    }
+
     /// The trace `--replay-networking` names, as given. `hermit analyze` and
     /// `hermit bisect` reconcile its epoch before their trials start
     /// (`AnalyzeOpts::adopt_recorded_epoch`).

@@ -725,9 +725,27 @@ impl AnalyzeOpts {
     /// arguments, before any workspace, schedule read or trial exists. Every
     /// trial writes its configuration and summary into the workspace under
     /// its own name (`RunData::new` replaces both paths), so the requested
-    /// files would never be written.
+    /// files would never be written. `--record-networking` is refused too:
+    /// it would put every trial on the host network and have every trial
+    /// write the same trace.
     pub fn refuse_outputs_trials_overwrite(&self) -> anyhow::Result<()> {
         let trial = RunData::get_raw_runopts(self);
+        // A recording runs on the host network (`RunOpts::validate_args`), so
+        // the trials would stop being reproducible, and every trial would
+        // write the same trace path.
+        if let Some(path) = trial.record_networking_trace() {
+            return Err(
+                anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                    "`hermit analyze` and `hermit bisect` refuse --record-networking={} in the \
+                     run arguments: it puts every trial on the host network, so the trials \
+                     are no longer reproducible, and every trial writes that same trace, so \
+                     only the last one would remain. Record the network once with `hermit run \
+                     --record-networking`, then pass the trace to the trials with \
+                     --replay-networking.",
+                    path.display()
+                )),
+            );
+        }
         let overwritten: Vec<&str> = [
             (trial.save_config.is_some(), "--save-config"),
             (trial.summary_json.is_some(), "--summary-json"),
@@ -1122,6 +1140,23 @@ mod tests {
             let path = path.as_ref().expect("the trial writes it");
             assert!(path.starts_with(workspace.path()), "{}", path.display());
         }
+        // A network recording would put every trial on the host network.
+        let error = options(&["--record-networking=requested.trace"])
+            .refuse_outputs_trials_overwrite()
+            .expect_err("a network recording");
+        assert!(
+            error
+                .downcast_ref::<crate::container::PolicyRefusal>()
+                .is_some(),
+            "{error:#}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("refuse --record-networking=requested.trace")
+                && message.contains("host network")
+                && message.contains("--replay-networking"),
+            "{message}"
+        );
     }
 
     /// rel-041's review of https://github.com/rrnewton/hermit/pull/3836:
@@ -1193,6 +1228,11 @@ mod tests {
                 Some("--backend=kvm"),
                 "--timeout=3",
                 "--timeout is not qualified",
+            ),
+            (
+                None,
+                "--record-networking=requested.trace",
+                "refuse --record-networking=requested.trace",
             ),
         ] {
             let mut argv = vec!["hermit"];

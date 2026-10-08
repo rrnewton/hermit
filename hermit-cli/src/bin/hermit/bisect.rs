@@ -245,6 +245,10 @@ mod tests {
             (&["--verify"][..], "--verify"),
             (&["--save-config=requested.config"][..], "--save-config"),
             (&["--summary-json=requested.summary"][..], "--summary-json"),
+            (
+                &["--record-networking=requested.trace"][..],
+                "refuse --record-networking=requested.trace",
+            ),
         ] {
             let error = bisect(run_args);
             assert!(
