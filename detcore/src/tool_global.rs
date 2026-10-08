@@ -7976,6 +7976,11 @@ mod tests {
         let tool = Detcore::new(reverie::Pid::from_raw(leader.as_raw()), &config);
         let mut thread = tool.init_thread_state(Tid::from_raw(leader.as_raw()), None);
         thread.detpid = Some(detpid);
+        // The exec's own syscall, intercepted and counted, as a backend that
+        // traces the guest counts it before post-exec. (A backend that starts
+        // the guest already executing reaches its first post-exec with nothing
+        // counted, and post-exec charges the execve itself.)
+        thread.stats.count_syscall();
         thread.thread_logical_time.add_syscall_with_cost(137);
         let mut guest = ExternalRegistrationGuest {
             global: &state,
