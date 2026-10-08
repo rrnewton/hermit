@@ -2064,7 +2064,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run_dbt_numbers_syscalls_like_ptrace_from_the_initial_execve retains all
     // 234: 235 (cargo nextest list with this node's arguments). It starts no
     // LiteInst guest, so test.cli_on_host selects it too.
-    ("test.cli", 246),
+    // happens_before_unusable_spec_is_a_named_policy_refusal
+    // (https://github.com/rrnewton/hermit/issues/3943) retains all 246: 247.
+    ("test.cli", 247),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2254,7 +2256,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The four in-guest-trap cli tests start in-guest LiteInst guests, so they
     // join the exact-name filterset: 187 + 4 - 4 = 187.
     // And the DBT syscall-numbering test: 188.
-    ("test.cli_on_host", 195),
+    // The happens-before unusable-spec refusal test starts no LiteInst guest: 196.
+    ("test.cli_on_host", 196),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 55),
