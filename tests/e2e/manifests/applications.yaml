@@ -52,6 +52,7 @@ test:
         backends_disabled:
           sabre: SaBRe does not yet determinize busy-wait polling on virtual wall-clock advancement; main validation has observed verify failure under load
           liteinst: LiteInst application coverage is owned by backend compatibility
+          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       replay:
         ci: false
         backends_enabled: []
@@ -61,6 +62,7 @@ test:
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       chaos:
         ci: false
         backends_enabled: []
@@ -70,6 +72,7 @@ test:
           kvm: Chaos scheduling is unsupported by KVM
           sabre: Chaos scheduling is unsupported by SaBRe
           liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       custom:
         ci: false
         backends_enabled: []
@@ -79,6 +82,7 @@ test:
           kvm: No edge-case Hermit arguments are required
           sabre: No edge-case Hermit arguments are required
           liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
   - id: applications/example-timed-progress-bar
     description: The user-facing timed progress example repeats deterministically under each applicable backend
     lane: portable
@@ -114,6 +118,7 @@ test:
         backends_disabled:
           sabre: SaBRe does not yet determinize busy-wait polling on virtual wall-clock advancement; keep the identical example workload unqualified
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
+          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
           ptrace: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit", "result": "infrastructure-error"}
           kvm: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit", "result": "infrastructure-error"}
@@ -130,6 +135,7 @@ test:
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       chaos:
         ci: false
         backends_enabled: []
@@ -139,6 +145,7 @@ test:
           kvm: Chaos scheduling is unsupported by KVM
           sabre: Chaos scheduling is unsupported by SaBRe
           liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       custom:
         ci: false
         backends_enabled: []
@@ -148,6 +155,7 @@ test:
           kvm: No edge-case Hermit arguments are required
           sabre: No edge-case Hermit arguments are required
           liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
   - id: applications/kvm-python-examples
     description: User-facing Python examples run identically with the system interpreter under KVM
     lane: privileged
@@ -185,6 +193,7 @@ test:
           dbt: This test specifically asserts the KVM execution path
           sabre: This test specifically asserts the KVM execution path
           liteinst: This test specifically asserts the KVM execution path
+          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
           kvm:
             result: determinism-failure
@@ -199,6 +208,7 @@ test:
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       chaos:
         ci: false
         backends_enabled: []
@@ -208,6 +218,7 @@ test:
           kvm: Chaos scheduling is unsupported by KVM
           sabre: Chaos scheduling is unsupported by SaBRe
           liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       custom:
         ci: false
         backends_enabled: []
@@ -217,6 +228,7 @@ test:
           kvm: No edge-case Hermit arguments are required
           sabre: No edge-case Hermit arguments are required
           liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
   - id: applications/kvm-shell-environment
     description: KVM executes a shell workload with a deterministic environment
     lane: privileged
@@ -246,6 +258,7 @@ test:
           dbt: This test specifically asserts the KVM execution path
           sabre: This test specifically asserts the KVM execution path
           liteinst: This test specifically asserts the KVM execution path
+          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       replay:
         ci: false
         backends_enabled: []
@@ -255,6 +268,7 @@ test:
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       chaos:
         ci: false
         backends_enabled: []
@@ -264,6 +278,7 @@ test:
           kvm: Chaos scheduling is unsupported by KVM
           sabre: Chaos scheduling is unsupported by SaBRe
           liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       custom:
         ci: false
         backends_enabled: []
@@ -273,6 +288,7 @@ test:
           kvm: No edge-case Hermit arguments are required
           sabre: No edge-case Hermit arguments are required
           liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
   - id: applications/c-toolchain-workflow
     description: Compile two C translation units, archive one, link them, and execute the result
     lane: portable
@@ -305,6 +321,7 @@ test:
           dbt: Establish the shared C toolchain transaction on the ptrace reference path before backend ratchets
           sabre: SaBRe multi-exec toolchain qualification must ratchet after the ptrace reference path
           liteinst: LiteInst multi-exec toolchain qualification must ratchet after the ptrace reference path
+          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       replay:
         ci: false
         backends_enabled: []
@@ -314,6 +331,7 @@ test:
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       chaos:
         ci: false
         backends_enabled: []
@@ -323,6 +341,7 @@ test:
           kvm: Chaos scheduling is unsupported by KVM
           sabre: Chaos scheduling is unsupported by SaBRe
           liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       custom:
         ci: false
         backends_enabled: []
@@ -332,6 +351,7 @@ test:
           kvm: No edge-case Hermit arguments are required
           sabre: No edge-case Hermit arguments are required
           liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
   - id: applications/git-repository-workflow
     description: Create two Git commits, verify the repository, and archive the resulting tree
     lane: portable
@@ -363,6 +383,7 @@ test:
           dbt: Establish the shared Git transaction on the ptrace reference path before backend ratchets
           sabre: SaBRe multi-exec Git qualification must ratchet after the ptrace reference path
           liteinst: LiteInst multi-exec Git qualification must ratchet after the ptrace reference path
+          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       replay:
         ci: false
         backends_enabled: []
@@ -372,6 +393,7 @@ test:
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       chaos:
         ci: false
         backends_enabled: []
@@ -381,6 +403,7 @@ test:
           kvm: Chaos scheduling is unsupported by KVM
           sabre: Chaos scheduling is unsupported by SaBRe
           liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       custom:
         ci: false
         backends_enabled: []
@@ -390,3 +413,4 @@ test:
           kvm: The Git transaction is not qualified on KVM
           sabre: The Git transaction is not qualified on SaBRe
           liteinst: The Git transaction is not qualified on LiteInst
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
