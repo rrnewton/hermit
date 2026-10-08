@@ -84,6 +84,8 @@ use hermit_manifest_plan::stress_series::SeriesOutcome;
 use hermit_manifest_plan::stress_series::SeriesPayload;
 use hermit_manifest_plan::stress_series::SeriesProducer;
 use hermit_manifest_plan::stress_series::SeriesRow;
+use hermit_manifest_plan::stress_series::SeriesRuntime;
+use hermit_manifest_plan::stress_series::SeriesRuntimeMeasurement;
 use hermit_manifest_plan::stress_series::SeriesSchema;
 use hermit_manifest_plan::stress_series::SourceDepth;
 use serde::Deserialize;
@@ -15736,6 +15738,19 @@ fn series_evidence(row: &SeriesRow, id: &CellId) -> Option<SeriesEvidence> {
     let result = match (row.series.outcome, id.mode.as_str()) {
         (SeriesOutcome::Passed, _) => Some(ObservedResult::Pass),
         (SeriesOutcome::Diverged, "replay") => Some(ObservedResult::ReplayFailure),
+        // The earlier schemas' writer labelled every verify that did not
+        // match "diverged", including one that stopped before its second run
+        // (its first run rejected, verify exiting 125 or 127). Such a row
+        // records no second run, and without one nothing was compared.
+        (SeriesOutcome::Diverged, "verify")
+            if !row
+                .series
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.run2.is_some()) =>
+        {
+            None
+        }
         (SeriesOutcome::Diverged, _) => Some(ObservedResult::DeterminismFailure),
         (
             SeriesOutcome::NoResult
@@ -32825,8 +32840,16 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
     let mut ambient_rows = (0..ambient_commits.len())
         .map(|index| legacy_row(index, SeriesOutcome::Passed, None))
         .collect::<Vec<_>>();
+    // Both runs of the divergence ran, so it is a comparison, not a verify
+    // that stopped before its second run.
+    let mut ambient_divergence = legacy_row(ambient_commits.len(), SeriesOutcome::Diverged, None);
+    ambient_divergence.series.runtime = Some(SeriesRuntime {
+        run1: Some(SeriesRuntimeMeasurement::default()),
+        run2: Some(SeriesRuntimeMeasurement::default()),
+        ..SeriesRuntime::default()
+    });
     ambient_rows.extend([
-        legacy_row(ambient_commits.len(), SeriesOutcome::Diverged, None),
+        ambient_divergence,
         legacy_row(
             ambient_commits.len() + 1,
             SeriesOutcome::Passed,
@@ -47867,5 +47890,143 @@ mod series_comparison_tests {
         assert_eq!(parity, parity_summary_without_store(&plain_cells));
         assert_eq!(parity.rows_read, 0);
         assert!(parity.runs.is_empty());
+    }
+}
+
+/// The earlier series schemas labelled every verify that did not match
+/// "diverged", including one that stopped before its second run. Only a
+/// verify that recorded a second run compared anything, so only that one may
+/// count as a determinism failure.
+#[cfg(test)]
+mod legacy_verify_divergence_tests {
+    use super::*;
+
+    /// A published stress-series/v2 row (the ledger's
+    /// series/hermit/devbig014/2026-08.jsonl): a verify labelled "diverged"
+    /// whose runtime records only its first run. Its retained verify report
+    /// says `no_result`: the first run was rejected and verify exited 125.
+    const PUBLISHED_ROW: &str = r#"{"emitted_at": "2026-08-29T19:17:06Z", "event_id": "series-fcbc1a0d35a78e285a64923021267f203c24507b5c78d593c53f266d3f8e2d07", "event_type": "series.observation", "host": "devbig014", "producer": "validate", "run_id": "validate-mega-lander-f2be3d81c9cb-1788029440105392158-943353-05df4e6f", "schema": "stress-series/v2", "series": {"cell": "c-programs/pidfd-poll-self/verify/ptrace", "depth": {"hermit": {"commits": 2501, "first_parent": 2426}, "reverie": {"commits": 1000, "first_parent": 985}}, "host_capabilities": {"cpuid-faulting": {"evidence": "arch_prctl(ARCH_SET_CPUID, 0) = 0; /proc/cpuinfo advertises cpuid_fault", "present": true}, "kvm": {"evidence": "open(/dev/kvm, O_RDWR) = ok; /proc/cpuinfo advertises vmx or svm", "present": true}}, "kernel_version": "7.1.3-0_fbk0_rc18_0_gd373cd4b8dbf", "machine_shortname": "devbig014", "main_ancestry": true, "num_runs": 1, "outcome": "diverged", "run_index": 1, "runtime": {"run1": {"scheduler_turns": 3, "syscalls": 3, "virtual_nanoseconds": 2012500}, "wall_time_max_ms": 1127, "wall_time_min_ms": 1127}, "source_tree_dirty": false, "tree": "f2be3d81c9cb609443bd34c4611683e2bfccf728"}, "team": "hermit"}"#;
+
+    fn published_row() -> JsonValue {
+        serde_json::from_str(PUBLISHED_ROW).unwrap()
+    }
+
+    /// A verify of the same cell at another commit whose two runs matched, as
+    /// every published cell also has; a projection in which every row was
+    /// skipped is not written at all.
+    fn passed_row(cell: &str) -> JsonValue {
+        let mut row = published_row();
+        row["event_id"] = "series-fixture-passed".into();
+        row["run_id"] = "fixture-passed-run".into();
+        row["series"]["cell"] = cell.into();
+        row["series"]["outcome"] = "passed".into();
+        row["series"]["tree"] = "1".repeat(40).into();
+        row["series"]["runtime"]["run2"] = row["series"]["runtime"]["run1"].clone();
+        row
+    }
+
+    /// Project `row` and a passed row of its cell onto a manifest holding
+    /// only that cell, in `mode`.
+    fn project(mode: &str, row: JsonValue) -> (TrackedCell, ProjectObservationsOutcome) {
+        let passed = passed_row(row["series"]["cell"].as_str().unwrap());
+        let rows = [row, passed].map(|row| {
+            serde_json::from_value::<SeriesRow>(row).expect("a published row shape")
+        });
+        let mut tracked = TrackedCells {
+            schema: SCHEMA,
+            projection: None,
+            cells: vec![TrackedCell {
+                id: CellId {
+                    lane: "portable".into(),
+                    category: "c-programs".into(),
+                    test: "c-programs/pidfd-poll-self".into(),
+                    mode: mode.into(),
+                    backend: "ptrace".into(),
+                },
+                status: CellStatus::Green,
+                ci_disabled_reason: None,
+                not_applicable_reason: None,
+                last_tested: None,
+                observations: Vec::new(),
+                measurement: MeasurementState::NeverMeasured,
+                green_removal_reason: None,
+            }],
+        };
+        let outcome = apply_series_rows(
+            Path::new("/absent-host-results"),
+            &mut tracked,
+            &rows,
+            None,
+        )
+        .expect("the row projects");
+        refresh_measurement(&mut tracked);
+        (tracked.cells.remove(0), outcome)
+    }
+
+    fn assert_no_comparison(cell: &TrackedCell, outcome: &ProjectObservationsOutcome) {
+        assert_eq!(outcome.skipped.len(), 1, "{:?}", outcome.skipped);
+        assert!(
+            outcome.skipped[0].contains("series-fcbc1a0d")
+                && outcome.skipped[0].contains("produced no comparison"),
+            "{:?}",
+            outcome.skipped
+        );
+        assert_eq!(cell.observations.len(), 1, "{:?}", cell.observations);
+        assert_eq!(
+            cell.observations[0].results,
+            BTreeSet::from([ObservedResult::Pass])
+        );
+        assert_eq!(cell.measurement, MeasurementState::MeasuredAndPassed);
+    }
+
+    #[test]
+    fn a_verify_that_recorded_no_second_run_compared_nothing() {
+        let (cell, outcome) = project("verify", published_row());
+        assert_no_comparison(&cell, &outcome);
+    }
+
+    #[test]
+    fn a_verify_that_recorded_no_runtime_compared_nothing() {
+        let mut row = published_row();
+        row["series"].as_object_mut().unwrap().remove("runtime");
+        let (cell, outcome) = project("verify", row);
+        assert_no_comparison(&cell, &outcome);
+    }
+
+    #[test]
+    fn the_same_verify_with_a_second_run_is_a_determinism_failure() {
+        let mut row = published_row();
+        row["series"]["runtime"]["run2"] = row["series"]["runtime"]["run1"].clone();
+        let (cell, outcome) = project("verify", row);
+        assert!(outcome.skipped.is_empty(), "{:?}", outcome.skipped);
+        let results = cell
+            .observations
+            .iter()
+            .map(|observation| observation.results.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 2, "{results:?}");
+        assert!(
+            results.contains(&BTreeSet::from([ObservedResult::DeterminismFailure])),
+            "{results:?}"
+        );
+        assert_eq!(cell.measurement, MeasurementState::DivergedUnlocated);
+    }
+
+    #[test]
+    fn a_replay_divergence_needs_no_runtime() {
+        let mut row = published_row();
+        row["series"]["cell"] = "c-programs/pidfd-poll-self/replay/ptrace".into();
+        row["series"].as_object_mut().unwrap().remove("runtime");
+        let (cell, outcome) = project("replay", row);
+        assert!(outcome.skipped.is_empty(), "{:?}", outcome.skipped);
+        assert!(
+            cell.observations
+                .iter()
+                .any(|observation| observation.results
+                    == BTreeSet::from([ObservedResult::ReplayFailure])),
+            "{:?}",
+            cell.observations
+        );
+        assert_eq!(cell.measurement, MeasurementState::DivergedUnlocated);
     }
 }
