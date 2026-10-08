@@ -869,9 +869,13 @@ pub struct RunOpts {
     /// debug info. The scheduler enforces anchors that name "the thread's Nth
     /// syscall" and anchors that name a syscall, optionally on one file
     /// descriptor ({"syscall": "writev", "fd": 9, "nth": 3}); a syscall anchor
-    /// that never fires ends the run with HERMIT_HB_ANCHOR_NEVER_FIRED. Combine
-    /// with `--hb-list-events` to preview how the spec resolves against the
-    /// binary.
+    /// that never fires ends the run with HERMIT_HB_ANCHOR_NEVER_FIRED. Both
+    /// kinds are enforced only when the guest runs under the ptrace runtime
+    /// (the default, or `--backend=e9patch`): with `--namespace-only` or
+    /// another backend, the run is refused before the guest starts (exit 122)
+    /// rather than run with the ordering ignored. A spec that does not load is
+    /// refused the same way. Combine with `--hb-list-events` to preview how the
+    /// spec resolves against the binary.
     #[clap(long, value_name = "filepath")]
     happens_before: Option<PathBuf>,
 
@@ -2008,6 +2012,101 @@ fn run_opts_for(argv: &[&str]) -> RunOpts {
     };
     run.backend = args.global.backend;
     *run
+}
+
+/// The launch-time happens-before refusal keys on the runtime backend:
+/// `--backend=e9patch` rewrites the program and runs it under ptrace, which
+/// enforces count and syscall-occurrence anchors, so neither is refused there.
+/// An in-guest backend never receives the program, so both are refused.
+#[test]
+fn happens_before_refusal_accepts_e9patch_and_refuses_in_guest_backends() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = dir.path().join("spec.json");
+    let spec_arg = spec.to_str().unwrap();
+    for (name, json) in [
+        (
+            "count",
+            r#"{"version": 1, "events": {"c": {"thread": "3", "syscalls": 5}}}"#,
+        ),
+        (
+            "occurrence",
+            r#"{"version": 1, "events": {"w": {"thread": "3", "syscall": "write", "fd": 1}}}"#,
+        ),
+    ] {
+        std::fs::write(&spec, json).unwrap();
+        let check = |backend: Option<&str>| {
+            let mut argv = vec!["hermit"];
+            if let Some(backend) = backend {
+                argv.extend(["--backend", backend]);
+            }
+            argv.extend(["run", "--happens-before", spec_arg, "fakeprog"]);
+            run_opts_for(&argv).refuse_unenforceable_happens_before()
+        };
+        for backend in [None, Some("ptrace"), Some("e9patch")] {
+            if let Err(error) = check(backend) {
+                panic!("{name} anchor refused under {backend:?}: {error:#}");
+            }
+        }
+        for backend in ["sabre", "kvm", "dbt", "liteinst", "in-guest-trap"] {
+            let error = check(Some(backend)).expect_err(backend);
+            assert!(
+                error
+                    .downcast_ref::<super::container::PolicyRefusal>()
+                    .is_some()
+                    && format!("{error:#}").contains("enforced only on the ptrace backend"),
+                "{name} anchor under {backend}: {error:#}"
+            );
+        }
+    }
+}
+
+/// A spec the user must fix is a policy refusal; a failure to read it that is
+/// not the user's (here `EIO`, from reading `/proc/self/mem` at address 0) is
+/// not.
+#[test]
+fn happens_before_spec_load_errors_are_refusals_except_host_read_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let nth_zero = dir.path().join("nth0.json");
+    std::fs::write(
+        &nth_zero,
+        r#"{"version": 1, "events": {"z": {"thread": "3", "syscall": "write", "nth": 0}}}"#,
+    )
+    .unwrap();
+    let not_json = dir.path().join("bad.json");
+    std::fs::write(&not_json, "{").unwrap();
+    let not_utf8 = dir.path().join("latin1.json");
+    std::fs::write(&not_utf8, b"\xff").unwrap();
+    for path in [
+        nth_zero,
+        not_json,
+        not_utf8,
+        dir.path().join("missing.json"),
+        dir.path().to_path_buf(),
+    ] {
+        let error = RunOpts::load_happens_before_spec(&path).expect_err("must not load");
+        assert!(
+            error
+                .downcast_ref::<super::container::PolicyRefusal>()
+                .is_some(),
+            "{}: {error:#}",
+            path.display()
+        );
+    }
+    let error = RunOpts::load_happens_before_spec(Path::new("/proc/self/mem"))
+        .expect_err("reading /proc/self/mem at address 0 fails");
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error),
+        Some(libc::EIO),
+        "{error:#}"
+    );
+    assert!(
+        error
+            .downcast_ref::<super::container::PolicyRefusal>()
+            .is_none(),
+        "{error:#}"
+    );
 }
 
 #[cfg(test)]
@@ -6124,7 +6223,7 @@ impl RunOpts {
             .happens_before
             .as_ref()
             .expect("load_and_resolve_happens_before requires --happens-before");
-        let mut program = load_program(spec_path)?;
+        let mut program = Self::load_happens_before_spec(spec_path)?;
 
         let (_, host) = self.resolve_guest_and_host_program()?;
         match DebugInfoResolver::open(&host) {
@@ -6166,11 +6265,39 @@ impl RunOpts {
         Ok(program)
     }
 
-    /// Refuse a `--happens-before` spec this launch cannot enforce
+    /// Load a `--happens-before` spec for a run or for `--hb-list-events`.
+    ///
+    /// A spec that is missing, unreadable for permission, a directory, not UTF-8,
+    /// not valid JSON or not a valid program (`nth: 0`, `fd` on the wrong syscall,
+    /// ...) is the user's to fix: a policy refusal, exit 122
+    /// (https://github.com/rrnewton/hermit/issues/3943). Any other failure to read
+    /// it (`EIO`, ...) is not the user's, and stays a Hermit failure, exit 125.
+    fn load_happens_before_spec(path: &Path) -> Result<HappensBeforeProgram, Error> {
+        load_program(path).map_err(|error| {
+            let host_read_failure = error.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                !matches!(
+                    io.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::IsADirectory
+                        | std::io::ErrorKind::InvalidData
+                )
+            });
+            if host_read_failure {
+                error
+            } else {
+                error.context(super::container::PolicyRefusal)
+            }
+        })
+    }
+
+    /// Refuse a `--happens-before` spec that does not load
+    /// ([`Self::load_happens_before_spec`]) or that this launch cannot enforce
     /// (`refuse_unenforceable_anchors`): a phase other than the prehook, an
-    /// unobservable syscall, or a syscall-occurrence anchor on a launch without
-    /// full ptrace interception. Needs only the spec, not the guest program, so
-    /// it runs before stdin is read or a backend is probed.
+    /// unobservable syscall, or a count or syscall-occurrence anchor on a launch
+    /// whose runtime is not ptrace (`--backend=e9patch` runs under ptrace and is
+    /// enforced). Needs only the spec, not the guest program, so it runs before
+    /// stdin is read or a backend is probed.
     fn refuse_unenforceable_happens_before(&self) -> Result<(), Error> {
         let Some(path) = self.happens_before.as_deref() else {
             return Ok(());
@@ -6178,19 +6305,16 @@ impl RunOpts {
         if self.hb_list_events {
             return Ok(());
         }
-        let backend = self.selected_backend();
-        // A spec that does not load (bad JSON, `nth: 0`, `fd` on the wrong
-        // syscall, ...) is the user's to fix: a policy refusal (exit 122), not
-        // a Hermit failure (https://github.com/rrnewton/hermit/issues/3943).
-        let program =
-            load_program(path).map_err(|error| error.context(super::container::PolicyRefusal))?;
-        let backend_name = format!("{:?}", backend);
+        let program = Self::load_happens_before_spec(path)?;
+        let backend_name = format!("{:?}", self.selected_backend());
         refuse_unenforceable_anchors(
             &program,
             path,
             HbLaunch {
                 backend: &backend_name,
-                ptrace: backend == Backend::Ptrace,
+                // e9patch rewrites the program and then runs it under the
+                // ptrace runtime, which receives and enforces the program.
+                ptrace: self.runtime_backend() == Backend::Ptrace,
                 namespace_only: self.namespace_only,
                 passthru_opt: self.det_opts.det_config.passthru_opt,
             },
@@ -6205,7 +6329,7 @@ impl RunOpts {
             .happens_before
             .as_ref()
             .expect("--hb-list-events requires --happens-before");
-        let mut program = load_program(spec_path)?;
+        let mut program = Self::load_happens_before_spec(spec_path)?;
 
         let (_, host) = self.resolve_guest_and_host_program()?;
         let resolver = match DebugInfoResolver::open(&host) {

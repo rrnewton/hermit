@@ -311,8 +311,9 @@ pub fn load_program(path: &Path) -> anyhow::Result<HappensBeforeProgram> {
 pub struct HbLaunch<'a> {
     /// The selected backend's name, for messages.
     pub backend: &'a str,
-    /// True when the backend is ptrace, where Detcore traces the guest from
-    /// outside and receives the happens-before program.
+    /// True when the guest runs under the ptrace runtime, where Detcore traces
+    /// the guest from outside and receives the happens-before program: the
+    /// ptrace backend, or e9patch preprocessing followed by ptrace.
     pub ptrace: bool,
     /// True for `--namespace-only` (alias `--lite`): no interception and no
     /// scheduler at all.
@@ -326,8 +327,8 @@ pub struct HbLaunch<'a> {
 /// - a syscall anchor for the polling or posthook phase (syscall anchors are
 ///   enforced at the prehook of the thread's nth matching call);
 /// - a count or syscall-occurrence anchor when the run bypasses interception
-///   (`--namespace-only`) or uses a backend other than ptrace (in-guest
-///   Detcore never receives the program,
+///   (`--namespace-only`) or runs the guest under a runtime other than ptrace
+///   (in-guest Detcore never receives the program,
 ///   <https://github.com/rrnewton/hermit/issues/3943>);
 /// - a syscall-occurrence anchor with `--passthru-opt` (some syscalls are left
 ///   unintercepted; a count anchor still counts the intercepted ones);
