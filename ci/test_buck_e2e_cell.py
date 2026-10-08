@@ -736,10 +736,13 @@ class ContainerChoiceTest(unittest.TestCase):
         self.assertFalse(dbt & chosen)
         self.assertTrue(any(targets[name]["route"] == "re" for name in dbt))
         # The test's KVM verify cell (enabled 2026-10-08) also runs locally, so it gets the
-        # same pinned-root /test workdir its guest asserts.
+        # same pinned-root /test workdir its guest asserts, and so do its in-guest LiteInst
+        # verify cells (liteinst and in-guest-trap, enabled the same day).
         self.assertEqual(chosen, privileged | {"c-programs-environment-and-workdir-custom-ptrace",
                                                "c-programs-environment-and-workdir-verify-ptrace",
-                                               "c-programs-environment-and-workdir-verify-kvm"})
+                                               "c-programs-environment-and-workdir-verify-kvm",
+                                               "c-programs-environment-and-workdir-verify-liteinst",
+                                               "c-programs-environment-and-workdir-verify-in-guest-trap"})
 
     def test_local(self) -> None:
         chosen = self.containerized(self.check("local"))
