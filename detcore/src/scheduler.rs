@@ -900,12 +900,15 @@ pub struct Scheduler {
     /// Blocking external calls that install no signal mask of their own, as
     /// recorded at their commit (`timer_copy_candidate`).
     own_mask_background_calls: BTreeMap<DetTid, OwnMaskBackgroundCall>,
-    /// For a process and a signal number, the thread that a timer's signal
-    /// was last sent to alone and that the release barrier has not yet
-    /// requeued (`fire_timer_signal`). An entry is meaningful only while that
-    /// thread is in `blocked.signaled_background`, and it is removed whenever
-    /// the thread leaves that set or its pool (`forget_timer_copy_records`).
-    outstanding_timer_copies: BTreeMap<(DetPid, i32), DetTid>,
+    /// For a process and a signal number, the timer's copy of that signal
+    /// sent to one thread alone that the thread has not yet been seen taking
+    /// (`fire_timer_signal`). While it stands, a further expiry of that signal
+    /// in that process is coalesced with it. It ends only when the scheduler
+    /// observes the holder's dequeue at a fixed point of a pass
+    /// (`end_timer_copies_taken_at_delivery_stop`,
+    /// `observe_timer_copy_dequeues`), or when the holder ends
+    /// (`end_timer_copies_of_departed_holder`).
+    outstanding_timer_copies: BTreeMap<(DetPid, i32), TimerCopy>,
     #[cfg(test)]
     host_signal_attempts: u64,
     /// When set, a signal the scheduler would send to a guest thread is
@@ -1741,6 +1744,52 @@ struct OwnMaskBackgroundCall {
     /// committed (`SigPnd | ShdPnd`), read while the thread was still stopped
     /// at its request.
     pending_at_commit: u64,
+}
+
+/// The kind of timer whose expiry a timer's copy of a signal sent to one
+/// thread alone stands for (`TimerCopy`). Linux queues both kinds on the
+/// process; they differ in what an exec does to a signal still pending there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimerCopyKind {
+    /// An `alarm` or `setitimer(ITIMER_REAL)` expiry. Its pending signal
+    /// survives an exec of the process. The other `setitimer` kinds are
+    /// refused with `ENOSYS` (`syscalls/signal.rs`), so they never fire.
+    ProcessAlarm,
+    /// A POSIX timer's expiry. Linux discards a POSIX timer's pending signal
+    /// at exec (`flush_itimer_signals`), together with the timer.
+    PosixTimer,
+}
+
+impl TimerCopyKind {
+    /// The kind of `id`; `None` for a child-exit `SIGCHLD`, which is never
+    /// sent to one thread alone (`dispatch_timed_signal`).
+    fn of(id: timed_waiters::SignalTimerId) -> Option<Self> {
+        match id {
+            timed_waiters::SignalTimerId::Alarm(_) => Some(Self::ProcessAlarm),
+            timed_waiters::SignalTimerId::Posix(..) => Some(Self::PosixTimer),
+            timed_waiters::SignalTimerId::ChildExit { .. } => None,
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            Self::ProcessAlarm => "alarm or ITIMER_REAL",
+            Self::PosixTimer => "POSIX timer",
+        }
+    }
+}
+
+/// A timer's copy of a signal that the scheduler sent to one thread alone
+/// and that the thread has not yet been seen taking
+/// (`Scheduler::outstanding_timer_copies`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TimerCopy {
+    /// The thread the copy was sent to.
+    holder: DetTid,
+    /// The timer the copy stands for.
+    kind: TimerCopyKind,
+    /// The signal sent.
+    signal: Signal,
 }
 
 /// The thread whose `rt_sigsuspend` entry the syscall layer should observe,
@@ -2793,6 +2842,7 @@ impl Scheduler {
         self.deschedule_or_defer(*dtid);
         // Remove from all non-runnable pools:
         self.remove_blocking_entries(dtid);
+        self.end_timer_copies_of_departed_holder(*dtid, "its thread ended");
         self.remove_physical_thread(dtid, mm);
         self.vfork_registration_origins.remove(dtid);
         self.saved_guest_sigmasks.remove(dtid);
@@ -3438,7 +3488,7 @@ impl Scheduler {
         self.blocked.sigchld_ready.remove(dtid);
         self.blocked.signaled_background.remove(dtid);
         self.rt_sigsuspend_entry_holds.remove(dtid);
-        self.forget_timer_copy_records(*dtid);
+        self.forget_timer_copy_candidacy(*dtid);
         self.blocked.child_waiters.remove(dtid);
         self.blocked.physical_child_ready.remove(dtid);
         self.blocked.physical_child_waiters.retain(|_, waiters| {
@@ -3908,7 +3958,18 @@ impl Scheduler {
     /// ends the run with `HERMIT_POLICY_REFUSAL_EXIT`. Dropping the arms instead
     /// would leave the threads for `step2c` to harvest behind runnable siblings:
     /// an admission order that host delivery time decides.
+    ///
+    /// Once the barrier has passed, the pass looks at every thread holding a
+    /// timer's copy of a signal sent to it alone
+    /// (`observe_timer_copy_dequeues`), before any timer can fire.
     fn step2_release_signaled_background(&mut self) -> Result<(), SkipTurn> {
+        self.release_signaled_background()?;
+        self.observe_timer_copy_dequeues();
+        Ok(())
+    }
+
+    /// The barrier of `step2_release_signaled_background`.
+    fn release_signaled_background(&mut self) -> Result<(), SkipTurn> {
         if self.blocked.signaled_background.is_empty() {
             self.signaled_background_since = None;
             return Ok(());
@@ -3921,10 +3982,12 @@ impl Scheduler {
             match self.next_turns.get(&dtid).map(|nt| nt.req.try_read()) {
                 Some(Some(Ok(_))) if in_pool => {}
                 Some(None) if in_pool => unposted.push(dtid),
-                // Left its pool, exited, or unregistered: nothing to order.
+                // Left its pool, exited, or unregistered: nothing to order. A
+                // timer copy it holds keeps its record: leaving the pool is
+                // not taking the signal (`outstanding_timer_copies`).
                 _ => {
                     self.blocked.signaled_background.remove(&dtid);
-                    self.forget_timer_copy_records(dtid);
+                    self.forget_timer_copy_candidacy(dtid);
                 }
             }
         }
@@ -3964,9 +4027,14 @@ impl Scheduler {
                 external.is_some() ^ sigsuspend.is_some(),
                 "ready thread must belong to exactly one blocking pool"
             );
-            // The thread's wake is folded here, so a timer copy it was sent
-            // alone is no longer outstanding (`fire_timer_signal`).
-            self.forget_timer_copy_records(dtid);
+            // A timer copy it was sent alone ends only if this report is its
+            // delivery stop for that signal; a completed call's continuation
+            // reports no dequeue, and the copy is then still queued on it.
+            self.end_timer_copies_taken_at_delivery_stop(
+                dtid,
+                "its delivery stop for the signal, reported from its blocking call",
+            );
+            self.forget_timer_copy_candidacy(dtid);
             self.run_queue.push_eager_io_repoll(dtid);
         }
         Ok(())
@@ -4131,23 +4199,29 @@ impl Scheduler {
     /// sends it, and the kernel coalesces it with a copy already pending on
     /// the process, as on Linux.
     ///
-    /// While a copy sent to one thread alone is outstanding (sent, and the
-    /// release barrier has not yet requeued that thread), a further expiry of
-    /// the same signal in the same process is coalesced here: nothing is sent,
-    /// and an INFO record names the process, the signal, the holder and the
-    /// virtual time. The woken holder takes its copy at a host-timed moment,
-    /// so a second kernel send would be dropped or delivered as host timing
-    /// decides. The window is exactly the holder's stay in
-    /// `blocked.signaled_background`, and the record
-    /// (`outstanding_timer_copies`) is removed wherever the holder leaves that
-    /// set or its pool (`forget_timer_copy_records`): its removal, the
-    /// barrier's requeue, never a host-timed event. Today the schedule cannot
-    /// reach this branch: a pass pops at most one timer before it skips once
-    /// a thread is armed (`step2b_process_timed`), and the barrier that
-    /// requeues the holder runs before the next pop
-    /// (`step2_release_signaled_background`). The branch keeps the rule at
-    /// the send rather than in that ordering. `timer_getoverrun` stays 0:
-    /// overruns are not modeled (`syscalls/time.rs`).
+    /// While a copy sent to one thread alone is outstanding (sent, and its
+    /// holder not yet seen taking it), a further expiry of the same signal in
+    /// the same process is coalesced here: nothing is sent, and an INFO record
+    /// names the process, the signal, the holder and the virtual time. Linux
+    /// queues every expiry on the process, where a standard signal still
+    /// pending absorbs the next one; the copy queued on the holder stands for
+    /// that pending signal, so a second copy sent to another thread would make
+    /// two deliveries where Linux makes one. The record
+    /// (`outstanding_timer_copies`) ends only where the scheduler observes the
+    /// holder's dequeue, at a fixed point of a pass: its delivery stop for the
+    /// signal, read where the release barrier or `step2c` requeues it
+    /// (`end_timer_copies_taken_at_delivery_stop`) or, outside every blocking
+    /// pool, right after the barrier (`observe_timer_copy_dequeues`), which
+    /// also ends it once the signal is off the holder's private queue. A
+    /// holder that ends first takes its record with it
+    /// (`end_timer_copies_of_departed_holder`). These holder states reach this
+    /// branch: woken and not yet requeued (`blocked.signaled_background`;
+    /// step2d can fire then, after an empty pass); requeued on the
+    /// continuation of a call that had already returned, awaiting its grant;
+    /// granted and running; stopped at a delivery stop for another signal, or
+    /// at a request the scheduler put in its place; and in a later blocking
+    /// call, with the signal blocked. `timer_getoverrun` stays 0: overruns
+    /// are not modeled (`syscalls/time.rs`).
     ///
     /// Known differences from Linux:
     /// * The guest sees `si_code` `SI_TKILL` for a signal sent to one thread.
@@ -4165,6 +4239,7 @@ impl Scheduler {
         dpid: DetPid,
         dtid: DetTid,
         sig: Signal,
+        kind: TimerCopyKind,
     ) {
         #[cfg(test)]
         {
@@ -4177,25 +4252,31 @@ impl Scheduler {
             );
             return;
         };
-        let key = (dpid, sig as i32);
-        if let Some(&holder) = self.outstanding_timer_copies.get(&key) {
-            let outstanding = self.blocked.signaled_background.contains(&holder);
-            debug_assert!(
-                outstanding,
-                "a timer copy record outlived its holder's stay in signaled_background"
+        if let Some(copy) = self.outstanding_timer_copies.get(&(dpid, sig as i32)) {
+            info!(
+                "[dpid {}] Timer signal {} expired at {} ns while thread {} has not yet taken the copy sent to it alone; coalesced with that copy, nothing sent.",
+                dpid,
+                sig,
+                deadline.as_nanos(),
+                copy.holder
             );
-            if outstanding {
-                info!(
-                    "[dpid {}] Timer signal {} expired at {} ns while thread {} has not yet taken the copy sent to it alone; coalesced with that copy, nothing sent.",
-                    dpid,
-                    sig,
-                    deadline.as_nanos(),
-                    holder
-                );
-                return;
-            }
-            self.outstanding_timer_copies.remove(&key);
+            return;
         }
+        self.deliver_timer_signal(dpid, preferred, sig, kind);
+    }
+
+    /// Send a timer's signal `sig` of process `dpid`, where no copy of it is
+    /// outstanding: to one thread alone if one will take it before it runs
+    /// any guest instruction (`timer_signal_recipient`, `preferred` first),
+    /// recording the copy (`outstanding_timer_copies`); otherwise to the
+    /// process with `kill(2)`, through `preferred`, as `fire_alarm` sends it.
+    fn deliver_timer_signal(
+        &mut self,
+        dpid: DetPid,
+        preferred: DetTid,
+        sig: Signal,
+        kind: TimerCopyKind,
+    ) {
         match self.timer_signal_recipient(dpid, preferred, sig) {
             Some(recipient) => {
                 info!(
@@ -4206,7 +4287,14 @@ impl Scheduler {
                 // The send armed the recipient for the release barrier
                 // (`arm_signaled_background`) unless it had already exited.
                 if self.blocked.signaled_background.contains(&recipient) {
-                    self.outstanding_timer_copies.insert(key, recipient);
+                    self.outstanding_timer_copies.insert(
+                        (dpid, sig as i32),
+                        TimerCopy {
+                            holder: recipient,
+                            kind,
+                            signal: sig,
+                        },
+                    );
                 }
             }
             None => {
@@ -4352,16 +4440,146 @@ impl Scheduler {
         confirmed_sleep || own_mask_call
     }
 
-    /// Drop what lets a timer's signal be sent to `thread` alone, and any copy
-    /// outstanding for it (`timer_copy_candidate`, `fire_timer_signal`).
-    /// Called wherever the thread leaves its blocking pool or
-    /// `blocked.signaled_background`: its removal, the release barrier, and
-    /// `step2c`'s requeue.
-    fn forget_timer_copy_records(&mut self, thread: DetTid) {
+    /// Drop what lets a timer's signal be sent to `thread` alone
+    /// (`timer_copy_candidate`). Called wherever the thread leaves its blocking
+    /// pool or `blocked.signaled_background`: its removal, the release
+    /// barrier, and `step2c`'s requeue. A copy the thread already holds keeps
+    /// its record (`outstanding_timer_copies`): leaving a pool is not taking
+    /// the signal.
+    fn forget_timer_copy_candidacy(&mut self, thread: DetTid) {
         self.confirmed_rt_sigsuspend_sleeps.remove(&thread);
         self.own_mask_background_calls.remove(&thread);
+    }
+
+    /// End the record of a timer copy (`outstanding_timer_copies`) because
+    /// its holder was seen taking the signal, `how`.
+    fn end_timer_copy(&mut self, key: (DetPid, i32), how: &str) {
+        if let Some(copy) = self.outstanding_timer_copies.remove(&key) {
+            info!(
+                "[dpid {}] Thread {} took the timer copy of signal {} ({}) sent to it alone: {}; the next expiry is sent again.",
+                key.0,
+                copy.holder,
+                copy.signal,
+                copy.kind.describe(),
+                how
+            );
+        }
+    }
+
+    /// End the record of every timer copy that `thread` holds, because the
+    /// thread ends before it takes the signal (`ending`): Linux drops a
+    /// thread's private signals with it.
+    fn end_timer_copies_of_departed_holder(&mut self, thread: DetTid, ending: &str) {
+        let held: Vec<(DetPid, i32)> = self
+            .outstanding_timer_copies
+            .iter()
+            .filter(|(_, copy)| copy.holder == thread)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in held {
+            let copy = self.outstanding_timer_copies.remove(&key).unwrap();
+            info!(
+                "[dpid {}] Timer copy of signal {} ({}) sent to thread {} alone ended before it was taken: {}; nothing sent.",
+                key.0,
+                copy.signal,
+                copy.kind.describe(),
+                copy.holder,
+                ending
+            );
+        }
+    }
+
+    /// The timer copies held by `thread` whose signal its posted request
+    /// reports it has just taken: an `InboundSignal` for that signal with
+    /// `Permission::RW`. Only the guest posts that request, at the stop the
+    /// kernel makes once it has dequeued the signal for delivery
+    /// (`handle_signal_event` in `lib.rs`); a request the scheduler puts in a
+    /// thread's place carries `Permission::W` (`wake_signaled_guest`) and
+    /// reports no dequeue.
+    fn timer_copies_taken_at_delivery_stop(&self, thread: DetTid) -> Vec<(DetPid, i32)> {
+        let Some(Some(Ok(request))) = self.next_turns.get(&thread).map(|nt| nt.req.try_read())
+        else {
+            return Vec::new();
+        };
         self.outstanding_timer_copies
-            .retain(|_, holder| *holder != thread);
+            .iter()
+            .filter(|(_, copy)| copy.holder == thread)
+            .filter(|((_, signal), _)| {
+                request
+                    .resources
+                    .get(&ResourceID::InboundSignal(SigWrapper(*signal)))
+                    == Some(&Permission::RW)
+            })
+            .map(|(key, _)| *key)
+            .collect()
+    }
+
+    /// End each record of a timer copy that `thread` holds and that its
+    /// posted request reports it has taken
+    /// (`timer_copies_taken_at_delivery_stop`), `how` naming the report.
+    /// Called where the release barrier and `step2c` requeue a thread on the
+    /// report it posted from its blocking pool.
+    fn end_timer_copies_taken_at_delivery_stop(&mut self, thread: DetTid, how: &str) {
+        for key in self.timer_copies_taken_at_delivery_stop(thread) {
+            self.end_timer_copy(key, how);
+        }
+    }
+
+    /// End the record of each timer copy whose holder, stopped at a posted
+    /// request outside every blocking pool, has taken the signal: its request
+    /// is its delivery stop for that signal
+    /// (`timer_copies_taken_at_delivery_stop`), or the signal is no longer on
+    /// its private queue (`SigPnd`), which a `sigwaitinfo`, `sigtimedwait` or
+    /// `signalfd` read takes and a `SIG_IGN` disposition discards without a
+    /// delivery stop. Run once per pass, right after the release barrier and
+    /// before any timer can fire (`step2_release_signaled_background`).
+    ///
+    /// Every input is ordered by the schedule. A thread stopped at a posted
+    /// request runs no guest instruction, and no guest thread holds the turn
+    /// here: the previous turn's thread has posted its next request before
+    /// the pass begins. So the holder's private queue can change only through
+    /// what a granted thread did in its turn, before this point. A holder in a
+    /// blocking pool is skipped: the kernel runs its call, and its report is
+    /// read where it is requeued. A holder with no posted request is running
+    /// its grant, and is looked at again at a later pass.
+    fn observe_timer_copy_dequeues(&mut self) {
+        if self.outstanding_timer_copies.is_empty() {
+            return;
+        }
+        let records: Vec<((DetPid, i32), TimerCopy)> = self
+            .outstanding_timer_copies
+            .iter()
+            .map(|(key, copy)| (*key, *copy))
+            .collect();
+        for (key, copy) in records {
+            let holder = copy.holder;
+            if self.blocked.external_io_blockers.contains_key(&holder)
+                || self.blocked.rt_sigsuspend_blockers.contains_key(&holder)
+                || self.blocked.signaled_background.contains(&holder)
+            {
+                continue;
+            }
+            if !matches!(
+                self.next_turns.get(&holder).map(|nt| nt.req.try_read()),
+                Some(Some(Ok(_)))
+            ) {
+                continue;
+            }
+            if self
+                .timer_copies_taken_at_delivery_stop(holder)
+                .contains(&key)
+            {
+                self.end_timer_copy(key, "its delivery stop for the signal");
+            } else if self
+                .read_thread_signal_state(holder)
+                .is_some_and(|state| state.thread_pending & kernel_signal_bit(key.1) == 0)
+            {
+                self.end_timer_copy(
+                    key,
+                    "the signal is no longer on its private queue, so it was taken or discarded without a delivery stop",
+                );
+            }
+        }
     }
 
     // Follow Linux semantics for delivering a signal to a thread within a process group.
@@ -5361,17 +5579,14 @@ impl Scheduler {
                         external.is_some() ^ sigsuspend.is_some(),
                         "ready thread must belong to exactly one blocking pool"
                     );
-                    // This step runs only once the release barrier has
-                    // requeued every armed thread (`step2_process_blocked`),
-                    // so no timer copy can be outstanding for this thread.
-                    debug_assert!(
-                        !scheduler
-                            .outstanding_timer_copies
-                            .values()
-                            .any(|holder| holder == ready_dtid),
-                        "a harvested thread still holds an outstanding timer copy"
+                    // A thread holding a timer copy can be here on a later
+                    // blocking call, with the copy still queued on it. Its
+                    // record ends only on its delivery stop for that signal.
+                    scheduler.end_timer_copies_taken_at_delivery_stop(
+                        *ready_dtid,
+                        "its delivery stop for the signal, reported from its blocking call",
                     );
-                    scheduler.forget_timer_copy_records(*ready_dtid);
+                    scheduler.forget_timer_copy_candidacy(*ready_dtid);
                     scheduler.run_queue.push_eager_io_repoll(*ready_dtid);
                 }
             };
@@ -10736,6 +10951,25 @@ mod test {
         scheduler.request_put(&req, delivered, global_time);
     }
 
+    /// `thread` posts its own delivery stop for `signal`, as the guest does
+    /// once the kernel has dequeued the signal for it (`Permission::RW`,
+    /// unlike the `Permission::W` request the scheduler puts in a woken
+    /// thread's place, which `post_inbound_signal` posts).
+    fn post_delivery_stop(
+        scheduler: &mut Scheduler,
+        thread: DetTid,
+        signal: libc::c_int,
+        global_time: &Arc<Mutex<GlobalTime>>,
+    ) {
+        let req = scheduler.next_turns.get(&thread).unwrap().req.clone();
+        let mut delivered = Resources::new(thread);
+        delivered.insert(
+            ResourceID::InboundSignal(SigWrapper(signal)),
+            Permission::RW,
+        );
+        scheduler.request_put(&req, delivered, global_time);
+    }
+
     /// A committed signal to a thread asleep in a real blocking call outside
     /// the run queue, on a traced backend, counterfeits no request for it: its
     /// request was consumed when it was backgrounded. The thread is armed, and
@@ -12844,14 +13078,14 @@ mod test {
     }
 
     /// A second expiry of a timer's signal while the copy sent to one thread
-    /// alone for the first is outstanding (sent, and that thread's wake not
-    /// yet folded into a scheduler pass) is merged with that copy: nothing is
-    /// sent, and one INFO record names the process, the signal, the thread
-    /// holding the copy and the virtual time of the expiry. The woken thread
-    /// takes its copy at a moment host timing chooses, so a second send would
-    /// be merged or delivered again depending on that timing. Once the pass
-    /// requeues the thread, the record is gone and the next expiry is sent
-    /// again, to the next thread that will take it.
+    /// alone for the first is outstanding (sent, and that thread not yet seen
+    /// taking it) is merged with that copy: nothing is sent, and one INFO
+    /// record names the process, the signal, the thread holding the copy and
+    /// the virtual time of the expiry. The woken thread takes its copy at a
+    /// moment host timing chooses, so a second send would be merged or
+    /// delivered again depending on that timing. Once the pass requeues the
+    /// thread on its own delivery stop for the signal, the record is gone and
+    /// the next expiry is sent again, to the next thread that will take it.
     #[test]
     fn a_second_expiry_before_the_first_copy_is_taken_is_merged_with_it() {
         if !super::exec_teardown_tests::in_isolated_log_test(
@@ -12896,7 +13130,7 @@ mod test {
         }
 
         // 101's delivery stop is posted, and the next pass requeues it.
-        post_inbound_signal(&mut scheduler, workers[0], libc::SIGALRM, &global_time);
+        post_delivery_stop(&mut scheduler, workers[0], libc::SIGALRM, &global_time);
         assert!(scheduler.step2_release_signaled_background().is_ok());
         assert!(scheduler.run_queue.contains_tid(workers[0]));
         fire(&mut scheduler, 3_000);
@@ -12909,12 +13143,13 @@ mod test {
         );
     }
 
-    /// A thread holding a timer copy sent to it alone that exits before it
-    /// takes the copy releases the merge: the record goes with it, and the
-    /// next expiry is sent again, to the next thread that will take it. Linux
-    /// drops a thread's private signals when it exits, so a record kept past
-    /// its holder would merge every later expiry of that signal in the
-    /// process into a copy nobody holds.
+    /// A thread holding a timer copy sent to it alone that the scheduler
+    /// removes before it takes the copy (`logically_kill_thread`) releases
+    /// the merge: the record goes with it, and the next expiry is sent again,
+    /// to the next thread that will take it. Linux drops a thread's private
+    /// signals with the thread, so a record kept past its holder would merge
+    /// every later expiry of that signal in the process into a copy nobody
+    /// holds.
     #[test]
     fn a_timer_copy_holder_that_exits_releases_the_next_expiry() {
         let alrm = kernel_signal_bit(libc::SIGALRM);
@@ -12938,8 +13173,9 @@ mod test {
         assert_eq!(
             scheduler
                 .outstanding_timer_copies
-                .get(&(process, libc::SIGALRM)),
-            Some(&workers[0])
+                .get(&(process, libc::SIGALRM))
+                .map(|copy| copy.holder),
+            Some(workers[0])
         );
 
         scheduler.logically_kill_thread(&workers[0], &process, MmId::initial(process));
@@ -12952,6 +13188,338 @@ mod test {
                 (workers[1], Signal::SIGALRM, HostSignalSend::ThreadDirected)
             ]
         );
+    }
+
+    /// `thread` posts the report that its blocking external call `op` has
+    /// returned, as a completed background call does.
+    fn post_continuation(scheduler: &mut Scheduler, thread: DetTid, op: ExternalOpId) {
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        let req = scheduler.next_turns.get(&thread).unwrap().req.clone();
+        let mut continuation = Resources::new(thread);
+        continuation.insert(ResourceID::BlockedExternalContinue(op), Permission::RW);
+        scheduler.request_put(&req, continuation, &global_time);
+    }
+
+    /// `thread`, granted what it had posted, runs and stops at its next
+    /// request: `rid` with `permission`.
+    fn stop_at_next_request(
+        scheduler: &mut Scheduler,
+        thread: DetTid,
+        rid: ResourceID,
+        permission: Permission,
+    ) {
+        let mut request = Resources::new(thread);
+        request.insert(rid, permission);
+        scheduler.next_turns.get_mut(&thread).unwrap().req = Ivar::full(Ok(request));
+    }
+
+    /// `thread` is granted what it had posted and runs: it has posted
+    /// nothing since.
+    fn grant_and_run(scheduler: &mut Scheduler, thread: DetTid) {
+        scheduler.next_turns.get_mut(&thread).unwrap().req = Ivar::new();
+    }
+
+    /// The thread holding the record of a timer's copy of `signal` sent to
+    /// one thread of process 100 alone (`outstanding_timer_copies`).
+    fn timer_copy_holder(scheduler: &Scheduler, signal: libc::c_int) -> Option<DetTid> {
+        scheduler
+            .outstanding_timer_copies
+            .get(&(DetPid::from_raw(100), signal))
+            .map(|copy| copy.holder)
+    }
+
+    /// The kernel's view of `thread` once a copy of `signal` sent to it alone
+    /// is queued on it: pending on its private queue (`SigPnd`).
+    fn copy_queued_on(scheduler: &mut Scheduler, thread: DetTid, signal: libc::c_int) {
+        let bit = kernel_signal_bit(signal);
+        let state = scheduler
+            .test_kernel_signal_states
+            .entry(thread)
+            .or_default();
+        state.pending |= bit;
+        state.thread_pending |= bit;
+    }
+
+    /// The kernel's view of `thread` once it has taken `signal` off its
+    /// private queue.
+    fn copy_taken_by(scheduler: &mut Scheduler, thread: DetTid, signal: libc::c_int) {
+        let bit = kernel_signal_bit(signal);
+        let state = scheduler
+            .test_kernel_signal_states
+            .get_mut(&thread)
+            .unwrap();
+        state.pending &= !bit;
+        state.thread_pending &= !bit;
+    }
+
+    /// An `alarm` of process 100 named for `leader`, due at 1000 ns and every
+    /// 1000 ns after, with virtual time already far past its first expiries:
+    /// every pass pops one overdue expiry (`step2b_process_timed`).
+    fn overdue_periodic_alarm(scheduler: &mut Scheduler, leader: DetTid) {
+        scheduler.blocked.timed_waiters.insert_alarm(
+            LogicalTime::from_nanos(1_000),
+            DetPid::from_raw(100),
+            leader,
+            Signal::SIGALRM,
+            LogicalTime::from_nanos(1_000),
+        );
+        scheduler.committed_time = LogicalTime::from_nanos(1_000_000);
+    }
+
+    /// The steps of an ordinary pass up to its timer pop: the release
+    /// barrier, the drain prefix and one overdue expiry
+    /// (`step2_process_blocked`). `false` when the pass skips its turn before
+    /// the pop.
+    fn pass_to_timer_pop(scheduler: &mut Scheduler) -> bool {
+        if scheduler.step2_release_signaled_background().is_err()
+            || scheduler.step2_drain_prefix().is_err()
+        {
+            return false;
+        }
+        scheduler.step2b_process_timed();
+        true
+    }
+
+    /// Process 100 with threads 101 and 102 back from background calls that
+    /// block no signal, each with its continuation posted, and an overdue
+    /// periodic `alarm`. The first pass sends the first expiry to 101 alone
+    /// and arms it; the copy is then queued on 101.
+    fn two_completed_background_calls(scheduler: &mut Scheduler) -> (DetTid, Vec<DetTid>) {
+        let alrm = kernel_signal_bit(libc::SIGALRM);
+        let (leader, workers, _) = timer_family(scheduler, !alrm, &[101, 102]);
+        for worker in &workers {
+            let op = commit_own_mask_call(scheduler, *worker, 0, 0);
+            post_continuation(scheduler, *worker, op);
+        }
+        overdue_periodic_alarm(scheduler, leader);
+        assert!(pass_to_timer_pop(scheduler));
+        assert_eq!(
+            host_signal_sends(scheduler),
+            vec![(workers[0], Signal::SIGALRM, HostSignalSend::ThreadDirected)]
+        );
+        assert!(scheduler.blocked.signaled_background.contains(&workers[0]));
+        copy_queued_on(scheduler, workers[0], libc::SIGALRM);
+        (leader, workers)
+    }
+
+    /// A timer's copy of a signal sent to one thread alone keeps its record
+    /// until that thread is seen taking the signal: its delivery stop for
+    /// that signal. Threads 101 and 102 are back from background calls; the
+    /// first overdue expiry of a periodic `alarm` is sent to 101 alone, and
+    /// the next pass's barrier requeues 101 on its posted continuation. Each
+    /// later expiry adds nothing while 101 waits for its grant, while it runs,
+    /// at its delivery stop for another signal, and at a delivery stop the
+    /// scheduler counterfeited (`Permission::W`, which reports no dequeue):
+    /// Linux queues each expiry on the process, where the standard signal
+    /// still pending absorbs the next. Before, the requeue ended the record,
+    /// the next expiry went to 102 alone, and the two copies made two handler
+    /// runs where Linux makes one (Codex round 10 finding 1 on
+    /// https://github.com/rrnewton/hermit/pull/3224). Once 101 posts its own
+    /// delivery stop for `SIGALRM`, the next expiry is sent again, to 102.
+    #[test]
+    fn a_timer_copy_record_stands_until_its_holder_dequeues_the_signal() {
+        let mut scheduler = gated_scheduler();
+        let (_, workers) = two_completed_background_calls(&mut scheduler);
+        let first_copy = (workers[0], Signal::SIGALRM, HostSignalSend::ThreadDirected);
+
+        assert!(pass_to_timer_pop(&mut scheduler));
+        assert!(scheduler.run_queue.contains_tid(workers[0]));
+        assert_eq!(
+            host_signal_sends(&scheduler),
+            vec![first_copy],
+            "requeued, awaiting its grant"
+        );
+        assert_eq!(
+            timer_copy_holder(&scheduler, libc::SIGALRM),
+            Some(workers[0])
+        );
+
+        grant_and_run(&mut scheduler, workers[0]);
+        assert!(pass_to_timer_pop(&mut scheduler));
+        assert_eq!(host_signal_sends(&scheduler), vec![first_copy], "running");
+
+        for (signal, permission) in [
+            (libc::SIGUSR1, Permission::RW),
+            (libc::SIGALRM, Permission::W),
+        ] {
+            stop_at_next_request(
+                &mut scheduler,
+                workers[0],
+                ResourceID::InboundSignal(SigWrapper(signal)),
+                permission.clone(),
+            );
+            assert!(pass_to_timer_pop(&mut scheduler));
+            assert_eq!(
+                host_signal_sends(&scheduler),
+                vec![first_copy],
+                "delivery stop for {signal} with {permission:?}"
+            );
+            assert_eq!(
+                timer_copy_holder(&scheduler, libc::SIGALRM),
+                Some(workers[0])
+            );
+        }
+
+        stop_at_next_request(
+            &mut scheduler,
+            workers[0],
+            ResourceID::InboundSignal(SigWrapper(libc::SIGALRM)),
+            Permission::RW,
+        );
+        copy_taken_by(&mut scheduler, workers[0], libc::SIGALRM);
+        assert!(pass_to_timer_pop(&mut scheduler));
+        assert_eq!(
+            host_signal_sends(&scheduler),
+            vec![
+                first_copy,
+                (workers[1], Signal::SIGALRM, HostSignalSend::ThreadDirected)
+            ]
+        );
+        assert_eq!(
+            timer_copy_holder(&scheduler, libc::SIGALRM),
+            Some(workers[1])
+        );
+    }
+
+    /// A holder can take its copy without a delivery stop: `sigwaitinfo`,
+    /// `sigtimedwait` and a `signalfd` read dequeue it as a call's result, and
+    /// setting the signal's disposition to `SIG_IGN` discards it. The record
+    /// then ends at the first pass that finds the holder stopped at a request
+    /// with the signal no longer on its private queue (`SigPnd`), and the next
+    /// expiry is sent again. While the signal is still there, it stands.
+    #[test]
+    fn a_timer_copy_record_ends_when_its_holder_takes_the_signal_without_a_delivery_stop() {
+        let mut scheduler = gated_scheduler();
+        let (_, workers) = two_completed_background_calls(&mut scheduler);
+        let first_copy = (workers[0], Signal::SIGALRM, HostSignalSend::ThreadDirected);
+        assert!(pass_to_timer_pop(&mut scheduler));
+        assert_eq!(host_signal_sends(&scheduler), vec![first_copy]);
+
+        stop_at_next_request(
+            &mut scheduler,
+            workers[0],
+            ResourceID::SchedYield,
+            Permission::RW,
+        );
+        assert!(pass_to_timer_pop(&mut scheduler));
+        assert_eq!(
+            host_signal_sends(&scheduler),
+            vec![first_copy],
+            "still on its queue"
+        );
+        assert_eq!(
+            timer_copy_holder(&scheduler, libc::SIGALRM),
+            Some(workers[0])
+        );
+
+        copy_taken_by(&mut scheduler, workers[0], libc::SIGALRM);
+        stop_at_next_request(
+            &mut scheduler,
+            workers[0],
+            ResourceID::SchedYield,
+            Permission::RW,
+        );
+        assert!(pass_to_timer_pop(&mut scheduler));
+        assert_eq!(
+            host_signal_sends(&scheduler),
+            vec![
+                first_copy,
+                (workers[1], Signal::SIGALRM, HostSignalSend::ThreadDirected)
+            ]
+        );
+        assert_eq!(
+            timer_copy_holder(&scheduler, libc::SIGALRM),
+            Some(workers[1])
+        );
+    }
+
+    /// The record survives its holder's next stay in a blocking pool. 101 is
+    /// requeued with its copy pending, blocks `SIGALRM`, and enters another
+    /// background call: expiries add nothing while it sleeps there, when
+    /// `step2c_process_io_blockers` requeues it on its continuation, and while
+    /// it waits for that grant. Its delivery stop for `SIGALRM` then ends the
+    /// record; with both workers in the run queue, the next expiry goes to
+    /// the process with `kill(2)`.
+    #[test]
+    fn a_timer_copy_record_survives_its_holders_next_blocking_call() {
+        let alrm = kernel_signal_bit(libc::SIGALRM);
+        let mut scheduler = gated_scheduler();
+        let (leader, workers) = two_completed_background_calls(&mut scheduler);
+        let first_copy = (workers[0], Signal::SIGALRM, HostSignalSend::ThreadDirected);
+        assert!(pass_to_timer_pop(&mut scheduler));
+        assert_eq!(host_signal_sends(&scheduler), vec![first_copy]);
+
+        grant_and_run(&mut scheduler, workers[0]);
+        scheduler.test_kernel_signal_states.insert(
+            workers[0],
+            KernelSignalState {
+                pending: alrm,
+                thread_pending: alrm,
+                blocked: alrm,
+                ..Default::default()
+            },
+        );
+        let second_call = ExternalOpId::new(workers[0], 292);
+        assert_eq!(
+            scheduler.run_queue.tentative_pop_tid(workers[0]),
+            Some(workers[0])
+        );
+        assert!(
+            scheduler
+                .block_for_one_resource(
+                    workers[0],
+                    &ResourceID::BlockingExternalIO(second_call),
+                    &Permission::RW,
+                    None,
+                    None,
+                    &Ivar::new(),
+                )
+                .is_err()
+        );
+        assert!(
+            scheduler
+                .blocked
+                .external_io_blockers
+                .contains_key(&workers[0])
+        );
+        assert!(pass_to_timer_pop(&mut scheduler));
+        assert_eq!(
+            host_signal_sends(&scheduler),
+            vec![first_copy],
+            "in its pool"
+        );
+
+        post_continuation(&mut scheduler, workers[0], second_call);
+        assert!(scheduler.step2c_process_io_blockers().is_ok());
+        assert!(scheduler.run_queue.contains_tid(workers[0]));
+        assert!(scheduler.run_queue.contains_tid(workers[1]));
+        assert_eq!(
+            timer_copy_holder(&scheduler, libc::SIGALRM),
+            Some(workers[0])
+        );
+        assert!(pass_to_timer_pop(&mut scheduler));
+        assert_eq!(
+            host_signal_sends(&scheduler),
+            vec![first_copy],
+            "requeued by step2c"
+        );
+
+        stop_at_next_request(
+            &mut scheduler,
+            workers[0],
+            ResourceID::InboundSignal(SigWrapper(libc::SIGALRM)),
+            Permission::RW,
+        );
+        copy_taken_by(&mut scheduler, workers[0], libc::SIGALRM);
+        assert!(pass_to_timer_pop(&mut scheduler));
+        assert_eq!(
+            host_signal_sends(&scheduler),
+            vec![
+                first_copy,
+                (leader, Signal::SIGALRM, HostSignalSend::ProcessDirected)
+            ]
+        );
+        assert_eq!(timer_copy_holder(&scheduler, libc::SIGALRM), None);
     }
 
     /// The barrier runs before anything else in a pass: while an armed thread
