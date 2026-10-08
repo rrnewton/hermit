@@ -1157,7 +1157,13 @@ fi
 # Cargo.toml, third-party or rust-toolchain.toml changes, so the four budget
 # inputs are unchanged. Carry, not recalibration: no new timing sample or
 # >=5-sample replacement claim is made.
-expected_pin=589ee25275ff6670b57da5f692fb2a6ceea63cba
+# CARRY TO e41cc2e1334e8a3be741e9def6b138a5ae5c7ed1 (2026-10-07): from
+# 589ee25275ff6670b57da5f692fb2a6ceea63cba. The one commit changes experimental/reverie-sabre only (a protected
+# tool-output socket for the in-guest SaBRe tool); no file under reverie-dbt,
+# the root Cargo.toml, third-party or rust-toolchain.toml changes, so the four
+# budget inputs are unchanged. Carry, not recalibration: no new timing sample
+# or >=5-sample replacement claim is made.
+expected_pin=e41cc2e1334e8a3be741e9def6b138a5ae5c7ed1
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
