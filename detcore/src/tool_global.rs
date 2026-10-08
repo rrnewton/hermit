@@ -3814,6 +3814,27 @@ pub enum SigalrmControl {
     /// Records the caller's "SIGALRM virtually blocked" bit, after its runtime
     /// changed its mask inside this turn. Never refused.
     PublishBlocked(bool),
+    /// Whether the caller's process has an entry that is due for the caller
+    /// (its SIGALRM not virtually blocked; "refused" is true when it has one).
+    /// Never changes anything.
+    DueEntry,
+    /// Takes the caller's process's entry for delivery to the caller, if it
+    /// is still pending, handled and due ("refused" is true when taken), in
+    /// the turn of the delivery's `InboundSignal` request (step I4, design
+    /// section 4, step 3).
+    TakeEntry,
+    /// Records a determinism loss for the caller's process, here in the
+    /// coordinator, where the verifier reads it: the runtime could not
+    /// deliver an entry the caller took (or could not tell the caller's
+    /// virtual mask). The caller then stops the process. Never refused.
+    DeliveryLost,
+    /// Records a determinism loss for the caller's process, here in the
+    /// coordinator: the caller delivers an entry before a syscall that has
+    /// not run (the I4 addendum's point c), whose handler cannot be shown the
+    /// registers Linux would show it (Reverie restores rcx and r11 as the
+    /// `syscall` instruction already wrote them). The delivery goes ahead and
+    /// the run continues; verification refuses to compare it. Never refused.
+    EntryDeliveryUnfaithful,
 }
 
 /// Messages to the global object.
@@ -5154,7 +5175,12 @@ where
         let end_rip = if let Some(r) = ev.end_rip {
             r
         } else {
-            let regs = guest.regs().await;
+            // While a SIGALRM delivery's signal pipeline runs at a syscall's
+            // completion, the registers are its completed projection.
+            let regs = match guest.thread_state().signal_register_projection {
+                Some(projection) => projection,
+                None => guest.regs().await,
+            };
             NonZeroUsize::new(regs.rip.try_into().unwrap()).unwrap()
         };
         SchedEvent {

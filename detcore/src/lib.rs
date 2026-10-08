@@ -343,6 +343,24 @@ fn choose_rcb_timer(
     (max_rcbs_remaining, true)
 }
 
+/// The registers a syscall's completion leaves, computed from `entry`, the
+/// context at its entry (`rip` at the `syscall` instruction): `rax` holds the
+/// result, `rip` follows the instruction, and the instruction's own clobbers
+/// hold `rcx` = that `rip` and `r11` = `rflags` (signal phase 1's completed
+/// projection, design section 4). Only read, never written back.
+fn completed_syscall_projection(
+    entry: libc::user_regs_struct,
+    result: i64,
+) -> libc::user_regs_struct {
+    const SYSCALL_INSTRUCTION_LENGTH: u64 = 2;
+    let mut completed = entry;
+    completed.rax = result as u64;
+    completed.rip = entry.rip.wrapping_add(SYSCALL_INSTRUCTION_LENGTH);
+    completed.rcx = completed.rip;
+    completed.r11 = entry.eflags;
+    completed
+}
+
 /// What returned control to Detcore, as far as ending a timeslice is concerned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CheckIn {
@@ -354,6 +372,153 @@ enum CheckIn {
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    /// Signal phase 1, step I4 (design section 4, "The commit"): when the
+    /// caller's process holds a SIGALRM entry that is due for it, run the
+    /// signal pipeline ptrace runs at a signal-delivery stop (step 2), take
+    /// the entry inside that pipeline's `InboundSignal` turn (step 3), and
+    /// hand the delivery to the backend (steps 4 to 8). An entry taken that
+    /// the backend cannot deliver is a determinism loss.
+    ///
+    /// `before_syscall` is the I4 addendum's point c: the delivery happens at
+    /// the current syscall's entry and the syscall, not yet run, starts again
+    /// after the handler. Returns whether a delivery was handed to the
+    /// backend; at a syscall's entry the caller then must not run the syscall.
+    ///
+    /// `completed` is the syscall's result at its completion (None at its
+    /// entry): the signal pipeline then reads the completed register
+    /// projection (design section 4).
+    async fn deliver_due_sigalrm<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        before_syscall: bool,
+        completed: Option<i64>,
+    ) -> bool {
+        if !tool_global::sigalrm_refuses(guest, tool_global::SigalrmControl::DueEntry).await {
+            return false;
+        }
+        if let Some(result) = completed {
+            let entry = guest.regs().await;
+            guest.thread_state_mut().signal_register_projection =
+                Some(completed_syscall_projection(entry, result));
+        }
+        let pipeline = self.handle_signal_event(guest, Signal::SIGALRM).await;
+        guest.thread_state_mut().signal_register_projection = None;
+        let delivering = matches!(pipeline, Ok(Some(_)));
+        // A suppressed signal's entry is dropped and nothing is delivered.
+        if !tool_global::sigalrm_refuses(guest, tool_global::SigalrmControl::TakeEntry).await
+            || !delivering
+        {
+            return false;
+        }
+        let mut info = [0_u8; reverie::SIGNAL_INFO_SIZE];
+        info[0..4].copy_from_slice(&libc::SIGALRM.to_ne_bytes());
+        info[8..12].copy_from_slice(&libc::SI_KERNEL.to_ne_bytes());
+        let target = reverie::SignalTarget::Process { pid: guest.pid() };
+        let delivered = match reverie::SignalEvent::new(libc::SIGALRM, info, target) {
+            Ok(event) if before_syscall => guest
+                .defer_signal_delivery_before_syscall(event)
+                .await
+                .is_ok(),
+            Ok(event) => guest.defer_signal_delivery(event).await.is_ok(),
+            Err(_) => false,
+        };
+        if !delivered {
+            self.stop_after_sigalrm_loss(guest).await;
+        }
+        if before_syscall {
+            // Faithful in its position relative to the guest's syscalls, but
+            // not in the interrupted registers the handler sees: recorded as a
+            // determinism loss, so verification refuses the run rather than
+            // compare it (round 4 of the I4 review; the faithful alternative
+            // is a delivery from the trampoline's return, before the syscall
+            // instruction runs).
+            tool_global::sigalrm_refuses(
+                guest,
+                tool_global::SigalrmControl::EntryDeliveryUnfaithful,
+            )
+            .await;
+        }
+        delivered
+    }
+
+    /// A SIGALRM entry this thread took cannot be delivered (or its virtual
+    /// mask cannot be read): record the determinism loss in the coordinator,
+    /// where the verifier reads it, and stop the process before any guest
+    /// instruction runs. Linux would have delivered the signal; continuing
+    /// would run the guest as if it never fired.
+    ///
+    /// The stop is the backend's `exit_group`, not `std::process::exit`: under
+    /// in-guest LiteInst the latter is the guest's own `exit`, which runs the
+    /// guest's `atexit` handlers and ELF finalizers.
+    async fn stop_after_sigalrm_loss<G: Guest<Self>>(&self, guest: &mut G) -> ! {
+        tool_global::sigalrm_refuses(guest, tool_global::SigalrmControl::DeliveryLost).await;
+        match guest
+            .tail_inject(
+                reverie::syscalls::ExitGroup::new()
+                    .with_status(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+            )
+            .await {}
+    }
+
+    /// Signal phase 1: before a callback can file a scheduler request, make
+    /// the scheduler's SIGALRM-blocked bit match the runtime's virtual mask. A
+    /// handler's start and return change that mask with no syscall, so the bit
+    /// may be stale at any callback (a syscall, or a trapped instruction whose
+    /// hooks may end a timeslice). Reads the runtime's virtual bit (one query
+    /// it answers from its virtual state) and publishes it when it differs from
+    /// the bit this thread last published, inside the thread's turn (no
+    /// firing commits while it holds it). Returns the bit.
+    async fn sync_sigalrm_eligibility<G: Guest<Self>>(&self, guest: &mut G) -> bool {
+        let Ok(blocked) = crate::syscalls::virtual_sigalrm_blocked(guest).await else {
+            self.stop_after_sigalrm_loss(guest).await
+        };
+        if blocked != guest.thread_state().sigalrm_blocked_published {
+            tool_global::sigalrm_refuses(
+                guest,
+                tool_global::SigalrmControl::PublishBlocked(blocked),
+            )
+            .await;
+            guest.thread_state_mut().sigalrm_blocked_published = blocked;
+        }
+        blocked
+    }
+
+    /// The completion of a syscall that can resume the guest (a result or an
+    /// errno, not a backend failure): in a process that handles SIGALRM, a due
+    /// entry is delivered here, where Linux would deliver a signal that became
+    /// pending while the call ran (design section 4, point a).
+    async fn complete_syscall<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        res: Result<i64, Error>,
+    ) -> Result<i64, Error> {
+        if self.cfg.backend.virtualizes_guest_sigalrm && guest.thread_state().sigalrm_handled {
+            let completed = match &res {
+                Ok(value) => Some(*value),
+                Err(Error::Errno(errno)) => Some(-i64::from(errno.into_raw())),
+                Err(_) => None,
+            };
+            if completed.is_some() {
+                self.deliver_due_sigalrm(guest, false, completed).await;
+            }
+        }
+        res
+    }
+
+    /// Signal phase 1 at a syscall's entry, before its first scheduler
+    /// request, in a process that handles SIGALRM: sync the scheduler's
+    /// blocked bit ([`Self::sync_sigalrm_eligibility`]), and while SIGALRM is
+    /// unblocked deliver an entry that is already due before this syscall (the
+    /// I4 addendum's point c). An entry is due here when it became deliverable
+    /// with no syscall completing (a handler returned and unblocked SIGALRM),
+    /// or committed during a scheduler yield inside a trapped instruction's
+    /// hooks; Linux delivers it before any further guest instruction. Returns
+    /// whether a delivery was prepared; the syscall then must not run.
+    async fn sigalrm_at_syscall_entry<G: Guest<Self>>(&self, guest: &mut G) -> bool {
+        let blocked = self.sync_sigalrm_eligibility(guest).await;
+        !blocked && self.deliver_due_sigalrm(guest, true, None).await
+    }
+
     /// Registers a child whose native backend executed the clone syscall.
     ///
     /// The caller must initialize the child's local thread state from the same
@@ -653,6 +818,16 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// A common hook called at the start of *every* handler, just after we receive
     /// control from the guest.
+    /// The guest's registers as Detcore's hooks report them: the completed
+    /// projection while a SIGALRM delivery's signal pipeline runs at a
+    /// syscall's completion, otherwise the backend's.
+    async fn observed_regs<G: Guest<Self>>(&self, guest: &mut G) -> libc::user_regs_struct {
+        match guest.thread_state().signal_register_projection {
+            Some(projection) => projection,
+            None => guest.regs().await,
+        }
+    }
+
     async fn pre_handler_hook<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -670,7 +845,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 "(pre) registers [dtid {}][rcbs {}]. {}",
                 dettid,
                 guest.thread_state().thread_logical_time.rcbs(),
-                guest.regs().await.display()
+                self.observed_regs(guest).await.display()
             );
         }
         trace!(
@@ -837,7 +1012,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 "(post) registers [dtid {}][rcbs {}]. {}",
                 dettid,
                 guest.thread_state().thread_logical_time.rcbs(),
-                guest.regs().await.display(),
+                self.observed_regs(guest).await.display(),
             );
         }
     }
@@ -1511,6 +1686,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         ecx: u32,
     ) -> Result<CpuIdResult, Errno> {
         trace!("handle_cpuid_event: eax: {}, ecx: {}", eax, ecx);
+        if self.cfg.backend.virtualizes_guest_sigalrm && guest.thread_state().sigalrm_handled {
+            self.sync_sigalrm_eligibility(guest).await;
+        }
         self.pre_handler_hook(guest, false, CheckIn::InstructionTrap)
             .await;
         let res = if self.cfg.virtualize_cpuid {
@@ -1564,6 +1742,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         request: Rdtsc,
     ) -> Result<RdtscResult, Errno> {
         trace!("handle_rdtsc_event: {:?}", request);
+        if self.cfg.backend.virtualizes_guest_sigalrm && guest.thread_state().sigalrm_handled {
+            self.sync_sigalrm_eligibility(guest).await;
+        }
         self.pre_handler_hook(guest, false, CheckIn::InstructionTrap)
             .await;
         let result = if guest.config().virtualize_time {
@@ -1817,6 +1998,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     restart_block: None,
                     // A fork child inherits its parent's signal dispositions.
                     sigalrm_handled: pts.1.sigalrm_handled,
+                    sigalrm_blocked_published: pts.1.sigalrm_blocked_published,
+                    signal_register_projection: None,
                     last_accounted_user_time,
                     last_accounted_system_time,
                     thread_cpu_start_user_time: last_accounted_user_time,
@@ -1984,6 +2167,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         guest.thread_state_mut().past_global_first_execve = true;
         // exec resets a handled signal to its default action.
         guest.thread_state_mut().sigalrm_handled = false;
+        guest.thread_state_mut().sigalrm_blocked_published = false;
         // Only a successful exec reaches this callback. Delete the old image's
         // POSIX timer IDs while exec still owns its scheduler turn; the global
         // notification below cancels their deadlines before the pre-handler
@@ -2141,6 +2325,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         guest: &mut G,
         call: Syscall,
     ) -> Result<i64, Error> {
+        // Signal phase 1: before this syscall's first scheduler request. A
+        // delivery prepared here runs the guest's handler before the syscall,
+        // which then starts again; what this returns is discarded.
+        if self.cfg.backend.virtualizes_guest_sigalrm
+            && guest.thread_state().sigalrm_handled
+            && self.sigalrm_at_syscall_entry(guest).await
+        {
+            return Ok(0);
+        }
+
         self.pre_handler_hook(guest, false, CheckIn::Event).await;
 
         // Linux's restart of an interrupted wait is the thread's very next syscall,
@@ -3231,7 +3425,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 .observe_brk(brk as u64);
         }
 
-        self.detlog_memory_maps(guest)?;
+        if let Err(error) = self.detlog_memory_maps(guest) {
+            return self.complete_syscall(guest, Err(error)).await;
+        }
         // Same control point again, for the bytes this syscall moved through a guest buffer.
         // Unlike the two mapping hashes above, the extent comes from the syscall's OWN
         // arguments, so it does not matter whether the buffer lives on the stack, in the brk
@@ -3239,8 +3435,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // can see. Only successful calls moved anything.
         if let Ok(ret) = &res
             && self.cfg.detlog_io_buffers
+            && let Err(error) = io_buffers::detlog_io_buffers(
+                guest,
+                &call,
+                *ret,
+                dettid,
+                rng_readv_output.as_deref(),
+            )
         {
-            io_buffers::detlog_io_buffers(guest, &call, *ret, dettid, rng_readv_output.as_deref())?;
+            return self.complete_syscall(guest, Err(error)).await;
         }
 
         if sequentialize_threads && self.cfg.should_trace_schedevent() {
@@ -3267,7 +3470,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             self.canonicalize_syscall_clobbers(guest).await;
         }
 
-        res
+        // Signal phase 1, step I4: a due SIGALRM entry is delivered here.
+        self.complete_syscall(guest, res).await
     }
 
     async fn on_exit_thread<G: GlobalRPC<Self::GlobalState>>(
@@ -3982,6 +4186,34 @@ mod thread_exit_identity_tests {
             select_thread_exit_detpid(None, process_detpid),
             (process_detpid, true)
         );
+    }
+}
+
+#[cfg(test)]
+mod completed_syscall_projection_tests {
+    use super::*;
+
+    /// Signal phase 1: the signal pipeline at a syscall's completion reads
+    /// the result in rax, rip after the two-byte syscall instruction, and the
+    /// instruction's clobbers; every other register is the entry's.
+    #[test]
+    fn a_completed_syscall_shows_its_result_and_return_address() {
+        let mut entry: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+        entry.rip = 0x40_1000;
+        entry.rax = libc::SYS_pause as u64;
+        entry.rcx = 0x1111;
+        entry.r11 = 0x2222;
+        entry.eflags = 0x246;
+        entry.rdi = 7;
+        entry.rsp = 0x7ffd_0000;
+        let completed = completed_syscall_projection(entry, -i64::from(libc::EINTR));
+        assert_eq!(completed.rax, (-i64::from(libc::EINTR)) as u64);
+        assert_eq!(completed.rip, 0x40_1002);
+        assert_eq!(completed.rcx, 0x40_1002);
+        assert_eq!(completed.r11, 0x246);
+        assert_eq!(completed.rdi, 7);
+        assert_eq!(completed.rsp, 0x7ffd_0000);
+        assert_eq!(completed.eflags, 0x246);
     }
 }
 

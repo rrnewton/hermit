@@ -138,6 +138,20 @@ impl Scheduler {
                 self.set_sigalrm_blocked(thread, blocked);
                 return false;
             }
+            SigalrmControl::DeliveryLost => {
+                crate::detlog::write_loss_notice(&format!(
+                    "thread {thread} of process {process} took a pending guest-handled SIGALRM, but the runtime could not deliver it"
+                ));
+                self.sigalrm.lost.insert(process);
+                return false;
+            }
+            SigalrmControl::EntryDeliveryUnfaithful => {
+                crate::detlog::write_loss_notice(&format!(
+                    "thread {thread} of process {process} delivers a guest-handled SIGALRM before a syscall that has not run; its handler cannot see the registers Linux would show it (rcx and r11 as the syscall instruction left them)"
+                ));
+                self.sigalrm.lost.insert(process);
+                return false;
+            }
             _ => {}
         }
         // Its questions, like every other control, are refused to a caller
@@ -168,6 +182,17 @@ impl Scheduler {
             }
             SigalrmControl::HandlerToDefault | SigalrmControl::PendingEntry => {
                 return self.sigalrm.pending.contains(&process);
+            }
+            SigalrmControl::DueEntry => return self.sigalrm_due(thread),
+            SigalrmControl::TakeEntry => {
+                let taken = self.take_sigalrm(process, thread);
+                if taken {
+                    info!(
+                        "[dtid {}] takes its process's pending SIGALRM for delivery to its handler.",
+                        thread
+                    );
+                }
+                return taken;
             }
             _ => {}
         }
@@ -200,7 +225,11 @@ impl Scheduler {
             | SigalrmControl::HandlerToDefault
             | SigalrmControl::PendingEntry
             | SigalrmControl::Publish { .. }
-            | SigalrmControl::PublishBlocked(_) => unreachable!("answered above"),
+            | SigalrmControl::PublishBlocked(_)
+            | SigalrmControl::DueEntry
+            | SigalrmControl::TakeEntry
+            | SigalrmControl::DeliveryLost
+            | SigalrmControl::EntryDeliveryUnfaithful => unreachable!("answered above"),
             SigalrmControl::ArmRecurringTimer => {
                 self.sigalrm.handled.contains(&self.sigchld_process(thread))
             }
@@ -317,9 +346,6 @@ impl Scheduler {
 
     /// Takes `process`'s entry for delivery, if it has one and it is due for
     /// `thread`. The caller has checked that `thread` holds the serial grant.
-    // Called by the runtime's control messages, which arrive with its handler
-    // admission (phase 1 step I3); until then only tests call it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn take_sigalrm(&mut self, process: DetPid, thread: DetTid) -> bool {
         if !self.sigalrm.handled.contains(&process)
             || self.sigalrm.blocked.get(&thread) != Some(&false)

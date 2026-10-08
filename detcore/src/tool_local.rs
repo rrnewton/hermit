@@ -1959,6 +1959,20 @@ pub struct ThreadState<T> {
     /// tests set it.
     pub(crate) sigalrm_handled: bool,
 
+    /// The SIGALRM blocked bit this thread last published to the scheduler's
+    /// ledger (signal phase 1). A handler's return changes the virtual mask
+    /// without a syscall; the next syscall's entry compares the runtime's
+    /// virtual bit with this one and publishes a change.
+    pub(crate) sigalrm_blocked_published: bool,
+
+    /// While Detcore runs its signal pipeline for a SIGALRM it delivers at a
+    /// syscall's completion: the registers as that completion leaves them
+    /// (`completed_syscall_projection`), which the pipeline reads instead of
+    /// the backend's, whose context still shows the syscall's entry. Never
+    /// written back.
+    #[serde(skip)]
+    pub(crate) signal_register_projection: Option<libc::user_regs_struct>,
+
     /// Per-thread checkpoints used to add only new work to the process totals.
     pub(crate) last_accounted_user_time: LogicalTime,
     pub(crate) last_accounted_system_time: LogicalTime,
@@ -2498,6 +2512,8 @@ impl<T> ThreadState<T> {
             parent_cpu_publication: None,
             restart_block: None,
             sigalrm_handled: false,
+            sigalrm_blocked_published: false,
+            signal_register_projection: None,
             last_accounted_user_time,
             last_accounted_system_time,
             thread_cpu_start_user_time: last_accounted_user_time,

@@ -245,6 +245,7 @@ pub const HOSTED_PORTABLE_EXCLUDED_BACKENDS: &[&str] = &["kvm"];
 pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_backend_stats_report_the_guests_own_dispatch_paths",
     "liteinst_in_guest_programs::liteinst_in_guest_abnormal_exit_after_registration_does_not_hang",
+    "liteinst_in_guest_programs::liteinst_in_guest_an_undeliverable_sigalrm_is_a_loss_and_stops_the_guest",
     "liteinst_in_guest_programs::liteinst_in_guest_close_range_releases_ports_like_ptrace",
     "liteinst_in_guest_programs::liteinst_in_guest_cpuid_in_a_late_loaded_library_runs",
     "liteinst_in_guest_programs::liteinst_in_guest_detcore_micro_suite",
@@ -274,7 +275,10 @@ pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_in_guest_programs::liteinst_in_guest_semantic_text_utilities",
     "liteinst_in_guest_programs::liteinst_in_guest_serves_its_own_userfaultfd_and_exits_registered",
     "liteinst_in_guest_programs::liteinst_in_guest_shell_and_entropy_consumer",
+    "liteinst_in_guest_programs::liteinst_in_guest_sigalrm_committed_at_an_instruction_trap_runs_before_exit",
     "liteinst_in_guest_programs::liteinst_in_guest_sigalrm_handler_is_virtual_and_published",
+    "liteinst_in_guest_programs::liteinst_in_guest_sigalrm_handler_runs_at_syscall_completion",
+    "liteinst_in_guest_programs::liteinst_in_guest_sigalrm_pending_at_handler_return_runs_before_the_next_syscall",
     "liteinst_in_guest_programs::liteinst_in_guest_tool_directory_reads_stay_out_of_the_guest_heap",
     "liteinst_in_guest_programs::liteinst_in_guest_unscheduled_deaths_complete_and_refuse_verification",
     "liteinst_in_guest_programs::liteinst_in_guest_user_address_limit_queries_keep_the_guest_errno",

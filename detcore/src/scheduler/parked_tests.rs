@@ -4164,6 +4164,47 @@ fn the_runtimes_sigalrm_publications_and_questions() {
     assert!(s.sigalrm_control(tid, SigalrmControl::InstallHandler));
 }
 
+/// Signal phase 1, step I4: DueEntry answers whether the caller's process
+/// holds an entry due for it, and changes nothing; TakeEntry removes it only
+/// while it is pending, handled and due, so a blocked entry stays pending, as
+/// Linux leaves it, and a second take finds nothing.
+#[test]
+fn a_due_sigalrm_entry_is_taken_once_and_only_when_due() {
+    let mut s = liteinst_scheduler();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    let pid = DetPid::from_raw(100);
+    s.set_running_for_test(tid);
+    // Nothing handled or pending: nothing is due or taken.
+    assert!(!s.sigalrm_control(tid, SigalrmControl::DueEntry));
+    assert!(!s.sigalrm_control(tid, SigalrmControl::TakeEntry));
+    assert!(!s.sigalrm_control(
+        tid,
+        SigalrmControl::Publish {
+            handled: true,
+            blocked: true
+        }
+    ));
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+    assert!(s.sigalrm_pending(pid));
+    // Blocked: pending but not due; a take leaves it pending.
+    assert!(!s.sigalrm_control(tid, SigalrmControl::DueEntry));
+    assert!(!s.sigalrm_control(tid, SigalrmControl::TakeEntry));
+    assert!(s.sigalrm_pending(pid));
+    // Unblocked: due. The question changes nothing; the take removes it once.
+    assert!(!s.sigalrm_control(tid, SigalrmControl::PublishBlocked(false)));
+    assert!(s.sigalrm_control(tid, SigalrmControl::DueEntry));
+    assert!(s.sigalrm_control(tid, SigalrmControl::DueEntry));
+    assert!(s.sigalrm_pending(pid));
+    assert!(s.sigalrm_control(tid, SigalrmControl::TakeEntry));
+    assert!(!s.sigalrm_pending(pid));
+    assert!(!s.sigalrm_control(tid, SigalrmControl::DueEntry));
+    assert!(!s.sigalrm_control(tid, SigalrmControl::TakeEntry));
+    // A taken entry the runtime cannot deliver is a loss, recorded here.
+    assert!(!s.sigalrm_loss_recorded(pid));
+    assert!(!s.sigalrm_control(tid, SigalrmControl::DeliveryLost));
+    assert!(s.sigalrm_loss_recorded(pid));
+}
+
 /// While a process handles SIGALRM, a sender that does not hold the serial
 /// grant is refused whatever it asks: its question could race a commit.
 #[test]
