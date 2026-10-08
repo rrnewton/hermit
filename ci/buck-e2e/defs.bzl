@@ -7,10 +7,13 @@ pass --no-retry to the harness, so `buck2 test ... -- --retry 1` retries a faile
 and the ingester keeps "passed only on rerun" red.
 
 Routing (per cell, first match wins; see _route):
-  local: kvm backend, privileged lane, a host-capability requirement, a `requires` tool
-         RE workers lack, the LOCAL_TESTS deny-list, a test measured to fail only on RE
+  local: kvm backend, privileged lane, a host-capability requirement (every kvm cell names
+         kvm, and every liteinst and in-guest-trap cell names cpuid-faulting, which the
+         in-guest LiteInst runtime needs and RE workers may lack), a `requires` tool RE
+         workers lack, the LOCAL_TESTS deny-list, a test measured to fail only on RE
          (re_exclusions.json), a PMU-armed cell under -c hermit_e2e.pmu_on_re=false, or
-         the ptrace verify cell of a test with a kvm verify cell (its parity reference).
+         the ptrace verify cell of a test whose kvm, liteinst or in-guest-trap verify cell
+         runs locally (its parity reference).
          A sabre or dbt verify cell also runs locally whenever its test's ptrace verify
          cell (its parity reference) does, so the pair always shares a route.
   re:    everything else.
@@ -59,6 +62,11 @@ PMU_FREE_CELLS = [
     "system-utils/clock-determinism/custom@ptrace",
 ]
 
+# Parity candidate backends whose verify cell is routed on its own; when it runs locally,
+# its test's ptrace verify cell (the parity reference) follows it there. sabre and dbt
+# verify cells instead follow their reference (hermit_e2e_cells).
+PARITY_LEADING_BACKENDS = ["in-guest-trap", "kvm", "liteinst"]
+
 def cell_id(cell):
     return "{}/{}@{}".format(cell["test"], cell["mode"], cell["backend"])
 
@@ -69,7 +77,7 @@ def cell_slug(cell):
 def pmu_armed(cell):
     return cell["backend"] in ["ptrace", "liteinst", "in-guest-trap"] and cell["category"] != "compat" and cell_id(cell) not in PMU_FREE_CELLS
 
-def _route(cell, pmu_on_re, re_exclusions, kvm_verify_tests):
+def _route(cell, pmu_on_re, re_exclusions, local_candidates):
     """Returns (where, reason): where is "local" or "re"."""
     if cell["backend"] == "kvm":
         return ("local", "kvm backend: RE workers have no /dev/kvm")
@@ -89,11 +97,14 @@ def _route(cell, pmu_on_re, re_exclusions, kvm_verify_tests):
         return ("local", "measured: " + re_exclusions[cell["test"]]["reason"])
     if pmu_armed(cell) and not pmu_on_re:
         return ("local", "arms the PMU and -c hermit_e2e.pmu_on_re=false")
-    if cell["backend"] == "ptrace" and cell["mode"] == "verify" and cell["test"] in kvm_verify_tests:
-        # Backend parity credits a kvm verify cell against this test's ptrace verify cell
-        # only when both ran on one route (ci/manifest-plan/src/parity.rs shares_route),
-        # and a kvm cell always runs locally.
-        return ("local", "parity reference of a kvm verify cell, which runs locally")
+    if cell["backend"] == "ptrace" and cell["mode"] == "verify" and cell["test"] in local_candidates:
+        # Backend parity credits a candidate verify cell against this test's ptrace verify
+        # cell only when both ran on one route (ci/manifest-plan/src/parity.rs shares_route),
+        # and these candidates run locally.
+        backends = local_candidates[cell["test"]]
+        if len(backends) == 1:
+            return ("local", "parity reference of a {} verify cell, which runs locally".format(backends[0]))
+        return ("local", "parity reference of the {} verify cells, which run locally".format(", ".join(backends)))
     return ("re", "")
 
 def _container(cell, where):
@@ -191,17 +202,23 @@ def hermit_e2e_cells(plan, re_exclusions, bundle = ":bundle", runner = "cell.sh"
     if plan["schema"] != 1:
         fail("expected-e2e-plan.json schema must be 1")
     by_route = {"local": [], "re": []}
-    kvm_verify_tests = {c["test"]: True for c in plan["cells"] if c["backend"] == "kvm" and c["mode"] == "verify"}
+    # Tests whose verify cell on a backend that never follows its parity reference (kvm,
+    # liteinst, in-guest-trap) routes locally, and by which backends. _route decides such a
+    # cell without consulting this map, which only moves ptrace cells.
+    local_candidates = {}
+    for c in plan["cells"]:
+        if c["mode"] == "verify" and c["backend"] in PARITY_LEADING_BACKENDS and _route(c, pmu_on_re, re_exclusions["tests"], {})[0] == "local":
+            local_candidates[c["test"]] = sorted(local_candidates.get(c["test"], []) + [c["backend"]])
     references = {c["test"]: c for c in plan["cells"] if c["backend"] == "ptrace" and c["mode"] == "verify"}
     for cell in plan["cells"]:
-        where, reason = _route(cell, pmu_on_re, re_exclusions["tests"], kvm_verify_tests)
+        where, reason = _route(cell, pmu_on_re, re_exclusions["tests"], local_candidates)
         reference = references.get(cell["test"]) if cell["backend"] in ["sabre", "dbt"] and cell["mode"] == "verify" else None
         if where == "re" and reference:
             # Backend parity credits this cell against its test's ptrace verify cell only
             # when both ran on one route (ci/manifest-plan/src/parity.rs shares_route), so
             # it follows that reference's whole routing decision, under every config. (The
             # DBT adapter takes the user namespace its --bind mounts need, so it runs anywhere.)
-            reference_where, reference_reason = _route(reference, pmu_on_re, re_exclusions["tests"], kvm_verify_tests)
+            reference_where, reference_reason = _route(reference, pmu_on_re, re_exclusions["tests"], local_candidates)
             if reference_where == "local":
                 where, reason = "local", "its parity reference runs locally: " + reference_reason
         if routing == "local":

@@ -134,7 +134,12 @@ Most tokens are descriptive prerequisites only and can never suppress a cell.
 The sole current host capability mapping is `cpuid` to `cpuid-faulting`.
 Independently of `requires`, a `kvm` backend cell needs the `kvm` capability:
 a missing `/dev/kvm` (ENOENT) is proof of absence even when the CPU advertises
-vmx or svm, which is what RE workers and containers show.
+vmx or svm, which is what RE workers and containers show. Likewise a
+`liteinst` or `in-guest-trap` backend cell needs `cpuid-faulting`: the in-guest
+LiteInst runtime arms CPUID faulting before the guest's first instruction and
+refuses to start without it, and RE workers and GitHub-hosted runners may lack
+it. Each such cell's plan row names the capability, which also keeps the Buck
+cell generator from routing it to RE (`ci/buck-e2e/defs.bzl`).
 One descriptive token is enforced at load time: a verify golden that prints
 the vDSO getrandom leg (`vdso-getrandom[`) can only be produced on a host
 kernel that exports `__vdso_getrandom` (Linux 6.11+ on x86-64), so its test
