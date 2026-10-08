@@ -1706,6 +1706,13 @@ impl GlobalTool for GlobalState {
         type R = GlobalResponse;
         let dtid = DetTid::from_raw(from.into()); // TODO(T78538674): FIXME
         let (guest_time, request_mm, request) = gr;
+        let request = match request {
+            GlobalRequest::WithForwardedCount(produced, request) => {
+                crate::detlog::check_forwarded_count(from.as_raw(), produced);
+                *request
+            }
+            request => request,
+        };
         let time_from_guest = guest_time.as_nanos();
         // Exec transfer messages authenticate both incarnations before ordinary
         // sender-clock accounting. The carried clock still belongs to the former
@@ -1951,6 +1958,9 @@ impl GlobalTool for GlobalState {
         let resp = match request {
             GlobalRequest::ReconnectExec { .. } | GlobalRequest::RetireExec { .. } => {
                 unreachable!("exec transfer handled before ordinary admission")
+            }
+            GlobalRequest::WithForwardedCount(..) => {
+                unreachable!("a counted request is unwrapped on arrival")
             }
             GlobalRequest::ResumeExec(process) => {
                 let mut resources = Resources::new(dtid);
@@ -3787,6 +3797,11 @@ pub enum SigalrmControl {
 #[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
 #[allow(clippy::enum_variant_names)]
 pub enum GlobalRequest {
+    /// `request`, sent with the number of records this guest thread produced
+    /// for forwarding since its previous counted request, so the coordinator
+    /// can check they all arrived (`detlog::check_forwarded_count`). Sent only
+    /// by a thread that has produced some ([`counted_request`]).
+    WithForwardedCount(u64, Box<GlobalRequest>),
     /// Lock the resources
     /// Also contains the `DetPid` of the process containing the thread requesting resources.
     RequestResources(Resources, DetPid),
@@ -4145,6 +4160,17 @@ pub enum GlobalResponse {
     Sigalrm(bool),
 }
 
+/// `request`, carrying the number of records this guest thread produced for
+/// forwarding since its previous counted request when there are any
+/// (`GlobalRequest::WithForwardedCount`). A thread of a backend whose Tool does
+/// not forward records never has any, so its requests are unchanged.
+pub(crate) fn counted_request(request: GlobalRequest) -> GlobalRequest {
+    match crate::detlog::take_forwarded_since_request() {
+        0 => request,
+        produced => GlobalRequest::WithForwardedCount(produced, Box::new(request)),
+    }
+}
+
 /// The global request that carries one shared open file control message. It
 /// is answered before any clock accounting, so its clock and address-space
 /// fields are placeholders. The sender is the thread the backend's transport
@@ -4349,7 +4375,7 @@ where
     );
     let mytime = guest.thread_state().thread_logical_time.clone();
     let mm = guest.thread_state().mm_id;
-    let resp = guest.send_rpc((mytime, mm, request)).await;
+    let resp = guest.send_rpc((mytime, mm, counted_request(request))).await;
     if resp.1 == GlobalResponse::ThreadExited {
         let dettid = guest.thread_state().dettid;
         trace!(
@@ -4651,7 +4677,12 @@ pub(crate) async fn deregister_thread<R>(
         let mm = thread.mm;
         // TODO: void_send_rpc
         let resp = reverie
-            .send_rpc((threads_time, mm, GlobalRequest::DeregisterThread(thread)))
+            .send_rpc((threads_time, mm, {
+                // The thread's last count; its slot is free for a later thread.
+                let request = counted_request(GlobalRequest::DeregisterThread(thread));
+                crate::detlog::release_forwarded_count();
+                request
+            }))
             .await;
         // We can't update the thread time here.  But it's dead anyway!
         match resp.1 {
