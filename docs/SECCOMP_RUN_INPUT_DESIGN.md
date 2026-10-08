@@ -110,6 +110,11 @@ Measured against a test inherited filter (`uname` → EACCES, `getppid` → EPER
 
 ## The guarantee, and its limits
 
+Exact reproducibility is the point of every Hermit run. `--verify` and
+`--verify-strict` are only testing features that check it by running twice;
+nothing in this design depends on whether a run uses them. Every guarantee and
+every limit below applies to an ordinary `hermit run`.
+
 With an inherited filter, Hermit runs only when the run config acknowledges it.
 At startup the host's measured actions must equal the declared policy at every
 observed system-call number, or the run is refused. During the run, a declared
@@ -165,7 +170,7 @@ Admission runs once, in the parent, before stdin is read and before either
 **The unacknowledged-filter policy is a single switch.** The case "an inherited filter is present and the run config does not acknowledge it" is decided by one enumeration with two values, in exactly one function that every caller consults:
 
 - `Error` (the default): refuse before the guest starts, as a policy refusal (exit 122), with the remedies in section 7.
-- `Warning`: print the same text as a warning, write it to the run's evidence, and continue. The run is then not reproducible from its config, and its `--verify` and `--run-evidence-dir` records say so.
+- `Warning`: print the same text as a warning and continue. The run is then not reproducible from its config, and every record the run writes (its run evidence, any recording, any verification report) carries the same warning.
 
 Changing the default is a one-line change. No other case has a switch: changed observations and a failed equality check always refuse.
 
@@ -300,13 +305,13 @@ Each refusal names what failed and what to run next.
 - **A failed equality check:** name the number, the declared action and the observed host action.
 - **A refused capture:** name the probe-safety condition that failed.
 
-### 8. Record and replay, and `--verify`
+### 8. Record and replay, and runs that execute the guest more than once
 
 - **Recording metadata**, which has no policy field today, gains the resolved policy and the evidence block.
 - **`hermit record` and `hermit replay`** go through the same admission as `hermit run`. Replay enforces the recorded declared policy for the calls it executes; replayed results come from the log.
 - **A replay host with inherited filters** is compared with the recording's evidence like any run config. If it differs, or the recording has none, replay refuses with the capture remedy.
 - **Recordings made before this change** replay as today on mode-0 hosts, and are refused on mode-2 hosts unless the replay command line supplies a run config that acknowledges the filter.
-- **`run --verify`:** admission runs once in the parent, and both children receive the same resolved policy.
+- **`run --verify`** (a testing feature that runs the guest twice): admission runs once in the parent, and both children receive the same resolved policy, exactly as an ordinary run would.
 
 ### 9. Paranoid mode: per-call checking (`--seccomp-paranoid`)
 
