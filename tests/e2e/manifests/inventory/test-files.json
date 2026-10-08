@@ -2006,6 +2006,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/timer_copy_coalesce.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
+      "why": "tests/c/timer_copy_coalesce.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and runs in blocking GitHub CI; it keeps a periodic ITIMER_REAL expiring while two workers' select calls over a descriptor above 64, which Hermit runs as blocking external IO, have already returned and the main thread blocks SIGALRM, so the scheduler sends one expiry to one worker alone and must merge every further expiry with that copy until the worker takes it, writing an INFO record for each merged expiry that strict verification compares; it requires each select to return 1 with its descriptor ready and the handler to run only on the workers"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/timer_create_determinism.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/timer_create_determinism.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"

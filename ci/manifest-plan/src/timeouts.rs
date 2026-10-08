@@ -165,6 +165,27 @@ pub const SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_SHA: &str =
     "e1e53c5934652df03a8f93b4f3a9283feb9dfaf7";
 pub const SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-10-07T22:23:43Z";
 pub const SIGSUSPEND_SIBLING_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
+/// `c-programs/timer-copy-coalesce` verify on ptrace, a new guest for timer
+/// expiries that Hermit sends to one thread alone: a periodic ITIMER_REAL keeps
+/// expiring while two workers' `select` calls over a descriptor above 64 have
+/// already returned and the main thread blocks SIGALRM, so the scheduler sends
+/// one expiry to one worker alone and must merge every further expiry with
+/// that copy until the worker takes it, writing an INFO record for each merged
+/// expiry. The guest's own output is the same whether or not later expiries
+/// merge; the INFO records in the strictly compared log are what show that the
+/// merge was reached. The cell passed ten consecutive strict verify runs (`run
+/// --strict --verify --verify-strict`, default log level, no relaxations), each
+/// on its first attempt with bitwise parity, with a stamped release build of
+/// the evidence SHA; every run's log held two merged expiries. That SHA
+/// contains every Hermit and Detcore change of the series that added the cell;
+/// the guest source the runs used, sha256
+/// 1b64caba6edec58a4ed78da5e65ef107317e328a1267fd388d3b02610694872a, was
+/// committed unchanged in the next commit, and the series' later commits change
+/// only CI records.
+pub const TIMER_COPY_COALESCE_2026_10_08_EVIDENCE_SHA: &str =
+    "ae82e833ca62a47469a4121d5a62434329ea343d";
+pub const TIMER_COPY_COALESCE_2026_10_08_EVIDENCE_COMPLETED_UTC: &str = "2026-10-08T04:54:34Z";
+pub const TIMER_COPY_COALESCE_2026_10_08_SELECTED_CI_CELL_COUNT: usize = 1;
 /// Cells slice S13 of <https://github.com/rrnewton/hermit/issues/3301> selected
 /// when it replaced `tests/backend-parity/run_matrix.py --backend dbt` with
 /// manifest cells: 26 DBT verify cells, one ptrace verify cell for each of the
@@ -2095,6 +2116,15 @@ mod tests {
             "2026-10-07T22:23:43Z"
         );
         assert_eq!(SIGSUSPEND_SIBLING_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
+        assert_eq!(
+            TIMER_COPY_COALESCE_2026_10_08_EVIDENCE_SHA,
+            "ae82e833ca62a47469a4121d5a62434329ea343d"
+        );
+        assert_eq!(
+            TIMER_COPY_COALESCE_2026_10_08_EVIDENCE_COMPLETED_UTC,
+            "2026-10-08T04:54:34Z"
+        );
+        assert_eq!(TIMER_COPY_COALESCE_2026_10_08_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(
             SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT,
             SELECT_REPLAY_2026_10_03_TESTS.len()
