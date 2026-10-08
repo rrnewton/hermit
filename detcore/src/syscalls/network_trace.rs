@@ -481,7 +481,7 @@ fn read_sockaddr<M: MemoryAccess>(
 /// microsecond count out of range fails with `EDOM`, both without reaching
 /// the network. A negative second count sets an immediate timeout, so a
 /// blocking call fails at once with `EAGAIN`.
-fn sets_a_timeout(timeout: libc::timeval) -> bool {
+pub(crate) fn sets_a_timeout(timeout: libc::timeval) -> bool {
     (0..1_000_000).contains(&timeout.tv_usec) && (timeout.tv_sec != 0 || timeout.tv_usec != 0)
 }
 
@@ -502,8 +502,8 @@ fn names_abstract_unix_address(bytes: &[u8], addrlen: usize, binding: bool) -> b
     }
 }
 
-/// The descriptors carried by the `SCM_RIGHTS` messages in a received
-/// control buffer.
+/// The descriptors carried by the `SCM_RIGHTS` messages in a sent or
+/// received control buffer.
 pub(crate) fn received_descriptors(control: &[u8]) -> Vec<RawFd> {
     const HEADER: usize = size_of::<libc::cmsghdr>();
     let align = |length: usize| length.next_multiple_of(size_of::<usize>());

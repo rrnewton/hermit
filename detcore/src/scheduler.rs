@@ -15,6 +15,7 @@ pub(crate) mod parked;
 #[cfg(test)]
 mod parked_tests;
 pub(crate) mod real_timer;
+mod rejoin_log;
 mod replayer;
 pub mod runqueue;
 mod sigalrm;
@@ -87,6 +88,9 @@ use crate::resources::LOOPBACK_POLL_YIELD_FYI;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::scheduler::rejoin_log::Rejoin;
+use crate::scheduler::rejoin_log::RejoinRefusal;
+use crate::scheduler::rejoin_log::RejoinWriter;
 use crate::scheduler::replayer::StopReason;
 use crate::scheduler::replayer::events_consistent;
 use crate::scheduler::replayer::events_match;
@@ -997,8 +1001,26 @@ pub struct Scheduler {
     /// continuations; `None` while the set is empty.
     signaled_background_since: Option<std::time::Instant>,
     /// Set when the release barrier's watchdog expires; the scheduler loop
-    /// ends the run with it (`exit_on_signaled_background_refusal`).
+    /// ends the run with it (`exit_on_scheduler_refusal`).
     signaled_background_refusal: Option<SignaledBackgroundRefusal>,
+    /// `hermit record`: where `step2c_process_io_blockers` logs each
+    /// readmission of a backgrounded call (see `rejoin_log`).
+    rejoin_writer: Option<RejoinWriter>,
+    /// `hermit replay`: the logged readmissions not yet replayed. A log that
+    /// cannot be read is refused when the scheduler is made, and one with
+    /// readmissions left when the run ends is refused then
+    /// (`unreplayed_rejoins`).
+    rejoin_replay: Option<std::collections::VecDeque<Rejoin>>,
+    /// Set when replay cannot follow the rejoin log; the scheduler loop ends
+    /// the run with it (`exit_on_scheduler_refusal`).
+    rejoin_refusal: Option<RejoinRefusal>,
+    /// When replay began waiting with nothing runnable and no readmission due
+    /// (`step2c_replay_rejoin`); `None` otherwise.
+    rejoin_stalled_since: Option<std::time::Instant>,
+    /// How many timed events `step2d_decide_empty_queue` has woken with the run
+    /// queue empty. With `turn`, it names a point in the schedule for the
+    /// rejoin log, because such a wake does not advance `turn`.
+    empty_queue_wakes: u64,
     #[cfg(test)]
     host_signal_attempts: u64,
     /// Turns that `do_a_turn_blocking` ran through the controlled loop.
@@ -1732,6 +1754,10 @@ async fn sched_loop_inner(
                     std::process::exit(detcore_model::HERMIT_POLICY_REFUSAL_EXIT);
                 }
                 info!("[scheduler] run queue empty, exiting sched_loop.");
+                if let Some(refusal) = sched.unreplayed_rejoins() {
+                    drop(sched);
+                    exit_on_scheduler_refusal(&refusal);
+                }
                 if let Some(observer) = &observer {
                     observer("run queue empty; scheduler completed");
                 }
@@ -1904,9 +1930,9 @@ impl std::error::Error for SignaledBackgroundRefusal {}
 /// End the run on a scheduler refusal: write it to stderr and exit with
 /// `HERMIT_POLICY_REFUSAL_EXIT`, the status for "hermit examined the run and
 /// refused it", as the network replay refusal does. Only the ptrace backend
-/// arms the release barrier, and a ptrace guest does not outlive this process
-/// (Reverie sets `PTRACE_O_EXITKILL`).
-fn exit_on_signaled_background_refusal(refusal: &SignaledBackgroundRefusal) -> ! {
+/// arms the release barrier or runs record/replay, and a ptrace guest does not
+/// outlive this process (Reverie sets `PTRACE_O_EXITKILL`).
+pub(crate) fn exit_on_scheduler_refusal(refusal: &dyn std::fmt::Display) -> ! {
     {
         use std::io::Write;
         let _ = writeln!(crate::util::RetryingStderr, "{refusal}");
@@ -2000,7 +2026,11 @@ async fn do_ordinary_turn_blocking(
         let blocked = sched.step2_process_blocked(&global_time);
         if let Some(refusal) = sched.signaled_background_refusal.take() {
             drop(sched);
-            exit_on_signaled_background_refusal(&refusal);
+            exit_on_scheduler_refusal(&refusal);
+        }
+        if let Some(refusal) = sched.rejoin_refusal.take() {
+            drop(sched);
+            exit_on_scheduler_refusal(&refusal);
         }
         blocked?;
         sched.step3_peek().ok_or(SkipTurn)?
@@ -2386,6 +2416,27 @@ impl Scheduler {
             backend: cfg.backend,
             signaled_background_since: None,
             signaled_background_refusal: None,
+            rejoin_writer: match &cfg.replay_data {
+                Some(dir) if cfg.recordreplay_modes && !cfg.replaying => {
+                    Some(RejoinWriter::create(dir).unwrap_or_else(|err| {
+                        panic!("cannot create the rejoin log in {}: {err}", dir.display())
+                    }))
+                }
+                _ => None,
+            },
+            rejoin_replay: match &cfg.replay_data {
+                Some(dir) if cfg.recordreplay_modes && cfg.replaying => {
+                    Some(rejoin_log::read(dir).unwrap_or_else(|err| {
+                        exit_on_scheduler_refusal(&RejoinRefusal {
+                            reason: format!("the recording's rejoin log cannot be read ({err})"),
+                        })
+                    }))
+                }
+                _ => None,
+            },
+            rejoin_refusal: None,
+            rejoin_stalled_since: None,
+            empty_queue_wakes: 0,
             #[cfg(test)]
             host_signal_attempts: 0,
             #[cfg(test)]
@@ -5212,6 +5263,12 @@ impl Scheduler {
                     return Ok(());
                 }
 
+                // Replay readmits each call at the turn the recording logged, not when
+                // it finishes (see `rejoin_log`).
+                if self.rejoin_replay.is_some() {
+                    return self.step2c_replay_rejoin(&blockers, &ready, requeue_ready);
+                }
+
                 // Readmit those calls first, in thread order; every one has finished.
                 // Other background calls are readmitted below once none of them remain.
                 if !log_served.is_empty() {
@@ -5225,7 +5282,12 @@ impl Scheduler {
                 // record-mode pipe livelock: previously a queued poller made this branch
                 // return early forever, so the completed read/write was never rescheduled
                 // and the poller spun on data that never arrived.
+                //
+                // Which pass finds a call finished depends on host timing, so record
+                // logs the turn of each readmission for replay to follow.
+                // TODO-HUMAN-REVIEW(PR-3908)
                 if !ready.is_empty() {
+                    self.log_rejoin(&blockers, &ready);
                     requeue_ready(self, &ready);
                     return Ok(());
                 }
@@ -5237,7 +5299,32 @@ impl Scheduler {
                     return Ok(());
                 }
 
-                // No completed IO yet, and nothing but pollers (or nothing) to run. The
+                // No completed IO yet, but pollers are queued: let one poll. A poller
+                // can be what the blocker waits for, not only the other way round: a
+                // client's read on a TCP connection waits for the server's accept, and
+                // the server polls that accept in turn
+                // (https://github.com/rrnewton/hermit/issues/3880). Spinning here would
+                // never run it. Readiness is still checked, and a ready blocker
+                // harvested, before every poll. Whether a call had finished before
+                // this poll is host-timed; the rejoin log above makes replay agree.
+                if !self.run_queue.is_empty() {
+                    return Ok(());
+                }
+
+                // No completed IO yet and nothing queued, but a thread sleeps
+                // until a reachable deadline: let step2d move virtual time
+                // there, as `hermit run` does below. The blocked call can wait
+                // on that thread, a client that sleeps before it connects or
+                // writes, and spinning would never wake it
+                // (https://github.com/rrnewton/hermit/issues/3881). Whether the
+                // call finished before this move is host-timed; the rejoin log
+                // records the wake count with the turn so replay agrees.
+                // TODO-HUMAN-REVIEW(PR-3908)
+                if self.next_deadline_is_reachable() {
+                    return Ok(());
+                }
+
+                // No completed IO yet, and nothing to run. The
                 // blocking syscalls are executing in the host kernel; go around the loop
                 // and re-check readiness. (Still a busy-wait; see T137183027 for the
                 // record-the-nondeterministic-event fix.)
@@ -5285,6 +5372,206 @@ impl Scheduler {
         } else {
             Ok(())
         }
+    }
+
+    /// `hermit record`: log that `step2c_process_io_blockers` readmits the
+    /// finished calls of `ready` at this turn (see `rejoin_log`).
+    fn log_rejoin(&mut self, blockers: &[(DetTid, ExternalOpId, bool)], ready: &[DetTid]) {
+        let Some(writer) = self.rejoin_writer.as_mut() else {
+            return;
+        };
+        let rejoin = Rejoin {
+            turn: self.turn,
+            wakes: self.empty_queue_wakes,
+            calls: ready
+                .iter()
+                .map(|dtid| {
+                    let (_, op_id, _) = blockers
+                        .iter()
+                        .find(|(blocked, _, _)| blocked == dtid)
+                        .expect("a ready thread is a blocker");
+                    (*dtid, op_id.sequence)
+                })
+                .collect(),
+        };
+        writer
+            .append(&rejoin)
+            .unwrap_or_else(|err| panic!("cannot write the rejoin log: {err}"));
+    }
+
+    /// How long replay waits, with nothing runnable and no readmission due, for
+    /// work to appear, or at a logged readmission for its calls to finish,
+    /// before it refuses (see `step2c_replay_rejoin`).
+    const REJOIN_STALL_VALVE: Duration = Duration::from_secs(30);
+
+    /// `hermit replay`: readmit backgrounded calls at the turns the recording
+    /// logged (see `rejoin_log`). Called where record readmits finished calls,
+    /// after the checks the two runs share.
+    ///
+    /// - A readmission logged for this turn waits until each of its calls has
+    ///   finished, without committing a turn, then readmits them in the logged
+    ///   order. Record readmitted them in a pass at this turn, before any other
+    ///   turn could commit. A call still unfinished after `REJOIN_STALL_VALVE`
+    ///   is refused rather than waited on forever.
+    /// - Until then a finished call stays parked, and queued threads run as
+    ///   they did in record.
+    /// - Replay refuses if it reaches a later turn than a logged readmission,
+    ///   or if the parked call is not the logged one.
+    ///   With nothing runnable and no readmission due, record spun until a call
+    ///   finished; replay waits `REJOIN_STALL_VALVE` for other work to appear
+    ///   (a thread admission, say) and then refuses rather than hang.
+    ///
+    /// By induction on turns, the two schedules agree up to the next logged
+    /// turn: everything host-timed before it (poll results, readmissions) is
+    /// in the recording, so whatever let the call finish in record has also
+    /// happened in replay by then.
+    // TODO-HUMAN-REVIEW(PR-3908)
+    fn step2c_replay_rejoin(
+        &mut self,
+        blockers: &[(DetTid, ExternalOpId, bool)],
+        ready: &[DetTid],
+        requeue_ready: impl Fn(&mut Self, &[DetTid]),
+    ) -> Result<(), SkipTurn> {
+        let next = match self.rejoin_replay.as_ref() {
+            Some(rejoins) => rejoins.front().cloned(),
+            None => unreachable!("only replay follows the rejoin log"),
+        };
+        let describe = |rejoin: &Rejoin| {
+            rejoin
+                .calls
+                .iter()
+                .map(|(dtid, sequence)| format!("thread {} call {}", dtid.as_raw(), sequence))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let point = (self.turn, self.empty_queue_wakes);
+        if let Some(next) = next {
+            if next.point() < point {
+                let reason = format!(
+                    "the recording readmitted {} at turn {} after {} timer wakes, and replay \
+                     reached turn {} after {} first",
+                    describe(&next),
+                    next.turn,
+                    next.wakes,
+                    self.turn,
+                    self.empty_queue_wakes
+                );
+                return self.refuse_rejoin(reason);
+            }
+            if next.point() == point {
+                for (dtid, sequence) in &next.calls {
+                    let parked = blockers
+                        .iter()
+                        .find(|(blocked, _, _)| blocked == dtid)
+                        .map(|(_, op_id, _)| op_id.sequence);
+                    if parked != Some(*sequence) {
+                        let reason = format!(
+                            "the recording readmitted {} at turn {}, but replay has {} parked there",
+                            describe(&next),
+                            next.turn,
+                            parked.map_or("no such call".to_string(), |parked| format!(
+                                "call {parked} of thread {}",
+                                dtid.as_raw()
+                            ))
+                        );
+                        return self.refuse_rejoin(reason);
+                    }
+                }
+                let due: Vec<DetTid> = next.calls.iter().map(|(dtid, _)| *dtid).collect();
+                if due.iter().all(|dtid| ready.contains(dtid)) {
+                    self.rejoin_stalled_since = None;
+                    if let Some(rejoins) = self.rejoin_replay.as_mut() {
+                        rejoins.pop_front();
+                    }
+                    requeue_ready(self, &due);
+                    return Ok(());
+                }
+                let since = *self
+                    .rejoin_stalled_since
+                    .get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= Self::REJOIN_STALL_VALVE {
+                    let reason = format!(
+                        "the recording readmitted {} at turn {}, and replay waited {} s there \
+                         for those calls to finish",
+                        describe(&next),
+                        next.turn,
+                        Self::REJOIN_STALL_VALVE.as_secs()
+                    );
+                    return self.refuse_rejoin(reason);
+                }
+                trace!(
+                    "[step2] waiting at turn {} for the logged readmission of {:?}",
+                    self.turn, due
+                );
+                std::thread::yield_now();
+                return Err(SkipTurn);
+            }
+        }
+        // Record readmitted nothing in this pass. `rt_sigsuspend` alone goes on
+        // to step2d, queued pollers run, and step2d wakes a reachable timed
+        // event, as in record.
+        if self.blocked.external_io_blockers.is_empty()
+            || !self.run_queue.is_empty()
+            || self.next_deadline_is_reachable()
+        {
+            self.rejoin_stalled_since = None;
+            return Ok(());
+        }
+        let since = *self
+            .rejoin_stalled_since
+            .get_or_insert_with(std::time::Instant::now);
+        if since.elapsed() < Self::REJOIN_STALL_VALVE {
+            std::thread::yield_now();
+            return Err(SkipTurn);
+        }
+        let reason = format!(
+            "at turn {} nothing can run, and the next logged readmission is {}",
+            self.turn,
+            match self
+                .rejoin_replay
+                .as_ref()
+                .and_then(|rejoins| rejoins.front())
+            {
+                Some(next) => format!("{} at turn {}", describe(next), next.turn),
+                None => "none".to_string(),
+            }
+        );
+        self.refuse_rejoin(reason)
+    }
+
+    /// Whether step2d, with the run queue empty, would wake a timed event: one
+    /// is pending, and the earliest is not `LogicalTime::INDEFINITE`.
+    fn next_deadline_is_reachable(&self) -> bool {
+        self.blocked
+            .timed_waiters
+            .next_deadline()
+            .is_some_and(|deadline| !deadline.is_indefinite())
+    }
+
+    /// Replay's refusal of a run that ends with logged readmissions it never
+    /// reached: the recording's schedule went on past where replay's ended.
+    fn unreplayed_rejoins(&self) -> Option<RejoinRefusal> {
+        let rejoins = self.rejoin_replay.as_ref()?;
+        let next = rejoins.front()?;
+        Some(RejoinRefusal {
+            reason: format!(
+                "the run ended at turn {} with {} logged readmissions not replayed, the first at \
+                 turn {}",
+                self.turn,
+                rejoins.len(),
+                next.turn
+            ),
+        })
+    }
+
+    /// Record a `RejoinRefusal` for the scheduler loop to end the run with.
+    fn refuse_rejoin(&mut self, reason: String) -> Result<(), SkipTurn> {
+        if self.rejoin_refusal.is_none() {
+            let refusal = RejoinRefusal { reason };
+            tracing::error!("[step2] {}", refusal);
+            self.rejoin_refusal = Some(refusal);
+        }
+        Err(SkipTurn)
     }
 
     /// Render one blocked thread's pending request, with a stable resource order.
@@ -5779,6 +6066,7 @@ impl Scheduler {
                     .pop()
                     .expect("internal error: no timed events found");
                 debug_assert_eq!(event_ns, next_deadline);
+                self.empty_queue_wakes += 1;
                 {
                     let mut gt = global_time.lock().unwrap();
                     let gt_now_ns = gt.as_nanos();
@@ -9552,6 +9840,331 @@ mod test {
             scheduler.run_queue.tentative_pop_next(),
             Some(exiting_child)
         );
+    }
+
+    /// Under record, a client's read can wait for a server that polls its
+    /// accept in turn (https://github.com/rrnewton/hermit/issues/3880). With
+    /// the client's read unfinished and only the poller queued, the scheduler
+    /// must let the poller run rather than wait for the read.
+    #[test]
+    fn record_lets_a_poller_run_while_external_io_is_unfinished() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.recordreplay_modes = true;
+        let client = DetTid::from_raw(21);
+        let server = DetTid::from_raw(3);
+        let op_id = ExternalOpId::new(client, 3);
+
+        scheduler.priorities.insert(client, DEFAULT_PRIORITY);
+        scheduler.priorities.insert(server, DEFAULT_PRIORITY);
+        scheduler
+            .run_queue
+            .push_poller(server, DEFAULT_PRIORITY, u32::MAX);
+        assert!(
+            scheduler
+                .run_queue
+                .first_priority()
+                .is_some_and(|priority| priority >= LAST_PRIORITY)
+        );
+        scheduler.blocked.external_io_blockers.insert(client, op_id);
+        scheduler.next_turns.insert(
+            client,
+            ThreadNextTurn {
+                dettid: client,
+                child_tid_addr: 0,
+                req: Ivar::new(),
+                resp: Ivar::new(),
+                protocol: Default::default(),
+            },
+        );
+
+        assert!(scheduler.step2c_process_io_blockers().is_ok());
+        assert_eq!(
+            scheduler.blocked.external_io_blockers.get(&client),
+            Some(&op_id)
+        );
+        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(server));
+    }
+
+    /// A record/replay scheduler with `client` backgrounded on call `op_id`,
+    /// finished when `finished`, and the poller `server`, if any, queued.
+    fn rejoin_fixture(op_id: ExternalOpId, server: Option<DetTid>, finished: bool) -> Scheduler {
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.recordreplay_modes = true;
+        let client = op_id.tid;
+        scheduler.priorities.insert(client, DEFAULT_PRIORITY);
+        if let Some(server) = server {
+            scheduler.priorities.insert(server, DEFAULT_PRIORITY);
+            scheduler
+                .run_queue
+                .push_poller(server, DEFAULT_PRIORITY, u32::MAX);
+        }
+        scheduler.blocked.external_io_blockers.insert(client, op_id);
+        let mut continuation = Resources::new(client);
+        continuation.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
+        scheduler.next_turns.insert(
+            client,
+            ThreadNextTurn {
+                dettid: client,
+                child_tid_addr: 0,
+                req: if finished {
+                    Ivar::full(Ok(continuation))
+                } else {
+                    Ivar::new()
+                },
+                resp: Ivar::new(),
+                protocol: Default::default(),
+            },
+        );
+        scheduler
+    }
+
+    /// Record logs the turn at which a finished backgrounded call rejoins,
+    /// with the call's ordinal (https://github.com/rrnewton/hermit/pull/3908).
+    #[test]
+    fn record_logs_the_turn_a_backgrounded_call_rejoins() {
+        let dir = tempfile::tempdir().unwrap();
+        let op_id = ExternalOpId::new(DetTid::from_raw(21), 9);
+        let mut scheduler = rejoin_fixture(op_id, Some(DetTid::from_raw(3)), true);
+        scheduler.rejoin_writer = Some(RejoinWriter::create(dir.path()).unwrap());
+        scheduler.turn = 12;
+
+        assert!(scheduler.step2c_process_io_blockers().is_ok());
+        assert!(scheduler.blocked.external_io_blockers.is_empty());
+        assert_eq!(
+            rejoin_log::read(dir.path()).unwrap(),
+            std::collections::VecDeque::from([Rejoin {
+                turn: 12,
+                wakes: 0,
+                calls: vec![(op_id.tid, 9)],
+            }])
+        );
+    }
+
+    fn replaying(scheduler: &mut Scheduler, rejoins: &[Rejoin]) {
+        scheduler.rejoin_replay = Some(rejoins.iter().cloned().collect());
+    }
+
+    /// Replay keeps a finished call parked until its logged turn, letting the
+    /// queued poller run as record did, then readmits it at that turn.
+    #[test]
+    fn replay_readmits_a_finished_call_only_at_its_logged_turn() {
+        let op_id = ExternalOpId::new(DetTid::from_raw(21), 9);
+        let server = DetTid::from_raw(3);
+        let mut scheduler = rejoin_fixture(op_id, Some(server), true);
+        let logged = Rejoin {
+            turn: 12,
+            wakes: 0,
+            calls: vec![(op_id.tid, 9)],
+        };
+        replaying(&mut scheduler, std::slice::from_ref(&logged));
+        scheduler.turn = 11;
+
+        assert!(scheduler.step2c_process_io_blockers().is_ok());
+        assert_eq!(
+            scheduler.blocked.external_io_blockers.get(&op_id.tid),
+            Some(&op_id)
+        );
+        assert!(scheduler.rejoin_refusal.is_none());
+
+        scheduler.turn = 12;
+        assert!(scheduler.step2c_process_io_blockers().is_ok());
+        assert!(scheduler.blocked.external_io_blockers.is_empty());
+        assert!(scheduler.run_queue.contains_tid(op_id.tid));
+        assert!(matches!(&scheduler.rejoin_replay, Some(left) if left.is_empty()));
+        assert_eq!(scheduler.unreplayed_rejoins(), None);
+    }
+
+    /// At its logged turn, replay waits for an unfinished call without
+    /// running the poller, because record readmitted it before any other turn,
+    /// and refuses once the call is still unfinished after the valve.
+    #[test]
+    fn replay_waits_at_the_logged_turn_for_an_unfinished_call() {
+        let op_id = ExternalOpId::new(DetTid::from_raw(21), 9);
+        let mut scheduler = rejoin_fixture(op_id, Some(DetTid::from_raw(3)), false);
+        replaying(
+            &mut scheduler,
+            &[Rejoin {
+                turn: 12,
+                wakes: 0,
+                calls: vec![(op_id.tid, 9)],
+            }],
+        );
+        scheduler.turn = 12;
+
+        assert!(scheduler.step2c_process_io_blockers().is_err());
+        assert!(scheduler.rejoin_refusal.is_none());
+        assert_eq!(
+            scheduler.blocked.external_io_blockers.get(&op_id.tid),
+            Some(&op_id)
+        );
+
+        // It does not wait forever: past the valve, it refuses.
+        scheduler.rejoin_stalled_since =
+            std::time::Instant::now().checked_sub(Scheduler::REJOIN_STALL_VALVE);
+        assert!(scheduler.step2c_process_io_blockers().is_err());
+        assert!(scheduler.rejoin_refusal.is_some());
+    }
+
+    /// Replay refuses a log it cannot follow: a logged point already passed,
+    /// by turn or by timer wakes within the turn, or a different call parked.
+    /// (An unreadable log is refused before the scheduler runs, and one left
+    /// unexhausted when the run ends; see
+    /// `replay_refuses_a_run_that_ends_before_its_log`.)
+    #[test]
+    fn replay_refuses_a_rejoin_log_it_cannot_follow() {
+        let op_id = ExternalOpId::new(DetTid::from_raw(21), 9);
+        let server = DetTid::from_raw(3);
+        let cases = [
+            (
+                "passed",
+                (13, 0),
+                vec![Rejoin {
+                    turn: 12,
+                    wakes: 0,
+                    calls: vec![(op_id.tid, 9)],
+                }],
+            ),
+            (
+                "passed by a wake",
+                (12, 1),
+                vec![Rejoin {
+                    turn: 12,
+                    wakes: 0,
+                    calls: vec![(op_id.tid, 9)],
+                }],
+            ),
+            (
+                "other call",
+                (12, 0),
+                vec![Rejoin {
+                    turn: 12,
+                    wakes: 0,
+                    calls: vec![(op_id.tid, 8)],
+                }],
+            ),
+        ];
+        for (name, (turn, wakes), log) in cases {
+            let mut scheduler = rejoin_fixture(op_id, Some(server), true);
+            scheduler.rejoin_replay = Some(log.into_iter().collect());
+            scheduler.turn = turn;
+            scheduler.empty_queue_wakes = wakes;
+            assert!(scheduler.step2c_process_io_blockers().is_err(), "{name}");
+            assert!(scheduler.rejoin_refusal.is_some(), "{name}");
+            assert_eq!(
+                scheduler.blocked.external_io_blockers.get(&op_id.tid),
+                Some(&op_id),
+                "{name}"
+            );
+        }
+    }
+
+    /// A replay that ends with logged readmissions left is refused, naming
+    /// the first one; an exhausted log, or a run that is not a replay, is not.
+    #[test]
+    fn replay_refuses_a_run_that_ends_before_its_log() {
+        let op_id = ExternalOpId::new(DetTid::from_raw(21), 9);
+        let mut scheduler = rejoin_fixture(op_id, Some(DetTid::from_raw(3)), true);
+        assert_eq!(scheduler.unreplayed_rejoins(), None);
+        replaying(&mut scheduler, &[]);
+        assert_eq!(scheduler.unreplayed_rejoins(), None);
+        replaying(
+            &mut scheduler,
+            &[Rejoin {
+                turn: 999_999_999,
+                wakes: 0,
+                calls: vec![(op_id.tid, 1)],
+            }],
+        );
+        let refusal = scheduler.unreplayed_rejoins().expect("no refusal");
+        assert!(
+            refusal
+                .reason
+                .contains("1 logged readmissions not replayed, the first at turn 999999999"),
+            "{refusal}"
+        );
+    }
+
+    /// `scheduler` with `sleeper` asleep until 1 µs from now; returns the clock
+    /// and the deadline.
+    fn add_sleeper(
+        scheduler: &mut Scheduler,
+        sleeper: DetTid,
+    ) -> (Arc<Mutex<GlobalTime>>, LogicalTime) {
+        let config = Config::default();
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let deadline = global_time.lock().unwrap().as_nanos() + LogicalTime::from_nanos(1_000);
+        scheduler.blocked.timed_waiters.insert(deadline, sleeper);
+        scheduler.priorities.insert(sleeper, DEFAULT_PRIORITY);
+        scheduler.next_turns.insert(
+            sleeper,
+            ThreadNextTurn {
+                dettid: sleeper,
+                child_tid_addr: 0,
+                req: Ivar::new(),
+                resp: Ivar::new(),
+                protocol: Default::default(),
+            },
+        );
+        (global_time, deadline)
+    }
+
+    /// With a backgrounded call unfinished and nothing queued, record wakes a
+    /// thread sleeping in virtual time instead of spinning: the call may wait
+    /// on that thread (https://github.com/rrnewton/hermit/issues/3881).
+    #[test]
+    fn record_wakes_a_sleeper_while_a_backgrounded_call_runs() {
+        let op_id = ExternalOpId::new(DetTid::from_raw(21), 9);
+        let sleeper = DetTid::from_raw(5);
+        let mut scheduler = rejoin_fixture(op_id, None, false);
+        let (global_time, deadline) = add_sleeper(&mut scheduler, sleeper);
+
+        assert!(scheduler.step2_process_blocked(&global_time).is_err());
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+        assert_eq!(scheduler.empty_queue_wakes, 1);
+        assert!(scheduler.run_queue.contains_tid(sleeper));
+        assert_eq!(
+            scheduler.blocked.external_io_blockers.get(&op_id.tid),
+            Some(&op_id)
+        );
+    }
+
+    /// Replay readmits a finished call at its logged turn and wake count. At
+    /// an earlier wake count in that turn it wakes the sleeper as record did,
+    /// leaving the call parked; at the logged point it readmits the call
+    /// without waking anyone.
+    #[test]
+    fn replay_follows_the_wake_count_within_a_turn() {
+        let op_id = ExternalOpId::new(DetTid::from_raw(21), 9);
+        let sleeper = DetTid::from_raw(5);
+        let logged = Rejoin {
+            turn: 12,
+            wakes: 1,
+            calls: vec![(op_id.tid, 9)],
+        };
+
+        let mut early = rejoin_fixture(op_id, None, true);
+        let (global_time, deadline) = add_sleeper(&mut early, sleeper);
+        replaying(&mut early, std::slice::from_ref(&logged));
+        early.turn = 12;
+        assert!(early.step2_process_blocked(&global_time).is_err());
+        assert!(early.rejoin_refusal.is_none());
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+        assert_eq!(early.empty_queue_wakes, 1);
+        assert_eq!(
+            early.blocked.external_io_blockers.get(&op_id.tid),
+            Some(&op_id)
+        );
+
+        let mut due = rejoin_fixture(op_id, None, true);
+        let (global_time, deadline) = add_sleeper(&mut due, sleeper);
+        replaying(&mut due, std::slice::from_ref(&logged));
+        due.turn = 12;
+        due.empty_queue_wakes = 1;
+        assert!(due.step2_process_blocked(&global_time).is_ok());
+        assert!(due.rejoin_refusal.is_none());
+        assert!(global_time.lock().unwrap().as_nanos() < deadline);
+        assert!(due.blocked.external_io_blockers.is_empty());
+        assert!(due.run_queue.contains_tid(op_id.tid));
     }
 
     #[test]

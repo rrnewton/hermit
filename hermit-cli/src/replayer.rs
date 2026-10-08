@@ -270,7 +270,9 @@ fn fd_is_unix_socket(tid: Pid, fd: libc::c_int) -> io::Result<bool> {
     let Some(inode) = socket_inode(&target) else {
         return Ok(false);
     };
-    let table = std::fs::read_to_string(format!("/proc/{}/net/unix", tid.as_raw()))?;
+    // The table lists every Unix socket in the network namespace, and a
+    // socket's path can be any bytes, so it is not read as UTF-8.
+    let table = std::fs::read(format!("/proc/{}/net/unix", tid.as_raw()))?;
     Ok(unix_table_lists_inode(&table, inode))
 }
 
@@ -285,8 +287,8 @@ fn socket_inode(target: &std::path::Path) -> Option<u64> {
 }
 
 /// Whether a `/proc/net/unix` table has a row for `inode`, its seventh column.
-fn unix_table_lists_inode(table: &str, inode: u64) -> bool {
-    table.lines().skip(1).any(|row| {
+fn unix_table_lists_inode(table: &[u8], inode: u64) -> bool {
+    String::from_utf8_lossy(table).lines().skip(1).any(|row| {
         row.split_whitespace()
             .nth(6)
             .and_then(|column| column.parse::<u64>().ok())
@@ -2776,11 +2778,14 @@ mod shutdown_replay_tests {
 
     #[test]
     fn unix_table_rows_match_only_their_inode_column() {
-        let table = "Num       RefCount Protocol Flags    Type St Inode Path\n\
-                     0000000000000000: 00000002 00000000 00010000 0001 01 23456 /run/a\n\
-                     0000000000000000: 00000003 00000000 00000000 0001 03 34567\n";
+        // A path need not be UTF-8 (the second row's).
+        let table = b"Num       RefCount Protocol Flags    Type St Inode Path\n\
+                      0000000000000000: 00000002 00000000 00010000 0001 01 23456 /run/a\n\
+                      0000000000000000: 00000002 00000000 00010000 0001 01 45678 @\xff\x01\n\
+                      0000000000000000: 00000003 00000000 00000000 0001 03 34567\n";
         assert!(unix_table_lists_inode(table, 23456));
         assert!(unix_table_lists_inode(table, 34567));
+        assert!(unix_table_lists_inode(table, 45678));
         assert!(!unix_table_lists_inode(table, 2));
         assert!(!unix_table_lists_inode(table, 10000));
         assert_eq!(

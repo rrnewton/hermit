@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use nix::fcntl::OFlag;
 use reverie::syscalls::Errno;
@@ -101,6 +102,48 @@ pub struct DetFd {
     fd_flags: i32,
     /// State shared by every descriptor referring to the same Linux `struct file`.
     open_file: Arc<Mutex<OpenFileState>>,
+}
+
+/// A socket's receive timeout (`SO_RCVTIMEO`, socket(7)), as the guest set it.
+// TODO-HUMAN-REVIEW(PR-3908)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ReceiveTimeout {
+    /// No timeout: a blocking call waits indefinitely. Also what a zero
+    /// value sets.
+    #[default]
+    None,
+    /// A negative second count, which Linux stores as a zero timeout, so a
+    /// blocking call fails at once with `EAGAIN`. `getsockopt` reads it back
+    /// as zero, the same as `None`.
+    Immediate,
+    /// Wait at most this long. Never so long that Linux stores no timeout.
+    After(Duration),
+    /// Set by a call whose value Detcore could not read.
+    Unknown,
+}
+
+impl ReceiveTimeout {
+    /// The timeout a successful `setsockopt(SO_RCVTIMEO)` with `value` sets.
+    /// (Linux has already refused a microsecond count out of range.)
+    ///
+    /// Linux stores a second count too large to count in scheduler ticks, at
+    /// least `LONG_MAX / HZ - 1`, as no timeout (`MAX_SCHEDULE_TIMEOUT`), so
+    /// such an accept restarts after a signal like an untimed one. The model
+    /// takes the bound for the largest `HZ`, 1000; on a kernel with a smaller
+    /// `HZ`, record's check against the kernel refuses a value between the two.
+    pub(crate) fn set_by(value: libc::timeval) -> Self {
+        const UNBOUNDED_SECONDS: libc::time_t = libc::time_t::MAX / 1000 - 1;
+        if value.tv_sec < 0 {
+            Self::Immediate
+        } else if (value.tv_sec == 0 && value.tv_usec == 0) || value.tv_sec >= UNBOUNDED_SECONDS {
+            Self::None
+        } else {
+            Self::After(
+                Duration::from_secs(value.tv_sec as u64)
+                    + Duration::from_micros(value.tv_usec.max(0) as u64),
+            )
+        }
+    }
 }
 
 /// Where the model of one open file description lives.
@@ -354,6 +397,23 @@ struct OpenFileDescription {
     /// eventfd for it. See `is_accepted_connection`.
     #[serde(default)]
     accepted_connection: bool,
+    /// True when record/replay runs a blocking `accept(2)` on this socket in
+    /// the caller's turn, one nonblocking attempt at a time. `socket(2)` sets
+    /// it for a stream socket the container created. See
+    /// `is_accept_in_turn_listener`.
+    // TODO-HUMAN-REVIEW(PR-3908)
+    #[serde(default)]
+    accept_in_turn_eligible: bool,
+    /// True once this socket was named in an `SCM_RIGHTS` message, so a
+    /// process outside Detcore's view may hold it. Permanent. See
+    /// `is_exported`.
+    #[serde(default)]
+    exported: bool,
+    /// The receive timeout the last successful `setsockopt(SO_RCVTIMEO)` on
+    /// this socket set, which a blocking accept in turn waits by. See
+    /// `receive_timeout`.
+    #[serde(default)]
+    receive_timeout: ReceiveTimeout,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#2373)
     /// The `flock(2)` mode this open file description currently holds, as the
@@ -441,6 +501,9 @@ impl DetFd {
                 network_socket: NetworkSocketKind::NotInet,
                 socketpair_endpoint: false,
                 accepted_connection: false,
+                accept_in_turn_eligible: false,
+                exported: false,
+                receive_timeout: ReceiveTimeout::None,
                 flock_mode: None,
                 flock_mode_known: true,
                 flock_mode_ever_known: true,
@@ -1060,6 +1123,49 @@ impl DetFd {
     /// Whether `accept(2)` or `accept4(2)` returned this open file.
     pub(crate) fn is_accepted_connection(&self) -> bool {
         self.with_description(|d| d.accepted_connection)
+    }
+
+    /// Mark this open file as a listener whose blocking `accept(2)` runs in
+    /// the caller's turn under record/replay. It applies to the open file
+    /// description, so dup and fork aliases are covered too.
+    pub(crate) fn set_accept_in_turn_eligible(&self) {
+        self.with_description(|d| d.accept_in_turn_eligible = true);
+    }
+
+    /// Whether a blocking `accept(2)` on this open file runs in the caller's
+    /// turn: it was marked eligible and has not been exported.
+    pub(crate) fn is_accept_in_turn_listener(&self) -> bool {
+        self.with_description(|d| d.accept_in_turn_eligible && !d.exported)
+    }
+
+    /// Whether this open file was marked eligible, exported or not.
+    pub(crate) fn is_accept_in_turn_eligible(&self) -> bool {
+        self.with_description(|d| d.accept_in_turn_eligible)
+    }
+
+    /// Mark this open file as passed over `SCM_RIGHTS`. Permanent.
+    pub(crate) fn set_exported(&self) {
+        self.with_description(|d| d.exported = true);
+    }
+
+    /// Whether this open file was passed over `SCM_RIGHTS`.
+    pub(crate) fn is_exported(&self) -> bool {
+        self.with_description(|d| d.exported)
+    }
+
+    /// Record the receive timeout a successful `setsockopt(SO_RCVTIMEO)` set.
+    pub(crate) fn set_receive_timeout(&self, timeout: ReceiveTimeout) {
+        self.with_description(|d| d.receive_timeout = timeout);
+    }
+
+    /// The receive timeout `setsockopt(SO_RCVTIMEO)` calls set through any
+    /// descriptor Detcore tracks for this open file description, dup, fork and
+    /// exec aliases included. A copy that reached a guest some other way, which
+    /// Detcore tracks as a description of its own, does not update it; record
+    /// checks the model against the kernel before a blocking accept relies on
+    /// it.
+    pub(crate) fn receive_timeout(&self) -> ReceiveTimeout {
+        self.with_description(|d| d.receive_timeout)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED

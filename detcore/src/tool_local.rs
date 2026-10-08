@@ -92,6 +92,17 @@ pub struct FileMetadata {
     /// Deserialization restores aliasing (`crate::fd::intern_open_files`).
     #[serde(deserialize_with = "deserialize_interned_file_handles")]
     pub(crate) file_handles: HashMap<RawFd, DetFd>,
+    /// Blocking accepts waiting in this table, each as (operation, listener):
+    /// a `close` of a listener here is refused while an accept waits on it
+    /// (`crate::syscalls::accept_in_turn`). Waits never cross a fork or an
+    /// exec: a fork's child and an exec'd task start with none, and each wait
+    /// removes only its own entry, from the table it registered in.
+    // TODO-HUMAN-REVIEW(PR-3908)
+    #[serde(skip)]
+    accept_waits: Vec<(u64, RawFd)>,
+    /// The next accept-wait operation number in this table.
+    #[serde(skip)]
+    next_accept_wait: u64,
 }
 
 /// Deserializes a descriptor table with its aliases restored, so a table
@@ -484,13 +495,39 @@ mod record_or_replay_error_tests {
 
 impl FileMetadata {
     /// create an empty file metadata
-    fn new(owner: DetTid) -> Self {
+    pub(crate) fn new(owner: DetTid) -> Self {
         FileMetadata {
             files_id: FilesId::initial(owner),
             next_open_file_sequence: 0,
             next_socket_open_file_sequence: 0,
             file_handles: HashMap::new(),
+            accept_waits: Vec::new(),
+            next_accept_wait: 0,
         }
+    }
+
+    /// Register a blocking accept waiting on `listener` and return the
+    /// operation number that removes it again.
+    pub(crate) fn add_accept_wait(&mut self, listener: RawFd) -> u64 {
+        let operation = self.next_accept_wait;
+        self.next_accept_wait += 1;
+        self.accept_waits.push((operation, listener));
+        operation
+    }
+
+    /// Remove the accept wait registered as `operation`, if it is here.
+    pub(crate) fn remove_accept_wait(&mut self, operation: u64) {
+        self.accept_waits
+            .retain(|(waiting, _)| *waiting != operation);
+    }
+
+    /// The lowest descriptor in `fds` that a blocking accept waits on.
+    pub(crate) fn waited_listener_in(&self, fds: std::ops::RangeInclusive<u32>) -> Option<RawFd> {
+        self.accept_waits
+            .iter()
+            .map(|(_, listener)| *listener)
+            .filter(|listener| u32::try_from(*listener).is_ok_and(|fd| fds.contains(&fd)))
+            .min()
     }
 
     fn allocate_open_file_id(&mut self, creator: DetTid, ty: FdType) -> OpenFileId {
@@ -582,6 +619,8 @@ impl FileMetadata {
             next_open_file_sequence: self.next_open_file_sequence,
             next_socket_open_file_sequence: self.next_socket_open_file_sequence,
             file_handles: self.file_handles.clone(),
+            accept_waits: Vec::new(),
+            next_accept_wait: 0,
         }
     }
 
@@ -595,6 +634,8 @@ impl FileMetadata {
                 .iter()
                 .filter_map(|(&fd, detfd)| (!detfd.is_cloexec()).then_some((fd, detfd.clone())))
                 .collect(),
+            accept_waits: Vec::new(),
+            next_accept_wait: 0,
         }
     }
 
@@ -2871,6 +2912,18 @@ impl<T> ThreadState<T> {
             .collect();
         fds.sort_unstable();
         fds
+    }
+
+    /// Mark every listener in this table eligible for accept in turn as passed
+    /// over `SCM_RIGHTS` (`DetFd::set_exported`), for a message whose
+    /// descriptors Detcore could not read.
+    // TODO-HUMAN-REVIEW(PR-3908)
+    pub(crate) fn mark_accept_in_turn_listeners_exported(&self) {
+        for detfd in self.metadata().file_handles.values() {
+            if detfd.is_accept_in_turn_eligible() {
+                detfd.set_exported();
+            }
+        }
     }
 
     /// Descriptors in this table that name a network record/replay channel,

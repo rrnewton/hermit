@@ -3162,8 +3162,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Exit(s) => self.handle_exit(guest, s).await,
 
                 Syscall::Dup(w) => self.handle_dup(guest, w).await.map_err(Into::into),
-                Syscall::Dup2(w) => self.handle_dup2(guest, w).await.map_err(Into::into),
-                Syscall::Dup3(w) => self.handle_dup3(guest, w).await.map_err(Into::into),
+                Syscall::Dup2(w) => self.handle_dup2(guest, w).await,
+                Syscall::Dup3(w) => self.handle_dup3(guest, w).await,
                 Syscall::Pipe(w) => self.handle_pipe2(guest, w.into()).await,
                 Syscall::Pipe2(w) => self.handle_pipe2(guest, w).await,
                 Syscall::Getrandom(s) => self.handle_getrandom(guest, s).await,

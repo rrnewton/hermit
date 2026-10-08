@@ -1991,6 +1991,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Close,
     ) -> Result<i64, Error> {
         let fd = call.fd();
+        if let Ok(waited) = u32::try_from(fd)
+            && let Some(refusal) = self
+                .refuse_close_of_waited_listener(guest, Sysno::close, waited..=waited)
+                .await
+        {
+            return refusal;
+        }
         let res = self.record_or_replay(guest, call).await;
         let fd_was_released = !matches!(res, Err(Errno::EBADF) | Err(Errno::ERESTARTSYS));
         if fd_was_released {
@@ -2024,6 +2031,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         let flags = args.arg2 as u32;
         if flags != 0 {
             return Err(Errno::ENOSYS.into());
+        }
+        if first <= last
+            && let Some(refusal) = self
+                .refuse_close_of_waited_listener(guest, Sysno::close_range, first..=last)
+                .await
+        {
+            return refusal;
         }
 
         let result = self.record_or_replay(guest, call).await;
@@ -4769,9 +4783,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         call: syscalls::Dup2,
-    ) -> Result<i64, Errno> {
+    ) -> Result<i64, Error> {
         let old_fd = call.oldfd();
         let new_fd = call.newfd();
+        if let Some(refusal) = self
+            .refuse_dup_over_waited_listener(guest, Sysno::dup2, old_fd, new_fd)
+            .await
+        {
+            return refusal;
+        }
         let res = self.record_or_replay(guest, call).await?;
         let replaced = guest
             .thread_state_mut()
@@ -4782,15 +4802,40 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(res)
     }
 
+    /// Refuse a `dup2` or `dup3` that would close `new_fd` while a blocking
+    /// accept waits on it. With `old_fd == new_fd` neither call closes
+    /// anything. The check comes before the call, so a call that would fail
+    /// for another reason (a bad `old_fd`) is refused as well.
+    async fn refuse_dup_over_waited_listener<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        old_fd: RawFd,
+        new_fd: RawFd,
+    ) -> Option<Result<i64, Error>> {
+        if old_fd == new_fd {
+            return None;
+        }
+        let new_fd = u32::try_from(new_fd).ok()?;
+        self.refuse_close_of_waited_listener(guest, sysno, new_fd..=new_fd)
+            .await
+    }
+
     /// dup3 system call.
     pub async fn handle_dup3<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Dup3,
-    ) -> Result<i64, Errno> {
+    ) -> Result<i64, Error> {
         let old_fd = call.oldfd();
         let new_fd = call.newfd();
         let flags = call.flags();
+        if let Some(refusal) = self
+            .refuse_dup_over_waited_listener(guest, Sysno::dup3, old_fd, new_fd)
+            .await
+        {
+            return refusal;
+        }
         let res = self.record_or_replay(guest, call).await?;
         let replaced = guest.thread_state_mut().dup_fd(old_fd, new_fd, flags)?;
         if let Some(open_file_id) = replaced {
@@ -5199,6 +5244,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await?;
             self.mark_sock_diag_fd(guest, fd, &call);
+            // Linux's SOCK_TYPE_MASK: the type without SOCK_NONBLOCK and SOCK_CLOEXEC.
+            const SOCK_TYPE_MASK: i32 = 0xf;
+            if self.accept_in_turn_enabled() && call.r#type() & SOCK_TYPE_MASK == libc::SOCK_STREAM
+            {
+                guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.set_accept_in_turn_eligible())?;
+            }
             Ok(fd as i64)
         } else {
             // Under run mode, force all sockets to be registered to be nonblocking in the OS:
@@ -5222,6 +5275,19 @@ impl<T: RecordOrReplay> Detcore<T> {
 
             Ok(fd as i64)
         }
+    }
+
+    // TODO-HUMAN-REVIEW(PR-3908)
+    /// Whether record/replay runs a blocking `accept(2)` on a stream socket
+    /// the container created in the caller's turn
+    /// (https://github.com/rrnewton/hermit/issues/3880). The temporary
+    /// `O_NONBLOCK` around each attempt goes through Detcore's own copy of the
+    /// listener (`AcceptBracket`), which needs a tool outside the guest's
+    /// descriptor table, as under ptrace.
+    pub(crate) fn accept_in_turn_enabled(&self) -> bool {
+        self.cfg.recordreplay_modes
+            && self.cfg.use_nonblocking_sockets()
+            && !self.cfg.backend.tool_shares_guest_descriptor_table
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -5315,12 +5381,39 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Apply a socket option to an already tracked socket. Record mode captures
     /// the result; replay re-applies a successful option before later socket I/O,
     /// which remains mediated by Detcore's nonblocking scheduler paths.
+    ///
+    /// Under record and replay a successful `SO_RCVTIMEO` also sets the
+    /// socket's modeled receive timeout (`DetFd::receive_timeout`), which a
+    /// blocking accept in turn waits by. The value is read before the call,
+    /// from the same guest memory in both phases.
     pub async fn handle_setsockopt<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Setsockopt,
     ) -> Result<i64, Error> {
-        Ok(self.record_or_replay(guest, call).await?)
+        // TODO-HUMAN-REVIEW(PR-3908)
+        const SO_RCVTIMEO_NEW: i32 = 66;
+        let receive_timeout = (self.accept_in_turn_enabled()
+            && call.level() == libc::SOL_SOCKET
+            && matches!(call.optname(), libc::SO_RCVTIMEO | SO_RCVTIMEO_NEW))
+        .then(|| {
+            // On x86_64 both forms take 16 bytes: seconds, then microseconds.
+            call.optval()
+                .and_then(|value| {
+                    guest
+                        .memory()
+                        .read_value::<_, libc::timeval>(value.cast())
+                        .ok()
+                })
+                .map_or(ReceiveTimeout::Unknown, ReceiveTimeout::set_by)
+        });
+        let result = self.record_or_replay(guest, call).await?;
+        if let Some(timeout) = receive_timeout {
+            let _ = guest
+                .thread_state()
+                .with_detfd(call.fd(), |detfd| detfd.set_receive_timeout(timeout));
+        }
+        Ok(result)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -5994,14 +6087,33 @@ impl<T: RecordOrReplay> Detcore<T> {
         // This option applies both to the socket we're doing the accept call on, and the connection
         // that we return. We don't have any smart detection yet to separate internal/external, so
         // applies to everything.
-        let call2 = if self.cfg.use_nonblocking_sockets() {
+        //
+        // Record and replay leave the connection as the guest asked, as `handle_socket` does.
+        // Their reads and writes on it run as backgrounded blocking calls, and on a physically
+        // nonblocking connection such a call returns EAGAIN to a guest that asked to block
+        // (https://github.com/rrnewton/hermit/issues/3882). The rejoin log orders their results.
+        // TODO-HUMAN-REVIEW(PR-3908)
+        let physically_nonblocking =
+            self.cfg.use_nonblocking_sockets() && !self.cfg.recordreplay_modes;
+        let call2 = if physically_nonblocking {
             // Let the socket returned from accept4 be physically nonblocking:
             call.with_flags(call.flags() | SockFlag::SOCK_NONBLOCK)
         } else {
             call
         };
-        // This will do blocking/polling as appropriate based on the fd status:
-        let fd = self.execute_nonblockable_fd_syscall(guest, call2).await? as RawFd;
+        let in_turn = self.accept_in_turn_enabled()
+            && guest
+                .thread_state()
+                .with_detfd(call.sockfd(), |detfd| detfd.is_accept_in_turn_listener())
+                .unwrap_or(false);
+        let fd = if in_turn {
+            // Record and replay run the accept in the caller's turn, so the new descriptor's
+            // number is allocated deterministically (https://github.com/rrnewton/hermit/issues/3880).
+            self.accept_in_turn(guest, call2).await? as RawFd
+        } else {
+            // This will do blocking/polling as appropriate based on the fd status:
+            self.execute_nonblockable_fd_syscall(guest, call2).await? as RawFd
+        };
 
         self.add_fd(
             guest,
@@ -6015,7 +6127,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             .thread_state()
             .with_detfd(fd, |detfd| detfd.set_accepted_connection())?;
 
-        self.maybe_set_nonblocking_fd(guest, fd);
+        if physically_nonblocking {
+            self.maybe_set_nonblocking_fd(guest, fd);
+        }
 
         Ok(fd as i64)
     }

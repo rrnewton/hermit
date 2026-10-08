@@ -25,7 +25,7 @@ pub const REQUIRED_ENV: &str = "HERMIT_PREPARED_NEXTEST_REQUIRED";
 pub const PACKAGE: &str = "hermetic_infra_hermit_tests";
 pub const C_FLAGS: [&str; 3] = ["-O0", "-g", "-pthread"];
 
-pub const C_SOURCES: [(&str, &str); 43] = [
+pub const C_SOURCES: [(&str, &str); 44] = [
     ("c_getpid", "tests/c/getpid.c"),
     ("c_getsockopt_null", "tests/c/getsockopt_null.c"),
     ("c_setsockopt_replay", "tests/c/record_replay_setsockopt.c"),
@@ -93,6 +93,10 @@ pub const C_SOURCES: [(&str, &str); 43] = [
     (
         "c_record_replay_socket_mmsg",
         "tests/c/record_replay_socket_mmsg.c",
+    ),
+    (
+        "c_record_replay_accept_in_turn",
+        "tests/c/record_replay_accept_in_turn.c",
     ),
     (
         "c_record_replay_sigchld_ignored_boundary",

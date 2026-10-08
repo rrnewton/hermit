@@ -1352,6 +1352,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_accept_in_turn.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_accept_in_turn.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration suite compiles this workload and checks that a blocking accept on a listener the container created waits for a late connector, times out, restarts or fails on a signal, and reports a reset, a shutdown and a nonblocking listener as Linux does, under record and under replay; that a killed accepting process leaves the listener blocking; and that record refuses by name to export a listener or close one while an accept still waits on it. Each expected line is what the guest prints natively."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/record_replay_deep_fork_chain.c",
       "runner": "hermit-cli/tests/record_replay.rs",
       "why": "tests/c/record_replay_deep_fork_chain.c is owned by hermit-cli/tests/record_replay.rs: The dedicated integration suite compiles this process-tree workload and asserts recording-stream behavior across a deep fork chain, including lifecycle setup not represented by a generic manifest row."

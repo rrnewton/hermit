@@ -2429,7 +2429,7 @@ mod tests {
         let population = record_workloads::consume_prepared(true, Some(&raw))
             .unwrap()
             .unwrap();
-        assert_eq!(population.len(), 60);
+        assert_eq!(population.len(), 61);
         assert_eq!(
             population.iter().map(|w| w.name).collect::<BTreeSet<_>>(),
             record_workloads::names().collect()

@@ -1199,7 +1199,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 981: 997.
     // happens_before::tests::launch_refuses_every_anchor_it_cannot_enforce
     // retains all 997: 998.
-    ("test.hermit_unit", 998),
+    // metadata::tests::record_version_rejects_backgrounded_accept_streams
+    // (https://github.com/rrnewton/hermit/pull/3908) retains all 998: 999,
+    // listed with this node's arguments less the five skipped real_random_
+    // tests.
+    ("test.hermit_unit", 999),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1543,7 +1547,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1184: 1186.
     // scheduler::test::checkpoint_fires_count_and_occurrence_anchors_reached_at_one_syscall
     // and unfired_occurrence_anchor_is_reported_by_name retain all 1186: 1188.
-    ("test.detcore_unit", 1188),
+    // Eight scheduler rejoin tests, two rejoin_log tests and four
+    // syscalls::accept_in_turn tests
+    // (https://github.com/rrnewton/hermit/pull/3908) retain all 1188: 1202,
+    // listed with this node's arguments.
+    ("test.detcore_unit", 1202),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1732,7 +1740,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // replay_reapplies_socket_calls_against_the_calling_threads_own_fd_table
     // (the same pull request) adds one and retains all 123 (`cargo nextest
     // list` lists 125).
-    ("test.record_replay", 124),
+    // Fourteen blocking-accept and rejoin-log tests
+    // (record_replay_blocking_accept_*, record_replay_accept_entry_cases_*,
+    // record_blocking_accept_*, record_accept_*, recording_refuses_* and
+    // replay_refuses_a_missing_or_unexhausted_rejoin_log,
+    // https://github.com/rrnewton/hermit/pull/3908) add fourteen and retain
+    // all 124 (`cargo nextest list` lists 139).
+    ("test.record_replay", 138),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -2251,7 +2265,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the ten child-exit SIGCHLD tests: 1184.
     // And the same two refused-turn-charge tests: 1186.
     // And the two happens-before syscall-occurrence scheduler tests: 1188.
-    ("test.detcore_unit_on_host", 1188),
+    // And the same fourteen rejoin and accept-in-turn tests: 1202.
+    ("test.detcore_unit_on_host", 1202),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -2348,7 +2363,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the scheduler-turn-cost CLI test: 981.
     // And the same sixteen run config tests: 997.
     // The same launch refusal test: 998.
-    ("test.hermit_unit_on_host", 998),
+    // And the same backgrounded-accept record-version test: 999.
+    ("test.hermit_unit_on_host", 999),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

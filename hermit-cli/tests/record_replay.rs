@@ -2647,8 +2647,41 @@ fn record_replay_output_failures(
     args: &[&str],
     expected: &str,
 ) -> Vec<String> {
+    record_replay_output_failures_with_env(label, program, args, &[], expected).0
+}
+
+/// As `record_replay_output_failures`, with `envs` set for Hermit in both
+/// phases. Also returns the stderr of each phase that ran, record first.
+fn record_replay_output_failures_with_env(
+    label: &str,
+    program: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    expected: &str,
+) -> (Vec<String>, Vec<String>) {
+    record_replay_output_failures_with(
+        label,
+        program,
+        args,
+        &|command| {
+            command.envs(envs.iter().copied());
+        },
+        expected,
+    )
+}
+
+/// As `record_replay_output_failures_with_env`, with `configure` applied to
+/// the command of each phase.
+fn record_replay_output_failures_with(
+    label: &str,
+    program: &Path,
+    args: &[&str],
+    configure: &dyn Fn(&mut Command),
+    expected: &str,
+) -> (Vec<String>, Vec<String>) {
     let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
     let mut record = Command::new("timeout");
+    configure(&mut record);
     record
         .args(["--kill-after=5s", "45s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
@@ -2658,28 +2691,32 @@ fn record_replay_output_failures(
         .arg(program)
         .args(args);
     let mut replay = Command::new("timeout");
+    configure(&mut replay);
     replay
         .args(["--kill-after=5s", "45s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args(["--log=off", "replay", "--autopilot"])
         .arg(format!("--data-dir={}", data_dir.path().display()));
     let mut failures = Vec::new();
+    let mut stderrs = Vec::new();
     for (phase, mut command) in [("record", record), ("replay", replay)] {
         let output = command
             .output()
             .unwrap_or_else(|error| panic!("failed to start {label} {phase}: {error}"));
         let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         if !output.status.success() || stdout != expected {
             failures.push(format!(
-                "{label} {phase}: status {}\nstdout:\n{stdout}stderr:\n{}",
+                "{label} {phase}: status {}\nstdout:\n{stdout}stderr:\n{stderr}",
                 output.status,
-                String::from_utf8_lossy(&output.stderr),
             ));
+            stderrs.push(stderr);
             // A replay of a failed recording says nothing more.
             break;
         }
+        stderrs.push(stderr);
     }
-    failures
+    (failures, stderrs)
 }
 
 /// Control for the socketpair test below: a pipe read already waits for its
@@ -3041,6 +3078,599 @@ fn assert_threaded_accept_replays_agree(guest_args: &[&str]) {
         "all {REPLAYS} replays {}",
         if finished { "finished" } else { "refused" }
     );
+}
+
+/// Record's refusal of a close, `dup2`/`dup3` or `close_range` that would
+/// close a listener a blocking accept still waits on, as Detcore prints it.
+const ACCEPT_CLOSE_REFUSAL: &str = "hermit refused the recording: a descriptor was closed \
+    while a blocking accept still waits on its listener";
+
+/// Record's refusal of an accept whose listener was passed over `SCM_RIGHTS`
+/// while it waited, as Detcore prints it.
+const ACCEPT_EXPORT_REFUSAL: &str = "hermit refused the recording: a blocking accept's \
+    listener was passed over SCM_RIGHTS while the accept waited";
+
+/// Record's refusal of an accept whose listener's file status flags could
+/// not be restored after its nonblocking attempt, as Detcore prints it.
+const ACCEPT_RESTORE_REFUSAL: &str = "hermit refused the recording: an accept could not \
+    restore its listener's file status flags";
+
+/// What Detcore prints when `HERMIT_TEST_ACCEPT_BRACKET_FAULT=kill-after-set`
+/// kills the accepting task while its listener is temporarily nonblocking.
+const ACCEPT_BRACKET_KILL_NOTICE: &str =
+    "accept bracket fault: killed the accepting task after the temporary O_NONBLOCK";
+
+/// Records and replays `mode` of `tests/c/record_replay_accept_in_turn.c` and
+/// returns a failure for each phase whose output is not `expected`.
+fn accept_in_turn_failures(mode: &str, expected: &str) -> Vec<String> {
+    record_replay_output_failures(
+        mode,
+        &workload("c_record_replay_accept_in_turn").path,
+        &[mode],
+        expected,
+    )
+}
+
+/// Records `mode` of `tests/c/record_replay_accept_in_turn.c` with `envs` set
+/// and requires the recording to stop with `refusal` on stderr, without
+/// hanging and before the guest prints the line that names `mode`.
+fn assert_accept_in_turn_recording_refuses(mode: &str, envs: &[(&str, &str)], refusal: &str) {
+    assert_recording_refuses(
+        mode,
+        &workload("c_record_replay_accept_in_turn").path,
+        &[mode],
+        &|command| {
+            command.envs(envs.iter().copied());
+        },
+        refusal,
+    );
+}
+
+/// Records `program` with `args` and `configure` applied to the command, and
+/// requires the recording to stop with `refusal` on stderr, without hanging
+/// and before the guest prints a line starting with `mode`.
+fn assert_recording_refuses(
+    mode: &str,
+    program: &Path,
+    args: &[&str],
+    configure: &dyn Fn(&mut Command),
+    refusal: &str,
+) {
+    let data_dir = tempfile::tempdir().expect("failed to create recording directory");
+    let mut command = Command::new("timeout");
+    configure(&mut command);
+    command
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "record", "start", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg("--")
+        .arg(program)
+        .args(args);
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start the {mode} recording: {error}"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_ne!(
+        output.status.code(),
+        Some(124),
+        "{mode} recording hung: {rendered}"
+    );
+    assert!(
+        !output.status.success(),
+        "{mode} recording reported success: {rendered}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(refusal),
+        "{mode} recording did not refuse with {refusal:?}:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains(&format!("{mode}: ")),
+        "the {mode} guest ran past the refusal: {stdout}"
+    );
+}
+
+/// A blocking accept on a listener the container created runs in the
+/// caller's turn, one nonblocking attempt at a time, until a connection
+/// arrives, its `SO_RCVTIMEO` expires or a signal ends it (see
+/// `tests/c/record_replay_accept_in_turn.c`). Record used to run it in the
+/// background, so the kernel chose the accepted descriptor's number at a
+/// host-timed point (https://github.com/rrnewton/hermit/issues/3880). Each
+/// case must print, under record and under replay, exactly what it prints
+/// natively; every case runs, so a failure reports all the cases it affects.
+#[test]
+fn record_replay_blocking_accept_in_turn_matches_linux() {
+    let _guard = hermit_record_lock();
+    let failures: Vec<String> = [
+        (
+            "late-connector",
+            "late-connector: accept=fd echoed=4 helper=0\n",
+        ),
+        ("reset", "reset: accept=fd read=-1 ECONNRESET\n"),
+        (
+            "sibling-setfl",
+            "sibling-setfl: accept=fd echoed=4 helper=0 nonblock-after=1\n",
+        ),
+        ("timeout-dup", "timeout-dup: original=EAGAIN dup=EAGAIN\n"),
+        ("shutdown", "shutdown: shutdown=0 accept=EINVAL\n"),
+        (
+            "nonblocking",
+            "nonblocking: empty=EAGAIN queued=fd conn-nonblock=1\n",
+        ),
+        ("accept-once", "accept-once: accept=fd echoed=4 client=1\n"),
+    ]
+    .into_iter()
+    .flat_map(|(mode, expected)| accept_in_turn_failures(mode, expected))
+    .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A handled signal ends a waiting accept as Linux ends it (signal(7)): an
+/// untimed accept whose handler has `SA_RESTART` restarts and takes the
+/// connection that comes later; without `SA_RESTART`, or on a listener with
+/// `SO_RCVTIMEO`, it fails with `EINTR`. An `SO_RCVTIMEO` of `{LONG_MAX, 0}`,
+/// which Linux stores as no timeout, restarts like an untimed accept.
+#[test]
+fn record_replay_blocking_accept_signals_match_linux() {
+    let _guard = hermit_record_lock();
+    let failures: Vec<String> = [
+        (
+            "signal-restart",
+            "signal-restart: accept=fd echoed=4 handled=1 helper=0\n",
+        ),
+        (
+            "signal-norestart",
+            "signal-norestart: accept=EINTR echoed=-1 handled=1 helper=0\n",
+        ),
+        (
+            "signal-timed-restart",
+            "signal-timed-restart: accept=EINTR echoed=-1 handled=1 helper=0\n",
+        ),
+        (
+            "signal-timed-norestart",
+            "signal-timed-norestart: accept=EINTR echoed=-1 handled=1 helper=0\n",
+        ),
+        (
+            "signal-unbounded-restart",
+            "signal-unbounded-restart: accept=fd echoed=4 handled=1 helper=0\n",
+        ),
+    ]
+    .into_iter()
+    .flat_map(|(mode, expected)| accept_in_turn_failures(mode, expected))
+    .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A blocking accept that nothing connects to never returns on Linux. Under
+/// record it must keep waiting until `--record-timeout` ends the recording,
+/// rather than return early or stall the host.
+#[test]
+fn record_blocking_accept_without_a_connector_waits_for_the_record_timeout() {
+    let _guard = hermit_record_lock();
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let started = Instant::now();
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "record", "start", "--record-timeout=2"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg("--")
+        .arg(&workload("c_record_replay_accept_in_turn").path)
+        .arg("unwakeable");
+    let output = command.output().expect("failed to start the recording");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Hermit's deadline and the outer `timeout` both exit 124, so the elapsed
+    // time and the deadline's message tell them apart.
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "recording hung past its deadline: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(124),
+        "recording did not end with the deadline's status:\nstdout:\n{stdout}stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Recording timed out after 2 seconds"),
+        "the recording did not end at its deadline:\nstdout:\n{stdout}stderr:\n{stderr}"
+    );
+    assert_eq!(stdout, "", "the accept returned without a connection");
+}
+
+/// Unit coverage of the guard behind the accept bracket lives in Detcore
+/// (`accept_bracket_guard_restores_on_drop`). Here, a forked child waits in
+/// accept on its parent's listener, and the test-only fault hook kills it just
+/// after Detcore made the shared description nonblocking for one attempt. The
+/// guard must restore the flags through Detcore's own copy of the listener, so
+/// the parent sees a blocking listener and its own accept waits for a delayed
+/// connector. Replay kills the child at the same point.
+#[test]
+fn record_accept_bracket_kill_restores_a_forked_listener() {
+    let _guard = hermit_record_lock();
+    let (failures, stderrs) = record_replay_output_failures_with_env(
+        "bracket-kill",
+        &workload("c_record_replay_accept_in_turn").path,
+        &["bracket-kill"],
+        &[("HERMIT_TEST_ACCEPT_BRACKET_FAULT", "kill-after-set")],
+        "bracket-kill: child-killed=1 nonblock=0 accept=fd echoed=4 client=1\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(
+        stderrs[0].contains(ACCEPT_BRACKET_KILL_NOTICE),
+        "the fault hook never killed the accepting child during record:\n{}",
+        stderrs[0]
+    );
+}
+
+/// When the accept bracket cannot restore its listener's flags, the shared
+/// description would stay nonblocking for every other alias, so record must
+/// stop and say why.
+#[test]
+fn recording_refuses_a_failed_accept_bracket_restore() {
+    let _guard = hermit_record_lock();
+    assert_accept_in_turn_recording_refuses(
+        "accept-once",
+        &[("HERMIT_TEST_ACCEPT_BRACKET_FAULT", "restore-fails")],
+        ACCEPT_RESTORE_REFUSAL,
+    );
+}
+
+/// Once a listener has been passed over `SCM_RIGHTS`, a process outside
+/// Detcore's view may hold it, so the bracket must not change its flags
+/// again. An accept already waiting on it must refuse by name at its next
+/// attempt, whether the listener went in a `sendmsg`, in the second message
+/// of a `sendmmsg`, or in a `sendmsg` that failed (Linux may still have
+/// queued it, and both phases must decide alike).
+#[test]
+fn recording_refuses_an_accept_whose_listener_is_exported_mid_wait() {
+    let _guard = hermit_record_lock();
+    for mode in [
+        "export-sendmsg",
+        "export-sendmmsg-second",
+        "export-failed-send",
+    ] {
+        assert_accept_in_turn_recording_refuses(mode, &[], ACCEPT_EXPORT_REFUSAL);
+    }
+}
+
+/// Each waiting accept guards its listener with its own entry. When one of
+/// two waiters returns, a close must still be refused because of the other;
+/// once both have returned, the close goes ahead.
+#[test]
+fn record_accept_close_guard_is_per_operation() {
+    let _guard = hermit_record_lock();
+    assert_accept_in_turn_recording_refuses("close-one-left", &[], ACCEPT_CLOSE_REFUSAL);
+    let failures = accept_in_turn_failures(
+        "close-both-done",
+        "close-both-done: close=0 clients=0,0 accepted=1,1\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A process that shares the waiter's descriptor table (`CLONE_FILES`, not a
+/// thread) and then execs gets a table of its own, without the waiter's
+/// guards, so it may close its copy of the listener. The waiter's table
+/// keeps its guard: a later close there is refused.
+#[test]
+fn record_accept_close_guard_does_not_follow_exec() {
+    let _guard = hermit_record_lock();
+    let failures = accept_in_turn_failures(
+        "exec-sharer-close",
+        "close-helper: open=1 close=0\n\
+         exec-sharer-close: sharer=1 close=skipped helper=0 accepted=1\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert_accept_in_turn_recording_refuses("exec-sharer-then-close", &[], ACCEPT_CLOSE_REFUSAL);
+}
+
+/// A sharer whose exec fails still shares the waiter's table, guards
+/// included, so its close of the listener must be refused.
+#[test]
+fn record_accept_close_guard_survives_a_failed_exec() {
+    let _guard = hermit_record_lock();
+    assert_accept_in_turn_recording_refuses("failed-exec-close", &[], ACCEPT_CLOSE_REFUSAL);
+}
+
+/// Record's refusal of an accept whose listener Detcore cannot copy or make
+/// nonblocking for one attempt, as Detcore prints it.
+const ACCEPT_SET_REFUSAL: &str = "hermit refused the recording: an accept could not make \
+    its listener nonblocking for one attempt";
+
+/// Each case queues its connection before the accept, so none depends on a
+/// timer, a signal or another thread, and each must print under record and
+/// replay what it prints natively (see `tests/c/record_replay_accept_in_turn.c`):
+/// - a tight stack, and an address length just below the red zone with a
+///   capacity of 0: record used to read the listener's `SO_RCVTIMEO` through a
+///   `getsockopt` whose buffers it pushed below the guest's stack pointer, so
+///   the first accept failed with `EFAULT` and the second wrote an address
+///   Linux leaves alone;
+/// - an accept on a thread other than the leader;
+/// - a negative `SO_RCVTIMEO`, which Linux takes as an immediate timeout but
+///   reads back as no timeout at all, so record used to wait forever;
+/// - an `SO_RCVTIMEO` a forked child set on the listener it shares with its
+///   parent, which the parent's accept must wait by (Detcore models the
+///   timeout per open file description, from the `setsockopt` calls it sees).
+#[test]
+fn record_replay_accept_entry_cases_match_linux() {
+    let _guard = hermit_record_lock();
+    let failures: Vec<String> = [
+        (
+            "scratch-tight",
+            "scratch-tight: accept=fd len=16 changed=1\n",
+        ),
+        (
+            "scratch-alias",
+            "scratch-alias: accept=fd len=16 changed=0\n",
+        ),
+        ("worker-queued", "worker-queued: accept=fd nonleader=1\n"),
+        ("negative-timeout", "negative-timeout: accept=EAGAIN\n"),
+        (
+            "timeout-set-by-child",
+            "timeout-set-by-child: set=1 accept=EAGAIN\n",
+        ),
+    ]
+    .into_iter()
+    .flat_map(|(mode, expected)| accept_in_turn_failures(mode, expected))
+    .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Makes every `pidfd_open(pid, PIDFD_THREAD)` in this process and its
+/// descendants fail with `EINVAL`, as Linux before 6.9 does, and lets every
+/// other system call through.
+fn deny_thread_pidfds(command: &mut Command) {
+    const PIDFD_THREAD: u32 = libc::O_EXCL as u32;
+    const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+    // SAFETY: the closure makes only prctl calls, which are async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            let filter = [
+                // Kill any other architecture.
+                libc::sock_filter {
+                    code: 0x20,
+                    jt: 0,
+                    jf: 0,
+                    k: 4,
+                },
+                libc::sock_filter {
+                    code: 0x15,
+                    jt: 1,
+                    jf: 0,
+                    k: AUDIT_ARCH_X86_64,
+                },
+                libc::sock_filter {
+                    code: 0x06,
+                    jt: 0,
+                    jf: 0,
+                    k: libc::SECCOMP_RET_KILL_PROCESS,
+                },
+                // pidfd_open(_, PIDFD_THREAD) fails with EINVAL.
+                libc::sock_filter {
+                    code: 0x20,
+                    jt: 0,
+                    jf: 0,
+                    k: 0,
+                },
+                libc::sock_filter {
+                    code: 0x15,
+                    jt: 0,
+                    jf: 3,
+                    k: libc::SYS_pidfd_open as u32,
+                },
+                libc::sock_filter {
+                    code: 0x20,
+                    jt: 0,
+                    jf: 0,
+                    k: 24,
+                },
+                libc::sock_filter {
+                    code: 0x15,
+                    jt: 0,
+                    jf: 1,
+                    k: PIDFD_THREAD,
+                },
+                libc::sock_filter {
+                    code: 0x06,
+                    jt: 0,
+                    jf: 0,
+                    k: libc::SECCOMP_RET_ERRNO | libc::EINVAL as u32,
+                },
+                libc::sock_filter {
+                    code: 0x06,
+                    jt: 0,
+                    jf: 0,
+                    k: libc::SECCOMP_RET_ALLOW,
+                },
+            ];
+            let program = libc::sock_fprog {
+                len: filter.len() as u16,
+                filter: filter.as_ptr() as *mut libc::sock_filter,
+            };
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                || libc::prctl(
+                    libc::PR_SET_SECCOMP,
+                    libc::SECCOMP_MODE_FILTER,
+                    &program as *const libc::sock_fprog,
+                ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// On Linux before 6.9 there is no thread pidfd. Detcore's copy of a
+/// listener a non-leader thread accepts on must then come through the
+/// leader's pidfd, but only when Linux confirms (`KCMP_FILES`) that the thread
+/// shares the leader's table: a thread sharing it accepts as on Linux, and a
+/// thread with a table of its own is refused by name, never served from the
+/// leader's table. Simulated by failing `PIDFD_THREAD` opens with seccomp.
+#[test]
+fn record_accept_on_a_non_leader_without_thread_pidfds() {
+    let _guard = hermit_record_lock();
+    let (failures, _) = record_replay_output_failures_with(
+        "worker-queued without PIDFD_THREAD",
+        &workload("c_record_replay_accept_in_turn").path,
+        &["worker-queued"],
+        &deny_thread_pidfds,
+        "worker-queued: accept=fd nonleader=1\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert_recording_refuses(
+        "private-table",
+        &workload("c_record_replay_accept_copyout").path,
+        &["private-table"],
+        &deny_thread_pidfds,
+        ACCEPT_SET_REFUSAL,
+    );
+}
+
+/// A listener passed over `SCM_RIGHTS` must not be made nonblocking again,
+/// even when Detcore cannot read the message's control buffer, which Linux
+/// reads all the same: here it is write-only. Under the fault hook, a bracket
+/// at the accept that follows reports a failed restore, so the recording
+/// refuses if the export scan let the listener through.
+#[test]
+fn record_accept_after_an_unreadable_scm_rights_control_keeps_mains_path() {
+    let _guard = hermit_record_lock();
+    let (failures, _) = record_replay_output_failures_with_env(
+        "export-write-only",
+        &workload("c_record_replay_accept_in_turn").path,
+        &["export-write-only"],
+        &[("HERMIT_TEST_ACCEPT_BRACKET_FAULT", "restore-fails")],
+        "export-write-only: sent=1 accept=fd\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// An accept checks its listener for an export before every attempt, the
+/// first included: the request for its first turn yields, so a thread
+/// already runnable can pass the listener over `SCM_RIGHTS` after the accept
+/// found it eligible. The guest yields N times before exporting; swept over
+/// N, every run either accepts as Linux does (the export came before the
+/// accept's entry, or after its first attempt took the queued connection) or
+/// refuses by name, and at least one N lands in the window and refuses.
+#[test]
+fn record_accept_refuses_an_export_before_its_first_attempt() {
+    let _guard = hermit_record_lock();
+    let program = &workload("c_record_replay_accept_in_turn").path;
+    let mut refused = Vec::new();
+    let mut failures = Vec::new();
+    for spins in 0..8 {
+        let spins = spins.to_string();
+        let data_dir = tempfile::tempdir().expect("failed to create recording directory");
+        let mut command = Command::new("timeout");
+        command
+            .args(["--kill-after=5s", "45s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args(["--log=off", "record", "start", "--record-timeout=30"])
+            .arg(format!("--data-dir={}", data_dir.path().display()))
+            .arg("--")
+            .arg(program)
+            .args(["export-at-entry", &spins]);
+        let output = command.output().expect("failed to start the recording");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.success() && stdout == "export-at-entry: accept=fd export=0\n" {
+            continue;
+        }
+        if output.status.code() == Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+            && stderr.contains(ACCEPT_EXPORT_REFUSAL)
+            && !stdout.contains("export-at-entry: ")
+        {
+            refused.push(spins);
+            continue;
+        }
+        failures.push(format!(
+            "N={spins}: status {}\nstdout:\n{stdout}stderr:\n{stderr}",
+            output.status
+        ));
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(
+        !refused.is_empty(),
+        "no N in 0..8 exported the listener between the accept's entry and its first attempt"
+    );
+}
+
+/// Replay's refusal of a recording whose rejoin log it cannot follow, as
+/// Detcore prints it.
+const REJOIN_REFUSAL: &str = "hermit replay refused to continue: ";
+
+/// Replay requires the recording's rejoin log whether or not the run
+/// backgrounds a call, and requires the run to reach every readmission it
+/// logs: a quiet recording (`/bin/true`, no backgrounded call) must refuse by
+/// name when its log is missing or carries a readmission past the run's end,
+/// and replay unchanged.
+#[test]
+fn replay_refuses_a_missing_or_unexhausted_rejoin_log() {
+    let _guard = hermit_record_lock();
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let mut record = Command::new("timeout");
+    record
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "record", "start", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .args(["--", "/bin/true"]);
+    command_output(record, "the /bin/true recording");
+    let recording_id =
+        fs::read_to_string(data_dir.path().join("last")).expect("recording did not publish its ID");
+    let log = data_dir.path().join(recording_id.trim()).join("rejoins");
+    let recorded = fs::read_to_string(&log).expect("the recording has no rejoin log");
+    assert_eq!(
+        recorded, "hermit-rejoins 1\n",
+        "the quiet recording logged a readmission"
+    );
+
+    let replay = || {
+        let mut replay = Command::new("timeout");
+        replay
+            .args(["--kill-after=5s", "45s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args(["--log=off", "replay", "--autopilot"])
+            .arg(format!("--data-dir={}", data_dir.path().display()));
+        replay.output().expect("failed to start the replay")
+    };
+    let intact = replay();
+    assert!(
+        intact.status.success(),
+        "the intact recording did not replay: {}",
+        String::from_utf8_lossy(&intact.stderr)
+    );
+
+    let mut failures = Vec::new();
+    for (case, contents, reason) in [
+        ("missing", None, "rejoin log cannot be read"),
+        (
+            "extra tail",
+            Some("hermit-rejoins 1\n999999999 0 3:1\n"),
+            "1 logged readmissions not replayed, the first at turn 999999999",
+        ),
+    ] {
+        match contents {
+            None => fs::remove_file(&log).expect("cannot remove the rejoin log"),
+            Some(contents) => fs::write(&log, contents).expect("cannot rewrite the rejoin log"),
+        }
+        let output = replay();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.code() != Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+            || !stderr.contains(REJOIN_REFUSAL)
+            || !stderr.contains(reason)
+        {
+            failures.push(format!(
+                "{case}: replay exited {:?} without refusing with {reason:?}:\n{stderr}",
+                output.status.code()
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// The scheduler records that place a guest's SIGCHLD in a ptrace log: every

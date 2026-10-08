@@ -50,6 +50,7 @@ use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::refuse_held_signal_loss;
 use crate::syscalls::helpers::result_after_restore;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
+use crate::syscalls::network_trace::received_descriptors;
 use crate::syscalls::signal::kernel_installed_signal_mask;
 use crate::syscalls::signal::read_kernel_sigset;
 use crate::syscalls::threads::KernelSigset;
@@ -1649,9 +1650,84 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Sendmsg,
     ) -> Result<i64, Error> {
+        if self.accept_in_turn_enabled() {
+            let headers: Vec<usize> = call
+                .msg()
+                .map(|header| header.as_raw())
+                .into_iter()
+                .collect();
+            self.mark_exported_listeners(guest, &headers);
+        }
         let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
         guest.thread_state().forget_flock_modes();
         Ok(result)
+    }
+
+    /// Mark every accept-in-turn listener (`DetFd::is_accept_in_turn_eligible`)
+    /// these messages name in `SCM_RIGHTS` as exported, before they are sent
+    /// and whatever the send returns: Linux may have queued the descriptor
+    /// even when the call reports an error, and both phases must decide alike.
+    /// `headers` are the guest addresses of the `msghdr`s: one for `sendmsg`,
+    /// one per entry Linux could send for `sendmmsg`.
+    ///
+    /// An exported listener may be held by a process outside Detcore's view,
+    /// so its accepts never take the temporary `O_NONBLOCK` again and keep the
+    /// backgrounded path. An accept already waiting on it refuses at its next
+    /// attempt (`ACCEPT_EXPORT_REFUSAL`). Both phases read the same guest
+    /// memory here. When a header or control buffer cannot be read in full
+    /// (Linux reads a write-only page, which Detcore cannot, and takes up to
+    /// `optmem_max` bytes of control data, more than `MAX_CONTROL_BYTES`),
+    /// every eligible listener in the table counts as exported. A thread that
+    /// rewrites the control buffer while this one is descheduled can send a
+    /// listener this did not see.
+    // TODO-HUMAN-REVIEW(PR-3908)
+    fn mark_exported_listeners<G: Guest<Self>>(&self, guest: &mut G, headers: &[usize]) {
+        let mut sent: Vec<RawFd> = Vec::new();
+        let mut unread = false;
+        for header in headers {
+            // A null header or control buffer fails the call with EFAULT
+            // before Linux reads any descriptor.
+            let Some(header) = Addr::<libc::msghdr>::from_raw(*header) else {
+                continue;
+            };
+            let Ok(header) = guest.memory().read_value::<_, libc::msghdr>(header) else {
+                unread = true;
+                continue;
+            };
+            let Some(control_address) = Addr::<u8>::from_raw(header.msg_control as usize) else {
+                continue;
+            };
+            if header.msg_controllen > MAX_CONTROL_BYTES {
+                unread = true;
+                continue;
+            }
+            let mut control = vec![0; header.msg_controllen];
+            if guest
+                .memory()
+                .read_exact(control_address, &mut control)
+                .is_err()
+            {
+                unread = true;
+                continue;
+            }
+            sent.extend(received_descriptors(&control));
+        }
+        if unread {
+            // Linux can read memory Detcore cannot (a write-only page) and
+            // accepts more control data than Detcore reads, so a message it
+            // could not read may carry any listener.
+            guest
+                .thread_state()
+                .mark_accept_in_turn_listeners_exported();
+            return;
+        }
+        for fd in sent {
+            let _ = guest.thread_state().with_detfd(fd, |detfd| {
+                if detfd.is_accept_in_turn_eligible() {
+                    detfd.set_exported();
+                }
+            });
+        }
     }
 
     /// Sends a message batch and invalidates process-wide flock knowledge when the
@@ -1665,6 +1741,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         if self.cfg.recordreplay_modes && is_accepted_connection(guest, call.sockfd()) {
             return self.refuse_log_served_mmsg(guest, Sysno::sendmmsg).await;
+        }
+        if self.accept_in_turn_enabled() {
+            // Every entry Linux could send, sent or not: see `mark_exported_listeners`.
+            // Reverie types the vector as `msghdr`s, but its entries are
+            // `mmsghdr`s, each a `msghdr` followed by `msg_len`, so step by
+            // the larger size.
+            let headers: Vec<usize> = call.msgvec().map_or_else(Vec::new, |vector| {
+                (0..call.vlen().min(libc::UIO_MAXIOV as u32) as usize)
+                    .map(|index| vector.as_raw() + index * std::mem::size_of::<libc::mmsghdr>())
+                    .collect()
+            });
+            self.mark_exported_listeners(guest, &headers);
         }
         let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
         if result > 0 {

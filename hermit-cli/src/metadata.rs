@@ -196,7 +196,16 @@ impl RecordVersion {
 // and shutdown record a `Return` event, instead of running live during replay
 // (https://github.com/rrnewton/hermit/issues/3864). An older recording has no
 // events for these calls, so this replayer would consume another call's event.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x124);
+// 0x124 -> 0x125: a blocking accept on a listener the container created runs in
+// the caller's turn (https://github.com/rrnewton/hermit/issues/3880). It
+// records one `Accept` event per nonblocking attempt, where an older recording
+// has a single `Accept` event for the backgrounded call. (Its timeout comes
+// from Detcore's model of `setsockopt`, not from a recorded event.) Connections accepted under record
+// are no longer made nonblocking. An older recording would hand this replayer
+// the wrong number of events. A recording also carries a `rejoins` file, the
+// turns at which backgrounded calls rejoined the run queue, which replay
+// requires.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x125);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -221,7 +230,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x124);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x124;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x125;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -757,6 +766,14 @@ mod tests {
     #[test]
     fn record_version_rejects_pre_accept_streams() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x123)));
+    }
+
+    /// A 0x124 recording ran a blocking accept in the background, with one
+    /// `Accept` event, while this replayer serves one event per in-turn
+    /// attempt; the version gate must refuse it.
+    #[test]
+    fn record_version_rejects_backgrounded_accept_streams() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x124)));
     }
 
     #[test]
