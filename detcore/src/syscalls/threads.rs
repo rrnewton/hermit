@@ -1824,6 +1824,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     bitset,
                 )
                 .await;
+                if self.cfg.yields_after_futex_wake(num) {
+                    guest.thread_state_mut().yield_after_futex_wake = true;
+                }
                 Ok(num as i64)
             }
             libc::FUTEX_WAIT | libc::FUTEX_WAIT_BITSET => {

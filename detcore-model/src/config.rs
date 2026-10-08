@@ -524,6 +524,25 @@ pub struct Config {
     #[clap(long, requires = "target_timeslice")]
     pub target_timeslice_syscalls_only: bool,
 
+    /// After a `FUTEX_WAKE` or `FUTEX_WAKE_BITSET` that woke at least one waiter, move the waker to
+    /// the back of its priority band and have it yield, so that woken threads of its priority run
+    /// before it continues. Without
+    /// it, a thread that releases a contended lock keeps running until its slice ends and can
+    /// re-take the lock many times before the waiter is scheduled: QEMU's multi-threaded TCG vCPUs
+    /// starve its main loop of the big QEMU lock this way. The yield is a scheduler turn of its
+    /// own: the waker's timeslice keeps its deadlines. Each extra thread switch is charged
+    /// scheduler time that the guest can observe (see `--scheduler-turn-cost`), and costs wall
+    /// time: a two-vCPU QEMU boot took 5% to 48% longer with it. The waker keeps its priority, so a
+    /// woken thread of a lower priority still runs after it; `--chaos` redraws threads' priorities
+    /// from their chaos PRNG, which can put a woken thread in a lower band; and a random
+    /// `--sched-heuristic` does not select first in, first out. In those cases a woken thread is not
+    /// guaranteed to run first. Applies to the precise futex mode while threads are sequentialized,
+    /// on the ptrace backend (including e9patch preprocessing, which runs on it); replay applies it
+    /// as the recorded run did.
+    #[serde(default)]
+    #[clap(long)]
+    pub futex_wake_yields: bool,
+
     /// Virtual nanoseconds that each committed scheduler turn adds to the global clock, before
     /// `--clock-multiplier` (default 500000). The charge keeps time moving while threads take
     /// turns without running. Every thread observes it as a jump in time across a thread switch,
@@ -961,6 +980,43 @@ impl Config {
         self.max_timeslice.is_some() && !self.no_rcb_time
     }
 
+    /// Whether a `FUTEX_WAKE` that woke `woken` waiters makes the waker yield
+    /// to them (`--futex-wake-yields`).
+    ///
+    /// A thread that releases a contended lock usually keeps running: the
+    /// waiter it woke is queued behind it, and the waker can re-take the lock,
+    /// uncontended, many times before that waiter runs.
+    /// glibc and Rust mutexes both let a releasing thread barge back in, and on
+    /// real hardware the woken thread wins on another CPU within the release
+    /// window. Under sequentialized threads it never gets one, so QEMU's
+    /// multi-threaded TCG vCPUs starved its main loop of the big QEMU lock for
+    /// whole PMU slices at a time
+    /// (<https://github.com/rrnewton/hermit/issues/3874>). When this holds, the
+    /// scheduler moves the waker to the back of its priority band, and the
+    /// waker takes a yield turn at the syscall's post-hook, so woken threads
+    /// of its priority run before it continues (it keeps its band; `--chaos`
+    /// can redraw priorities, and a random heuristic does not select first
+    /// in, first out). The yield leaves the waker's timeslice alone.
+    ///
+    /// A thread switch is not free in virtual time: every scheduler decision
+    /// is charged, so a policy that switches more often moves time that the
+    /// guest observes. A QEMU guest kernel that calibrates its TSC against the
+    /// emulated PIT failed that calibration with this policy, because the
+    /// main loop now ran in the middle of it.
+    ///
+    /// The decision reads only the configuration and the wake's result, the
+    /// number of waiters the scheduler took off the futex in the waker's turn,
+    /// which is already deterministic. A wake that woke no one keeps the
+    /// slice. Replay applies the policy exactly as the recorded run did: a
+    /// preemption record holds slice ends but not this queue order, so the
+    /// requeue and the yield must happen again for the replayed run to reach
+    /// the same schedule. Because the yield consumes no slice end and draws
+    /// nothing from the thread's chaos PRNG, making it again keeps the replay
+    /// aligned with its record.
+    pub fn yields_after_futex_wake(&self, woken: u64) -> bool {
+        self.futex_wake_yields && woken > 0
+    }
+
     /// The virtual nanoseconds each committed scheduler turn adds to the
     /// global clock: `--scheduler-turn-cost` (default [`NANOS_PER_SCHED`])
     /// times `--clock-multiplier`, truncated as it always was. A configured
@@ -1144,6 +1200,9 @@ impl fmt::Display for Config {
         }
         if self.target_timeslice_syscalls_only {
             write!(f, " --target-timeslice-syscalls-only")?;
+        }
+        if self.futex_wake_yields {
+            write!(f, " --futex-wake-yields")?;
         }
         if let Some(cost) = self.scheduler_turn_cost {
             write!(f, " --scheduler-turn-cost={}", cost)?;
@@ -1603,10 +1662,11 @@ impl Default for Config {
 /// that capability reads, and [`Config::in_guest_detlog_forward_policy`] and
 /// [`Config::in_guest_site_patching_off`], which are unset for DBT. So is [`Config::target_timeslice_syscalls_only`],
 /// added after this form froze; DBT runs without a PMU maximum, where the
-/// option has no effect. So is [`Config::replaying`], set only by `hermit
-/// replay`, which runs only on the ptrace backend, and
-/// [`Config::scheduler_turn_cost`], which `hermit run` refuses with the DBT
-/// backend. Every other field is serialized exactly as
+/// option has no effect. So are [`Config::futex_wake_yields`] and
+/// [`Config::scheduler_turn_cost`], also added after this form froze, which
+/// `hermit run` refuses with the DBT backend, and [`Config::replaying`], set
+/// only by `hermit replay`, which runs only on the ptrace backend. Every other
+/// field is serialized exactly as
 /// `serde_json::to_string(config)` serializes it.
 ///
 /// Use this wherever the JSON is visible to the guest. `hermit run
@@ -1936,13 +1996,13 @@ mod legacy_backend_json {
     /// the behaviour every legacy reader already has.
     /// `in_guest_detlog_forward_policy` is unset for DBT (its runtime forwards
     /// no records on a socket), so it is never written and reads as unset.
+    /// `futex_wake_yields` and `scheduler_turn_cost` came after the legacy
+    /// form froze too, and `hermit run` refuses them with the DBT backend.
     /// `replaying` is never written either: only `hermit replay` sets it, and
-    /// replay runs only on the ptrace backend. Nor is `scheduler_turn_cost`,
-    /// which came after the legacy form froze and which `hermit run` refuses
-    /// with the DBT backend.
+    /// replay runs only on the ptrace backend.
     /// `in_guest_site_patching_off` is false for DBT (it is set only for
     /// in-guest LiteInst), so it is never written and reads as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 9] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 10] = [
         "backend",
         "record_host_inputs",
         "backend_supports_blocked_wait_signal_interruption",
@@ -1950,6 +2010,7 @@ mod legacy_backend_json {
         "in_guest_detlog_forward_policy",
         "in_guest_site_patching_off",
         "target_timeslice_syscalls_only",
+        "futex_wake_yields",
         "replaying",
         "scheduler_turn_cost",
     ];
@@ -2045,7 +2106,8 @@ mod legacy_backend_json {
     /// [`Config::guest_may_inherit_a_terminal`],
     /// [`Config::in_guest_detlog_forward_policy`],
     /// [`Config::in_guest_site_patching_off`],
-    /// [`Config::target_timeslice_syscalls_only`], [`Config::replaying`] or
+    /// [`Config::target_timeslice_syscalls_only`],
+    /// [`Config::futex_wake_yields`], [`Config::replaying`] or
     /// [`Config::scheduler_turn_cost`] takes an element. Each gets a
     /// placeholder; [`super::from_legacy_backend_json`] replaces the first.
     struct LegacyPositions<'f, 'l, A> {
@@ -2082,6 +2144,7 @@ mod legacy_backend_json {
                     | "guest_may_inherit_a_terminal"
                     | "in_guest_site_patching_off"
                     | "target_timeslice_syscalls_only"
+                    | "futex_wake_yields"
                     | "replaying",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Unset, as its serde default is.
@@ -2334,6 +2397,7 @@ mod legacy_backend_json {
                 | "in_guest_detlog_forward_policy"
                 | "in_guest_site_patching_off"
                 | "target_timeslice_syscalls_only"
+                | "futex_wake_yields"
                 | "replaying"
                 | "scheduler_turn_cost" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
@@ -2799,8 +2863,8 @@ mod tests {
     /// `record_host_inputs`, `backend_supports_blocked_wait_signal_interruption`,
     /// `guest_may_inherit_a_terminal`, `in_guest_detlog_forward_policy`,
     /// `in_guest_site_patching_off`, `target_timeslice_syscalls_only`,
-    /// `replaying` or `scheduler_turn_cost`, which is the key order the
-    /// encoder writes.
+    /// `futex_wake_yields`, `replaying` or `scheduler_turn_cost`, which is the
+    /// key order the encoder writes.
     #[test]
     fn legacy_positions_are_the_encoded_key_order() {
         let names = legacy_backend_keys(&Config::default()).map(|(name, _)| name);
@@ -2821,6 +2885,7 @@ mod tests {
                 | "in_guest_detlog_forward_policy"
                 | "in_guest_site_patching_off"
                 | "target_timeslice_syscalls_only"
+                | "futex_wake_yields"
                 | "replaying"
                 | "scheduler_turn_cost" => {}
                 other => expected.push(other.to_owned()),
@@ -2836,9 +2901,9 @@ mod tests {
         // `backend_supports_blocked_wait_signal_interruption`,
         // `guest_may_inherit_a_terminal`, `in_guest_detlog_forward_policy`,
         // `in_guest_site_patching_off`, `target_timeslice_syscalls_only`,
-        // `replaying` and `scheduler_turn_cost` none.
+        // `futex_wake_yields`, `replaying` and `scheduler_turn_cost` none.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len() + 6, keys.len());
+        assert_eq!(fields.len() + 5, keys.len());
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -3062,6 +3127,42 @@ mod tests {
     }
 
     #[test]
+    fn a_futex_wake_yields_only_when_it_woke_a_waiter() {
+        let config = Config {
+            futex_wake_yields: true,
+            ..Config::default()
+        };
+        assert!(config.yields_after_futex_wake(1));
+        assert!(config.yields_after_futex_wake(3));
+        // A wake that found no waiter hands nothing off and keeps the slice.
+        assert!(!config.yields_after_futex_wake(0));
+        // Off by default.
+        assert!(!Config::default().futex_wake_yields);
+        assert!(!Config::default().yields_after_futex_wake(1));
+    }
+
+    #[test]
+    fn a_futex_wake_yields_under_replay_too() {
+        // Neither record holds the queue order the policy creates, so replay
+        // must make the same decision as the recorded run.
+        let config = Config {
+            futex_wake_yields: true,
+            ..Config::default()
+        };
+        let preemption_replay = Config {
+            replay_preemptions_from: Some(PathBuf::from("/nonexistent/preemptions.json")),
+            ..config.clone()
+        };
+        assert!(preemption_replay.yields_after_futex_wake(1));
+        assert!(!preemption_replay.yields_after_futex_wake(0));
+        let schedule_replay = Config {
+            replay_schedule_from: Some(PathBuf::from("/nonexistent/schedule.json")),
+            ..config
+        };
+        assert!(schedule_replay.yields_after_futex_wake(1));
+    }
+
+    #[test]
     fn scheduler_turn_charge_refuses_a_scaled_charge_below_one_nanosecond() {
         let default = Config::default();
         assert_eq!(default.scheduler_turn_charge(), Ok(500_000));
@@ -3112,6 +3213,31 @@ mod tests {
             .unwrap_err();
         assert!(message.contains("at least 1"), "{message}");
         assert!(message.contains("at most 1000000000"), "{message}");
+    }
+
+    /// `futex_wake_yields` never enters the legacy form, whatever its
+    /// value: the guest-visible string stays the legacy bytes, and it reads
+    /// back as false from both the object and the array form.
+    #[test]
+    fn futex_wake_yields_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            futex_wake_yields: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("futex_wake_yields"), "{json}");
+        assert!(!from_legacy_backend_json(&json).unwrap().futex_wake_yields);
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(!from_legacy_backend_json(&array).unwrap().futex_wake_yields);
     }
 
     /// `scheduler_turn_cost` never enters the legacy form, whatever its value:

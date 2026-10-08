@@ -75,6 +75,7 @@ use tracing::debug;
 use tracing::enabled;
 use tracing::info;
 use tracing::trace;
+use tracing::warn;
 
 use crate::config::Config;
 use crate::config::RunsPostFork;
@@ -3775,6 +3776,38 @@ impl Scheduler {
         // N.B. We don't write the response here.  That's for the scheduler to do.
         // But with a place in the queue, and a request filled, this thread
         // is ready to run in normal order.
+    }
+
+    /// Move a waker to the back of its own priority band, under
+    /// [`Config::yields_after_futex_wake`], so that it is behind the waiters
+    /// its `FUTEX_WAKE` just queued when they share that band.
+    ///
+    /// The waker is the running thread, still in the run queue at the place
+    /// its last committed turn left it, so ahead of the waiters
+    /// [`Scheduler::wake_futex_waiter`] has just pushed. A yield request
+    /// alone would be granted at once, and it would keep running. At the
+    /// back of its band, its yield waits for the turns of every thread
+    /// queued there, as at the end of any turn. It keeps its priority: a
+    /// waiter in a lower-priority band still runs after it. (`--chaos`
+    /// redraws priorities from the threads' chaos PRNGs, and a random
+    /// heuristic does not select first in, first out.)
+    /// The call comes in the waker's own wake request, in its turn, like the
+    /// waiters' admission. A waker not in the run queue is left alone rather
+    /// than asserted on: this runs with the scheduler locked, and a panic
+    /// here would poison the lock.
+    pub(crate) fn requeue_futex_waker(&mut self, waker: DetTid) {
+        if !self.run_queue.remove_tid(waker) {
+            warn!(
+                "[detcore] futex waker dtid {} is not in the run queue; not requeued",
+                waker
+            );
+            return;
+        }
+        let pos = self.runqueue_push_back(waker);
+        trace!(
+            "[detcore] futex waker dtid {} requeued to the back of its priority band at position {}",
+            waker, pos
+        );
     }
 
     /// `--fuzz-futexes`: a random sample of `num_woken` of the matching waiters.
@@ -10836,6 +10869,42 @@ mod test {
         );
         assert!(!scheduler.is_parked_futex_waiter(waiters[1]));
         assert!(scheduler.is_parked_futex_waiter(waiters[2]));
+    }
+
+    /// Under `--futex-wake-yields` a waker that woke a waiter goes
+    /// behind it, and behind every thread already queued, so its yield at the
+    /// syscall's post-hook is granted only after their turns
+    /// (https://github.com/rrnewton/hermit/issues/3874). By default the waker
+    /// keeps its place ahead of the waiter it woke.
+    #[test]
+    fn a_futex_waker_is_requeued_behind_the_waiters_it_woke() {
+        for requeue in [false, true] {
+            let mut scheduler = Scheduler::new(&Config::default());
+            let waiter = DetTid::from_raw(100);
+            let waker = DetTid::from_raw(101);
+            let runnable = DetTid::from_raw(102);
+            for tid in [waiter, waker, runnable] {
+                register_known_thread(&mut scheduler, tid);
+            }
+            scheduler.runqueue_push_back(waker);
+            scheduler.runqueue_push_back(runnable);
+            let futex = FutexID::private(MmId::initial(DetPid::from_raw(100)), 0x404110);
+            scheduler.sleep_futex_waiter(&waiter, futex, None, u32::MAX, None);
+
+            assert_eq!(scheduler.wake_futex_waiters(waker, futex, 1, u32::MAX), 1);
+            if requeue {
+                scheduler.requeue_futex_waker(waker);
+            }
+            let expected = if requeue {
+                vec![runnable, waiter, waker]
+            } else {
+                vec![waker, runnable, waiter]
+            };
+            assert_eq!(
+                scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
+                expected
+            );
+        }
     }
 
     /// The scheduler under the condition that turns on its model of which thread

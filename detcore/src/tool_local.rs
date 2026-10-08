@@ -2099,6 +2099,21 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub(crate) in_uncharged_bootstrap_syscall: bool,
 
+    /// Set by the syscall handler when a `FUTEX_WAKE` woke a waiter and
+    /// [`Config::yields_after_futex_wake`] holds, so that the
+    /// syscall's post-hook takes a yield turn. A logically killed waker gets
+    /// `EINTR` (4) as its wake count and may set this although the scheduler
+    /// did not requeue it; that thread is already being torn down. The other
+    /// way round, the scheduler requeues the waker without a yield following
+    /// when the wake is the robust-list owner-death wake of an exiting thread
+    /// (which never sets this and skips the post-hook), and when the syscall
+    /// handler returns an error after the wake and skips the post-hook. In
+    /// both the thread is retiring or the run is failing, and the requeue
+    /// alone only reorders the run queue deterministically. Cleared at the
+    /// start of every handler and by that post-hook.
+    #[serde(default)]
+    pub(crate) yield_after_futex_wake: bool,
+
     /// Thread state associated with record/replay.
     pub record_or_replay: T,
 
@@ -2600,6 +2615,7 @@ impl<T> ThreadState<T> {
             committed_clock_value: 0,
             uncharged_bootstrap_syscalls: 0,
             in_uncharged_bootstrap_syscall: false,
+            yield_after_futex_wake: false,
             end_of_timeslice: None, // Temporary/bogus.
             replay_rcb_end: None,
             // AUTONOMOUS-BOT-IMPLEMENTED

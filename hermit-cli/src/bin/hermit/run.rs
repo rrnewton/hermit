@@ -3297,6 +3297,117 @@ fn skid_margin_override_rejects_non_ptrace_backed_backends() {
     }
 }
 
+/// `--futex-wake-yields` parses, is rendered into the reproduce
+/// command and round-trips. It is refused where it cannot apply: without
+/// sequentialized threads, outside the precise futex mode, and with the DBT
+/// backend, whose runtime reads a configuration form that cannot carry it.
+#[test]
+fn futex_wake_yields_parses_round_trips_and_is_refused_where_inert() {
+    let mut opts = RunOpts::parse_from(["fakehermit", "--futex-wake-yields", "fakeprog"]);
+    opts.validate_args_with_perf_support(true).unwrap();
+    assert!(opts.det_opts.det_config.futex_wake_yields);
+    let rendered = format!("{opts}");
+    assert!(rendered.contains(" --futex-wake-yields"), "{rendered}");
+    let mut reparsed_args = vec!["fakehermit".to_owned()];
+    reparsed_args.extend(shell_words::split(&rendered).unwrap());
+    let mut reparsed = RunOpts::parse_from(reparsed_args);
+    reparsed.validate_args_with_perf_support(true).unwrap();
+    assert!(reparsed.det_opts.det_config.futex_wake_yields);
+
+    let mut default = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    default.validate_args_with_perf_support(true).unwrap();
+    assert!(!default.det_opts.det_config.futex_wake_yields);
+    assert!(!format!("{default}").contains("futex-wake"));
+
+    // e9patch is preprocessing on the ptrace backend, where Detcore and the
+    // handoff run unchanged, so the gate accepts it.
+    let e9patch = [
+        "hermit",
+        "--backend=e9patch",
+        "run",
+        "--futex-wake-yields",
+        "fakeprog",
+    ];
+    if let Err(error) = run_opts_for(&e9patch).validate_args_with_perf_support(true) {
+        assert!(
+            !error.to_string().contains("futex-wake-yields"),
+            "{e9patch:?}: {error}"
+        );
+    }
+
+    for (argv, expected) in [
+        (
+            vec![
+                "hermit",
+                "run",
+                "--no-sequentialize-threads",
+                "--futex-wake-yields",
+                "fakeprog",
+            ],
+            "--no-sequentialize-threads",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--debug-futex-mode=polling",
+                "--futex-wake-yields",
+                "fakeprog",
+            ],
+            "--debug-futex-mode=precise",
+        ),
+        (
+            vec![
+                "hermit",
+                "--backend=dbt",
+                "run",
+                "--futex-wake-yields",
+                "fakeprog",
+            ],
+            "the dbt backend cannot apply --futex-wake-yields",
+        ),
+        (
+            vec![
+                "hermit",
+                "--backend=kvm",
+                "run",
+                "--futex-wake-yields",
+                "fakeprog",
+            ],
+            "--futex-wake-yields has been tested only on the ptrace backend",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--namespace-only",
+                "--futex-wake-yields",
+                "fakeprog",
+            ],
+            "--namespace-only (--lite) runs the guest natively",
+        ),
+        (
+            vec!["hermit", "run", "--lite", "--futex-wake-yields", "fakeprog"],
+            "--namespace-only (--lite) runs the guest natively",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--strace-only",
+                "--futex-wake-yields",
+                "fakeprog",
+            ],
+            "--strace-only turns sequentialization off",
+        ),
+    ] {
+        let error = run_opts_for(&argv)
+            .validate_args_with_perf_support(true)
+            .unwrap_err();
+        assert!(error.to_string().contains(expected), "{argv:?}: {error}");
+    }
+}
+
 /// `--scheduler-turn-cost` parses, is rendered into the reproduce command and
 /// round-trips; zero and the DBT backend are refused.
 #[test]
@@ -5663,6 +5774,50 @@ impl RunOpts {
         }
 
         config.sequentialize_threads = self.strict || !self.no_sequentialize_threads;
+        // `--futex-wake-yields` is accepted only where Detcore's precise futex
+        // scheduler runs the guest with sequentialized threads, on the ptrace
+        // backend (with or without e9patch preprocessing). Every other launch
+        // would accept the flag and ignore it, so it is refused before launch.
+        if config.futex_wake_yields {
+            if self.namespace_only {
+                anyhow::bail!(
+                    "--futex-wake-yields needs Detcore's scheduler; --namespace-only (--lite) \
+                     runs the guest natively, without it"
+                );
+            }
+            if self.strace_only {
+                anyhow::bail!(
+                    "--futex-wake-yields reorders the turns of sequentialized threads; \
+                     --strace-only turns sequentialization off"
+                );
+            }
+            if !config.sequentialize_threads {
+                anyhow::bail!(
+                    "--futex-wake-yields reorders the turns of sequentialized threads; it \
+                     cannot be combined with --no-sequentialize-threads"
+                );
+            }
+            if config.debug_futex_mode != detcore::BlockingMode::Precise {
+                anyhow::bail!(
+                    "--futex-wake-yields needs --debug-futex-mode=precise, the only futex \
+                     mode in which Detcore knows how many waiters a FUTEX_WAKE woke"
+                );
+            }
+            if backend == Backend::Dbt {
+                anyhow::bail!(
+                    "the dbt backend cannot apply --futex-wake-yields: its runtime reads \
+                     a frozen configuration form that predates the option"
+                );
+            }
+            if !matches!(backend, Backend::Ptrace | Backend::E9patch) {
+                anyhow::bail!(
+                    "--futex-wake-yields has been tested only on the ptrace backend (and e9patch \
+                     preprocessing, which runs on it); backend `{}` is refused until its \
+                     handoff is tested",
+                    backend.as_str()
+                );
+            }
+        }
         if config.scheduler_turn_cost.is_some() && backend == Backend::Dbt {
             anyhow::bail!(
                 "the dbt backend cannot apply --scheduler-turn-cost: its runtime reads a frozen \

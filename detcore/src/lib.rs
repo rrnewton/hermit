@@ -872,8 +872,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         boundary: CheckIn,
     ) {
         // A handler that left early (an error return) may not have cleared
-        // this; no request made by this new handler belongs to that syscall.
+        // these; no request made by this new handler belongs to that syscall,
+        // and a wake that syscall made no longer ends the slice.
         guest.thread_state_mut().in_uncharged_bootstrap_syscall = false;
+        guest.thread_state_mut().yield_after_futex_wake = false;
         let dettid = guest.thread_state().dettid;
         let evs = self.update_logical_time_rcbs(guest, precise_branch).await;
 
@@ -928,6 +930,21 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// However, note that the thread's timeslice (turn) may have expired DURING this handler.
     /// Therefore the timeslice can end in the posthook as well as in the prehook.
     async fn post_handler_hook<G: Guest<Self>>(&self, guest: &mut G, boundary: CheckIn) {
+        if std::mem::take(&mut guest.thread_state_mut().yield_after_futex_wake) {
+            // A turn of its own, outside the timeslice bookkeeping: the slice
+            // keeps its deadlines, draws nothing from the thread's chaos PRNG
+            // and consumes no recorded preemption point, so a replay that
+            // makes the same decision stays aligned with its record. (Under
+            // a random `--sched-heuristic` the turn's selection draws from the
+            // run queue's generator, as every turn does, identically in record
+            // and replay.)
+            trace!(
+                "posthook [dtid {}] FUTEX_WAKE woke a waiter; yielding to it",
+                guest.thread_state().dettid
+            );
+            let request = Self::yield_request(guest);
+            resource_request(guest, request).await;
+        }
         self.end_timeslice_if_needed(guest, boundary).await;
 
         let dettid = guest.thread_state().dettid;
@@ -2135,6 +2152,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     // bootstrapping thread, so it starts outside any window.
                     uncharged_bootstrap_syscalls: 0,
                     in_uncharged_bootstrap_syscall: false,
+                    yield_after_futex_wake: false,
 
                     end_of_timeslice: None,
                     replay_rcb_end: None,

@@ -839,6 +839,7 @@ mod tests {
                 "--target-timeslice-syscalls-only",
             ],
         ),
+        ("futex-wake-yields", &["--futex-wake-yields"]),
         ("scheduler-turn-cost", &["--scheduler-turn-cost=10000"]),
         ("sigint-instakill", &["--sigint-instakill"]),
         ("warn-non-zero-binds", &["--warn-non-zero-binds"]),
