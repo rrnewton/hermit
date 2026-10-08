@@ -6179,7 +6179,11 @@ impl RunOpts {
             return Ok(());
         }
         let backend = self.selected_backend();
-        let program = load_program(path)?;
+        // A spec that does not load (bad JSON, `nth: 0`, `fd` on the wrong
+        // syscall, ...) is the user's to fix: a policy refusal (exit 122), not
+        // a Hermit failure (https://github.com/rrnewton/hermit/issues/3943).
+        let program =
+            load_program(path).map_err(|error| error.context(super::container::PolicyRefusal))?;
         let backend_name = format!("{:?}", backend);
         refuse_unenforceable_anchors(
             &program,

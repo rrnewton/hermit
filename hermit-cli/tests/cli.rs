@@ -9161,6 +9161,77 @@ fn happens_before_unsupported_fd_anchor_is_refused_before_reading_stdin() {
     );
 }
 
+/// A happens-before spec the launch cannot use is a policy refusal (exit 122)
+/// that names the problem, never a silent pass or a Hermit internal failure
+/// (https://github.com/rrnewton/hermit/issues/3943):
+/// - a count anchor under `--namespace-only`, which has no tracer or
+///   scheduler to enforce it (it used to run the guest and exit 0);
+/// - a spec that does not load, here `nth: 0` (it used to exit 125).
+///
+/// The guest never runs in either case.
+#[test]
+fn happens_before_unusable_spec_is_a_named_policy_refusal() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let count_spec = directory.path().join("count.json");
+    fs::write(
+        &count_spec,
+        r#"{"version": 1, "events": {"early": {"thread": "3", "syscalls": 5}}}"#,
+    )
+    .unwrap();
+    let bad_spec = directory.path().join("nth0.json");
+    fs::write(
+        &bad_spec,
+        r#"{"version": 1,
+            "events": {"zeroth": {"thread": "3", "syscall": "write", "fd": 1, "nth": 0}}}"#,
+    )
+    .unwrap();
+    let count_spec = count_spec.to_str().unwrap().to_owned();
+    let bad_spec = bad_spec.to_str().unwrap().to_owned();
+    for (args, expected) in [
+        (
+            vec![
+                "run",
+                "--namespace-only",
+                "--happens-before",
+                count_spec.as_str(),
+                "--",
+                "/bin/echo",
+                "ran",
+            ],
+            "anchor 'early' (after 5 syscalls) is a count anchor, but --namespace-only runs the \
+             guest without interception or a scheduler",
+        ),
+        (
+            vec![
+                "run",
+                "--strict",
+                "--happens-before",
+                bad_spec.as_str(),
+                "--",
+                "/bin/echo",
+                "ran",
+            ],
+            "event 'zeroth' sets 'nth' to 0; occurrences are counted from 1",
+        ),
+    ] {
+        let output = hermit(&args);
+        let log = stderr(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{args:?}: an unusable spec must be a policy refusal:\n{log}"
+        );
+        assert!(
+            log.contains(expected),
+            "{args:?}: no refusal naming the problem:\n{log}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).is_empty(),
+            "{args:?}: the guest ran although the spec was refused"
+        );
+    }
+}
+
 /// `--hb-list-events` prints the resolved spec and exits 0 without running
 /// the guest; the anchors it cannot resolve are named on stderr.
 #[test]

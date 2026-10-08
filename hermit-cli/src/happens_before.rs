@@ -325,10 +325,12 @@ pub struct HbLaunch<'a> {
 /// cannot enforce as written:
 /// - a syscall anchor for the polling or posthook phase (syscall anchors are
 ///   enforced at the prehook of the thread's nth matching call);
-/// - a syscall-occurrence anchor when the run bypasses interception
-///   (`--namespace-only`), uses a backend other than ptrace (in-guest Detcore
-///   never receives the program), or runs with `--passthru-opt` (some
-///   syscalls are left unintercepted);
+/// - a count or syscall-occurrence anchor when the run bypasses interception
+///   (`--namespace-only`) or uses a backend other than ptrace (in-guest
+///   Detcore never receives the program,
+///   <https://github.com/rrnewton/hermit/issues/3943>);
+/// - a syscall-occurrence anchor with `--passthru-opt` (some syscalls are left
+///   unintercepted; a count anchor still counts the intercepted ones);
 /// - a syscall anchor on a syscall that never reaches Detcore
 ///   ([`syscall_never_reaches_tracer`]).
 ///
@@ -341,35 +343,47 @@ pub fn refuse_unenforceable_anchors(
     launch: HbLaunch<'_>,
 ) -> anyhow::Result<()> {
     for anchor in program.anchors.values() {
-        let Position::Syscall { sysno, .. } = &anchor.position else {
-            continue;
-        };
-        let refusal = if !anchor.is_syscall_occurrence() {
-            "names a syscall phase other than 'prehook'; syscall anchors are enforced only at \
-             the prehook"
-                .to_owned()
-        } else if syscall_never_reaches_tracer(*sysno) {
-            format!(
+        let refusal = match &anchor.position {
+            Position::Syscall { .. } if !anchor.is_syscall_occurrence() => {
+                "names a syscall phase other than 'prehook'; syscall anchors are enforced only \
+                 at the prehook"
+                    .to_owned()
+            }
+            Position::Syscall { sysno, .. } if syscall_never_reaches_tracer(*sysno) => format!(
                 "names {}, which never reaches Hermit's tracer: it runs untraced so the \
                  signal frame is restored safely",
                 sysno.name()
-            )
-        } else if launch.namespace_only {
-            "is a syscall-occurrence anchor, but --namespace-only runs the guest without \
-             interception or a scheduler"
-                .to_owned()
-        } else if !launch.ptrace {
-            format!(
-                "is a syscall-occurrence anchor, which is enforced only on the ptrace backend; \
-                 this run selected the {} backend",
-                launch.backend
-            )
-        } else if launch.passthru_opt {
-            "is a syscall-occurrence anchor, which needs every syscall intercepted; \
-             --passthru-opt leaves some unintercepted"
-                .to_owned()
-        } else {
-            continue;
+            ),
+            Position::Syscall { .. } | Position::SyscallCount(_) => {
+                let kind = if anchor.is_syscall_occurrence() {
+                    "syscall-occurrence anchor"
+                } else {
+                    "count anchor"
+                };
+                if launch.namespace_only {
+                    format!(
+                        "is a {kind}, but --namespace-only runs the guest without interception \
+                         or a scheduler"
+                    )
+                } else if !launch.ptrace {
+                    format!(
+                        "is a {kind}, which is enforced only on the ptrace backend; this run \
+                         selected the {} backend",
+                        launch.backend
+                    )
+                } else if launch.passthru_opt && anchor.is_syscall_occurrence() {
+                    // A count anchor counts the intercepted syscalls, which
+                    // --passthru-opt still determines; an occurrence anchor
+                    // names one syscall, which may be left unintercepted.
+                    format!(
+                        "is a {kind}, which needs every syscall intercepted; --passthru-opt \
+                         leaves some unintercepted"
+                    )
+                } else {
+                    continue;
+                }
+            }
+            _ => continue,
         };
         anyhow::bail!(
             "happens-before spec {}: anchor '{}' ({}) {}",
@@ -627,17 +641,46 @@ mod tests {
             )
             .is_ok()
         );
-        // A count anchor is not refused on any of these launches.
+        // A count anchor cannot be enforced without interception or off
+        // ptrace either (https://github.com/rrnewton/hermit/issues/3943), but
+        // --passthru-opt still counts the intercepted syscalls it names.
         let count_only = r#"{"version": 1, "events": {"c": {"thread": "3", "syscalls": 5}}}"#;
+        let err = check(
+            count_only,
+            HbLaunch {
+                namespace_only: true,
+                ..ptrace
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("anchor 'c' (after 5 syscalls) is a count anchor, but --namespace-only"),
+            "{err}"
+        );
+        let err = check(
+            count_only,
+            HbLaunch {
+                backend: "Sabre",
+                ptrace: false,
+                ..ptrace
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("is a count anchor, which is enforced only on the ptrace backend")
+                && err.contains("the Sabre backend"),
+            "{err}"
+        );
         assert!(
             check(
                 count_only,
                 HbLaunch {
-                    namespace_only: true,
+                    passthru_opt: true,
                     ..ptrace
                 }
             )
             .is_ok()
         );
+        assert!(check(count_only, ptrace).is_ok());
     }
 }
