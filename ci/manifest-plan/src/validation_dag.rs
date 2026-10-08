@@ -254,15 +254,20 @@ const HOSTED_VARIANT_SUFFIX: &str = "_on_host";
 ///
 /// GitHub-hosted runners expose `/dev/kvm` through nested virtualization but
 /// provide no PMU, so every KVM guest fails when its clock opens the retired
-/// branch counter (`perf_event_open` returns ENOENT). The local `full` and
-/// `portable` profiles still select every KVM cell. The hosted E2E commands,
+/// branch counter (`perf_event_open` returns ENOENT). They also lack CPUID
+/// faulting, which the in-guest LiteInst runtime of the `liteinst` and
+/// `in-guest-trap` backends needs before the guest's first instruction
+/// (`detcore-liteinst: initialization failed: CPUID faulting is unavailable`,
+/// the same refusal that keeps the in-guest `test.cli` cases off these runners;
+/// see [`HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS`]). The local `full` and
+/// `portable` profiles still select every cell of these backends. The hosted E2E commands,
 /// their result ownership, the hosted expected population, and the hosted
 /// scorecard verification all omit the same backends, so an omitted cell is
 /// never reported as a pass. `.github/workflows/ci-portable.yml`,
 /// `ci/check-shard-coverage.sh`, and `ci/hermetic/run-split-validate.sh`
 /// apply the same filter to `ci/expected-e2e-plan.json`; a test below keeps
 /// them in agreement with this list.
-pub const HOSTED_PORTABLE_EXCLUDED_BACKENDS: &[&str] = &["kvm"];
+pub const HOSTED_PORTABLE_EXCLUDED_BACKENDS: &[&str] = &["kvm", "liteinst", "in-guest-trap"];
 
 /// `test.cli` cases the GitHub-hosted portable profile excludes by exact name.
 ///
@@ -5230,8 +5235,9 @@ sys.exit(37)
                 "{retired} must stay folded into c-programs"
             );
         }
-        // The hosted selector also omits KVM cells: GitHub-hosted runners
-        // have no PMU (HOSTED_PORTABLE_EXCLUDED_BACKENDS).
+        // The hosted selector also omits KVM, liteinst and in-guest-trap
+        // cells: GitHub-hosted runners have no PMU and no CPUID faulting
+        // (HOSTED_PORTABLE_EXCLUDED_BACKENDS).
         let selectors = [
             (
                 "e2e.manifest_c_programs",
@@ -5239,7 +5245,7 @@ sys.exit(37)
             ),
             (
                 "e2e.manifest_c_programs_on_host",
-                "--category c-programs --ci-only --prebuilt --exclude-backend kvm --results",
+                "--category c-programs --ci-only --prebuilt --exclude-backend kvm --exclude-backend liteinst --exclude-backend in-guest-trap --results",
             ),
         ];
         for (tag, selector_argv) in selectors {
@@ -5281,26 +5287,41 @@ sys.exit(37)
         }
     }
 
-    /// GitHub-hosted runners have no PMU, so the hosted-portable profile omits
-    /// KVM cells from every command, owned result, and expected population,
-    /// while the local profiles keep requiring them.
+    /// GitHub-hosted runners have no PMU and no CPUID faulting, so the
+    /// hosted-portable profile omits KVM, liteinst and in-guest-trap cells from
+    /// every command, owned result, and expected population, while the local
+    /// profiles keep requiring them.
     #[test]
     fn hosted_portable_omits_the_excluded_backends_everywhere_and_locally_keeps_them() {
-        assert_eq!(HOSTED_PORTABLE_EXCLUDED_BACKENDS, ["kvm"]);
+        assert_eq!(
+            HOSTED_PORTABLE_EXCLUDED_BACKENDS,
+            ["kvm", "liteinst", "in-guest-trap"]
+        );
+        let flags = hosted_portable_exclusion_flags();
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let cells = expected_cells(&crate::git_environment::checkout_root()).unwrap();
         let excluded = |cell: &DagManifest| hosted_portable_excludes(cell);
         let portable = expected_for_label("portable", &cells);
         let hosted = expected_for_label(HOSTED_PORTABLE_LABEL, &cells);
         let omitted = portable.iter().filter(|cell| excluded(cell)).count();
-        assert!(omitted > 0, "the corpus has no portable KVM cell to omit");
+        assert!(omitted > 0, "the corpus has no portable cell to omit");
+        // Each excluded backend has portable cells, so no part of the
+        // exclusion is vacuous.
+        for backend in HOSTED_PORTABLE_EXCLUDED_BACKENDS {
+            assert!(
+                portable
+                    .iter()
+                    .any(|cell| cell.backend.as_deref() == Some(*backend)),
+                "the corpus has no portable {backend} cell to omit"
+            );
+        }
         assert_eq!(hosted.len() + omitted, portable.len());
         assert!(hosted.iter().all(|cell| !excluded(cell)));
         assert!(
             expected_for_label("full", &cells)
                 .iter()
                 .any(|cell| excluded(cell)),
-            "the local full profile must still require KVM cells"
+            "the local full profile must still require the excluded backends' cells"
         );
 
         let owned = |step: &Step| {
@@ -5318,17 +5339,15 @@ sys.exit(37)
         {
             let category = &step.manifest.as_ref().unwrap().category;
             assert!(
-                step.cmd.contains(&format!(
-                    "{} --exclude-backend kvm ",
-                    manifest_selector_flags(category)
-                )),
+                step.cmd
+                    .contains(&format!("{}{flags} ", manifest_selector_flags(category))),
                 "{}: {}",
                 step.tag(),
                 step.cmd
             );
             assert_eq!(
                 step.cmd.matches("--exclude-backend").count(),
-                1,
+                HOSTED_PORTABLE_EXCLUDED_BACKENDS.len(),
                 "{}: {}",
                 step.tag(),
                 step.cmd
@@ -5375,9 +5394,11 @@ sys.exit(37)
                 .cmd
                 .clone()
         };
-        assert!(scorecard("scorecard.compatibility_on_host").ends_with(
-            "verify-results --results \"$E2E_RESULT_ROOT\" --lanes portable --exclude-backend kvm"
-        ));
+        assert!(
+            scorecard("scorecard.compatibility_on_host").ends_with(&format!(
+                "verify-results --results \"$E2E_RESULT_ROOT\" --lanes portable{flags}"
+            ))
+        );
         assert!(scorecard("scorecard.compatibility").ends_with("--lanes portable"));
 
         let mut planted = committed.clone();
@@ -5386,10 +5407,10 @@ sys.exit(37)
             .iter_mut()
             .find(|step| step.tag() == "e2e.manifest_c_programs_on_host")
             .unwrap();
-        step.cmd = step.cmd.replace(" --exclude-backend kvm", "");
+        step.cmd = step.cmd.replace(&flags, "");
         assert_eq!(
             assert_invariants(&planted, &cells).unwrap_err(),
-            "hosted-portable step(s) do not carry the backend exclusion `--exclude-backend kvm` exactly once: e2e.manifest_c_programs_on_host"
+            "hosted-portable step(s) do not carry the backend exclusion `--exclude-backend kvm --exclude-backend liteinst --exclude-backend in-guest-trap` exactly once: e2e.manifest_c_programs_on_host"
         );
         let mut planted = committed.clone();
         let step = planted
@@ -5397,10 +5418,10 @@ sys.exit(37)
             .iter_mut()
             .find(|step| step.tag() == "scorecard.compatibility_on_host")
             .unwrap();
-        step.cmd = step.cmd.replace(" --exclude-backend kvm", "");
+        step.cmd = step.cmd.replace(&flags, "");
         assert_eq!(
             assert_invariants(&planted, &cells).unwrap_err(),
-            "hosted-portable step(s) do not carry the backend exclusion `--exclude-backend kvm` exactly once: scorecard.compatibility_on_host"
+            "hosted-portable step(s) do not carry the backend exclusion `--exclude-backend kvm --exclude-backend liteinst --exclude-backend in-guest-trap` exactly once: scorecard.compatibility_on_host"
         );
 
         // A repeated exclusion still contains the anchored substring, but
@@ -5409,11 +5430,11 @@ sys.exit(37)
         for (tag, anchor) in [
             (
                 "e2e.manifest_bin_c_on_host",
-                "--prebuilt --exclude-backend kvm",
+                "--prebuilt --exclude-backend kvm --exclude-backend liteinst --exclude-backend in-guest-trap",
             ),
             (
                 "scorecard.compatibility_on_host",
-                "--lanes portable --exclude-backend kvm",
+                "--lanes portable --exclude-backend kvm --exclude-backend liteinst --exclude-backend in-guest-trap",
             ),
         ] {
             let mut planted = committed.clone();
@@ -5434,7 +5455,7 @@ sys.exit(37)
             assert_eq!(
                 assert_invariants(&planted, &cells).unwrap_err(),
                 format!(
-                    "hosted-portable step(s) do not carry the backend exclusion `--exclude-backend kvm` exactly once: {tag}"
+                    "hosted-portable step(s) do not carry the backend exclusion `--exclude-backend kvm --exclude-backend liteinst --exclude-backend in-guest-trap` exactly once: {tag}"
                 )
             );
         }

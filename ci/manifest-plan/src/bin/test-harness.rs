@@ -10635,10 +10635,20 @@ sys.exit(1 if failed else 0)
             before,
             "{test} does not enable {backend}"
         );
-        for per_backend in ["ci", "expected_stdout"] {
+        for per_backend in ["ci", "expected_stdout", "hermit_args"] {
             if let Some(map) = mode.get_mut(per_backend).and_then(Value::as_mapping_mut) {
                 map.remove(backend);
             }
+        }
+        // Hermit flags may name only enabled backends, and their reason may
+        // not outlive the last of them.
+        if mode
+            .get("hermit_args")
+            .and_then(Value::as_mapping)
+            .is_some_and(serde_yaml::Mapping::is_empty)
+        {
+            mode.remove("hermit_args");
+            mode.remove("hermit_args_reason");
         }
         let disabled = mode
             .entry("backends_disabled".into())

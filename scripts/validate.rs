@@ -15377,10 +15377,11 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
         .iter()
         .find(|bucket| bucket.lane == "privileged" && bucket.category == "c-programs")
         .ok_or("node vacuity: required plan lost the privileged c-programs bucket")?;
-    // The checked-in bucket selects cpuid-probe for KVM, ptrace and DBT. The
-    // LiteInst cell left when every LiteInst cell was switched off for the
-    // in-guest reset (https://github.com/rrnewton/hermit/issues/3520).
-    if privileged.selected != 3
+    // The checked-in bucket selects cpuid-probe for KVM, ptrace, DBT, and the
+    // two in-guest LiteInst backends (liteinst and in-guest-trap), which came
+    // back after the in-guest reset
+    // (https://github.com/rrnewton/hermit/issues/3745).
+    if privileged.selected != 5
         || !bucket_runs_nothing(privileged)
         || privileged.capabilities != vec!["cpuid-faulting".to_string()]
     {
@@ -17674,9 +17675,13 @@ fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool)
     let mut selection = Selection::default();
     let mut prebuilt = false;
     let mut seen = BTreeSet::new();
+    let mut excluded_backends = BTreeSet::new();
     let mut index = 2;
     while let Some(option) = argv.get(index) {
-        if !seen.insert(option.as_str()) {
+        // `--exclude-backend` may name several backends, each once, as
+        // test-harness itself accepts (the hosted-portable nodes omit kvm,
+        // liteinst and in-guest-trap); every other option appears once.
+        if option != "--exclude-backend" && !seen.insert(option.as_str()) {
             return Err(format!(
                 "retry bounds: {tag} supplies {option} more than once"
             ));
@@ -17700,11 +17705,19 @@ fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool)
                     "--test" => selection.test = Some(value.clone()),
                     "--mode" => selection.mode = Some(value.clone()),
                     "--backend" => selection.backend = Some(value.clone()),
-                    // The hosted-portable nodes omit the KVM backend. Modeling
-                    // the omission keeps the retry bound computed over the
-                    // cells the node actually runs; the repeated-option guard
-                    // above still refuses a second exclusion.
-                    "--exclude-backend" => selection.exclude_backends.push(value.clone()),
+                    // The hosted-portable nodes omit the KVM, liteinst and
+                    // in-guest-trap backends. Modeling the omission keeps the
+                    // retry bound computed over the cells the node actually
+                    // runs; a backend excluded twice is refused, as
+                    // test-harness refuses it.
+                    "--exclude-backend" => {
+                        if !excluded_backends.insert(value.as_str()) {
+                            return Err(format!(
+                                "retry bounds: {tag} supplies {option} more than once"
+                            ));
+                        }
+                        selection.exclude_backends.push(value.clone())
+                    }
                     // The quick verify smoke omits the host-bound strict
                     // compatibility corpus; model it like the backend omission.
                     "--exclude-category" => selection.exclude_categories.push(value.clone()),
@@ -19036,12 +19049,15 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             }
         }
     }
-    // The hosted-portable publisher carries exactly the KVM omission and the
-    // local one carries none, so the two retry bounds are computed over
-    // different, correctly sized cell sets.
+    // The hosted-portable publisher carries exactly the KVM, liteinst and
+    // in-guest-trap omission and the local one carries none, so the two retry
+    // bounds are computed over different, correctly sized cell sets.
     for (tag, expected) in [
         ("e2e.manifest_c_programs", &[][..]),
-        ("e2e.manifest_c_programs_on_host", &["kvm"][..]),
+        (
+            "e2e.manifest_c_programs_on_host",
+            &["kvm", "liteinst", "in-guest-trap"][..],
+        ),
     ] {
         let publisher = committed
             .steps
@@ -19069,11 +19085,15 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             ));
         }
         // Without this the exclusion check above is vacuous: the local node
-        // must still select the KVM cells that the hosted node omits.
-        if expected.is_empty() && !backends.contains("kvm") {
-            return Err(format!(
-                "retry bounds: {tag} selects no kvm cell, so the hosted omission is untested"
-            ));
+        // must still select the cells of every backend the hosted node omits.
+        if expected.is_empty() {
+            for omitted in ["kvm", "liteinst", "in-guest-trap"] {
+                if !backends.contains(omitted) {
+                    return Err(format!(
+                        "retry bounds: {tag} selects no {omitted} cell, so the hosted omission is untested"
+                    ));
+                }
+            }
         }
     }
     for tag in ["e2e.manifest_c_programs", "e2e.manifest_c_programs_on_host"] {
