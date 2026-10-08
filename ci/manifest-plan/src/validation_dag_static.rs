@@ -863,7 +863,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retains all 997: 998, listed with this node's arguments.
     // happens_before::tests::has_syscall_count_anchor_at_is_exact (detcore-model,
     // https://github.com/rrnewton/hermit/issues/3877) retains all 998: 999.
-    ("test.regular_crates", 999),
+    // config::tests::in_guest_detlog_forward_policy_never_enters_the_legacy_form
+    // (detcore-model) retains all 999: 1000, listed with this node's arguments.
+    ("test.regular_crates", 1000),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1453,7 +1455,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tool_global; step I1b part 2), re-listed: 1134.
     // procfs::tests::self_sched_hides_schedstats_fields retains all 1149:
     // 1150, listed with this node's arguments.
-    ("test.detcore_unit", 1150),
+    // Five detlog forwarding tests (the full-socket-buffer receiver, per-thread
+    // counts, the completeness rule, count-slot churn, released-slot reuse;
+    // SaBRe tool-output socket) retain all 1150: 1155, listed the same way.
+    // detlog::tests::a_required_forwarder_that_is_missing_makes_counts_uncounted
+    // retains all 1155: 1156.
+    ("test.detcore_unit", 1156),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1810,7 +1817,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // happens_before_inert_spec_adds_no_per_syscall_scheduler_turns and
     // happens_before_edge_reverses_two_processes_writes
     // (https://github.com/rrnewton/hermit/issues/3877) retain all 211: 213.
-    ("test.cli", 213),
+    // liteinst_in_guest_refuses_a_guest_socket_at_the_forwarding_number
+    // retains all 213: 214, measured with cargo nextest list --profile ci.
+    ("test.cli", 214),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -1822,7 +1831,17 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retains all 12 prior identities: 13.
     // sabre_forked_child_gets_no_plugin_warning_on_guest_stderr retains all
     // 13: 14.
-    ("test.sabre_examples", 14),
+    // sabre_verify_log_keeps_forwarded_records_in_ptraces_order and
+    // sabre_verify_survives_a_guest_dup_onto_the_forwarding_socket retain all
+    // 14: 16 (measured with cargo nextest list).
+    // sabre_verify_refuses_when_forwarded_records_go_missing retains all 16:
+    // 17. sabre_verify_writes_no_tool_record_into_a_guest_stderr_file retains
+    // all 17: 18.
+    // sabre_verify_sends_no_tool_record_to_a_guest_socket_at_the_passed_number
+    // retains all 18: 19.
+    // sabre_verify_never_loses_an_exec_image_that_drops_its_forwarding_settings
+    // retains all 19: 20.
+    ("test.sabre_examples", 20),
     ("test.hermit_modes", 21),
     ("test.app_strict_verify", 8),
     ("test.command_strict_verify", 9),
@@ -1958,7 +1977,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The two happens-before tests (inert turn count, ordering edge) start no
     // LiteInst guest, so the filterset is unchanged and the host twin selects
     // both too: 173.
-    ("test.cli_on_host", 173),
+    // liteinst_in_guest_refuses_a_guest_socket_at_the_forwarding_number is not
+    // in the exclusion filterset, so the host twin selects it too: 174.
+    ("test.cli_on_host", 174),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 55),
@@ -2040,7 +2061,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same fifteen fatal_core::tests: 1142.
     // And the same seven signal phase 1 table tests, re-listed: 1134.
     // And the schedstats sanitizer test: 1150.
-    ("test.detcore_unit_on_host", 1150),
+    // And the same five detlog forwarding tests: 1155.
+    // And the same required-forwarder test: 1156.
+    ("test.detcore_unit_on_host", 1156),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -2215,13 +2238,17 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same detcore-model legacy-form test: 997.
     // And the same fork-window cgroup test: 998.
     // It selects the detcore-model checkpoint-filter test too: 999.
-    ("test.regular_crates_on_host", 999),
+    // And the same in_guest_detlog_forward_policy legacy-form test: 1000.
+    ("test.regular_crates_on_host", 1000),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
     // And the same target-scoped DETLOG forwarding test (13), and the same
-    // forked-child stderr test (14).
-    ("test.sabre_examples_on_host", 14),
+    // forked-child stderr test (14), and the same two forwarding-socket
+    // tests (16), the same missing-records refusal test (17), and the same
+    // guest-stderr-file test (18), and the same guest-socket test (19).
+    // And the same exec-image forwarding test: 20.
+    ("test.sabre_examples_on_host", 20),
 ];
 
 pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {
@@ -4943,7 +4970,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"test"########,
         job: r########"sabre_examples"########,
         desc: r########"SaBRe non-racy examples: per-backend time determinism and non-time ptrace parity"########,
-        description: r########"Holds the SaBRe backend to ptrace's results on non-racy examples: hermit-cli/tests/sabre_examples.rs runs one test at a time, its count pinned by NEXTEST_EXPECTED_EXECUTED, against an explicitly configured SaBRe loader, so a missing loader, libdetcore_sabre.so or revision file fails rather than skips. examples/devrand.sh, a root-PID shell probe and a glibc getrandom caller must give identical status, stdout and stderr under ptrace and --backend sabre; examples/date.sh and a clock-progress guest must repeat across three runs on each backend; and every SaBRe guest must pass `--verify --verify-strict` with bitwise_parity true. A guest that points its stderr at a pipe and forks a child that only exits must, at --log=warn, read nothing from that pipe on either backend (at --log=info the plugin's DETLOG forwarding still writes there, and that run is only checked for repeatability). SaBRe letting getrandom return host entropy, a controller line leaking into guest stderr, or the plugin's fingerprint warning reaching a forked child's guest stderr, is caught."########,
+        description: r########"Holds the SaBRe backend to ptrace's results on non-racy examples: hermit-cli/tests/sabre_examples.rs runs one test at a time, its count pinned by NEXTEST_EXPECTED_EXECUTED, against an explicitly configured SaBRe loader, so a missing loader, libdetcore_sabre.so or revision file fails rather than skips. examples/devrand.sh, a root-PID shell probe and a glibc getrandom caller must give identical status, stdout and stderr under ptrace and --backend sabre; examples/date.sh and a clock-progress guest must repeat across three runs on each backend; and every SaBRe guest must pass `--verify --verify-strict` with bitwise_parity true. A guest that points its stderr at a pipe and forks a child that only exits must, at --log=warn, read nothing from that pipe on either backend (at --log=info the plugin's DETLOG forwarding still writes there, and that run is only checked for repeatability). Under --verify the plugin sends its DETLOG records on a socket reverie-sabre keeps from the guest, so the run log must match ptrace's through the post-exec AT_RANDOM record, and a guest that dup2s onto every descriptor from 1024 to 1039 must still run to the end with its records in the log. SaBRe letting getrandom return host entropy, a controller line leaking into guest stderr, the plugin's fingerprint warning reaching a forked child's guest stderr, the in-guest records appended after the run instead of interleaved, a run whose forwarded records went missing (a guest that closes the socket before the plugin adopts it) being compared instead of refused, the plugin writing its records into a file the guest made its own stderr after the socket it was given could not be adopted, or the plugin adopting a socket of the guest's own that guest code put at the passed number before the plugin ran, is caught."########,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,
