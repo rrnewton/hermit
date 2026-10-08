@@ -48,6 +48,7 @@ pub mod exit_dependencies;
 mod fatal_core;
 mod fd;
 mod host_inputs;
+pub mod in_guest_site_patching;
 mod io_buffers;
 mod iovecs;
 #[allow(unused)]
@@ -1470,6 +1471,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // connect, the LiteInst constructor); without one, or with another
             // policy, refuse.
             detlog::require_forwarding(policy);
+        }
+        if cfg.in_guest_site_patching_off {
+            // Record the host's request; the preload constructor compares it
+            // with the settings the runtime captured once installation
+            // returns (see in_guest_site_patching).
+            in_guest_site_patching::require_site_patching_off();
         }
         // Read before any guest syscall, so a readlink of another process's
         // pipe or socket never depends on the tracer's descriptors then. The
