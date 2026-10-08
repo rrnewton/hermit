@@ -178,7 +178,16 @@ pub(crate) struct AnonymousObjectDevices {
 pub(crate) fn anonymous_object_devices() -> &'static Result<AnonymousObjectDevices, String> {
     static DEVICES: std::sync::OnceLock<Result<AnonymousObjectDevices, String>> =
         std::sync::OnceLock::new();
-    DEVICES.get_or_init(|| probe_anonymous_object_devices().map_err(|error| error.to_string()))
+    DEVICES.get_or_init(|| retained_probe_outcome(probe_anonymous_object_devices()))
+}
+
+/// The probe's outcome as Detcore keeps it. Under in-guest LiteInst the probe
+/// runs inside the guest before `main`, so a failure is described without the
+/// C library's errno message (see [`crate::util::describe_io_error`]).
+fn retained_probe_outcome(
+    probe: std::io::Result<AnonymousObjectDevices>,
+) -> Result<AnonymousObjectDevices, String> {
+    probe.map_err(|error| crate::util::describe_io_error(&error))
 }
 
 fn probe_anonymous_object_devices() -> std::io::Result<AnonymousObjectDevices> {
@@ -601,6 +610,18 @@ impl<T: RecordOrReplay> Detcore<T> {
 
 #[cfg(test)]
 mod tests {
+    /// A failed probe (here, the pipe's descriptor limit) is kept as its kind
+    /// and errno number, not the C library's message, which `to_string`
+    /// fetches through strerror_r.
+    #[test]
+    fn a_failed_device_probe_is_kept_without_the_c_library_message() {
+        let failure = || std::io::Error::from_raw_os_error(libc::EMFILE);
+        assert!(failure().to_string().contains("Too many open files"));
+        let kept = super::retained_probe_outcome(Err(failure())).unwrap_err();
+        assert!(kept.ends_with("(errno 24)"), "{kept}");
+        assert!(!kept.contains("Too many open files"), "{kept}");
+    }
+
     use super::*;
 
     /// The devices read once are the pipe and socket filesystems' own: a
