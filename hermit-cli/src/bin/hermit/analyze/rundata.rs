@@ -1175,18 +1175,25 @@ mod tests {
         }
     }
 
-    /// Through `main`: the dropped-option refusal is in analyze's preflight,
-    /// before the workspace and every trial (see the `--run1-schedule` note
-    /// on the strict counter test below).
+    /// Through `main`: the dropped-option, overwritten-output and
+    /// unqualified-timeout refusals are in analyze's preflight, before the
+    /// workspace and every trial. `--run1-schedule` stops a `main` that passed
+    /// them, with its own refusal right after that preflight, so each case
+    /// asserts which refusal fired and that it was not that one (see the
+    /// strict counter test below).
     #[test]
     fn trials_refuse_run_options_only_main_applies_before_their_workspace() {
-        for (backend, extra) in [
-            (None, "--namespace-only"),
-            (None, "--lite"),
-            (None, "--verify"),
-            (None, "--save-config=requested.config"),
-            (None, "--summary-json=requested.summary"),
-            (Some("--backend=kvm"), "--timeout=3"),
+        for (backend, extra, named) in [
+            (None, "--namespace-only", "--namespace-only"),
+            (None, "--lite", "--namespace-only"),
+            (None, "--verify", "--verify"),
+            (None, "--save-config=requested.config", "--save-config"),
+            (None, "--summary-json=requested.summary", "--summary-json"),
+            (
+                Some("--backend=kvm"),
+                "--timeout=3",
+                "--timeout is not qualified",
+            ),
         ] {
             let mut argv = vec!["hermit"];
             argv.extend(backend);
@@ -1207,6 +1214,12 @@ mod tests {
                     .downcast_ref::<crate::container::PolicyRefusal>()
                     .is_some(),
                 "{argv:?}: {error:#}"
+            );
+            let message = error.to_string();
+            assert!(message.contains(named), "{argv:?}: {error:#}");
+            assert!(
+                !message.contains("does not implement"),
+                "{argv:?}: main passed the preflight refusal: {error:#}"
             );
         }
     }
@@ -1277,8 +1290,9 @@ mod tests {
 
     /// Through `main`: the refusal must be wired into analyze's preflight,
     /// ahead of the workspace and every trial. `--run1-schedule` is not
-    /// implemented and `main` panics on it right after that preflight, so an
-    /// analyze that passed the refusal panics instead of starting anything.
+    /// implemented and `main` refuses it right after that preflight, so an
+    /// analyze that passed the counter refusal stops at that refusal instead,
+    /// before starting anything; the message assertion below tells them apart.
     /// A trial with `--namespace-only` or `--lite` is refused earlier in that
     /// preflight, for a dropped option
     /// (`trials_refuse_run_options_only_main_applies_before_their_workspace`);
