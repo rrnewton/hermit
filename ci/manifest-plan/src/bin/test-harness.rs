@@ -6714,7 +6714,15 @@ sys.exit(1 if failed else 0)
                 // row's environment is the same across runs.
                 .env("HERMIT_EPOCH", "2021-12-31T23:59:59Z")
                 .env("E2E_MACHINE_SHORTNAME", "native-control")
-                .env("E2E_KERNEL_VERSION", "native-control");
+                .env("E2E_KERNEL_VERSION", "native-control")
+                // This machine can run every fixture cell, whatever the host:
+                // without CPUID faulting (GitHub's hosted runners) the
+                // liteinst cells would be host-inapplicable and change the
+                // exit status this test pins.
+                .env(
+                    "HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT",
+                    "kvm,cpuid-faulting",
+                );
             if keep {
                 command.env("E2E_KEEP_VERIFY_LOGS", "1");
             }
