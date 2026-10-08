@@ -462,6 +462,19 @@ pub struct BlockedPool {
     /// (`step2_release_signaled_background`), so host delivery timing decides
     /// only how long the scheduler spins, not where they enter the run queue.
     pub signaled_background: BTreeSet<DetTid>,
+
+    /// Threads the scheduler signaled at a committed point while they were
+    /// still stopped at a `BlockingRtSigsuspend` request whose temporary mask
+    /// does not block the signal. The call's handler checked for a pending
+    /// signal before posting that request, so it could not see this one; the
+    /// thread's current mask may block it, so the kernel holds it pending until
+    /// the real `rt_sigsuspend` installs the temporary mask, and then delivers
+    /// it at once. Granting the request therefore arms the thread for the
+    /// release barrier (`arm_signaled_background`) as if the signal had been
+    /// sent one turn later, when it slept; otherwise the pool would hold a
+    /// sleeper the scheduler counts as unwakeable, and the next pass reports a
+    /// deadlock before the thread's signal stop is posted.
+    pub signaled_sigsuspend_requests: BTreeMap<DetTid, Signal>,
 }
 
 impl BlockedPool {
@@ -3315,6 +3328,7 @@ impl Scheduler {
         self.blocked.sigchld_deferred.remove(dtid);
         self.blocked.sigchld_ready.remove(dtid);
         self.blocked.signaled_background.remove(dtid);
+        let _ = self.blocked.signaled_sigsuspend_requests.remove(dtid);
         self.blocked.child_waiters.remove(dtid);
         self.blocked.physical_child_ready.remove(dtid);
         self.blocked.physical_child_waiters.retain(|_, waiters| {
@@ -4106,6 +4120,31 @@ impl Scheduler {
         self.wake_signaled_guest(dettid, signal);
     }
 
+    /// Record `signal`, just sent at a committed point, for a thread still
+    /// stopped at a `BlockingRtSigsuspend` request whose temporary mask does not
+    /// block it (`BlockedPool::signaled_sigsuspend_requests`). A later signal
+    /// of the same kind adds nothing: either one wakes the call.
+    fn note_signaled_sigsuspend_request(&mut self, dettid: DetTid, signal: Signal) {
+        let Some(Some(Ok(request))) = self.next_turns.get(&dettid).map(|nt| nt.req.try_read())
+        else {
+            return;
+        };
+        let suspends = request
+            .resources
+            .keys()
+            .any(|rid| matches!(rid, ResourceID::BlockingRtSigsuspend(_)));
+        let unblocked = matches!(
+            request.blocked_signal_mask,
+            Some(mask) if mask & kernel_signal_bit(signal as i32) == 0
+        );
+        if suspends && unblocked {
+            self.blocked
+                .signaled_sigsuspend_requests
+                .entry(dettid)
+                .or_insert(signal);
+        }
+    }
+
     /// `wake_signaled_guest` for a thread asleep in a real blocking call outside
     /// the run queue (`rt_sigsuspend_blockers` or `external_io_blockers`) on a
     /// traced backend, just sent `signal` at a committed point.
@@ -4162,6 +4201,9 @@ impl Scheduler {
         // scheduler and must await its own continuation.
         let has_external_blocker = self.blocked.external_io_blockers.contains_key(&dettid)
             || self.blocked.rt_sigsuspend_blockers.contains_key(&dettid);
+        if self.models_signal_targets && !has_external_blocker {
+            self.note_signaled_sigsuspend_request(dettid, signal);
+        }
         let await_external_continuation =
             self.backend.signal_interrupts_external_syscalls && has_external_blocker;
         // Where the scheduler models signal targets (`models_signal_targets`),
@@ -5651,6 +5693,9 @@ impl Scheduler {
                 assert!(old.is_none(), "thread started a second external operation");
                 if let Some(mask) = sleeping_mask {
                     self.blocked.out_of_scheduler_masks.insert(dettid, mask);
+                }
+                if let Some(signal) = self.blocked.signaled_sigsuspend_requests.remove(&dettid) {
+                    self.arm_signaled_background(dettid, signal);
                 }
                 Err(SkipTurn)
             }
@@ -10015,6 +10060,51 @@ mod test {
             scheduler.kernel_sigchld_target(parent, creator),
             Some(creator)
         );
+    }
+
+    /// A signal the scheduler sends while a thread is still stopped at its
+    /// `rt_sigsuspend` request reaches the call: the thread may block it now,
+    /// but the call's temporary mask does not, so the kernel delivers it as
+    /// soon as the call starts. Committing the call arms the thread for the
+    /// release barrier, which waits for its signal stop, as for a signal sent
+    /// after the commit. Before, the thread entered the pool as a sleeper no
+    /// signal could reach, and the next pass reported a deadlock. That is how
+    /// dash's `wait` failed: a `ChildExit` timer fired between its
+    /// `wait4(WNOHANG)` and its `rt_sigsuspend`, while it blocked every signal.
+    /// A signal the temporary mask blocks arms nothing.
+    #[test]
+    fn a_signal_sent_at_an_rt_sigsuspend_request_arms_the_call_it_wakes() {
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        for (temporary_mask, armed) in [(0, true), (chld, false)] {
+            let (mut scheduler, _parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+            let op = ExternalOpId::new(creator, 7);
+            let mut request = Resources::new(creator);
+            request.insert(ResourceID::BlockingRtSigsuspend(op), Permission::RW);
+            request.blocked_signal_mask = Some(temporary_mask);
+            scheduler.next_turns.get_mut(&creator).unwrap().req = Ivar::full(Ok(request));
+            // Its request is posted, so it waits in the run queue for its turn.
+            scheduler.runqueue_push_back(creator);
+
+            scheduler.wake_signaled_guest(creator, Signal::SIGCHLD);
+            assert!(scheduler.run_queue.remove_tid(creator));
+            commit_out_of_scheduler_call(
+                &mut scheduler,
+                creator,
+                ResourceID::BlockingRtSigsuspend(op),
+                Some(temporary_mask),
+            );
+            assert_eq!(
+                scheduler.blocked.rt_sigsuspend_blockers.get(&creator),
+                Some(&op)
+            );
+            assert_eq!(
+                scheduler.blocked.signaled_background.contains(&creator),
+                armed,
+                "temporary mask {temporary_mask:#x}"
+            );
+            assert_eq!(scheduler.blocked.sigchld_ready.contains(&creator), armed);
+            assert!(scheduler.blocked.signaled_sigsuspend_requests.is_empty());
+        }
     }
 
     /// A scheduler that does not model signal targets (`models_signal_targets`)

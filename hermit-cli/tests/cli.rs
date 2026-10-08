@@ -114,6 +114,7 @@ static STDIO_LSEEK_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_INODE_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REPLAY_EPOCH_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FORK_CHILD_GETRANDOM_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SIGSUSPEND_AFTER_WNOHANG_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "liteinst")]
 static LITEINST_IN_GUEST_WAIT_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
@@ -642,6 +643,32 @@ stdout:
 {}
 stderr:
 {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn sigsuspend_after_wnohang_wait_guest() -> &'static Path {
+    SIGSUSPEND_AFTER_WNOHANG_WAIT_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("sigsuspend-after-wnohang-wait");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the sigsuspend-after-wnohang-wait guest directory");
+        let guest = build_root.join("sigsuspend_after_wnohang_wait");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/sigsuspend_after_wnohang_wait.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the sigsuspend-after-wnohang-wait guest");
+        assert!(
+            output.status.success(),
+            "sigsuspend-after-wnohang-wait guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -6277,6 +6304,44 @@ fn no_namespace_fork_children_have_deterministic_distinct_rng_streams() {
     assert!(
         stderr.contains("Determinism verified"),
         "missing verification success marker:\n{stderr}"
+    );
+}
+
+/// dash's `wait` for a background job, as tests/c/sigsuspend_after_wnohang_wait.c
+/// copies it: the child's exit falls between the parent's `wait4(WNOHANG)` and
+/// its `rt_sigsuspend`, so the child-exit SIGCHLD arrives while the parent
+/// blocks every signal and is still stopped at its `rt_sigsuspend` request. The
+/// call must wake for it. Before, Detcore counted the call as a wait no signal
+/// could end and reported a deadlock (exit 125), which made
+/// `happens_before_edge_reverses_two_processes_writes` fail on hosts whose
+/// /bin/sh is dash. The timeslice is disabled so a host with a PMU schedules
+/// the guest as one without does.
+#[test]
+fn a_sigchld_sent_at_an_rt_sigsuspend_request_wakes_the_call() {
+    let _guard = hermit_run_guard();
+    let guest = sigsuspend_after_wnohang_wait_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let args = [
+        "run",
+        "--strict",
+        "--verify",
+        "--max-timeslice=disabled",
+        "--",
+        guest,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let mut lines: Vec<&str> = std::str::from_utf8(&output.stdout)
+        .expect("guest stdout should be UTF-8")
+        .lines()
+        .collect();
+    lines.sort_unstable();
+    assert_eq!(lines, ["child", "parent"]);
+    assert!(
+        stderr(&output).contains("Determinism verified"),
+        "missing verification success marker:\n{}",
+        stderr(&output)
     );
 }
 

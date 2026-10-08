@@ -1459,7 +1459,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tool_global; step I1b part 2), re-listed: 1134.
     // procfs::tests::self_sched_hides_schedstats_fields retains all 1149:
     // 1150, listed with this node's arguments.
-    ("test.detcore_unit", 1150),
+    // scheduler::test::a_signal_sent_at_an_rt_sigsuspend_request_arms_the_call_it_wakes
+    // retains all 1150: 1151, listed with this node's arguments.
+    ("test.detcore_unit", 1151),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1816,7 +1818,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // happens_before_inert_spec_adds_no_per_syscall_scheduler_turns and
     // happens_before_edge_reverses_two_processes_writes
     // (https://github.com/rrnewton/hermit/issues/3877) retain all 211: 213.
-    ("test.cli", 213),
+    // a_sigchld_sent_at_an_rt_sigsuspend_request_wakes_the_call retains all
+    // 213: 214, listed with this node's arguments.
+    ("test.cli", 214),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -1964,7 +1968,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The two happens-before tests (inert turn count, ordering edge) start no
     // LiteInst guest, so the filterset is unchanged and the host twin selects
     // both too: 173.
-    ("test.cli_on_host", 173),
+    // The rt_sigsuspend SIGCHLD wake test starts no LiteInst guest either and
+    // needs no PMU (it disables the timeslice): 174, listed.
+    ("test.cli_on_host", 174),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 55),
@@ -2046,7 +2052,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same fifteen fatal_core::tests: 1142.
     // And the same seven signal phase 1 table tests, re-listed: 1134.
     // And the schedstats sanitizer test: 1150.
-    ("test.detcore_unit_on_host", 1150),
+    // And the rt_sigsuspend request signal test: 1151.
+    ("test.detcore_unit_on_host", 1151),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
