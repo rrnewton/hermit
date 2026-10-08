@@ -6504,7 +6504,7 @@ fn monitor_live_cpu_in<R>(
                     // from `now`, which was taken before it ran. One host-wide
                     // /proc census can itself outlast the grace, and proccpu
                     // then serves its refusal again for 500 ms
-                    // (https://github.com/rrnewton/hermit/issues/3377). Timed
+                    // (https://github.com/rrnewton/hermit/issues/3822). Timed
                     // from `now`, that census alone would stop the command at
                     // the next poll, with no fresh sample in between.
                     let failed_at = Instant::now();
@@ -11452,7 +11452,7 @@ mod tests {
         // census pairs its pidfd with its stat file ("pidfd/stat generation
         // mismatch"); either failure is then served to every call for 500 ms
         // by proccpu's shared snapshot
-        // (https://github.com/rrnewton/hermit/issues/3377). Real samples
+        // (https://github.com/rrnewton/hermit/issues/3822). Real samples
         // through the monitor, with the monitor's one-second grace for
         // unavailable samples, are checked by
         // native_zombie_then_reaped_child_has_no_double_cpu_charge (every
@@ -11703,7 +11703,7 @@ mod tests {
         //
         // This test used to take the valid sample at 500 ms from a real host-wide
         // /proc census (`ProcessGroupCpu::seconds`), which under load can be slow
-        // or refused (https://github.com/rrnewton/hermit/issues/3377), and it left
+        // or refused (https://github.com/rrnewton/hermit/issues/3822), and it left
         // the child about 0.4 s to exit (measured: done written at 1.32 s, the
         // restarted grace due at 1.72 s). It failed under host load 155-173.
         let output = monitor_process(
@@ -11757,7 +11757,7 @@ mod tests {
     fn a_slow_failed_sample_does_not_use_up_the_unavailable_grace() {
         // One host-wide /proc census can outlast the whole grace. proccpu then
         // refuses it ("scan deadline") and serves that refusal again for 500 ms
-        // (https://github.com/rrnewton/hermit/issues/3377). The grace is timed
+        // (https://github.com/rrnewton/hermit/issues/3822). The grace is timed
         // from when the failed sample returned, so the refusal served right
         // after a slow census cannot stop the command before a fresh sample
         // runs. The samples are synthetic so the sequence is exact on any host.
@@ -11814,7 +11814,7 @@ mod tests {
     fn a_slow_census_that_keeps_failing_still_stops_the_command() {
         // The refusal above never clears here: every fresh census takes 1 s and
         // fails, and its refusal is served again for 500 ms, as proccpu does
-        // (https://github.com/rrnewton/hermit/issues/3377). The command must
+        // (https://github.com/rrnewton/hermit/issues/3822). The command must
         // still be stopped and reaped through the accounting stop, at least
         // the grace after the first failed census returned. The grace is only
         // checked when a sample returns, so the census running when it expires

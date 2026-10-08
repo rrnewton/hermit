@@ -4066,7 +4066,7 @@ fn self_test() -> Result<(), String> {
             writeback_delegated.exit_code, writeback_delegated.detail,
         ));
     }
-    let refusal_detail = verdict_refusals(None, 0, Some(0))
+    let refusal_detail = verdict_refusals(None, 0, Some(0), false)
         .into_iter()
         .map(|why| format!("REFUSED ON COMPLETENESS: {why}"))
         .collect::<Vec<_>>();
@@ -4848,6 +4848,7 @@ fn self_test() -> Result<(), String> {
     rebase_freshness_message_bracket()?;
     test_node_coverage_bracket()?;
     typed_libtest_count_bracket()?;
+    test_free_selection_verdict_bracket()?;
     ledger_gate_origin_bracket()?;
     ledger_gate_compaction_bracket()?;
     requalification_plan_bracket(&root)?;
@@ -15017,6 +15018,7 @@ fn verdict_refusals(
     compat_measured: Option<usize>,
     structural_failures: usize,
     executed_tests: Option<i64>,
+    test_free_selection: bool,
 ) -> Vec<String> {
     let mut out = Vec::new();
     if structural_failures > 0 {
@@ -15034,7 +15036,13 @@ fn verdict_refusals(
                 .to_string(),
         );
     }
-    if executed_tests == Some(0) {
+    // A DELIBERATE, NARROW EXCEPTION (https://github.com/rrnewton/hermit/issues/3915):
+    // a label selection of envelope-only or qemu-l2-only whose every planned
+    // node is declared test-free and passed (declared_test_free_selection)
+    // measures zero by design, and is the only zero accepted here. Its ledger row still has executed_tests 0 and a
+    // non-full profile, which the qualifying-receipt predicate refuses
+    // (profile "full", executed_tests_min 1), so it is never landing evidence.
+    if executed_tests == Some(0) && !test_free_selection {
         out.push(
             "ZERO tests executed; a run that executed nothing cannot certify anything".to_string(),
         );
@@ -16261,12 +16269,206 @@ fn host_capability_bracket(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Verdict-level bracket for the test-free selection exception
+/// (https://github.com/rrnewton/hermit/issues/3915). It runs the same
+/// `derive_run_counts` that run() uses, then the real verdict gate, so it
+/// fails if run() counts from the original outcomes again or if the narrow
+/// exception widens.
+fn test_free_selection_verdict_bracket() -> Result<(), String> {
+    let declared = |tag: &str| tag.starts_with("free.");
+    let passed = |tag: &str, executed: Option<u64>| {
+        StepOutcome::passed(
+            tag.to_string(),
+            1.0,
+            String::new(),
+            Some(0),
+            executed,
+            executed.map(|_| 0),
+        )
+    };
+    let planned = |tags: &[&str]| {
+        tags.iter()
+            .map(|tag| tag.to_string())
+            .collect::<BTreeSet<_>>()
+    };
+    let verdict = |outcomes: &[StepOutcome], planned: &BTreeSet<String>| {
+        let counts = derive_run_counts(
+            outcomes,
+            &[],
+            None,
+            None,
+            ("qemu-l2-only", "label"),
+            planned,
+            declared,
+        );
+        let exit = exit_code_with_verdict_refusals(0, &run_verdict_refusals(None, 0, &counts));
+        (counts, exit)
+    };
+
+    // (a) Every planned node declared and passing: an exact 0/0 that PASSES.
+    let all_declared = planned(&["free.build", "free.boot"]);
+    let (counts, exit) = verdict(
+        &[passed("free.build", None), passed("free.boot", None)],
+        &all_declared,
+    );
+    // (c) Wiring: the counts come from the declared zeroes, not the raw outcomes
+    // (which would sum to UNKNOWN).
+    if (counts.executed_tests, counts.passed_tests) != (Some(0), Some(0)) {
+        return Err(format!(
+            "test-free verdict: run counts did not come from the declared zeroes: {:?}/{:?}",
+            counts.executed_tests, counts.passed_tests
+        ));
+    }
+    if !counts.test_free_selection || exit != 0 || completed_verdict(exit) != Verdict::Pass {
+        return Err(format!(
+            "test-free verdict: an all-declared passing selection must end exit 0/PASSED, got exit {exit}/{:?}",
+            completed_verdict(exit)
+        ));
+    }
+
+    // (b) Full-shaped: a declared zero beside an undeclared test node whose
+    // counts were lost still sums to a measured zero, and is still REFUSED.
+    let (counts, exit) = verdict(
+        &[passed("free.build", None), passed("test.unit", None)],
+        &planned(&["free.build", "test.unit"]),
+    );
+    if counts.executed_tests != Some(0)
+        || counts.test_free_selection
+        || exit != NO_RESULT_EXIT_CODE as u8
+    {
+        return Err(format!(
+            "test-free verdict: a full-shaped run with no real counts must stay refused (exit {NO_RESULT_EXIT_CODE}), got exit {exit}, test_free={}",
+            counts.test_free_selection
+        ));
+    }
+    // A full-shaped run with real counts is unaffected.
+    let (counts, exit) = verdict(
+        &[passed("free.build", None), passed("test.unit", Some(398))],
+        &planned(&["free.build", "test.unit"]),
+    );
+    if counts.executed_tests != Some(398) || counts.test_free_selection || exit != 0 {
+        return Err("test-free verdict: a counted run changed under the declaration".into());
+    }
+
+    // A declared node that failed, or never reported, is not a test-free pass.
+    let mut failed = passed("free.boot", None);
+    failed.ok = false;
+    failed.reason = "test failure".into();
+    if verdict(&[passed("free.build", None), failed], &all_declared)
+        .0
+        .test_free_selection
+    {
+        return Err("test-free verdict: a failed declared node made a test-free selection".into());
+    }
+    if verdict(&[passed("free.build", None)], &all_declared)
+        .0
+        .test_free_selection
+    {
+        return Err(
+            "test-free verdict: an unreported planned node made a test-free selection".into(),
+        );
+    }
+    // A compatibility matrix or an empty plan never qualifies.
+    let label = |profile| SelectionShape {
+        profile,
+        selection_mode: "label",
+        compat_selected: false,
+    };
+    let compat_shape = SelectionShape {
+        compat_selected: true,
+        ..label("qemu-l2-only")
+    };
+    if declared_test_free_selection(
+        &compat_shape,
+        &all_declared,
+        &[passed("free.build", None), passed("free.boot", None)],
+        declared,
+    ) || declared_test_free_selection(&label("qemu-l2-only"), &BTreeSet::new(), &[], declared)
+    {
+        return Err("test-free verdict: a compatibility run or an empty plan qualified".into());
+    }
+    // Only a label selection of a test-free profile qualifies. Three reachable
+    // invocations plan only the five declared preflight nodes, with the real
+    // declarations, and must keep the zero-test refusal (review N1 of
+    // https://github.com/rrnewton/hermit/pull/3919).
+    let preflight = [
+        "pre.submodules",
+        "pre.reverie_pin",
+        "build.rust_scripts",
+        "setup.manifest_plan",
+        "gate.manifest",
+    ];
+    let preflight_tags = planned(&preflight);
+    let preflight_outcomes: Vec<StepOutcome> =
+        preflight.iter().map(|tag| passed(tag, None)).collect();
+    let real = hermit_manifest_plan::validation_dag::declared_test_free;
+    for (profile, mode, what) in [
+        (
+            "selective",
+            "selective",
+            "--selective when the selector skips",
+        ),
+        ("only-full", "only", "--only full gate.manifest"),
+        ("full", "selected", "full --selected gate.manifest"),
+        ("full", "full", "a full plan reduced to its preflight"),
+        (
+            "envelope-only",
+            "only",
+            "an envelope-only profile outside label selection",
+        ),
+    ] {
+        let counts = derive_run_counts(
+            &preflight_outcomes,
+            &[],
+            None,
+            None,
+            (profile, mode),
+            &preflight_tags,
+            real,
+        );
+        let exit = exit_code_with_verdict_refusals(0, &run_verdict_refusals(None, 0, &counts));
+        if counts.test_free_selection || exit != NO_RESULT_EXIT_CODE as u8 {
+            return Err(format!(
+                "test-free verdict: {what} (profile {profile}, selection {mode}) must keep the zero-test refusal (exit {NO_RESULT_EXIT_CODE}), got exit {exit}"
+            ));
+        }
+    }
+    for profile in TEST_FREE_PROFILES {
+        let counts = derive_run_counts(
+            &preflight_outcomes,
+            &[],
+            None,
+            None,
+            (profile, "label"),
+            &preflight_tags,
+            real,
+        );
+        let exit = exit_code_with_verdict_refusals(0, &run_verdict_refusals(None, 0, &counts));
+        if !counts.test_free_selection || exit != 0 {
+            return Err(format!(
+                "test-free verdict: a label selection of {profile} made of declared nodes must pass, got exit {exit}"
+            ));
+        }
+    }
+
+    // The exception lifts only the zero-count refusal.
+    if verdict_refusals(None, 1, Some(0), true).len() != 1
+        || verdict_refusals(Some(0), 0, Some(0), true).len() != 1
+    {
+        return Err(
+            "test-free verdict: the exception must not excuse a spine failure or an empty matrix"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// Two-sided bracket for [`verdict_refusals`]. Inert: no DAG, no ledger, no
 /// label, no PR — it exercises the decision function with planted counts only.
 fn verdict_refusal_bracket() -> Result<(), String> {
     // POSITIVE 1 — the exact shape measured on 2026-08-08 must fire, and must
     // fire for BOTH reasons rather than collapsing into one.
-    let observed = verdict_refusals(Some(0), 1, Some(20));
+    let observed = verdict_refusals(Some(0), 1, Some(20), false);
     if observed.len() != 2 {
         return Err(format!(
             "verdict: the observed fail-open shape (0 measured, 1 spine failure, 20 executed) \
@@ -16275,27 +16477,27 @@ fn verdict_refusal_bracket() -> Result<(), String> {
         ));
     }
     // POSITIVE 2 — zero executed tests alone, with nothing else wrong.
-    if verdict_refusals(None, 0, Some(0)).len() != 1 {
+    if verdict_refusals(None, 0, Some(0), false).len() != 1 {
         return Err("verdict: zero executed tests must refuse on its own".into());
     }
     // POSITIVE 3 — a spine failure alone, with a fully measured matrix, still
     // refuses: 187/187 passing rows do not excuse a failed prep node.
-    if verdict_refusals(Some(187), 1, Some(862)).len() != 1 {
+    if verdict_refusals(Some(187), 1, Some(862), false).len() != 1 {
         return Err("verdict: a spine failure must refuse even with a full matrix".into());
     }
     // NEGATIVE 1 — a genuinely complete run must stay inert, or the gate is a
     // blanket red rather than a predicate.
-    let clean = verdict_refusals(Some(187), 0, Some(862));
+    let clean = verdict_refusals(Some(187), 0, Some(862), false);
     if !clean.is_empty() {
         return Err(format!(
             "verdict: a complete run must NOT refuse, got {clean:?}"
         ));
     }
     // NEGATIVE 2 — unknown counts are not a measured zero.
-    if !verdict_refusals(None, 0, None).is_empty() {
+    if !verdict_refusals(None, 0, None, false).is_empty() {
         return Err("verdict: unknown counts must not be read as a measured zero".into());
     }
-    let zero_executed = verdict_refusals(None, 0, Some(0));
+    let zero_executed = verdict_refusals(None, 0, Some(0), false);
     let refusal_exit = exit_code_with_verdict_refusals(0, &zero_executed);
     if refusal_exit != NO_RESULT_EXIT_CODE as u8
         || completed_verdict(refusal_exit) != Verdict::NoResult
@@ -21672,6 +21874,145 @@ fn exact_passed_test_count(outcomes: &[StepOutcome]) -> Option<i64> {
     seen.then(|| i64::try_from(passed).ok()).flatten()
 }
 
+/// Count a passing node that the committed DAG declares test-free
+/// (`hermit_manifest_plan::validation_dag::TEST_FREE_STEPS`) as a demonstrated
+/// 0 executed / 0 filtered, so a selection made only of such nodes sums to an
+/// exact 0/0 instead of UNKNOWN (https://github.com/rrnewton/hermit/issues/3915).
+/// Only the copy used for counting changes. An undeclared node without counts
+/// stays UNKNOWN, and a failed declared node is not zeroed. A declared node that
+/// published counts contradicts its declaration and is refused.
+fn with_declared_test_free_zeroes(
+    outcomes: &[StepOutcome],
+    declared: impl Fn(&str) -> bool,
+) -> Result<Vec<StepOutcome>, String> {
+    let mut counted = outcomes.to_vec();
+    for outcome in &mut counted {
+        if !declared(&outcome.tag) {
+            continue;
+        }
+        if outcome.executed_tests.is_some()
+            || outcome.filtered_tests.is_some()
+            || outcome.test_results.is_some()
+        {
+            return Err(format!(
+                "{} is declared test-free (TEST_FREE_STEPS) but published test counts",
+                outcome.tag
+            ));
+        }
+        if outcome.ok {
+            outcome.executed_tests = Some(0);
+            outcome.filtered_tests = Some(0);
+        }
+    }
+    Ok(counted)
+}
+
+/// The only profiles whose label selections are wholly test-free by design
+/// (https://github.com/rrnewton/hermit/issues/3915).
+const TEST_FREE_PROFILES: [&str; 2] = ["envelope-only", "qemu-l2-only"];
+
+/// Whether a measured zero is the declared shape of this selection rather than
+/// a vacuous run (https://github.com/rrnewton/hermit/issues/3915). True only
+/// for a LABEL selection of one of TEST_FREE_PROFILES, with no compatibility
+/// matrix and a nonempty plan, whose EVERY planned node is declared test-free and
+/// passed. The profile and selection-mode conjuncts matter: `--selective` when
+/// the selector skips, `--only full gate.manifest` and
+/// `full --selected gate.manifest` all plan only the five declared preflight
+/// nodes, and must keep the zero-test refusal.
+fn declared_test_free_selection(
+    shape: &SelectionShape<'_>,
+    planned_tags: &BTreeSet<String>,
+    outcomes: &[StepOutcome],
+    declared: impl Fn(&str) -> bool,
+) -> bool {
+    TEST_FREE_PROFILES.contains(&shape.profile)
+        && shape.selection_mode == "label"
+        && !shape.compat_selected
+        && !planned_tags.is_empty()
+        && planned_tags.iter().all(|tag| {
+            let mut runs = outcomes
+                .iter()
+                .filter(|outcome| &outcome.tag == tag)
+                .peekable();
+            declared(tag) && runs.peek().is_some() && runs.all(|outcome| outcome.ok)
+        })
+}
+
+/// What a run selected, as the test-free exception needs it.
+struct SelectionShape<'a> {
+    profile: &'a str,
+    selection_mode: &'a str,
+    compat_selected: bool,
+}
+
+/// The run's test counts and the facts the verdict needs about them, derived
+/// in one place so run() cannot count from a different set of outcomes than
+/// the self-tests check.
+struct RunCounts {
+    executed_tests: Option<i64>,
+    passed_tests: Option<i64>,
+    filtered_tests: Option<i64>,
+    compatibility_count_error: Option<String>,
+    test_free_declaration_error: Option<String>,
+    test_free_selection: bool,
+}
+
+fn derive_run_counts(
+    outcomes: &[StepOutcome],
+    attempts: &[NodeAttempt],
+    compat: Option<CompatMode>,
+    compat_prefix: Option<&str>,
+    shape: (&str, &str),
+    planned_tags: &BTreeSet<String>,
+    declared: impl Fn(&str) -> bool + Copy,
+) -> RunCounts {
+    let declared_counts = with_declared_test_free_zeroes(outcomes, declared);
+    let test_free_declaration_error = declared_counts.as_ref().err().cloned();
+    let counted_outcomes = declared_counts.unwrap_or_else(|_| outcomes.to_vec());
+    let (executed_tests, passed_tests, filtered_tests, compatibility_count_error) =
+        match run_test_counts(&counted_outcomes, attempts, compat, compat_prefix) {
+            Ok((executed, passed, filtered)) => (executed, passed, filtered, None),
+            Err(error) => {
+                let (executed, passed, filtered) = libtest_counts(&counted_outcomes);
+                (executed, passed, filtered, Some(error))
+            }
+        };
+    let test_free_selection = test_free_declaration_error.is_none()
+        && declared_test_free_selection(
+            &SelectionShape {
+                profile: shape.0,
+                selection_mode: shape.1,
+                compat_selected: compat.is_some(),
+            },
+            planned_tags,
+            outcomes,
+            declared,
+        );
+    RunCounts {
+        executed_tests,
+        passed_tests,
+        filtered_tests,
+        compatibility_count_error,
+        test_free_declaration_error,
+        test_free_selection,
+    }
+}
+
+/// The verdict's completeness refusals for a run's counts. run() and the
+/// self-tests both call this, so the test-free flag they pass cannot differ.
+fn run_verdict_refusals(
+    compat_measured: Option<usize>,
+    structural_failures: usize,
+    counts: &RunCounts,
+) -> Vec<String> {
+    verdict_refusals(
+        compat_measured,
+        structural_failures,
+        counts.executed_tests,
+        counts.test_free_selection,
+    )
+}
+
 fn libtest_counts(outcomes: &[StepOutcome]) -> (Option<i64>, Option<i64>, Option<i64>) {
     (
         sum_typed_count(outcomes, |o| o.executed_tests),
@@ -21962,6 +22303,53 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
     }
     if libtest_counts(&[outcome("build.only", true, None, None)]) != (None, None, None) {
         return Err("typed libtest counts: unknown bannerless output was coerced".into());
+    }
+    // https://github.com/rrnewton/hermit/issues/3915: a passing declared
+    // test-free node is a demonstrated zero; undeclared and failed nodes are not.
+    let declared = |tag: &str| tag.starts_with("free.");
+    let test_free = with_declared_test_free_zeroes(
+        &[
+            outcome("free.build", true, None, None),
+            outcome("free.probe", true, None, None),
+        ],
+        declared,
+    )?;
+    if libtest_counts(&test_free) != (Some(0), Some(0), Some(0)) {
+        return Err("test-free declarations: an all-declared passing run did not count 0/0".into());
+    }
+    let mixed = with_declared_test_free_zeroes(
+        &[
+            outcome("free.build", true, None, None),
+            outcome("test.a", true, Some(398), Some(0)),
+        ],
+        declared,
+    )?;
+    if libtest_counts(&mixed) != (Some(398), Some(398), Some(0)) {
+        return Err("test-free declarations: a declared zero changed a counted total".into());
+    }
+    let undeclared = with_declared_test_free_zeroes(
+        &[
+            outcome("free.build", true, None, None),
+            outcome("build.only", true, None, None),
+        ],
+        declared,
+    )?;
+    if undeclared[1].executed_tests.is_some() {
+        return Err("test-free declarations: an undeclared bannerless node was zeroed".into());
+    }
+    let failed_free =
+        with_declared_test_free_zeroes(&[outcome("free.build", false, None, None)], declared)?;
+    if libtest_counts(&failed_free) != (None, None, None) {
+        return Err("test-free declarations: a failed declared node was zeroed".into());
+    }
+    match with_declared_test_free_zeroes(&[outcome("free.liar", true, Some(3), Some(0))], declared)
+    {
+        Err(error) if error.contains("free.liar") && error.contains("declared test-free") => {}
+        other => {
+            return Err(format!(
+                "test-free declarations: a declared node with counts was not refused: {other:?}"
+            ));
+        }
     }
 
     let mut exact = outcome("test.exact", false, Some(2), Some(0));
@@ -28011,15 +28399,26 @@ fn run(
     // Whole-run CPU, taken once in THIS process (a worker thread would see only
     // its own accounting, exactly as a bash subshell's `times` would).
     let (cpu_user, cpu_sys) = validate_runtime::process_cpu_seconds();
-    let (executed_tests, passed_tests, filtered_tests, compatibility_count_error) =
-        match run_test_counts(&outcomes, &attempts, plan.compat, plan.compat_prefix) {
-            Ok((executed, passed, filtered)) => (executed, passed, filtered, None),
-            Err(error) => {
-                eprintln!("validate: ERROR: {error}");
-                let (executed, passed, filtered) = libtest_counts(&outcomes);
-                (executed, passed, filtered, Some(error))
-            }
-        };
+    let run_counts = derive_run_counts(
+        &outcomes,
+        &attempts,
+        plan.compat,
+        plan.compat_prefix,
+        (plan.profile.as_str(), plan.selection_mode),
+        &planned_tags,
+        hermit_manifest_plan::validation_dag::declared_test_free,
+    );
+    let executed_tests = run_counts.executed_tests;
+    let passed_tests = run_counts.passed_tests;
+    let filtered_tests = run_counts.filtered_tests;
+    let compatibility_count_error = run_counts.compatibility_count_error.clone();
+    let test_free_declaration_error = run_counts.test_free_declaration_error.clone();
+    for error in [&test_free_declaration_error, &compatibility_count_error]
+        .into_iter()
+        .flatten()
+    {
+        eprintln!("validate: ERROR: {error}");
+    }
     if executed_tests.is_none() {
         eprintln!(
             "validate: WARNING: libtest counts are UNKNOWN for this run. A ledger row with \
@@ -28428,7 +28827,7 @@ fn run(
     if series_error.is_some() {
         exit_code = 1;
     }
-    if compatibility_count_error.is_some() {
+    if compatibility_count_error.is_some() || test_free_declaration_error.is_some() {
         exit_code = 1;
     }
     if !execution_complete {
@@ -28443,7 +28842,7 @@ fn run(
     // Completeness is not the ratchet's to decide. A ratchet narrows WHICH
     // measured rows may fail; it cannot answer whether anything was measured, so
     // these conditions are checked separately and named individually.
-    let refusals = verdict_refusals(compat_measured, structural_failures, executed_tests);
+    let refusals = run_verdict_refusals(compat_measured, structural_failures, &run_counts);
     if exit_code == 0 && !refusals.is_empty() {
         for why in &refusals {
             eprintln!("validate: ERROR: {why}");
@@ -28823,6 +29222,9 @@ fn run(
         detail.push(format!(
             "direct compatibility rows could not produce an exact test count: {error}"
         ));
+    }
+    if let Some(error) = &test_free_declaration_error {
+        detail.push(format!("a test-free declaration was contradicted: {error}"));
     }
     detail.extend(evidence_refusal_details);
     if !timed_out_nodes(&outcomes).is_empty() {
@@ -31553,7 +31955,7 @@ mod final_validate_status_tests {
 
     #[test]
     fn completeness_refusal_is_not_a_product_failure() {
-        let refusals = verdict_refusals(None, 0, Some(0));
+        let refusals = verdict_refusals(None, 0, Some(0), false);
         assert!(!refusals.is_empty());
 
         let refused_exit = exit_code_with_verdict_refusals(0, &refusals);
@@ -31592,7 +31994,7 @@ mod final_validate_status_tests {
     #[test]
     fn schema_five_publishes_detail_only_for_could_not_run() {
         let temp = tempfile::tempdir().unwrap();
-        let refusals = verdict_refusals(None, 0, Some(0));
+        let refusals = verdict_refusals(None, 0, Some(0), false);
         let expected_detail = refusals
             .iter()
             .map(|why| format!("REFUSED ON COMPLETENESS: {why}"))

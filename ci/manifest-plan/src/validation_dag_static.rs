@@ -875,7 +875,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // config::tests::replaying_never_enters_the_legacy_form and
     // config::tests::replaying_round_trips_through_reverie_bincode
     // (https://github.com/rrnewton/hermit/pull/3871) retain all 1002: 1004.
-    ("test.regular_crates", 1004),
+    // validation_dag::tests::test_free_declarations_name_count_free_committed_nodes
+    // (https://github.com/rrnewton/hermit/issues/3915) retains all 1004: 1005.
+    ("test.regular_crates", 1005),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2372,7 +2374,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same in_guest_detlog_forward_policy legacy-form test: 1001.
     // And the same committed-selection preparation test: 1002.
     // And the two detcore-model replaying tests listed there: 1004.
-    ("test.regular_crates_on_host", 1004),
+    // And the same test-free declaration test: 1005.
+    ("test.regular_crates_on_host", 1005),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
