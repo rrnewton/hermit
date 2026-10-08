@@ -275,6 +275,7 @@ pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_in_guest_programs::liteinst_in_guest_serves_its_own_userfaultfd_and_exits_registered",
     "liteinst_in_guest_programs::liteinst_in_guest_shell_and_entropy_consumer",
     "liteinst_in_guest_programs::liteinst_in_guest_sigalrm_handler_is_virtual_and_published",
+    "liteinst_in_guest_programs::liteinst_in_guest_tool_directory_reads_stay_out_of_the_guest_heap",
     "liteinst_in_guest_programs::liteinst_in_guest_unscheduled_deaths_complete_and_refuse_verification",
     "liteinst_in_guest_programs::liteinst_in_guest_user_address_limit_queries_keep_the_guest_errno",
     "liteinst_in_guest_programs::liteinst_in_guest_virtual_identity_and_time",

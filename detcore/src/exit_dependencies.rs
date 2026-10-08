@@ -132,20 +132,16 @@ pub fn descriptor_exit_dependency(fd_link: &Path) -> Option<&'static str> {
 /// directory) that would make its holder serve another guest's exit: its name
 /// in the directory and what it is. The in-guest runtime checks
 /// `/proc/self/fd` with it before installing Detcore. A directory that cannot
-/// be listed is an error, never a pass.
+/// be listed is an error, never a pass. Listed with
+/// [`crate::util::find_in_directory`]: this runs inside the guest, where
+/// `std::fs::read_dir` would leave the listing in the guest's heap.
 pub fn held_exit_dependency(
     fd_directory: &Path,
 ) -> std::io::Result<Option<(String, &'static str)>> {
-    for entry in std::fs::read_dir(fd_directory)? {
-        let entry = entry?;
-        if let Some(what) = descriptor_exit_dependency(&entry.path()) {
-            return Ok(Some((
-                entry.file_name().to_string_lossy().into_owned(),
-                what,
-            )));
-        }
-    }
-    Ok(None)
+    crate::util::find_in_directory(fd_directory, |name| {
+        descriptor_exit_dependency(&fd_directory.join(name))
+            .map(|what| (name.to_string_lossy().into_owned(), what))
+    })
 }
 
 /// The descriptors a `struct msghdr` at `address` received through

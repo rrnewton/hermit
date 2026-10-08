@@ -153,16 +153,17 @@ pub(crate) fn link_is_signalfd(target: &Path) -> bool {
 
 /// Whether process `pid` holds a signalfd, from the kernel's own descriptor
 /// table (`/proc/<pid>/fd`), so an inherited one counts whatever Detcore's
-/// model calls it. A table that cannot be read counts as holding one.
+/// model calls it. A table that cannot be read counts as holding one. Listed
+/// with [`crate::util::find_in_directory`], which keeps the guest's heap out
+/// of it under in-guest LiteInst.
 pub(crate) fn process_holds_signalfd(pid: i32) -> bool {
-    let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
-        return true;
-    };
-    entries.into_iter().any(|entry| {
-        entry.map_or(true, |entry| {
-            std::fs::read_link(entry.path()).is_ok_and(|target| link_is_signalfd(&target))
-        })
+    let directory = std::path::PathBuf::from(format!("/proc/{pid}/fd"));
+    crate::util::find_in_directory(&directory, |name| {
+        std::fs::read_link(directory.join(name))
+            .is_ok_and(|target| link_is_signalfd(&target))
+            .then_some(())
     })
+    .map_or(true, |found| found.is_some())
 }
 
 /// [`kernel_provenance`] from its kernel facts: the file system type, the
