@@ -39,6 +39,12 @@
  *    that instruction (ERESTARTSYS) or inside it (ERESTARTNOHAND), depending
  *    on host timing, and strict verify diverges at the `rt_sigsuspend`
  *    record although the guest's output is the same either way.
+ *
+ * Defect 1 lost a host-timing race only some of the time: on a tree without
+ * its fix, 5 of 13 strict verify runs deadlocked with each phase run once,
+ * and 5 of 6 with 25 rounds (the sixth completed and diverged by defect 2).
+ * The phases therefore repeat ROUNDS times in one run, so that a single CI
+ * run meets the race many times.
  */
 
 #define _GNU_SOURCE
@@ -52,6 +58,8 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+#define ROUNDS 25
 
 static volatile sig_atomic_t usr2_runs = 0;
 static volatile sig_atomic_t usr2_on_waiter = 0;
@@ -157,9 +165,11 @@ int main(void) {
   }
   waiter_tid = (pid_t)syscall(SYS_gettid);
 
-  if (phase("ignored-alarm", 0) != 0 || phase("ignored-chld", 1) != 0) {
-    puts("SIGSUSPEND_SIBLING_SIGNAL_WAKE_FAILED");
-    return 1;
+  for (int round = 0; round < ROUNDS; round++) {
+    if (phase("ignored-alarm", 0) != 0 || phase("ignored-chld", 1) != 0) {
+      puts("SIGSUSPEND_SIBLING_SIGNAL_WAKE_FAILED");
+      return 1;
+    }
   }
   puts("SIGSUSPEND_SIBLING_SIGNAL_WAKE_OK");
   return 0;
