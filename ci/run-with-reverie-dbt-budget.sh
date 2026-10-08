@@ -1182,7 +1182,22 @@ fi
 # under reverie-dbt, the root Cargo.toml, third-party or rust-toolchain.toml
 # changes, so the four budget inputs are unchanged. Carry, not recalibration:
 # no new timing sample or >=5-sample replacement claim is made.
-expected_pin=684186e9e7dcbb242a5cc9507a4b3cd57ee561f1
+# CARRY TO 8d08e1e6d4aeafd9341f9c8f5945ccb3c80f66eb (2026-10-08): from
+# 684186e9e7dcbb242a5cc9507a4b3cd57ee561f1. The eleven commits change reverie-inguest (da61ef94: the
+# Tool heap moves to anonymous memory; e88a23fa: the RCB clock binds in the
+# private allocation scope; 768fee5b, 6a9896e8, 4947d504 and 7c0cff93: the C
+# library is identified without dlopen, by its DT_SONAME, through the
+# loader's own records and its own segment; 31b4c806 and 278fd766: errors are
+# described without the C library's errno messages; efdf52b5: the page size
+# comes from the auxiliary vector; with new tests), reverie-liteinst
+# (1a0200c0: a Tool is installed in the private allocation scope; 31b4c806,
+# 278fd766 and efdf52b5: the same error descriptions and page size) and
+# reverie-ptrace (efdf52b5: the perf page size; 8d08e1e6: procfs errors
+# described numerically); no file under reverie-dbt, the root Cargo.toml,
+# third-party or rust-toolchain.toml changes, so the four budget inputs are
+# unchanged. Carry, not recalibration: no new timing sample or >=5-sample
+# replacement claim is made.
+expected_pin=8d08e1e6d4aeafd9341f9c8f5945ccb3c80f66eb
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
