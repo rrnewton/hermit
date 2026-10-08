@@ -289,9 +289,24 @@ pub fn validate_golden_kernel_floor(
 }
 
 /// The host capability a backend itself needs, independent of any `requires`
-/// token: a kvm cell cannot run where KVM is proven absent.
+/// token: a kvm cell cannot run where KVM is proven absent, and a cell of
+/// either in-guest LiteInst backend (`liteinst`, and `in-guest-trap`, the same
+/// runtime with syscall site patching off) cannot run where CPUID faulting is
+/// proven absent, because that runtime arms CPUID faulting before the guest's
+/// first instruction and refuses to start without it
+/// (`detcore-liteinst: initialization failed: CPUID faulting is unavailable`).
+///
+/// Each required plan row carries this capability in
+/// `requires_host_capabilities`, so the harness withholds the cell on such a
+/// host, the validation planner counts it, and the Buck cell generator
+/// (`ci/buck-e2e/defs.bzl`) runs it locally rather than on a remote execution
+/// worker, which may lack the capability.
 pub fn backend_capability(backend: &str) -> Option<HostCapability> {
-    (backend == "kvm").then_some(HostCapability::Kvm)
+    match backend {
+        "kvm" => Some(HostCapability::Kvm),
+        "liteinst" | "in-guest-trap" => Some(HostCapability::CpuidFaulting),
+        _ => None,
+    }
 }
 
 /// Whether `hermit run --strict` on `backend` reads its virtual clock from the
@@ -10820,11 +10835,17 @@ mod tests {
         // host), also with the default timeouts and no calibration change.
         // Its DBT verify cell joins the same day on the same evidence (the DBT
         // zero-class qualification), again with the default timeouts.
+        // Its liteinst and in-guest-trap verify cells join the same day too,
+        // from ten clean in-guest verify runs each with the maximum timeslice
+        // disabled (https://github.com/rrnewton/hermit/issues/3745), again with
+        // the default timeouts.
         assert_eq!(
             regular_sink,
             BTreeSet::from([
                 ("verify", Some("dbt")),
+                ("verify", Some("in-guest-trap")),
                 ("verify", Some("kvm")),
+                ("verify", Some("liteinst")),
                 ("verify", Some("ptrace")),
                 ("verify", Some("sabre"))
             ])
@@ -10923,11 +10944,17 @@ mod tests {
         // hybrid. The owner reset of 2026-10-04 switched every LiteInst cell
         // off while in-guest Detcore replaces it
         // (https://github.com/rrnewton/hermit/issues/3745, step 1 of
-        // https://github.com/rrnewton/hermit/issues/3520), so none of them may
-        // be enabled. A cell comes back only on the new architecture, with
-        // fresh evidence; delete the groups then rather than re-enabling them.
+        // https://github.com/rrnewton/hermit/issues/3520), and the groups are
+        // history: they qualify nothing. LiteInst cells came back on
+        // 2026-10-08 only on the new architecture, with fresh evidence: verify
+        // cells of in-guest LiteInst (liteinst, and in-guest-trap with site
+        // patching off) that passed ten clean verify runs each with the
+        // maximum timeslice disabled, which in-guest LiteInst requires. So
+        // every enabled LiteInst or in-guest-trap cell, a hybrid-group member
+        // included, must be a verify cell that carries exactly that
+        // relaxation and the default bounds, never a hybrid-era calibration.
         // The census covers every run type and the occasional tests, so a
-        // LiteInst cell that full validation would skip is caught too.
+        // cell that full validation would skip is caught too.
         let enabled_anywhere = manifests
             .select(&Selection {
                 population: Some(Population::Enabled),
@@ -10936,31 +10963,48 @@ mod tests {
                 ..Selection::default()
             })
             .unwrap();
-        for calibration in LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS
+        let in_guest = enabled_anywhere
+            .iter()
+            .filter(|cell| {
+                matches!(
+                    cell.id.backend.as_deref(),
+                    Some("liteinst" | "in-guest-trap")
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(!in_guest.is_empty());
+        for cell in &in_guest {
+            let backend = cell.id.backend.as_deref().unwrap();
+            let name = format!("{} {}/{backend}", cell.id.test, cell.id.mode);
+            assert_eq!(cell.id.mode, "verify", "{name}");
+            assert_eq!(
+                cell_hermit_args(&cell.test.modes[&cell.id.mode], backend),
+                ["--max-timeslice=disabled"],
+                "{name}"
+            );
+            assert_eq!(
+                (cell.cpu_timeout_seconds, cell.timeout_seconds),
+                (
+                    DEFAULT_TEST_CPU_TIMEOUT_SECONDS,
+                    DEFAULT_TEST_WALL_TIMEOUT_SECONDS
+                ),
+                "{name}"
+            );
+        }
+        let hybrid_group_cells = LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS
             .iter()
             .chain(&LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS)
-        {
-            assert!(
-                !enabled_anywhere.iter().any(|cell| {
+            .filter(|calibration| {
+                in_guest.iter().any(|cell| {
                     cell.id.test == calibration.test
                         && cell.id.mode == calibration.mode
                         && cell.id.backend.as_deref() == Some(calibration.backend)
-                }),
-                "{} {}/{} was switched off by the LiteInst reset",
-                calibration.test,
-                calibration.mode,
-                calibration.backend
-            );
-        }
-        let liteinst_enabled = enabled_anywhere
-            .iter()
-            .filter(|cell| cell.id.backend.as_deref() == Some("liteinst"))
-            .map(|cell| format!("{} {}", cell.id.test, cell.id.mode))
-            .collect::<Vec<_>>();
-        assert!(
-            liteinst_enabled.is_empty(),
-            "the LiteInst reset leaves no LiteInst cell enabled: {liteinst_enabled:?}"
-        );
+                })
+            })
+            .count();
+        // Hybrid-group cells do come back, on the in-guest evidence above, so
+        // the checks above are not vacuous for them.
+        assert!(hybrid_group_cells > 0);
 
         let observed = enabled
             .iter()
