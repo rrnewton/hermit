@@ -1253,12 +1253,13 @@ test:
           ptrace: true
           sabre: true
           dbt: true
+          kvm: true
         backends_enabled:
           - ptrace
           - sabre
           - dbt
+          - kvm
         backends_disabled:
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
         expected_stdout:
           ptrace: "wait4=7 waitid=9 sigchld=observed reaped=2 cpu=zero\n"
@@ -1407,9 +1408,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
@@ -1847,12 +1848,13 @@ test:
         ci:
           ptrace: true
           sabre: false
+          kvm: true
         backends_enabled:
           - ptrace
           - sabre
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
@@ -2104,9 +2106,9 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
@@ -2246,9 +2248,9 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
@@ -2600,6 +2602,7 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         guest_args:
           ptrace:
             - pipe-order
@@ -2609,7 +2612,6 @@ test:
             - "pipe-order"
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
@@ -3041,6 +3043,7 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         guest_args:
           ptrace:
             - threads
@@ -3050,7 +3053,6 @@ test:
             - "threads"
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
@@ -4272,12 +4274,13 @@ test:
         ci:
           ptrace: true
           sabre: false
+          kvm: true
         backends_enabled:
           - ptrace
           - sabre
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
@@ -4763,14 +4766,15 @@ test:
         ci:
           ptrace: true
           sabre: true
+          kvm: true
         backends_enabled:
           - ptrace
           - sabre
+          - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: pause(2) scheduler interaction is qualified against the ptrace reference first; qualify DBT separately
-          kvm: pause(2) scheduler interaction is qualified against the ptrace reference first; qualify KVM separately
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
@@ -5094,9 +5098,9 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
@@ -5464,12 +5468,13 @@ test:
         ci:
           ptrace: true
           sabre: false
+          kvm: true
         backends_enabled:
           - ptrace
           - sabre
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           sabre: {"result": "determinism-failure", "evidence": "Generated scorecard ci/compat-envelope/cells.json at Hermit 5b811757980b9cab599206c047560a7962176a6b retains historical results determinism-failure, crash-error at Hermit 90e46cba9ad83550205f3c9cd232ae222c6b6173; retained first divergent record positions: 118, 198.", "reason": "Historical canonical verification diverged at recorded positions. The later clean observations do not erase that retained failure, so this backend remains excluded pending separate qualification."}
@@ -5798,12 +5803,13 @@ test:
         ci:
           ptrace: true
           sabre: false
+          kvm: true
         backends_enabled:
           - ptrace
           - sabre
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
@@ -5929,9 +5935,9 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
@@ -6831,9 +6837,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
@@ -7072,9 +7078,9 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - kvm
         backends_disabled:
           dbt: Regular-file sendfile variant has not been qualified on DBT
-          kvm: Regular-file sendfile variant has not been qualified on KVM
           liteinst: Regular-file sendfile variant has not been qualified on LiteInst
       naked:
         ci: false
@@ -7134,6 +7140,7 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - kvm
         guest_args:
           ptrace:
             - README.md
@@ -7145,7 +7152,6 @@ test:
             - "README.md"
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
@@ -7590,11 +7596,12 @@ test:
       verify:
         ci:
           ptrace: true
+          kvm: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
@@ -7834,12 +7841,13 @@ test:
         ci:
           ptrace: true
           sabre: false
+          kvm: true
         backends_enabled:
           - ptrace
           - sabre
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
@@ -8103,12 +8111,13 @@ test:
         ci:
           ptrace: true
           sabre: false
+          kvm: true
         backends_enabled:
           - ptrace
           - sabre
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
@@ -8317,9 +8326,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
@@ -8385,12 +8394,13 @@ test:
         ci:
           ptrace: true
           sabre: false
+          kvm: true
         backends_enabled:
           - ptrace
           - sabre
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
@@ -8457,9 +8467,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
@@ -8866,6 +8876,7 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         guest_args:
           ptrace:
             - v4-us
@@ -8875,7 +8886,6 @@ test:
             - v4-us
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
@@ -8930,11 +8940,12 @@ test:
       verify:
         ci:
           ptrace: true
+          kvm: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
@@ -9497,9 +9508,9 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
@@ -9564,9 +9575,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
@@ -10263,12 +10274,13 @@ test:
         ci:
           ptrace: true
           sabre: false
+          kvm: true
         backends_enabled:
           - ptrace
           - sabre
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
@@ -12036,13 +12048,14 @@ test:
       verify:
         ci:
           ptrace: true
+          kvm: true
         backends_enabled:
           - ptrace
+          - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
@@ -16313,6 +16326,7 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         guest_args:
           ptrace:
             - workdir
@@ -16324,7 +16338,6 @@ test:
           bitwise_parity: true
         backends_disabled:
           dbt: DBT does not enter the per-cell /test mount namespace
-          kvm: KVM verification does not yet compare canonical non-vacuous INFO evidence
           sabre: Canonical SaBRe verification has not been qualified for this environment-control fixture
           liteinst: LiteInst canonical verification remains blocked by guest-visible startup mapping identity
       naked:
@@ -16738,14 +16751,15 @@ test:
         ci:
           ptrace: true
           dbt: false
+          kvm: true
         ci_disabled_reason:
           dbt: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit", "result": "infrastructure-error"}
         backends_enabled:
           - ptrace
           - dbt
+          - kvm
         backends_disabled:
           sabre: 'MEASURED HANG 2026-08-06: prints through the sigkill case then never returns from the SIGILL case (killed at 150s). This is the defect the fixture exists to pin; re-enable when SaBRe signal delivery terminates.'
-          kvm: Cannot complete a guest on the current host (startup livelock); no wait-status observation exists to compare
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
@@ -16877,12 +16891,13 @@ test:
           ptrace: true
           dbt: true
           sabre: true
+          kvm: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - kvm
         backends_disabled:
-          kvm: KVM times out before guest start on the validation host, so no host-identity verdict is available; re-enable when the startup livelock is fixed
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
@@ -17143,11 +17158,12 @@ test:
       verify:
         ci:
           ptrace: true
+          kvm: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: New top-of-funnel coverage is established on the ptrace reference first; DBI ratchets against it separately
-          kvm: New top-of-funnel coverage is established on the ptrace reference first; KVM ratchets against it separately
           sabre: New top-of-funnel coverage is established on the ptrace reference first; SaBRe ratchets against it separately
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
@@ -17272,9 +17288,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: The DynamoRIO (DBT) backend is not buildable on the current host (third-party-backends feature off; DynamoRIO needs cmake), so no witness could be recorded; qualify DBT separately once it builds
-          kvm: KVM livelocks at guest startup on the current host, so no witness could be recorded; qualify KVM separately
           sabre: SaBRe is not buildable on the current host (same third-party-backends gate); qualify SaBRe separately
           liteinst: LiteInst preload runtime libreverie_liteinst.so is not built beside the binary on the current host; qualify LiteInst separately
       naked:
@@ -17668,8 +17684,8 @@ test:
           - ptrace
           - dbt
           - sabre
+          - kvm
         backends_disabled:
-          kvm: Added for the DBT contract that replaced the backend-parity matrix; qualify KVM against the same oracle separately
           liteinst: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately
         expected_stdout_contains:
           ptrace: "heap "
@@ -17733,8 +17749,8 @@ test:
           - ptrace
           - dbt
           - sabre
+          - kvm
         backends_disabled:
-          kvm: Added for the DBT contract that replaced the backend-parity matrix; qualify KVM against the same oracle separately
           liteinst: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately
         expected_stdout_contains:
           ptrace: "shared "
@@ -17808,8 +17824,8 @@ test:
           - ptrace
           - dbt
           - sabre
+          - kvm
         backends_disabled:
-          kvm: Added for the DBT contract that replaced the backend-parity matrix; qualify KVM against the same oracle separately
           liteinst: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately
         expected_stdout:
           ptrace: "wait4=7 waitid=9 reaped=2 cpu=zero\n"
@@ -17877,8 +17893,8 @@ test:
           - ptrace
           - dbt
           - sabre
+          - kvm
         backends_disabled:
-          kvm: Added for the DBT contract that replaced the backend-parity matrix; qualify KVM against the same oracle separately
           liteinst: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately
         expected_stdout:
           ptrace: "getrandom-flags ok\ngetrandom-faults ok\ngetrandom[0]=1212b04c40f490d33b549b528fc5173a\nurandom[0]=2972bb044d96df2871ba034c95de2770\nrandom[0]=2972bb044d96df2871ba034c95de2770\ngetrandom[1]=d3c59830106052459f8535a9ba53cced\nurandom[1]=2972bb044d96df2871ba034c95de2770\nrandom[1]=2972bb044d96df2871ba034c95de2770\ngetrandom[2]=a29a84d693ecdf16982c841b1247d414\nurandom[2]=2972bb044d96df2871ba034c95de2770\nrandom[2]=2972bb044d96df2871ba034c95de2770\ngetrandom[3]=0492c3131e74468a52aed55683b922d2\nurandom[3]=2972bb044d96df2871ba034c95de2770\nrandom[3]=2972bb044d96df2871ba034c95de2770\ngetrandom[4]=9a03f0034d7fec17b6652c772ed91aa5\nurandom[4]=2972bb044d96df2871ba034c95de2770\nrandom[4]=2972bb044d96df2871ba034c95de2770\nvdso-getrandom unavailable\n"
@@ -17945,8 +17961,8 @@ test:
           - ptrace
           - dbt
           - sabre
+          - kvm
         backends_disabled:
-          kvm: Added for the DBT contract that replaced the backend-parity matrix; qualify KVM against the same oracle separately
           liteinst: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately
         expected_stdout:
           ptrace: "signal-disposition-ok\n"
@@ -18013,8 +18029,8 @@ test:
           - ptrace
           - dbt
           - sabre
+          - kvm
         backends_disabled:
-          kvm: Added for the DBT contract that replaced the backend-parity matrix; qualify KVM against the same oracle separately
           liteinst: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately
         expected_stdout:
           ptrace: "sigaction ok=5\n"
@@ -18081,8 +18097,8 @@ test:
           - ptrace
           - dbt
           - sabre
+          - kvm
         backends_disabled:
-          kvm: Added for the DBT contract that replaced the backend-parity matrix; qualify KVM against the same oracle separately
           liteinst: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately
         expected_stdout:
           ptrace: "sigprocmask ok=5\n"
@@ -18149,8 +18165,8 @@ test:
           - ptrace
           - dbt
           - sabre
+          - kvm
         backends_disabled:
-          kvm: Added for the DBT contract that replaced the backend-parity matrix; qualify KVM against the same oracle separately
           liteinst: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately
         expected_stdout:
           ptrace: "sigaltstack ok=4\n"

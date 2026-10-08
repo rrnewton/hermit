@@ -26,9 +26,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
-          kvm: KVM requires the privileged runner
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           sabre: The exec socket is fixed, but SaBRe strict verification intermittently diverges in shell PATH lookup and multi-exec DETLOG ordering
       replay:
@@ -83,9 +83,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
-          kvm: KVM requires the privileged runner
           sabre: Forwarded-DETLOG verification exposes nondeterministic multi-process scheduler and SIGCHLD ordering under SaBRe despite stable stdout
           liteinst: LiteInst omits the fork/clone/pipe process model this pipeline requires
       replay:
@@ -209,9 +209,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: DBT SQLite qualification is tracked by backend compatibility
-          kvm: KVM requires the privileged runner
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst SQLite qualification is tracked by backend compatibility
       replay:
@@ -273,9 +273,9 @@ test:
           ptrace: Across 59 retained typed passing rows, nearest-rank p90 was 39.112 wall seconds and 37.109853 CPU seconds; 4x wall exceeds 120, so ceil(3x wall)=118 and ceil(1.5x CPU)=56.
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: DBI coverage is owned by its backend parity partition
-          kvm: KVM requires the privileged runner
           sabre: SaBRe strict verification intermittently diverges on multi-thread DETLOG ordering
           liteinst: LiteInst coverage is owned by its backend compatibility partition
       replay:
@@ -350,9 +350,9 @@ test:
           ptrace: Across 60 retained typed passing rows, nearest-rank p90 was 14.275 wall seconds and 12.732855 CPU seconds; ceil(4x wall)=58 while the owner-approved 22-second CPU default already covers ceil(1.5x CPU)=20.
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: Established on ptrace first; other backends ratchet against this shared entry
-          kvm: KVM requires the privileged runner and does not start on the validation host
           sabre: Established on ptrace first; other backends ratchet against this shared entry
           liteinst: Established on ptrace first; other backends ratchet against this shared entry
       replay:

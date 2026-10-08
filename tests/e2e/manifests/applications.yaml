@@ -297,9 +297,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: Establish the shared C toolchain transaction on the ptrace reference path before backend ratchets
-          kvm: KVM requires the privileged runner and must ratchet after the ptrace reference path
           sabre: SaBRe multi-exec toolchain qualification must ratchet after the ptrace reference path
           liteinst: LiteInst multi-exec toolchain qualification must ratchet after the ptrace reference path
       replay:
@@ -355,9 +355,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: Establish the shared Git transaction on the ptrace reference path before backend ratchets
-          kvm: KVM requires the privileged runner and must ratchet after the ptrace reference path
           sabre: SaBRe multi-exec Git qualification must ratchet after the ptrace reference path
           liteinst: LiteInst multi-exec Git qualification must ratchet after the ptrace reference path
       replay:
