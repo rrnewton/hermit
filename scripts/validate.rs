@@ -14983,15 +14983,110 @@ fn manifest_node_vacuity_profile_bracket(
         .iter()
         .map(|step| (step.tag(), step.deps.clone()))
         .collect::<BTreeMap<_, _>>();
-    if after != expected
-        || actual.host_inapplicable.len() != 1
-        || actual.host_inapplicable[0].tag != withheld_tag
+    let wholly = actual
+        .host_inapplicable
+        .iter()
+        .filter(|node| !node.runs())
+        .map(|node| node.tag.as_str())
+        .collect::<Vec<_>>();
+    if after != expected || wholly != [withheld_tag] {
+        return Err(format!(
+            "node vacuity: {label} withholding changed the wrong graph state: withheld \
+             {wholly:?}, graph {after:?}"
+        ));
+    }
+    // Every other record is a node that still RUNS with some cells withheld:
+    // exactly the planned bucket nodes whose plan rows need an absent
+    // capability without all of them doing so (the in-guest LiteInst cells,
+    // which need cpuid-faulting, sit beside cells that need nothing), each
+    // with the plan's own counts. Read from the raw plan rows, not pinned.
+    let needing = plan_capability_buckets(root, absent)?;
+    let expected_running = actual
+        .cfg
+        .steps
+        .iter()
+        .filter_map(|step| {
+            let bucket = manifest_bucket_of(step)?;
+            let (withheld, selected) = needing.get(&bucket).copied()?;
+            (withheld > 0).then(|| (step.tag(), withheld, selected))
+        })
+        .collect::<BTreeSet<_>>();
+    let running = actual
+        .host_inapplicable
+        .iter()
+        .filter_map(|node| {
+            node.cells.map(|cells| {
+                (
+                    node.tag.clone(),
+                    absent.contains_key(&node.capability),
+                    cells.withheld,
+                    cells.selected,
+                )
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    let expected_running_records = expected_running
+        .iter()
+        .map(|(tag, withheld, selected)| (tag.clone(), true, *withheld, *selected))
+        .collect::<BTreeSet<_>>();
+    if running != expected_running_records
+        || expected_running
+            .iter()
+            .any(|(_, withheld, selected)| withheld >= selected)
     {
         return Err(format!(
-            "node vacuity: {label} withholding changed the wrong graph state: {after:?}"
+            "node vacuity: {label} must record exactly the running bucket nodes whose plan rows \
+             need an absent capability, with the plan's counts; expected \
+             {expected_running:?}, recorded {running:?}"
         ));
     }
     Ok(())
+}
+
+/// (cells needing any capability in `absent`, all cells) of each (lane,
+/// category) manifest bucket of `ci/expected-e2e-plan.json`, read from each
+/// row's raw `requires_host_capabilities` strings, independently of
+/// [`read_plan_cells`].
+fn plan_capability_buckets(
+    root: &Path,
+    absent: &BTreeMap<validate_plan::HostCapability, String>,
+) -> Result<BTreeMap<(String, String), (usize, usize)>, String> {
+    let path = root.join("ci/expected-e2e-plan.json");
+    let document: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?,
+    )
+    .map_err(|e| format!("invalid JSON in {}: {e}", path.display()))?;
+    let cells = document
+        .get("cells")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("{} has no cells array", path.display()))?;
+    let names = absent
+        .keys()
+        .map(|capability| capability.value())
+        .collect::<BTreeSet<_>>();
+    let mut buckets = BTreeMap::<(String, String), (usize, usize)>::new();
+    for cell in cells {
+        let field = |name: &str| {
+            cell.get(name)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("{} contains a cell without a {name}", path.display()))
+        };
+        let needs = cell
+            .get("requires_host_capabilities")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|values| {
+                values
+                    .iter()
+                    .any(|value| value.as_str().is_some_and(|name| names.contains(name)))
+            });
+        let bucket = buckets
+            .entry((field("lane")?.to_string(), field("category")?.to_string()))
+            .or_default();
+        bucket.0 += usize::from(needs);
+        bucket.1 += 1;
+    }
+    Ok(buckets)
 }
 
 fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
@@ -15173,10 +15268,11 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
         .iter()
         .find(|bucket| bucket.lane == "privileged" && bucket.category == "c-programs")
         .ok_or("node vacuity: required plan lost the privileged c-programs bucket")?;
-    // The checked-in bucket selects cpuid-probe for KVM, ptrace and DBT. The
-    // LiteInst cell left when every LiteInst cell was switched off for the
-    // in-guest reset (https://github.com/rrnewton/hermit/issues/3520).
-    if privileged.selected != 3
+    // The checked-in bucket selects cpuid-probe for KVM, ptrace, DBT, and the
+    // two in-guest LiteInst backends (liteinst and in-guest-trap), which came
+    // back after the in-guest reset
+    // (https://github.com/rrnewton/hermit/issues/3745).
+    if privileged.selected != 5
         || !bucket_runs_nothing(privileged)
         || privileged.capabilities != vec!["cpuid-faulting".to_string()]
     {
@@ -15529,12 +15625,12 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
     // ATTRIBUTION — cpuid-probe@kvm needs both capabilities and its siblings
     // only cpuid-faulting. A host lacking both withholds the privileged bucket
     // for the one capability every cell lacks, instead of refusing the run.
-    let mut plan = plan_for("full")?;
+    let mut plan = plan_for("privileged")?;
     withhold_vacuous_manifest_nodes(root, &mut plan, &both_absent)?;
     let c_programs = plan
         .host_inapplicable
         .iter()
-        .find(|n| n.tag == "privileged-e2e.manifest_c_programs")
+        .find(|n| n.tag == "privileged-only-e2e.manifest_c_programs")
         .ok_or("host-inapplicable cells: both absent lost privileged/c-programs")?;
     if c_programs.runs() || c_programs.capability != HostCapability::CpuidFaulting {
         return Err(format!(
@@ -15542,7 +15638,26 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
              be withheld whole for cpuid-faulting: {c_programs:?}"
         ));
     }
-    // ...but cells withheld by DIFFERENT capabilities with none shared still
+    // The full plan also runs the portable buckets, where kvm cells (kvm) sit
+    // beside in-guest LiteInst cells (cpuid-faulting) with no capability
+    // shared, so a host lacking both refuses it rather than naming one of them.
+    // (Every real run takes the committed branch, which refuses whenever a
+    // capability its cells need is absent, so this changes no real run.)
+    let mut plan = plan_for("full")?;
+    match withhold_vacuous_manifest_nodes(root, &mut plan, &both_absent) {
+        Err(why)
+            if why.contains("portable/")
+                && why.contains("cpuid-faulting, kvm")
+                && why.contains("no single capability shared") => {}
+        other => {
+            return Err(format!(
+                "host-inapplicable cells: the full plan with both capabilities absent must \
+                 refuse a portable bucket that mixes kvm and in-guest LiteInst cells; got \
+                 {other:?}"
+            ));
+        }
+    }
+    // ...and cells withheld by DIFFERENT capabilities with none shared still
     // refuse, whole or partial, rather than naming one of them.
     let cell = |capabilities: &[HostCapability]| PlanCell {
         lane: "planted".into(),
@@ -15579,7 +15694,7 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
         "  host-inapplicable cells: plan rows {kvm_total} kvm withheld / {c_programs_all} portable \
          c-programs counted, portable {} running recorded / {} withheld, full {} running \
          recorded / {} withheld, qualifying 2 complete / violating 2 NO_RESULT, attribution 1 \
-         shared / 2 refused",
+         shared / 3 refused",
         portable_partial.len(),
         portable_whole.len(),
         portable_partial.len() + privileged_partial.len(),
@@ -17171,9 +17286,13 @@ fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool)
     let mut selection = Selection::default();
     let mut prebuilt = false;
     let mut seen = BTreeSet::new();
+    let mut excluded_backends = BTreeSet::new();
     let mut index = 2;
     while let Some(option) = argv.get(index) {
-        if !seen.insert(option.as_str()) {
+        // `--exclude-backend` may name several backends, each once, as
+        // test-harness itself accepts (the hosted-portable nodes omit kvm,
+        // liteinst and in-guest-trap); every other option appears once.
+        if option != "--exclude-backend" && !seen.insert(option.as_str()) {
             return Err(format!(
                 "retry bounds: {tag} supplies {option} more than once"
             ));
@@ -17197,11 +17316,19 @@ fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool)
                     "--test" => selection.test = Some(value.clone()),
                     "--mode" => selection.mode = Some(value.clone()),
                     "--backend" => selection.backend = Some(value.clone()),
-                    // The hosted-portable nodes omit the KVM backend. Modeling
-                    // the omission keeps the retry bound computed over the
-                    // cells the node actually runs; the repeated-option guard
-                    // above still refuses a second exclusion.
-                    "--exclude-backend" => selection.exclude_backends.push(value.clone()),
+                    // The hosted-portable nodes omit the KVM, liteinst and
+                    // in-guest-trap backends. Modeling the omission keeps the
+                    // retry bound computed over the cells the node actually
+                    // runs; a backend excluded twice is refused, as
+                    // test-harness refuses it.
+                    "--exclude-backend" => {
+                        if !excluded_backends.insert(value.as_str()) {
+                            return Err(format!(
+                                "retry bounds: {tag} supplies {option} more than once"
+                            ));
+                        }
+                        selection.exclude_backends.push(value.clone())
+                    }
                     // The quick verify smoke omits the host-bound strict
                     // compatibility corpus; model it like the backend omission.
                     "--exclude-category" => selection.exclude_categories.push(value.clone()),
@@ -18533,12 +18660,15 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             }
         }
     }
-    // The hosted-portable publisher carries exactly the KVM omission and the
-    // local one carries none, so the two retry bounds are computed over
-    // different, correctly sized cell sets.
+    // The hosted-portable publisher carries exactly the KVM, liteinst and
+    // in-guest-trap omission and the local one carries none, so the two retry
+    // bounds are computed over different, correctly sized cell sets.
     for (tag, expected) in [
         ("e2e.manifest_c_programs", &[][..]),
-        ("e2e.manifest_c_programs_on_host", &["kvm"][..]),
+        (
+            "e2e.manifest_c_programs_on_host",
+            &["kvm", "liteinst", "in-guest-trap"][..],
+        ),
     ] {
         let publisher = committed
             .steps
@@ -18566,11 +18696,15 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             ));
         }
         // Without this the exclusion check above is vacuous: the local node
-        // must still select the KVM cells that the hosted node omits.
-        if expected.is_empty() && !backends.contains("kvm") {
-            return Err(format!(
-                "retry bounds: {tag} selects no kvm cell, so the hosted omission is untested"
-            ));
+        // must still select the cells of every backend the hosted node omits.
+        if expected.is_empty() {
+            for omitted in ["kvm", "liteinst", "in-guest-trap"] {
+                if !backends.contains(omitted) {
+                    return Err(format!(
+                        "retry bounds: {tag} selects no {omitted} cell, so the hosted omission is untested"
+                    ));
+                }
+            }
         }
     }
     for tag in ["e2e.manifest_c_programs", "e2e.manifest_c_programs_on_host"] {

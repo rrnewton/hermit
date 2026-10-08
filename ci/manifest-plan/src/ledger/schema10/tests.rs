@@ -984,10 +984,15 @@ fn generated_plan_populations_preserve_command_policy() {
         .count();
     let hosted_cells = expected_cells
         .iter()
-        .filter(|cell| cell.lane == "portable" && cell.backend != "kvm")
+        .filter(|cell| {
+            cell.lane == "portable"
+                && !crate::validation_dag::HOSTED_PORTABLE_EXCLUDED_BACKENDS
+                    .contains(&cell.backend.as_str())
+        })
         .cloned()
         .collect::<Vec<_>>();
-    // The exclusion is exercised only while the plan has portable KVM cells.
+    // The exclusion is exercised only while the plan has portable cells of an
+    // excluded backend.
     assert!(hosted_cells.len() < portable);
     assert_eq!(current_hosted.planned_cells().unwrap(), hosted_cells);
     assert_eq!(
@@ -1000,7 +1005,7 @@ fn generated_plan_populations_preserve_command_policy() {
         let mut changed = hosted_now.clone();
         if strip_flag {
             for step in &mut changed.steps {
-                step.cmd = step.cmd.replace(" --exclude-backend kvm", "");
+                step.cmd = step.cmd.replace(&hosted_exclusion_flags(), "");
             }
         } else {
             restore_pre_exclusion_ownership(&mut changed, &generated);
@@ -1016,6 +1021,56 @@ fn generated_plan_populations_preserve_command_policy() {
             "strip_flag={strip_flag}"
         );
     }
+    // A hosted plan constructed while only KVM was excluded carries
+    // `--exclude-backend kvm` alone and owns every portable cell except KVM's.
+    // Retained receipts of that shape still read, with exactly those cells.
+    let mut kvm_only = hosted_now.clone();
+    restore_pre_exclusion_ownership(&mut kvm_only, &generated);
+    for step in &mut kvm_only.steps {
+        step.cmd = step
+            .cmd
+            .replace(&hosted_exclusion_flags(), " --exclude-backend kvm");
+        if let Some(manifests) = &mut step.result_manifests {
+            manifests.retain(|manifest| {
+                !matches!(
+                    manifest,
+                    dagrun::model::ResultManifest::ManifestCell(cell)
+                        if cell.backend.as_deref() == Some("kvm")
+                )
+            });
+        }
+    }
+    let kvm_only_cells = expected_cells
+        .iter()
+        .filter(|cell| cell.lane == "portable" && cell.backend != "kvm")
+        .cloned()
+        .collect::<Vec<_>>();
+    // The two generations differ only while the plan has portable in-guest
+    // cells, so this case is not vacuous.
+    assert!(kvm_only_cells.len() > hosted_cells.len());
+    let kvm_only_plan = ConstructedValidationPlanV10 {
+        dag_json: dag_to_json(&kvm_only),
+        ..current_hosted.clone()
+    };
+    assert_eq!(kvm_only_plan.planned_cells().unwrap(), kvm_only_cells);
+    // The KVM-only flags with today's ownership, which also omits the in-guest
+    // cells, match neither generation.
+    let mut mixed = hosted_now.clone();
+    for step in &mut mixed.steps {
+        step.cmd = step
+            .cmd
+            .replace(&hosted_exclusion_flags(), " --exclude-backend kvm");
+    }
+    let mixed_plan = ConstructedValidationPlanV10 {
+        dag_json: dag_to_json(&mixed),
+        ..current_hosted.clone()
+    };
+    assert!(
+        mixed_plan
+            .planned_cells()
+            .unwrap_err()
+            .ends_with("result ownership differs from its expected manifest selection")
+    );
     let pre_fold_json = pre_fold_expected_json(&expected_json);
     let pre_fold_cells = crate::validation_dag::expected_cells_from_json(&pre_fold_json)
         .unwrap()
@@ -1048,7 +1103,7 @@ fn generated_plan_populations_preserve_command_policy() {
             // rebuilt from that shape.
             restore_pre_exclusion_ownership(&mut live, &generated);
             for step in &mut live.steps {
-                step.cmd = step.cmd.replace(" --exclude-backend kvm", "");
+                step.cmd = step.cmd.replace(&hosted_exclusion_flags(), "");
             }
         }
         let live_selected = expected_cells
@@ -2766,4 +2821,13 @@ fn the_weak_tier_is_refused_unless_it_is_exactly_a_stripped_verify_comparison() 
         };
         refused(&other, &weak(&comparison, false));
     }
+}
+
+/// The hosted-portable exclusion flags exactly as the generator writes them,
+/// one ` --exclude-backend NAME` per excluded backend.
+fn hosted_exclusion_flags() -> String {
+    crate::validation_dag::HOSTED_PORTABLE_EXCLUDED_BACKENDS
+        .iter()
+        .map(|backend| format!(" --exclude-backend {backend}"))
+        .collect()
 }

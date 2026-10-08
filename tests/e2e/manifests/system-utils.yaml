@@ -33,17 +33,25 @@ test:
           sabre: true
           kvm: true
           dbt: true
+          liteinst: true
+          in-guest-trap: true
         backends_enabled:
           - ptrace
           - sabre
           - kvm
           - dbt
-        backends_disabled:
-          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+          - liteinst
+          - in-guest-trap
+        backends_disabled: {}
         expected_stdout_contains:
           ptrace: "clock matrix success\n"
           dbt: "clock matrix success\n"
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       replay:
         ci: false
         backends_enabled: []
@@ -966,14 +974,22 @@ test:
           kvm: true
           sabre: true
           dbt: true
+          liteinst: true
+          in-guest-trap: true
         backends_enabled:
           - ptrace
           - kvm
           - sabre
           - dbt
-        backends_disabled:
-          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+          - liteinst
+          - in-guest-trap
+        backends_disabled: {}
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       replay:
         ci: true
         backends_enabled:
@@ -1436,10 +1452,16 @@ test:
           - ptrace
           - kvm
           - dbt
+          - liteinst
+          - in-guest-trap
         backends_disabled:
           sabre: Qualify recursive du independently against the new ptrace golden baseline
-          liteinst: Qualify recursive du independently against the new ptrace golden baseline
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       replay:
         ci: false
         backends_enabled: []
@@ -1509,9 +1531,15 @@ test:
           - sabre
           - kvm
           - dbt
-        backends_disabled:
-          liteinst: Qualify recursive find independently against the new ptrace golden baseline
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+          - liteinst
+          - in-guest-trap
+        backends_disabled: {}
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       replay:
         ci: false
         backends_enabled: []
@@ -1570,9 +1598,15 @@ test:
           - sabre
           - kvm
           - dbt
-        backends_disabled:
-          liteinst: Enable once measured on this backend; ptrace is the proven baseline
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+          - liteinst
+          - in-guest-trap
+        backends_disabled: {}
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       naked:
         ci: false
         backends_enabled: []
@@ -1635,10 +1669,16 @@ test:
           - ptrace
           - sabre
           - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
           dbt: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in the RAW vDSO base or AT_RANDOM is a FINDING to report, never something to normalise away
-          liteinst: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in the RAW vDSO base or AT_RANDOM is a FINDING to report, never something to normalise away
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       naked:
         ci: false
         backends_enabled: []
@@ -1776,14 +1816,22 @@ test:
           sabre: true
           kvm: true
           dbt: true
+          liteinst: true
+          in-guest-trap: true
         backends_enabled:
           - ptrace
           - sabre
           - kvm
           - dbt
-        backends_disabled:
-          liteinst: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+          - liteinst
+          - in-guest-trap
+        backends_disabled: {}
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       naked:
         ci: false
         backends_enabled: []
@@ -1914,9 +1962,15 @@ test:
           - sabre
           - kvm
           - dbt
-        backends_disabled:
-          liteinst: Enable once measured on this backend; ptrace is the proven baseline
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+          - liteinst
+          - in-guest-trap
+        backends_disabled: {}
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       naked:
         ci: false
         backends_enabled: []
@@ -2305,12 +2359,18 @@ test:
           - dbt
           - sabre
           - kvm
-        backends_disabled:
-          liteinst: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+          - liteinst
+          - in-guest-trap
+        backends_disabled: {}
         expected_stdout:
           ptrace: "hello world\n"
           dbt: "hello world\n"
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (by design): the output is fixed by construction, so a native run has no nondeterminism to show.'
@@ -2377,12 +2437,18 @@ test:
           - dbt
           - sabre
           - kvm
-        backends_disabled:
-          liteinst: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+          - liteinst
+          - in-guest-trap
+        backends_disabled: {}
         expected_stdout:
           ptrace: "alpha|two words\n"
           dbt: "alpha|two words\n"
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (by design): the output is fixed by construction, so a native run has no nondeterminism to show.'
@@ -2446,12 +2512,18 @@ test:
           - dbt
           - sabre
           - kvm
-        backends_disabled:
-          liteinst: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+          - liteinst
+          - in-guest-trap
+        backends_disabled: {}
         expected_stdout:
           ptrace: ""
           dbt: ""
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (by design): the output is fixed by construction, so a native run has no nondeterminism to show.'
@@ -2516,16 +2588,22 @@ test:
           - ptrace
           - dbt
           - kvm
+          - liteinst
+          - in-guest-trap
         backends_disabled:
           sabre: Added for the DBT contract that replaced the backend-parity matrix; qualify SaBRe against the same oracle separately
-          liteinst: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         expected_guest_exit:
           code: 23
           reason: The shell exits 23 on purpose so the cell proves each backend reports an exact nonzero guest exit status with empty stdout.
         expected_stdout:
           ptrace: ""
           dbt: ""
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (by design): the output is fixed by construction, so a native run has no nondeterminism to show.'
@@ -2590,12 +2668,18 @@ test:
           - dbt
           - sabre
           - kvm
-        backends_disabled:
-          liteinst: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+          - liteinst
+          - in-guest-trap
+        backends_disabled: {}
         expected_stdout:
           ptrace: "backend parity fixture\n"
           dbt: "backend parity fixture\n"
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (by design): the output is fixed by construction, so a native run has no nondeterminism to show.'

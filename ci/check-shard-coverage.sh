@@ -32,9 +32,10 @@ cd "$ROOT_DIR"
 shards="ci/portable-shards.json"
 # The hosted-portable E2E population: portable cells minus the backends that
 # HOSTED_PORTABLE_EXCLUDED_BACKENDS (ci/manifest-plan/src/validation_dag.rs)
-# omits because GitHub-hosted runners have no PMU for KVM guests. The workflow
+# omits because GitHub-hosted runners have no PMU for KVM guests and no CPUID
+# faulting for the in-guest LiteInst runtime (liteinst, in-guest-trap). The workflow
 # reducer must apply this exact filter; a generator test keeps it in sync.
-hosted_e2e_cell_filter='select(.lane == "portable" and .backend != "kvm")'
+hosted_e2e_cell_filter='select(.lane == "portable" and .backend != "kvm" and .backend != "liteinst" and .backend != "in-guest-trap")'
 workflow=".github/workflows/ci-portable.yml"
 hosted_runner="ci/run-hosted-node.sh"
 command -v jq >/dev/null 2>&1 || { echo "check-shard-coverage.sh: jq is required" >&2; exit 2; }

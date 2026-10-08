@@ -1635,12 +1635,13 @@ jobs:
               and .lane == "portable"
               and .source_tree_dirty == false)
           ' ignored/reduced/results.jsonl >/dev/null
-          # GitHub-hosted runners have no PMU, so the hosted-portable profile
-          # omits KVM cells (HOSTED_PORTABLE_EXCLUDED_BACKENDS in
-          # ci/manifest-plan/src/validation_dag.rs). Local validate still
-          # requires every KVM cell.
+          # GitHub-hosted runners have no PMU and no CPUID faulting, so the
+          # hosted-portable profile omits KVM cells and the in-guest LiteInst
+          # cells of liteinst and in-guest-trap (HOSTED_PORTABLE_EXCLUDED_BACKENDS
+          # in ci/manifest-plan/src/validation_dag.rs). Local validate still
+          # requires every one of them.
           jq -S --argjson expected "$EXPECTED_CELLS" '
-            [.cells[] | select(.lane == "portable" and .backend != "kvm")
+            [.cells[] | select(.lane == "portable" and .backend != "kvm" and .backend != "liteinst" and .backend != "in-guest-trap")
               | [.lane, .category, .test, .mode, .backend]]
             | select(length == $expected) | sort
           ' ci/expected-e2e-plan.json > ignored/reduced/expected-identities.json

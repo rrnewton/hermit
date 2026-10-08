@@ -4117,6 +4117,7 @@ mod tests {
     use super::EXPECTED_PLAN_SCHEMA;
     use super::HostCapability;
     use super::HostCapabilityVerdict;
+    use super::JsonValue;
     use super::PINNED_COMMAND_PREFIX;
     use super::PINNED_COMMAND_SEPARATOR;
     use super::PREBUILT_COMMAND_PREFIX;
@@ -4140,6 +4141,7 @@ mod tests {
     use super::parse;
     use super::planned_verify;
     use super::print_best_effort;
+    use super::required_plan_rows;
     use super::run_cells;
     use super::run_with_retry;
     use super::scheduled_worker_capacity;
@@ -8224,6 +8226,69 @@ sys.exit(1 if failed else 0)
         assert!(host_inapplicable_reason(&requires, Some("kvm"), &verdicts(true), None).is_none());
     }
 
+    /// The in-guest LiteInst runtime, behind both the liteinst and in-guest-trap
+    /// backends, needs CPUID faulting whatever a cell's `requires` say, so
+    /// proven absence withholds those cells and no other backend's. Their
+    /// required plan rows name the capability too, which is what keeps the Buck
+    /// cell generator from sending them to remote execution workers, where CPUID
+    /// faulting may be absent (a validate of d60c6e78 sent 251 cells of each
+    /// backend there and every one that landed on such a worker failed).
+    #[test]
+    fn an_in_guest_liteinst_cell_needs_cpuid_faulting() {
+        let verdicts = |present| {
+            BTreeMap::from([(
+                HostCapability::CpuidFaulting,
+                HostCapabilityVerdict {
+                    present,
+                    evidence: "arch_prctl(ARCH_SET_CPUID, 0) = -1 errno=19".into(),
+                },
+            )])
+        };
+        let requires = vec!["linux".to_string(), "x86_64".to_string()];
+        for backend in ["liteinst", "in-guest-trap"] {
+            let (capabilities, reason) =
+                host_inapplicable_reason(&requires, Some(backend), &verdicts(false), None)
+                    .unwrap_or_else(|| panic!("{backend} ran without CPUID faulting"));
+            assert_eq!(capabilities, ["cpuid-faulting"], "{backend}");
+            assert!(reason.contains("errno=19"), "{reason}");
+            assert!(
+                host_inapplicable_reason(&requires, Some(backend), &verdicts(true), None).is_none(),
+                "{backend}"
+            );
+        }
+        for backend in ["ptrace", "kvm", "dbt", "sabre", "e9patch"] {
+            assert!(
+                host_inapplicable_reason(&requires, Some(backend), &verdicts(false), None)
+                    .is_none(),
+                "{backend}"
+            );
+        }
+
+        let (_, rows) = required_plan_rows(&ManifestSet::load(&super::root(None)).unwrap());
+        let mut in_guest = 0;
+        for row in &rows {
+            let backend = row["backend"].as_str().unwrap();
+            let capabilities = row
+                .get("requires_host_capabilities")
+                .and_then(JsonValue::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(JsonValue::as_str)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if matches!(backend, "liteinst" | "in-guest-trap") {
+                in_guest += 1;
+                assert!(capabilities.contains(&"cpuid-faulting"), "{row}");
+            }
+        }
+        assert!(
+            in_guest > 0,
+            "the required plan has no in-guest LiteInst cell"
+        );
+    }
+
     /// Where the hermit binary reports an inexact branch counter it refuses
     /// `hermit run --strict` and `hermit record start --strict` on ptrace and
     /// e9patch, so exactly the cells that run those are withheld, with the
@@ -10635,10 +10700,20 @@ sys.exit(1 if failed else 0)
             before,
             "{test} does not enable {backend}"
         );
-        for per_backend in ["ci", "expected_stdout"] {
+        for per_backend in ["ci", "expected_stdout", "hermit_args"] {
             if let Some(map) = mode.get_mut(per_backend).and_then(Value::as_mapping_mut) {
                 map.remove(backend);
             }
+        }
+        // Hermit flags may name only enabled backends, and their reason may
+        // not outlive the last of them.
+        if mode
+            .get("hermit_args")
+            .and_then(Value::as_mapping)
+            .is_some_and(serde_yaml::Mapping::is_empty)
+        {
+            mode.remove("hermit_args");
+            mode.remove("hermit_args_reason");
         }
         let disabled = mode
             .entry("backends_disabled".into())
