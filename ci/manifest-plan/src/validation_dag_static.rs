@@ -870,7 +870,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // validation_dag::tests::committed_full_selections_survive_a_slow_preparation
     // (hermit-manifest-plan, https://github.com/rrnewton/hermit/issues/3896)
     // retains all 1001: 1002, measured by the validate of 7ec8f5fb.
-    ("test.regular_crates", 1002),
+    // config::tests::{inherited_seccomp_never_enters_the_legacy_form,
+    // inherited_seccomp_is_read_from_a_status_file} (detcore-model) retain
+    // all 1002: 1004.
+    ("test.regular_crates", 1004),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1502,7 +1505,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_path_linux_marks_deleted_names_nothing,
     // a_procfs_object_is_told_by_its_filesystem_type} (entries of exited tasks
     // and procfs files outside the guest's mounts) retain all 1183: 1186.
-    ("test.detcore_unit", 1186),
+    // procfs_inode::tests::a_failed_host_call_leaves_the_callers_errno
+    // (naming keeps a SaBRe guest's errno) retains all 1186: 1187.
+    ("test.detcore_unit", 1187),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1561,7 +1566,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_close_that_reports_success_without_running_ends_in_a_determinism_loss}
     // (keys decided with the snapshot; the O_PATH descriptor is closed or the
     // run records a loss) retain all 96 (measured 99).
-    ("test.detcore_misc", 99),
+    // procfs_inode::{an_inherited_filter_that_fakes_an_open_leaves_descriptor_0_open,
+    // an_inherited_filter_that_suspends_an_open_does_not_stop_the_guest,
+    // naming_an_entry_leaves_the_guests_errno} (an inherited seccomp filter
+    // refuses naming before any injected call) retain all 99: 102.
+    ("test.detcore_misc", 102),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -2065,7 +2074,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
     // The host node carries the identical tests_misc selection.
-    ("test.detcore_misc_on_host", 99),
+    ("test.detcore_misc_on_host", 102),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -2144,7 +2153,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two signal phase 1 step I3 tests: 1152.
     // And the three happens-before parked-thread scheduler tests: 1167.
     // The host twin selects the same nineteen procfs inode tests: 1167 + 19 = 1186.
-    ("test.detcore_unit_on_host", 1186),
+    // And the same procfs inode errno test: 1187.
+    ("test.detcore_unit_on_host", 1187),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -2325,7 +2335,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the detcore-dbt determinism-loss record test: 1000.
     // And the same in_guest_detlog_forward_policy legacy-form test: 1001.
     // And the same committed-selection preparation test: 1002.
-    ("test.regular_crates_on_host", 1002),
+    // And the same two detcore-model inherited-seccomp tests: 1004.
+    ("test.regular_crates_on_host", 1004),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
