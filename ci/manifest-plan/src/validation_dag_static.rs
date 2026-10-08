@@ -1405,7 +1405,17 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     //   a_thread_in_rt_sigsuspend_is_seen_asleep_under_its_temporary_mask,
     //   kernel_signal_state_pending_under_the_mask_matches_rt_sigpending,
     //   the_rt_sigsuspend_entry_watch_ends_asleep_unwanted_or_out_of_time.
-    ("test.detcore_unit", 1125),
+    // Its round-11 commits add seven scheduler::test tests for the lifetime of a
+    // timer copy's record and retain all 1125 identities above (1132, measured
+    // with cargo nextest list --profile ci -p hermit-detcore --lib --bins):
+    //   a_failed_sibling_exec_keeps_the_timer_copy_record,
+    //   a_sibling_exec_returns_an_alarm_copy_to_the_process_and_drops_a_posix_copy,
+    //   a_timer_copy_holder_that_execs_keeps_the_record,
+    //   a_timer_copy_holder_that_exits_returns_the_copy_to_the_process,
+    //   a_timer_copy_record_ends_when_its_holder_takes_the_signal_without_a_delivery_stop,
+    //   a_timer_copy_record_stands_until_its_holder_dequeues_the_signal,
+    //   a_timer_copy_record_survives_its_holders_next_blocking_call.
+    ("test.detcore_unit", 1132),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1965,7 +1975,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same unidentified-stop SIGCHLD refusal test: 1088 + 1 = 1089.
     // And the same 36 https://github.com/rrnewton/hermit/pull/3224 tests listed
     // for test.detcore_unit (1125, measured).
-    ("test.detcore_unit_on_host", 1125),
+    // And the same seven timer-copy record tests from that pull request's
+    // round-11 commits listed for test.detcore_unit (1132, measured).
+    ("test.detcore_unit_on_host", 1132),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
