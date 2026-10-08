@@ -76,7 +76,7 @@ use timeouts::MAX_TIMEOUT_SECONDS;
 use timeouts::MIN_TIMEOUT_SECONDS;
 use timeouts::resolve_timeout_seconds;
 
-const HERMIT_BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
+const HERMIT_BACKENDS: [&str; 6] = ["ptrace", "dbt", "kvm", "sabre", "liteinst", "in-guest-trap"];
 const NAKED_BACKENDS: [&str; 1] = ["native"];
 const RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=\"$cell/tmp\" E2E_FIXTURE_DIR=\"$cell/fixtures\"";
 const HERMIT_RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=/tmp/hermit-e2e E2E_FIXTURE_DIR=\"$cell/fixtures\"";
@@ -1227,7 +1227,7 @@ backends_disabled: {}
     );
     assert_eq!(
         validate_requested_backend(&outside_partition, "verify", "native", "fixture").unwrap_err(),
-        "fixture: backend `native` is invalid for mode `verify`; expected one of [\"ptrace\", \"dbt\", \"kvm\", \"sabre\", \"liteinst\"]"
+        "fixture: backend `native` is invalid for mode `verify`; expected one of [\"ptrace\", \"dbt\", \"kvm\", \"sabre\", \"liteinst\", \"in-guest-trap\"]"
     );
     let naked_partition: Value = r#"
 backends_enabled: [native]
@@ -1309,7 +1309,7 @@ guest_args:
     .unwrap();
     assert_eq!(
         validate_mode_guest_args(&unknown_guest_args, "verify", "fixture").unwrap_err(),
-        "fixture: modes.verify.guest_args.ptrcae names an invalid backend for this mode; expected one of [\"ptrace\", \"dbt\", \"kvm\", \"sabre\", \"liteinst\"]"
+        "fixture: modes.verify.guest_args.ptrcae names an invalid backend for this mode; expected one of [\"ptrace\", \"dbt\", \"kvm\", \"sabre\", \"liteinst\", \"in-guest-trap\"]"
     );
     let wrong_naked_guest_args: Value = r#"
 backends_enabled: [native]
@@ -1442,7 +1442,8 @@ USAGE:
 
 FILTERS (list):
   --bucket   manifest bucket (e.g. system-utils, c-programs)
-  --backend  a backend enabled in some mode (ptrace, dbt, kvm, sabre, liteinst, native)
+  --backend  a backend enabled in some mode (ptrace, dbt, kvm, sabre, liteinst, in-guest-trap,
+             native)
   --tag      a `requires` capability token (e.g. python3, bash, kvm, cpuid)
   --mode     verify | naked | replay | chaos | custom
   --lane     portable | privileged

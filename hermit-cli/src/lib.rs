@@ -1021,12 +1021,23 @@ fn validate_liteinst_tool_runtime_library(path: &Path) -> io::Result<PathBuf> {
 /// boundary as [`error::FailureKind::PolicyRefusal`] (exit 122).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiteinstInGuestRefusal {
+    backend: Backend,
     reason: String,
 }
 
 impl LiteinstInGuestRefusal {
+    /// A refusal of a `--backend=liteinst` run.
     pub fn new(reason: impl Into<String>) -> Self {
+        Self::for_backend(Backend::Liteinst, reason)
+    }
+
+    /// A refusal of a run of `backend`, one of the in-guest LiteInst backends
+    /// ([`Backend::is_in_guest_liteinst`]), so the message names the backend
+    /// the caller selected.
+    pub fn for_backend(backend: Backend, reason: impl Into<String>) -> Self {
+        debug_assert!(backend.is_in_guest_liteinst(), "{backend:?}");
         Self {
+            backend,
             reason: reason.into(),
         }
     }
@@ -1034,9 +1045,14 @@ impl LiteinstInGuestRefusal {
 
 impl std::fmt::Display for LiteinstInGuestRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let runtime = match self.backend {
+            Backend::InGuestTrap => "in-guest LiteInst, site patching off",
+            _ => "in-guest LiteInst",
+        };
         write!(
             f,
-            "--backend=liteinst (in-guest LiteInst) refuses this run: {}",
+            "--backend={} ({runtime}) refuses this run: {}",
+            self.backend.as_str(),
             self.reason
         )
     }
@@ -1055,14 +1071,25 @@ impl std::error::Error for LiteinstInGuestRefusal {}
 /// - A kernel older than Linux 6.5 ([`in_guest_liteinst_kernel_gap`]).
 /// - A guest program that would run code before, or without, the runtime's
 ///   constructor ([`in_guest_liteinst_program_gap`]).
+/// - For `in-guest-trap`, a guest environment that sets
+///   `REVERIE_LITEINST_SITE_PATCHING` to anything but `0`
+///   ([`in_guest_trap_site_patching_conflict`]).
 ///
 /// This runs where the guest is spawned (inside the container for the CLI),
 /// so it resolves the program in the filesystem the guest sees. It pins the
 /// resolved program on `command` ([`pin_spawn_program`]), so the launch
-/// executes the same path this check inspected.
+/// executes the same path this check inspected. For `in-guest-trap` it then
+/// sets `REVERIE_LITEINST_SITE_PATCHING=0` on `command`
+/// ([`force_in_guest_site_patching`]).
 #[cfg(feature = "liteinst")]
-fn refuse_in_guest_liteinst_run(command: &mut Command, config: &DetConfig) -> Result<(), Error> {
-    let reason = if config.max_timeslice.is_some() {
+fn refuse_in_guest_liteinst_run(
+    command: &mut Command,
+    config: &DetConfig,
+    backend: Backend,
+) -> Result<(), Error> {
+    let reason = if let Some(conflict) = in_guest_trap_site_patching_conflict(command, backend) {
+        Some(conflict)
+    } else if config.max_timeslice.is_some() {
         Some(
             "it cannot deliver Detcore's preemption timer yet (the in-guest Tool host refuses \
              set_timer with ENOSYS), so the run would fail at its first timeslice; pass \
@@ -1075,7 +1102,156 @@ fn refuse_in_guest_liteinst_run(command: &mut Command, config: &DetConfig) -> Re
         in_guest_liteinst_program_gap(command)?
     };
     match reason {
-        Some(reason) => Err(Error::new(LiteinstInGuestRefusal::new(reason))),
+        Some(reason) => Err(Error::new(LiteinstInGuestRefusal::for_backend(
+            backend, reason,
+        ))),
+        None => {
+            force_in_guest_site_patching(command, backend);
+            Ok(())
+        }
+    }
+}
+
+/// The value of `REVERIE_LITEINST_SITE_PATCHING` (`reverie_liteinst::SITE_PATCHING_ENV`)
+/// that the guest sees under `backend`, when Hermit decides it: `0` for
+/// `in-guest-trap`, which exists to run with no syscall site patched, and
+/// `None` for `liteinst`, which leaves the variable to the guest environment
+/// (unset means patching on).
+pub fn forced_site_patching_value(backend: Backend) -> Option<&'static str> {
+    match backend {
+        Backend::InGuestTrap => Some("0"),
+        _ => None,
+    }
+}
+
+/// Why an `in-guest-trap` run cannot start with the guest environment of
+/// `command`: the environment (explicit or inherited) sets
+/// `REVERIE_LITEINST_SITE_PATCHING` to a value other than the one Hermit
+/// forces. Hermit refuses such a run rather than overriding the value
+/// silently, because the caller asked for two contradictory things: site
+/// patching (or a value the runtime would reject) and the backend that exists
+/// to run without it. A value equal to the forced one is accepted. `None`
+/// for every other backend.
+#[cfg(feature = "liteinst")]
+fn in_guest_trap_site_patching_conflict(command: &Command, backend: Backend) -> Option<String> {
+    let forced = forced_site_patching_value(backend)?;
+    let name = reverie_liteinst::SITE_PATCHING_ENV;
+    let value = command.get_env(name)?;
+    (*value != *std::ffi::OsStr::new(forced)).then(|| {
+        format!(
+            "the guest environment sets {name}={}, but --backend={} runs with syscall site \
+             patching off and sets {name}={forced} itself; drop the variable, or select \
+             --backend=liteinst to patch syscall sites",
+            value.to_string_lossy(),
+            backend.as_str()
+        )
+    })
+}
+
+/// Sets the guest's `REVERIE_LITEINST_SITE_PATCHING` to the value Hermit
+/// forces for `backend` ([`forced_site_patching_value`]), leaving the
+/// environment unchanged for a backend that forces none. The guest's
+/// descendants inherit it unless the guest changes its own environment; a
+/// descendant that turns patching back on shows in the run's dispatch record
+/// as patched sites.
+#[cfg(feature = "liteinst")]
+fn force_in_guest_site_patching(command: &mut Command, backend: Backend) {
+    if let Some(value) = forced_site_patching_value(backend) {
+        command.env(reverie_liteinst::SITE_PATCHING_ENV, value);
+    }
+}
+
+/// Whether every in-guest Tool image of a `backend` run checks that its runtime
+/// captured site patching off and statistics on
+/// (`detcore::Config::in_guest_site_patching_off`): true for `in-guest-trap`.
+#[cfg(feature = "liteinst")]
+fn in_guest_site_patching_off(backend: Backend) -> bool {
+    forced_site_patching_value(backend) == Some("0")
+}
+
+/// Whether an in-guest run of `backend` collects LiteInst's statistics: when
+/// something reads them ([`backend_stats::request`]), and on every
+/// `in-guest-trap` run, whose result is checked against them
+/// ([`in_guest_trap_patching_evidence`]).
+#[cfg(feature = "liteinst")]
+fn in_guest_stats_request(
+    backend: Backend,
+    summary_json: &Option<PathBuf>,
+) -> reverie::BackendStatsRequest {
+    if backend == Backend::InGuestTrap {
+        reverie::BackendStatsRequest::ENABLED
+    } else {
+        backend_stats::request(summary_json)
+    }
+}
+
+/// Why a finished `in-guest-trap` run did not show that it ran with syscall
+/// site patching off, from its dispatch record and the number of guest
+/// processes that reported LiteInst statistics: a site the runtime patched or
+/// considered patching (with patching off it considers none), no record, or no
+/// process report at all, in which case the record's zeros are not
+/// measurements (a run whose guests collected no statistics still yields an
+/// empty record). `None` for every other backend.
+///
+/// This is the coordinator's postcondition. Each Tool image also refuses to
+/// run its program when the runtime started it with patching on
+/// (`detcore::in_guest_site_patching`), which holds for every image whatever
+/// it reports; this one sees only the images that report, because an image
+/// reports its statistics when it exits (`exit` or `exit_group`), so an image
+/// that `execve`s, or is killed by a signal, sends none, and the coordinator
+/// cannot tell that from a report that was suppressed. It refuses a run in
+/// which no process reported; it does not detect a run in which some did and
+/// others did not. Each image's own check covers that: an image whose runtime
+/// is not collecting statistics refuses to run its program.
+#[cfg(feature = "liteinst")]
+fn in_guest_trap_patching_evidence(
+    backend: Backend,
+    dispatch: Option<&reverie::DispatchStats>,
+    process_reports: u64,
+) -> Option<String> {
+    if backend != Backend::InGuestTrap {
+        return None;
+    }
+    let Some(record) = dispatch else {
+        return Some(
+            "the run produced no LiteInst dispatch record, so it cannot show that no syscall \
+             site was patched"
+                .to_owned(),
+        );
+    };
+    if process_reports == 0 {
+        return Some(
+            "no guest process reported LiteInst statistics, so the run's zero patched sites \
+             are not a measurement and it cannot show that no syscall site was patched"
+                .to_owned(),
+        );
+    }
+    let shown =
+        |count: Option<u64>| count.map_or_else(|| "unmeasured".to_owned(), |n| n.to_string());
+    (record.sites.patched != Some(0) || record.sites.candidates != Some(0)).then(|| {
+        format!(
+            "its guests' LiteInst statistics report {} patched and {} candidate syscall sites, \
+             so it did not run with syscall site patching off and its result is not an \
+             in-guest-trap result",
+            shown(record.sites.patched),
+            shown(record.sites.candidates)
+        )
+    })
+}
+
+/// Refuses a finished `in-guest-trap` run whose dispatch record shows site
+/// patching ([`in_guest_trap_patching_evidence`]): records a determinism loss,
+/// so verification refuses to compare it, and returns the typed in-guest
+/// refusal (exit 122).
+#[cfg(feature = "liteinst")]
+fn refuse_in_guest_trap_patching(backend: Backend, evidence: Option<String>) -> Result<(), Error> {
+    match evidence {
+        Some(reason) => {
+            detcore::detlog::record_determinism_loss(&reason);
+            Err(Error::new(LiteinstInGuestRefusal::for_backend(
+                backend, reason,
+            )))
+        }
         None => Ok(()),
     }
 }
@@ -1330,8 +1506,9 @@ fn refuse_in_guest_liteinst_timeout(
     backend: Backend,
     timeout: Option<Duration>,
 ) -> Result<(), Error> {
-    if backend == Backend::Liteinst && timeout.is_some() {
-        return Err(Error::new(LiteinstInGuestRefusal::new(
+    if backend.is_in_guest_liteinst() && timeout.is_some() {
+        return Err(Error::new(LiteinstInGuestRefusal::for_backend(
+            backend,
             "a wall-clock timeout has not been qualified for the in-guest runtime, whose run \
              future does not kill the guest when it is dropped",
         )));
@@ -1395,6 +1572,13 @@ pub enum Backend {
     Dbt,
     /// Use LiteInst, with Detcore's Tool running inside the guest.
     Liteinst,
+    /// Use in-guest LiteInst with syscall site patching off: the same
+    /// in-guest Detcore host as `liteinst`, but every trapped syscall reaches
+    /// the Tool through the seccomp `SIGSYS` fallback and no syscall site is
+    /// rewritten. Hermit sets `REVERIE_LITEINST_SITE_PATCHING=0` in the
+    /// guest's environment and refuses a run whose environment asks for any
+    /// other value.
+    InGuestTrap,
     /// Use the SaBRe static binary rewriting backend.
     Sabre,
     /// Use the KVM backend.
@@ -1446,10 +1630,11 @@ impl std::fmt::Display for BackendUnavailable {
 impl std::error::Error for BackendUnavailable {}
 
 impl Backend {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Ptrace,
         Self::Dbt,
         Self::Liteinst,
+        Self::InGuestTrap,
         Self::Sabre,
         Self::Kvm,
         Self::E9patch,
@@ -1461,9 +1646,30 @@ impl Backend {
             Self::Ptrace => "ptrace",
             Self::Dbt => "dbt",
             Self::Liteinst => "liteinst",
+            Self::InGuestTrap => "in-guest-trap",
             Self::Sabre => "sabre",
             Self::Kvm => "kvm",
             Self::E9patch => "e9patch",
+        }
+    }
+
+    /// Whether this backend hosts Detcore's Tool inside each guest process
+    /// through the in-guest LiteInst preload runtime: `liteinst` and
+    /// `in-guest-trap`, which differ only in whether syscall sites are patched.
+    /// Every refusal, capability and launch step of in-guest LiteInst applies to
+    /// both.
+    pub const fn is_in_guest_liteinst(self) -> bool {
+        matches!(self, Self::Liteinst | Self::InGuestTrap)
+    }
+
+    /// The name of the backend runtime that executes this backend's guest, as
+    /// its statistics source names itself (`BackendStatsSnapshot::BACKEND_NAME`).
+    /// `in-guest-trap` runs the in-guest LiteInst runtime, so its statistics come
+    /// from that runtime's source, which is named `liteinst`.
+    pub const fn runtime_name(self) -> &'static str {
+        match self {
+            Self::InGuestTrap => Self::Liteinst.as_str(),
+            other => other.as_str(),
         }
     }
 
@@ -1471,7 +1677,7 @@ impl Backend {
         match self {
             Self::Ptrace | Self::E9patch => true,
             // In-guest Detcore has no ptrace tracer to arm the PMU timer from.
-            Self::Liteinst | Self::Dbt | Self::Sabre | Self::Kvm => false,
+            Self::Liteinst | Self::InGuestTrap | Self::Dbt | Self::Sabre | Self::Kvm => false,
         }
     }
 
@@ -1505,7 +1711,8 @@ impl Backend {
                 .err()
                 .map(|error| error.to_string()),
             Self::Dbt => dbt_unavailable_reason(),
-            Self::Liteinst => liteinst_unavailable_reason(),
+            // The same runtime, so the same prerequisites and the same reason.
+            Self::Liteinst | Self::InGuestTrap => liteinst_unavailable_reason(),
             // TODO-HUMAN-REVIEW(#589): Review SaBRe backend availability reporting.
             Self::Sabre => sabre_unavailable_reason(),
             Self::Kvm => kvm_device_unavailable_reason(Path::new("/dev/kvm")),
@@ -3394,7 +3601,9 @@ pub fn backend_capabilities(backend: Backend) -> reverie::BackendCapabilities {
             capabilities.runs_exit_robust_list = false;
             capabilities
         }
-        Backend::Liteinst => reverie::BackendCapabilities::LITEINST_IN_GUEST,
+        // Site patching changes how a syscall reaches the Tool, not what the
+        // Tool host can do, so in-guest-trap has in-guest LiteInst's capabilities.
+        Backend::Liteinst | Backend::InGuestTrap => reverie::BackendCapabilities::LITEINST_IN_GUEST,
         Backend::Sabre => reverie::BackendCapabilities::SABRE,
         Backend::Dbt => reverie::BackendCapabilities::DBT,
     }
@@ -3588,12 +3797,12 @@ async fn dispatch_backend(
         .await?
         .status);
     }
-    if backend == Backend::Liteinst {
+    if backend.is_in_guest_liteinst() {
         #[cfg(feature = "liteinst")]
         {
-            let stats_request = backend_stats::request(print_summary_to_json_file);
+            let stats_request = in_guest_stats_request(backend, print_summary_to_json_file);
             let mut command = command;
-            refuse_in_guest_liteinst_run(&mut command, &config)?;
+            refuse_in_guest_liteinst_run(&mut command, &config, backend)?;
             let _detlog_descriptor = request_liteinst_detlog_forwarding(
                 &mut command,
                 &in_guest_detlog_forward_policy(),
@@ -3604,9 +3813,10 @@ async fn dispatch_backend(
             config.in_guest_detlog_forward_policy = _detlog_descriptor
                 .is_some()
                 .then(|| in_guest_detlog_forward_policy().encode());
+            config.in_guest_site_patching_off = in_guest_site_patching_off(backend);
             let preload = liteinst_tool_runtime_library_path()?;
             let exits = std::sync::Arc::new(in_guest_exits::InGuestExitAdmission::default());
-            let (exit_status, mut global_state, dispatch_stats) =
+            let (exit_status, mut global_state, dispatch_stats, process_reports) =
                 reverie_liteinst::LiteinstBackend::with_connection_admission(
                     exits.clone(),
                     async {
@@ -3618,19 +3828,27 @@ async fn dispatch_backend(
                                 .await?;
                             let dispatch_stats =
                                 backend_stats::report(backend, stats_request, &source);
-                            Ok::<_, reverie::Error>((exit_status, global_state, dispatch_stats))
+                            let process_reports = source.snapshot().process_reports();
+                            Ok::<_, reverie::Error>((
+                                exit_status,
+                                global_state,
+                                dispatch_stats,
+                                process_reports,
+                            ))
                         } else {
                             let (exit_status, global_state) =
                                 reverie_liteinst::LiteinstBackend::run_with_preload::<Detcore>(
                                     command, config, preload,
                                 )
                                 .await?;
-                            Ok((exit_status, global_state, None))
+                            Ok((exit_status, global_state, None, 0))
                         }
                     },
                 )
                 .await
                 .inspect_err(|error| exits.fail_launch(error))?;
+            let patched =
+                in_guest_trap_patching_evidence(backend, dispatch_stats.as_ref(), process_reports);
             let settled = settle_in_guest_exits(&exits, &global_state).await;
             if settled.is_err() || liteinst_requires_forced_shutdown(exit_status) {
                 global_state.force_shutdown_with_error();
@@ -3644,6 +3862,7 @@ async fn dispatch_backend(
                 )
                 .await;
             settled?;
+            refuse_in_guest_trap_patching(backend, patched)?;
             return Ok(exit_status);
         }
         #[cfg(not(feature = "liteinst"))]
@@ -3891,12 +4110,12 @@ async fn dispatch_output_backend(
         )
         .await;
     }
-    if backend == Backend::Liteinst {
+    if backend.is_in_guest_liteinst() {
         #[cfg(feature = "liteinst")]
         {
             command.stdin(output_backend_stdin()?);
-            let stats_request = backend_stats::request(print_summary_to_json_file);
-            refuse_in_guest_liteinst_run(&mut command, &config)?;
+            let stats_request = in_guest_stats_request(backend, print_summary_to_json_file);
+            refuse_in_guest_liteinst_run(&mut command, &config, backend)?;
             let _detlog_descriptor = request_liteinst_detlog_forwarding(
                 &mut command,
                 &in_guest_detlog_forward_policy(),
@@ -3907,9 +4126,10 @@ async fn dispatch_output_backend(
             config.in_guest_detlog_forward_policy = _detlog_descriptor
                 .is_some()
                 .then(|| in_guest_detlog_forward_policy().encode());
+            config.in_guest_site_patching_off = in_guest_site_patching_off(backend);
             let preload = liteinst_tool_runtime_library_path()?;
             let exits = std::sync::Arc::new(in_guest_exits::InGuestExitAdmission::default());
-            let (output, mut global_state, dispatch_stats) =
+            let (output, mut global_state, dispatch_stats, process_reports) =
                 reverie_liteinst::LiteinstBackend::with_connection_admission(exits.clone(), async {
                     if stats_request.is_enabled() {
                         let (output, global_state, source) =
@@ -3918,18 +4138,21 @@ async fn dispatch_output_backend(
                             >(command, config, preload)
                             .await?;
                         let dispatch_stats = backend_stats::report(backend, stats_request, &source);
-                        Ok::<_, reverie::Error>((output, global_state, dispatch_stats))
+                        let process_reports = source.snapshot().process_reports();
+                        Ok::<_, reverie::Error>((output, global_state, dispatch_stats, process_reports))
                     } else {
                         let (output, global_state) =
                             reverie_liteinst::LiteinstBackend::run_with_output_and_preload::<Detcore>(
                                 command, config, preload,
                             )
                             .await?;
-                        Ok((output, global_state, None))
+                        Ok((output, global_state, None, 0))
                     }
                 })
                 .await
                 .inspect_err(|error| exits.fail_launch(error))?;
+            let patched =
+                in_guest_trap_patching_evidence(backend, dispatch_stats.as_ref(), process_reports);
             let settled = settle_in_guest_exits(&exits, &global_state).await;
             let output = Output {
                 status: output.status.into(),
@@ -3949,6 +4172,7 @@ async fn dispatch_output_backend(
                 )
                 .await;
             settled?;
+            refuse_in_guest_trap_patching(backend, patched)?;
             return Ok(Output {
                 status,
                 stdout: output.stdout,
@@ -4737,6 +4961,7 @@ mod tests {
         }
         // In-guest Detcore has no ptrace tracer to arm the PMU timer from.
         assert!(!Backend::Liteinst.uses_ptrace_pmu_timers());
+        assert!(!Backend::InGuestTrap.uses_ptrace_pmu_timers());
     }
 
     #[cfg(feature = "liteinst")]
@@ -4852,6 +5077,200 @@ mod tests {
             "{error}"
         );
         assert!(detcore::detlog::determinism_loss().is_some());
+    }
+
+    #[test]
+    fn in_guest_trap_is_in_guest_liteinst_and_forces_site_patching_off() {
+        assert!(Backend::Liteinst.is_in_guest_liteinst());
+        assert!(Backend::InGuestTrap.is_in_guest_liteinst());
+        for backend in [
+            Backend::Ptrace,
+            Backend::Dbt,
+            Backend::Sabre,
+            Backend::Kvm,
+            Backend::E9patch,
+        ] {
+            assert!(!backend.is_in_guest_liteinst(), "{backend:?}");
+            assert_eq!(backend.runtime_name(), backend.as_str(), "{backend:?}");
+            assert_eq!(forced_site_patching_value(backend), None, "{backend:?}");
+        }
+        assert_eq!(Backend::InGuestTrap.as_str(), "in-guest-trap");
+        assert_eq!(Backend::InGuestTrap.runtime_name(), "liteinst");
+        assert_eq!(Backend::Liteinst.runtime_name(), "liteinst");
+        // liteinst leaves the variable to the guest environment.
+        assert_eq!(forced_site_patching_value(Backend::Liteinst), None);
+        assert_eq!(forced_site_patching_value(Backend::InGuestTrap), Some("0"));
+        // The CLI spelling parses to the variant and back.
+        assert_eq!(
+            <Backend as ValueEnum>::from_str("in-guest-trap", false),
+            Ok(Backend::InGuestTrap)
+        );
+        assert!(Backend::ALL.contains(&Backend::InGuestTrap));
+        for backend in Backend::ALL {
+            let name = backend
+                .to_possible_value()
+                .expect("every backend is a visible CLI value");
+            assert_eq!(name.get_name(), backend.as_str(), "{backend:?}");
+        }
+    }
+
+    /// in-guest-trap sets `REVERIE_LITEINST_SITE_PATCHING=0` on the guest
+    /// command when the guest environment leaves it unset or already `0`, and
+    /// refuses, before anything starts, an environment that sets any other
+    /// value; the refusal names the value and both ways out. liteinst neither
+    /// refuses nor changes the variable.
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn in_guest_trap_refuses_a_guest_environment_that_turns_site_patching_on() {
+        let name = reverie_liteinst::SITE_PATCHING_ENV;
+        let mut unset = Command::new("/bin/true");
+        unset.env_remove(name);
+        assert_eq!(
+            in_guest_trap_site_patching_conflict(&unset, Backend::InGuestTrap),
+            None
+        );
+        force_in_guest_site_patching(&mut unset, Backend::InGuestTrap);
+        assert_eq!(unset.get_env(name).as_deref(), Some(OsStr::new("0")));
+
+        let mut zero = Command::new("/bin/true");
+        zero.env(name, "0");
+        assert_eq!(
+            in_guest_trap_site_patching_conflict(&zero, Backend::InGuestTrap),
+            None
+        );
+
+        for value in ["1", "", "yes", " 0"] {
+            let mut command = Command::new("/bin/true");
+            command.env(name, value);
+            let conflict = in_guest_trap_site_patching_conflict(&command, Backend::InGuestTrap)
+                .unwrap_or_else(|| panic!("{value:?} was accepted"));
+            assert!(conflict.contains(&format!("{name}={value},")), "{conflict}");
+            assert!(conflict.contains("--backend=liteinst"), "{conflict}");
+            assert!(conflict.contains("drop the variable"), "{conflict}");
+            // The whole refusal path stops on it first, before the program,
+            // kernel or timeslice checks, and leaves the value untouched.
+            let error = refuse_in_guest_liteinst_run(
+                &mut command,
+                &DetConfig::default(),
+                Backend::InGuestTrap,
+            )
+            .unwrap_err();
+            let refusal = error
+                .downcast_ref::<LiteinstInGuestRefusal>()
+                .expect("a typed in-guest refusal, which the CLI reports as exit 122");
+            assert!(
+                refusal.to_string().starts_with(
+                    "--backend=in-guest-trap (in-guest LiteInst, site patching off) refuses \
+                     this run: the guest environment sets"
+                ),
+                "{refusal}"
+            );
+            assert_eq!(command.get_env(name).as_deref(), Some(OsStr::new(value)));
+
+            // liteinst takes the variable from the guest environment as it is.
+            let mut liteinst = Command::new("/bin/true");
+            liteinst.env(name, value);
+            assert_eq!(
+                in_guest_trap_site_patching_conflict(&liteinst, Backend::Liteinst),
+                None
+            );
+            force_in_guest_site_patching(&mut liteinst, Backend::Liteinst);
+            assert_eq!(liteinst.get_env(name).as_deref(), Some(OsStr::new(value)));
+        }
+    }
+
+    /// The coordinator's postcondition for an in-guest-trap run: a record
+    /// with no patched and no candidate site passes; a patched site, a
+    /// candidate, an unmeasured count or a missing record is refused, with a
+    /// typed in-guest refusal and a determinism loss. Other backends are not
+    /// held to it.
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn an_in_guest_trap_run_that_patched_a_site_is_refused_after_it_ends() {
+        let record = |candidates: Option<u64>, patched: Option<u64>| {
+            reverie::DispatchStats::new(
+                "in-guest-trap",
+                reverie::DispatchCounters::ZERO,
+                reverie::SiteCounters {
+                    candidates,
+                    patched,
+                    fell_back: Some(0),
+                },
+            )
+        };
+        let clean = record(Some(0), Some(0));
+        assert_eq!(
+            in_guest_trap_patching_evidence(Backend::InGuestTrap, Some(&clean), 1),
+            None
+        );
+        for (candidates, patched, shown) in [
+            (Some(3), Some(3), "3 patched and 3 candidate"),
+            (Some(1), Some(0), "0 patched and 1 candidate"),
+            (Some(0), None, "unmeasured patched and 0 candidate"),
+        ] {
+            let reason = in_guest_trap_patching_evidence(
+                Backend::InGuestTrap,
+                Some(&record(candidates, patched)),
+                1,
+            )
+            .unwrap_or_else(|| panic!("{candidates:?} {patched:?} was accepted"));
+            assert!(reason.contains(shown), "{reason}");
+        }
+        assert!(
+            in_guest_trap_patching_evidence(Backend::InGuestTrap, None, 1)
+                .is_some_and(|reason| reason.contains("no LiteInst dispatch record"))
+        );
+        // An empty record from guests that collected nothing is not zero.
+        assert!(
+            in_guest_trap_patching_evidence(Backend::InGuestTrap, Some(&clean), 0)
+                .is_some_and(|reason| reason.contains("no guest process reported"))
+        );
+        let patched = record(Some(3), Some(3));
+        assert_eq!(
+            in_guest_trap_patching_evidence(Backend::Liteinst, Some(&patched), 1),
+            None
+        );
+        assert_eq!(
+            in_guest_trap_patching_evidence(Backend::Liteinst, None, 0),
+            None
+        );
+
+        refuse_in_guest_trap_patching(Backend::InGuestTrap, None).unwrap();
+        let error = refuse_in_guest_trap_patching(
+            Backend::InGuestTrap,
+            in_guest_trap_patching_evidence(Backend::InGuestTrap, Some(&patched), 1),
+        )
+        .unwrap_err();
+        assert!(
+            error.downcast_ref::<LiteinstInGuestRefusal>().is_some(),
+            "{error:#}"
+        );
+        assert!(
+            error
+                .to_string()
+                .starts_with("--backend=in-guest-trap (in-guest LiteInst, site patching off)"),
+            "{error:#}"
+        );
+        assert!(
+            detcore::detlog::determinism_loss().is_some_and(|loss| loss.contains("3 patched")),
+            "the refusal must record a determinism loss"
+        );
+    }
+
+    /// Only an in-guest-trap run tells every Tool image to check the settings
+    /// its runtime captured, and that run always collects the statistics the
+    /// check requires.
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn only_in_guest_trap_asks_tool_images_to_check_their_runtime() {
+        for backend in Backend::ALL {
+            let checks = in_guest_site_patching_off(backend);
+            assert_eq!(checks, backend == Backend::InGuestTrap, "{backend:?}");
+            if checks {
+                assert!(in_guest_stats_request(backend, &None).is_enabled());
+            }
+        }
+        assert!(!in_guest_stats_request(Backend::Liteinst, &None).is_enabled());
     }
 
     #[test]
@@ -5357,6 +5776,9 @@ mod tests {
             (Backend::E9patch, "e9patch"),
             #[cfg(not(feature = "liteinst"))]
             (Backend::Liteinst, "liteinst"),
+            // in-guest-trap is the same runtime behind the same feature.
+            #[cfg(not(feature = "liteinst"))]
+            (Backend::InGuestTrap, "liteinst"),
         ];
 
         for &(backend, feature) in feature_disabled_backends {
@@ -5734,11 +6156,14 @@ mod tests {
         // in-guest LiteInst refusal relies on seeing it.
         let config = super::DetConfig::default();
         assert!(config.max_timeslice.is_some());
-        assert!(
-            prepare_backend_config(config.clone(), Backend::Liteinst)
-                .max_timeslice
-                .is_some()
-        );
+        for backend in [Backend::Liteinst, Backend::InGuestTrap] {
+            assert!(
+                prepare_backend_config(config.clone(), backend)
+                    .max_timeslice
+                    .is_some(),
+                "{backend:?}"
+            );
+        }
         assert!(
             prepare_backend_config(config, Backend::Ptrace)
                 .max_timeslice
@@ -5749,11 +6174,14 @@ mod tests {
     #[test]
     fn in_guest_liteinst_cancels_killed_thread_rpcs() {
         let config = super::DetConfig::default();
-        assert!(
-            prepare_backend_config(config.clone(), Backend::Liteinst)
-                .backend
-                .needs_killed_thread_rpc_cancellation
-        );
+        for backend in [Backend::Liteinst, Backend::InGuestTrap] {
+            assert!(
+                prepare_backend_config(config.clone(), backend)
+                    .backend
+                    .needs_killed_thread_rpc_cancellation,
+                "{backend:?}"
+            );
+        }
         // LiteInst's cancellation changes no other backend.
         assert!(
             !prepare_backend_config(config, Backend::Ptrace)
@@ -5858,6 +6286,7 @@ mod tests {
             Backend::Dbt,
             Backend::Sabre,
             Backend::Liteinst,
+            Backend::InGuestTrap,
             Backend::E9patch,
         ] {
             let config = super::DetConfig {
@@ -5902,13 +6331,15 @@ mod tests {
     /// publishes a process's exit to its parent, and
     /// `virtualizes_guest_sigalrm` (Reverie 7142ff8c), true only for in-guest
     /// LiteInst, whose runtime keeps a guest SIGALRM handler virtual (signal
-    /// phase 1).
+    /// phase 1). `in-guest-trap` is in-guest LiteInst with site patching off,
+    /// which changes how a syscall reaches the Tool and nothing the Tool host
+    /// can do, so it has exactly in-guest LiteInst's row.
     fn golden_backend_capabilities(backend: Backend) -> serde_json::Value {
         let sabre = backend == Backend::Sabre;
         let kvm = backend == Backend::Kvm;
         let dbt = backend == Backend::Dbt;
         // LiteInst runs only through its in-guest runtime.
-        let in_guest_liteinst = backend == Backend::Liteinst;
+        let in_guest_liteinst = matches!(backend, Backend::Liteinst | Backend::InGuestTrap);
         serde_json::json!({
             "tool_shares_guest_descriptor_table": sabre,
             "rediscovers_descriptors_after_exec": sabre,
@@ -5946,6 +6377,7 @@ mod tests {
             Backend::Kvm,
             Backend::E9patch,
             Backend::Liteinst,
+            Backend::InGuestTrap,
             Backend::Sabre,
             Backend::Dbt,
         ] {
@@ -5972,6 +6404,11 @@ mod tests {
         {
             assert_eq!(
                 super::backend_capabilities(Backend::Liteinst),
+                <reverie_liteinst::LiteinstBackend as reverie::Backend>::capabilities()
+            );
+            // in-guest-trap runs the same Reverie backend.
+            assert_eq!(
+                super::backend_capabilities(Backend::InGuestTrap),
                 <reverie_liteinst::LiteinstBackend as reverie::Backend>::capabilities()
             );
         }
@@ -6114,6 +6551,7 @@ mod tests {
             (Backend::Ptrace, "010000011000100", "010000011000100"),
             (Backend::E9patch, "010000010000100", "010000010000100"),
             (Backend::Liteinst, "010001010000000", "010001010000000"),
+            (Backend::InGuestTrap, "010001010000000", "010001010000000"),
             (Backend::Sabre, "011111110000000", "011111110000000"),
             (Backend::Dbt, "010001000100000", "010001000100000"),
             (Backend::Kvm, "100001010010011", "100001010011011"),
@@ -6163,6 +6601,7 @@ mod tests {
             (Backend::Kvm, false),
             (Backend::Sabre, false),
             (Backend::Liteinst, false),
+            (Backend::InGuestTrap, false),
             (Backend::E9patch, true),
         ] {
             let config = prepare_backend_config(super::DetConfig::default(), backend);
@@ -6181,6 +6620,7 @@ mod tests {
             (Backend::Kvm, false),
             (Backend::Sabre, false),
             (Backend::Liteinst, false),
+            (Backend::InGuestTrap, false),
             (Backend::E9patch, false),
         ] {
             let config = prepare_backend_config(super::DetConfig::default(), backend);
@@ -6226,6 +6666,7 @@ mod tests {
             Backend::Kvm,
             Backend::Sabre,
             Backend::Liteinst,
+            Backend::InGuestTrap,
             Backend::E9patch,
         ] {
             let config = prepare_backend_config(super::DetConfig::default(), backend);
@@ -6301,6 +6742,11 @@ mod tests {
         assert_eq!(
             available.contains(&Backend::Liteinst),
             liteinst_unavailable_reason().is_none()
+        );
+        // The same runtime, so available exactly when liteinst is.
+        assert_eq!(
+            available.contains(&Backend::InGuestTrap),
+            available.contains(&Backend::Liteinst)
         );
         assert_eq!(
             available.contains(&Backend::Sabre),
@@ -6533,6 +6979,10 @@ mod tests {
         }
         assert_eq!(
             Backend::Liteinst.ensure_available().is_ok(),
+            liteinst_unavailable_reason().is_none()
+        );
+        assert_eq!(
+            Backend::InGuestTrap.ensure_available().is_ok(),
             liteinst_unavailable_reason().is_none()
         );
 
