@@ -1033,9 +1033,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
-          kvm: KVM requires the privileged runner
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
       replay:
@@ -1859,9 +1859,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: Established on ptrace first; other backends ratchet against this shared entry
-          kvm: KVM requires the privileged runner and does not start on the validation host
           sabre: Established on ptrace first; other backends ratchet against this shared entry
           liteinst: Established on ptrace first; other backends ratchet against this shared entry
       replay:
@@ -1982,9 +1982,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: The mount is container setup and backend-independent; ptrace is the canonical required witness
-          kvm: The mount is container setup and backend-independent; ptrace is the canonical required witness
           sabre: The mount is container setup and backend-independent; ptrace is the canonical required witness
           liteinst: The mount is container setup and backend-independent; ptrace is the canonical required witness
       replay:
@@ -2165,8 +2165,8 @@ test:
           - ptrace
           - dbt
           - sabre
+          - kvm
         backends_disabled:
-          kvm: Added for the DBT contract that replaced the backend-parity matrix; qualify KVM against the same oracle separately
           liteinst: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately
         expected_stdout:
           ptrace: "hello world\n"
@@ -2233,8 +2233,8 @@ test:
           - ptrace
           - dbt
           - sabre
+          - kvm
         backends_disabled:
-          kvm: Added for the DBT contract that replaced the backend-parity matrix; qualify KVM against the same oracle separately
           liteinst: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately
         expected_stdout:
           ptrace: "alpha|two words\n"
@@ -2298,8 +2298,8 @@ test:
           - ptrace
           - dbt
           - sabre
+          - kvm
         backends_disabled:
-          kvm: Added for the DBT contract that replaced the backend-parity matrix; qualify KVM against the same oracle separately
           liteinst: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately
         expected_stdout:
           ptrace: ""
@@ -2364,8 +2364,8 @@ test:
         backends_enabled:
           - ptrace
           - dbt
+          - kvm
         backends_disabled:
-          kvm: Added for the DBT contract that replaced the backend-parity matrix; qualify KVM against the same oracle separately
           sabre: Added for the DBT contract that replaced the backend-parity matrix; qualify SaBRe against the same oracle separately
           liteinst: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately
         expected_guest_exit:
@@ -2434,8 +2434,8 @@ test:
           - ptrace
           - dbt
           - sabre
+          - kvm
         backends_disabled:
-          kvm: Added for the DBT contract that replaced the backend-parity matrix; qualify KVM against the same oracle separately
           liteinst: Added for the DBT contract that replaced the backend-parity matrix; qualify LiteInst against the same oracle separately
         expected_stdout:
           ptrace: "backend parity fixture\n"
