@@ -3397,10 +3397,11 @@ fn result_options(
                 let value = args.next().ok_or("--backend requires a backend")?;
                 if !matches!(
                     value.as_str(),
-                    "ptrace" | "dbt" | "kvm" | "sabre" | "liteinst" | "native"
+                    "ptrace" | "dbt" | "kvm" | "sabre" | "liteinst" | "in-guest-trap" | "native"
                 ) {
                     return Err(format!(
-                        "unknown backend `{value}`; expected ptrace, dbt, kvm, sabre, liteinst, or native"
+                        "unknown backend `{value}`; expected ptrace, dbt, kvm, sabre, liteinst, \
+                         in-guest-trap, or native"
                     ));
                 }
                 if selection.backend.replace(value).is_some() {
@@ -10168,7 +10169,15 @@ fn summarize(
     );
     println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
     let mut totals = [0usize; 9];
-    for backend in ["ptrace", "dbt", "kvm", "sabre", "liteinst", "native"] {
+    for backend in [
+        "ptrace",
+        "dbt",
+        "kvm",
+        "sabre",
+        "liteinst",
+        "in-guest-trap",
+        "native",
+    ] {
         let counts = by_backend.get(backend).cloned().unwrap_or_default();
         let pass = counts.get("pass").copied().unwrap_or(0);
         let determinism = counts.get("determinism-failure").copied().unwrap_or(0);
@@ -14730,8 +14739,9 @@ fn self_test(root: &Path) -> Result<(), String> {
     let direct_exact_backends_ok = ["ptrace", "kvm"]
         .into_iter()
         .all(|backend| required_build_tags(Some(("verify", backend))) == lean_exact);
-    // DBT, SaBRe and LiteInst consume runtimes staged by the one workspace build.
-    let staged_runtime_exact_ok = ["dbt", "sabre", "liteinst"]
+    // DBT, SaBRe and LiteInst (liteinst and in-guest-trap) consume runtimes
+    // staged by the one workspace build.
+    let staged_runtime_exact_ok = ["dbt", "sabre", "liteinst", "in-guest-trap"]
         .into_iter()
         .all(|backend| required_build_tags(Some(("verify", backend))) == full_closure);
     let all_closures = [

@@ -39,6 +39,8 @@ pub enum RunEvidenceBackend {
     Ptrace,
     Dbt,
     Liteinst,
+    /// In-guest LiteInst with syscall site patching off (`--backend=in-guest-trap`).
+    InGuestTrap,
     Sabre,
     Kvm,
     E9patch,
@@ -304,7 +306,10 @@ pub enum RunEvidenceInspection {
 fn backend_supports_evidence(backend: RunEvidenceBackend) -> bool {
     matches!(
         backend,
-        RunEvidenceBackend::Ptrace | RunEvidenceBackend::Liteinst | RunEvidenceBackend::Kvm
+        RunEvidenceBackend::Ptrace
+            | RunEvidenceBackend::Liteinst
+            | RunEvidenceBackend::InGuestTrap
+            | RunEvidenceBackend::Kvm
     )
 }
 
@@ -332,7 +337,9 @@ fn disposition_matches_backend(backend: RunEvidenceBackend, disposition: GuestDi
                 ..
             }
         ),
-        RunEvidenceBackend::Ptrace | RunEvidenceBackend::Liteinst => matches!(
+        RunEvidenceBackend::Ptrace
+        | RunEvidenceBackend::Liteinst
+        | RunEvidenceBackend::InGuestTrap => matches!(
             disposition,
             GuestDisposition::Exited { .. } | GuestDisposition::Signaled { .. }
         ),
@@ -917,6 +924,7 @@ Apr 09 06:08:02.100  INFO hermit_test: second evidence record\n"
         for backend in [
             RunEvidenceBackend::Ptrace,
             RunEvidenceBackend::Liteinst,
+            RunEvidenceBackend::InGuestTrap,
             RunEvidenceBackend::Kvm,
         ] {
             for code in [i32::MIN, -1, 0, 23, 128, 255, 256, i32::MAX] {
