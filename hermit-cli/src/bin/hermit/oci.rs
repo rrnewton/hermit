@@ -245,6 +245,17 @@ impl OciRunOpts {
                 self.image_ref
             )));
         }
+        // A run config records a `hermit run` command line, and this run's
+        // image is resolved from the store rather than given as an option, so
+        // a saved config could not reproduce it.
+        if let Some(option) = self.run.run_config_option() {
+            return Err(Error::msg(format!(
+                "`hermit oci run` does not accept {option}: run configs are read and written \
+                 only by `hermit run`. Resolve the image id with `hermit oci inspect {:?}` and \
+                 run `hermit run --image <ID> {option} ...` instead.",
+                self.image_ref
+            )));
+        }
         let store = require_store()?;
         // Resolution never contacts a registry unless --pull was asked for, so
         // an ordinary `hermit oci run` cannot silently download.

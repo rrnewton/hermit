@@ -227,6 +227,7 @@ impl RunData {
 
         let repro_file = self.root_path().with_extension("repro");
         std::fs::write(repro_file, self.to_repro() + "\n")?;
+        self.runopts.write_debug_options_dump()?;
 
         let (_, output) = self.runopts.run(&gopts, true)?;
         let output: Output = output.context("expected captured output")?;

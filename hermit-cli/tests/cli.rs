@@ -9928,6 +9928,111 @@ fn log_true_run(log: &Path, level: &str, epoch: &str) {
     assert_success(&output, &args);
 }
 
+/// The implicit inputs a run config must capture, and the log variables a
+/// harness may set, removed so the run samples its own.
+fn without_implicit_hermit_inputs(command: &mut Command) -> &mut Command {
+    for variable in [
+        "HERMIT_EPOCH",
+        "HERMIT_PRNG",
+        "HERMIT_SCHED_SEED",
+        "HERMIT_LOG",
+        "HERMIT_LOG_FILE",
+    ] {
+        command.env_remove(variable);
+    }
+    command.stdin(Stdio::null())
+}
+
+/// `--save-config` writes a file that `--config` loads to reproduce the run:
+/// the epoch sampled from the host clock and the seed `--seed-from` chose are
+/// written out, so the reloaded guest prints the same time and the same
+/// random bytes and Hermit's canonical INFO log matches. A command-line
+/// `--log-file` replaces the file's. A third run with the same options but no
+/// file samples new inputs and prints something else, so the match is the
+/// file's doing.
+#[test]
+fn run_config_saved_by_one_run_reproduces_it() {
+    let _lock = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = |name: &str| directory.path().join(name).to_str().unwrap().to_owned();
+    let (config, first_log, second_log) = (path("run.yaml"), path("a.log"), path("b.log"));
+    // `env -C /tmp` keeps the shell's startup `stat(".")` on the guest's
+    // private /tmp rather than on a host directory that can change.
+    let guest = [
+        "--",
+        "/usr/bin/env",
+        "-C",
+        "/tmp",
+        "/bin/sh",
+        "-c",
+        "date +%s.%N; od -An -tx1 -N8 /dev/urandom",
+    ];
+    let save_config = format!("--save-config={config}");
+    let first_log_arg = format!("--log-file={first_log}");
+    let options = ["--max-timeslice=disabled", "--seed-from=SystemRandom"];
+    let first_args: Vec<&str> = ["--log=info", first_log_arg.as_str(), "run"]
+        .into_iter()
+        .chain(options)
+        .chain([save_config.as_str()])
+        .chain(guest)
+        .collect();
+    let first = without_implicit_hermit_inputs(&mut hermit_command(&first_args))
+        .output()
+        .unwrap();
+    assert_success(&first, &first_args);
+
+    let saved: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    assert_eq!(saved["schema"], "hermit-run-config/v1", "{saved:?}");
+    assert_eq!(saved["global"]["log-file"], first_log.as_str(), "{saved:?}");
+    assert!(saved["run"]["epoch"].is_string(), "{saved:?}");
+    assert!(saved["run"]["seed"].is_u64(), "{saved:?}");
+    assert!(saved["run"].get("seed-from").is_none(), "{saved:?}");
+    assert!(saved["run"].get("save-config").is_none(), "{saved:?}");
+
+    let second_log_arg = format!("--log-file={second_log}");
+    let second_args = [second_log_arg.as_str(), "run", "--config", config.as_str()];
+    let second = without_implicit_hermit_inputs(&mut hermit_command(&second_args))
+        .output()
+        .unwrap();
+    assert_success(&second, &second_args);
+    assert_eq!(stdout(&first).lines().count(), 2, "{}", stdout(&first));
+    assert_eq!(stdout(&second), stdout(&first));
+    let diff = log_diff(&["--canonical-info", &first_log, &second_log]);
+    assert_eq!(diff.status.code(), Some(0), "{}", stderr(&diff));
+
+    let third_args: Vec<&str> = ["run"].into_iter().chain(options).chain(guest).collect();
+    let third = without_implicit_hermit_inputs(&mut hermit_command(&third_args))
+        .output()
+        .unwrap();
+    assert_success(&third, &third_args);
+    assert_ne!(stdout(&third), stdout(&first));
+}
+
+/// A run config with a key that names no option is refused before anything
+/// runs, as a usage error that gives the spelling that works.
+#[test]
+fn run_config_refuses_an_unknown_key_with_the_working_spelling() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let config = directory.path().join("run.yaml");
+    std::fs::write(
+        &config,
+        "schema: hermit-run-config/v1\nrun: {base_env: minimal}\nprogram: /bin/true\n",
+    )
+    .unwrap();
+    let config = config.to_str().unwrap();
+    let output = hermit(&["run", "--config", config]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains(&format!(
+            "error: cannot load run config {config}: `run.base_env` names no option: keys are \
+             long option names, with hyphens: write `base-env`"
+        )),
+        "{stderr}"
+    );
+}
+
 fn log_diff(args: &[&str]) -> Output {
     hermit_command(&[&["log-diff"], args].concat())
         .stdin(Stdio::null())

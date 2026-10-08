@@ -639,6 +639,61 @@ mode for reproducibility.
 seccomp interception, or determinization. It helps separate namespace setup
 failures from interception failures.
 
+## Run Configuration Files
+
+`hermit run --save-config=run.yaml ...` writes the run's options to a file, and
+`hermit run --config=run.yaml` runs with them again:
+
+```bash
+hermit --log=info run --seed-from=SystemRandom --save-config=run.yaml -- PROGRAM ARGS
+hermit run --config=run.yaml
+```
+
+A run config is YAML (JSON is accepted, being YAML) that names options by their
+long names, without the leading `--`:
+
+```yaml
+schema: hermit-run-config/v1
+hermit-version: 0.4.1 (2026-10-08, source revision not embedded)
+global:            # options before the subcommand: hermit [GLOBAL] run
+  backend: ptrace
+  log: info
+run:               # options of `hermit run`
+  base-env: minimal
+  epoch: 2026-10-08T17:54:04.637477466+00:00
+  seed: 12919933106523941100
+  verify: true     # a flag: true gives it; false is the same as leaving it out
+  env:             # a repeatable option: one list entry per occurrence
+  - FOO=1
+  - BAR=2
+program: /bin/sh
+args: [-c, echo $FOO$BAR]
+```
+
+- A file means exactly what typing its options would: Hermit turns each entry
+  into the option it names and checks the result like any command line, so
+  every `hermit run` option can appear and the same combinations are refused.
+- An option given on the command line replaces the file's value for that
+  option (for a repeatable option, its whole list). A guest program on the
+  command line replaces the file's `program` and `args`. The file's values
+  replace the options' environment variables (`HERMIT_EPOCH`, `HERMIT_LOG`, ...).
+  A flag the file gives cannot be taken back on the command line, because
+  flags have no negative spelling; edit the file instead.
+- `--save-config` writes the options given on the command line, in a `--config`
+  file, or through their environment variables, and the implicit inputs Hermit
+  resolved: the epoch taken from the host clock (or from a replayed recording)
+  and the seed `--seed-from` chose. It is written on the host before the guest
+  starts. Defaults are not written, so a file reproduces its run under the
+  Hermit version recorded in it. The host environment that `--base-env=host`
+  passes through is not recorded; use `--base-env=minimal` and `-e` to make the
+  guest environment part of the file.
+- `schema` is required and must be `hermit-run-config/v1`. Unknown keys are
+  refused, with the spelling that would work where there is one. The top-level
+  key `seccomp` is reserved for a future syscall policy section and is refused
+  until then. `--config` and `--save-config` cannot appear in a file.
+- `hermit oci run`, `hermit analyze` and `hermit bisect` do not load run
+  configs.
+
 ## Troubleshooting
 
 ### Program Not Found Or Not Executable
@@ -795,6 +850,8 @@ Linux interface.
 Before treating a result as reproducible:
 
 - Use the same Hermit revision, executable, arguments, and configuration.
+- Save the run's options with `--save-config` and rerun with `--config`; the
+  file records the epoch and any seed Hermit chose.
 - Keep file contents and mount layout fixed.
 - Prefer `--base-env=minimal` and explicit `-e` variables.
 - Keep networking isolated; do not depend on external services.

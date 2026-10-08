@@ -949,6 +949,16 @@ pub struct RunOpts {
     #[clap(skip)]
     epoch_from_recording: bool,
 
+    /// Runtime-only: the options this invocation was given, captured from the
+    /// parsed command line for `--save-config` (see [`crate::run_config::capture`]).
+    #[clap(skip)]
+    config_capture: Option<crate::run_config::RunConfig>,
+
+    /// Runtime-only: the seed `--seed-from` chose, which `--save-config`
+    /// writes in its place.
+    #[clap(skip)]
+    seed_from_resolved: Option<u64>,
+
     #[clap(flatten)]
     pub(crate) det_opts: DetOptions,
 
@@ -1334,9 +1344,25 @@ pub struct RunOpts {
     #[clap(long, value_name = "path")]
     workdir: Option<String>,
 
-    /// For debugging, save the details of this final run config: printed to a file in a human
-    /// readable format.
-    #[clap(long, value_name = "path")]
+    /// Load options from a run config file: YAML (or JSON) naming `hermit run` options by their
+    /// long names, as `--save-config` writes it. The file's options count as given on the command
+    /// line and are checked the same way. An option given on the command line replaces the
+    /// file's value for that option (a repeatable option's whole list), a guest program given on
+    /// the command line replaces the file's `program` and `args`, and the file's values replace
+    /// the options' environment variables. For example, `{schema: hermit-run-config/v1, global:
+    /// {log: info}, run: {seed: 7, env: [A=1, B=2], verify: true}, program: /bin/date}`; the
+    /// format is described under "Run Configuration Files" in docs/USER_GUIDE.md. Unknown keys and any
+    /// `schema` other than `hermit-run-config/v1` are refused.
+    #[clap(long, value_name = "FILE")]
+    config: Option<PathBuf>,
+
+    /// Write this run's options to FILE as a run config that `--config` loads to reproduce the
+    /// run: the options given on the command line, in a `--config` file or through their
+    /// environment variables, plus the implicit inputs hermit resolved (an epoch taken from the
+    /// host clock or from a replayed recording, and the seed `--seed-from` chose). Defaults are
+    /// not written, and neither is the host environment `--base-env=host` passes through. The
+    /// file is written on the host before the guest starts, so a run that fails still leaves it.
+    #[clap(long, value_name = "FILE")]
     pub save_config: Option<PathBuf>,
 
     /// Read-only overlay that exposes the rewritten ELF at its original guest path.
@@ -1974,6 +2000,83 @@ fn run_opts_for(argv: &[&str]) -> RunOpts {
     };
     run.backend = args.global.backend;
     *run
+}
+
+#[cfg(test)]
+impl RunOpts {
+    /// These options as a run config must reproduce them: every field
+    /// except the runtime-only provenance that a reload legitimately changes.
+    /// An epoch the first parse took from the clock is explicit after a
+    /// reload, and `--save-config` is never written into the file.
+    pub(crate) fn config_equivalence_key(&self) -> String {
+        let mut options = self.clone();
+        options.epoch_omitted = false;
+        options.epoch_captured_from_host = false;
+        options.epoch_from_recording = false;
+        options.config_capture = None;
+        options.save_config = None;
+        format!("{options:#?}")
+    }
+}
+
+/// `--save-config` writes the seed `--seed-from` chose in its place, so the
+/// saved run does not choose again.
+#[test]
+fn saved_config_records_the_seed_seed_from_chose() {
+    let argv = [
+        "hermit",
+        "run",
+        "--seed-from=SystemRandom",
+        "--seed=3",
+        "--save-config=unused.yaml",
+        "/bin/true",
+    ];
+    let matches = <crate::Args as clap::CommandFactory>::command()
+        .try_get_matches_from(argv)
+        .unwrap();
+    let args = crate::args_from_matches_with_clock(&matches, SystemTime::now).unwrap();
+    let crate::Subcommand::Run(mut ro) = args.command else {
+        panic!("{argv:?} is not a `run` command");
+    };
+    let before = ro.saved_run_config().unwrap();
+    assert_eq!(before.run["seed-from"], "SystemRandom");
+    assert_eq!(before.run["seed"], 3);
+    ro.validate_args_with_perf_support(true).unwrap();
+    let chosen = ro.det_opts.det_config.seed;
+    let saved = ro.saved_run_config().unwrap();
+    assert_eq!(saved.run.get("seed-from"), None, "{saved:?}");
+    assert_eq!(saved.run["seed"], chosen, "{saved:?}");
+}
+
+/// An epoch adopted from a replayed recording is an implicit input too.
+#[test]
+fn saved_config_records_an_epoch_adopted_from_a_recording() {
+    let argv = ["hermit", "run", "--save-config=unused.yaml", "/bin/true"];
+    let matches = <crate::Args as clap::CommandFactory>::command()
+        .try_get_matches_from(argv)
+        .unwrap();
+    let mut args = crate::args_from_matches_with_clock(&matches, SystemTime::now).unwrap();
+    let crate::Subcommand::Run(ro) = &mut args.command else {
+        panic!("{argv:?} is not a `run` command");
+    };
+    // What `adopt_replayed_schedule_epoch` leaves behind.
+    ro.det_opts.det_config.epoch = "2001-02-03T04:05:06.5Z".parse().unwrap();
+    ro.epoch_captured_from_host = false;
+    ro.epoch_from_recording = true;
+    let saved = ro.saved_run_config().unwrap();
+    assert_eq!(saved.run["epoch"], "2001-02-03T04:05:06.500+00:00");
+}
+
+/// Without `--save-config` there is nothing to capture, and asking for the
+/// config says why instead of writing an empty one.
+#[test]
+fn saved_config_requires_the_parsers_capture() {
+    let ro = RunOpts::parse_from(["fakehermit", "--save-config=x.yaml", "fakeprog"]);
+    let error = ro.saved_run_config().unwrap_err().to_string();
+    assert!(
+        error.contains("only by a `hermit run` invocation"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -4910,6 +5013,7 @@ impl RunOpts {
         // The backend is a global option (`hermit --backend X run ...`), the only
         // place it can be given.
         self.backend = global.backend;
+        self.refuse_unapplied_config()?;
         let guest_capture_paths = self.guest_run_capture_paths()?;
         if let Some(paths) = &guest_capture_paths {
             // Evidence is intentionally claimed by main before this preflight.
@@ -4941,6 +5045,9 @@ impl RunOpts {
         // for it.
         self.validate_args()?;
         self.adopt_replayed_schedule_epoch()?;
+        // Once every implicit input it records is resolved, and before the
+        // guest starts, so a run that fails or hangs still leaves it.
+        self.write_saved_config()?;
         // After every refusal above, which holds in every build, so a build
         // without the feature refuses those runs the way a feature build does;
         // and before stdin is read.
@@ -5432,6 +5539,7 @@ impl RunOpts {
                 seed
             );
             config.seed = seed;
+            self.seed_from_resolved = Some(seed);
         }
 
         // Deterministic RCB counts requires thread pinning.  But this only matters if
@@ -5568,6 +5676,12 @@ impl RunOpts {
         const SHARED: &str = "every trial writes that same path, so only the last trial's output \
                               would remain";
         [
+            (
+                self.config.is_some(),
+                "--config",
+                "the trials parse their run arguments directly and would ignore the file; give \
+                 its options as run arguments",
+            ),
             (
                 self.strace_only,
                 "--strace-only",
@@ -7309,7 +7423,82 @@ impl RunOpts {
         Ok(command)
     }
 
-    fn save_config_to_disk(&self) -> Result<(), Error> {
+    /// Whether this invocation asked for `--save-config`.
+    pub(crate) fn saves_config(&self) -> bool {
+        self.save_config.is_some()
+    }
+
+    /// The run config option this invocation gave, if any, for the commands
+    /// that embed `run`'s options but cannot honour them.
+    pub(crate) fn run_config_option(&self) -> Option<&'static str> {
+        if self.config.is_some() {
+            Some("--config")
+        } else if self.save_config.is_some() {
+            Some("--save-config")
+        } else {
+            None
+        }
+    }
+
+    /// The top-level parser replaces `hermit run --config FILE` with the
+    /// file's options before parsing (`crate::run_config::expand_argv`), so a
+    /// `--config` still present here was never applied.
+    fn refuse_unapplied_config(&self) -> Result<(), Error> {
+        match &self.config {
+            Some(path) => Err(Error::msg(format!(
+                "--config {} was not applied: only a top-level `hermit run` invocation loads a \
+                 run config. Run `hermit [GLOBAL OPTIONS] run --config {} [OPTIONS]`.",
+                path.display(),
+                path.display()
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Hands over the options the top-level parser captured for
+    /// `--save-config`.
+    pub(crate) fn set_config_capture(&mut self, config: crate::run_config::RunConfig) {
+        self.config_capture = Some(config);
+    }
+
+    /// The run config `--save-config` writes: the captured options with the
+    /// implicit inputs this run resolved written out, so that loading it
+    /// reproduces the run rather than resolving them again.
+    pub(crate) fn saved_run_config(&self) -> Result<crate::run_config::RunConfig, Error> {
+        use crate::run_config::EPOCH_KEY;
+        use crate::run_config::SEED_FROM_KEY;
+        use crate::run_config::SEED_KEY;
+
+        let mut config = self.config_capture.clone().ok_or_else(|| {
+            Error::msg(
+                "--save-config is written only by a `hermit run` invocation, whose parser \
+                 captures the options it was given",
+            )
+        })?;
+        if self.epoch_captured_from_host || self.epoch_from_recording {
+            config
+                .run
+                .insert(EPOCH_KEY.to_owned(), self.epoch_rfc3339().into());
+        }
+        if let Some(seed) = self.seed_from_resolved {
+            config.run.remove(SEED_FROM_KEY);
+            config.run.insert(SEED_KEY.to_owned(), seed.into());
+        }
+        Ok(config)
+    }
+
+    fn write_saved_config(&self) -> Result<(), Error> {
+        match &self.save_config {
+            Some(path) => crate::run_config::write(path, &self.saved_run_config()?),
+            None => Ok(()),
+        }
+    }
+
+    /// `hermit analyze` keeps a debugging dump of each trial's options in
+    /// its workspace. Trials are built by the program, not parsed from a
+    /// command line, so this is Rust's `Debug` rendering and not a run config
+    /// that `--config` can load.
+    pub(crate) fn write_debug_options_dump(&self) -> Result<(), Error> {
         if let Some(path) = &self.save_config {
             let mut file = File::create(path)?;
             file.write_all(format!("{:#?}\n", self).as_bytes())?;
@@ -7585,7 +7774,6 @@ impl RunOpts {
         config.mountinfo_mount_ids = mountinfo_order;
         config.mountinfo_mount_ids_captured = identity_sources.is_some();
         config.mount_id_assignment_order.clear();
-        self.save_config_to_disk()?;
 
         let timeout = self.run_timeout();
         super::staged_summary::with_published_summary(
@@ -7699,7 +7887,6 @@ impl RunOpts {
         config.mountinfo_mount_ids = mountinfo_order;
         config.mountinfo_mount_ids_captured = identity_sources.is_some();
         config.mount_id_assignment_order.clear();
-        self.save_config_to_disk()?;
 
         let forwarding = forwarded_detlogs.take().map(|(sender, receiver)| {
             hermit::forward_in_guest_detlogs_to(sender);

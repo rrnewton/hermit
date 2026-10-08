@@ -38,6 +38,7 @@ mod record_start;
 mod remove;
 mod replay;
 mod run;
+mod run_config;
 mod run_evidence;
 mod run_timeout;
 mod schedule_search;
@@ -179,6 +180,21 @@ fn args_from_matches_with_clock(
             Subcommand::Oci(oci) => oci.capture_default_run_epoch(capture_now),
             _ => unreachable!("only run subcommands carry an epoch"),
         }
+    }
+    // `--save-config` records the options as given, which only the matches
+    // still hold apart from defaults. `hermit oci run` refuses the option.
+    if let (Subcommand::Run(run), Some(run_matches)) =
+        (&mut args.command, matches.subcommand_matches("run"))
+        && run.saves_config()
+    {
+        let config =
+            run_config::capture(&Args::command(), matches, run_matches).map_err(|error| {
+                Args::command().error(
+                    clap::error::ErrorKind::ValueValidation,
+                    format!("{error:#}"),
+                )
+            })?;
+        run.set_config_capture(config);
     }
     Ok(args)
 }
@@ -531,9 +547,32 @@ fn main() {
     // stable library default for wire fingerprints and unit fixtures; only an
     // actual `hermit run` invocation captures host wall time.
     let argv = std::env::args_os().collect::<Vec<_>>();
+    // `hermit run --config FILE` means the command line the file names, so
+    // it is rewritten into that command line before anything is parsed.
+    let (argv, config_applied) = match run_config::expand_argv(&Args::command(), &argv) {
+        Ok(Some(expanded)) => (expanded, true),
+        Ok(None) => (argv, false),
+        Err(error) => Args::command()
+            .error(
+                clap::error::ErrorKind::ValueValidation,
+                format!("{error:#}"),
+            )
+            .exit(),
+    };
     let matches = Args::command()
         .try_get_matches_from(&argv)
-        .unwrap_or_else(|error| redirect_misplaced_backend(error, &argv).exit());
+        .unwrap_or_else(|error| {
+            let error = redirect_misplaced_backend(error, &argv);
+            if config_applied && error.use_stderr() {
+                let _ = error.print();
+                eprintln!(
+                    "note: the options of the --config file count as given on the command \
+                     line, and an option given on the command line replaces the file's value"
+                );
+                std::process::exit(error.exit_code());
+            }
+            error.exit()
+        });
     let Args {
         mut global,
         mut command,

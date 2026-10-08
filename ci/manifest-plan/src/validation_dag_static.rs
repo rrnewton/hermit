@@ -1190,7 +1190,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // scheduler_turn_cost_parses_round_trips_and_is_refused_for_dbt (lane
     // qemu-rcb, https://github.com/rrnewton/hermit/pull/3885) retains all 980:
     // 981.
-    ("test.hermit_unit", 981),
+    // Thirteen run_config::tests and three run::saved_config_* tests of the
+    // loadable run config (`hermit run --config` / `--save-config`) retain all
+    // 981: 997.
+    ("test.hermit_unit", 997),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1950,7 +1953,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_child_exit_is_notified_once_with_linuxs_siginfo retains all 231: 232,
     // run with this node's arguments. It starts no LiteInst guest, so
     // test.cli_on_host selects it too.
-    ("test.cli", 232),
+    // run_config_saved_by_one_run_reproduces_it and
+    // run_config_refuses_an_unknown_key_with_the_working_spelling retain all
+    // 232: 234. Neither starts a LiteInst guest, so test.cli_on_host selects both.
+    ("test.cli", 234),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2130,7 +2136,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // an in-guest LiteInst guest (CPUID faulting), so it joins the hosted
     // CPUID-faulting exact-name filterset: 185 - 1 = 184.
     // a_child_exit_is_notified_once_with_linuxs_siginfo: 185.
-    ("test.cli_on_host", 185),
+    // And the two run_config_ tests: 187.
+    ("test.cli_on_host", 187),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 55),
@@ -2320,7 +2327,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two accept stand-in tests: 973.
     // And the same seven accept stand-in and peer-address tests: 980.
     // And the scheduler-turn-cost CLI test: 981.
-    ("test.hermit_unit_on_host", 981),
+    // And the same sixteen run config tests: 997.
+    ("test.hermit_unit_on_host", 997),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
