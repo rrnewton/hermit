@@ -898,7 +898,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests::an_in_guest_liteinst_cell_needs_cpuid_faulting (hermit-manifest-plan
     // test-harness; liteinst and in-guest-trap cells need CPUID faulting and
     // route locally) retains all 1013: 1014, listed with this node's arguments.
-    ("test.regular_crates", 1017),
+    // config::tests::inherited_seccomp_never_enters_the_legacy_form,
+    // config::tests::inherited_seccomp_round_trips_through_reverie_bincode and
+    // config::tests::inherited_seccomp_is_read_from_a_status_file (detcore-model)
+    // retain all 1017: 1020, listed with this node's arguments.
+    ("test.regular_crates", 1020),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1599,7 +1603,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_path_linux_marks_deleted_names_nothing,
     // a_procfs_object_is_told_by_its_filesystem_type} (entries of exited tasks
     // and procfs files outside the guest's mounts) retain all 1219: 1222.
-    ("test.detcore_unit", 1222),
+    // procfs_inode::tests::a_failed_host_call_leaves_the_callers_errno (the
+    // guest's errno under SaBRe) retains all 1222: 1223.
+    ("test.detcore_unit", 1223),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1658,7 +1664,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_close_that_a_filter_refuses_ends_in_a_determinism_loss}
     // (keys decided with the snapshot; the O_PATH descriptor is closed or the
     // run records a loss) retain all 96 (measured 99).
-    ("test.detcore_misc", 99),
+    // procfs_inode::naming_an_entry_leaves_the_guests_errno (the guest's errno
+    // under SaBRe) retains all 99 (measured 100).
+    ("test.detcore_misc", 100),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -2260,7 +2268,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
     // The host node carries the identical tests_misc selection.
-    ("test.detcore_misc_on_host", 99),
+    ("test.detcore_misc_on_host", 100),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -2352,7 +2360,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the three tests of naming procfs entries through the guest: 1217.
     // And the two tests of where procfs entries are named: 1219.
     // And the three tests of exited tasks and outside procfs files: 1222.
-    ("test.detcore_unit_on_host", 1222),
+    // And the errno test: 1223.
+    ("test.detcore_unit_on_host", 1223),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -2551,7 +2560,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same test-free declaration test: 1005; removed with it: 1004.
     // And the same two in-guest-trap tests: 1013.
     // And the same in-guest CPUID-faulting test: 1014.
-    ("test.regular_crates_on_host", 1017),
+    // And the three detcore-model inherited_seccomp tests: 1020.
+    ("test.regular_crates_on_host", 1020),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

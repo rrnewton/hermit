@@ -66,6 +66,62 @@ pub struct MountInfoRootRewrite {
     pub deterministic_mountpoint_prefix: Option<Vec<u8>>,
 }
 
+/// The seccomp state of the thread that starts the guest, which the guest
+/// inherits: every filter that thread has applies to the guest's system calls,
+/// and to the calls Detcore injects into it. Detcore refuses the guest's own
+/// `seccomp(2)` and `prctl(PR_SET_SECCOMP)`, so these and the backend's own
+/// filter are the only filters a guest has.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize
+)]
+pub enum InheritedSeccomp {
+    /// Not measured, or not readable, so a filter may apply.
+    #[default]
+    Unknown,
+    /// No seccomp (`Seccomp: 0`).
+    Disabled,
+    /// Strict mode (`Seccomp: 1`).
+    Strict,
+    /// Filter mode (`Seccomp: 2`), with the number of filters when
+    /// `Seccomp_filters` gives it.
+    Filter(Option<u32>),
+}
+
+impl InheritedSeccomp {
+    /// The state of the calling thread, which a process it forks inherits,
+    /// from `/proc/thread-self/status`.
+    pub fn measure() -> Self {
+        std::fs::read_to_string("/proc/thread-self/status")
+            .map_or(Self::Unknown, |status| Self::parse(&status))
+    }
+
+    /// The state the `Seccomp` and `Seccomp_filters` lines of the text of a
+    /// `/proc/<pid>/status` file give. A missing or unexpected `Seccomp` line
+    /// is unknown.
+    pub fn parse(status: &str) -> Self {
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(name)?.strip_prefix(':'))
+                .map(str::trim)
+        };
+        match field("Seccomp") {
+            Some("0") => Self::Disabled,
+            Some("1") => Self::Strict,
+            Some("2") => Self::Filter(field("Seccomp_filters").and_then(|n| n.parse().ok())),
+            _ => Self::Unknown,
+        }
+    }
+}
+
 /// Configuration options for detcore.
 #[derive(Debug, Serialize, Deserialize, Clone, Parser)]
 pub struct Config {
@@ -176,6 +232,18 @@ pub struct Config {
     #[serde(default)]
     #[clap(skip)]
     pub in_guest_site_patching_off: bool,
+
+    /// The seccomp state the guest inherits from the thread that starts it
+    /// ([`InheritedSeccomp`]). The caller that starts the guest states it, as
+    /// only the caller knows the filters its launch installs, such as those of
+    /// a `pre_exec` callback; `hermit run` measures it. Not stated, it is
+    /// unknown. Nothing reads it yet: it is measured for a policy on inherited
+    /// filters that is still to be decided. It has no legacy key:
+    /// [`to_legacy_backend_json`] leaves it out and
+    /// [`from_legacy_backend_json`] reads it back as unknown.
+    #[serde(default)]
+    #[clap(skip)]
+    pub inherited_seccomp: InheritedSeccomp,
 
     /// Epoch of the logical time.
     ///
@@ -1606,7 +1674,8 @@ impl Default for Config {
 /// option has no effect. So is [`Config::replaying`], set only by `hermit
 /// replay`, which runs only on the ptrace backend, and
 /// [`Config::scheduler_turn_cost`], which `hermit run` refuses with the DBT
-/// backend. Every other field is serialized exactly as
+/// backend. So is [`Config::inherited_seccomp`], added after this form froze,
+/// which reads back as unknown. Every other field is serialized exactly as
 /// `serde_json::to_string(config)` serializes it.
 ///
 /// Use this wherever the JSON is visible to the guest. `hermit run
@@ -1942,7 +2011,9 @@ mod legacy_backend_json {
     /// with the DBT backend.
     /// `in_guest_site_patching_off` is false for DBT (it is set only for
     /// in-guest LiteInst), so it is never written and reads as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 9] = [
+    /// `inherited_seccomp` came after the legacy form froze too. It is never
+    /// written and reads as unknown.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 10] = [
         "backend",
         "record_host_inputs",
         "backend_supports_blocked_wait_signal_interruption",
@@ -1952,6 +2023,7 @@ mod legacy_backend_json {
         "target_timeslice_syscalls_only",
         "replaying",
         "scheduler_turn_cost",
+        "inherited_seccomp",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -2045,8 +2117,9 @@ mod legacy_backend_json {
     /// [`Config::guest_may_inherit_a_terminal`],
     /// [`Config::in_guest_detlog_forward_policy`],
     /// [`Config::in_guest_site_patching_off`],
-    /// [`Config::target_timeslice_syscalls_only`], [`Config::replaying`] or
-    /// [`Config::scheduler_turn_cost`] takes an element. Each gets a
+    /// [`Config::target_timeslice_syscalls_only`], [`Config::replaying`],
+    /// [`Config::scheduler_turn_cost`] or [`Config::inherited_seccomp`] takes
+    /// an element. Each gets a
     /// placeholder; [`super::from_legacy_backend_json`] replaces the first.
     struct LegacyPositions<'f, 'l, A> {
         inner: A,
@@ -2089,6 +2162,14 @@ mod legacy_backend_json {
                     .deserialize(serde_json::Value::Null)
                     .map(Some)
                     .map_err(<A::Error as de::Error>::custom),
+                // Unknown, as its serde default is.
+                Some("inherited_seccomp") => {
+                    let unknown = serde_json::to_value(super::InheritedSeccomp::Unknown)
+                        .map_err(<A::Error as de::Error>::custom)?;
+                    seed.deserialize(unknown)
+                        .map(Some)
+                        .map_err(<A::Error as de::Error>::custom)
+                }
                 _ => self.inner.next_element_seed(seed),
             }
         }
@@ -2335,7 +2416,8 @@ mod legacy_backend_json {
                 | "in_guest_site_patching_off"
                 | "target_timeslice_syscalls_only"
                 | "replaying"
-                | "scheduler_turn_cost" => Ok(()),
+                | "scheduler_turn_cost"
+                | "inherited_seccomp" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -2799,8 +2881,8 @@ mod tests {
     /// `record_host_inputs`, `backend_supports_blocked_wait_signal_interruption`,
     /// `guest_may_inherit_a_terminal`, `in_guest_detlog_forward_policy`,
     /// `in_guest_site_patching_off`, `target_timeslice_syscalls_only`,
-    /// `replaying` or `scheduler_turn_cost`, which is the key order the
-    /// encoder writes.
+    /// `replaying`, `scheduler_turn_cost` or `inherited_seccomp`, which is the
+    /// key order the encoder writes.
     #[test]
     fn legacy_positions_are_the_encoded_key_order() {
         let names = legacy_backend_keys(&Config::default()).map(|(name, _)| name);
@@ -2822,7 +2904,8 @@ mod tests {
                 | "in_guest_site_patching_off"
                 | "target_timeslice_syscalls_only"
                 | "replaying"
-                | "scheduler_turn_cost" => {}
+                | "scheduler_turn_cost"
+                | "inherited_seccomp" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -2836,9 +2919,9 @@ mod tests {
         // `backend_supports_blocked_wait_signal_interruption`,
         // `guest_may_inherit_a_terminal`, `in_guest_detlog_forward_policy`,
         // `in_guest_site_patching_off`, `target_timeslice_syscalls_only`,
-        // `replaying` and `scheduler_turn_cost` none.
+        // `replaying`, `scheduler_turn_cost` and `inherited_seccomp` none.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len() + 6, keys.len());
+        assert_eq!(fields.len() + 5, keys.len());
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -3025,6 +3108,97 @@ mod tests {
                 .unwrap()
                 .guest_may_inherit_a_terminal
         );
+    }
+
+    /// `inherited_seccomp` never enters the legacy form, whatever its value:
+    /// the guest-visible string stays the legacy bytes, and it reads back as
+    /// unknown from both the object and the array form.
+    #[test]
+    fn inherited_seccomp_never_enters_the_legacy_form() {
+        use crate::config::InheritedSeccomp;
+        let unknown = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        assert_eq!(unknown.inherited_seccomp, InheritedSeccomp::Unknown);
+        let measured = Config {
+            inherited_seccomp: InheritedSeccomp::Filter(Some(2)),
+            ..unknown.clone()
+        };
+        let json = to_legacy_backend_json(&measured).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&unknown).unwrap());
+        assert!(!json.contains("inherited_seccomp"), "{json}");
+        assert_eq!(
+            from_legacy_backend_json(&json).unwrap().inherited_seccomp,
+            InheritedSeccomp::Unknown
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert_eq!(
+            from_legacy_backend_json(&array).unwrap().inherited_seccomp,
+            InheritedSeccomp::Unknown
+        );
+    }
+
+    /// `Config` crosses Reverie RPC as legacy bincode, which is positional, so
+    /// `inherited_seccomp` must be encoded whatever its value, the number of
+    /// filters included.
+    #[test]
+    fn inherited_seccomp_round_trips_through_reverie_bincode() {
+        use crate::config::InheritedSeccomp;
+        for inherited_seccomp in [
+            InheritedSeccomp::Unknown,
+            InheritedSeccomp::Disabled,
+            InheritedSeccomp::Strict,
+            InheritedSeccomp::Filter(None),
+            InheritedSeccomp::Filter(Some(3)),
+        ] {
+            let config = Config {
+                inherited_seccomp,
+                ..Config::default()
+            };
+            let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
+            let (decoded, read): (Config, usize) =
+                bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
+            assert_eq!(read, wire.len());
+            assert_eq!(decoded.inherited_seccomp, inherited_seccomp);
+            assert_eq!(
+                bincode::serde::encode_to_vec(&decoded, bincode::config::legacy()).unwrap(),
+                wire
+            );
+        }
+    }
+
+    /// `Seccomp` gives the mode, and `Seccomp_filters` the number of filters in
+    /// filter mode.
+    #[test]
+    fn inherited_seccomp_is_read_from_a_status_file() {
+        use crate::config::InheritedSeccomp;
+        let status = |lines: &str| {
+            InheritedSeccomp::parse(&format!(
+                "Name:\tguest\nNoNewPrivs:\t1\n{lines}Speculation_Store_Bypass:\tthread vulnerable\n"
+            ))
+        };
+        assert_eq!(
+            status("Seccomp:\t0\nSeccomp_filters:\t0\n"),
+            InheritedSeccomp::Disabled
+        );
+        assert_eq!(
+            status("Seccomp:\t1\nSeccomp_filters:\t0\n"),
+            InheritedSeccomp::Strict
+        );
+        assert_eq!(
+            status("Seccomp:\t2\nSeccomp_filters:\t3\n"),
+            InheritedSeccomp::Filter(Some(3))
+        );
+        assert_eq!(status("Seccomp:\t2\n"), InheritedSeccomp::Filter(None));
+        assert_eq!(status(""), InheritedSeccomp::Unknown);
+        assert_eq!(status("Seccomp:\t7\n"), InheritedSeccomp::Unknown);
+        // This thread's own state is readable.
+        assert_ne!(InheritedSeccomp::measure(), InheritedSeccomp::Unknown);
     }
 
     /// `target_timeslice_syscalls_only` never enters the legacy form, whatever
