@@ -290,11 +290,12 @@ pub enum Position {
     ///   thread starts at zero, an exec keeps them, and after a non-leader exec
     ///   the calling thread's counters continue under the leader's thread id.
     /// - Like every anchor, it fires at the prehook: an edge orders the BEFORE
-    ///   thread *reaching* its syscall, not that syscall's effect. Under the
-    ///   default scheduler the BEFORE syscall completes before the held thread
-    ///   is re-admitted (equal priorities run in queue order); a run that
-    ///   reorders runnable threads (chaos) or a BEFORE syscall that takes
-    ///   several scheduler turns can let the AFTER thread's effect land first.
+    ///   thread *reaching* its syscall, not that syscall's effect. The held
+    ///   thread is re-admitted at the next drain, so a BEFORE syscall that
+    ///   takes more scheduler turns than the AFTER thread needs (a `write` to
+    ///   stdout takes a checkpoint turn and a resource turn) can let the AFTER
+    ///   thread's effect land first, even under the default scheduler
+    ///   (<https://github.com/rrnewton/hermit/issues/3929>).
     Syscall {
         /// The syscall number.
         sysno: Sysno,

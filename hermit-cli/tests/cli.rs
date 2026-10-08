@@ -8912,6 +8912,46 @@ fn happens_before_before_anchor_that_never_fires_is_refused_by_name() {
     );
 }
 
+/// Run `command` with stdout and stderr redirected to files in `directory`,
+/// waiting at most `limit`, and return its exit status (`None` when it had to
+/// be killed at the deadline) and its stderr. Files rather than pipes: a child
+/// that writes more than a pipe holds before it exits would block on the full
+/// pipe and look like a hang. With `open_stdin`, stdin is a pipe whose writer
+/// stays open for the whole wait, so a child that reads its input first never
+/// returns.
+fn run_with_deadline(
+    mut command: Command,
+    directory: &Path,
+    limit: Duration,
+    open_stdin: bool,
+) -> (Option<std::process::ExitStatus>, String) {
+    let stdout_path = directory.join("deadline-run.stdout");
+    let stderr_path = directory.join("deadline-run.stderr");
+    command
+        .stdout(fs::File::create(&stdout_path).expect("failed to create the stdout file"))
+        .stderr(fs::File::create(&stderr_path).expect("failed to create the stderr file"));
+    if open_stdin {
+        command.stdin(Stdio::piped());
+    }
+    let mut child = command.spawn().expect("failed to spawn hermit");
+    let stdin_writer = child.stdin.take();
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        match child.try_wait().expect("failed to poll hermit") {
+            Some(status) => break Some(status),
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            None => thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    drop(stdin_writer);
+    let stderr = fs::read_to_string(&stderr_path).expect("failed to read the stderr file");
+    (status, stderr)
+}
+
 /// A gate on a vfork child before its exec can never open: while the child
 /// runs, no other thread can (https://github.com/rrnewton/hermit/issues/3930).
 /// The child of `posix_spawn` calls dup2 before execve; a spec holding it there
@@ -8932,18 +8972,28 @@ fn happens_before_hold_in_a_vfork_child_is_refused_by_name() {
     )
     .unwrap();
     let spec = spec.to_str().unwrap().to_owned();
-    let args = [
-        "run",
-        "--strict",
-        "--happens-before",
-        spec.as_str(),
-        "--",
-        guest.as_str(),
-    ];
-    let output = hermit(&args);
-    let log = stderr(&output);
+    // A deadline, so a regression to the old spin fails with a message instead
+    // of hanging the suite.
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "run",
+            "--strict",
+            "--happens-before",
+            spec.as_str(),
+            "--",
+            guest.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(60),
+        false,
+    );
+    let status = status.unwrap_or_else(|| {
+        panic!(
+            "a hold inside a vfork child spun instead of being refused: no exit within 60s\n{log}"
+        )
+    });
     assert_eq!(
-        output.status.code(),
+        status.code(),
         Some(HERMIT_POLICY_REFUSAL_EXIT),
         "a hold inside a vfork child must be refused with the policy-refusal status:\n{log}"
     );
@@ -9015,48 +9065,26 @@ fn happens_before_unsupported_fd_anchor_is_refused_before_reading_stdin() {
     )
     .unwrap();
     let spec = spec.to_str().unwrap().to_owned();
-    let mut child = hermit_command(&[
-        "--backend=kvm",
-        "run",
-        "--strict",
-        "--verify",
-        "--happens-before",
-        spec.as_str(),
-        "--",
-        "/bin/true",
-    ])
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
-    .expect("failed to spawn hermit");
-    // Hold the stdin pipe's writer open for the whole wait: a run that reads
-    // its input first never returns.
-    let stdin_writer = child.stdin.take().expect("stdin is piped");
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let mut timed_out = false;
-    loop {
-        match child.try_wait().expect("failed to poll hermit") {
-            Some(_) => break,
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                timed_out = true;
-                break;
-            }
-            None => thread::sleep(Duration::from_millis(50)),
-        }
-    }
-    drop(stdin_writer);
-    let output = child
-        .wait_with_output()
-        .expect("failed to collect hermit output");
-    let log = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(
-        !timed_out,
-        "the refusal waited for stdin: no exit within 60s with an open stdin pipe\n{log}"
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--backend=kvm",
+            "run",
+            "--strict",
+            "--verify",
+            "--happens-before",
+            spec.as_str(),
+            "--",
+            "/bin/true",
+        ]),
+        directory.path(),
+        Duration::from_secs(60),
+        true,
     );
+    let status = status.unwrap_or_else(|| {
+        panic!("the refusal waited for stdin: no exit within 60s with an open stdin pipe\n{log}")
+    });
     assert_eq!(
-        output.status.code(),
+        status.code(),
         Some(HERMIT_POLICY_REFUSAL_EXIT),
         "an unsupported anchor must be a policy refusal:\n{log}"
     );

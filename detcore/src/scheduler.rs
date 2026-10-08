@@ -2611,16 +2611,18 @@ impl Scheduler {
                 // (`step3_peek`), so a BEFORE anchor could never fire and the run
                 // would spin with no report
                 // (https://github.com/rrnewton/hermit/issues/3930). Refuse instead.
-                self.terminal_deadlock.get_or_insert_with(|| {
-                    format!(
+                // Keep an earlier verdict, and its classification, if one is
+                // already pending.
+                if self.terminal_deadlock.is_none() {
+                    self.terminal_deadlock = Some(format!(
                         "HERMIT_HB_HOLD_IN_VFORK_CHILD: happens-before anchor(s) {:?} would hold \
                          dtid {}, a vfork child that has not exec'd yet; while it runs no other \
                          thread can, so its gate could never open. Anchor the edge on a point \
                          before the vfork or after the child's exec.",
                         reached, dettid
-                    )
-                });
-                self.terminal_is_refusal = true;
+                    ));
+                    self.terminal_is_refusal = true;
+                }
             }
             let hb = self.happens_before.as_mut().unwrap();
             hb.parked.insert(dettid);
