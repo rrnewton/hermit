@@ -161,6 +161,22 @@ pub struct Config {
     #[clap(skip)]
     pub in_guest_detlog_forward_policy: Option<String>,
 
+    /// Whether every in-guest Tool image must run with syscall site patching
+    /// off and collect its exit statistics (`hermit --backend=in-guest-trap`).
+    ///
+    /// The host sets it, not a flag, and every Tool image receives it in the
+    /// configuration handshake on its coordinator connection, which guest code
+    /// cannot change. The in-guest LiteInst runtime takes both settings from
+    /// the guest environment, which guest code running before or during its
+    /// installation could change, so once installation returns a Tool image
+    /// compares the settings the runtime actually captured with this one and
+    /// refuses to run the program when they differ
+    /// (`detcore::in_guest_site_patching`). Like
+    /// `in_guest_detlog_forward_policy`, it has no legacy key.
+    #[serde(default)]
+    #[clap(skip)]
+    pub in_guest_site_patching_off: bool,
+
     /// Epoch of the logical time.
     ///
     /// This is the datetime from which all time and date modtimes begin and
@@ -1584,8 +1600,8 @@ impl Default for Config {
 /// only DBT, whose launcher collects no host inputs. So is
 /// [`Config::backend_supports_blocked_wait_signal_interruption`], which
 /// is false for DBT, and [`Config::guest_may_inherit_a_terminal`], which only
-/// that capability reads, and [`Config::in_guest_detlog_forward_policy`],
-/// which is unset for DBT. So is [`Config::target_timeslice_syscalls_only`],
+/// that capability reads, and [`Config::in_guest_detlog_forward_policy`] and
+/// [`Config::in_guest_site_patching_off`], which are unset for DBT. So is [`Config::target_timeslice_syscalls_only`],
 /// added after this form froze; DBT runs without a PMU maximum, where the
 /// option has no effect. So is [`Config::replaying`], set only by `hermit
 /// replay`, which runs only on the ptrace backend, and
@@ -1924,12 +1940,15 @@ mod legacy_backend_json {
     /// replay runs only on the ptrace backend. Nor is `scheduler_turn_cost`,
     /// which came after the legacy form froze and which `hermit run` refuses
     /// with the DBT backend.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 8] = [
+    /// `in_guest_site_patching_off` is false for DBT (it is set only for
+    /// in-guest LiteInst), so it is never written and reads as false.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 9] = [
         "backend",
         "record_host_inputs",
         "backend_supports_blocked_wait_signal_interruption",
         "guest_may_inherit_a_terminal",
         "in_guest_detlog_forward_policy",
+        "in_guest_site_patching_off",
         "target_timeslice_syscalls_only",
         "replaying",
         "scheduler_turn_cost",
@@ -2025,6 +2044,7 @@ mod legacy_backend_json {
     /// [`Config::backend_supports_blocked_wait_signal_interruption`],
     /// [`Config::guest_may_inherit_a_terminal`],
     /// [`Config::in_guest_detlog_forward_policy`],
+    /// [`Config::in_guest_site_patching_off`],
     /// [`Config::target_timeslice_syscalls_only`], [`Config::replaying`] or
     /// [`Config::scheduler_turn_cost`] takes an element. Each gets a
     /// placeholder; [`super::from_legacy_backend_json`] replaces the first.
@@ -2060,6 +2080,7 @@ mod legacy_backend_json {
                     "record_host_inputs"
                     | "backend_supports_blocked_wait_signal_interruption"
                     | "guest_may_inherit_a_terminal"
+                    | "in_guest_site_patching_off"
                     | "target_timeslice_syscalls_only"
                     | "replaying",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
@@ -2311,6 +2332,7 @@ mod legacy_backend_json {
                 | "backend_supports_blocked_wait_signal_interruption"
                 | "guest_may_inherit_a_terminal"
                 | "in_guest_detlog_forward_policy"
+                | "in_guest_site_patching_off"
                 | "target_timeslice_syscalls_only"
                 | "replaying"
                 | "scheduler_turn_cost" => Ok(()),
@@ -2381,6 +2403,7 @@ mod tests {
         assert!(!config.backend_supports_blocked_wait_signal_interruption);
         assert!(!config.guest_may_inherit_a_terminal);
         assert!(config.in_guest_detlog_forward_policy.is_none());
+        assert!(!config.in_guest_site_patching_off);
     }
 
     #[test]
@@ -2775,8 +2798,9 @@ mod tests {
     /// with the fifteen legacy keys where `backend` stands and no
     /// `record_host_inputs`, `backend_supports_blocked_wait_signal_interruption`,
     /// `guest_may_inherit_a_terminal`, `in_guest_detlog_forward_policy`,
-    /// `target_timeslice_syscalls_only`, `replaying` or `scheduler_turn_cost`,
-    /// which is the key order the encoder writes.
+    /// `in_guest_site_patching_off`, `target_timeslice_syscalls_only`,
+    /// `replaying` or `scheduler_turn_cost`, which is the key order the
+    /// encoder writes.
     #[test]
     fn legacy_positions_are_the_encoded_key_order() {
         let names = legacy_backend_keys(&Config::default()).map(|(name, _)| name);
@@ -2795,6 +2819,7 @@ mod tests {
                 | "backend_supports_blocked_wait_signal_interruption"
                 | "guest_may_inherit_a_terminal"
                 | "in_guest_detlog_forward_policy"
+                | "in_guest_site_patching_off"
                 | "target_timeslice_syscalls_only"
                 | "replaying"
                 | "scheduler_turn_cost" => {}
@@ -2810,10 +2835,10 @@ mod tests {
         // `backend` becomes fifteen keys; `record_host_inputs`,
         // `backend_supports_blocked_wait_signal_interruption`,
         // `guest_may_inherit_a_terminal`, `in_guest_detlog_forward_policy`,
-        // `target_timeslice_syscalls_only`, `replaying` and
-        // `scheduler_turn_cost` none.
+        // `in_guest_site_patching_off`, `target_timeslice_syscalls_only`,
+        // `replaying` and `scheduler_turn_cost` none.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len() + 7, keys.len());
+        assert_eq!(fields.len() + 6, keys.len());
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -2936,6 +2961,39 @@ mod tests {
                 .unwrap()
                 .in_guest_detlog_forward_policy
                 .is_none()
+        );
+    }
+
+    /// `in_guest_site_patching_off` is false for DBT, so the legacy form never
+    /// carries it, and it reads back as false from both the object and the
+    /// array form.
+    #[test]
+    fn in_guest_site_patching_off_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            in_guest_site_patching_off: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("in_guest_site_patching_off"), "{json}");
+        assert!(
+            !from_legacy_backend_json(&json)
+                .unwrap()
+                .in_guest_site_patching_off
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(
+            !from_legacy_backend_json(&array)
+                .unwrap()
+                .in_guest_site_patching_off
         );
     }
 

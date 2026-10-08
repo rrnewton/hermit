@@ -45,10 +45,10 @@ refuses retirement. Selection changes do not fabricate a result or timestamp.
 
 The denominator is the complete comparable manifest matrix, not just the
 combinations selected by one validate path. For `N` manifest tests, verify,
-replay, and chaos span five Hermit backends, while native contributes one
-naked-execution control: `N × (5 × 3 + 1)` cells. Native is shown as a sixth
-backend in the table, but it does not have replay or chaos cells, so the formula
-is not `N × 6 × 3`. Explicit `custom` commands still run when selected by
+replay, and chaos span six Hermit backends (`in-guest-trap` became the sixth on
+2026-10-08), while native contributes one naked-execution control:
+`N × (6 × 3 + 1)` cells. Native is shown as a seventh backend in the table, but
+it does not have replay or chaos cells, so the formula is not `N × 7 × 3`. Explicit `custom` commands still run when selected by
 ordinary validation, but they are not multiplied across every test/backend
 pair: unlike the three common modes, they do not define a uniform product-wide
 denominator.
@@ -59,7 +59,7 @@ population actually recorded Green on ptrace. Missing backend evidence stays
 in that common population and earns no comparison credit.
 
 For one dated example only: on 2026-08-13, `N = 336`, so the comparable matrix
-has `336 × (5 × 3 + 1) = 5,376` cells. The checked-in table is generated from
+had `336 × (5 × 3 + 1) = 5,376` cells, with five Hermit backends. The checked-in table is generated from
 the live manifest and changes automatically when a manifest test is added.
 
 `hermit-manifest-plan --format matrix-json` emits every cell in the manifest,

@@ -307,4 +307,20 @@ mod tests {
              statically linked"
         );
     }
+
+    /// An in-guest-trap refusal names that backend and keeps the same class.
+    #[test]
+    fn in_guest_trap_refusal_is_serialized_as_a_policy_refusal() {
+        let refusal =
+            SerializableError::from(Error::new(crate::LiteinstInGuestRefusal::for_backend(
+                crate::Backend::InGuestTrap,
+                "guest program /static is statically linked",
+            )));
+        assert_eq!(refusal.kind(), FailureKind::PolicyRefusal);
+        assert_eq!(
+            refusal.error,
+            "--backend=in-guest-trap (in-guest LiteInst, site patching off) refuses this run: \
+             guest program /static is statically linked"
+        );
+    }
 }

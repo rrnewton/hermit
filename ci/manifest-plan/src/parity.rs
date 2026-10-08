@@ -8,7 +8,8 @@
 //! committed snapshot.
 //!
 //! A parity cell compares one manifest test's `verify` run on a candidate
-//! backend (kvm, liteinst, sabre or dbt) against the same test's `verify` run
+//! backend (kvm, liteinst, in-guest-trap, sabre or dbt) against the same
+//! test's `verify` run
 //! on ptrace, the reference. A [`ParityCellId`] is therefore a test id plus a
 //! candidate backend. It has no mode, because the mode is always `verify`,
 //! and ptrace cannot be a member, because it is the reference. It is distinct
@@ -16,7 +17,7 @@
 //! comparison between two.
 //!
 //! The matrix is derived, never hand-written: every manifest test crossed with
-//! the four candidate backends. A cell is
+//! the five candidate backends. A cell is
 //!
 //! - APPLICABLE when `verify` is enabled on both ptrace and the candidate, and
 //! - SELECTABLE when it is applicable and both of those `verify` cells are
@@ -141,17 +142,28 @@ const BELOW_ONE: f64 = 1.0 - f64::EPSILON / 2.0;
 #[serde(rename_all = "lowercase")]
 pub enum ParityBackend {
     Dbt,
+    /// In-guest LiteInst with syscall site patching off, scored as its own
+    /// column apart from `liteinst`.
+    #[serde(rename = "in-guest-trap")]
+    InGuestTrap,
     Kvm,
     Liteinst,
     Sabre,
 }
 
 impl ParityBackend {
-    pub const ALL: [Self; 4] = [Self::Dbt, Self::Kvm, Self::Liteinst, Self::Sabre];
+    pub const ALL: [Self; 5] = [
+        Self::Dbt,
+        Self::InGuestTrap,
+        Self::Kvm,
+        Self::Liteinst,
+        Self::Sabre,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Dbt => "dbt",
+            Self::InGuestTrap => "in-guest-trap",
             Self::Kvm => "kvm",
             Self::Liteinst => "liteinst",
             Self::Sabre => "sabre",
@@ -171,7 +183,7 @@ impl ParityBackend {
                     )
                 } else {
                     format!(
-                        "unknown parity backend {value:?}; expected one of dbt, kvm, liteinst, sabre"
+                        "unknown parity backend {value:?}; expected one of dbt, in-guest-trap, kvm, liteinst, sabre"
                     )
                 }
             })
@@ -5859,7 +5871,9 @@ mod tests {
         }
         let parsed: ParityCells = serde_json::from_str(committed).unwrap();
         // c-programs/userfaultfd-self-service adds one line per backend but ptrace: 3148.
-        assert_eq!(parsed.cells.len(), 3148);
+        // in-guest-trap, a fifth candidate backend, adds one line per test (787):
+        // 3148 + 787 = 3935.
+        assert_eq!(parsed.cells.len(), 3935);
         assert_eq!(parsed.schema, PARITY_CELLS_SCHEMA);
         // The repository's limit for a text file is 2 MiB. This bound was
         // 1 MiB until fold 5 of https://github.com/rrnewton/hermit/issues/3448
@@ -10336,7 +10350,7 @@ mod tests {
         ]);
         scope.extend(ParityBackend::ALL.map(|backend| parity_cell("fx/reference", backend)));
         let report = post_pass(&config, &scope, &rows).unwrap();
-        assert_eq!(report.records.len(), 8);
+        assert_eq!(report.records.len(), 4 + ParityBackend::ALL.len());
         assert_eq!((report.log_diff_runs, fixture.log_diff_calls()), (0, 0));
 
         let golden = |test: &str| path_text(&golden_paths(&fixture.artifacts(), test).unwrap().0);
@@ -10434,10 +10448,10 @@ mod tests {
         }
         let summary = report.summary_line();
         for part in [
-            "8 cell(s)",
-            "matched 0, diverged 0, nondeterministic 8, reference-missing 0, candidate-missing 0, \
+            "9 cell(s)",
+            "matched 0, diverged 0, nondeterministic 9, reference-missing 0, candidate-missing 0, \
              unavailable 0, inputs-not-equalized 0",
-            "measured 0; no golden 8 (determinism-mismatch 8); not compared 0; unmeasured 0",
+            "measured 0; no golden 9 (determinism-mismatch 9); not compared 0; unmeasured 0",
             "none measured with equal inputs; none measured with unequal inputs",
             "0 log-diff comparison(s), 0 guest runs",
         ] {
@@ -10978,9 +10992,10 @@ mod tests {
             })
             .count();
         // Every selected candidate is outside; every other one is a counted 0.
+        let candidates = ParityBackend::ALL.len();
         assert_eq!(
             (tally.not_sampled, tally.population, tally.zero),
-            (selected, 4 - selected, 4 - selected)
+            (selected, candidates - selected, candidates - selected)
         );
         assert!(
             report.summary_line().contains(&format!(
