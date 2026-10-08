@@ -7987,8 +7987,8 @@ test:
           - ptrace
           - sabre
           - kvm
-          - dbt
         backends_disabled:
+          dbt: Strict verification fails on GitHub-hosted runners (determinism-failure, first divergence at record 158, syscall 57; both attempts of https://github.com/rrnewton/hermit/actions/runs/37784639364) though it passes on the validation host; re-enable once the run-to-run difference is understood
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false

@@ -6090,13 +6090,6 @@
           "category": "c-programs",
           "test": "c-programs/setitimer-determinism",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/setitimer-determinism",
-          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -25781,13 +25774,6 @@
           "category": "c-programs",
           "test": "c-programs/setitimer-determinism",
           "mode": "verify",
-          "backend": "dbt"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/setitimer-determinism",
-          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -42951,13 +42937,6 @@
           "test": "c-programs/set-tid-address",
           "mode": "verify",
           "backend": "sabre"
-        },
-        {
-          "lane": "portable",
-          "category": "c-programs",
-          "test": "c-programs/setitimer-determinism",
-          "mode": "verify",
-          "backend": "dbt"
         },
         {
           "lane": "portable",

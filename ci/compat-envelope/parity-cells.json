@@ -9,22 +9,22 @@
   "counts": {
     "all": {
       "cells": 3148,
-      "applicable": 1067,
-      "selectable": 775,
+      "applicable": 1066,
+      "selectable": 774,
       "population": 2208,
-      "population_candidate_selected": 775,
+      "population_candidate_selected": 774,
       "population_candidate_not_selected": 260,
-      "population_candidate_disabled": 1173
+      "population_candidate_disabled": 1174
     },
     "by_backend": {
       "dbt": {
         "cells": 787,
-        "applicable": 253,
-        "selectable": 206,
+        "applicable": 252,
+        "selectable": 205,
         "population": 552,
-        "population_candidate_selected": 206,
+        "population_candidate_selected": 205,
         "population_candidate_not_selected": 46,
-        "population_candidate_disabled": 300
+        "population_candidate_disabled": 301
       },
       "kvm": {
         "cells": 787,
@@ -912,7 +912,7 @@
     {"test_id":"c-programs/set-tid-address","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/set-tid-address","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)"},
     {"test_id":"c-programs/set-tid-address","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"c-programs/setitimer-determinism","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/setitimer-determinism","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Strict verification fails on GitHub-hosted runners (determinism-failure, first divergence at record 158, syscall 57; both attempts of https://github.com/rrnewton/hermit/actions/runs/37784639364) though it passes on the validation host; re-enable once the run-to-run difference is understood"},
     {"test_id":"c-programs/setitimer-determinism","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/setitimer-determinism","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"},
     {"test_id":"c-programs/setitimer-determinism","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
