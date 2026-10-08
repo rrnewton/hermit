@@ -15,6 +15,10 @@
 
 use std::path::Path;
 
+// Errors are printed without the C library's errno messages: strerror_r can
+// allocate through the guest's malloc (see describe_io_error).
+use reverie_inguest::guest::support::describe_io_error;
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-3635): Review the
 // in-guest Detcore constructor boundary.
@@ -69,13 +73,19 @@ static TOOL_OUTPUT_IDENTITY: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLo
 /// is still single-threaded and before any seccomp filter is active.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn detcore_liteinst_initialize() {
-    // Until Detcore is installed, this library's Rust allocations would come
-    // from the guest's own malloc (outside a Tool callback the runtime's
-    // allocator forwards there), so what this setup reads (environment values,
-    // the /proc/self/fd listing and its links) would stay in the guest's heap
-    // after it is freed, where the guest's own allocations find it. Allocate
-    // from the runtime's private Tool heap instead, as a Tool callback does.
-    let private_allocations = reverie_inguest::guest::alloc::enter_dispatch();
+    // Outside a Tool callback this library's Rust allocations would come from
+    // the guest's own malloc (the runtime's allocator forwards there), so what
+    // this constructor reads and builds (environment values, the
+    // /proc/self/fd listing and its links, the Tool installed below and the
+    // configuration it receives, the open file channel) would stay in the
+    // guest's heap, where the guest's own allocations find it before `main`.
+    // Its sizes follow host state (the configuration lists every mount the
+    // guest's namespace holds), so the guest's heap layout would differ
+    // between two runs of one program. Allocate everything from the runtime's
+    // private Tool heap instead, as a Tool callback does, until the
+    // constructor returns: the guest's heap is then exactly what the program
+    // itself made.
+    let _private_allocations = reverie_inguest::guest::alloc::enter_dispatch();
     let Some(socket) = std::env::var_os(reverie_liteinst::COORDINATOR_ENV) else {
         fail("the coordinator socket environment variable is missing");
     };
@@ -135,7 +145,7 @@ pub unsafe extern "C" fn detcore_liteinst_initialize() {
                     Ok(reserved)
                 }
                 Ok(_) => Err("the reserved copy is not the socket Hermit passed".to_owned()),
-                Err(error) => Err(error.to_string()),
+                Err(error) => Err(describe_io_error(&error)),
             }
         };
         restore_signals(&blocked);
@@ -167,15 +177,15 @@ pub unsafe extern "C" fn detcore_liteinst_initialize() {
              --backend=ptrace"
         )),
         Err(error) => fail(&format!(
-            "cannot list the descriptors this process started with: {error}"
+            "cannot list the descriptors this process started with: {}",
+            describe_io_error(&error)
         )),
     }
-    drop(private_allocations);
     // SAFETY: the loader runs constructors before any application thread
     // exists and before the application can install a seccomp filter, which is
     // the window `install_tool` requires.
     if let Err(error) = unsafe { reverie_liteinst::install_tool::<detcore::Detcore>(socket) } {
-        fail(&error.to_string());
+        fail(&describe_io_error(&error));
     }
     // `--backend=in-guest-trap`: the Tool's constructor recorded the host's
     // request from the coordinator's configuration; compare it with the
@@ -215,7 +225,8 @@ impl detcore::OpenFileControlTransport for CoordinatorOpenFiles {
         )
         .map_err(|error| {
             detcore::SharedOpenFileError(format!(
-                "the coordinator connection refused a shared open file message: {error}"
+                "the coordinator connection refused a shared open file message: {}",
+                describe_io_error(&error)
             ))
         })?;
         detcore::shared_open_file_reply(response)
@@ -239,20 +250,23 @@ fn forward_detlog(target: &str, record_suffix: &str, index: u64, message: std::f
 }
 
 /// Blocks every signal this thread can block; returns the mask it replaced.
-fn block_signals() -> libc::sigset_t {
-    // SAFETY: sigfillset and pthread_sigmask write only the given sets.
-    unsafe {
-        let mut all: libc::sigset_t = std::mem::zeroed();
-        let mut previous: libc::sigset_t = std::mem::zeroed();
-        libc::sigfillset(&mut all);
-        libc::pthread_sigmask(libc::SIG_BLOCK, &all, &mut previous);
-        previous
-    }
+/// The raw rt_sigprocmask, not libc's pthread_sigmask, which the program or a
+/// preloaded library may define.
+fn block_signals() -> u64 {
+    let all = u64::MAX;
+    let mut previous = 0_u64;
+    // SAFETY: the masks are valid for the call.
+    let _ = unsafe {
+        reverie_inguest::signal::raw_sigprocmask(libc::SIG_BLOCK, Some(&all), Some(&mut previous))
+    };
+    previous
 }
 
-fn restore_signals(previous: &libc::sigset_t) {
-    // SAFETY: pthread_sigmask reads only the given set.
-    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, previous, std::ptr::null_mut()) };
+fn restore_signals(previous: &u64) {
+    // SAFETY: the mask is valid for the call.
+    let _ = unsafe {
+        reverie_inguest::signal::raw_sigprocmask(libc::SIG_SETMASK, Some(previous), None)
+    };
 }
 
 /// Overwrites the bytes of `key`'s entry in the environment block with zeros.
@@ -286,6 +300,12 @@ unsafe fn scrub_env(key: &str) {
 
 fn fail(message: &str) -> ! {
     eprintln!("detcore-liteinst: initialization failed: {message}");
-    // SAFETY: `_exit` takes no pointers and does not return.
+    // libc's _exit, not a raw exit_group from this library: an exit_group
+    // issued from the runtime's own code bypasses the runtime's exit path, so
+    // the process's site statistics would never reach the coordinator, which
+    // then could not say which sites the refused image patched. The process
+    // ends here, so an interposed _exit can change only a heap that is about
+    // to disappear.
+    // SAFETY: _exit takes no pointers and does not return.
     unsafe { libc::_exit(127) }
 }
