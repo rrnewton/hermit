@@ -1167,6 +1167,54 @@ int main(int argc, char **argv) {
     }
 }
 
+/// A guest RDTSC runs, with Detcore's virtual value, under SaBRe: both one that
+/// is the guest's first intercepted event and one that follows its syscalls.
+///
+/// The loader's RDTSC entry points used to call the plugin's handler without
+/// the enter_plugin/exit_plugin bracket that syscalls get, so the syscalls the
+/// plugin made while handling the RDTSC came back into it as guest syscalls
+/// and waited on a lock it already held: every such guest hung, the first-event
+/// case on the tool's own construction. The guest prints the raw readings, so a
+/// bitwise strict verification also shows they are virtual: two native
+/// readings never repeat across runs.
+#[test]
+fn sabre_runs_a_guest_rdtsc_before_and_after_its_first_syscall() {
+    const GUEST: &str = r#"
+#include <stdio.h>
+#include <unistd.h>
+#include <x86intrin.h>
+
+int main(void) {
+  unsigned long long first = __rdtsc();
+  if (write(1, "start\n", 6) != 6) return 2;
+  unsigned long long second = __rdtsc();
+  printf("%llx %llx\n", first, second);
+  return first != 0 && second > first ? 0 : 3;
+}
+"#;
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("sabre-rdtsc-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest directory");
+    let guest = compile_guest(dir.path(), "rdtsc", GUEST);
+    let guest = guest.to_str().unwrap();
+    let sabre = verify_run(Some(&loader), &[guest], "SaBRe guest that reads the TSC");
+    let stdout = String::from_utf8(sabre.output.stdout).unwrap();
+    let mut lines = stdout.lines();
+    assert_eq!(lines.next(), Some("start"), "{stdout}");
+    let readings = lines
+        .next()
+        .unwrap_or_else(|| panic!("no TSC readings: {stdout}"))
+        .split(' ')
+        .map(|reading| u64::from_str_radix(reading, 16).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(readings.len(), 2, "{stdout}");
+    assert!(readings[1] > readings[0], "{stdout}");
+}
+
 /// Compiles C `source` into `dir/name` and returns the executable's path.
 fn compile_guest(dir: &Path, name: &str, source: &str) -> PathBuf {
     let source_path = dir.join(format!("{name}.c"));
