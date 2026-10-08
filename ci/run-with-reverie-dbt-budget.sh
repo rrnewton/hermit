@@ -1190,7 +1190,15 @@ fi
 # re-entrant RDTSC refused); no file under reverie-dbt, the root Cargo.toml, third-party or rust-toolchain.toml
 # changes, so the four budget inputs are unchanged. Carry, not recalibration:
 # no new timing sample or >=5-sample replacement claim is made.
-expected_pin=23ca5355678059c7acd598d3a989af7143885947
+# CARRY TO fe6af9c87a72f8179c83cec29d9be4b94879e69b (2026-10-08): from
+# 23ca5355678059c7acd598d3a989af7143885947. The one commit changes experimental/reverie-sabre's vendored
+# SaBRe loader (a pre-plugin resource-limit read forwarded through the
+# bootstrap channel, a pre-plugin change refused, and a version 2 frame
+# descriptor); no file under reverie-dbt, the root Cargo.toml, third-party or
+# rust-toolchain.toml changes, so the four budget inputs are unchanged. Carry,
+# not recalibration: no new timing sample or >=5-sample replacement claim is
+# made.
+expected_pin=fe6af9c87a72f8179c83cec29d9be4b94879e69b
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

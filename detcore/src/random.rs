@@ -83,12 +83,65 @@ pub const MAX_INITIAL_STATE_BYTES: usize = 4096;
 
 /// Version 2 carries the AT_RANDOM bytes so that post-exec emits their record.
 /// Version 3 also carries the loader's getrandom fills, for the same reason.
-const INITIAL_STATE_VERSION: u32 = 3;
+/// Version 4 carries its resource-limit reads too, in one ordered list with the
+/// fills ([`EarlyRequest`]).
+const INITIAL_STATE_VERSION: u32 = 4;
 
 /// Most getrandom fills a loader may serve before post-exec. glibc's early
 /// initialization makes one (the malloc tcache key); the bound keeps the
 /// handoff within [`MAX_INITIAL_STATE_BYTES`].
 pub const MAX_EARLY_GETRANDOM: usize = 32;
+
+/// Most resource-limit reads a loader may serve before post-exec. glibc's
+/// startup makes one (RLIMIT_STACK, for the default thread stack size); the
+/// bound keeps the handoff within [`MAX_INITIAL_STATE_BYTES`].
+pub const MAX_EARLY_LIMIT_READS: usize = 4;
+
+/// The syscall that made an early resource-limit read. Their records differ,
+/// as when Detcore's own handlers serve them: `prlimit64` records the read,
+/// `getrlimit` records nothing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum LimitReadCall {
+    /// `prlimit64(pid, resource, NULL, old)`.
+    Prlimit64 {
+        /// The `pid` argument, as its record shows it.
+        pid: i32,
+    },
+    /// `getrlimit(resource, limit)`.
+    Getrlimit,
+}
+
+/// One request a loader served before post-exec. None emits a record when
+/// served, because Detcore's root thread does not exist yet: post-exec emits
+/// their records after the AT_RANDOM record, in the order they were served.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum EarlyRequest {
+    /// A getrandom fill ([`getrandom_unrecorded`]).
+    Getrandom(RandomFill),
+    /// A resource-limit read, answered from Detcore's initial limits
+    /// ([`crate::initial_resource_limit`]).
+    LimitRead {
+        /// The syscall that read the limit.
+        call: LimitReadCall,
+        /// The resource read.
+        resource: u32,
+        /// The soft limit returned.
+        current: u64,
+        /// The hard limit returned.
+        maximum: u64,
+    },
+}
+
+/// Whether `requests` is within the bounds a loader's handoff may carry.
+fn early_requests_within_bounds(requests: &[EarlyRequest]) -> bool {
+    let fills = requests
+        .iter()
+        .filter(|request| matches!(request, EarlyRequest::Getrandom(_)))
+        .count();
+    fills <= MAX_EARLY_GETRANDOM && requests.len() - fills <= MAX_EARLY_LIMIT_READS
+}
 
 /// One fill of guest memory from the stream: the bytes written and, in debug
 /// builds, the hash its record logs (zero in release builds, which log none).
@@ -149,10 +202,10 @@ pub enum LoaderState {
         /// no record; the thread's post-exec callback emits it from these
         /// bytes (`record_initial_auxv`), where every backend emits it.
         at_random_value: [u8; 16],
-        /// The loader's getrandom fills, in order ([`getrandom_unrecorded`]).
+        /// The loader's getrandom fills and resource-limit reads, in order.
         /// They emit no record either: post-exec emits theirs after the
-        /// AT_RANDOM record, as on a backend whose own handler serves them.
-        early_getrandom: Vec<RandomFill>,
+        /// AT_RANDOM record, as on a backend whose own handlers serve them.
+        early_requests: Vec<EarlyRequest>,
     },
     /// A later real kernel exec observed in this owned process lineage.
     ObservedExecContinuation,
@@ -181,18 +234,18 @@ fn configuration_identity(config: &crate::Config) -> Result<[u8; 32], Errno> {
 }
 
 /// Encode only the actual PRNG, the completed auxv identity, the bytes
-/// written there ([`write_initial_auxv`]) and the loader's getrandom fills
-/// ([`getrandom_unrecorded`]), whose records are still to be emitted. No clock,
+/// written there ([`write_initial_auxv`]) and the loader's early requests
+/// ([`EarlyRequest`]), whose records are still to be emitted. No clock,
 /// metadata, chaos RNG or scheduler state is transferred.
 pub fn encode_initial_state(
     config: &crate::Config,
     image: InitialImage,
     prng: &Pcg64Mcg,
     at_random_value: [u8; 16],
-    early_getrandom: &[RandomFill],
+    early_requests: &[EarlyRequest],
 ) -> Result<Vec<u8>, Errno> {
     image.validate()?;
-    if early_getrandom.len() > MAX_EARLY_GETRANDOM {
+    if !early_requests_within_bounds(early_requests) {
         return Err(Errno::EOVERFLOW);
     }
     let value = InitialRandomState {
@@ -202,7 +255,7 @@ pub fn encode_initial_state(
         state: LoaderState::InitialRandom {
             prng: prng.clone(),
             at_random_value,
-            early_getrandom: early_getrandom.to_vec(),
+            early_requests: early_requests.to_vec(),
         },
     };
     encode_state(value)
@@ -260,12 +313,12 @@ pub fn decode_loader_state(
 }
 
 /// The decoded initial random state: the stream, the AT_RANDOM bytes and the
-/// loader's getrandom fills whose records post-exec emits.
-pub(crate) type InitialRandom = (Pcg64Mcg, [u8; 16], Vec<RandomFill>);
+/// loader's early requests whose records post-exec emits.
+pub(crate) type InitialRandom = (Pcg64Mcg, [u8; 16], Vec<EarlyRequest>);
 
-/// The records post-exec emits for a loader's early random work: the AT_RANDOM
-/// bytes, then the getrandom fills in order.
-pub(crate) type EarlyRandomRecords = ([u8; 16], Vec<RandomFill>);
+/// The records post-exec emits for a loader's early work: the AT_RANDOM bytes,
+/// then the early requests in order.
+pub(crate) type EarlyRandomRecords = ([u8; 16], Vec<EarlyRequest>);
 
 pub(crate) fn decode_initial_state(
     bytes: &[u8],
@@ -276,9 +329,9 @@ pub(crate) fn decode_initial_state(
         LoaderState::InitialRandom {
             prng,
             at_random_value,
-            early_getrandom,
-        } if early_getrandom.len() <= MAX_EARLY_GETRANDOM => {
-            Ok((prng, at_random_value, early_getrandom))
+            early_requests,
+        } if early_requests_within_bounds(&early_requests) => {
+            Ok((prng, at_random_value, early_requests))
         }
         LoaderState::InitialRandom { .. } => Err(Errno::EPROTO),
         LoaderState::ObservedExecContinuation | LoaderState::InitialStaticLegacy => {
@@ -789,79 +842,100 @@ mod tests {
             "an empty getrandom has no record"
         );
         same_state(&empty, &stream);
-        let encoded = encode_initial_state(&config, image, &stream, written, &[fill]).unwrap();
-        let (decoded, decoded_value, decoded_fills) =
+        // An early stack-limit read, as glibc's startup makes, between two
+        // fills: the order survives the handoff.
+        let (stack_current, stack_maximum) =
+            crate::initial_resource_limit(libc::RLIMIT_STACK).unwrap();
+        let limit_read = EarlyRequest::LimitRead {
+            call: LimitReadCall::Prlimit64 { pid: 0 },
+            resource: libc::RLIMIT_STACK,
+            current: stack_current,
+            maximum: stack_maximum,
+        };
+        let requests = [
+            EarlyRequest::Getrandom(fill),
+            limit_read,
+            EarlyRequest::Getrandom(fill),
+        ];
+        let encoded = encode_initial_state(&config, image, &stream, written, &requests).unwrap();
+        let (decoded, decoded_value, decoded_requests) =
             decode_initial_state(&encoded, &config, image).unwrap();
         same_state(&decoded, &stream);
         assert_eq!(decoded_value, written);
-        assert_eq!(decoded_fills, [fill]);
-        // The bound on early fills keeps the largest handoff within its limit,
-        // and neither side accepts more.
-        let widest = RandomFill {
+        assert_eq!(decoded_requests, requests);
+        // The bounds keep the largest handoff within its limit, and neither
+        // side accepts more of either kind.
+        let widest_fill = EarlyRequest::Getrandom(RandomFill {
             written: usize::MAX,
             hash: u64::MAX,
+        });
+        let widest_read = EarlyRequest::LimitRead {
+            call: LimitReadCall::Prlimit64 { pid: i32::MIN },
+            resource: u32::MAX,
+            current: u64::MAX,
+            maximum: u64::MAX,
         };
-        let full = encode_initial_state(
-            &config,
-            image,
-            &stream,
-            written,
-            &[widest; MAX_EARLY_GETRANDOM],
-        )
-        .unwrap();
+        let widest: Vec<EarlyRequest> = std::iter::repeat_n(widest_fill, MAX_EARLY_GETRANDOM)
+            .chain(std::iter::repeat_n(widest_read, MAX_EARLY_LIMIT_READS))
+            .collect();
+        let full = encode_initial_state(&config, image, &stream, written, &widest).unwrap();
         assert_eq!(
             decode_initial_state(&full, &config, image).unwrap().2,
-            [widest; MAX_EARLY_GETRANDOM]
+            widest
         );
-        assert_eq!(
-            encode_initial_state(
-                &config,
+        for excess in [
+            vec![EarlyRequest::Getrandom(fill); MAX_EARLY_GETRANDOM + 1],
+            vec![limit_read; MAX_EARLY_LIMIT_READS + 1],
+        ] {
+            assert_eq!(
+                encode_initial_state(&config, image, &stream, written, &excess),
+                Err(Errno::EOVERFLOW)
+            );
+            let too_many = encode_state(InitialRandomState {
+                version: INITIAL_STATE_VERSION,
+                configuration: configuration_identity(&config).unwrap(),
                 image,
-                &stream,
-                written,
-                &[fill; MAX_EARLY_GETRANDOM + 1],
-            ),
-            Err(Errno::EOVERFLOW)
-        );
-        let too_many = encode_state(InitialRandomState {
-            version: INITIAL_STATE_VERSION,
-            configuration: configuration_identity(&config).unwrap(),
-            image,
-            state: LoaderState::InitialRandom {
-                prng: stream.clone(),
-                at_random_value: written,
-                early_getrandom: vec![fill; MAX_EARLY_GETRANDOM + 1],
-            },
-        })
-        .unwrap();
-        assert!(matches!(
-            decode_initial_state(&too_many, &config, image),
-            Err(Errno::EPROTO)
-        ));
+                state: LoaderState::InitialRandom {
+                    prng: stream.clone(),
+                    at_random_value: written,
+                    early_requests: excess,
+                },
+            })
+            .unwrap();
+            assert!(matches!(
+                decode_initial_state(&too_many, &config, image),
+                Err(Errno::EPROTO)
+            ));
+        }
         for bad in [
             Vec::new(),
             [encoded.as_slice(), b" "].concat(),
-            // Version 2 carried no getrandom fills and version 1 no AT_RANDOM
-            // bytes; neither they nor a later version is accepted.
+            // Version 3 carried only getrandom fills, version 2 none and version
+            // 1 no AT_RANDOM bytes; neither they nor a later version is
+            // accepted.
             String::from_utf8(encoded.clone())
                 .unwrap()
-                .replace("\"version\":3", "\"version\":1")
+                .replace("\"version\":4", "\"version\":1")
                 .into_bytes(),
             String::from_utf8(encoded.clone())
                 .unwrap()
-                .replace("\"version\":3", "\"version\":2")
+                .replace("\"version\":4", "\"version\":2")
                 .into_bytes(),
             String::from_utf8(encoded.clone())
                 .unwrap()
-                .replace("\"version\":3", "\"version\":4")
+                .replace("\"version\":4", "\"version\":3")
                 .into_bytes(),
-            // A version 2 body, without the fills, under the current version.
+            String::from_utf8(encoded.clone())
+                .unwrap()
+                .replace("\"version\":4", "\"version\":5")
+                .into_bytes(),
+            // A body without the early requests, under the current version.
             String::from_utf8(encoded.clone())
                 .unwrap()
                 .replace(
                     &format!(
-                        ",\"early_getrandom\":{}",
-                        serde_json::to_string(&[fill]).unwrap()
+                        ",\"early_requests\":{}",
+                        serde_json::to_string(&requests).unwrap()
                     ),
                     "",
                 )
@@ -986,13 +1060,13 @@ mod tests {
         // handle_post_exec sets this before consuming the completion fact.
         state.past_global_first_execve = true;
         // It returns the bytes the early write stored, for post-exec's record,
-        // not what the guest left there since, and the early fills, in order,
-        // for the records post-exec emits after it.
+        // not what the guest left there since, and the early requests, in
+        // order, for the records post-exec emits after it.
         assert_eq!(
             state
                 .complete_initial_random_auxv(Some(image.at_random))
                 .unwrap(),
-            Some((written, vec![fill]))
+            Some((written, requests.to_vec()))
         );
         assert_eq!(pages.bytes(0, 16), [0x7c; 16]);
         same_state(&state.prng, &stream);
