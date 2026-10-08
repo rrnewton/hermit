@@ -2149,6 +2149,9 @@ impl GlobalTool for GlobalState {
                 // POSIX deadlines before the replacement image can yield or run.
                 // Failed exec takes CancelExec and never reaches this point.
                 sched.blocked.timed_waiters.remove_posix_timers(detpid);
+                // The exec resets the process's exit signal to SIGCHLD and turns
+                // its existing children's notifications into SIGCHLD.
+                sched.record_successful_exec(detpid);
                 // Reloading backends consumed the preparation in their
                 // registration reconnect; state-preserving leaders consume it
                 // here after the terminal exec notification was authenticated.

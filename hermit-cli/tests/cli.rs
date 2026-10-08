@@ -120,6 +120,7 @@ static FORK_CHILD_GETRANDOM_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGSUSPEND_AFTER_WNOHANG_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGSUSPEND_SHARED_MASK_REWRITE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGSUSPEND_SHARED_STACK_MASK_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static CLONE_EXIT_SIGNAL_EFFECTIVE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "liteinst")]
 static LITEINST_IN_GUEST_WAIT_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
@@ -803,6 +804,32 @@ fn sigsuspend_shared_stack_mask_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "sigsuspend-shared-stack-mask guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn clone_exit_signal_effective_guest() -> &'static Path {
+    CLONE_EXIT_SIGNAL_EFFECTIVE_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("clone-exit-signal-effective");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the clone-exit-signal-effective guest directory");
+        let guest = build_root.join("clone_exit_signal_effective");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/clone_exit_signal_effective.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the clone-exit-signal-effective guest");
+        assert!(
+            output.status.success(),
+            "clone-exit-signal-effective guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -6546,6 +6573,45 @@ fn a_sigsuspend_mask_on_a_shared_stack_below_the_red_zone_is_copied_elsewhere() 
         "missing verification success marker:\n{}",
         stderr(&output)
     );
+}
+
+/// tests/c/clone_exit_signal_effective.c: a child's effective exit signal
+/// decides which waits reap it. A CLONE_VFORK child created with SIGUSR1 that
+/// execs, and a CLONE_PARENT | SIGUSR1 grandchild (which inherits its creator's
+/// SIGCHLD), are both reaped by a plain waitpid, and the parent gets SIGCHLD,
+/// as natively. Before, Detcore kept the clone's requested SIGUSR1, counted
+/// both as clone children, and the plain waitpid failed with ECHILD
+/// (https://github.com/rrnewton/hermit/issues/3895).
+#[test]
+fn a_childs_exit_signal_follows_its_exec_and_clone_parent() {
+    let _guard = hermit_run_guard();
+    let guest = clone_exit_signal_effective_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    for mode in ["exec", "clone-parent"] {
+        let args = [
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--max-timeslice=disabled",
+            "--",
+            guest,
+            mode,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            format!("{mode} sigusr1=0 sigchld_seen=1\n"),
+            "{mode}"
+        );
+        assert!(
+            stderr(&output).contains("Determinism verified"),
+            "missing verification success marker:\n{}",
+            stderr(&output)
+        );
+    }
 }
 
 #[test]

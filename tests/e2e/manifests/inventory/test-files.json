@@ -163,6 +163,12 @@
       "why": "tests/c/clone.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/clone_exit_signal_effective.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/clone_exit_signal_effective.c is owned by hermit-cli/tests/cli.rs: A CLONE_VFORK child created with SIGUSR1 that execs, and a CLONE_PARENT | SIGUSR1 grandchild, must be reaped by a plain waitpid and notify with SIGCHLD, because exec resets and CLONE_PARENT inherits the exit signal (https://github.com/rrnewton/hermit/issues/3895); the integration test runs both modes under run --strict --verify --verify-strict with the timeslice disabled. It remains a fixture because the generic manifest cannot run one guest in two modes with different expected outputs."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/close_range_fds.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
