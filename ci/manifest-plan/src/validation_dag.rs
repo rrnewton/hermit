@@ -1203,9 +1203,17 @@ pub(crate) fn refresh_pinned_root_environment(tag: &str, command: &str) -> Resul
     Ok(format!("{refreshed} -- bash -c {payload}"))
 }
 
+/// The fetch node. Its memory cap, 1.75 GiB, is sized for a COLD Cargo home,
+/// not the warm shared one ordinary runs reuse (where the fetch takes 16-18 s).
+/// Measured 2026-10-08 at hermit 8d464d3b, `run-split-validate.sh --fetch-only`
+/// with no seed and no cap: peaks of 1,133,400,064 and 1,142,509,568 bytes
+/// (most of it page cache from writing a ~958 MB Cargo home), 20-22 s. The
+/// earlier 1 GiB cap OOM-killed every cold fetch, which is every
+/// `--frozen-validate` run (https://github.com/rrnewton/dev-hermit/issues/549).
+/// 1.5x the higher peak is 1,713,764,352 bytes, rounded up to 7 x 256 MiB.
 fn pinned_root_fetch() -> Result<Step, String> {
     let text = format!(
-        r#"{{"description":"Pinned-root fetch node","steps":[{{"group":"setup","job":"pinned_root_fetch","desc":"Fetch locked Cargo inputs","description":"Fetch locked Cargo inputs before network-disabled pinned-root commands.","cmd":{},"deps":[],"env":{{"VALIDATE_VERBOSITY":"1"}},"labels":[],"result_manifests":[],"timeout":600,"cpu_timeout":600,"hint":{{"rss_baseline_bytes":1073741824,"hard_mem_max_bytes":1073741824}},"fail_fast_family":"setup.pinned_root_fetch"}}]}}"#,
+        r#"{{"description":"Pinned-root fetch node","steps":[{{"group":"setup","job":"pinned_root_fetch","desc":"Fetch locked Cargo inputs","description":"Fetch locked Cargo inputs before network-disabled pinned-root commands.","cmd":{},"deps":[],"env":{{"VALIDATE_VERBOSITY":"1"}},"labels":[],"result_manifests":[],"timeout":600,"cpu_timeout":600,"hint":{{"rss_baseline_bytes":1879048192,"hard_mem_max_bytes":1879048192}},"fail_fast_family":"setup.pinned_root_fetch"}}]}}"#,
         serde_json::to_string(PINNED_ROOT_FETCH_COMMAND).expect("constant is serializable")
     );
     let mut step = dag_from_json(&text)

@@ -55885,8 +55885,8 @@
       "hint": {
         "resources": {},
         "est_duration_s": 0.0,
-        "rss_baseline_bytes": 1073741824,
-        "hard_mem_max_bytes": 1073741824,
+        "rss_baseline_bytes": 1879048192,
+        "hard_mem_max_bytes": 1879048192,
         "classification": "light",
         "preferred_inner_jobs": null,
         "measured_effective_cores": null,
