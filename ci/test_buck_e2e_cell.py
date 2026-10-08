@@ -19,7 +19,10 @@ ran remotely (fetched with testx) and from one that ran locally (read from buck-
 
 ContainerChoiceTest evaluates defs.bzl's hermit_e2e_cells over the real
 ci/expected-e2e-plan.json with stand-ins for the Buck builtins and checks which cells
-get the pinned-root container in hybrid and local routing.
+get the pinned-root container in hybrid and local routing. ParityRouteTest and
+InGuestRouteTest evaluate the same plan for each candidate backend's route: every
+liteinst and in-guest-trap cell runs locally, and each parity candidate shares its
+ptrace reference's route.
 """
 
 from __future__ import annotations
@@ -736,10 +739,13 @@ class ContainerChoiceTest(unittest.TestCase):
         self.assertFalse(dbt & chosen)
         self.assertTrue(any(targets[name]["route"] == "re" for name in dbt))
         # The test's KVM verify cell (enabled 2026-10-08) also runs locally, so it gets the
-        # same pinned-root /test workdir its guest asserts.
+        # same pinned-root /test workdir its guest asserts, and so do its in-guest LiteInst
+        # verify cells (liteinst and in-guest-trap, enabled the same day).
         self.assertEqual(chosen, privileged | {"c-programs-environment-and-workdir-custom-ptrace",
                                                "c-programs-environment-and-workdir-verify-ptrace",
-                                               "c-programs-environment-and-workdir-verify-kvm"})
+                                               "c-programs-environment-and-workdir-verify-kvm",
+                                               "c-programs-environment-and-workdir-verify-liteinst",
+                                               "c-programs-environment-and-workdir-verify-in-guest-trap"})
 
     def test_local(self) -> None:
         chosen = self.containerized(self.check("local"))
@@ -792,6 +798,48 @@ class ParityRouteTest(unittest.TestCase):
             for test in dbt:
                 if (test, "ptrace") in routes:
                     self.assertEqual(routes[(test, "dbt")], routes[(test, "ptrace")], (routing, test))
+
+    def test_every_in_guest_cells_ptrace_reference_shares_its_route(self) -> None:
+        # A liteinst or in-guest-trap verify cell always runs locally (InGuestRouteTest), so
+        # its ptrace reference must run there too, or parity never credits the pair.
+        for routing in self.CONFIGS:
+            routes = self.routes(routing)
+            for backend in IN_GUEST_BACKENDS:
+                tests = sorted(test for test, b in routes if b == backend)
+                self.assertGreater(len(tests), 250, (routing, backend))
+                for test in tests:
+                    if (test, "ptrace") in routes:
+                        self.assertEqual(routes[(test, "ptrace")], routes[(test, backend)],
+                                         (routing, backend, test))
+
+
+# The two backends that run the in-guest LiteInst runtime.
+IN_GUEST_BACKENDS = ("liteinst", "in-guest-trap")
+
+
+class InGuestRouteTest(unittest.TestCase):
+    """The in-guest LiteInst runtime (liteinst and in-guest-trap) arms CPUID faulting before
+    the guest's first instruction and refuses to start without it, and RE workers may lack
+    it: a validate of d60c6e78 sent 251 cells of each backend to RE, and every one that
+    landed on a worker without CPUID faulting failed (exit 125 for liteinst, refusal 122 for
+    in-guest-trap). Each such plan row names cpuid-faulting, so _route keeps it local."""
+
+    plan = json.loads(PLAN.read_text())["cells"]
+
+    def test_every_in_guest_plan_row_needs_cpuid_faulting(self) -> None:
+        rows = [c for c in self.plan if c["backend"] in IN_GUEST_BACKENDS]
+        self.assertGreater(len(rows), 500)
+        for row in rows:
+            self.assertIn("cpuid-faulting", row.get("requires_host_capabilities", []), row)
+
+    def test_every_in_guest_cell_runs_locally_under_every_config(self) -> None:
+        for routing in ParityRouteTest.CONFIGS:
+            targets = evaluate_cells(*routing)
+            for backend in IN_GUEST_BACKENDS:
+                cells = [t for t in targets.values() if t["args"][2] == backend]
+                self.assertGreater(len(cells), 250, (routing, backend))
+                remote = sorted(t["name"] for t in cells if t["route"] != "local")
+                self.assertEqual(remote, [], (routing, backend))
 
 
 if __name__ == "__main__":
