@@ -98,6 +98,10 @@ What makes that guarantee checkable is the per-call check in section 3, not
 any startup sample. Startup observations (section 4) are early warnings and the
 input to capture; they never certify that a policy is complete.
 
+This is the guarantee of option A. The owner is choosing between it and a
+cheaper option B with a weaker, stated guarantee; see "Owner decision:
+transport on hosts with inherited filters".
+
 ## Design
 
 ### 1. Admission at startup
@@ -258,6 +262,69 @@ Each refusal says what failed and what to run next. "No acknowledgement" and "an
 - **Recordings made before this change** have no policy field. They replay as today on mode-0 hosts and are refused on mode-2 hosts, unless the replay command line supplies a run config that acknowledges the filter.
 - **`run --verify`:** admission runs once in the parent, and both children receive the same resolved policy and transport.
 
+## Owner decision: transport on hosts with inherited filters
+
+Sections 1 to 8 describe option A, which revision 2 proposed. Option B is the cheaper alternative. Every
+default Docker container inherits a filter, so this choice sets the cost of
+running Hermit in a container at all.
+
+**Option A: entry-stop interception on every filtered host** (section 3).
+Every guest call costs three ptrace stops instead of one, about 2.9× per
+traced call as measured. In exchange, the guest observes exactly the declared
+policy or the run stops on the first call where the host disagrees, and
+accounting is identical inside and outside the container.
+
+**Option B: normal transport, a startup probe, per-call checks only in
+paranoid mode.** Guest calls cost one stop, as today. Admission still refuses
+an unacknowledged filter, and the startup probe still compares observations.
+The per-call check runs only under `--seccomp-paranoid`. What B gives up,
+stated without softening:
+
+1. **A declared rule stronger than the host is not enforced on calls the host
+   blocks.** If the host returns ERRNO for a call, Hermit's TRACE stop never
+   arrives (point 5), so Detcore never sees the call. A declared KILL or TRAP
+   for it cannot apply; the guest gets the host's errno. Under B, admission
+   must therefore require the declared action to **equal** the observed host
+   action at every observed number, not merely be stronger, and must refuse
+   any declared rule it cannot enforce.
+2. **Accounting differs inside and outside the container for host-blocked
+   calls.** Outside, Detcore sees such a call: it is counted, charged virtual
+   time, logged in DETLOG, can anchor a happens-before edge, and is recorded.
+   Inside, none of that happens. The guest-visible result can match (Detcore
+   applies the same declared errno outside), but INFO logs, syscall counts and
+   virtual-time trajectories differ, so `--verify` comparisons and replay
+   across the two hosts are not expected to match whenever the guest makes
+   such a call. Within one host, runs are still deterministic: the host filter
+   is a fixed function of the call.
+3. **Drift is detected only at the sampled points.** The startup probe compares
+   observations at the probed numbers and argument vectors. A host change that
+   affects only non-zero arguments, unprobed numbers or a different
+   instruction pointer goes unnoticed, and the guest silently observes the new
+   host behavior. Under A, the per-call check would catch it on first use.
+4. **Argument-conditional host rules stay invisible** unless the operator
+   declares them. Under A, a mismatch stops the run; under B, the guest
+   observes whatever the host does.
+5. **What B keeps:** refusal of unacknowledged filters, the observation record
+   in the run config, drift detection at sampled points, guest-visible seccomp
+   metadata from the policy, record/replay admission, and exact per-call
+   checking whenever `--seccomp-paranoid` is given, for example when a run's
+   reproduction inside and outside a container is in question.
+
+| | Option A: entry-stop always | Option B: normal transport + probe |
+| --- | --- | --- |
+| cost per traced guest call on a filtered host | 3 stops, about 2.9× | 1 stop, as today |
+| startup cost on a filtered host | about 6 ms probe (when observations are recorded) | the same |
+| declared rule stronger than the host | enforced | refused at admission; must equal the host where observed |
+| host blocks a call the policy allows | run stops on that call | guest silently gets the host result, unless paranoid |
+| accounting inside versus outside a container | identical | differs for host-blocked calls |
+| drift on unsampled arguments or numbers | caught on first use | not detected, unless paranoid |
+| exact per-call check | always | only with `--seccomp-paranoid` |
+
+A third shape is possible later: B by default, plus a run-config key
+(`seccomp.transport: entry-stop`) that turns on A for runs whose reproduction
+across hosts matters. That is B with the paranoid check as a recorded,
+per-run choice rather than a debug flag.
+
 ## Acceptance matrix
 
 Every phase lands with the rows that apply to it. Each row asserts both the result and that no probed call executed where that is the point.
@@ -308,7 +375,7 @@ Every phase lands with the rows that apply to it. Each row asserts both the resu
 1. **Detecting a USER_NOTIF host before probing.** No unprivileged signal is known to expose it. Revision 2's answer is layered: probing only with consent, the canaries and the fake-success abort (section 4, step 5), deadlines, and the per-call runtime check as the guarantee. Is that enough, or should mode-2 hosts without an imported profile refuse capture altogether?
 2. **Probe argument vectors.** A second vector (for example all bits set) costs about 6 ms and catches more argument-conditional rules. Since the runtime check now catches the rest, a single zero vector may be enough.
 3. **Run config schema version.** `hermit-run-config/v2` when `seccomp:` is accepted, or stay at v1, because the key only moves from refused to accepted. A v1 reader refuses the key, so either way an older Hermit fails safe on a newer file.
-4. **Cost.** Entry-stop interception costs about 2.9× per traced call on mode-2 hosts. Is that acceptable as the price of the guarantee, or should a declared-and-profiled host be allowed to opt into normal transport with a weaker, labelled guarantee?
+4. **Transport on filtered hosts.** For the owner: option A, option B, or B with a per-run `entry-stop` key (see "Owner decision: transport on hosts with inherited filters").
 
 ## Review response (revision 1 review, requested changes at a4327d92)
 
