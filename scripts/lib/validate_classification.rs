@@ -1485,21 +1485,34 @@ mod timeout_tests {
                 pending.deps = vec!["classification.cutoff".into()];
                 steps.extend([make_step("cutoff", "sleep 10", 10), pending]);
             } else {
-                // The runner correctly refuses an individual node whose own
-                // bound cannot fit the remaining run budget. Exercise an active
-                // whole-run cutoff using three individually bounded steps whose
-                // sequential total exceeds that allowance instead.
+                // The runner refuses a lane in which any node's own bound is
+                // not below the remaining run budget, so an active whole-run
+                // cutoff needs a chain of individually bounded steps whose
+                // sequential total exceeds the budget. Each step sleeps 1 s
+                // under its own 4 s bound: 3 s of slack, so only the whole-run
+                // deadline can stop the chain. (Three 1.5 s sleeps under 2 s
+                // bounds left 0.5 s; at a load average of 210 one took 2.358 s,
+                // hit its own bound, and the run completed without a cutoff.)
+                // Ten steps take 10 s against an 8 s budget, whose floor at
+                // dispatch stays above the 4 s bounds after 3 s of setup.
                 if prior_failure {
                     steps.push(make_step("prior_failure", "exit 1", 2));
                 }
-                let first = make_step("cutoff", "sleep 1.5", 2);
-                let mut second = make_step("cutoff_second", "sleep 1.5", 2);
-                second.deps = vec![first.tag()];
-                let mut third = make_step("cutoff_third", "sleep 1.5", 2);
-                third.deps = vec![second.tag()];
-                let mut pending = make_step("pending", "true", 2);
-                pending.deps = vec![third.tag()];
-                steps.extend([first, second, third, pending]);
+                let mut previous: Option<String> = None;
+                for index in 0..10 {
+                    let job = if index == 0 {
+                        "cutoff".to_string()
+                    } else {
+                        format!("cutoff_{index}")
+                    };
+                    let mut step = make_step(&job, "sleep 1", 4);
+                    step.deps = previous.iter().cloned().collect();
+                    previous = Some(step.tag());
+                    steps.push(step);
+                }
+                let mut pending = make_step("pending", "true", 4);
+                pending.deps = previous.into_iter().collect();
+                steps.push(pending);
             }
             let cfg = super::super::DagConfig {
                 steps,
@@ -1515,7 +1528,7 @@ mod timeout_tests {
             let allowance = if cold_log {
                 2_000_000_000
             } else {
-                5_000_000_000
+                8_000_000_000
             };
             let deadline = super::super::monotonic_now_ns().unwrap() + allowance;
             let result =
