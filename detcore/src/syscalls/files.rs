@@ -851,6 +851,20 @@ pub(crate) fn may_write_process_memory(flags: OFlag, descriptor: Option<(&Path, 
         })
 }
 
+/// What Detcore fills the buffer of an `fstat` it injects with while a seccomp
+/// filter the guest inherited may apply to its calls, so that a call the
+/// filter answered without running it shows ([`Detcore::inject_fstat`]).
+/// Linux zeroes a `struct stat` before it fills the fields in, and the
+/// padding at its end stays zero, so a `stat` it wrote never has every byte
+/// equal to this one.
+const UNWRITTEN_STAT_BYTE: u8 = 0xa5;
+
+/// The `stat` a call staged without [`UNWRITTEN_STAT_BYTE`] wrote, which is
+/// all that can be told of it ([`Detcore::inject_stat_into`]).
+fn as_written(copied: Option<libc::stat>) -> libc::stat {
+    copied.expect("only a prefilled stat buffer can show that the call left it unwritten")
+}
+
 /// Writes back the guest bytes that a pre-call lookup buffer (utimensat's, or
 /// the removal lookup's) covered.
 fn restore_lookup_buffer<M: MemoryAccess>(memory: &mut M, buffer: StatPtr, saved: &[u8]) {
@@ -1033,8 +1047,9 @@ enum ProcfsEntry {
     /// loss.
     Unnamed,
     /// A file Detcore could not tell from a procfs file, as it could not read
-    /// the guest's mount table or the file's filesystem type. It recorded a
-    /// determinism loss.
+    /// the guest's mount table or the file's filesystem type, or did not try,
+    /// as a seccomp filter the guest inherited may apply to its calls. It
+    /// recorded a determinism loss.
     Unknown,
 }
 
@@ -1408,6 +1423,17 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// guest, so the same fstat is repeated with its buffer in a transient
     /// private page that is unmapped before the guest resumes
     /// (<https://github.com/rrnewton/hermit/issues/3328>).
+    ///
+    /// A seccomp filter the guest inherited (`Config::inherited_seccomp`) can
+    /// make this fstat return 0 without running it, which leaves the buffer as
+    /// it was. While such a filter may apply ([`Self::naming_seccomp_mode`]),
+    /// the buffer is filled with [`UNWRITTEN_STAT_BYTE`] before the call, and
+    /// a call that reports success with every byte still as filled wrote
+    /// nothing. Detcore then records a determinism loss that names the filter
+    /// mode and returns a zeroed `stat`, which describes no file: no procfs
+    /// file has a zero block size, and the open path retires no inode for a
+    /// file with no links. It does not fail, as the guest's own call has
+    /// already run, and the open path would close the descriptor it returned.
     pub(crate) async fn inject_fstat<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1424,16 +1450,28 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .with_stat(Some(statptr)),
             )
         };
-        let copied = match Self::inject_stat_on_stack(guest, fstat).await {
+        let filter_mode = Self::naming_seccomp_mode(guest);
+        let prefill = filter_mode.is_some();
+        let copied = match Self::inject_stat_on_stack(guest, fstat, prefill).await {
             Err(Errno::EFAULT) => {
                 info!(
                     "Guest stack scratch cannot hold the fstat buffer for fd {}; \
                      using a transient page instead.",
                     raw_fd
                 );
-                Self::inject_stat_in_transient_page(guest, fstat).await?
+                Self::inject_stat_in_transient_page(guest, fstat, prefill).await?
             }
             result => result?,
+        };
+        let Some(copied) = copied else {
+            info!(
+                "A seccomp filter answered the fstat of fd {} without running it.",
+                raw_fd
+            );
+            let mode = filter_mode.expect("only a prefilled buffer can be left unwritten");
+            procfs_inode::preserving_errno(Self::record_unwritten_fstat_loss(guest, mode)).await;
+            // SAFETY: `libc::stat` is plain integers, for which zero is valid.
+            return Ok(unsafe { std::mem::zeroed() });
         };
         trace!("extra fstat returned inode {}", copied.st_ino);
         Ok(copied)
@@ -1481,7 +1519,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         // computed by subtraction.
         let scratch = 128 + std::mem::size_of::<libc::stat>();
         if usize::try_from(guest.regs().await.rsp).map_or(true, |rsp| rsp <= scratch) {
-            return Self::inject_stat_in_transient_page(guest, lstatat).await;
+            return Self::inject_stat_in_transient_page(guest, lstatat, false)
+                .await
+                .map(as_written);
         }
         let mut stack = guest.stack().await;
         let statptr: StatPtr = StatPtr(stack.reserve());
@@ -1495,17 +1535,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .is_ok();
         if !staged_on_stack {
             drop(stack);
-            return Self::inject_stat_in_transient_page(guest, lstatat).await;
+            return Self::inject_stat_in_transient_page(guest, lstatat, false)
+                .await
+                .map(as_written);
         }
         let guard = match stack.commit() {
             Ok(guard) => guard,
             Err(_) => {
                 restore_lookup_buffer(&mut guest.memory(), statptr, &saved);
-                return Self::inject_stat_in_transient_page(guest, lstatat).await;
+                return Self::inject_stat_in_transient_page(guest, lstatat, false)
+                    .await
+                    .map(as_written);
             }
         };
         restore_lookup_buffer(&mut guest.memory(), statptr, &saved);
-        let looked_up = Self::inject_stat_into(guest, lstatat(statptr), statptr).await;
+        let looked_up = Self::inject_stat_into(guest, lstatat(statptr), statptr, false)
+            .await
+            .map(as_written);
         restore_lookup_buffer(&mut guest.memory(), statptr, &saved);
         drop(guard);
         looked_up
@@ -1516,7 +1562,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     async fn inject_stat_on_stack<G: Guest<Self>>(
         guest: &mut G,
         stat_call: impl Fn(StatPtr<'_>) -> Syscall,
-    ) -> Result<libc::stat, Errno> {
+        prefill: bool,
+    ) -> Result<Option<libc::stat>, Errno> {
         let mut stack = guest.stack().await;
         let statptr: StatPtr = StatPtr(stack.reserve());
         // Keep the guard until the buffer is no longer used. Backends whose
@@ -1524,7 +1571,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // drops, so dropping it before the injected fstat would let the kernel
         // write into freed memory.
         let _stack_guard = stack.commit()?;
-        let copied = Self::inject_stat_into(guest, stat_call(statptr), statptr).await?;
+        let copied = Self::inject_stat_into(guest, stat_call(statptr), statptr, prefill).await?;
         // clear stack memory used for fstat allocation
         guest
             .memory()
@@ -1540,7 +1587,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     async fn inject_stat_in_transient_page<G: Guest<Self>>(
         guest: &mut G,
         stat_call: impl Fn(StatPtr<'_>) -> Syscall,
-    ) -> Result<libc::stat, Errno> {
+        prefill: bool,
+    ) -> Result<Option<libc::stat>, Errno> {
         let len = std::mem::size_of::<libc::stat>();
         let mapped = guest
             .inject_with_retry(Syscall::Mmap(
@@ -1557,7 +1605,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             .ok()
             .and_then(AddrMut::<libc::stat>::from_raw)
             .unwrap_or_else(|| panic!("transient fstat page mmap returned {mapped}"));
-        let copied = Self::inject_stat_into(guest, stat_call(StatPtr(page)), StatPtr(page)).await;
+        let copied =
+            Self::inject_stat_into(guest, stat_call(StatPtr(page)), StatPtr(page), prefill).await;
         if let Err(errno) = guest
             .inject_with_retry(Syscall::Munmap(
                 syscalls::Munmap::new()
@@ -1578,16 +1627,34 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Inject `stat_call`, which writes a `struct stat` at `statptr`, and read
-    /// back what the kernel wrote.
+    /// back what the kernel wrote. With `prefill`, the buffer is first filled
+    /// with [`UNWRITTEN_STAT_BYTE`], and `None` is a call that reported
+    /// success yet left every byte as filled, so wrote nothing (see
+    /// [`Self::inject_fstat`]). A fill that faults is `EFAULT`, as the call's
+    /// own write would be.
     async fn inject_stat_into<G: Guest<Self>>(
         guest: &mut G,
         stat_call: Syscall,
         statptr: StatPtr<'_>,
-    ) -> Result<libc::stat, Errno> {
+        prefill: bool,
+    ) -> Result<Option<libc::stat>, Errno> {
+        const LEN: usize = std::mem::size_of::<libc::stat>();
+        if prefill {
+            guest
+                .memory()
+                .write_exact(statptr.0.cast(), &[UNWRITTEN_STAT_BYTE; LEN])?;
+        }
         // NOTE: Must retry the injection here. This could get interrupted and
         // we don't want to rerun the entire syscall handler twice.
         guest.inject_with_retry(stat_call).await?;
-        statptr.read(&guest.memory())
+        if prefill {
+            let mut written = [0u8; LEN];
+            guest.memory().read_exact(statptr.0.cast(), &mut written)?;
+            if written.iter().all(|&byte| byte == UNWRITTEN_STAT_BYTE) {
+                return Ok(None);
+            }
+        }
+        statptr.read(&guest.memory()).map(Some)
     }
 
     // helper function to track a new file descriptor.
@@ -2617,20 +2684,46 @@ impl<T: RecordOrReplay> Detcore<T> {
                         deterministic_stdio_inode_for_resource(target_fd, detfd.resource()),
                     )
                 })?;
+            // No `fstat` is injected while a seccomp filter the guest
+            // inherited may apply to its calls, as in `directory_inodes`.
             let stat = match cached_stat {
-                Some(stat) => stat,
-                None => DetStat::from(self.inject_fstat(guest, target_fd).await?),
+                Some(stat) => Ok(stat),
+                None => match Self::naming_seccomp_mode(guest) {
+                    Some(mode) => Err(mode),
+                    None => Ok(DetStat::from(self.inject_fstat(guest, target_fd).await?)),
+                },
             };
             // Keyed as `fstat` keys the descriptor, so the two numbers agree.
-            let virtual_inode = match inode_override {
-                Some(inode) => inode,
-                None => {
+            let virtual_inode = match (inode_override, stat) {
+                (Some(inode), _) => inode,
+                (None, Ok(stat)) => {
                     let procfs =
                         Self::procfs_entry(guest, &stat, StatTarget::Descriptor(target_fd)).await;
                     determinize_inode_observing_mtime(
                         guest,
                         stat.raw_inode(),
                         procfs.name(stat.dev),
+                        ObservedMtime::Unobserved,
+                        InodeSighting::Descriptor,
+                    )
+                    .await
+                    .0
+                }
+                // Keyed instead on the host inode number fdinfo itself
+                // reports, on `procfs_inode::UNKNOWN_DEVICE`, with a
+                // determinism loss: the number can differ from the one
+                // `fstat` reports for the descriptor.
+                (None, Err(mode)) => {
+                    procfs_inode::preserving_errno(Self::record_inherited_seccomp_loss(
+                        guest, mode,
+                    ))
+                    .await;
+                    let host_inode =
+                        detcore_model::procfs::parse_fdinfo_inode(&contents).unwrap_or(0);
+                    determinize_inode_observing_mtime(
+                        guest,
+                        detcore_model::fd::RawInode::new(procfs_inode::UNKNOWN_DEVICE, host_inode),
+                        None,
                         ObservedMtime::Unobserved,
                         InodeSighting::Descriptor,
                     )
@@ -4240,11 +4333,16 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// `/proc/<tid>` to read.
     ///
     /// Nor when a seccomp filter the guest inherited may apply to its calls
-    /// (`Config::inherited_seccomp`): naming a path injects an `openat` and a
-    /// `close` into the guest, which such a filter can answer without running,
-    /// with a descriptor the guest already holds, or hold until a listener
-    /// replies. Detcore refuses before it injects anything, and records a
-    /// determinism loss that names the filter mode.
+    /// (`Config::inherited_seccomp`) and the file may be a procfs one: naming
+    /// a path injects an `openat` and a `close` into the guest, which such a
+    /// filter can answer without running, with a descriptor the guest already
+    /// holds, or hold until a listener replies. So Detcore refuses before it
+    /// injects anything, and records a determinism loss that names the filter
+    /// mode. Whether the file may be a procfs one is read from `stat` alone,
+    /// which injects nothing, so a file that cannot be costs nothing under a
+    /// filter. A `stat` from Detcore's own fstat is one the filter did not
+    /// answer unseen ([`Self::inject_fstat`]); one from the guest's own call
+    /// holds what that call left, which Detcore only reads.
     ///
     /// The guest's `errno` is what it was: under SaBRe, Detcore shares libc,
     /// and so `errno`, with the guest thread it handles (see
@@ -4257,29 +4355,46 @@ impl<T: RecordOrReplay> Detcore<T> {
         procfs_inode::preserving_errno(Self::name_procfs_entry(guest, stat, target)).await
     }
 
+    /// Whether Detcore names procfs entries for `guest` at all: not under
+    /// record and replay, nor when its thread IDs do not name host tasks (see
+    /// [`Self::procfs_entry`]).
+    fn names_procfs_entries<G: Guest<Self>>(guest: &G) -> bool {
+        !guest.config().recordreplay_modes
+            && procfs_inode::guest_tids_name_host_tasks(
+                &guest.config().backend,
+                guest.thread_state().physical_tid,
+            )
+    }
+
+    /// The mode of a seccomp filter the guest inherited that may apply to its
+    /// calls (`Config::inherited_seccomp`), when Detcore names procfs entries
+    /// for `guest`. Detcore then injects no call to learn how to number a
+    /// procfs file, as the filter can answer it without running it or hold it
+    /// until a listener replies (see [`Self::procfs_entry`]), and checks that
+    /// the fstat it injects ran ([`Self::inject_fstat`]).
+    fn naming_seccomp_mode<G: Guest<Self>>(guest: &G) -> Option<String> {
+        if Self::names_procfs_entries(guest) {
+            guest.config().inherited_seccomp.filter_mode()
+        } else {
+            None
+        }
+    }
+
     /// [`Self::procfs_entry`], which restores the guest's `errno` afterwards.
     async fn name_procfs_entry<G: Guest<Self>>(
         guest: &mut G,
         stat: &DetStat,
         target: StatTarget<'_>,
     ) -> ProcfsEntry {
-        if guest.config().recordreplay_modes
-            || !procfs_inode::guest_tids_name_host_tasks(
-                &guest.config().backend,
-                guest.thread_state().physical_tid,
-            )
-            || !procfs_inode::may_be_procfs(stat.dev, stat.blksize)
-        {
+        if !Self::names_procfs_entries(guest) {
             return ProcfsEntry::NotProcfs;
         }
+        if !procfs_inode::may_be_procfs(stat.dev, stat.blksize) {
+            return ProcfsEntry::NotProcfs;
+        }
+        // Before anything is injected to name the entry.
         if let Some(mode) = guest.config().inherited_seccomp.filter_mode() {
-            Self::record_procfs_loss(
-                guest,
-                format!(
-                    "a seccomp filter the guest inherited may apply to its calls (mode: {mode})"
-                ),
-            )
-            .await;
+            Self::record_inherited_seccomp_loss(guest, mode).await;
             return ProcfsEntry::Unknown;
         }
         let mounts = match procfs_inode::procfs_mounts(guest.tid().as_raw(), stat.dev) {
@@ -4472,6 +4587,35 @@ impl<T: RecordOrReplay> Detcore<T> {
         static RECORDED: AtomicBool = AtomicBool::new(false);
         if !RECORDED.swap(true, Ordering::Relaxed) {
             report_determinism_loss(guest, format!("procfs inode numbers: {reason}")).await;
+        }
+    }
+
+    /// Records the determinism loss of the procfs entries Detcore does not
+    /// name as a seccomp filter the guest inherited, in mode `mode`, may apply
+    /// to its calls ([`Self::naming_seccomp_mode`]).
+    async fn record_inherited_seccomp_loss<G: Guest<Self>>(guest: &mut G, mode: String) {
+        Self::record_procfs_loss(
+            guest,
+            format!("a seccomp filter the guest inherited may apply to its calls (mode: {mode})"),
+        )
+        .await;
+    }
+
+    /// Records, once per process, the determinism loss of a file whose
+    /// metadata Detcore does not know, as a seccomp filter the guest
+    /// inherited, in mode `mode`, answered the fstat Detcore injected to learn
+    /// it without running it ([`Self::inject_fstat`]).
+    async fn record_unwritten_fstat_loss<G: Guest<Self>>(guest: &mut G, mode: String) {
+        static RECORDED: AtomicBool = AtomicBool::new(false);
+        if !RECORDED.swap(true, Ordering::Relaxed) {
+            report_determinism_loss(
+                guest,
+                format!(
+                    "file metadata: a seccomp filter the guest inherited answered an fstat \
+                     Detcore injected without running it (mode: {mode})"
+                ),
+            )
+            .await;
         }
     }
 
@@ -6738,6 +6882,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// a procfs directory's entries also name their paths beneath its
     /// canonical path (see [`procfs_inode`]). The directory's stat is the
     /// cached one when Detcore tracks `fd`, and an injected `fstat` otherwise.
+    ///
+    /// No `fstat` is injected while a seccomp filter the guest inherited may
+    /// apply to its calls ([`Self::naming_seccomp_mode`]): Detcore records a
+    /// determinism loss, and keys the entries on
+    /// [`procfs_inode::UNKNOWN_DEVICE`], so that their numbers can differ from
+    /// those `stat` reports for the same files.
     async fn directory_inodes<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -6750,7 +6900,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             .flatten();
         let stat = match cached {
             Some(stat) => stat,
-            None => DetStat::from(self.inject_fstat(guest, fd).await?),
+            None => {
+                if let Some(mode) = Self::naming_seccomp_mode(guest) {
+                    procfs_inode::preserving_errno(Self::record_inherited_seccomp_loss(
+                        guest, mode,
+                    ))
+                    .await;
+                    return Ok(DirectoryInodes::new(procfs_inode::UNKNOWN_DEVICE, None));
+                }
+                DetStat::from(self.inject_fstat(guest, fd).await?)
+            }
         };
         let procfs = match Self::procfs_entry(guest, &stat, StatTarget::Descriptor(fd)).await {
             ProcfsEntry::At(within) => Some(ProcfsDirectory::new(within)),

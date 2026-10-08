@@ -1338,10 +1338,13 @@ fn chroot_mountinfo_subset_keeps_fdinfo_identity_consistent() {
     // explicitly. Unlike `hermit run`, the library API does not downgrade the
     // default timeslice when perf_event_open is unavailable, so leaving the
     // default would make this test depend on the host having a usable PMU.
+    // The guest inherits this thread's seccomp filters, and the command has no
+    // `pre_exec` callback; the library does not measure them for its caller.
     let config = hermit::DetConfig {
         mountinfo_mount_ids: captured_mount_ids,
         mountinfo_mount_ids_captured: true,
         max_timeslice: None,
+        inherited_seccomp: detcore::InheritedSeccomp::measure(),
         ..Default::default()
     };
     let mut command = ReverieCommand::new(&controller_program);
@@ -1411,6 +1414,178 @@ fn chroot_mountinfo_subset_keeps_fdinfo_identity_consistent() {
     assert!(
         !mountinfo.contains(root.path().to_str().expect("UTF-8 chroot path")),
         "chroot mountinfo leaked the host-side chroot path:\n{mountinfo}"
+    );
+}
+
+/// The first of the usual paths of `stat(1)` that exists.
+fn stat_binary() -> &'static str {
+    ["/usr/bin/stat", "/bin/stat"]
+        .into_iter()
+        .find(|path| Path::new(path).exists())
+        .expect("find stat(1)")
+}
+
+/// A BPF statement: `code`, with operand `k`.
+fn bpf_statement(code: u32, k: u32) -> libc::sock_filter {
+    libc::sock_filter {
+        code: code as u16,
+        jt: 0,
+        jf: 0,
+        k,
+    }
+}
+
+/// A BPF jump past `jt` statements when the accumulator equals `value`, and
+/// past `jf` otherwise.
+#[cfg(target_arch = "x86_64")]
+fn bpf_jump_if(value: u32, jt: u8, jf: u8) -> libc::sock_filter {
+    libc::sock_filter {
+        code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+        jt,
+        jf,
+        k: value,
+    }
+}
+
+/// Install `program` as a seccomp filter of the calling thread, which the
+/// processes it starts inherit. It allocates nothing, so a `pre_exec`
+/// callback can call it.
+fn install_seccomp_filter(program: &mut [libc::sock_filter]) -> std::io::Result<()> {
+    let fprog = libc::sock_fprog {
+        len: program.len() as u16,
+        filter: program.as_mut_ptr(),
+    };
+    // SAFETY: seccomp(2) copies the live, borrowed program before returning.
+    unsafe {
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+            || libc::syscall(
+                libc::SYS_seccomp,
+                libc::SECCOMP_SET_MODE_FILTER,
+                0,
+                &fprog as *const libc::sock_fprog,
+            ) != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// `hermit run` measures the seccomp state its guest inherits from it. A
+/// filter that whatever started Hermit installed, here one that allows every
+/// call, may apply to the calls Detcore would inject to name a procfs entry,
+/// so Detcore names none and records a determinism loss that counts the
+/// filters, and `--verify` refuses to compare the runs.
+#[test]
+fn hermit_run_measures_the_seccomp_filters_its_guest_inherits() {
+    let _guard = hermit_run_lock();
+    // Hermit inherits this thread's filters and the one installed below.
+    let filters = match detcore::InheritedSeccomp::measure() {
+        detcore::InheritedSeccomp::Disabled => 1,
+        detcore::InheritedSeccomp::Filter(Some(filters)) => filters + 1,
+        other => panic!("cannot count this thread's seccomp filters: {other:?}"),
+    };
+    let expected = format!(
+        "determinism loss recorded: procfs inode numbers: a seccomp filter the guest inherited may apply to its calls (mode: filter, with {filters} {})",
+        if filters == 1 { "filter" } else { "filters" }
+    );
+
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command.args([
+        "--log=info",
+        "run",
+        "--verify",
+        "--base-env=minimal",
+        "--no-virtualize-cpuid",
+        "--max-timeslice=disabled",
+        "--",
+        stat_binary(),
+        "/proc/self/stat",
+    ]);
+    hermit_test::configure_guest_execution(&mut command);
+    command.stdin(Stdio::null());
+    // SAFETY: the callback allocates nothing, and only Hermit and its guest
+    // inherit the filter.
+    unsafe {
+        command.pre_exec(|| {
+            install_seccomp_filter(&mut [bpf_statement(
+                libc::BPF_RET | libc::BPF_K,
+                libc::SECCOMP_RET_ALLOW,
+            )])
+        });
+    }
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && stderr.contains(&expected),
+        "{rendered} should refuse with {expected:?}\nstatus: {}\nstdout:\n{}\nstderr:\n{stderr}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+    );
+}
+
+/// The library does not measure the seccomp state of a guest whose caller
+/// states none: a `pre_exec` callback of the guest's command runs in the
+/// guest and can install a filter its caller's thread does not have. Here
+/// one makes the `O_PATH` open that Detcore injects to name a path it must
+/// not follow return 0 without running, as if it had opened descriptor 0, so
+/// the close that follows would close the guest's descriptor 0. The state
+/// stays unknown, so Detcore names no procfs entry and records a determinism
+/// loss.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn a_library_guest_whose_seccomp_state_is_not_stated_names_no_procfs_entry() {
+    /// `AUDIT_ARCH_X86_64`, the `arch` of an x86_64 system call in seccomp
+    /// data.
+    const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+    const NAMING: u32 = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u32;
+    let _guard = hermit_run_lock();
+    let mut command = ReverieCommand::new(stat_binary());
+    command.arg("/proc/self/stat");
+    // SAFETY: the callback allocates nothing, and only the guest inherits the
+    // filter.
+    unsafe {
+        command.pre_exec(|| {
+            let load = |offset| bpf_statement(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, offset);
+            let ret = |action| bpf_statement(libc::BPF_RET | libc::BPF_K, action);
+            // seccomp_data: nr at 0, arch at 4, and the low half of args[2] at
+            // 32.
+            install_seccomp_filter(&mut [
+                load(4),
+                bpf_jump_if(AUDIT_ARCH_X86_64, 1, 0),
+                ret(libc::SECCOMP_RET_ALLOW),
+                load(0),
+                bpf_jump_if(libc::SYS_openat as u32, 0, 3),
+                load(32),
+                bpf_jump_if(NAMING, 0, 1),
+                ret(libc::SECCOMP_RET_ERRNO),
+                ret(libc::SECCOMP_RET_ALLOW),
+            ])
+            .map_err(|_| reverie::Errno::last())
+        });
+    }
+    // Unlike `hermit run`, the library does not downgrade the default PMU
+    // timeslice when perf_event_open is unavailable, so request none.
+    let config = hermit::DetConfig {
+        max_timeslice: None,
+        ..Default::default()
+    };
+    let output = hermit::run_with_output(command, config, false, &None).expect("run stat(1)");
+    assert_eq!(
+        output.status,
+        reverie::process::ExitStatus::Exited(0),
+        "stat(1) failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        detcore::detlog::determinism_loss().as_deref(),
+        Some(
+            "procfs inode numbers: a seccomp filter the guest inherited may apply to its calls (mode: unknown)"
+        )
     );
 }
 

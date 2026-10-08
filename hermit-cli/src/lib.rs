@@ -3335,16 +3335,17 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // host is asked only for them.
     config.guest_may_inherit_a_terminal =
         config.backend_supports_blocked_wait_signal_interruption && launcher_may_pass_a_terminal();
-    // The guest inherits the seccomp filters of the thread that starts it
-    // (`Config::inherited_seccomp`). That thread descends from this one, and
-    // Hermit installs no filter of its own, so it has exactly these. Only
-    // procfs naming reads them, which KVM and DBT never do, as their guest
-    // thread IDs are not host thread IDs, so the host is asked only for the
-    // other backends. DBT keeps the unknown its legacy form reads back.
-    config.inherited_seccomp = match backend {
-        Backend::Kvm | Backend::Dbt => detcore::InheritedSeccomp::Unknown,
-        _ => detcore::InheritedSeccomp::measure(),
-    };
+    // Only procfs naming reads `Config::inherited_seccomp`, which KVM and DBT
+    // never do, as their guest thread IDs are not host thread IDs. DBT keeps
+    // the unknown its legacy form reads back. On the other backends the value
+    // is the caller's: the guest inherits the seccomp filters of the thread
+    // that starts it, together with any that a `pre_exec` callback of its
+    // `Command` installs, and only the caller knows its callbacks. Not stated,
+    // it stays unknown, and naming records a determinism loss instead. `hermit
+    // run` measures it.
+    if matches!(backend, Backend::Kvm | Backend::Dbt) {
+        config.inherited_seccomp = detcore::InheritedSeccomp::Unknown;
+    }
     config
 }
 
@@ -5964,6 +5965,48 @@ mod tests {
                 serde_json::to_value(config.backend).unwrap(),
                 golden_backend_capabilities(backend),
                 "{backend:?}"
+            );
+        }
+    }
+
+    /// KVM and DBT never name procfs entries, so they get "unknown". Every
+    /// other backend keeps the state its caller states, which is "unknown"
+    /// when the caller states none.
+    #[test]
+    fn inherited_seccomp_is_the_callers_where_naming_reads_it() {
+        use detcore::InheritedSeccomp;
+        for backend in [
+            Backend::Ptrace,
+            Backend::Kvm,
+            Backend::E9patch,
+            Backend::Liteinst,
+            Backend::Sabre,
+            Backend::Dbt,
+        ] {
+            let names_entries = !matches!(backend, Backend::Kvm | Backend::Dbt);
+            for stated in [
+                InheritedSeccomp::Disabled,
+                InheritedSeccomp::Filter(Some(2)),
+            ] {
+                let config = super::DetConfig {
+                    inherited_seccomp: stated,
+                    ..Default::default()
+                };
+                let expected = if names_entries {
+                    stated
+                } else {
+                    InheritedSeccomp::Unknown
+                };
+                assert_eq!(
+                    prepare_backend_config(config, backend).inherited_seccomp,
+                    expected,
+                    "{backend:?} with {stated:?}"
+                );
+            }
+            assert_eq!(
+                prepare_backend_config(super::DetConfig::default(), backend).inherited_seccomp,
+                InheritedSeccomp::Unknown,
+                "{backend:?} with nothing stated"
             );
         }
     }
