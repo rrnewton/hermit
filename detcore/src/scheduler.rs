@@ -906,9 +906,17 @@ pub struct Scheduler {
     /// in that process is coalesced with it. It ends only when the scheduler
     /// observes the holder's dequeue at a fixed point of a pass
     /// (`end_timer_copies_taken_at_delivery_stop`,
-    /// `observe_timer_copy_dequeues`), or when the holder ends
-    /// (`end_timer_copies_of_departed_holder`).
+    /// `observe_timer_copy_dequeues`), or when the holder ends first: at the
+    /// grant of its own exit (`settle_timer_copies_at_exit`), at an exec of
+    /// its process (`settle_timer_copies_at_exec`), or wherever else it is
+    /// removed (`end_timer_copies_of_departed_holder`).
     outstanding_timer_copies: BTreeMap<(DetPid, i32), TimerCopy>,
+    /// Timer copies whose holder's thread exited before it took the signal
+    /// while its process lives on, in the order of those exits
+    /// (`settle_timer_copies_at_exit`). Each is sent to its process again at
+    /// the next pass, after the drain prefix and before any timer can fire
+    /// (`send_returned_timer_copies`).
+    returning_timer_copies: Vec<TimerCopyReturn>,
     #[cfg(test)]
     host_signal_attempts: u64,
     /// When set, a signal the scheduler would send to a guest thread is
@@ -1792,6 +1800,34 @@ struct TimerCopy {
     signal: Signal,
 }
 
+/// Why a timer's signal is being sent (`Scheduler::deliver_timer_signal`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimerSignalCause {
+    /// The timer expired.
+    Expiry,
+    /// A copy sent to `holder` alone goes back to its process, because the
+    /// holder's thread exited (`ending`) before it took the signal
+    /// (`Scheduler::send_returned_timer_copies`). The holder is never the
+    /// recipient.
+    Returned {
+        holder: DetTid,
+        ending: &'static str,
+    },
+}
+
+/// A timer's copy of a signal whose holder's thread exited before it took
+/// the signal while other threads of its process live on, queued to be sent
+/// to the process again (`Scheduler::returning_timer_copies`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TimerCopyReturn {
+    /// The process the copy was sent for.
+    process: DetPid,
+    /// The copy, as it was recorded.
+    copy: TimerCopy,
+    /// The event that ended the holder.
+    ending: &'static str,
+}
+
 /// The thread whose `rt_sigsuspend` entry the syscall layer should observe,
 /// with the operation the observation belongs to
 /// (`Scheduler::rt_sigsuspend_entry_probe`).
@@ -2316,6 +2352,7 @@ impl Scheduler {
             confirmed_rt_sigsuspend_sleeps: BTreeMap::new(),
             own_mask_background_calls: BTreeMap::new(),
             outstanding_timer_copies: BTreeMap::new(),
+            returning_timer_copies: Vec::new(),
             #[cfg(test)]
             host_signal_attempts: 0,
             #[cfg(test)]
@@ -2938,7 +2975,25 @@ impl Scheduler {
         retired
     }
 
+    /// Reconnect a successful exec (`reconnect_exec_body`), settling the
+    /// process's timer copies at that edge (`settle_timer_copies_at_exec`).
+    /// The records are taken before the old image's threads are retired, so
+    /// the ordinary removal (`end_timer_copies_of_departed_holder`) never sees
+    /// them, and settled after, before the replacement's first grant.
     fn reconnect_exec(
+        &mut self,
+        reconnect: ExecReconnect,
+        replay_resume: Option<(DetTid, Option<LogicalTime>)>,
+    ) -> Vec<DetTid> {
+        let (caller, new_leader, process) =
+            (reconnect.caller, reconnect.new_leader, reconnect.detpid);
+        let records = self.take_timer_copies_of_process(process);
+        let retired = self.reconnect_exec_body(reconnect, replay_resume);
+        self.settle_timer_copies_at_exec(caller, new_leader, records);
+        retired
+    }
+
+    fn reconnect_exec_body(
         &mut self,
         reconnect: ExecReconnect,
         replay_resume: Option<(DetTid, Option<LogicalTime>)>,
@@ -3915,10 +3970,12 @@ impl Scheduler {
     ) -> Result<(), SkipTurn> {
         self.step2_release_signaled_background()?;
         self.step2_drain_prefix()?;
+        self.send_returned_timer_copies();
         self.step2b_process_timed();
         // A timed signal that just armed a background thread is followed by an
         // empty pass, so the barrier above requeues it at the top of the next
-        // one whether or not its continuation is already posted.
+        // one whether or not its continuation is already posted. So is a
+        // returned timer copy that armed one.
         if self.backend_failed()
             || self.control_barrier()
             || !self.blocked.signaled_background.is_empty()
@@ -4212,9 +4269,29 @@ impl Scheduler {
     /// signal, read where the release barrier or `step2c` requeues it
     /// (`end_timer_copies_taken_at_delivery_stop`) or, outside every blocking
     /// pool, right after the barrier (`observe_timer_copy_dequeues`), which
-    /// also ends it once the signal is off the holder's private queue. A
-    /// holder that ends first takes its record with it
-    /// (`end_timer_copies_of_departed_holder`). These holder states reach this
+    /// also ends it once the signal is off the holder's private queue.
+    ///
+    /// A holder that ends before it takes the signal settles the record as
+    /// Linux settles the process's pending signal that the copy stands for:
+    /// * Its own thread exits while its process lives on: Linux keeps the
+    ///   signal pending on the process, where a thread that does not block it
+    ///   takes it. The copy is queued at the exit's grant and sent to the
+    ///   process again at the next pass, by the rule above with the holder
+    ///   excluded (`settle_timer_copies_at_exit`,
+    ///   `send_returned_timer_copies`).
+    /// * A sibling's successful exec retires it: an `alarm` or `ITIMER_REAL`
+    ///   copy is sent to the process with `kill(2)` at that edge, since Linux
+    ///   keeps that pending signal across the exec; a POSIX timer's copy is
+    ///   dropped, since Linux discards it (`settle_timer_copies_at_exec`).
+    /// * It is the exec's caller: the record stays, under the leader's ID
+    ///   after a non-leader exec; the copy stays queued on the surviving
+    ///   thread.
+    /// * Its whole process ends: the record ends and nothing is sent
+    ///   (`settle_timer_copies_at_exit` for `exit_group` or the last thread's
+    ///   `exit`; `end_timer_copies_of_departed_holder` for a fatal signal or a
+    ///   kill, and for any other removal).
+    ///
+    /// These holder states reach this
     /// branch: woken and not yet requeued (`blocked.signaled_background`;
     /// step2d can fire then, after an empty pass); requeued on the
     /// continuation of a call that had already returned, awaiting its grant;
@@ -4233,6 +4310,13 @@ impl Scheduler {
     /// * Distinct timers of one process that share a signal are coalesced
     ///   with one another, as `fire_alarm`'s `kill(2)` sends already are;
     ///   Linux queues each POSIX timer's signal separately.
+    /// * A holder that blocks the signal before it takes it keeps the copy
+    ///   to itself. Linux keeps the signal on the process, where another
+    ///   thread that does not block it can take it (`retarget_shared_pending`
+    ///   wakes one when a thread blocks a signal).
+    /// * A copy held by the exec's caller survives the exec for a POSIX timer
+    ///   too, as the `kill(2)` send of `fire_alarm` (`SI_USER`) does; Linux
+    ///   discards a POSIX timer's pending signal at exec.
     fn fire_timer_signal(
         &mut self,
         deadline: LogicalTime,
@@ -4262,7 +4346,7 @@ impl Scheduler {
             );
             return;
         }
-        self.deliver_timer_signal(dpid, preferred, sig, kind);
+        self.deliver_timer_signal(dpid, preferred, sig, kind, TimerSignalCause::Expiry);
     }
 
     /// Send a timer's signal `sig` of process `dpid`, where no copy of it is
@@ -4270,19 +4354,37 @@ impl Scheduler {
     /// any guest instruction (`timer_signal_recipient`, `preferred` first),
     /// recording the copy (`outstanding_timer_copies`); otherwise to the
     /// process with `kill(2)`, through `preferred`, as `fire_alarm` sends it.
+    /// `cause` says why it is sent: an expiry, or a copy returned to the
+    /// process, whose former holder is never the recipient.
     fn deliver_timer_signal(
         &mut self,
         dpid: DetPid,
         preferred: DetTid,
         sig: Signal,
         kind: TimerCopyKind,
+        cause: TimerSignalCause,
     ) {
-        match self.timer_signal_recipient(dpid, preferred, sig) {
+        let former_holder = match cause {
+            TimerSignalCause::Expiry => None,
+            TimerSignalCause::Returned { holder, .. } => Some(holder),
+        };
+        match self.timer_signal_recipient(dpid, preferred, sig, former_holder) {
             Some(recipient) => {
-                info!(
-                    "[dtid {}] Alarm fired, delivering signal {} to guest thread {} alone: it takes the signal before it runs any guest instruction.",
-                    preferred, sig, recipient
-                );
+                match cause {
+                    TimerSignalCause::Expiry => info!(
+                        "[dtid {}] Alarm fired, delivering signal {} to guest thread {} alone: it takes the signal before it runs any guest instruction.",
+                        preferred, sig, recipient
+                    ),
+                    TimerSignalCause::Returned { holder, ending } => info!(
+                        "[dpid {}] Timer copy of signal {} ({}) sent to thread {} alone ended before it was taken: {}; the signal is sent again, to guest thread {} alone: it takes the signal before it runs any guest instruction.",
+                        dpid,
+                        sig,
+                        kind.describe(),
+                        holder,
+                        ending,
+                        recipient
+                    ),
+                }
                 self.signal_guest_thread_directed(recipient, sig);
                 // The send armed the recipient for the release barrier
                 // (`arm_signaled_background`) unless it had already exited.
@@ -4298,10 +4400,21 @@ impl Scheduler {
                 }
             }
             None => {
-                info!(
-                    "[dtid {}] Alarm fired, delivering signal {} to guest process: no thread takes it alone, so it is sent to the process as fire_alarm sends it.",
-                    preferred, sig
-                );
+                match cause {
+                    TimerSignalCause::Expiry => info!(
+                        "[dtid {}] Alarm fired, delivering signal {} to guest process: no thread takes it alone, so it is sent to the process as fire_alarm sends it.",
+                        preferred, sig
+                    ),
+                    TimerSignalCause::Returned { holder, ending } => info!(
+                        "[dpid {}] Timer copy of signal {} ({}) sent to thread {} alone ended before it was taken: {}; the signal is sent to the process with kill(2) through thread {}: no thread takes it alone.",
+                        dpid,
+                        sig,
+                        kind.describe(),
+                        holder,
+                        ending,
+                        preferred
+                    ),
+                }
                 self.signal_guest(preferred, sig);
             }
         }
@@ -4310,7 +4423,8 @@ impl Scheduler {
     /// The thread of `process` that a timer's signal is sent to alone
     /// (`fire_timer_signal`): `preferred` if it is a candidate
     /// (`timer_copy_candidate`), otherwise the first candidate in thread-ID
-    /// order; `None` when there is none.
+    /// order; `None` when there is none. `excluded`, the former holder of a
+    /// returned copy (`send_returned_timer_copies`), is never chosen.
     ///
     /// POSIX lets any thread that does not block a process-directed signal
     /// take it; preferring `preferred` follows Linux, which tries the thread
@@ -4322,9 +4436,11 @@ impl Scheduler {
         process: DetPid,
         preferred: DetTid,
         signal: Signal,
+        excluded: Option<DetTid>,
     ) -> Option<DetTid> {
         let bit = kernel_signal_bit(signal as i32);
         let mut threads = self.process_signal_targets(process);
+        threads.retain(|thread| Some(*thread) != excluded);
         // Stable, so the rest stay in thread-ID order.
         threads.sort_by_key(|thread| *thread != preferred);
         threads
@@ -4467,8 +4583,14 @@ impl Scheduler {
     }
 
     /// End the record of every timer copy that `thread` holds, because the
-    /// thread ends before it takes the signal (`ending`): Linux drops a
-    /// thread's private signals with it.
+    /// thread is removed before it takes the signal (`ending`), with nothing
+    /// sent: Linux drops a thread's private signals with it. A holder that
+    /// leaves by its own exit or by an exec has its records settled before
+    /// this runs (`settle_timer_copies_at_exit`,
+    /// `settle_timer_copies_at_exec`), so what reaches this is a removal
+    /// that ends the whole process (a fatal signal or a kill, which Linux
+    /// ends with the process's pending signals) or a removal outside those
+    /// paths.
     fn end_timer_copies_of_departed_holder(&mut self, thread: DetTid, ending: &str) {
         let held: Vec<(DetPid, i32)> = self
             .outstanding_timer_copies
@@ -4486,6 +4608,234 @@ impl Scheduler {
                 copy.holder,
                 ending
             );
+        }
+    }
+
+    /// Settle, at the grant of `dettid`'s exit (`ResourceID::Exit`; `group`
+    /// for `exit_group`), the timer copies that the exit ends before their
+    /// holder takes the signal (`outstanding_timer_copies`). After this grant
+    /// the exiting thread runs no guest instruction and takes no signal:
+    /// neither `exit` nor `exit_group` returns to user mode.
+    ///
+    /// * `exit_group`: every copy held in the exiting thread's process ends
+    ///   with nothing sent. Every thread of the process dies with it, and once
+    ///   a group exit has begun the kernel dequeues no other signal for any of
+    ///   them (`get_signal`), so Linux's pending signal dies with the process.
+    /// * `exit` of the process's last live thread: the same.
+    /// * `exit` of a holder whose process lives on: Linux keeps the pending
+    ///   signal on the process, where a thread that does not block it takes
+    ///   it (`exit_signals` -> `retarget_shared_pending` wakes one). The copy
+    ///   is queued (`returning_timer_copies`) and sent to the process again at
+    ///   the next pass (`send_returned_timer_copies`).
+    ///
+    /// The exiting thread's process is read from the thread tree: a raw clone
+    /// child's exit can name its creator (see the `ResourceID::Exit` arm).
+    /// Only scheduler state changes here: this runs inside the turn's
+    /// tentative window, where the run queue may not change and a host send
+    /// could wake a thread that nobody armed.
+    fn settle_timer_copies_at_exit(&mut self, dettid: DetTid, group: bool) {
+        if self.outstanding_timer_copies.is_empty() {
+            return;
+        }
+        let process = self.registered_process(dettid).unwrap_or(dettid);
+        let ended: Vec<(DetPid, i32)> = self
+            .outstanding_timer_copies
+            .iter()
+            .filter(|(key, copy)| {
+                if group {
+                    key.0 == process
+                } else {
+                    copy.holder == dettid
+                }
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        for key in ended {
+            let copy = self.outstanding_timer_copies.remove(&key).unwrap();
+            let process_lives_on = self
+                .process_signal_targets(key.0)
+                .into_iter()
+                .any(|thread| thread != dettid);
+            if !group && process_lives_on {
+                self.returning_timer_copies.push(TimerCopyReturn {
+                    process: key.0,
+                    copy,
+                    ending: "its thread exited",
+                });
+                continue;
+            }
+            info!(
+                "[dpid {}] Timer copy of signal {} ({}) sent to thread {} alone ended before it was taken: {}; nothing sent.",
+                key.0,
+                copy.signal,
+                copy.kind.describe(),
+                copy.holder,
+                if group {
+                    "its process exits (exit_group)"
+                } else {
+                    "its thread exits, the last of its process"
+                }
+            );
+        }
+    }
+
+    /// Send each queued returned copy (`returning_timer_copies`) to its
+    /// process again: by the timer rule (`deliver_timer_signal`) with the
+    /// former holder excluded as recipient and as the thread that `kill(2)`
+    /// names, which is the process's leader if it is another live thread and
+    /// otherwise its first other live thread in thread-ID order. A process
+    /// with no other live thread left gets nothing, and an INFO record says so.
+    ///
+    /// Called once per pass, after the drain prefix and before any timer can
+    /// fire (`step2_process_blocked`), so the return is sent before a later
+    /// expiry of the same signal and before any later grant: between the
+    /// exit's grant and this point no guest thread is granted a turn, and the
+    /// exiting thread runs no guest instruction. That is where the round-10
+    /// timer rule can send safely: no guest thread holds the turn and the run
+    /// queue is settled, as at a step2b pop. Linux has the signal pending on
+    /// the process from the exit on; sending it here instead, by that rule,
+    /// rather than with a bare `kill(2)` at the exit, keeps a sleeping thread
+    /// the scheduler did not arm from being woken by it.
+    fn send_returned_timer_copies(&mut self) {
+        if self.returning_timer_copies.is_empty() {
+            return;
+        }
+        for TimerCopyReturn {
+            process,
+            copy,
+            ending,
+        } in std::mem::take(&mut self.returning_timer_copies)
+        {
+            let holder = copy.holder;
+            let conduit = self
+                .process_signal_targets(process)
+                .into_iter()
+                .filter(|thread| *thread != holder)
+                .min_by_key(|thread| (*thread != process, *thread));
+            let Some(conduit) = conduit else {
+                info!(
+                    "[dpid {}] Timer copy of signal {} ({}) sent to thread {} alone ended before it was taken: {}, and no other thread of its process remains; nothing sent.",
+                    process,
+                    copy.signal,
+                    copy.kind.describe(),
+                    holder,
+                    ending
+                );
+                continue;
+            };
+            if let Some(standing) = self
+                .outstanding_timer_copies
+                .get(&(process, copy.signal as i32))
+            {
+                info!(
+                    "[dpid {}] Timer copy of signal {} ({}) sent to thread {} alone ended before it was taken: {}; coalesced with the copy thread {} has not yet taken, nothing sent.",
+                    process,
+                    copy.signal,
+                    copy.kind.describe(),
+                    holder,
+                    ending,
+                    standing.holder
+                );
+                continue;
+            }
+            self.deliver_timer_signal(
+                process,
+                conduit,
+                copy.signal,
+                copy.kind,
+                TimerSignalCause::Returned { holder, ending },
+            );
+        }
+    }
+
+    /// Take every timer copy recorded for `process` out of
+    /// `outstanding_timer_copies`, to be settled at its exec
+    /// (`settle_timer_copies_at_exec`).
+    fn take_timer_copies_of_process(&mut self, process: DetPid) -> Vec<((DetPid, i32), TimerCopy)> {
+        let keys: Vec<(DetPid, i32)> = self
+            .outstanding_timer_copies
+            .keys()
+            .filter(|key| key.0 == process)
+            .copied()
+            .collect();
+        keys.into_iter()
+            .map(|key| (key, self.outstanding_timer_copies.remove(&key).unwrap()))
+            .collect()
+    }
+
+    /// Settle, at a successful exec, the timer copies of the process taken
+    /// before its old image's threads were retired (`reconnect_exec`).
+    /// `caller` called exec and survives it as `new_leader`.
+    ///
+    /// * Held by `caller`: the record stays, under `new_leader` after a
+    ///   non-leader exec. The copy stays queued on the surviving thread, whose
+    ///   private signals Linux keeps across exec (`de_thread` gives it the
+    ///   leader's ID), so the record keeps standing for it.
+    /// * Held by a sibling, for an `alarm` or `ITIMER_REAL`: the exec retired
+    ///   the holder and its private queue. Linux keeps the process's pending
+    ///   signal across exec, so the signal is sent to the process with
+    ///   `kill(2)` here, and the record ends. No run-queue wake follows, as
+    ///   none is needed: the process's only thread, `new_leader`, is held in
+    ///   its exec stop, so the kernel leaves the signal on the process's queue
+    ///   and gives it to that thread when it first returns to user mode
+    ///   (`ptrace_stop` ends with `recalc_sigpending_tsk`), before the new
+    ///   image's first instruction, under the new image's disposition and the
+    ///   mask it inherited. That is where Linux's pending signal reaches it.
+    /// * Held by a sibling, for a POSIX timer: dropped, and the record ends.
+    ///   Linux discards a POSIX timer's pending signal at exec
+    ///   (`flush_itimer_signals`).
+    ///
+    /// Each send, drop or surviving record writes one INFO record. This runs
+    /// at the exec edge, after the old image's threads are retired and before
+    /// the replacement's first grant: the scheduler is waiting for the
+    /// caller's next request, and every other guest thread is stopped at a
+    /// request, in a blocking pool, or retired, so the records' place in the
+    /// log is fixed by the schedule. A failed exec retires no thread that is
+    /// still live and never reaches here (`finish_exec_teardown`).
+    fn settle_timer_copies_at_exec(
+        &mut self,
+        caller: DetTid,
+        new_leader: DetTid,
+        records: Vec<((DetPid, i32), TimerCopy)>,
+    ) {
+        for (key, copy) in records {
+            if copy.holder == caller {
+                info!(
+                    "[dpid {}] Timer copy of signal {} ({}) sent to thread {} alone, not yet taken, stays queued on it across its exec, as thread {}.",
+                    key.0,
+                    copy.signal,
+                    copy.kind.describe(),
+                    copy.holder,
+                    new_leader
+                );
+                self.outstanding_timer_copies.insert(
+                    key,
+                    TimerCopy {
+                        holder: new_leader,
+                        ..copy
+                    },
+                );
+                continue;
+            }
+            match copy.kind {
+                TimerCopyKind::ProcessAlarm => {
+                    info!(
+                        "[dpid {}] Timer copy of signal {} ({}) sent to thread {} alone ended before it was taken: a sibling's exec ended its thread; the signal is sent to the process with kill(2), which keeps it pending across the exec as Linux does.",
+                        key.0,
+                        copy.signal,
+                        copy.kind.describe(),
+                        copy.holder
+                    );
+                    self.host_send_signal(new_leader, copy.signal, HostSignalSend::ProcessDirected);
+                }
+                TimerCopyKind::PosixTimer => info!(
+                    "[dpid {}] Timer copy of signal {} ({}) sent to thread {} alone ended before it was taken: a sibling's exec ended its thread, and Linux discards a POSIX timer's pending signal at exec; nothing sent.",
+                    key.0,
+                    copy.signal,
+                    copy.kind.describe(),
+                    copy.holder
+                ),
+            }
         }
     }
 
@@ -4799,13 +5149,22 @@ impl Scheduler {
         self.send_signal_to_guest(dettid, signal, HostSignalSend::ThreadDirected);
     }
 
-    /// The body of `signal_guest`: send `signal` to `dettid` as `send` says,
-    /// then make it visible to the scheduler (`wake_signaled_guest`).
+    /// The body of `signal_guest`: send `signal` to `dettid` as `send` says
+    /// (`host_send_signal`), then, if it was sent, make it visible to the
+    /// scheduler (`wake_signaled_guest`).
+    fn send_signal_to_guest(&mut self, dettid: DetTid, signal: Signal, send: HostSignalSend) {
+        if self.host_send_signal(dettid, signal, send) {
+            self.wake_signaled_guest(dettid, signal);
+        }
+    }
+
+    /// Send `signal` to `dettid` on the host as `send` says, with no change to
+    /// the scheduler's view of the target, and say whether it was sent.
     ///
     /// A backend that registered a pidfd for the thread is sent through it
     /// either way, and that send is thread-directed already. A backend that
     /// requires one and has none is refused either way.
-    fn send_signal_to_guest(&mut self, dettid: DetTid, signal: Signal, send: HostSignalSend) {
+    fn host_send_signal(&mut self, dettid: DetTid, signal: Signal, send: HostSignalSend) -> bool {
         debug!(
             "[dtid {}] deliver signal {} physically to guest thread ({:?}).",
             dettid, signal, send
@@ -4813,8 +5172,7 @@ impl Scheduler {
         #[cfg(test)]
         if let Some(sends) = self.test_host_signal_sends.as_mut() {
             sends.push((dettid, signal, send));
-            self.wake_signaled_guest(dettid, signal);
-            return;
+            return true;
         }
         let result = if let Some((_, _, _, pidfd)) = self.physical_thread_pidfds.get(&dettid) {
             let rc = unsafe {
@@ -4838,7 +5196,7 @@ impl Scheduler {
                     signal, dettid,
                 )
             });
-            return;
+            return false;
         } else {
             match send {
                 HostSignalSend::ProcessDirected => {
@@ -4867,7 +5225,7 @@ impl Scheduler {
             }
         };
         match result {
-            Ok(()) => {}
+            Ok(()) => true,
             // ⚠️ ESRCH IS AN EXPECTED OUTCOME HERE, NOT AN ERROR. The target
             // chose to exit between the moment it was selected and the moment
             // the signal was sent; that window is inherent and cannot be closed
@@ -4895,11 +5253,10 @@ impl Scheduler {
                      Expected race; nothing to deliver and nothing to wake.",
                     dettid, signal
                 );
-                return;
+                false
             }
             Err(errno) => panic!("signal::kill to go through ({send:?}), got {errno}"),
         }
-        self.wake_signaled_guest(dettid, signal);
     }
 
     /// `wake_signaled_guest` for a thread asleep in a real blocking call outside
@@ -5020,8 +5377,10 @@ impl Scheduler {
             ThreadStatus::NotRunning => {
                 // This is a commit point. The only callers are a timed pop in
                 // step2b (`dispatch_timed_signal` -> `fire_alarm` ->
-                // `signal_guest`) or the empty-queue time skip, both on the
-                // scheduler thread while no guest thread holds the turn. So the
+                // `signal_guest`), the empty-queue time skip, or a returned
+                // timer copy sent after the drain prefix
+                // (`send_returned_timer_copies`), all on the scheduler thread
+                // while no guest thread holds the turn. So the
                 // dispositions read here are the ones in force at this point in
                 // the global order, with the exceptions named at
                 // `parked_futex_interrupting_signals`. That is where Linux
@@ -6609,6 +6968,9 @@ impl Scheduler {
                         return Err(SkipTurn);
                     }
                 };
+                // The exit is granted from here on (step5 skips it only to end
+                // the run), so the timer copies it ends are settled now.
+                self.settle_timer_copies_at_exit(dettid, *group);
                 // An exit that ends its process leaves the host some time after
                 // this grant. Hold turn selection from here until the backend
                 // reports the process physically gone (asynchronous exit
@@ -13149,7 +13511,8 @@ mod test {
     /// to the next thread that will take it. Linux drops a thread's private
     /// signals with the thread, so a record kept past its holder would merge
     /// every later expiry of that signal in the process into a copy nobody
-    /// holds.
+    /// holds. The holder's own exit, which returns the copy to the process,
+    /// is `a_timer_copy_holder_that_exits_returns_the_copy_to_the_process`.
     #[test]
     fn a_timer_copy_holder_that_exits_releases_the_next_expiry() {
         let alrm = kernel_signal_bit(libc::SIGALRM);
@@ -13267,15 +13630,16 @@ mod test {
     }
 
     /// The steps of an ordinary pass up to its timer pop: the release
-    /// barrier, the drain prefix and one overdue expiry
-    /// (`step2_process_blocked`). `false` when the pass skips its turn before
-    /// the pop.
+    /// barrier, the drain prefix, the returned timer copies and one overdue
+    /// expiry (`step2_process_blocked`). `false` when the pass skips its turn
+    /// before the pop.
     fn pass_to_timer_pop(scheduler: &mut Scheduler) -> bool {
         if scheduler.step2_release_signaled_background().is_err()
             || scheduler.step2_drain_prefix().is_err()
         {
             return false;
         }
+        scheduler.send_returned_timer_copies();
         scheduler.step2b_process_timed();
         true
     }
@@ -13520,6 +13884,322 @@ mod test {
             ]
         );
         assert_eq!(timer_copy_holder(&scheduler, libc::SIGALRM), None);
+    }
+
+    /// Process 100 under a seeded random run-queue heuristic, with its leader
+    /// parked, 101 holding a copy of a timer's `SIGALRM` sent to it alone
+    /// (`posix`: from a POSIX timer, otherwise from `alarm`) and requeued on
+    /// its posted continuation, and 102 stopped at a queued request with
+    /// `SIGALRM` blocked. Returns the scheduler and its `tentative_pop_next`.
+    fn exec_race_family(
+        heuristic: crate::config::SchedHeuristic,
+        seed: u64,
+        posix: bool,
+    ) -> (Scheduler, Option<DetTid>) {
+        let alrm = kernel_signal_bit(libc::SIGALRM);
+        let process = DetPid::from_raw(100);
+        let mut scheduler = Scheduler::new(&Config {
+            sequentialize_threads: true,
+            backend_supports_blocked_wait_signal_interruption: true,
+            sched_heuristic: heuristic,
+            sched_seed: Some(seed),
+            ..Config::default()
+        });
+        let (leader, workers, _) = timer_family(&mut scheduler, !alrm, &[101, 102]);
+        let op = commit_own_mask_call(&mut scheduler, workers[0], 0, 0);
+        post_continuation(&mut scheduler, workers[0], op);
+        let id = if posix {
+            timed_waiters::SignalTimerId::Posix(process, 7)
+        } else {
+            timed_waiters::SignalTimerId::Alarm(process)
+        };
+        scheduler.dispatch_timed_signal(
+            LogicalTime::from_nanos(1_000),
+            id,
+            leader,
+            Signal::SIGALRM,
+            true,
+        );
+        assert_eq!(
+            host_signal_sends(&scheduler),
+            vec![(workers[0], Signal::SIGALRM, HostSignalSend::ThreadDirected)]
+        );
+        copy_queued_on(&mut scheduler, workers[0], libc::SIGALRM);
+        assert!(scheduler.step2_release_signaled_background().is_ok());
+        queue_request(&mut scheduler, workers[1], ResourceID::SchedYield, alrm);
+        let picked = scheduler.run_queue.tentative_pop_next();
+        (scheduler, picked)
+    }
+
+    /// Seeds under which the random heuristics pick 102 before 101, although
+    /// the barrier queued 101 first. Of seeds 0 to 23, both heuristics pick
+    /// 102 under 1, 2, 3, 4, 5, 7, 8, 9, 12, 14, 15, 19, 20 and 23, and 101
+    /// under the rest.
+    const EXEC_RACE_SEEDS: [(crate::config::SchedHeuristic, u64); 2] = [
+        (crate::config::SchedHeuristic::Random, 1),
+        (crate::config::SchedHeuristic::StickyRandom, 2),
+    ];
+
+    /// A sibling's successful exec destroys a thread holding a timer's copy
+    /// of a signal it has not yet taken (Linux `de_thread`). Under the
+    /// supported random heuristics a sibling can run before the holder's
+    /// continuation is granted, although the barrier queued the holder first:
+    /// with these seeds 102 is picked first, blocks `SIGALRM`, and execs.
+    /// Linux queues an `alarm` expiry on the process, where it survives the
+    /// exec; the scheduler sent it to 101 alone, so at the exec it sends the
+    /// signal to the process with `kill(2)`, once, and the record ends. Linux
+    /// discards a POSIX timer's pending signal at exec
+    /// (`flush_itimer_signals`), so a POSIX timer's copy ends with nothing
+    /// sent. Before, the `alarm` was lost with 101 (Codex round 10 finding 2
+    /// on https://github.com/rrnewton/hermit/pull/3224).
+    #[test]
+    fn a_sibling_exec_returns_an_alarm_copy_to_the_process_and_drops_a_posix_copy() {
+        let process = DetPid::from_raw(100);
+        let mm = MmId::initial(process);
+        let (holder, sibling, leader) = (
+            DetTid::from_raw(101),
+            DetTid::from_raw(102),
+            DetTid::from_raw(100),
+        );
+        for (heuristic, seed) in EXEC_RACE_SEEDS {
+            for posix in [false, true] {
+                let case = format!("{heuristic:?} seed {seed} posix {posix}");
+                let (mut scheduler, picked) = exec_race_family(heuristic, seed, posix);
+                assert_eq!(picked, Some(sibling), "{case}");
+                assert_eq!(scheduler.run_queue.commit_tentative_pop(), sibling);
+                assert!(scheduler.run_queue.contains_tid(holder), "{case}");
+                scheduler.runqueue_push_back(sibling);
+                grant_and_run(&mut scheduler, sibling);
+                assert!(
+                    scheduler.prepare_exec_teardown(sibling, process, mm),
+                    "{case}"
+                );
+                scheduler.reconnect_transferred_exec(ExecReconnect {
+                    caller: sibling,
+                    new_leader: leader,
+                    detpid: process,
+                    pre_exec_mm: mm,
+                    post_exec_mm: mm.for_exec(process),
+                    child_tid_addr: 0,
+                    reconnect_priority: None,
+                });
+                let copy = (holder, Signal::SIGALRM, HostSignalSend::ThreadDirected);
+                let expected = if posix {
+                    vec![copy]
+                } else {
+                    vec![
+                        copy,
+                        (leader, Signal::SIGALRM, HostSignalSend::ProcessDirected),
+                    ]
+                };
+                assert_eq!(host_signal_sends(&scheduler), expected, "{case}");
+                assert_eq!(timer_copy_holder(&scheduler, libc::SIGALRM), None, "{case}");
+            }
+        }
+    }
+
+    /// A sibling's failed exec destroys nothing, so a timer copy's record and
+    /// the signals sent are unchanged.
+    #[test]
+    fn a_failed_sibling_exec_keeps_the_timer_copy_record() {
+        let process = DetPid::from_raw(100);
+        let mm = MmId::initial(process);
+        let (holder, sibling) = (DetTid::from_raw(101), DetTid::from_raw(102));
+        let (mut scheduler, picked) =
+            exec_race_family(crate::config::SchedHeuristic::None, 0, false);
+        assert_eq!(picked, Some(holder));
+        scheduler.run_queue.undo_tentative_pop();
+        assert_eq!(
+            scheduler.run_queue.tentative_pop_tid(sibling),
+            Some(sibling)
+        );
+        assert_eq!(scheduler.run_queue.commit_tentative_pop(), sibling);
+        scheduler.runqueue_push_back(sibling);
+        grant_and_run(&mut scheduler, sibling);
+        assert!(scheduler.prepare_exec_teardown(sibling, process, mm));
+        scheduler.finish_exec_teardown(sibling, process, mm, false);
+        assert_eq!(
+            host_signal_sends(&scheduler),
+            vec![(holder, Signal::SIGALRM, HostSignalSend::ThreadDirected)]
+        );
+        assert_eq!(timer_copy_holder(&scheduler, libc::SIGALRM), Some(holder));
+    }
+
+    /// The holder itself can exec only with the signal blocked, and its
+    /// pending signals survive the exec, so the record stays. After a
+    /// non-leader's exec the holder carries the leader's thread ID, and the
+    /// record names that ID.
+    #[test]
+    fn a_timer_copy_holder_that_execs_keeps_the_record() {
+        let alrm = kernel_signal_bit(libc::SIGALRM);
+        let process = DetPid::from_raw(100);
+        let mm = MmId::initial(process);
+        let leader = DetTid::from_raw(100);
+        let worker = DetTid::from_raw(101);
+        for leader_execs in [true, false] {
+            let mut scheduler = gated_scheduler();
+            scheduler.thread_tree.add_child(leader, leader, true);
+            register_known_thread(&mut scheduler, leader);
+            scheduler.thread_tree.add_child(leader, worker, false);
+            register_known_thread(&mut scheduler, worker);
+            scheduler.test_host_signal_sends = Some(Vec::new());
+            let (holder, other) = if leader_execs {
+                (leader, worker)
+            } else {
+                (worker, leader)
+            };
+            queue_request(&mut scheduler, other, ResourceID::SchedYield, alrm);
+            let op = commit_own_mask_call(&mut scheduler, holder, 0, 0);
+            post_continuation(&mut scheduler, holder, op);
+            scheduler.dispatch_timed_signal(
+                LogicalTime::from_nanos(1_000),
+                timed_waiters::SignalTimerId::Alarm(process),
+                holder,
+                Signal::SIGALRM,
+                true,
+            );
+            let copy = (holder, Signal::SIGALRM, HostSignalSend::ThreadDirected);
+            assert_eq!(host_signal_sends(&scheduler), vec![copy], "{leader_execs}");
+            copy_queued_on(&mut scheduler, holder, libc::SIGALRM);
+            assert!(scheduler.step2_release_signaled_background().is_ok());
+            assert_eq!(scheduler.run_queue.tentative_pop_tid(holder), Some(holder));
+            assert_eq!(scheduler.run_queue.commit_tentative_pop(), holder);
+            scheduler.runqueue_push_back(holder);
+            grant_and_run(&mut scheduler, holder);
+            scheduler
+                .test_kernel_signal_states
+                .get_mut(&holder)
+                .unwrap()
+                .blocked = alrm;
+            assert!(scheduler.prepare_exec_teardown(holder, process, mm));
+            let reconnect = ExecReconnect {
+                caller: holder,
+                new_leader: leader,
+                detpid: process,
+                pre_exec_mm: mm,
+                post_exec_mm: mm.for_exec(process),
+                child_tid_addr: 0,
+                reconnect_priority: None,
+            };
+            if leader_execs {
+                scheduler.reconnect_after_exec(reconnect);
+            } else {
+                scheduler.reconnect_transferred_exec(reconnect);
+            }
+            assert_eq!(host_signal_sends(&scheduler), vec![copy], "{leader_execs}");
+            assert_eq!(
+                timer_copy_holder(&scheduler, libc::SIGALRM),
+                Some(leader),
+                "{leader_execs}"
+            );
+        }
+    }
+
+    /// A holder that ends its own thread before it takes its copy (for
+    /// example from the handler of another signal whose `sa_mask` blocks
+    /// it) hands the signal back to its process, as Linux's `exit_signals`
+    /// hands a pending process signal to a thread that can take it. The
+    /// exit's grant queues the copy (`settle_timer_copies_at_exit`), and the
+    /// next pass sends it after its drain prefix, before any timer can fire
+    /// (`send_returned_timer_copies`): to another thread alone if one will
+    /// take it (`timer_signal_recipient`), otherwise to the process with
+    /// `kill(2)`. Nothing is sent at the grant itself, inside the turn's
+    /// selection, where a send could wake a thread asleep in a blocking pool
+    /// that nobody armed; no guest thread is granted a turn between the two
+    /// points. An `exit_group` ends the process, and the copy ends with it,
+    /// nothing sent. Before, the signal was lost with the holder.
+    #[test]
+    fn a_timer_copy_holder_that_exits_returns_the_copy_to_the_process() {
+        let alrm = kernel_signal_bit(libc::SIGALRM);
+        let process = DetPid::from_raw(100);
+        let mm = MmId::initial(process);
+        for case in [
+            "another thread takes it",
+            "no thread takes it alone",
+            "exit_group",
+        ] {
+            let mut scheduler = gated_scheduler();
+            let (leader, workers, _) = timer_family(&mut scheduler, !alrm, &[101, 102]);
+            let (holder, other) = (workers[0], workers[1]);
+            if case == "another thread takes it" {
+                commit_own_mask_call(&mut scheduler, other, 0, 0);
+            } else {
+                queue_request(&mut scheduler, other, ResourceID::SchedYield, alrm);
+            }
+            let op = commit_own_mask_call(&mut scheduler, holder, 0, 0);
+            post_continuation(&mut scheduler, holder, op);
+            scheduler.dispatch_timed_signal(
+                LogicalTime::from_nanos(1_000),
+                timed_waiters::SignalTimerId::Alarm(process),
+                leader,
+                Signal::SIGALRM,
+                true,
+            );
+            let copy = (holder, Signal::SIGALRM, HostSignalSend::ThreadDirected);
+            assert_eq!(host_signal_sends(&scheduler), vec![copy], "{case}");
+            copy_queued_on(&mut scheduler, holder, libc::SIGALRM);
+            assert!(scheduler.step2_release_signaled_background().is_ok());
+
+            // Granted, the holder blocks `SIGALRM` and stops at its exit.
+            scheduler
+                .test_kernel_signal_states
+                .get_mut(&holder)
+                .unwrap()
+                .blocked = alrm;
+            let group = case == "exit_group";
+            let exit = ResourceID::Exit { group, process, mm };
+            stop_at_next_request(&mut scheduler, holder, exit.clone(), Permission::RW);
+            assert_eq!(scheduler.run_queue.tentative_pop_tid(holder), Some(holder));
+            assert!(
+                scheduler
+                    .block_for_one_resource(
+                        holder,
+                        &exit,
+                        &Permission::RW,
+                        None,
+                        None,
+                        &Ivar::new()
+                    )
+                    .is_ok(),
+                "{case}"
+            );
+            assert_eq!(scheduler.run_queue.commit_tentative_pop(), holder);
+            assert_eq!(
+                host_signal_sends(&scheduler),
+                vec![copy],
+                "{case}: at the grant"
+            );
+            if group {
+                scheduler.logically_kill_thread(&other, &process, mm);
+                scheduler.logically_kill_thread(&leader, &process, mm);
+            }
+            scheduler.logically_kill_thread(&holder, &process, mm);
+
+            assert!(pass_to_timer_pop(&mut scheduler), "{case}");
+            let (expected, holder_after) = match case {
+                "another thread takes it" => (
+                    vec![
+                        copy,
+                        (other, Signal::SIGALRM, HostSignalSend::ThreadDirected),
+                    ],
+                    Some(other),
+                ),
+                "no thread takes it alone" => (
+                    vec![
+                        copy,
+                        (leader, Signal::SIGALRM, HostSignalSend::ProcessDirected),
+                    ],
+                    None,
+                ),
+                _ => (vec![copy], None),
+            };
+            assert_eq!(host_signal_sends(&scheduler), expected, "{case}");
+            assert_eq!(
+                timer_copy_holder(&scheduler, libc::SIGALRM),
+                holder_after,
+                "{case}"
+            );
+        }
     }
 
     /// The barrier runs before anything else in a pass: while an armed thread
