@@ -502,13 +502,41 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         chaos_epoch_length_ns: 0,
         fuzz_seed: None,
     };
-    if config.max_timeslice.is_some() && !reverie_ptrace::is_perf_supported() {
-        tracing::warn!(
-            "Hardware perf counters are not supported on this machine. Records/Replays may randomly fail!"
-        );
-        config.max_timeslice = None;
+    if let Err(reason) = record_timer_support() {
+        disable_timeslice_without_a_timer(&mut config, &reason);
     }
     config
+}
+
+/// Whether this host can arm Reverie's ptrace timer for a record or replay:
+/// working perf counters AND a PMU profile for its CPU. Without a profile,
+/// Reverie gives no task a timer, so a timeslice would be configured and never
+/// delivered.
+fn record_timer_support() -> Result<(), String> {
+    timer_support_from(
+        reverie_ptrace::is_perf_supported(),
+        reverie_ptrace::host_pmu_profile(),
+    )
+}
+
+/// [`record_timer_support`] from what the host answered: whether perf works,
+/// and whether Reverie has a PMU profile for its CPU.
+fn timer_support_from(
+    perf_supported: bool,
+    profile: Result<(), reverie_ptrace::PmuValidationError>,
+) -> Result<(), String> {
+    if !perf_supported {
+        return Err("hardware perf counters are not supported on this machine".to_owned());
+    }
+    profile.map_err(|error| error.to_string())
+}
+
+/// Turn off `config`'s timeslice, which this host cannot deliver (`reason`).
+fn disable_timeslice_without_a_timer(config: &mut detcore::Config, reason: &str) {
+    if config.max_timeslice.is_some() {
+        tracing::warn!("{reason}; Records/Replays run without a timeslice and may randomly fail!");
+        config.max_timeslice = None;
+    }
 }
 
 #[cfg(test)]
@@ -517,6 +545,35 @@ mod tests {
     use reverie::syscalls::Sysno;
 
     use super::*;
+
+    // A host whose counters work but whose CPU has no PMU profile (Reverie's
+    // UnsupportedCpu) records without a timeslice, as a host without counters
+    // does, rather than keeping one no task can be given.
+    #[test]
+    fn a_record_without_a_timer_has_no_timeslice() {
+        let unknown = || reverie_ptrace::PmuValidationError::UnsupportedCpu {
+            family: 0x06,
+            model: 0x01,
+        };
+        assert_eq!(timer_support_from(true, Ok(())), Ok(()));
+        let no_profile = timer_support_from(true, Err(unknown())).unwrap_err();
+        assert!(no_profile.contains("model 0x1"), "{no_profile}");
+        let no_perf = timer_support_from(false, Err(unknown())).unwrap_err();
+        assert!(
+            no_perf.contains("perf counters are not supported"),
+            "{no_perf}"
+        );
+        let mut config = detcore::Config::default();
+        assert!(config.max_timeslice.is_some());
+        disable_timeslice_without_a_timer(
+            &mut config,
+            "Unsupported CPU family 0x6, model 0x1: Reverie has no performance-counter profile for it",
+        );
+        assert_eq!(config.max_timeslice, None);
+        // Already off: stays off.
+        disable_timeslice_without_a_timer(&mut config, "again");
+        assert_eq!(config.max_timeslice, None);
+    }
 
     #[test]
     fn record_version_requires_an_exact_match() {
