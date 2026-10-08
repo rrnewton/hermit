@@ -2643,32 +2643,120 @@ fn submodule_ledger_identity(metadata: &std::fs::Metadata) -> SubmoduleLedgerIde
 /// waiting terminates it: `timeout` forwards SIGTERM to the child it runs.
 struct SubmoduleFixtureChild {
     child: Option<std::process::Child>,
+    started: std::time::Instant,
     stdout: PathBuf,
     stderr: PathBuf,
     ledger: PathBuf,
     ledger_before: SubmoduleLedgerIdentity,
+    /// The no-submodules child's private rust-script cache; dropped, and so
+    /// removed, after the child (fields drop after `Drop::drop` reaps it).
+    _rust_script_cache: Option<tempfile::TempDir>,
+}
+
+/// The wall bound, in seconds, that `timeout` puts on one fixture child.
+const SUBMODULE_FIXTURE_CHILD_SECONDS: u64 = 300;
+
+/// The rust-script cache of the no-submodules child, private to its fixture.
+///
+/// rust-script builds into one Cargo target directory under `XDG_CACHE_HOME`,
+/// and Cargo holds that directory's lock for a whole build. A validation run
+/// gives every node the same `XDG_CACHE_HOME`, and two nodes run this bracket
+/// at once (`selftest.validate_rs` on 2 CPUs, and `check.script_unit_tests`
+/// in an 8-CPU node shared by every script suite), each starting from an
+/// empty cache. With one shared cache the second child waited for the
+/// first's whole cold build, so a child on idle CPUs inherited a starved
+/// child's time and was killed at the 300-second bound
+/// (https://github.com/rrnewton/hermit/issues/3891). Measured 2026-10-08 with
+/// two brackets 5 seconds apart, one capped at half a CPU: the 2-CPU one took
+/// 264.6 s sharing the cache and 99.4 s with its own. A cold private build
+/// is about 600 MB, removed with the returned directory.
+///
+/// It is made under `base`, the effective cache path, not beside the
+/// fixture: a top-level run with no TMPDIR puts TMPDIR inside the Hermit
+/// Cargo workspace, and Cargo refuses a generated package below a workspace
+/// that does not list it. The run's own cache is already kept outside every
+/// workspace (see `create_safe_cache`); a base inside one is refused here
+/// rather than failing inside the child.
+const SUBMODULE_FIXTURE_CACHE_PREFIX: &str = "submodule-fixture-rust-script-";
+
+/// A private cache older than this belongs to no live child: a child is
+/// killed after [`SUBMODULE_FIXTURE_CHILD_SECONDS`] plus `timeout`'s 10-second
+/// grace.
+const SUBMODULE_FIXTURE_CACHE_STALE_SECONDS: u64 = 3600;
+
+/// Removes private caches that a killed run left in a persistent cache
+/// directory (a run's own runtime root is removed with the run, but a
+/// developer's `~/.cache` or a shared validate cache is not). Best effort:
+/// what cannot be read or removed is left for the next run.
+fn remove_stale_submodule_fixture_caches(base: &Path, now: std::time::SystemTime) {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with(SUBMODULE_FIXTURE_CACHE_PREFIX) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let stale = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age.as_secs() >= SUBMODULE_FIXTURE_CACHE_STALE_SECONDS);
+        if metadata.is_dir() && stale {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+fn submodule_fixture_rust_script_cache(base: Option<PathBuf>) -> Result<tempfile::TempDir, String> {
+    let base = base.ok_or(
+        "submodule service result: no cache directory for the private rust-script cache \
+         (set XDG_CACHE_HOME or HOME)",
+    )?;
+    if let Some(workspace) = base
+        .ancestors()
+        .find(|dir| dir.join("Cargo.toml").is_file())
+    {
+        return Err(format!(
+            "submodule service result: cache directory {} is inside Cargo workspace {}, where \
+             Cargo refuses rust-script's generated package",
+            base.display(),
+            workspace.display()
+        ));
+    }
+    std::fs::create_dir_all(&base).map_err(|error| {
+        format!("submodule service result: cannot create {}: {error}", base.display())
+    })?;
+    remove_stale_submodule_fixture_caches(&base, std::time::SystemTime::now());
+    tempfile::Builder::new()
+        .prefix(SUBMODULE_FIXTURE_CACHE_PREFIX)
+        .tempdir_in(&base)
+        .map_err(|error| {
+            format!(
+                "submodule service result: cannot create a private rust-script cache in {}: {error}",
+                base.display()
+            )
+        })
 }
 
 impl SubmoduleFixtureChild {
-    fn spawn(
+    /// The child's command line and environment, without its stdio.
+    fn command(
         checkout: &Path,
         prepared_source_root: Option<&Path>,
         result: &Path,
         ledger: &Path,
-    ) -> Result<Self, String> {
-        let ledger_before = std::fs::symlink_metadata(ledger).map_err(|error| {
-            format!("submodule service result: cannot inspect private ledger: {error}")
-        })?;
-        if !ledger_before.is_file() || ledger_before.len() != 0 {
-            return Err(
-                "submodule service result: private ledger must be an empty regular file".into(),
-            );
-        }
+        private_cache: Option<&Path>,
+    ) -> Command {
         let mut command = Command::new("timeout");
         // The child validate finds this fixture checkout from its working
         // directory, so it must not inherit a caller's repository location.
         without_repository_location(&mut command)
-            .args(["--signal=TERM", "--kill-after=10s", "300"])
+            .args(["--signal=TERM", "--kill-after=10s"])
+            .arg(SUBMODULE_FIXTURE_CHILD_SECONDS.to_string())
             .arg(
                 prepared_source_root
                     .unwrap_or(checkout)
@@ -2740,7 +2828,56 @@ impl SubmoduleFixtureChild {
                 // check.script_unit_tests reached its own wall bound
                 // (https://github.com/rrnewton/hermit/actions/runs/37543769782).
                 .env("CARGO_PROFILE_RELEASE_OPT_LEVEL", "0");
+            if let Some(cache) = private_cache {
+                command.env("XDG_CACHE_HOME", cache);
+            }
         }
+        command
+    }
+
+    fn spawn(
+        checkout: &Path,
+        prepared_source_root: Option<&Path>,
+        result: &Path,
+        ledger: &Path,
+    ) -> Result<Self, String> {
+        Self::spawn_with_cache_base(
+            checkout,
+            prepared_source_root,
+            result,
+            ledger,
+            effective_cache_path(),
+        )
+    }
+
+    /// [`Self::spawn`] with the directory the private rust-script cache is
+    /// made under, so a test need not change the process environment.
+    fn spawn_with_cache_base(
+        checkout: &Path,
+        prepared_source_root: Option<&Path>,
+        result: &Path,
+        ledger: &Path,
+        cache_base: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        let ledger_before = std::fs::symlink_metadata(ledger).map_err(|error| {
+            format!("submodule service result: cannot inspect private ledger: {error}")
+        })?;
+        if !ledger_before.is_file() || ledger_before.len() != 0 {
+            return Err(
+                "submodule service result: private ledger must be an empty regular file".into(),
+            );
+        }
+        let rust_script_cache = match prepared_source_root {
+            None => Some(submodule_fixture_rust_script_cache(cache_base)?),
+            Some(_) => None,
+        };
+        let mut command = Self::command(
+            checkout,
+            prepared_source_root,
+            result,
+            ledger,
+            rust_script_cache.as_ref().map(tempfile::TempDir::path),
+        );
         // The missing-rr case retains normal producer selection for the
         // original-root script. Its RUN entrypoint (never this process's
         // potentially libtest current_exe) still discovers the fixture via cwd.
@@ -2764,10 +2901,12 @@ impl SubmoduleFixtureChild {
             .map_err(|error| format!("submodule service result: cannot launch fixture: {error}"))?;
         Ok(Self {
             child: Some(child),
+            started: std::time::Instant::now(),
             stdout,
             stderr,
             ledger: ledger.to_path_buf(),
             ledger_before: submodule_ledger_identity(&ledger_before),
+            _rust_script_cache: rust_script_cache,
         })
     }
 
@@ -2798,6 +2937,17 @@ impl SubmoduleFixtureChild {
         })?;
         if submodule_ledger_identity(&ledger_after) != self.ledger_before {
             return Err("submodule service result: child modified the private ledger".into());
+        }
+        // `timeout` exits 124 when it killed the child. Say so, with the time
+        // it ran: otherwise the next check reports only the missing result.
+        if output.status.code() == Some(124) {
+            return Err(format!(
+                "submodule service result: the fixture child was killed at its \
+                 {SUBMODULE_FIXTURE_CHILD_SECONDS}-second bound after {:.1} s; output={}{}",
+                self.started.elapsed().as_secs_f64(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
         }
         Ok(output)
     }
@@ -31945,6 +32095,252 @@ mod shared_consumer_tests {
 #[cfg(test)]
 mod submodule_service_tests {
     use super::*;
+
+    #[test]
+    fn only_the_no_submodules_child_builds_in_a_private_rust_script_cache() {
+        fn env(command: &Command, key: &str) -> Option<Option<PathBuf>> {
+            command
+                .get_envs()
+                .find(|(name, _)| *name == OsStr::new(key))
+                .map(|(_, value)| value.map(PathBuf::from))
+        }
+        // A top-level run with no TMPDIR puts TMPDIR, and so the fixture,
+        // inside the Hermit Cargo workspace.
+        let outer = tempfile::tempdir().unwrap();
+        let workspace = outer.path().join("hermit-checkout");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[workspace]\nmembers = []\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        let fixture = workspace.join("target/tmp/fixture");
+        std::fs::create_dir_all(&fixture).unwrap();
+        let checkout = fixture.join("hermit");
+        let ledger = fixture.join("ledger");
+        let base = outer.path().join("run-cache");
+
+        // The copied-source child compiles: its cache is private (another
+        // node's build holds Cargo's lock on a shared one) and outside every
+        // Cargo workspace (Cargo refuses the generated package inside one).
+        let private = submodule_fixture_rust_script_cache(Some(base.clone())).unwrap();
+        let cache = private.path().to_path_buf();
+        assert!(cache.starts_with(&base), "{} is not under {}", cache.display(), base.display());
+        assert!(
+            !cache.ancestors().any(|dir| dir.join("Cargo.toml").is_file()),
+            "{} is inside a Cargo workspace",
+            cache.display()
+        );
+        let bootstrap_result = fixture.join("bootstrap-result.json");
+        let compiling = SubmoduleFixtureChild::command(
+            &checkout,
+            None,
+            &bootstrap_result,
+            &ledger,
+            Some(&cache),
+        );
+        assert_eq!(env(&compiling, "XDG_CACHE_HOME"), Some(Some(cache.clone())));
+        let args: Vec<_> = compiling
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.contains(&SUBMODULE_FIXTURE_CHILD_SECONDS.to_string()),
+            "{args:?}"
+        );
+        drop(private);
+        assert!(!cache.exists(), "the private cache outlived its owner");
+
+        // A cache base inside a workspace is refused before any child runs.
+        let refused = submodule_fixture_rust_script_cache(Some(workspace.join("cache")))
+            .expect_err("a cache inside a Cargo workspace was accepted");
+        assert!(refused.contains("inside Cargo workspace"), "{refused}");
+
+        // The prepared child runs a prebuilt executable and keeps the run's
+        // environment unchanged.
+        let result = fixture.join("service-result.json");
+        let prepared =
+            SubmoduleFixtureChild::command(&checkout, Some(&fixture), &result, &ledger, None);
+        assert_eq!(env(&prepared, "XDG_CACHE_HOME"), None);
+    }
+
+    /// A stub `scripts/validate.rs` under `root` that records what a fixture
+    /// child sees, in `scripts/record`: its XDG_CACHE_HOME (or "unset") and
+    /// whether that directory exists while it runs. With `hold`, it then
+    /// sleeps instead of exiting.
+    fn stub_checkout(root: &Path, hold: bool) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let scripts = root.join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        let stub = scripts.join("validate.rs");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\n\
+                 d=\"${{XDG_CACHE_HOME-unset}}\"\n\
+                 if [ -d \"$d\" ]; then e=yes; else e=no; fi\n\
+                 here=$(dirname \"$0\")\n\
+                 printf '%s\\n%s\\n' \"$d\" \"$e\" > \"$here/record.tmp\"\n\
+                 mv \"$here/record.tmp\" \"$here/record\"\n\
+                 {}exit 1\n",
+                if hold { "exec sleep 60\n" } else { "" }
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        root.to_path_buf()
+    }
+
+    fn stub_record(root: &Path) -> (PathBuf, String) {
+        let text = std::fs::read_to_string(root.join("scripts/record")).unwrap();
+        let mut lines = text.lines();
+        (
+            PathBuf::from(lines.next().unwrap()),
+            lines.next().unwrap().to_string(),
+        )
+    }
+
+    #[test]
+    fn the_compiling_child_runs_with_a_fresh_private_cache_that_ends_with_it() {
+        let outer = tempfile::tempdir().unwrap();
+        let base = outer.path().join("cache-base");
+        let ledger = outer.path().join("ledger");
+        std::fs::write(&ledger, b"").unwrap();
+        let private_caches = |base: &Path| {
+            std::fs::read_dir(base)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter(|entry| {
+                            entry
+                                .file_name()
+                                .to_string_lossy()
+                                .starts_with(SUBMODULE_FIXTURE_CACHE_PREFIX)
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+
+        // Waited: the cache is private, outside any workspace, present for
+        // the whole run, and gone once the child has been waited for.
+        let waited = stub_checkout(&outer.path().join("waited"), false);
+        let child = SubmoduleFixtureChild::spawn_with_cache_base(
+            &waited,
+            None,
+            &outer.path().join("waited-result.json"),
+            &ledger,
+            Some(base.clone()),
+        )
+        .unwrap();
+        assert_eq!(child.wait().unwrap().status.code(), Some(1));
+        let (cache, existed) = stub_record(&waited);
+        assert!(
+            cache.starts_with(&base),
+            "the compiling child's cache {} is not a private one under {}",
+            cache.display(),
+            base.display()
+        );
+        assert!(!cache.ancestors().any(|dir| dir.join("Cargo.toml").is_file()));
+        assert_eq!(existed, "yes", "the cache was gone while the child still ran");
+        assert!(!cache.exists(), "the cache outlived the waited child");
+
+        // Dropped mid-run: a fresh cache, removed once Drop has reaped the child.
+        let dropped = stub_checkout(&outer.path().join("dropped"), true);
+        let child = SubmoduleFixtureChild::spawn_with_cache_base(
+            &dropped,
+            None,
+            &outer.path().join("dropped-result.json"),
+            &ledger,
+            Some(base.clone()),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !dropped.join("scripts/record").exists() {
+            assert!(std::time::Instant::now() < deadline, "the stub never ran");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let (second, existed) = stub_record(&dropped);
+        assert_ne!(second, cache, "the cache was reused, not fresh");
+        assert!(second.starts_with(&base));
+        assert_eq!(existed, "yes");
+        assert!(second.exists());
+        drop(child);
+        assert!(!second.exists(), "the cache outlived the dropped child");
+
+        // Prepared: the caller's XDG_CACHE_HOME is passed through unchanged.
+        let prepared = stub_checkout(&outer.path().join("prepared"), false);
+        let checkout = outer.path().join("prepared-checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        let child = SubmoduleFixtureChild::spawn_with_cache_base(
+            &checkout,
+            Some(&prepared),
+            &outer.path().join("prepared-result.json"),
+            &ledger,
+            Some(base.clone()),
+        )
+        .unwrap();
+        assert_eq!(child.wait().unwrap().status.code(), Some(1));
+        let (seen, _) = stub_record(&prepared);
+        let inherited = std::env::var_os("XDG_CACHE_HOME")
+            .filter(|value| !value.is_empty())
+            .map_or_else(|| PathBuf::from("unset"), PathBuf::from);
+        assert_eq!(seen, inherited, "the prepared child's cache was overridden");
+        assert_eq!(private_caches(&base), 0, "a private cache was left behind");
+    }
+
+    #[test]
+    fn private_caches_left_by_killed_runs_are_swept() {
+        let base = tempfile::tempdir().unwrap();
+        let stale = base
+            .path()
+            .join(format!("{SUBMODULE_FIXTURE_CACHE_PREFIX}stale"));
+        let fresh = base
+            .path()
+            .join(format!("{SUBMODULE_FIXTURE_CACHE_PREFIX}fresh"));
+        let unrelated = base.path().join("rust-script");
+        for dir in [&stale, &fresh, &unrelated] {
+            std::fs::create_dir_all(dir.join("binaries")).unwrap();
+        }
+        let old = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(SUBMODULE_FIXTURE_CACHE_STALE_SECONDS + 60);
+        for dir in [&stale, &unrelated] {
+            std::fs::File::open(dir).unwrap().set_modified(old).unwrap();
+        }
+        remove_stale_submodule_fixture_caches(base.path(), std::time::SystemTime::now());
+        assert!(!stale.exists(), "a stale private cache was kept");
+        assert!(fresh.exists(), "a cache a live child may use was removed");
+        assert!(unrelated.exists(), "a directory that is not a private cache was removed");
+    }
+
+    #[test]
+    fn a_child_killed_at_its_bound_is_reported_as_killed() {
+        let fixture = tempfile::tempdir().unwrap();
+        let ledger = fixture.path().join("ledger");
+        let stdout = fixture.path().join("child.stdout");
+        let stderr = fixture.path().join("child.stderr");
+        std::fs::write(&ledger, b"").unwrap();
+        std::fs::write(&stdout, b"").unwrap();
+        std::fs::write(&stderr, b"").unwrap();
+        // `timeout` exits 124 when it kills its child.
+        let child = Command::new("sh").args(["-c", "exit 124"]).spawn().unwrap();
+        let killed = SubmoduleFixtureChild {
+            child: Some(child),
+            started: std::time::Instant::now(),
+            stdout,
+            stderr,
+            ledger_before: submodule_ledger_identity(&std::fs::symlink_metadata(&ledger).unwrap()),
+            ledger,
+            _rust_script_cache: None,
+        };
+        let error = killed.wait().expect_err("a killed child was treated as finished");
+        assert!(
+            error.contains(&format!(
+                "killed at its {SUBMODULE_FIXTURE_CHILD_SECONDS}-second bound"
+            )),
+            "{error}"
+        );
+    }
 
     #[test]
     fn source_and_agent_utils_mismatches_refuse_prepared_reuse() {
