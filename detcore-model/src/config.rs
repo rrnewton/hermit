@@ -236,9 +236,11 @@ pub struct Config {
     /// running them or hold for ever, so it names none unless this says that
     /// no filter applies, and records a determinism loss instead.
     ///
-    /// The host measures it while it prepares the backend configuration; not
-    /// measured, it is unknown. It has no legacy key: [`to_legacy_backend_json`]
-    /// leaves it out and [`from_legacy_backend_json`] reads it back as unknown.
+    /// The caller that starts the guest states it, as only the caller knows
+    /// the filters its launch installs, such as those of a `pre_exec`
+    /// callback; `hermit run` measures it. Not stated, it is unknown. It has
+    /// no legacy key: [`to_legacy_backend_json`] leaves it out and
+    /// [`from_legacy_backend_json`] reads it back as unknown.
     #[serde(default)]
     #[clap(skip)]
     pub inherited_seccomp: InheritedSeccomp,
