@@ -22,12 +22,13 @@ test:
         ci:
           ptrace: true
           sabre: false
+          kvm: true
         backends_enabled:
           - ptrace
           - sabre
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
@@ -94,9 +95,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: This determinism cell calibrates the ptrace strict-verify baseline; qualify DBT separately
-          kvm: This determinism cell calibrates the ptrace strict-verify baseline; qualify KVM separately
           sabre: This determinism cell calibrates the ptrace strict-verify baseline; qualify SaBRe separately
           liteinst: This determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately
       naked:
@@ -214,9 +215,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: This determinism cell calibrates the ptrace strict-verify baseline; qualify DBT separately
-          kvm: This determinism cell calibrates the ptrace strict-verify baseline; qualify KVM separately
           sabre: This determinism cell calibrates the ptrace strict-verify baseline; qualify SaBRe separately
           liteinst: This determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately
       naked:
@@ -279,9 +280,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: DBT was observed emitting a raw host tid in DETLOG records; this fixture is the gate for enabling it
-          kvm: KVM compares output only and cannot assert DETLOG identity yet
           sabre: Not yet qualified for the pid-identity fixture
           liteinst: Not yet qualified for the pid-identity fixture
       naked:
@@ -461,9 +462,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: This condvar/futex determinism cell calibrates the ptrace strict-verify baseline; qualify DBT separately
-          kvm: This condvar/futex determinism cell calibrates the ptrace strict-verify baseline; qualify KVM separately
           sabre: This condvar/futex determinism cell calibrates the ptrace strict-verify baseline; qualify SaBRe separately
           liteinst: This condvar/futex determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately
       naked:
@@ -591,6 +592,7 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         guest_args:
           ptrace:
             - contention
@@ -600,7 +602,6 @@ test:
             - "contention"
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
@@ -704,12 +705,13 @@ test:
         ci:
           ptrace: true
           sabre: false
+          kvm: true
         backends_enabled:
           - ptrace
           - sabre
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
