@@ -1,9 +1,11 @@
 # Inherited seccomp filters as an explicit run input
 
-Status: design, revision 2. The direction was approved on 2026-10-08. Revision 1
-received a design review that requested changes; this revision answers every
-finding (see "Review response" at the end). It lands together with its
-implementation; nothing here is built yet.
+Status: design, revision 3. The direction was approved on 2026-10-08. Revision 1
+was reviewed and changes were requested; revision 2 answered the review with
+per-call checking on every filtered host. The owner rejected that cost on
+2026-10-08 ("I definitely don't want 3x ptrace stops"), so this revision makes
+normal transport the design and keeps per-call checking as an opt-in paranoid
+mode. It lands together with its implementation; nothing here is built yet.
 Tracking issue: https://github.com/rrnewton/hermit/issues/3942.
 
 ## Background
@@ -32,6 +34,27 @@ The owner's direction (2026-10-08, in the tracking issue) has five points:
 5. Detect host interference exactly, per call, in a paranoid debugging mode.
 
 Points 1 to 3 carry over below. Point 4 had to be replaced: the BPF cannot be read from inside, but its effect can be measured. Point 5 holds, with one exception.
+
+### Why host-blocked calls cannot be classified after the fact
+
+It is natural to expect Hermit to notice afterwards when a call failed because
+of a filter. It cannot, for two separate reasons:
+
+1. **Hermit never sees the return.** In normal transport, a call the host filter
+   blocks produces no ptrace stop at all. The kernel returns the errno straight
+   to the guest (measured: 0 stops for the blocked call). Hermit could see the
+   return only by stopping at every syscall exit, which is the cost the owner
+   rejected.
+2. **The value is ambiguous anyway.** A filter returns whatever errno it chooses
+   (Docker's default is EPERM), and EPERM also comes from ordinary permission
+   checks. In the prototype, `setuid(0)` as non-root and a filtered `getppid`
+   both returned `-1 EPERM`. They differ only in whether Hermit's TRACE stop
+   arrived, which can be seen only with the extra stops.
+
+What Hermit can do cheaply is control an experiment: the startup probe issues
+calls it chose itself and checks for its own TRACE stop on each one. That is
+why drift detection happens at startup, against recorded observations, and not
+during the run.
 
 ## Prototype results
 
@@ -85,50 +108,70 @@ Measured against a test inherited filter (`uname` → EACCES, `getppid` → EPER
 - **Argument-conditional rules are seen only at the probed arguments.** `personality(0xffffffff)` → EINVAL read as allow, because the probe passed zero. The probe fingerprints what the host does at canonical arguments; it is not a decompilation of the filter. Rules that depend on arguments must be declared in the run config. Exact capture needs a reader outside the container (phase 5).
 - **A host filter that uses USER_NOTIF cannot be probed safely.** Such a filter hands calls to a user-space supervisor, which may act on them; the issue already puts filters that fake results out of scope. The probe would give such a supervisor zero-argument calls. Detecting this case before probing is an open question (below).
 
-## The guarantee
+## The guarantee, and its limits
 
-With an inherited filter and a run config that declares a seccomp policy, the
-guest observes **exactly the declared policy for every system call it makes, or
-the run stops** with a refusal naming the call on which the host disagreed.
-Without an inherited filter, the same declared policy gives the same guest
-observations, the same Detcore accounting (syscall counts, virtual time,
-happens-before anchors, DETLOG records) and the same replay events.
+With an inherited filter, Hermit runs only when the run config acknowledges it.
+At startup the host's measured actions must equal the declared policy at every
+observed system-call number, or the run is refused. During the run, a declared
+deny returns its declared result through Detcore without an extra ptrace stop,
+in the same way inside and outside a container.
 
-What makes that guarantee checkable is the per-call check in section 3, not
-any startup sample. Startup observations (section 4) are early warnings and the
-input to capture; they never certify that a policy is complete.
+**Limits, stated plainly:**
 
-This is the guarantee of option A. The owner is choosing between it and a
-cheaper option B with a weaker, stated guarantee; see "Owner decision:
-transport on hosts with inherited filters".
+1. **Host-blocked calls are invisible to Detcore.** Inside a container, a call
+   the host blocks never reaches Hermit: no syscall count, no virtual-time
+   charge, no DETLOG record, no happens-before anchor, no replay record.
+   Section 3 makes declared denies equally invisible outside the container, so
+   for every call covered by a declared rule, accounting is the same in both
+   places. Accounting differs only for a call the host blocks that the declared
+   policy does not cover: that is, drift (limit 2) or an argument-conditional
+   host rule nobody declared (limit 3). There, the guest silently gets the
+   host's result inside the container and the real call outside, and INFO logs,
+   syscall counts and virtual time diverge between the two. On one host, runs
+   remain deterministic, because the host filter is a fixed function of the
+   call.
+2. **Drift is detected only at the sampled points.** The startup probe compares
+   the host's actions at the probed numbers and argument vectors. A host change
+   that affects only other arguments, unprobed numbers or a different
+   instruction pointer goes unnoticed until someone runs with
+   `--seccomp-paranoid`.
+3. **Argument-conditional host rules stay invisible** unless the operator
+   declares them. The probe sees them only at its own arguments.
+4. **A supervisor-backed (USER_NOTIF) host filter** may act on calls the probe
+   issues before the probe can tell. This is bounded but not removed
+   (section 4).
+
+`--seccomp-paranoid` (section 9) removes limits 1 to 3 for one run, at about
+2.9× per traced call. It checks every call and stops the run on the first call
+where the host disagrees with the declared policy.
 
 ## Design
 
 ### 1. Admission at startup
 
 Admission runs once, in the parent, before stdin is read and before either
-`--verify` child exists. Its steps, in order:
+`--verify` child exists.
 
 1. Read `Seccomp`, `Seccomp_filters` and `NoNewPrivs` from `/proc/self/status`.
-   - **Mode 0:** nothing is inherited. A declared policy is enforced in Detcore (section 3).
+   - **Mode 0:** nothing is inherited. A declared policy is enforced as in section 3.
    - **Mode 1 (strict):** refuse; Hermit cannot run.
-   - **Mode 2:** continue to step 2.
-2. **The run config does not acknowledge the filter** (it has no `seccomp:` section): apply the unacknowledged-filter policy below. The default refuses **without probing**. Probing is never done on a host that has not consented to it (section 4).
+   - **Mode 2:** continue.
+2. **The run config does not acknowledge the filter** (it has no `seccomp:` section): apply the unacknowledged-filter policy below. The default refuses **without probing**.
 3. **The run config acknowledges it:**
-   - Check the transport prerequisites: ptrace is permitted, and the designated null call (section 3) is allowed by the host according to the recorded evidence.
-   - If the run config records observations and does not say `probe: never`, run the startup probe as an early drift check (section 4). A difference refuses, listing old and new rows.
-   - Run with entry-stop interception (section 3).
+   - Unless the section says `probe: never`, run the startup probe (section 4, about 6 ms) and compare its canonical observation rows with the recorded ones.
+   - A difference refuses, listing each changed number with its old and new action.
+   - Then apply the **equality check**: at every observed number, the declared policy's action at the probed arguments must **equal** the observed host action (the same action, errno and TRAP data). It must not be merely stronger. Under normal transport, Detcore never sees a call the host blocks, so it could not enforce a stronger declared rule there; refusing at admission keeps the run config truthful.
 
 **The unacknowledged-filter policy is a single switch.** The case "an inherited filter is present and the run config does not acknowledge it" is decided by one enumeration with two values, in exactly one function that every caller consults:
 
 - `Error` (the default): refuse before the guest starts, as a policy refusal (exit 122), with the remedies in section 7.
 - `Warning`: print the same text as a warning, write it to the run's evidence, and continue. The run is then not reproducible from its config, and its `--verify` and `--run-evidence-dir` records say so.
 
-The default stays `Error` until the owner decides otherwise, and changing it is a one-line change. No other case has a switch: a changed observation and a host that disagrees with the declared policy at runtime always refuse.
+Changing the default is a one-line change. No other case has a switch: changed observations and a failed equality check always refuse.
 
 ### 2. The `seccomp:` section of the run config
 
-It is OCI/Docker-profile-shaped and typed. Its `inherited` block holds evidence about the host and is never itself a policy:
+It is OCI/Docker-profile-shaped and typed. The `inherited` block is evidence about the host, never itself a policy:
 
 ```yaml
 seccomp:
@@ -152,182 +195,161 @@ seccomp:
       numbers: "0-511"
       argument_vectors: [zero]
       kernel_passthrough: [335, 336]   # detected on the capture host, not assumed
-      null_call: getpid
     observations:                   # canonical rows; every other probed number was observed allowed
       - {nr: 63, name: uname, action: errno, errno: 13}
       - {nr: 110, name: getppid, action: errno, errno: 1}
-      - {nr: 163, name: acct, action: trap, data: 0}
-      - {nr: 246, name: kexec_load, action: kill_process}
-    observations_sha256: <hex>      # over the canonical rows, for quick comparison only
-    filters: 1                      # Seccomp_filters at capture; informational only
+    observations_sha256: <hex>      # over the canonical rows; a shortcut only
+    filters: 1                      # Seccomp_filters at capture; informational
 ```
 
-- **Rule actions:** ALLOW, LOG (the same as allow for the guest), ERRNO, TRAP (with its data), KILL_THREAD and KILL_PROCESS. Default actions: ALLOW and ERRNO.
-- **Argument operators:** OCI's `NE`, `LT`, `LE`, `EQ`, `GE`, `GT` and `MASKED_EQ`.
-- **Refused, each with a message:** `SCMP_ACT_NOTIFY`, `SCMP_ACT_TRACE`, `listenerPath`, and filter `flags`.
-- **Unknown keys are refused**, as everywhere else in the run config.
-- **Typed load and save.** The run config's existing loader turns option keys into command-line tokens, and a typed section cannot travel that way. The loader therefore returns the parsed `seccomp` section alongside the rewritten argv, `RunOpts` carries it, and `--save-config` writes it back unchanged. A load-save-load test pins this.
+- **Rule actions:**
+  - ALLOW, LOG (the same as allow for the guest) and ERRNO in phase 2.
+  - TRAP (with its data), KILL_THREAD and KILL_PROCESS later (section 3). Until then, a declared rule with one of these actions, or an observed host rule that would require one, is refused with a message naming the rule.
+- **Default actions:** ALLOW and ERRNO.
+- **Argument operators:** OCI's `NE`, `LT`, `LE`, `EQ`, `GE`, `GT` and `MASKED_EQ`, applied to argument registers (as seccomp does), never to memory.
+- **Refused, each with a message:** `SCMP_ACT_NOTIFY`, `SCMP_ACT_TRACE`, `listenerPath`, filter `flags`, and unknown keys.
+- **Typed load and save.** The run config's loader turns option keys into command-line tokens, and a typed section cannot travel that way. The loader therefore returns the parsed section beside the rewritten argv, `RunOpts` carries it, and `--save-config` writes it back unchanged. A load-save-load test pins this.
 - **Recapture** replaces the `inherited` block and the `origin: observed` rules, and keeps every `origin: declared` and `origin: profile` rule.
-- `--passthru-opt` (a partial syscall subscription) is refused together with a `seccomp` section, because unsubscribed calls would bypass Detcore.
+- **`--passthru-opt`** (a partial syscall subscription) is refused together with a `seccomp` section, because unsubscribed calls bypass Detcore and the declared denies.
 
-### 3. Enforcement: Detcore decides once per call, at the first stop
+### 3. Enforcement: a Detcore deny check that accounting never sees
 
-Detcore's syscall dispatch matches the declared rules before any handler runs. A match does one of:
-- returns the errno;
-- delivers a deterministic SIGSYS with seccomp `siginfo` (`si_code = SYS_SECCOMP`, the call's number and architecture, and the rule's data in `si_errno`) for TRAP;
-- kills the thread or the process for KILL_THREAD and KILL_PROCESS.
+The declared rules compile into a lookup that Detcore consults first in its
+syscall event handler. That means before the signal-phase check, before the
+scheduler check-in (`pre_handler_hook`), and before the DETLOG record, the
+syscall count and the virtual-time charge. A match skips the call and returns
+the declared errno, then returns from the handler. It commits no scheduler
+turn, charges no time, counts nothing and writes no INFO record; it is logged
+at DEBUG, outside the compared INFO stream. Every backend that hosts Detcore
+gets the same check, and none of them needs an extra stop:
+- under ptrace, the check runs at the TRACE stop that every call already has in a fail-closed run;
+- in-guest backends run it at their existing dispatch.
 
-The result is a pure function of the system-call number and the argument registers, so it is deterministic, and every match is logged in DETLOG. A stacked BPF filter was rejected because point 5 shows that its ERRNO would hide the call from the scheduler, DETLOG and the record. Backends without seccomp (KVM, in-guest LiteInst, DBT) would not apply it at all.
+**Why the deny is invisible to accounting.** Inside a container, a call the
+host blocks never reaches Detcore. The equality check (section 1) makes every
+observed host-blocked call a declared deny. If Detcore accounted declared
+denies outside the container, the same run would count, charge and log a call
+there that it never sees inside. Making the deny invisible in both places is
+what keeps accounting identical for every declared call (limit 1).
 
-**The logical event.** Each guest system call produces exactly one Detcore decision. All accounting attaches to that decision: the syscall count, the virtual-time charge, happens-before anchors, the DETLOG record and the replay record. Later ptrace stops for the same call update only transport state. So the transport can change without changing anything the guest or the log can observe.
-
-**Mode 2: entry-stop interception.** On a host with inherited filters, Reverie resumes guest threads with `PTRACE_SYSCALL`. The prototype showed that the syscall-entry stop arrives **before** any seccomp filter runs, so Detcore decides there:
-
-- **Declared deny:** the call must not reach the host. At the entry stop, the tracer rewrites the syscall number to the *null call*. That is a call whose number the evidence shows the host allows (`getpid` by default, checked at admission). At the exit stop it sets the declared result. The rewrite is verified at the exit stop, which must report the null call's number; anything else stops the run. The host filter never sees the denied call, so a declared deny is enforced even when the host would have done something weaker or different.
-- **Declared allow:** the call continues into the filter stack.
-  - If Hermit's TRACE stop arrives, the call proceeds as today, but without accounting it a second time.
-  - If the exit stop arrives with no TRACE stop, and the call is not in an expected-no-TRACE context (below), the host has blocked a call the declared policy allows. The run stops with a typed refusal naming the call, its arguments and the host's result. This is where the guarantee is enforced: hidden drift, argument-conditional host rules and incomplete observations all surface here, exactly, on the first call they affect.
-
-**Mode 0: normal transport.** On a host without inherited filters, the TRACE stop is the first stop and Detcore decides there, as today. The acceptance tests compare complete observations between the two transports.
-
-Entry-stop interception costs two extra ptrace stops per call, measured at about 2.9× per traced call (section "Point 5 holds"). It applies only on hosts with inherited filters.
-
-`--seccomp-paranoid` forces entry-stop interception on a mode-0 host. It replaces revision 1's paranoid mode, whose test is now always on wherever it matters. It exists to test the transport.
-
-**Transport state machine (per thread).** Below, "entry", "exit" and "TRACE" are stops; "call" is the logical event.
-
-| context | stops seen | TRACE expected | Detcore decision |
-| --- | --- | --- | --- |
-| ordinary guest call | entry, TRACE, exit | yes | at entry |
-| declared deny (rewritten to the null call) | entry, TRACE (null call), exit | yes, for the null call | at entry; the null call's TRACE stop is transport only |
-| `rt_sigreturn` (Hermit's filter allows it) | entry, exit | no | none, as today: Detcore does not see it |
-| a call Reverie injects (from its private instruction window, which Hermit's filter allows) | entry, exit | no | none: the tracer knows it injected the call |
-| a kernel passthrough number (uretprobe, uprobe) | entry, exit (or SIGILL) | no | none, as today; counted in a transport counter |
-| a call interrupted by a signal | entry, [TRACE], exit with `-ERESTART*`, signal stop, then a new entry for the restart | per the restarted call | once, for the original call; the restart is transport |
-| `execve` | entry, TRACE, `PTRACE_EVENT_EXEC`, exit | yes | at entry |
-| the thread dies inside the call (a sibling's `exit_group`, KILL) | entry, [TRACE], `PTRACE_EVENT_EXIT` | n/a | at entry |
-| `clone` | the parent's entry, TRACE and exit; the child's first stop is not a syscall stop | yes, for the parent | at the parent's entry |
-
-The kernel passthrough list is a per-architecture, per-kernel capability. It is detected by the probe (a passthrough number gets no TRACE stop even on a mode-0 host, and raises SIGILL outside the uprobe trampoline), recorded in the evidence, and its calls are counted in a visible transport counter, never as host interference. It is not an unconditional numeric skip.
+**Alternative considered: Hermit's own seccomp ERRNO rules.** The ptrace
+backend could add ERRNO rules for the declared denies to the filter it already
+installs. The kernel would then return the errno with no stop at all, and the
+calls would be invisible to Detcore by construction. That needs a change to
+Reverie's filter construction (the filter is built from the Tool's syscall
+subscription in reverie-ptrace), which is a Reverie interception-model change
+under the project's review rules. It would also cover only seccomp-based
+backends. The Detcore check is a Hermit-only change, applies to every backend,
+and is exact for ERRNO. The BPF route stays the candidate for TRAP and KILL,
+whose kernel semantics (the real SIGSYS `siginfo`, the kill scope) a filter
+reproduces exactly and an emulation would have to match field by field.
 
 ### 4. Observing the host: the safe probe
 
-The probe runs only with consent: through the explicit capture command (section 5), or as the startup drift check of a run config that already records observations. It probes no number other than the canaries until every condition below holds. A failed condition refuses capture (exit 122) and names the condition.
+The probe runs only with consent: through the explicit capture command
+(section 5), or as the startup drift check of a run config that already records
+observations. It probes no number other than the canaries until every condition
+below holds. A failed condition refuses (exit 122) and names the condition.
 
 1. **A sacrificial child.** It is single-threaded, in its own session and process group (so `kill(0, …)` reaches only itself), with every file descriptor closed. It also unshares user, PID, network and mount namespaces where the host allows that; this is recorded either way.
-2. **Non-dumpable, checked positively.** After `PR_SET_DUMPABLE 0`, the tracer checks that `/proc/<child>/status` is owned by root, which the kernel does only for a non-dumpable task. That was measured: `uid 0` versus the tracer's own uid for a dumpable control. Without this, every KILL rule invokes the host's core handler (about 400 ms each when cores are piped to a user-space handler).
-3. **Filter installation checked positively.** `Seccomp_filters` in `/proc/<child>/status` must go up by exactly one after the probe child installs Hermit's filter. A return code from `seccomp()` is not evidence, because an inherited `ERRNO(0)` can fake it.
-4. **Skipping checked on canaries.** The tracer skips `getpid`, then `gettid`, at their TRACE stops (`orig_rax = -1`). Each exit stop must report `-ENOSYS` (measured: `-38`) and not a process or thread ID. That shows the tracer's register write took effect, even if an inherited `ERRNO(0)` aimed at `ptrace` returned success.
-5. **No fake success and no supervisor.** Any probed number that returns without a TRACE stop and with a non-negative result aborts the probe, and the host is refused as unsupported ("a filter fakes success or a supervisor answers calls"). This catches `ERRNO(0)`, and USER_NOTIF answers other than errors, on every number the probe reaches. The canaries are probed first.
+2. **Non-dumpable, checked positively.** After `PR_SET_DUMPABLE 0`, `/proc/<child>/status` must be owned by root, which the kernel does only for a non-dumpable task. That was measured: uid 0, versus the tracer's own uid for a dumpable control child. Without this, every KILL rule invokes the host's core handler (about 400 ms each when cores are piped to a user-space handler).
+3. **Filter installation checked positively.** `Seccomp_filters` in `/proc/<child>/status` must go up by exactly one after the child installs Hermit's filter. A return code is not evidence, because an inherited `ERRNO(0)` can fake it.
+4. **Skipping checked on canaries.** The tracer skips `getpid`, then `gettid`, at their TRACE stops (`orig_rax = -1`). Each exit stop must report `-ENOSYS` (measured: `-38`), not an ID. That shows the tracer's register write took effect, even if an `ERRNO(0)` aimed at `ptrace` returned success.
+5. **No fake success and no supervisor.** A probed number that returns without a TRACE stop and with a non-negative result aborts the probe. The host is refused as unsupported ("a filter fakes success or a supervisor answers calls"). The canaries are probed first.
 6. **Signals checked.** A SIGSYS stop counts as a TRAP only with `si_code == SYS_SECCOMP`, `si_syscall` equal to the probed number and `si_arch` equal to the probed architecture. Its `si_errno` is recorded as the TRAP's data. Any other signal aborts the probe.
-7. **Kill scope resolved.** A number that kills the single-threaded child is probed again from the second thread of a two-thread child. If only that thread dies, the rule is KILL_THREAD; otherwise it is KILL_PROCESS. If neither outcome is clean, the number is left out of the captured rules and named in the output, for the operator to declare.
-8. **Bounded.** Every probed number has a deadline (proposed: 100 ms), and the whole probe has one too. On expiry the child is killed and capture is refused ("a probed call blocked; a supervisor may be holding it").
+7. **Kill scope resolved.** A number that kills the single-threaded child is probed again from the second thread of a two-thread child, which distinguishes KILL_THREAD from KILL_PROCESS. If neither outcome is clean, the number is left out and named, for the operator to declare.
+8. **Bounded.** Every probed number has a deadline (proposed: 100 ms), and the whole probe has one too. On expiry the child is killed and the probe refuses ("a probed call blocked; a supervisor may be holding it").
 
-**Residual risk, stated plainly.** A USER_NOTIF supervisor that answers `CONTINUE` for a number the probe reaches before step 5 can catch it runs that call in the sacrificial child, with zero arguments. Conditions 1 and 8 bound the damage; nothing removes it. That is why probing needs consent, why `probe: never` exists, and why the per-call check in section 3, not the probe, carries the guarantee.
+**Residual risk.** A USER_NOTIF supervisor that answers `CONTINUE` for a number
+the probe reaches before step 5 catches it runs that call in the sacrificial
+child, with zero arguments. Conditions 1 and 8 bound the damage; nothing removes
+it. That is why probing needs consent and why `probe: never` exists.
 
-**Evidence is sampled.** The probe observes the host only at the probed numbers, architecture and argument vectors. Two filters that differ only on a non-zero `ioctl` request produce identical observations. Revision 1 overclaimed here: observations never establish that a declared policy dominates the host, and Hermit never claims they do. Dominance is checked per call at runtime (section 3). Authoritative evidence about the whole filter comes only from an operator-supplied profile or a host-side reader (section 5).
+**Evidence is sampled.** Two filters that differ only on a non-zero `ioctl`
+request produce identical observations. Observations never establish that the
+declared policy matches the host everywhere (limits 2 and 3). Authoritative
+evidence about the whole filter comes only from an operator-supplied profile or
+a host-side reader (section 5), and exact per-call evidence only from
+`--seccomp-paranoid`.
 
 ### 5. Capture and profiles
 
-- `hermit run --capture-seccomp --save-config FILE [OPTIONS] [-- PROGRAM ARGS]` runs admission step 1 and the safe probe (section 4). It then writes the run config with the `seccomp` section (merged as in section 2), prints a summary of the observed rows, and **exits 0 without running the guest**. This is the bootstrap that the default refusal points to.
-- `--seccomp-profile PROFILE.json` imports an OCI profile, for example the container runtime's own default profile, as the declared policy, with `evidence: profile`. An imported profile is the operator's statement about the host. It is still checked per call at runtime, and if observations exist, Hermit compares the two and reports any difference.
-- Later, optionally: `hermit seccomp capture --pid PID`, run on the host outside the container. Where the kernel allows it (`CONFIG_CHECKPOINT_RESTORE`, `CAP_SYS_ADMIN`, and the caller itself unfiltered), it reads the real BPF and emits exact argument rules with `evidence: profile`.
+- `hermit run --capture-seccomp --save-config FILE [OPTIONS] [-- PROGRAM ARGS]` runs admission step 1 and the safe probe. It then writes the run config with the `seccomp` section (merged as in section 2), prints the observed rows, and **exits 0 without running the guest**. This is the bootstrap that the default refusal points to.
+- `--seccomp-profile PROFILE.json` imports an OCI profile, for example the container runtime's own default profile, as the declared policy, with `evidence: profile`. If observations exist, the equality check compares them with the profile at the observed numbers.
+- Later, optionally: `hermit seccomp capture --pid PID`, run on the host outside the container. Where the kernel allows it (`CONFIG_CHECKPOINT_RESTORE`, `CAP_SYS_ADMIN`, and the caller itself unfiltered), it reads the real BPF and emits exact argument rules.
 
 ### 6. Guest-visible seccomp metadata
 
-Detcore's procfs sanitizer passes `Seccomp_filters` through today, so a guest would see the physical stack, and a run inside a container would differ from the same run outside it. Detcore instead presents the fields from the explicit policy:
-
+Detcore's procfs sanitizer passes `Seccomp_filters` through today, so the
+physical filter stack would show, and a run inside a container would differ
+from the same run outside it. Detcore instead presents the fields from the
+explicit policy:
 - `Seccomp: 2`.
 - `Seccomp_filters`: what a guest sees today with Hermit's filter alone, plus one when the run config declares a `seccomp` section.
 - `NoNewPrivs`: the value Reverie establishes.
 
-Neither stripping the fields (which weakens verification) nor requiring the physical count to match (which contradicts outside-container reproduction) is acceptable.
-
 ### 7. Refusal messages
 
-Each refusal says what failed and what to run next. "No acknowledgement" and "an operation the host denies" are kept apart:
+Each refusal names what failed and what to run next.
 
 - **An inherited filter that is not acknowledged** has three remedies:
-  - capture it: `hermit run --capture-seccomp --save-config run.yaml …`, then `hermit run --config run.yaml` (sampled evidence);
+  - capture it: `hermit run --capture-seccomp --save-config run.yaml …`, then `hermit run --config run.yaml`;
   - import the runtime's profile with `--seccomp-profile PROFILE.json`;
   - or run in a container created without a filter (for Docker, `--security-opt seccomp=unconfined`). A filter cannot be removed from inside a running container, so the container has to be recreated.
-- **Ptrace denied**, for example a container without `SYS_PTRACE`: say so separately. Granting ptrace does not remove the seccomp filter or acknowledge it.
-- **Capture refused:** name the probe-safety condition that failed (section 4).
+- **Ptrace denied:** said separately. Granting ptrace (for example `--cap-add=SYS_PTRACE`) neither removes the filter nor acknowledges it.
+- **A failed equality check:** name the number, the declared action and the observed host action.
+- **A refused capture:** name the probe-safety condition that failed.
 
 ### 8. Record and replay, and `--verify`
 
-- **Recording metadata** (which has no policy field today) gains the resolved policy and the evidence block, including the probe version.
-- `hermit record` and `hermit replay` go through the same admission as `hermit run`. Replay enforces the recorded policy for the calls it executes; replayed results come from the log.
-- **A replay host with inherited filters** is compared with the recording's evidence like any run config. If it differs, or the recording has no evidence, replay refuses with the capture remedy.
-- **Recordings made before this change** have no policy field. They replay as today on mode-0 hosts and are refused on mode-2 hosts, unless the replay command line supplies a run config that acknowledges the filter.
-- **`run --verify`:** admission runs once in the parent, and both children receive the same resolved policy and transport.
+- **Recording metadata**, which has no policy field today, gains the resolved policy and the evidence block.
+- **`hermit record` and `hermit replay`** go through the same admission as `hermit run`. Replay enforces the recorded declared policy for the calls it executes; replayed results come from the log.
+- **A replay host with inherited filters** is compared with the recording's evidence like any run config. If it differs, or the recording has none, replay refuses with the capture remedy.
+- **Recordings made before this change** replay as today on mode-0 hosts, and are refused on mode-2 hosts unless the replay command line supplies a run config that acknowledges the filter.
+- **`run --verify`:** admission runs once in the parent, and both children receive the same resolved policy.
 
-## Owner decision: transport on hosts with inherited filters
+### 9. Paranoid mode: per-call checking (`--seccomp-paranoid`)
 
-Sections 1 to 8 describe option A, which revision 2 proposed. Option B is the cheaper alternative. Every
-default Docker container inherits a filter, so this choice sets the cost of
-running Hermit in a container at all.
+This is revision 2's entry-stop interception, demoted to an opt-in mode for
+runs where reproduction across hosts is in question. Reverie resumes guest
+threads with `PTRACE_SYSCALL`. The syscall-entry stop arrives before any
+seccomp filter runs, so for each call:
 
-**Option A: entry-stop interception on every filtered host** (section 3).
-Every guest call costs three ptrace stops instead of one, about 2.9× per
-traced call as measured. In exchange, the guest observes exactly the declared
-policy or the run stops on the first call where the host disagrees, and
-accounting is identical inside and outside the container.
+- If Hermit's TRACE stop arrives, the host allowed the call.
+- If the exit stop arrives with no TRACE stop, outside the expected-no-TRACE contexts below, the host blocked it.
+- A host-blocked call that the declared policy allows stops the run with a typed refusal naming the call, its arguments and the host's result.
 
-**Option B: normal transport, a startup probe, per-call checks only in
-paranoid mode.** Guest calls cost one stop, as today. Admission still refuses
-an unacknowledged filter, and the startup probe still compares observations.
-The per-call check runs only under `--seccomp-paranoid`. What B gives up,
-stated without softening:
+Cost: two extra stops per call, measured at about 2.9× per traced call.
 
-1. **A declared rule stronger than the host is not enforced on calls the host
-   blocks.** If the host returns ERRNO for a call, Hermit's TRACE stop never
-   arrives (point 5), so Detcore never sees the call. A declared KILL or TRAP
-   for it cannot apply; the guest gets the host's errno. Under B, admission
-   must therefore require the declared action to **equal** the observed host
-   action at every observed number, not merely be stronger, and must refuse
-   any declared rule it cannot enforce.
-2. **Accounting differs inside and outside the container for host-blocked
-   calls.** Outside, Detcore sees such a call: it is counted, charged virtual
-   time, logged in DETLOG, can anchor a happens-before edge, and is recorded.
-   Inside, none of that happens. The guest-visible result can match (Detcore
-   applies the same declared errno outside), but INFO logs, syscall counts and
-   virtual-time trajectories differ, so `--verify` comparisons and replay
-   across the two hosts are not expected to match whenever the guest makes
-   such a call. Within one host, runs are still deterministic: the host filter
-   is a fixed function of the call.
-3. **Drift is detected only at the sampled points.** The startup probe compares
-   observations at the probed numbers and argument vectors. A host change that
-   affects only non-zero arguments, unprobed numbers or a different
-   instruction pointer goes unnoticed, and the guest silently observes the new
-   host behavior. Under A, the per-call check would catch it on first use.
-4. **Argument-conditional host rules stay invisible** unless the operator
-   declares them. Under A, a mismatch stops the run; under B, the guest
-   observes whatever the host does.
-5. **What B keeps:** refusal of unacknowledged filters, the observation record
-   in the run config, drift detection at sampled points, guest-visible seccomp
-   metadata from the policy, record/replay admission, and exact per-call
-   checking whenever `--seccomp-paranoid` is given, for example when a run's
-   reproduction inside and outside a container is in question.
+**Paranoid mode only observes; it does not change guest-visible behavior.**
+Declared denies still go through the Detcore check (section 3). Detcore still
+decides each call once, at the same logical event as in normal transport. The
+extra entry and exit stops are transport only: they create no syscall event, no
+scheduler turn, no time charge and no replay record. A paranoid run of a
+compliant guest therefore produces the same outputs, INFO log and replay events
+as a normal run.
 
-| | Option A: entry-stop always | Option B: normal transport + probe |
-| --- | --- | --- |
-| cost per traced guest call on a filtered host | 3 stops, about 2.9× | 1 stop, as today |
-| startup cost on a filtered host | about 6 ms probe (when observations are recorded) | the same |
-| declared rule stronger than the host | enforced | refused at admission; must equal the host where observed |
-| host blocks a call the policy allows | run stops on that call | guest silently gets the host result, unless paranoid |
-| accounting inside versus outside a container | identical | differs for host-blocked calls |
-| drift on unsampled arguments or numbers | caught on first use | not detected, unless paranoid |
-| exact per-call check | always | only with `--seccomp-paranoid` |
+**Transport state machine (per thread).**
 
-A third shape is possible later: B by default, plus a run-config key
-(`seccomp.transport: entry-stop`) that turns on A for runs whose reproduction
-across hosts matters. That is B with the paranoid check as a recorded,
-per-run choice rather than a debug flag.
+| context | stops seen | TRACE expected | Detcore decision |
+| --- | --- | --- | --- |
+| ordinary guest call | entry, TRACE, exit | yes | at TRACE, as in normal transport |
+| declared deny | entry, TRACE, exit | yes | at TRACE; skipped and invisible (section 3) |
+| `rt_sigreturn` (Hermit's filter allows it) | entry, exit | no | none, as today |
+| a call Reverie injects (from its private instruction window, which Hermit's filter allows) | entry, exit | no | none; the tracer knows it injected the call |
+| a kernel passthrough number (uretprobe, uprobe) | entry, exit or SIGILL | no | none, as today; counted in a transport counter |
+| a call interrupted by a signal | entry, [TRACE], exit with `-ERESTART*`, signal stop, then a new entry for the restart | per the restarted call | once, for the original call |
+| `execve` | entry, TRACE, `PTRACE_EVENT_EXEC`, exit | yes | at TRACE |
+| the thread dies inside the call | entry, [TRACE], `PTRACE_EVENT_EXIT` | n/a | at TRACE, if it arrived |
+| `clone` | the parent's entry, TRACE and exit; the child's first stop is not a syscall stop | yes, for the parent | at the parent's TRACE |
+
+The kernel passthrough list is detected per kernel and architecture: such a
+number gets no TRACE stop even on a mode-0 host. It is recorded in the evidence
+and counted visibly, never reported as host interference.
 
 ## Acceptance matrix
 
-Every phase lands with the rows that apply to it. Each row asserts both the result and that no probed call executed where that is the point.
+Each phase lands with the rows that apply to it.
 
 - **Probe safety:**
   - USER_NOTIF answering `CONTINUE`, emulated success and emulated error, `ADDFD`, a missing listener and a hung one;
@@ -335,59 +357,60 @@ Every phase lands with the rows that apply to it. Each row asserts both the resu
   - a failed non-dumpable setup.
 
   Assert that no probed call executes, that no core handler runs, and that cleanup completes within the deadline.
-- **Signals and termination:**
+- **Signals and termination**, for the later TRAP and KILL phase:
   - an asynchronous SIGSYS versus a seccomp SIGSYS;
   - blocked, ignored and caught dispositions;
   - TRAP payload and registers;
   - KILL_THREAD with surviving siblings;
   - KILL_PROCESS with blocked siblings;
   - robust-futex and clear-TID cleanup.
-- **Negative controls for observations:**
-  - identical zero-argument observations with different argument, instruction-pointer or ABI behavior (the per-call check must catch it at runtime);
-  - unprobed numbers;
-  - changed TRAP data;
-  - changed kill scope;
-  - an extra ALLOW filter stacked on top.
-- **Full-observation equality:** the same declared policy with and without inherited filters, and entry-stop versus normal transport. Compare outputs, syscall counts, continuous virtual time, happens-before anchors, INFO logs, procfs seccomp fields and replay events.
-- **Transport transitions:** injection, skipping, restarts, `clone`, non-leader `exec`, fatal signals, `rt_sigreturn`, partial subscriptions (refused) and kernel passthrough numbers. Transport counters are checked separately from guest accounting.
+- **Observations:**
+  - recorded versus changed rows, including changed errno, TRAP data and kill scope;
+  - an extra ALLOW filter stacked on top (observations unchanged; guest-visible metadata unchanged);
+  - the equality check refusing a stronger declared rule.
+- **Invisible declared denies:** the same guest and the same declared ERRNO policy, run on a host whose filter blocks those calls and on a host with no filter. Outputs, syscall counts, continuous virtual time, happens-before anchors, INFO logs, procfs seccomp fields and replay events must all be equal.
+- **The stated limit, demonstrated:** a host rule on a non-zero argument that nothing declared. A normal run on that host and one off it differ, and `--seccomp-paranoid` on that host refuses on that call.
+- **Paranoid transport:** injection, skipping, restarts, `clone`, non-leader `exec`, fatal signals, `rt_sigreturn` and kernel passthrough numbers. Paranoid and normal runs of a compliant guest produce equal observations, and transport counters are checked separately from guest accounting.
 - **Config and replay:**
   - load-save-load preservation of the typed section;
   - command-line precedence;
   - recapture that keeps declared rules;
-  - drift rows that persist;
   - legacy recordings;
   - replay hosts with no, matching and changed filters.
 - **Refusal UX:**
   - run the printed remedy in a default Docker container;
   - refuse before any probe, guest launch or stdin read;
-  - keep unsupported capture, a missing acknowledgement and denied capabilities distinct.
+  - keep unsupported capture, a missing acknowledgement, denied capabilities and a failed equality check distinct.
 
 ## Phases (each lands separately)
 
-1. **Admission:** the `/proc` check, refusal before any probing, the policy switch, the refusal messages and guest-visible seccomp metadata. No probe and no enforcement yet, so mode-2 hosts always refuse under `Error`.
-2. **The typed `seccomp` section and Detcore enforcement on mode-0 hosts:** the logical event, TRAP and KILL semantics, recording metadata, and `--passthru-opt` refused with a section.
-3. **Entry-stop interception on mode-2 hosts:** the transport state machine and the per-call runtime check. `--seccomp-paranoid` is how this is tested on mode-0 hosts.
-4. **The safe probe and capture:** `--capture-seccomp`, observations, drift diagnostics and the kill-scope probe.
-5. **Profiles:** `--seccomp-profile` import, and optionally the host-side BPF reader.
+1. **Admission:** the `/proc` check, refusal before any probing, the policy switch, refusal messages and guest-visible seccomp metadata. No probe and no enforcement yet: mode-2 hosts refuse under `Error`.
+2. **The typed `seccomp` section and the invisible Detcore deny check for ERRNO rules:** recording metadata, and `--passthru-opt` refused with a section.
+3. **The safe probe, capture and the equality check:** `--capture-seccomp`, observation rows, drift diagnostics and the kill-scope probe.
+4. **`--seccomp-paranoid`:** the transport state machine.
+5. **TRAP and KILL rules:** through Hermit's own filter (Reverie change) or an exact Detcore emulation, decided then. Also `--seccomp-profile` import, and optionally the host-side BPF reader.
 
 ## Open questions
 
-1. **Detecting a USER_NOTIF host before probing.** No unprivileged signal is known to expose it. Revision 2's answer is layered: probing only with consent, the canaries and the fake-success abort (section 4, step 5), deadlines, and the per-call runtime check as the guarantee. Is that enough, or should mode-2 hosts without an imported profile refuse capture altogether?
-2. **Probe argument vectors.** A second vector (for example all bits set) costs about 6 ms and catches more argument-conditional rules. Since the runtime check now catches the rest, a single zero vector may be enough.
+1. **Detecting a USER_NOTIF host before probing.** No unprivileged signal is known to expose it. The answer here is layered: probing only with consent, the canaries and the fake-success abort, and deadlines. Should a mode-2 host without an imported profile refuse capture altogether instead?
+2. **Probe argument vectors.** A second vector (for example all bits set) costs about 6 ms and narrows limits 2 and 3 without closing them.
 3. **Run config schema version.** `hermit-run-config/v2` when `seccomp:` is accepted, or stay at v1, because the key only moves from refused to accepted. A v1 reader refuses the key, so either way an older Hermit fails safe on a newer file.
-4. **Transport on filtered hosts.** For the owner: option A, option B, or B with a per-run `entry-stop` key (see "Owner decision: transport on hosts with inherited filters").
 
-## Review response (revision 1 review, requested changes at a4327d92)
+## Review history
 
-| finding | resolution |
+**Revision 1** (a4327d92) received "changes requested". **Revision 2**
+(105cb732) answered every finding with per-call checking on every filtered
+host. The owner rejected that cost, so revision 3 answers the findings this way:
+
+| finding | resolution in revision 3 |
 | --- | --- |
-| 1. The probe can execute the probed call (USER_NOTIF `CONTINUE`, `ERRNO(0)`) | No probing without consent; refusal comes before probing (section 1). Positive checks for non-dumpability, filter installation and skipping; the fake-success abort; signal validation; deadlines (section 4). The residual risk is stated. |
-| 2. A stronger declared rule cannot be enforced on host-hidden calls; accounting differs | Entry-stop interception decides before any filter runs. A declared deny is rewritten to the null call so it never reaches the host. One logical event carries all accounting (section 3). |
-| 3. Observations prove sampled equality, not dominance | The guarantee is moved to the per-call runtime check. Observations are labelled sampled. Authoritative evidence comes only from profiles (sections 3, 4 and 5). |
-| 4. Kill scope, TRAP payload, asynchronous SIGSYS | Two-thread kill-scope probe, TRAP `si_errno` recorded, SIGSYS validated, unresolved numbers left out and named (section 4). |
-| 5. `Seccomp_filters` is guest-visible | The fields are presented from the explicit policy (section 6). |
-| 6. Paranoid mode needs a full tracing state machine | Per-thread transport table, with exactly one logical event per call. Passthrough numbers are detected and counted visibly (section 3). |
-| 7. Record and replay are unspecified | Metadata field, shared admission, replay-host comparison, legacy behavior, `--verify` (section 8). |
-| 8. Capture cannot get past the refusal; typed config transport | `--capture-seccomp` exits without running the guest. Typed section carried beside the argv; load-save-load test (sections 2 and 5). |
-| 9. A hash alone cannot give per-syscall drift diagnostics | Canonical observation rows plus probe coverage are stored; the hash is only a shortcut (section 2). |
-| 10. Docker remediation | Separate messages for a missing acknowledgement and for denied operations. Recreating the container is stated as the only way to drop a filter (section 7). |
+| 1. The probe can execute the probed call | No probing without consent; refusal comes before probing. Positive checks, the fake-success abort, signal validation and deadlines (section 4). The residual risk is stated. |
+| 2. A stronger declared rule cannot be enforced on host-hidden calls; accounting differs | The equality check refuses stronger declared rules (section 1). Declared denies are invisible to accounting, so declared calls account identically inside and outside a container (section 3). The remaining difference, on undeclared host blocks, is limit 1. Exact checking is available as `--seccomp-paranoid`. |
+| 3. Observations prove sampled equality, not dominance | Observations are labelled sampled. Drift off the samples is limit 2. Authoritative evidence comes only from profiles; exact evidence only from paranoid mode. |
+| 4. Kill scope, TRAP payload, asynchronous SIGSYS | The probe resolves kill scope and validates SIGSYS (section 4). TRAP and KILL enforcement is deferred to phase 5; until then such rules are refused. |
+| 5. `Seccomp_filters` is guest-visible | Presented from the explicit policy (section 6). |
+| 6. Paranoid mode needs a full tracing state machine | Section 9, with exactly one logical event per call. |
+| 7. Record and replay are unspecified | Section 8. |
+| 8. Capture cannot get past the refusal; typed config transport | `--capture-seccomp` exits without running the guest. Typed section carried beside the argv (sections 2 and 5). |
+| 9. A hash alone cannot give drift diagnostics | Canonical observation rows (section 2). |
+| 10. Docker remediation | Section 7. |
