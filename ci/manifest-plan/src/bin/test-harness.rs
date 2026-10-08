@@ -861,18 +861,18 @@ fn validate_args(command: &str, args: &Args) {
     {
         fail("--mode must be verify, chaos, replay, naked, or custom");
     }
-    if args
-        .selection
-        .backend
-        .as_deref()
-        .is_some_and(|backend| !matches!(backend, "ptrace" | "dbt" | "kvm" | "sabre" | "liteinst"))
-    {
+    if args.selection.backend.as_deref().is_some_and(|backend| {
+        !matches!(
+            backend,
+            "ptrace" | "dbt" | "kvm" | "sabre" | "liteinst" | "in-guest-trap"
+        )
+    }) {
         fail("--backend must name a Hermit backend");
     }
     if args.selection.exclude_backends.iter().any(|backend| {
         !matches!(
             backend.as_str(),
-            "ptrace" | "dbt" | "kvm" | "sabre" | "liteinst"
+            "ptrace" | "dbt" | "kvm" | "sabre" | "liteinst" | "in-guest-trap"
         )
     }) {
         fail("--exclude-backend must name a Hermit backend");
@@ -4212,7 +4212,8 @@ mod tests {
             let disabled = json!({"ci": false, "backends_enabled": [], "backends_disabled": {
                 "ptrace": "Not selected by this control", "dbt": "Not selected by this control",
                 "kvm": "Not selected by this control", "sabre": "Not selected by this control",
-                "liteinst": "Not selected by this control"
+                "liteinst": "Not selected by this control",
+                "in-guest-trap": "Not selected by this control"
             }});
             fs::write(manifests.join("parity.yaml"), serde_json::to_vec(&json!({
                 "schema": 3, "bucket": "parity", "test": [{
@@ -4221,12 +4222,12 @@ mod tests {
                     "observation": {"status": true, "stdout": true, "stderr": true},
                     "modes": {
                         "verify": {"ci": true, "backends_enabled": ["ptrace", "kvm"],
-                            "backends_disabled": {"dbt": "Not selected", "sabre": "Not selected", "liteinst": "Not selected"}},
+                            "backends_disabled": {"dbt": "Not selected", "sabre": "Not selected", "liteinst": "Not selected", "in-guest-trap": "Not selected"}},
                         "naked": {"ci": false, "backends_enabled": [],
                             "backends_disabled": {"native": "Not selected by this CI control"}},
                         "chaos": disabled, "replay": disabled,
                         "custom": {"ci": true, "backends_enabled": ["kvm"],
-                            "backends_disabled": {"ptrace": "Not selected", "dbt": "Not selected", "sabre": "Not selected", "liteinst": "Not selected"},
+                            "backends_disabled": {"ptrace": "Not selected", "dbt": "Not selected", "sabre": "Not selected", "liteinst": "Not selected", "in-guest-trap": "Not selected"},
                             "assert": {"runs": 1}}
                     }
                 }]
@@ -4604,14 +4605,15 @@ report.write_bytes((root/'verification.json').read_bytes())
             let disabled = json!({"ci": false, "backends_enabled": [], "backends_disabled": {
                 "ptrace": "Not selected by this control", "dbt": "Not selected by this control",
                 "kvm": "Not selected by this control", "sabre": "Not selected by this control",
-                "liteinst": "Not selected by this control"
+                "liteinst": "Not selected by this control",
+                "in-guest-trap": "Not selected by this control"
             }});
             let mut verify = if backend == "sabre" {
                 json!({"ci": true, "backends_enabled": ["sabre"],
-                    "backends_disabled": {"ptrace": "Not selected", "kvm": "Not selected", "dbt": "Not selected", "liteinst": "Not selected"}})
+                    "backends_disabled": {"ptrace": "Not selected", "kvm": "Not selected", "dbt": "Not selected", "liteinst": "Not selected", "in-guest-trap": "Not selected"}})
             } else {
                 json!({"ci": true, "backends_enabled": ["ptrace"],
-                    "backends_disabled": {"kvm": "Not selected", "dbt": "Not selected", "sabre": "Not selected", "liteinst": "Not selected"}})
+                    "backends_disabled": {"kvm": "Not selected", "dbt": "Not selected", "sabre": "Not selected", "liteinst": "Not selected", "in-guest-trap": "Not selected"}})
             };
             if scenario == "skid-wrong-stdout" {
                 // Every fixture report records empty stdout from both runs, so
@@ -5583,7 +5585,8 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
         let disabled = json!({"ci": false, "backends_enabled": [], "backends_disabled": {
             "ptrace": "Not selected by this control", "dbt": "Not selected by this control",
             "kvm": "Not selected by this control", "sabre": "Not selected by this control",
-            "liteinst": "Not selected by this control"
+            "liteinst": "Not selected by this control",
+            "in-guest-trap": "Not selected by this control"
         }});
         fs::write(manifests_dir.join("imported.yaml"), serde_json::to_vec(&json!({
             "schema": 3, "bucket": "imported", "test": [{
@@ -5592,12 +5595,12 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                 "observation": {"status": true, "stdout": true, "stderr": true},
                 "modes": {
                     "verify": {"ci": true, "backends_enabled": ["ptrace", "kvm"],
-                        "backends_disabled": {"dbt": "Not selected", "sabre": "Not selected", "liteinst": "Not selected"}},
+                        "backends_disabled": {"dbt": "Not selected", "sabre": "Not selected", "liteinst": "Not selected", "in-guest-trap": "Not selected"}},
                     "naked": {"ci": false, "backends_enabled": [],
                         "backends_disabled": {"native": "Not selected by this CI control"}},
                     "chaos": disabled, "replay": disabled,
                     "custom": {"ci": true, "backends_enabled": ["kvm"],
-                        "backends_disabled": {"ptrace": "Not selected", "dbt": "Not selected", "sabre": "Not selected", "liteinst": "Not selected"},
+                        "backends_disabled": {"ptrace": "Not selected", "dbt": "Not selected", "sabre": "Not selected", "liteinst": "Not selected", "in-guest-trap": "Not selected"},
                         "assert": {"runs": 1}}
                 }
             }]
@@ -6550,7 +6553,8 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
         let disabled = json!({"ci": false, "backends_enabled": [], "backends_disabled": {
             "ptrace": "Not selected by this control", "dbt": "Not selected by this control",
             "kvm": "Not selected by this control", "sabre": "Not selected by this control",
-            "liteinst": "Not selected by this control"
+            "liteinst": "Not selected by this control",
+            "in-guest-trap": "Not selected by this control"
         }});
         let naked = json!({"ci": false, "backends_enabled": [],
             "backends_disabled": {"native": "Not selected by this CI control"}});
@@ -6570,9 +6574,10 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
             manifests.join("parity.yaml"),
             serde_json::to_vec(&json!({"schema": 3, "bucket": "parity", "test": [
                 test("parity/alpha", json!(["ptrace", "kvm", "liteinst", "dbt"]),
-                    json!({"sabre": "Not selected"})),
+                    json!({"sabre": "Not selected", "in-guest-trap": "Not selected"})),
                 test("parity/beta", json!(["ptrace", "kvm", "liteinst"]),
-                    json!({"dbt": "Not selected", "sabre": "Not selected"})),
+                    json!({"dbt": "Not selected", "sabre": "Not selected",
+                        "in-guest-trap": "Not selected"})),
             ]}))
             .unwrap(),
         )
@@ -6976,19 +6981,19 @@ sys.exit(1 if failed else 0)
         );
         // alpha@dbt, alpha@kvm, alpha@liteinst and beta@kvm are measurable; a
         // candidate that failed determinism is not compared, and neither is a
-        // disabled one (alpha@sabre, beta@dbt, beta@sabre), which full
-        // validation never runs.
+        // disabled one (alpha@in-guest-trap, alpha@sabre, beta@dbt,
+        // beta@in-guest-trap, beta@sabre), which full validation never runs.
         assert_eq!(count(&five_calls, "compare"), 4);
         assert_eq!(count(&mutated_calls, "compare"), 4);
         assert!(
-            five_stdout.contains("test-harness: parity: 8 cell(s)"),
+            five_stdout.contains("test-harness: parity: 10 cell(s)"),
             "{five_stdout}"
         );
-        // Every one of the 8 is in the population: the 4 measured matches
-        // score 1, the nondeterministic candidate and the 3 disabled ones 0.
+        // Every one of the 10 is in the population: the 4 measured matches
+        // score 1, the nondeterministic candidate and the 5 disabled ones 0.
         assert!(
             five_stdout.contains(
-                "population 8: mean credit 0.5000 over 8 (4 full, 0 partial, 4 zero); 0 excluded \
+                "population 10: mean credit 0.4000 over 10 (4 full, 0 partial, 6 zero); 0 excluded \
                  (ptrace reference left no golden)"
             ),
             "{five_stdout}"
@@ -6996,7 +7001,7 @@ sys.exit(1 if failed else 0)
         assert!(
             five_stdout.contains(
                 "measured 4; no golden 1 (determinism-mismatch 1); not compared 0; unmeasured 0; \
-                 candidate not run 3 (candidate-not-enabled 3); mean credit 1.0000 over 4 \
+                 candidate not run 5 (candidate-not-enabled 5); mean credit 1.0000 over 4 \
                  measured with equal inputs; none measured with unequal inputs"
             ),
             "{five_stdout}"
@@ -7009,27 +7014,29 @@ sys.exit(1 if failed else 0)
             verdicts(&five_records),
             [
                 "parity/alpha@dbt=Matched",
+                "parity/alpha@in-guest-trap=CandidateMissing",
                 "parity/alpha@kvm=Matched",
                 "parity/alpha@liteinst=Matched",
                 "parity/alpha@sabre=CandidateMissing",
                 "parity/beta@dbt=CandidateMissing",
+                "parity/beta@in-guest-trap=CandidateMissing",
                 "parity/beta@kvm=Matched",
                 "parity/beta@liteinst=Nondeterministic",
                 "parity/beta@sabre=CandidateMissing",
             ]
         );
         assert!(
-            five_records[6]
+            five_records[8]
                 .reason
                 .as_deref()
                 .unwrap()
                 .contains("failed determinism"),
             "{:?}",
-            five_records[6]
+            five_records[8]
         );
         // A disabled candidate carries its typed class and the manifest's
         // own disabled reason.
-        for index in [3, 4, 7] {
+        for index in [1, 4, 5, 6, 9] {
             let record = &five_records[index];
             assert_eq!(
                 record.unavailable_class,
@@ -7048,10 +7055,12 @@ sys.exit(1 if failed else 0)
             verdicts(&mutated_records),
             [
                 "parity/alpha@dbt=Diverged",
+                "parity/alpha@in-guest-trap=CandidateMissing",
                 "parity/alpha@kvm=Diverged",
                 "parity/alpha@liteinst=Diverged",
                 "parity/alpha@sabre=CandidateMissing",
                 "parity/beta@dbt=CandidateMissing",
+                "parity/beta@in-guest-trap=CandidateMissing",
                 "parity/beta@kvm=Diverged",
                 "parity/beta@liteinst=Nondeterministic",
                 "parity/beta@sabre=CandidateMissing",
@@ -7064,7 +7073,7 @@ sys.exit(1 if failed else 0)
         for records in [&five_records, &mutated_records] {
             for (index, record) in records.iter().enumerate() {
                 record.validate().unwrap();
-                let measured = [0, 1, 2, 5].contains(&index);
+                let measured = [0, 2, 3, 7].contains(&index);
                 assert_eq!(record.verdict.is_measured(), measured, "{record:?}");
                 assert_eq!(record.inputs_equalized, measured, "{record:?}");
                 assert_eq!(record.unequalized_credit, None, "{record:?}");
@@ -7102,7 +7111,7 @@ sys.exit(1 if failed else 0)
         let five_status: PostPassStatus =
             serde_json::from_slice(&fs::read(five.join("parity.status.json")).unwrap()).unwrap();
         assert_eq!(five_status.state, PostPassState::Complete);
-        assert_eq!(five_status.cells, 8);
+        assert_eq!(five_status.cells, 10);
         assert!(five.join("parity/logdiff").is_dir());
         let (again, _, _, _, again_calls) = child("five", "shared", true, None, None, off);
         assert_eq!(count(&again_calls, "compare"), 0);
@@ -7145,10 +7154,12 @@ sys.exit(1 if failed else 0)
             verdicts(&records(&pass.join("parity.jsonl"))),
             [
                 "parity/alpha@dbt=Diverged",
+                "parity/alpha@in-guest-trap=CandidateMissing",
                 "parity/alpha@kvm=Diverged",
                 "parity/alpha@liteinst=Diverged",
                 "parity/alpha@sabre=CandidateMissing",
                 "parity/beta@dbt=CandidateMissing",
+                "parity/beta@in-guest-trap=CandidateMissing",
                 "parity/beta@kvm=Diverged",
                 "parity/beta@liteinst=Diverged",
                 "parity/beta@sabre=CandidateMissing",
@@ -7221,10 +7232,12 @@ sys.exit(1 if failed else 0)
             verdicts(&expired_records),
             [
                 "parity/alpha@dbt=Unavailable",
+                "parity/alpha@in-guest-trap=CandidateMissing",
                 "parity/alpha@kvm=Unavailable",
                 "parity/alpha@liteinst=Unavailable",
                 "parity/alpha@sabre=CandidateMissing",
                 "parity/beta@dbt=CandidateMissing",
+                "parity/beta@in-guest-trap=CandidateMissing",
                 "parity/beta@kvm=Unavailable",
                 "parity/beta@liteinst=Unavailable",
                 "parity/beta@sabre=CandidateMissing",
@@ -9276,13 +9289,14 @@ sys.exit(1 if failed else 0)
                     .collect::<serde_json::Map<_, _>>(),
             })
         };
-        let all = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
+        let all = ["ptrace", "dbt", "kvm", "sabre", "liteinst", "in-guest-trap"];
         let test = |id: &str, diagnostic: bool| {
             let mut verify = json!({
                 "ci": true,
                 "backends_enabled": ["ptrace"],
                 "backends_disabled": {
-                    "dbt": "fixture", "kvm": "fixture", "sabre": "fixture", "liteinst": "fixture"
+                    "dbt": "fixture", "kvm": "fixture", "sabre": "fixture", "liteinst": "fixture",
+                    "in-guest-trap": "fixture"
                 },
                 "comparator": "stripped",
                 "comparator_reason": "The fixture corpus uses the stripped comparison",
@@ -9405,7 +9419,8 @@ sys.exit(1 if failed else 0)
                 "dbt": "This control executes native commands only",
                 "kvm": "This control executes native commands only",
                 "sabre": "This control executes native commands only",
-                "liteinst": "This control executes native commands only"
+                "liteinst": "This control executes native commands only",
+                "in-guest-trap": "This control executes native commands only"
             }
         });
         let modes = json!({
@@ -10306,7 +10321,8 @@ sys.exit(1 if failed else 0)
                 "dbt": "This control executes native commands only",
                 "kvm": "This control executes native commands only",
                 "sabre": "This control executes native commands only",
-                "liteinst": "This control executes native commands only"
+                "liteinst": "This control executes native commands only",
+                "in-guest-trap": "This control executes native commands only"
             }
         });
         let manifest = json!({

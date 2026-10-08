@@ -214,6 +214,7 @@
     {
       "_why": "@generated: Cargo package `detcore-liteinst`; reverse-dependent closure: detcore-liteinst.",
       "e2e_backends": [
+        "in-guest-trap",
         "liteinst"
       ],
       "nodes": [
