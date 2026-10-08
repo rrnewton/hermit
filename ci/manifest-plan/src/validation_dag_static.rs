@@ -1596,7 +1596,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // inode_reuse::removals_retire_the_same_numbers_while_a_filter_may_apply
     // (a faked lookup before a removal or a utimensat is a recorded loss)
     // retain all 107 (measured 111).
-    ("test.detcore_misc", 111),
+    // procfs_inode::{an_inherited_filter_that_denies_an_mmap_leaves_the_lookups_working,
+    // an_inherited_filter_that_fakes_an_mmap_leaves_the_lookups_working,
+    // an_inherited_filter_that_answers_an_mmap_with_a_guest_page_leaves_the_page,
+    // an_inherited_filter_that_faults_a_removal_lookup_records_a_loss_and_retires_nothing}
+    // (no mmap is injected under an inherited filter, and a lookup that
+    // faults is a recorded loss) and
+    // inode_reuse::a_path_that_aliases_the_stack_scratch_records_a_loss_and_retires_nothing
+    // (a path the buffer's filling changes is a recorded loss) retain all
+    // 111 (measured 116).
+    ("test.detcore_misc", 116),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -2110,7 +2119,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
     // The host node carries the identical tests_misc selection.
-    ("test.detcore_misc_on_host", 111),
+    ("test.detcore_misc_on_host", 116),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).

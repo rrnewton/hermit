@@ -367,13 +367,108 @@ fn removing_a_last_name_retires_its_number_and_nothing_else() {
 
 /// While a seccomp filter the guest inherited may apply to its calls, as
 /// Detcore assumes when nobody says, the lookup before a removal is checked
-/// in a transient page instead. It retires the same numbers, leaves the paths
-/// of the raw calls in the stack scratch intact, and records no determinism
-/// loss.
+/// in the first slot of the stack scratch that overlaps no path of the call.
+/// It retires the same numbers, leaves the paths of the raw calls in the
+/// stack scratch intact, and records no determinism loss.
 #[test]
 fn removals_retire_the_same_numbers_while_a_filter_may_apply() {
     check_removals(InheritedSeccomp::Unknown);
     assert_eq!(detcore::detlog::determinism_loss(), None);
+}
+
+/// Unlink a file whose path the guest keeps in a second mapping of the memory
+/// under its stack scratch, where the first slot of the scratch lies: no
+/// comparison of addresses sees that the two share their bytes.
+fn aliased_path_guest(root: &tempfile::TempDir) {
+    let len = 64 * 1024;
+    let memfd = unsafe { libc::memfd_create(c"stack".as_ptr(), 0) };
+    assert!(
+        memfd >= 0,
+        "memfd_create: {}",
+        std::io::Error::last_os_error()
+    );
+    assert_eq!(unsafe { libc::ftruncate(memfd, len as libc::off_t) }, 0);
+    let map = || unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            memfd,
+            0,
+        )
+    };
+    let (stack, alias) = (map(), map());
+    assert!(stack != libc::MAP_FAILED && alias != libc::MAP_FAILED);
+    let top = stack as usize + len;
+    // The first slot of the scratch, just below the 128-byte red zone.
+    let slot = top - 128 - std::mem::size_of::<libc::stat>();
+    let path = alias as usize + (slot - stack as usize);
+    let victim = root.path().join("aliased");
+    File::create(&victim).unwrap();
+    let bytes = CString::new(victim.as_os_str().as_bytes()).unwrap();
+    let bytes = bytes.as_bytes_with_nul();
+    assert!(
+        bytes.len() <= std::mem::size_of::<libc::stat>(),
+        "{} is too long",
+        victim.display()
+    );
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), path as *mut u8, bytes.len()) };
+    let unlinked = unsafe { syscall_on_stack(top as *mut u8, libc::SYS_unlink, path, 0) };
+    assert_eq!(
+        unlinked, 0,
+        "unlink with its path aliasing the stack scratch"
+    );
+    assert!(!victim.exists(), "the raw unlink removed its file");
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(path as *const u8, bytes.len()) },
+        bytes,
+        "the path the unlink read"
+    );
+    unsafe {
+        libc::munmap(alias, len);
+        libc::munmap(stack, len);
+        libc::close(memfd);
+    }
+}
+
+/// Filling the lookup's buffer in a slot of the stack scratch changes a path
+/// that shares the slot's memory through a second mapping. While a filter may
+/// apply, Detcore reads the path again after filling the buffer; seeing that
+/// it changed, it records a determinism loss and retires nothing, and the
+/// call reads its path intact.
+#[test]
+fn a_path_that_aliases_the_stack_scratch_records_a_loss_and_retires_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        virtualize_metadata: true,
+        inherited_seccomp: InheritedSeccomp::Unknown,
+        ..Default::default()
+    };
+    let (output, state) = detcore_testutils::test_fn_with_config::<Detcore, _>(
+        || aliased_path_guest(&root),
+        config,
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        output.status,
+        ExitStatus::Exited(0),
+        "guest failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(state.retired_inodes(), Vec::new());
+    assert_eq!(
+        detcore::detlog::determinism_loss().as_deref(),
+        Some(
+            "file metadata: Detcore could not check an fstatat it injected while a seccomp \
+             filter the guest inherited may apply to its calls: filling its buffer changed \
+             the path it reads (mode: unknown)"
+        )
+    );
 }
 
 /// Without sequentialized threads another thread could link or rename a file

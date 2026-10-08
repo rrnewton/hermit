@@ -784,13 +784,12 @@ fn change_a_file_through_a_directory_descriptor(
 
 /// A filter the guest inherits can make the `fstatat` Detcore injects, to
 /// learn which file a removal takes the last name of, return 0 without
-/// running, which leaves its buffer as it was. Were the buffer the guest's
-/// stack scratch, Detcore would take the bytes it held for the file's device
-/// and inode, and could retire the number of another file they named, whose
-/// next stat would then show a new number, without a determinism loss. While
-/// a filter may apply, Detcore looks the path up in a filled transient page
-/// instead, so it sees that nothing was written, records the loss, and
-/// retires nothing.
+/// running, which leaves its buffer as it was. Detcore would take the bytes
+/// the buffer held for the file's device and inode, and could retire the
+/// number of another file they named, whose next stat would then show a new
+/// number, without a determinism loss. While a filter may apply, Detcore
+/// fills the buffer before the lookup, so it sees that nothing was written,
+/// records the loss, and retires nothing.
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn an_inherited_filter_that_fakes_a_removal_lookup_records_a_loss_and_retires_nothing() {
@@ -811,8 +810,8 @@ fn an_inherited_filter_that_fakes_a_removal_lookup_records_a_loss_and_retires_no
 /// A filter the guest inherits can likewise make the `fstatat` Detcore
 /// injects, to learn which file a utimensat changes, return 0 without
 /// running, which would leave the virtual mtime update to whatever the buffer
-/// held. While a filter may apply, Detcore looks the path up in a filled
-/// transient page, records the loss, and leaves the virtual mtime alone.
+/// held. While a filter may apply, Detcore fills the buffer before the
+/// lookup, records the loss, and leaves the virtual mtime alone.
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn an_inherited_filter_that_fakes_a_utimensat_lookup_records_a_determinism_loss() {
@@ -857,6 +856,297 @@ fn an_inherited_filter_records_no_loss_for_lookups_it_lets_run() {
     let retired = state.retired_inodes();
     assert_eq!(retired.len(), 1, "retired: {retired:?}");
     assert_eq!(detcore::detlog::determinism_loss(), None);
+}
+
+/// The length of the `struct stat` buffer of a lookup Detcore injects, and
+/// so of the transient page it once mapped for one while a filter may apply.
+#[cfg(target_arch = "x86_64")]
+const STAT_LEN: usize = std::mem::size_of::<libc::stat>();
+
+/// Give `action` to every `mmap` of `len` bytes, and return what
+/// `seccomp(2)` returned for `flags`. The test process maps nothing that
+/// small, so only an `mmap` Detcore injects matches.
+#[cfg(target_arch = "x86_64")]
+fn filter_mmap_of(len: usize, action: u32, flags: libc::c_ulong) -> libc::c_long {
+    // seccomp_data: nr at 0, arch at 4, and args[1], the length, at 24 (low
+    // half) and 28 (high half).
+    let mut program = [
+        load(4),
+        jump_if(AUDIT_ARCH_X86_64, 1, 0),
+        ret(libc::SECCOMP_RET_ALLOW),
+        load(0),
+        jump_if(libc::SYS_mmap as u32, 0, 5),
+        load(24),
+        jump_if(len as u32, 0, 3),
+        load(28),
+        jump_if((len >> 32) as u32, 0, 1),
+        ret(action),
+        ret(libc::SECCOMP_RET_ALLOW),
+    ];
+    install(&mut program, flags)
+}
+
+/// The seconds `touch_and_remove` sets a file's times to.
+#[cfg(target_arch = "x86_64")]
+const TOUCHED: libc::time_t = 1_000_000_000;
+
+/// Set the times of `name` in `directory` to `TOUCHED` seconds, check that
+/// its mtime shows them, and remove it.
+#[cfg(target_arch = "x86_64")]
+fn touch_and_remove(directory: i32, name: &CStr) -> libc::c_int {
+    let times = [libc::timespec {
+        tv_sec: TOUCHED,
+        tv_nsec: 0,
+    }; 2];
+    let touched = unsafe { libc::utimensat(directory, name.as_ptr(), times.as_ptr(), 0) };
+    if touched != 0 {
+        return touched;
+    }
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe {
+            libc::fstatat(
+                directory,
+                name.as_ptr(),
+                &mut stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        },
+        0,
+        "fstatat: {}",
+        std::io::Error::last_os_error()
+    );
+    assert_eq!(
+        (stat.st_mtime, stat.st_mtime_nsec),
+        (TOUCHED, 0),
+        "the mtime the guest sees after utimensat"
+    );
+    unsafe { libc::unlinkat(directory, name.as_ptr(), 0) }
+}
+
+/// Run `touch_and_remove` on a file under Detcore while `mmap_action` is the
+/// action of an inherited filter on every `mmap` of a lookup buffer's length,
+/// and check that the utimensat moved the mtime the guest sees, that the
+/// removal retired the file's number, and that nothing was lost.
+#[cfg(target_arch = "x86_64")]
+fn touch_and_remove_while_mmap_gets(mmap_action: u32) {
+    let root = tempfile::tempdir().unwrap();
+    filter_mmap_of(STAT_LEN, mmap_action, 0);
+    let state = under_detcore_with(config(), || {
+        change_a_file_through_a_directory_descriptor(root.path(), false, touch_and_remove);
+    });
+    let retired = state.retired_inodes();
+    assert_eq!(retired.len(), 1, "retired: {retired:?}");
+    assert_eq!(detcore::detlog::determinism_loss(), None);
+}
+
+/// A filter the guest inherits can deny the `mmap` of the transient page in
+/// which Detcore looked a path up while a filter may apply. The lookups
+/// before a utimensat and a removal then failed as if the path did not
+/// resolve: the virtual mtime stayed where it was, and the removal retired
+/// nothing, without a determinism loss. Detcore injects no `mmap` while a
+/// filter may apply, and checks the lookups in the guest stack scratch, so
+/// both work as without the filter.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn an_inherited_filter_that_denies_an_mmap_leaves_the_lookups_working() {
+    touch_and_remove_while_mmap_gets(libc::SECCOMP_RET_ERRNO | libc::EPERM as u32);
+}
+
+/// The same for a filter that makes that `mmap` return 0 without running,
+/// which Detcore recorded as a determinism loss.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn an_inherited_filter_that_fakes_an_mmap_leaves_the_lookups_working() {
+    touch_and_remove_while_mmap_gets(libc::SECCOMP_RET_ERRNO);
+}
+
+/// Linux's `struct seccomp_notif`, which `SECCOMP_IOCTL_NOTIF_RECV` fills in.
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+struct SeccompNotif {
+    id: u64,
+    pid: u32,
+    flags: u32,
+    data: [u8; 64],
+}
+
+/// Linux's `struct seccomp_notif_resp`, which `SECCOMP_IOCTL_NOTIF_SEND`
+/// reads.
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+struct SeccompNotifResp {
+    id: u64,
+    val: i64,
+    error: i32,
+    flags: u32,
+}
+
+/// `_IOWR('!', 0, struct seccomp_notif)`.
+#[cfg(target_arch = "x86_64")]
+const SECCOMP_IOCTL_NOTIF_RECV: libc::c_ulong = 0xc050_2100;
+
+/// `_IOWR('!', 1, struct seccomp_notif_resp)`.
+#[cfg(target_arch = "x86_64")]
+const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong = 0xc018_2101;
+
+/// Answer every call `listener` is notified of with success and `address`
+/// for a result, as a supervisor can for an `mmap`, until `stop`, and count
+/// the calls in `answered`.
+#[cfg(target_arch = "x86_64")]
+fn answer_with(
+    listener: i32,
+    address: usize,
+    stop: &std::sync::atomic::AtomicBool,
+    answered: &std::sync::atomic::AtomicUsize,
+) {
+    use std::sync::atomic::Ordering;
+    while !stop.load(Ordering::Relaxed) {
+        let mut ready = libc::pollfd {
+            fd: listener,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut ready, 1, 100) } <= 0 {
+            continue;
+        }
+        // Linux requires the buffer to be zeroed.
+        let mut notification = SeccompNotif {
+            id: 0,
+            pid: 0,
+            flags: 0,
+            data: [0; 64],
+        };
+        let received = unsafe {
+            libc::ioctl(
+                listener,
+                SECCOMP_IOCTL_NOTIF_RECV,
+                &mut notification as *mut SeccompNotif,
+            )
+        };
+        if received != 0 {
+            continue;
+        }
+        let response = SeccompNotifResp {
+            id: notification.id,
+            val: address as i64,
+            error: 0,
+            flags: 0,
+        };
+        unsafe {
+            libc::ioctl(
+                listener,
+                SECCOMP_IOCTL_NOTIF_SEND,
+                &response as *const SeccompNotifResp,
+            )
+        };
+        answered.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A filter the guest inherits can hand that `mmap` to a supervisor, which
+/// can answer it with the address of a page the guest uses. Detcore, taking
+/// the page for its own, filled it, wrote the lookup there and unmapped it,
+/// so the guest lost the page's contents and then the page. Detcore injects
+/// no `mmap` while a filter may apply, so the supervisor is never asked, the
+/// guest's page keeps its contents, and the removal retires the file's
+/// number without a determinism loss.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn an_inherited_filter_that_answers_an_mmap_with_a_guest_page_leaves_the_page() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    const CANARY: u8 = 0x5c;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    // Mapped before the guest forks, so that the guest has it at the same
+    // address.
+    let page = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            page_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(
+        page,
+        libc::MAP_FAILED,
+        "{}",
+        std::io::Error::last_os_error()
+    );
+    unsafe { std::ptr::write_bytes(page.cast::<u8>(), CANARY, page_size) };
+    let address = page as usize;
+    let listener = filter_mmap_of(
+        STAT_LEN,
+        libc::SECCOMP_RET_USER_NOTIF,
+        libc::SECCOMP_FILTER_FLAG_NEW_LISTENER,
+    );
+    let listener = unsafe { std::os::fd::OwnedFd::from_raw_fd(listener as i32) };
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let answered = std::sync::Arc::new(AtomicUsize::new(0));
+    let supervisor = {
+        let (stop, answered) = (stop.clone(), answered.clone());
+        let listener = listener.as_raw_fd();
+        std::thread::spawn(move || answer_with(listener, address, &stop, &answered))
+    };
+    let root = tempfile::tempdir().unwrap();
+    let state = under_detcore_with(config(), || {
+        change_a_file_through_a_directory_descriptor(
+            root.path(),
+            false,
+            |directory, name| unsafe { libc::unlinkat(directory, name.as_ptr(), 0) },
+        );
+        let page = unsafe { std::slice::from_raw_parts(address as *const u8, page_size) };
+        assert!(
+            page.iter().all(|&byte| byte == CANARY),
+            "the guest's page lost its contents"
+        );
+    });
+    stop.store(true, Ordering::Relaxed);
+    supervisor.join().unwrap();
+    drop(listener);
+    assert_eq!(
+        answered.load(Ordering::Relaxed),
+        0,
+        "Detcore injected an mmap"
+    );
+    let retired = state.retired_inodes();
+    assert_eq!(retired.len(), 1, "retired: {retired:?}");
+    assert_eq!(detcore::detlog::determinism_loss(), None);
+}
+
+/// The determinism loss Detcore records when the one filter a test installed
+/// makes an `fstatat` Detcore injects, to look a path up, fail with `EFAULT`.
+#[cfg(target_arch = "x86_64")]
+const ONE_FILTER_FAULTED_AN_FSTATAT: &str = "file metadata: Detcore could not check an fstatat it injected while a seccomp filter the guest inherited may apply to its calls: it faulted on memory Detcore had just read and written (mode: filter, with 1 filter)";
+
+/// A filter the guest inherits can make the `fstatat` Detcore injects, to
+/// learn which file a removal takes the last name of, fail with `EFAULT`,
+/// which Linux cannot report for a path and a buffer Detcore had just read
+/// and written. Detcore took it for the lookup's own error, as for a name
+/// that does not resolve, and retired nothing without a determinism loss,
+/// and the guard against a blocking open in a process that handles SIGALRM,
+/// which shares the lookup, took it the same way. Detcore now records the
+/// loss, retires nothing, and the guard refuses such an open.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn an_inherited_filter_that_faults_a_removal_lookup_records_a_loss_and_retires_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    filter_newfstatat(FILTERED_FD, libc::SECCOMP_RET_ERRNO | libc::EFAULT as u32);
+    let state = under_detcore_with(config(), || {
+        change_a_file_through_a_directory_descriptor(root.path(), true, |directory, name| unsafe {
+            libc::unlinkat(directory, name.as_ptr(), 0)
+        });
+    });
+    assert_eq!(state.retired_inodes(), Vec::new());
+    assert_eq!(
+        detcore::detlog::determinism_loss().as_deref(),
+        Some(ONE_FILTER_FAULTED_AN_FSTATAT)
+    );
 }
 
 /// Where the guest inherits a directory. Reverie closes descriptors 3 to 255
