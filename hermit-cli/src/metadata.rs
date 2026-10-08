@@ -461,6 +461,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         max_timeslice: default_config.max_timeslice,
         target_timeslice: default_config.target_timeslice,
         target_timeslice_syscalls_only: default_config.target_timeslice_syscalls_only,
+        scheduler_turn_cost: default_config.scheduler_turn_cost,
         seed: default_config.seed,
         rng_seed: default_config.rng_seed,
         imprecise_timers: false,

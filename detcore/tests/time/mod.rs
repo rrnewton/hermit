@@ -1274,6 +1274,144 @@ fn rdtsc_inside_a_spinlock_does_not_end_a_target_timeslice() {
     );
 }
 
+/// Two threads that alternate `sched_yield` and clock reads, printing every
+/// value read, so the output is the clock's whole trajectory across turns.
+fn clock_reads_across_yields() {
+    fn monotonic_ns() -> u64 {
+        let mut now = MaybeUninit::<libc::timespec>::uninit();
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_clock_gettime,
+                libc::CLOCK_MONOTONIC,
+                now.as_mut_ptr(),
+            )
+        };
+        assert_eq!(result, 0);
+        let now = unsafe { now.assume_init() };
+        now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
+    }
+    let reads = |name: &'static str| {
+        move || {
+            let mut values = Vec::new();
+            for _ in 0..20 {
+                values.push(monotonic_ns());
+                assert_eq!(unsafe { libc::sched_yield() }, 0);
+            }
+            assert!(values.windows(2).all(|pair| pair[0] < pair[1]));
+            (name, values)
+        }
+    };
+    let other = thread::spawn(reads("b"));
+    let mine = reads("a")();
+    let theirs = other.join().unwrap();
+    for (name, values) in [mine, theirs] {
+        let line = format!("{name}: {values:?}\n");
+        unsafe { libc::write(1, line.as_ptr().cast(), line.len()) };
+    }
+}
+
+/// With a small `--scheduler-turn-cost`, two runs read the same strictly
+/// increasing clock trajectory across thread switches.
+#[test]
+fn scheduler_turn_cost_runs_are_deterministic() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        sequentialize_threads: true,
+        scheduler_turn_cost: std::num::NonZeroU64::new(1_000),
+        ..Default::default()
+    };
+    detcore_testutils::det_test_fn_with_config(
+        true,
+        clock_reads_across_yields,
+        config,
+        detcore_testutils::expect_success,
+    );
+}
+
+/// A finite `poll` on a pipe nobody writes to still times out with a small
+/// `--scheduler-turn-cost`: its retries are turns that run no guest code, and
+/// only the scheduler charge moves the clock towards the deadline.
+#[test]
+fn a_finite_poll_times_out_with_a_small_scheduler_turn_cost() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        sequentialize_threads: true,
+        scheduler_turn_cost: std::num::NonZeroU64::new(1_000),
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || {
+            let mut fds = [0; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            let mut pollfd = libc::pollfd {
+                fd: fds[0],
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 1) }, 0);
+            assert_eq!(pollfd.revents, 0);
+        },
+        config,
+        true,
+    );
+}
+
+/// Each committed scheduler turn adds `--scheduler-turn-cost` virtual
+/// nanoseconds (default 500,000) to the clock, so two reads around a
+/// `sched_yield`, which takes one turn, differ by that charge plus the two
+/// syscalls' own cost: measured 515,060 ns by default and 16,060 ns with a
+/// 1,000 ns charge. A smaller charge makes the jump smaller, and time still
+/// advances.
+#[test]
+fn scheduler_turn_cost_sets_the_clock_jump_across_a_turn() {
+    fn delta_across_a_yield() -> u64 {
+        let monotonic_ns = || {
+            let mut now = MaybeUninit::<libc::timespec>::uninit();
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_clock_gettime,
+                    libc::CLOCK_MONOTONIC,
+                    now.as_mut_ptr(),
+                )
+            };
+            assert_eq!(result, 0);
+            let now = unsafe { now.assume_init() };
+            now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
+        };
+        let before = monotonic_ns();
+        assert_eq!(unsafe { libc::sched_yield() }, 0);
+        monotonic_ns() - before
+    }
+    fn check(delta: u64, low: u64, high: u64) {
+        if !(low..high).contains(&delta) {
+            // The forked-test harness reports a guest panic without its
+            // message, so write the reason to fd 2 directly.
+            let why = format!("clock moved {delta} ns across a yield, expected {low}..{high}\n");
+            unsafe { libc::write(2, why.as_ptr().cast(), why.len()) };
+            panic!("unexpected clock jump across a scheduler turn");
+        }
+    }
+    let config = detcore::Config {
+        virtualize_time: true,
+        sequentialize_threads: true,
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || check(delta_across_a_yield(), 515_000, 515_200),
+        config.clone(),
+        true,
+    );
+    let config = detcore::Config {
+        scheduler_turn_cost: std::num::NonZeroU64::new(1_000),
+        ..config
+    };
+    check_fn_with_config::<Detcore, _>(
+        || check(delta_across_a_yield(), 16_000, 16_200),
+        config,
+        true,
+    );
+}
+
 #[test]
 fn tod_clock_getres() {
     let mut tp: MaybeUninit<libc::timespec> = MaybeUninit::uninit();

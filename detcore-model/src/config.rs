@@ -28,6 +28,7 @@ use crate::network_trace::NetworkTraceConfig;
 use crate::pid::DetTid;
 use crate::schedule::SigWrapper;
 use crate::time::NANOS_PER_RCB;
+use crate::time::NANOS_PER_SCHED;
 use crate::time::RcbTimeMultiplier;
 
 const fn default_backend_capabilities() -> BackendCapabilities {
@@ -507,6 +508,19 @@ pub struct Config {
     #[clap(long, requires = "target_timeslice")]
     pub target_timeslice_syscalls_only: bool,
 
+    /// Virtual nanoseconds that each committed scheduler turn adds to the global clock, before
+    /// `--clock-multiplier` (default 500000). The charge keeps time moving while threads take
+    /// turns without running. Every thread observes it as a jump in time across a thread switch,
+    /// so a guest that times short intervals while another thread runs, such as a QEMU guest
+    /// kernel calibrating its TSC against the emulated PIT, can see a gap far larger than any
+    /// work done. A smaller charge makes those jumps smaller; a finite poll or futex timeout then
+    /// takes more turns to expire. The charge, after the multiplier, must be between 1 and
+    /// 1000000000. If a charged turn would pass the end of representable virtual time, the run
+    /// stops with HERMIT_VIRTUAL_CLOCK_EXHAUSTED and exit status 125.
+    #[serde(default)]
+    #[clap(long, value_name = "virtual-nanoseconds")]
+    pub scheduler_turn_cost: Option<NonZeroU64>,
+
     /// Shut down immediately upon SIGINT, rather than letting the guest handle it.
     #[clap(long)]
     pub sigint_instakill: bool,
@@ -931,6 +945,38 @@ impl Config {
         self.max_timeslice.is_some() && !self.no_rcb_time
     }
 
+    /// The virtual nanoseconds each committed scheduler turn adds to the
+    /// global clock: `--scheduler-turn-cost` (default [`NANOS_PER_SCHED`])
+    /// times `--clock-multiplier`, truncated as it always was. A configured
+    /// cost must give a charge of at least one nanosecond, because the charge
+    /// is what advances the clock through turns that run no guest code, such
+    /// as the retries of a finite poll; a scaled charge of zero would leave
+    /// such a timeout unable to expire. A configured cost, or its scaled
+    /// charge, above [`MAX_SCHEDULER_TURN_COST`] is refused too, so that a
+    /// configured charge never exceeds one second per turn.
+    pub fn scheduler_turn_charge(&self) -> Result<u64, String> {
+        let multiplier = self.clock_multiplier.unwrap_or(1.0);
+        let Some(cost) = self.scheduler_turn_cost else {
+            return Ok((NANOS_PER_SCHED * multiplier) as u64);
+        };
+        let cost = u64::from(cost);
+        if cost > MAX_SCHEDULER_TURN_COST {
+            return Err(format!(
+                "--scheduler-turn-cost must be at most {MAX_SCHEDULER_TURN_COST} virtual \
+                 nanoseconds (received {cost})"
+            ));
+        }
+        let charge = cost as f64 * multiplier;
+        if !(1.0..=MAX_SCHEDULER_TURN_COST as f64).contains(&charge) {
+            return Err(format!(
+                "--scheduler-turn-cost {cost} at --clock-multiplier {multiplier} charges {charge} \
+                 virtual nanoseconds per scheduler turn; the charge must be at least 1, so that \
+                 timed waits keep advancing, and at most {MAX_SCHEDULER_TURN_COST}"
+            ));
+        }
+        Ok(charge as u64)
+    }
+
     /// Should we convert sockets to SOCK_NONBLOCK?
     pub fn use_nonblocking_sockets(&self) -> bool {
         self.sequentialize_threads && !self.debug_externalize_sockets
@@ -1082,6 +1128,9 @@ impl fmt::Display for Config {
         }
         if self.target_timeslice_syscalls_only {
             write!(f, " --target-timeslice-syscalls-only")?;
+        }
+        if let Some(cost) = self.scheduler_turn_cost {
+            write!(f, " --scheduler-turn-cost={}", cost)?;
         }
         if self.sigint_instakill {
             write!(f, " --sigint-instakill")?;
@@ -1391,6 +1440,11 @@ impl Config {
     }
 }
 
+/// The largest `--scheduler-turn-cost` accepted, in virtual nanoseconds, both
+/// before and after the clock multiplier scales it: one second per scheduler
+/// turn.
+pub const MAX_SCHEDULER_TURN_COST: u64 = 1_000_000_000;
+
 /// N.B. we don't want to specify two different notions of "default", so we use the
 /// `Clap` instance above.
 /// Environment variable carrying the coordinator's [`config_wire_fingerprint`]
@@ -1534,7 +1588,9 @@ impl Default for Config {
 /// which is unset for DBT. So is [`Config::target_timeslice_syscalls_only`],
 /// added after this form froze; DBT runs without a PMU maximum, where the
 /// option has no effect. So is [`Config::replaying`], set only by `hermit
-/// replay`, which runs only on the ptrace backend. Every other field is serialized exactly as
+/// replay`, which runs only on the ptrace backend, and
+/// [`Config::scheduler_turn_cost`], which `hermit run` refuses with the DBT
+/// backend. Every other field is serialized exactly as
 /// `serde_json::to_string(config)` serializes it.
 ///
 /// Use this wherever the JSON is visible to the guest. `hermit run
@@ -1865,8 +1921,10 @@ mod legacy_backend_json {
     /// `in_guest_detlog_forward_policy` is unset for DBT (its runtime forwards
     /// no records on a socket), so it is never written and reads as unset.
     /// `replaying` is never written either: only `hermit replay` sets it, and
-    /// replay runs only on the ptrace backend.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 7] = [
+    /// replay runs only on the ptrace backend. Nor is `scheduler_turn_cost`,
+    /// which came after the legacy form froze and which `hermit run` refuses
+    /// with the DBT backend.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 8] = [
         "backend",
         "record_host_inputs",
         "backend_supports_blocked_wait_signal_interruption",
@@ -1874,6 +1932,7 @@ mod legacy_backend_json {
         "in_guest_detlog_forward_policy",
         "target_timeslice_syscalls_only",
         "replaying",
+        "scheduler_turn_cost",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -1966,8 +2025,8 @@ mod legacy_backend_json {
     /// [`Config::backend_supports_blocked_wait_signal_interruption`],
     /// [`Config::guest_may_inherit_a_terminal`],
     /// [`Config::in_guest_detlog_forward_policy`],
-    /// [`Config::target_timeslice_syscalls_only`] or [`Config::replaying`]
-    /// takes an element. Each gets a
+    /// [`Config::target_timeslice_syscalls_only`], [`Config::replaying`] or
+    /// [`Config::scheduler_turn_cost`] takes an element. Each gets a
     /// placeholder; [`super::from_legacy_backend_json`] replaces the first.
     struct LegacyPositions<'f, 'l, A> {
         inner: A,
@@ -2005,7 +2064,7 @@ mod legacy_backend_json {
                     | "replaying",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Unset, as its serde default is.
-                Some("in_guest_detlog_forward_policy") => seed
+                Some("in_guest_detlog_forward_policy" | "scheduler_turn_cost") => seed
                     .deserialize(serde_json::Value::Null)
                     .map(Some)
                     .map_err(<A::Error as de::Error>::custom),
@@ -2253,7 +2312,8 @@ mod legacy_backend_json {
                 | "guest_may_inherit_a_terminal"
                 | "in_guest_detlog_forward_policy"
                 | "target_timeslice_syscalls_only"
-                | "replaying" => Ok(()),
+                | "replaying"
+                | "scheduler_turn_cost" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -2715,8 +2775,8 @@ mod tests {
     /// with the fifteen legacy keys where `backend` stands and no
     /// `record_host_inputs`, `backend_supports_blocked_wait_signal_interruption`,
     /// `guest_may_inherit_a_terminal`, `in_guest_detlog_forward_policy`,
-    /// `target_timeslice_syscalls_only` or `replaying`, which is the key order
-    /// the encoder writes.
+    /// `target_timeslice_syscalls_only`, `replaying` or `scheduler_turn_cost`,
+    /// which is the key order the encoder writes.
     #[test]
     fn legacy_positions_are_the_encoded_key_order() {
         let names = legacy_backend_keys(&Config::default()).map(|(name, _)| name);
@@ -2736,7 +2796,8 @@ mod tests {
                 | "guest_may_inherit_a_terminal"
                 | "in_guest_detlog_forward_policy"
                 | "target_timeslice_syscalls_only"
-                | "replaying" => {}
+                | "replaying"
+                | "scheduler_turn_cost" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -2749,9 +2810,10 @@ mod tests {
         // `backend` becomes fifteen keys; `record_host_inputs`,
         // `backend_supports_blocked_wait_signal_interruption`,
         // `guest_may_inherit_a_terminal`, `in_guest_detlog_forward_policy`,
-        // `target_timeslice_syscalls_only` and `replaying` none.
+        // `target_timeslice_syscalls_only`, `replaying` and
+        // `scheduler_turn_cost` none.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len() + 8, keys.len());
+        assert_eq!(fields.len() + 7, keys.len());
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -2938,6 +3000,92 @@ mod tests {
             !from_legacy_backend_json(&array)
                 .unwrap()
                 .target_timeslice_syscalls_only
+        );
+    }
+
+    #[test]
+    fn scheduler_turn_charge_refuses_a_scaled_charge_below_one_nanosecond() {
+        let default = Config::default();
+        assert_eq!(default.scheduler_turn_charge(), Ok(500_000));
+        let scaled = Config {
+            clock_multiplier: Some(0.1),
+            ..Config::default()
+        };
+        assert_eq!(scaled.scheduler_turn_charge(), Ok(50_000));
+        let cost = |cost: u64, multiplier: f64| Config {
+            scheduler_turn_cost: NonZeroU64::new(cost),
+            clock_multiplier: Some(multiplier),
+            ..Config::default()
+        };
+        assert_eq!(cost(10_000, 0.1).scheduler_turn_charge(), Ok(1_000));
+        assert_eq!(cost(10, 0.1).scheduler_turn_charge(), Ok(1));
+        // Truncation would make these zero: a finite poll would never expire.
+        assert!(cost(9, 0.1).scheduler_turn_charge().is_err());
+        assert!(cost(1, 0.1).scheduler_turn_charge().is_err());
+        assert_eq!(
+            cost(MAX_SCHEDULER_TURN_COST, 1.0).scheduler_turn_charge(),
+            Ok(MAX_SCHEDULER_TURN_COST)
+        );
+        assert!(
+            cost(MAX_SCHEDULER_TURN_COST + 1, 1.0)
+                .scheduler_turn_charge()
+                .is_err()
+        );
+        assert!(cost(u64::MAX, 1.0).scheduler_turn_charge().is_err());
+        assert!(
+            cost(MAX_SCHEDULER_TURN_COST, 1e12)
+                .scheduler_turn_charge()
+                .is_err()
+        );
+        // The scaled charge has the same upper bound as the cost: one charge
+        // of 9e18 ns would exhaust the clock in two turns.
+        assert!(
+            cost(MAX_SCHEDULER_TURN_COST, 9e9)
+                .scheduler_turn_charge()
+                .is_err()
+        );
+        assert!(cost(1_000_000, 1_001.0).scheduler_turn_charge().is_err());
+        assert_eq!(
+            cost(1_000_000, 1_000.0).scheduler_turn_charge(),
+            Ok(MAX_SCHEDULER_TURN_COST)
+        );
+        let message = cost(MAX_SCHEDULER_TURN_COST, 9e9)
+            .scheduler_turn_charge()
+            .unwrap_err();
+        assert!(message.contains("at least 1"), "{message}");
+        assert!(message.contains("at most 1000000000"), "{message}");
+    }
+
+    /// `scheduler_turn_cost` never enters the legacy form, whatever its value:
+    /// the guest-visible string stays the legacy bytes, and it reads back as
+    /// unset from both the object and the array form.
+    #[test]
+    fn scheduler_turn_cost_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            scheduler_turn_cost: NonZeroU64::new(10_000),
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("scheduler_turn_cost"), "{json}");
+        assert_eq!(
+            from_legacy_backend_json(&json).unwrap().scheduler_turn_cost,
+            None
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert_eq!(
+            from_legacy_backend_json(&array)
+                .unwrap()
+                .scheduler_turn_cost,
+            None
         );
     }
 

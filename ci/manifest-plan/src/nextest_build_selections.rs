@@ -614,8 +614,10 @@ mod tests {
             );
             // 287 listed, less the 25 external_signal_interrupt ptrace cases
             // that need the PMU timer, which test.pmu_integration_cases
-            // runs, plus the eight fatal_core_capture tests.
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "270");
+            // runs, plus the eight fatal_core_capture tests, plus the
+            // scheduler-turn-cost clock-exhaustion test in
+            // container_init_deadline.
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "271");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

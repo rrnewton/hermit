@@ -3058,6 +3058,82 @@ fn skid_margin_override_rejects_non_ptrace_backed_backends() {
     }
 }
 
+/// `--scheduler-turn-cost` parses, is rendered into the reproduce command and
+/// round-trips; zero and the DBT backend are refused.
+#[test]
+fn scheduler_turn_cost_parses_round_trips_and_is_refused_for_dbt() {
+    let mut opts = RunOpts::parse_from(["fakehermit", "--scheduler-turn-cost=10000", "fakeprog"]);
+    opts.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(
+        opts.det_opts.det_config.scheduler_turn_cost,
+        std::num::NonZeroU64::new(10_000)
+    );
+    let rendered = format!("{opts}");
+    assert!(
+        rendered.contains(" --scheduler-turn-cost=10000"),
+        "{rendered}"
+    );
+    let mut reparsed_args = vec!["fakehermit".to_owned()];
+    reparsed_args.extend(shell_words::split(&rendered).unwrap());
+    let reparsed = RunOpts::parse_from(reparsed_args);
+    assert_eq!(
+        reparsed.det_opts.det_config.scheduler_turn_cost,
+        std::num::NonZeroU64::new(10_000)
+    );
+    let mut default = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    default.validate_args_with_perf_support(true).unwrap();
+    assert!(!format!("{default}").contains("turn-cost"));
+    assert!(
+        RunOpts::try_parse_from(["fakehermit", "--scheduler-turn-cost=0", "fakeprog"]).is_err(),
+        "a zero charge would freeze time across turns"
+    );
+    // A cost that the multiplier scales below one nanosecond would charge
+    // nothing per turn; a cost above the bound is refused too.
+    for args in [
+        vec!["--scheduler-turn-cost=9", "--clock-multiplier=0.1"],
+        vec!["--scheduler-turn-cost=1000000001", "--clock-multiplier=1"],
+        // A permitted cost that the multiplier scales past the bound.
+        vec![
+            "--scheduler-turn-cost=1000000000",
+            "--clock-multiplier=9000000000",
+            "--max-timeslice=disabled",
+        ],
+    ] {
+        let mut argv = vec!["fakehermit"];
+        argv.extend(args.iter().copied());
+        argv.push("fakeprog");
+        let error = RunOpts::parse_from(argv)
+            .validate_args_with_perf_support(true)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("--scheduler-turn-cost"),
+            "{args:?}: {error}"
+        );
+    }
+    let mut smallest = RunOpts::parse_from([
+        "fakehermit",
+        "--scheduler-turn-cost=10",
+        "--clock-multiplier=0.1",
+        "fakeprog",
+    ]);
+    smallest.validate_args_with_perf_support(true).unwrap();
+    let error = run_opts_for(&[
+        "hermit",
+        "--backend=dbt",
+        "run",
+        "--scheduler-turn-cost=10000",
+        "fakeprog",
+    ])
+    .validate_args_with_perf_support(true)
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("the dbt backend cannot apply --scheduler-turn-cost"),
+        "{error}"
+    );
+}
+
 #[cfg(test)]
 fn liteinst_in_guest_refusal(options: &[&str]) -> Result<(), anyhow::Error> {
     let mut argv = vec!["hermit", "--backend=liteinst", "run"];
@@ -5257,6 +5333,12 @@ impl RunOpts {
         }
 
         config.sequentialize_threads = self.strict || !self.no_sequentialize_threads;
+        if config.scheduler_turn_cost.is_some() && backend == Backend::Dbt {
+            anyhow::bail!(
+                "the dbt backend cannot apply --scheduler-turn-cost: its runtime reads a frozen \
+                 configuration form that predates the option"
+            );
+        }
         config.deterministic_io = self.strict || !self.no_deterministic_io;
         // An unmodeled host syscall makes a successful result unqualified.
         // Ordinary execution therefore fails closed; compatibility passthrough
@@ -5290,6 +5372,9 @@ impl RunOpts {
                 "--clock-multiplier must be finite and positive (received {})",
                 multiplier
             );
+        }
+        if let Err(error) = config.scheduler_turn_charge() {
+            anyhow::bail!("{error}");
         }
         let minimum_max_timeslice = config.minimum_max_timeslice_nanos();
         if let Some(max_timeslice) = config.max_timeslice

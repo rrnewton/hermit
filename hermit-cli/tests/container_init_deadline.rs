@@ -429,3 +429,70 @@ fn container_init_honours_signals_sent_before_it_arms() {
         );
     }
 }
+
+/// A run that Hermit itself must end: with a configured
+/// `--scheduler-turn-cost`, a scheduler turn whose charge would pass the end of
+/// representable virtual time ends the run with an internal-failure exit and
+/// the report, rather than saturating the clock or leaving every guest parked
+/// behind a panicked scheduler (https://github.com/rrnewton/hermit/pull/3885).
+/// The epoch starts the clock 51,615 ns before u64::MAX nanoseconds, so the
+/// first 1 s scheduler charge passes it, whatever the guest does.
+#[test]
+fn virtual_clock_exhaustion_under_a_scheduler_turn_cost_ends_the_run() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut stderr_file = tempfile::tempfile().expect("failed to create a stderr capture");
+    let mut command = Command::new(hermit_bin());
+    command.args([
+        "--backend=ptrace",
+        "run",
+        "--strict",
+        "--epoch=2554-07-21T23:34:33.7095Z",
+        "--max-timeslice=disabled",
+        "--scheduler-turn-cost=1000000000",
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo unreachable >&2",
+    ]);
+    hermit_test::configure_guest_execution(&mut command);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            stderr_file
+                .try_clone()
+                .expect("failed to clone the stderr capture"),
+        ));
+    // SAFETY: as in `spawn_in_new_session`.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().expect("failed to start hermit");
+    let session = child.id() as i32;
+    let _guard = SessionGuard(session);
+    let status = poll_until(TEARDOWN_BUDGET, || child.try_wait().unwrap());
+    let mut stderr = String::new();
+    io::Seek::seek(&mut stderr_file, io::SeekFrom::Start(0))
+        .expect("failed to rewind the stderr capture");
+    io::Read::read_to_string(&mut stderr_file, &mut stderr)
+        .expect("failed to read the stderr capture");
+    let status = status.unwrap_or_else(|| {
+        panic!("the run did not end within {TEARDOWN_BUDGET:?}; stderr:\n{stderr}")
+    });
+    assert_eq!(
+        status.code(),
+        Some(hermit::HERMIT_INTERNAL_FAILURE_EXIT),
+        "clock exhaustion must end the run as an internal failure: {status}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("HERMIT_VIRTUAL_CLOCK_EXHAUSTED: virtual clock exhausted"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("unreachable"), "{stderr}");
+    assert_session_drains(session, "a run ended by clock exhaustion");
+}

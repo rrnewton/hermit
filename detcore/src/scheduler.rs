@@ -834,6 +834,15 @@ pub struct Scheduler {
     /// poison the scheduler mutex on the way out.
     terminal_deadlock: Option<String>,
 
+    /// A scheduler turn refused because its configured charge would pass the
+    /// end of representable virtual time (`--scheduler-turn-cost`). Like
+    /// [`Scheduler::terminal_deadlock`], `bump_global_time` records it and
+    /// `sched_loop_inner` prints it and exits, because a panic in the
+    /// scheduler task would leave every guest parked. Both turn functions
+    /// return as soon as it is set, before any maintenance, selection, grant
+    /// or signal observation, so nothing new waits on a guest.
+    terminal_clock_exhaustion: Option<String>,
+
     /// The scheduler turn at which `step2d_handle_empty_queue` last logged
     /// "zero threads left anywhere, fizzling.", while that empty state lasts.
     ///
@@ -1620,6 +1629,12 @@ async fn sched_loop_inner(
             eprintln!("{}", report);
             immediate_fatal_exit(); // We don't want a backtrace of this thread.
         }
+        // Virtual time ran out under a configured --scheduler-turn-cost: end
+        // the run the same way, rather than saturate the clock.
+        if let Some(report) = sched.lock().unwrap().terminal_clock_exhaustion.take() {
+            eprintln!("{}", report);
+            immediate_fatal_exit();
+        }
 
         if last_res.is_ok() && !observed_turn {
             if let Some(observer) = &observer {
@@ -1812,6 +1827,11 @@ async fn do_ordinary_turn_blocking(
             let arc = global_time.clone();
 
             let next_outstanding = mg.step1_check_quiescence(&arc, last_turn);
+            // A refused charge ends the turn here, before any maintenance,
+            // selection or grant; `sched_loop_inner` then reports it and exits.
+            if mg.terminal_clock_exhaustion.is_some() {
+                return Err(SkipTurn);
+            }
             match next_outstanding {
                 None => {
                     trace!("Scheduler observed full quiescense, proceeding...");
@@ -1894,6 +1914,12 @@ pub async fn do_a_turn_blocking(
                     if !charged {
                         state.bump_global_time(&global_time, last_turn);
                         charged = true;
+                        // A refused charge ends the turn before maintenance,
+                        // alarm selection, signal observations or grants can
+                        // start; `sched_loop_inner` reports it and exits.
+                        if state.terminal_clock_exhaustion.is_some() {
+                            return Err(SkipTurn);
+                        }
                     } else if refresh {
                         // A hook can advance real observed logical time. Refresh
                         // eligibility without charging again. An earlier empty
@@ -2205,6 +2231,7 @@ impl Scheduler {
             test_kernel_mask_reads: Default::default(),
             cleared_child_tids: Default::default(),
             terminal_deadlock: None,
+            terminal_clock_exhaustion: None,
             empty_queue_kick_turn: None,
             backend_failure: None,
             backend_failure_sender: Some(backend_failure_sender),
@@ -6398,7 +6425,15 @@ impl Scheduler {
                     "[scheduler] skipping scheduler time advance because just-finished turn served a backend-runtime bootstrap syscall whose cost is withheld"
                 );
             } else {
-                let newtime = gtime.add_scheduler_time();
+                let newtime = match gtime.add_scheduler_time() {
+                    Ok(newtime) => newtime,
+                    Err(exhausted) => {
+                        // Keep the first report; the clock did not move.
+                        self.terminal_clock_exhaustion
+                            .get_or_insert_with(|| exhausted.to_string());
+                        gtime.as_nanos()
+                    }
+                };
                 if last_turn_was_polling {
                     // Advance time (needed for timeout enforcement) but keep it off the DETLOG.
                     trace!(
@@ -8800,6 +8835,56 @@ mod test {
             canonical.queue, broken.queue,
             "the deliberate caller-gate violation was inert"
         );
+    }
+
+    /// With `--scheduler-turn-cost`, a charge refused because it would pass the
+    /// end of representable virtual time ends an ordinary turn at once: the
+    /// runnable thread is not selected or granted, so the terminal report can
+    /// exit without waiting on any guest
+    /// (https://github.com/rrnewton/hermit/pull/3885). Before the fix the turn
+    /// went on to select and grant thread 100.
+    #[tokio::test]
+    async fn a_refused_turn_charge_returns_before_an_ordinary_grant() {
+        let config = Config {
+            sequentialize_threads: true,
+            epoch: "2554-07-21T23:34:32.709051615Z".parse().unwrap(),
+            scheduler_turn_cost: std::num::NonZeroU64::new(1_000_000_000),
+            ..Config::default()
+        };
+        let mut s = Scheduler::new(&config);
+        let ready = DetTid::from_raw(100);
+        register_known_thread(&mut s, ready);
+        s.next_turns[&ready].req.put(Ok(Resources::new(ready)));
+        s.runqueue_push_back(ready);
+        let mut time = GlobalTime::new(&config);
+        // One accepted charge leaves 500,615 ns of representable time.
+        let now = time.add_scheduler_time().unwrap();
+        assert_eq!(now.as_nanos(), u64::MAX - 500_615);
+        s.committed_time = now;
+        let response = s.next_turns[&ready].resp.clone();
+        let sched = Arc::new(Mutex::new(s));
+        let global_time = Arc::new(Mutex::new(time));
+
+        let outcome = do_a_turn_blocking(
+            sched.clone(),
+            global_time.clone(),
+            &Ok(Resources::new(ready)),
+        )
+        .await;
+        let s = sched.lock().unwrap();
+        assert!(s.terminal_clock_exhaustion.is_some());
+        assert!(matches!(outcome, Err(SkipTurn)), "{outcome:?}");
+        assert_eq!(
+            global_time.lock().unwrap().as_nanos(),
+            now,
+            "a refused charge adds nothing"
+        );
+        assert!(
+            response.try_read().is_none(),
+            "the runnable thread was not granted"
+        );
+        assert!(!s.run_queue.tentative_pop_in_progress());
+        assert!(s.run_queue.contains_tid(ready));
     }
 
     /// F6 (real-path regression): when the thread `step3_peek` tentatively

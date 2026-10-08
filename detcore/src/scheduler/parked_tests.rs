@@ -2373,7 +2373,7 @@ fn timed_maintenance_preserves_reference_selection_and_clock() {
         let mut last = Ok(Resources::new(r));
         let mut observations = Vec::new();
         for selected in [a, b] {
-            let expected_clock = expected_time.add_scheduler_time();
+            let expected_clock = expected_time.add_scheduler_time().unwrap();
             let result = do_a_turn_blocking(scheduler.clone(), global.clone(), &last)
                 .now_or_never()
                 .expect("all three requests were quiescent")
@@ -4220,4 +4220,94 @@ fn a_sigalrm_control_without_the_serial_grant_is_refused() {
     assert!(s.sigalrm_control(outside, SigalrmControl::SendTo(granted)));
     assert!(s.sigalrm_control(outside, SigalrmControl::ArmRecurringTimer));
     let _ = handler;
+}
+
+/// With `--scheduler-turn-cost`, a charge refused because it would pass the
+/// end of representable virtual time ends a controlled turn at once: no
+/// maintenance runs, no due alarm is published to a blocked thread and no
+/// signal observation starts, so the terminal report can exit without waiting
+/// on any guest (https://github.com/rrnewton/hermit/pull/3885). Thread 100 has
+/// just finished an ordinary turn and has its next request filled; thread 101
+/// is blocked in nanosleep with a real alarm due. Before the fix the turn
+/// published `ObserveSignal` to 101 and waited on its new callback request.
+/// Adapted from Codex's review fixture.
+#[test]
+fn a_refused_turn_charge_returns_before_a_controlled_observation() {
+    use futures::FutureExt;
+
+    let config = Config {
+        sequentialize_threads: true,
+        virtualize_time: true,
+        max_timeslice: None,
+        epoch: "2554-07-21T23:34:32.709051615Z".parse().unwrap(),
+        scheduler_turn_cost: std::num::NonZeroU64::new(1_000_000_000),
+        ..Config::default().with_backend(|backend| {
+            backend.provides_process_signal_control = true;
+            backend.emulates_child_waits = true;
+            backend.needs_killed_thread_rpc_cancellation = true;
+        })
+    };
+    config.validate_invariants();
+    let mut s = Scheduler::new(&config);
+    let backend = Arc::new(Backend::default());
+    assert_eq!(
+        s.install_signal_control(
+            Some(BackendSignalControl {
+                process: backend.clone()
+            }),
+            true,
+        )
+        .unwrap(),
+        BackendSignalControlMode::ToolControlled,
+    );
+    let (ready, _, _) = add(&mut s, 100, 100);
+    let (tid, mm, site) = add(&mut s, 100, 101);
+
+    // One accepted charge leaves 500,615 ns of representable time.
+    let mut time = GlobalTime::new(&config);
+    let now = time.add_scheduler_time().unwrap();
+    assert_eq!(now.as_nanos(), u64::MAX - 500_615);
+    s.committed_time = now;
+    s.replace_real_timer(ready, ready, now, at(1_000), at(0), Signal::SIGALRM)
+        .unwrap();
+    let original_response = sleep(&mut s, tid, mm, site, now.as_nanos() + 100_000);
+    let original_request = s.next_turns[&tid].req.clone();
+    backend.recipients.lock().unwrap().push(SignalRecipient {
+        task: task(100, 101),
+    });
+    s.next_turns[&ready].req.put(Ok(Resources::new(ready)));
+    s.runqueue_push_back(ready);
+    // Observed work makes the alarm due; the sleep's deadline is still ahead.
+    let current = time.add_extra_time(std::time::Duration::from_nanos(2_000));
+    assert!(s.blocked.timed_waiters.thread_deadline(tid).unwrap() > current);
+    assert!(s.are_all_quiesced().is_none());
+    assert!(s.terminal_clock_exhaustion.is_none());
+
+    let scheduler = Arc::new(Mutex::new(s));
+    let global = Arc::new(Mutex::new(time));
+    let last = Ok(Resources::new(ready));
+    let outcome = do_a_turn_blocking(scheduler.clone(), global.clone(), &last).now_or_never();
+    let state = scheduler.lock().unwrap();
+    assert!(state.terminal_clock_exhaustion.is_some());
+    assert_eq!(
+        global.lock().unwrap().as_nanos(),
+        current,
+        "a refused charge adds nothing"
+    );
+    assert!(
+        matches!(outcome, Some(Err(SkipTurn))),
+        "a refused turn must return to the terminal report before starting a callback"
+    );
+    assert!(
+        original_response.try_read().is_none(),
+        "no signal observation started"
+    );
+    assert!(backend.publications.lock().unwrap().is_empty());
+    assert!(backend.permits.lock().unwrap().is_empty());
+    assert_eq!(state.next_turns[&tid].req, original_request);
+    assert_eq!(
+        state.next_turns[&tid].protocol.owner,
+        NextTurnOwner::Ordinary
+    );
+    assert!(!state.run_queue.tentative_pop_in_progress());
 }
