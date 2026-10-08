@@ -1583,7 +1583,22 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // in_guest_site_patching::tests::only_zero_satisfies_a_request_for_site_patching_off
     // (the in-guest-trap Tool image check) retains all 1186: 1187, listed
     // with this node's arguments.
-    ("test.detcore_unit", 1203),
+    // The rt_sigsuspend-mask subset of
+    // https://github.com/rrnewton/hermit/pull/3224 retains all 1203 and adds
+    // ten tests: 1213, listed with this node's arguments.
+    // scheduler::test, nine tests:
+    //   a_sibling_signal_sent_at_an_rt_sigsuspend_request_arms_the_call_it_wakes,
+    //   a_sibling_signal_sent_before_the_rt_sigsuspend_grant_requeues_the_waiter_first,
+    //   child_exit_signal_does_not_replace_a_posted_vfork_continuation,
+    //   child_exit_signal_leaves_vfork_parent_waiting_for_its_continuation,
+    //   rt_sigsuspend_mask_uses_kernel_sigset_bits_and_cannot_block_kill_or_stop,
+    //   signal_blocked_by_the_rt_sigsuspend_mask_leaves_the_wait_in_its_pool,
+    //   signal_leaves_blocking_external_io_waiting_for_its_own_report,
+    //   signal_leaves_rt_sigsuspend_in_its_pool_on_a_backend_without_a_guaranteed_report,
+    //   signal_requeues_rt_sigsuspend_without_counterfeiting_its_report;
+    // syscalls::signal::tests, one test:
+    //   the_installed_mask_cannot_block_kill_or_stop.
+    ("test.detcore_unit", 1213),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2322,7 +2337,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two happens-before syscall-occurrence scheduler tests: 1188.
     // And the same fourteen rejoin and accept-in-turn tests: 1202.
     // And the in-guest-trap site-patching check test: 1187.
-    ("test.detcore_unit_on_host", 1203),
+    // And the same ten tests of the rt_sigsuspend-mask subset of
+    // https://github.com/rrnewton/hermit/pull/3224: 1213, listed with the
+    // host twin's arguments.
+    ("test.detcore_unit_on_host", 1213),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
