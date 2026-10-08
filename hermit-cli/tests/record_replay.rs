@@ -3234,6 +3234,27 @@ fn record_replay_blocking_accept_signals_match_linux() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// A signal Linux ignores ends no wait (signal(7)). Here a forked child exits
+/// with `SIGCHLD` at its default while the parent waits in accept, timed and
+/// untimed, and a thread connects later. Under ptrace that `SIGCHLD` still
+/// stops the injected attempt, and record used to end the timed accept with
+/// `EINTR` (https://github.com/rrnewton/hermit/issues/3938). Each case must take
+/// the connection in record and replay; three rounds each, as the child's
+/// exit is host-timed.
+#[test]
+fn record_replay_blocking_accept_ignores_a_child_exit() {
+    let _guard = hermit_record_lock();
+    let failures: Vec<String> = ["child-exit-timed", "child-exit-untimed"]
+        .into_iter()
+        .flat_map(|mode| {
+            (0..3).flat_map(move |_| {
+                accept_in_turn_failures(mode, &format!("{mode}: accept=fd child=1 connector=0\n"))
+            })
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// A blocking accept that nothing connects to never returns on Linux. Under
 /// record it must keep waiting until `--record-timeout` ends the recording,
 /// rather than return early or stall the host.

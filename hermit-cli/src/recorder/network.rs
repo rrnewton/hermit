@@ -845,6 +845,31 @@ impl Recorder {
     // TODO: Add support for select here.
 }
 
+/// Signals whose default action is to ignore them (signal(7)).
+const DEFAULT_IGNORED: [i32; 4] = [libc::SIGCHLD, libc::SIGCONT, libc::SIGURG, libc::SIGWINCH];
+
+/// Whether `signal`, which stopped an injected accept4 before the call ran,
+/// ends no wait on Linux, given the thread's `/proc/<pid>/task/<tid>/status`
+/// text: its disposition is to ignore it (`SigIgn`), or its default action is
+/// to ignore it and it has no handler (`SigCgt`). Such a signal is never
+/// delivered to the thread, so it interrupts nothing
+/// (https://github.com/rrnewton/hermit/issues/3938). `None` when the text
+/// lacks either line or `signal` is out of range.
+// TODO-HUMAN-REVIEW(PR-NRW3938)
+#[cfg_attr(not(test), allow(dead_code))]
+fn signal_ends_no_wait(signal: i32, status: &str) -> Option<bool> {
+    let bit = 1_u64.checked_shl(u32::try_from(signal).ok()?.checked_sub(1)?)?;
+    let field = |name: &str| {
+        status.lines().find_map(|line| {
+            let value = line.strip_prefix(name)?.strip_prefix(':')?;
+            u64::from_str_radix(value.trim(), 16).ok()
+        })
+    };
+    let ignored = field("SigIgn")? & bit != 0;
+    let caught = field("SigCgt")? & bit != 0;
+    Some(ignored || (DEFAULT_IGNORED.contains(&signal) && !caught))
+}
+
 #[cfg(test)]
 mod tests {
     use reverie::syscalls::LocalMemory;
@@ -1613,5 +1638,57 @@ mod tests {
         assert_eq!(event.result, Err(Errno::EBADF));
         assert!(event.fd_sets.iter().all(Option::is_none));
         assert!(event.timeout.is_none());
+    }
+
+    /// A status text with the given ignored and caught masks.
+    fn status(ignored: u64, caught: u64) -> String {
+        format!(
+            "Name:\tguest\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\n\
+             SigBlk:\t0000000000000000\nSigIgn:\t{ignored:016x}\nSigCgt:\t{caught:016x}\n"
+        )
+    }
+
+    /// Only an ignored disposition, or a default-ignored signal without a
+    /// handler, ends no wait; a handled signal, or one whose default action
+    /// stops or kills the thread, interrupts.
+    #[test]
+    fn a_signal_ends_no_wait_only_when_linux_ignores_it() {
+        let bit = |signal: i32| 1_u64 << (signal - 1);
+        // glibc's handler for signal 33 must not matter for SIGCHLD.
+        let glibc = bit(33);
+        assert_eq!(
+            signal_ends_no_wait(libc::SIGCHLD, &status(0, glibc)),
+            Some(true)
+        );
+        assert_eq!(
+            signal_ends_no_wait(libc::SIGCHLD, &status(0, glibc | bit(libc::SIGCHLD))),
+            Some(false),
+            "a SIGCHLD handler runs"
+        );
+        assert_eq!(
+            signal_ends_no_wait(libc::SIGUSR1, &status(bit(libc::SIGUSR1), 0)),
+            Some(true),
+            "SIG_IGN"
+        );
+        assert_eq!(
+            signal_ends_no_wait(libc::SIGUSR1, &status(0, bit(libc::SIGUSR1))),
+            Some(false),
+            "a handled SIGUSR1"
+        );
+        assert_eq!(
+            signal_ends_no_wait(libc::SIGTERM, &status(0, glibc)),
+            Some(false),
+            "default action terminates"
+        );
+        for signal in [libc::SIGCONT, libc::SIGURG, libc::SIGWINCH] {
+            assert_eq!(
+                signal_ends_no_wait(signal, &status(0, 0)),
+                Some(true),
+                "{signal}"
+            );
+        }
+        assert_eq!(signal_ends_no_wait(libc::SIGCHLD, "Name:\tguest\n"), None);
+        assert_eq!(signal_ends_no_wait(0, &status(0, 0)), None);
+        assert_eq!(signal_ends_no_wait(65, &status(0, 0)), None);
     }
 }

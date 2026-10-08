@@ -88,6 +88,12 @@
  *     immediate timeout, so the accept fails at once with EAGAIN.
  *   "timeout-set-by-child": a forked child sets SO_RCVTIMEO on the listener it
  *     shares with its parent; the parent's accept then times out.
+ *
+ * Signals Linux ignores:
+ *   "child-exit-timed", "child-exit-untimed": a forked child exits at once,
+ *     with SIGCHLD left at its default (ignore), while the parent accepts on a
+ *     listener with or without a 5 s SO_RCVTIMEO and a thread connects later.
+ *     The SIGCHLD ends no wait, so the accept takes the connection.
  */
 
 #ifndef _GNU_SOURCE
@@ -906,6 +912,48 @@ static int timeout_set_by_child(void) {
   return 0;
 }
 
+/* ---- Signals Linux ignores ---- */
+
+static void* sleep_then_connect(void* result) {
+  usleep(2 * DELAY_US);
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  *(int*)result =
+      fd >= 0 && connect(fd, (const struct sockaddr*)&server, sizeof server) == 0
+      ? 0
+      : 1;
+  if (fd >= 0) {
+    close(fd);
+  }
+  return NULL;
+}
+
+static int child_exit_case(const char* name, int timed) {
+  listener = make_listener(1);
+  if (listener < 0 || (timed && set_receive_timeout(listener, 5000000) != 0)) {
+    return 2;
+  }
+  int connector = -1;
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, sleep_then_connect, &connector) != 0) {
+    return 2;
+  }
+  fflush(stdout);
+  pid_t child = fork();
+  if (child == 0) {
+    _exit(0);
+  }
+  int conn = accept(listener, NULL, NULL);
+  int error = errno;
+  pthread_join(thread, NULL);
+  printf(
+      "%s: accept=%s child=%d connector=%d\n",
+      name,
+      outcome(conn, error),
+      reaped_ok(child),
+      connector);
+  return 0;
+}
+
 static int close_helper(const char* fd_arg) {
   int fd = atoi(fd_arg);
   int was_open = fcntl(fd, F_GETFD) >= 0;
@@ -1002,6 +1050,12 @@ int main(int argc, char** argv) {
   }
   if (strcmp(mode, "timeout-set-by-child") == 0) {
     return timeout_set_by_child();
+  }
+  if (strcmp(mode, "child-exit-timed") == 0) {
+    return child_exit_case(mode, 1);
+  }
+  if (strcmp(mode, "child-exit-untimed") == 0) {
+    return child_exit_case(mode, 0);
   }
   if (strcmp(mode, "close-helper") == 0 && argc > 2) {
     return close_helper(argv[2]);
