@@ -875,7 +875,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // config::tests::{inherited_seccomp_never_enters_the_legacy_form,
     // inherited_seccomp_is_read_from_a_status_file} (detcore-model) retain
     // all 1002: 1004.
-    ("test.regular_crates", 1004),
+    // procfs::tests::fdinfo_inode_is_strict_and_unique (detcore-model) retains
+    // all 1004: 1005.
+    ("test.regular_crates", 1005),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1167,7 +1169,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retains all 961: 962, listed with this node's arguments.
     // analyze::phases::tests::analyze_refuses_the_unimplemented_schedule_inputs_before_any_trial
     // retains all 962: 963, measured with cargo nextest list.
-    ("test.hermit_unit", 963),
+    // tests::inherited_seccomp_is_the_callers_where_naming_reads_it retains
+    // all 963: 964.
+    ("test.hermit_unit", 964),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1579,7 +1583,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // an_inherited_filter_that_suspends_an_open_does_not_stop_the_guest,
     // naming_an_entry_leaves_the_guests_errno} (an inherited seccomp filter
     // refuses naming before any injected call) retain all 99: 102.
-    ("test.detcore_misc", 102),
+    // procfs_inode::{an_inherited_filter_that_fakes_an_open_files_stat_records_a_determinism_loss,
+    // an_inherited_filter_records_no_loss_for_a_file_that_is_not_procfs,
+    // an_inherited_filter_that_fakes_a_directory_stat_records_a_determinism_loss,
+    // an_inherited_filter_that_suspends_a_directory_stat_does_not_stop_the_guest,
+    // an_inherited_filter_that_suspends_a_descriptor_stat_does_not_stop_the_guest}
+    // (a faked fstat under an inherited filter is a recorded loss) retain all
+    // 102 (measured 107).
+    ("test.detcore_misc", 107),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -1666,7 +1677,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // move to test.pmu_integration_cases: 287 - 25 = 262, listed
     // with this node's filter.
     // The eight fatal_core_capture tests: 270.
-    ("test.hermit_integration", 270),
+    // procfs_determinism's hermit_run_measures_the_seccomp_filters_its_guest_inherits
+    // and a_library_guest_whose_seccomp_state_is_not_stated_names_no_procfs_entry
+    // retain all 270: 272.
+    ("test.hermit_integration", 272),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -2090,7 +2104,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
     // The host node carries the identical tests_misc selection.
-    ("test.detcore_misc_on_host", 102),
+    ("test.detcore_misc_on_host", 107),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -2199,7 +2213,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the minimal-environment test (287, measured).
     // The host twin skips the same 25 PMU-timer cases: 262.
     // And the same eight fatal_core_capture tests: 270.
-    ("test.hermit_integration_on_host", 270),
+    // And the same two procfs_determinism inherited-seccomp tests: 272.
+    ("test.hermit_integration_on_host", 272),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -2262,7 +2277,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the record timer-support test: 961.
     // And the DBT determinism-loss evidence test: 962.
     // And the analyze schedule-input refusal test: 963.
-    ("test.hermit_unit_on_host", 963),
+    // And the same inherited-seccomp caller test: 964.
+    ("test.hermit_unit_on_host", 964),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -2355,7 +2371,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same in_guest_detlog_forward_policy legacy-form test: 1001.
     // And the same committed-selection preparation test: 1002.
     // And the same two detcore-model inherited-seccomp tests: 1004.
-    ("test.regular_crates_on_host", 1004),
+    // And the same detcore-model fdinfo inode test: 1005.
+    ("test.regular_crates_on_host", 1005),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

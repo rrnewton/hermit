@@ -580,9 +580,43 @@ fn filter_naming_opens(action: u32, flags: libc::c_ulong) -> libc::c_long {
     install(&mut program, flags)
 }
 
-/// The determinism loss Detcore records, before it injects any call, for a
-/// guest that inherits the one filter a test installed.
+/// The determinism loss Detcore records, before it injects any call to name a
+/// procfs entry, for a guest that inherits the one filter a test installed.
 const ONE_INHERITED_FILTER: &str = "procfs inode numbers: a seccomp filter the guest inherited may apply to its calls (mode: filter, with 1 filter)";
+
+/// The determinism loss Detcore records when the one filter a test installed
+/// answers an `fstat` that Detcore injects without running it.
+const ONE_FILTER_FAKED_AN_FSTAT: &str = "file metadata: a seccomp filter the guest inherited answered an fstat Detcore injected without running it (mode: filter, with 1 filter)";
+
+/// Fill the guest's descriptors below `FILTERED_FD`, which must be free, so
+/// that the next descriptor the guest opens, or Detcore opens in it, is that
+/// one.
+#[cfg(target_arch = "x86_64")]
+fn take_the_descriptors_below_the_filtered_one() {
+    let open = |fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0;
+    assert!(!open(FILTERED_FD), "{FILTERED_FD} is open from the start");
+    let null = File::open("/dev/null").unwrap().into_raw_fd();
+    let mut last = null;
+    while last < FILTERED_FD - 1 {
+        last = unsafe { libc::dup(null) };
+        assert!(last >= 0, "dup: {}", std::io::Error::last_os_error());
+    }
+    assert_eq!(
+        last,
+        FILTERED_FD - 1,
+        "a descriptor below {FILTERED_FD} was free"
+    );
+}
+
+/// Open `/dev/zero` and read 8 bytes through it, returning its descriptor.
+fn read_dev_zero() -> i32 {
+    let zero = File::open("/dev/zero").unwrap().into_raw_fd();
+    let mut bytes = [0xff_u8; 8];
+    let read = unsafe { libc::read(zero, bytes.as_mut_ptr().cast(), bytes.len()) };
+    assert_eq!(read, 8, "read: {}", std::io::Error::last_os_error());
+    assert_eq!(bytes, [0; 8], "/dev/zero read nonzero bytes");
+    zero
+}
 
 /// A filter the guest inherits can make the `O_PATH` open that names a path
 /// return 0 without running, as if it had opened descriptor 0, so the close
@@ -622,6 +656,163 @@ fn an_inherited_filter_that_suspends_an_open_does_not_stop_the_guest() {
     let listener = unsafe { std::os::fd::OwnedFd::from_raw_fd(listener as i32) };
     under_detcore(|| {
         std::fs::symlink_metadata("/proc/self/stat").unwrap();
+    });
+    drop(listener);
+    assert_eq!(
+        detcore::detlog::determinism_loss().as_deref(),
+        Some(ONE_INHERITED_FILTER)
+    );
+}
+
+/// Give `action` to every `fstat(fd)`, and return what `seccomp(2)` returned
+/// for `flags`.
+#[cfg(target_arch = "x86_64")]
+fn filter_fstat(fd: i32, action: u32, flags: libc::c_ulong) -> libc::c_long {
+    // seccomp_data: nr at 0, arch at 4, and the low half of args[0] at 16.
+    let mut program = [
+        load(4),
+        jump_if(AUDIT_ARCH_X86_64, 1, 0),
+        ret(libc::SECCOMP_RET_ALLOW),
+        load(0),
+        jump_if(libc::SYS_fstat as u32, 0, 3),
+        load(16),
+        jump_if(fd as u32, 0, 1),
+        ret(action),
+        ret(libc::SECCOMP_RET_ALLOW),
+    ];
+    install(&mut program, flags)
+}
+
+/// A filter the guest inherits can make the `fstat` Detcore injects, to learn
+/// the metadata of a file the guest opened, return 0 without running, which
+/// leaves its buffer as it was. Detcore would then take whatever the buffer
+/// held for the file's metadata, without a determinism loss. While a filter
+/// may apply, Detcore fills the buffer before the call, so it sees that
+/// nothing was written, and records the loss. The guest's open still
+/// succeeds, and its descriptor works.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn an_inherited_filter_that_fakes_an_open_files_stat_records_a_determinism_loss() {
+    filter_fstat(FILTERED_FD, libc::SECCOMP_RET_ERRNO, 0);
+    under_detcore(|| {
+        take_the_descriptors_below_the_filtered_one();
+        assert_eq!(read_dev_zero(), FILTERED_FD);
+    });
+    assert_eq!(
+        detcore::detlog::determinism_loss().as_deref(),
+        Some(ONE_FILTER_FAKED_AN_FSTAT)
+    );
+}
+
+/// While a filter the guest inherited may apply, opening a file that cannot be
+/// a procfs one records no determinism loss: the `fstat` Detcore injects runs
+/// and writes its buffer, and Detcore injects nothing to name the file.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn an_inherited_filter_records_no_loss_for_a_file_that_is_not_procfs() {
+    filter_fstat(FILTERED_FD, libc::SECCOMP_RET_ERRNO, 0);
+    assert!(
+        matches!(InheritedSeccomp::measure(), InheritedSeccomp::Filter(_)),
+        "the guest inherits no filter"
+    );
+    under_detcore(|| {
+        assert_ne!(read_dev_zero(), FILTERED_FD);
+    });
+    assert_eq!(detcore::detlog::determinism_loss(), None);
+}
+
+/// Where the guest inherits a directory. Reverie closes descriptors 3 to 255
+/// when it starts a guest (`init_tracee`), so the descriptor is above them.
+#[cfg(target_arch = "x86_64")]
+const INHERITED_DIRECTORY_FD: i32 = 300;
+
+/// Leave a descriptor of the procfs directory `/proc/sys/vm` at
+/// `INHERITED_DIRECTORY_FD` for the guest to inherit. Detcore does not see it
+/// opened, so it has no `stat` of it.
+#[cfg(target_arch = "x86_64")]
+fn inherit_a_procfs_directory() {
+    let directory = File::open("/proc/sys/vm").unwrap();
+    assert_eq!(
+        unsafe { libc::dup2(directory.as_raw_fd(), INHERITED_DIRECTORY_FD) },
+        INHERITED_DIRECTORY_FD
+    );
+}
+
+/// List the directory the guest inherited at `INHERITED_DIRECTORY_FD`.
+#[cfg(target_arch = "x86_64")]
+fn list_the_inherited_directory() {
+    let directory = unsafe { File::from_raw_fd(INHERITED_DIRECTORY_FD) };
+    let entries = rest_of_listing(&directory);
+    assert!(
+        entries.contains_key("overcommit_memory"),
+        "/proc/sys/vm lists no overcommit_memory: {entries:?}"
+    );
+}
+
+/// A filter the guest inherits can make the `fstat` Detcore injects, to learn
+/// the device of a directory it did not see opened, return 0 without
+/// running. Detcore would then read a `stat` the call did not write, which
+/// describes no procfs file, and number the directory's procfs entries by
+/// their host numbers without a determinism loss. Detcore injects no `fstat`
+/// while a filter may apply, and records the loss.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn an_inherited_filter_that_fakes_a_directory_stat_records_a_determinism_loss() {
+    inherit_a_procfs_directory();
+    filter_fstat(INHERITED_DIRECTORY_FD, libc::SECCOMP_RET_ERRNO, 0);
+    under_detcore(list_the_inherited_directory);
+    assert_eq!(
+        detcore::detlog::determinism_loss().as_deref(),
+        Some(ONE_INHERITED_FILTER)
+    );
+}
+
+/// A filter the guest inherits can hand that `fstat` to a supervisor that
+/// never answers, which would stop the guest for good. Detcore injects no
+/// `fstat` while a filter may apply, so the listing completes. (Were it
+/// injected, the test would hang until the test runner's timeout.)
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn an_inherited_filter_that_suspends_a_directory_stat_does_not_stop_the_guest() {
+    inherit_a_procfs_directory();
+    let listener = filter_fstat(
+        INHERITED_DIRECTORY_FD,
+        libc::SECCOMP_RET_USER_NOTIF,
+        libc::SECCOMP_FILTER_FLAG_NEW_LISTENER,
+    );
+    let listener = unsafe { std::os::fd::OwnedFd::from_raw_fd(listener as i32) };
+    under_detcore(list_the_inherited_directory);
+    drop(listener);
+    assert_eq!(
+        detcore::detlog::determinism_loss().as_deref(),
+        Some(ONE_INHERITED_FILTER)
+    );
+}
+
+/// The same for the `fstat` Detcore injects to number the descriptor that a
+/// `/proc/<pid>/fdinfo/<n>` file describes, which it does when it has no
+/// `stat` of the descriptor, as when it does not virtualize metadata.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn an_inherited_filter_that_suspends_a_descriptor_stat_does_not_stop_the_guest() {
+    let listener = filter_fstat(
+        FILTERED_FD,
+        libc::SECCOMP_RET_USER_NOTIF,
+        libc::SECCOMP_FILTER_FLAG_NEW_LISTENER,
+    );
+    let listener = unsafe { std::os::fd::OwnedFd::from_raw_fd(listener as i32) };
+    let config = Config {
+        virtualize_metadata: false,
+        ..config()
+    };
+    under_detcore_with(config, || {
+        let null = File::open("/dev/null").unwrap();
+        assert_eq!(
+            unsafe { libc::dup2(null.as_raw_fd(), FILTERED_FD) },
+            FILTERED_FD
+        );
+        let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{FILTERED_FD}")).unwrap();
+        assert!(fdinfo.contains("\nino:"), "fdinfo has no inode: {fdinfo}");
     });
     drop(listener);
     assert_eq!(
@@ -672,21 +863,12 @@ fn stat_a_procfs_path_with_close_filtered(errno: u32) -> Option<String> {
         ..config()
     };
     under_detcore_with(config, || {
-        let open = |fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0;
-        assert!(!open(FILTERED_FD), "{FILTERED_FD} is open from the start");
-        let null = File::open("/dev/null").unwrap().into_raw_fd();
-        let mut last = null;
-        while last < FILTERED_FD - 1 {
-            last = unsafe { libc::dup(null) };
-            assert!(last >= 0, "dup: {}", std::io::Error::last_os_error());
-        }
-        assert_eq!(
-            last,
-            FILTERED_FD - 1,
-            "a descriptor below {FILTERED_FD} was free"
-        );
+        take_the_descriptors_below_the_filtered_one();
         std::fs::symlink_metadata("/proc/self/stat").unwrap();
-        assert!(open(FILTERED_FD), "Detcore's O_PATH descriptor was closed");
+        assert!(
+            unsafe { libc::fcntl(FILTERED_FD, libc::F_GETFD) } >= 0,
+            "Detcore's O_PATH descriptor was closed"
+        );
     });
     detcore::detlog::determinism_loss()
 }

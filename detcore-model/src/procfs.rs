@@ -216,22 +216,33 @@ pub fn parse_mountinfo(contents: &[u8]) -> Option<Vec<MountInfoRow>> {
 /// container capture path from accepting input the guest-visible sanitizer
 /// would later refuse.
 pub fn parse_fdinfo_mount_id(contents: &[u8]) -> Option<u64> {
-    let mut mount_id = None;
+    parse_fdinfo_number(contents, b"mnt_id:")
+}
+
+/// Parse the one decimal `ino` field of Linux fdinfo (Linux 5.14 and later),
+/// the inode number of the open file, under the same rules as
+/// [`parse_fdinfo_mount_id`].
+pub fn parse_fdinfo_inode(contents: &[u8]) -> Option<u64> {
+    parse_fdinfo_number(contents, b"ino:")
+}
+
+/// The one decimal field of fdinfo that `label` (its name and colon) starts.
+fn parse_fdinfo_number(contents: &[u8], label: &[u8]) -> Option<u64> {
+    let mut number = None;
     for line in contents.split(|byte| *byte == b'\n') {
-        let Some(value) = line.strip_prefix(b"mnt_id:") else {
+        let Some(value) = line.strip_prefix(label) else {
             continue;
         };
         let value = value
             .strip_prefix(b"\t")
             .or_else(|| value.strip_prefix(b" "))?;
-        if value.is_empty() || value.iter().any(|byte| !byte.is_ascii_digit()) || mount_id.is_some()
-        {
+        if value.is_empty() || value.iter().any(|byte| !byte.is_ascii_digit()) || number.is_some() {
             return None;
         }
         let text = std::str::from_utf8(value).ok()?;
-        mount_id = Some(text.parse().ok()?);
+        number = Some(text.parse().ok()?);
     }
-    mount_id
+    number
 }
 
 #[cfg(test)]
@@ -239,6 +250,7 @@ mod tests {
     use super::exclude_ephemeral_host_seed_mounts;
     use super::is_ephemeral_host_seed_mount;
     use super::mount_ids_are_ordered_subset;
+    use super::parse_fdinfo_inode;
     use super::parse_fdinfo_mount_id;
     use super::parse_mountinfo;
 
@@ -255,6 +267,25 @@ mod tests {
             b"mnt_id:37\n".as_slice(),
         ] {
             assert_eq!(parse_fdinfo_mount_id(malformed), None, "{malformed:?}");
+        }
+    }
+
+    #[test]
+    fn fdinfo_inode_is_strict_and_unique() {
+        assert_eq!(
+            parse_fdinfo_inode(b"pos:\t0\nflags:\t02\nmnt_id:\t37\nino:\t4026\n"),
+            Some(4026)
+        );
+        assert_eq!(parse_fdinfo_inode(b"ino: 0\n"), Some(0));
+        for malformed in [
+            b"pos:\t0\nmnt_id:\t37\n".as_slice(),
+            b"ino:\tbad\nino:\t37\n".as_slice(),
+            b"ino:\t37\nino:\t38\n".as_slice(),
+            b"ino:\t37 trailing\n".as_slice(),
+            b"ino:\t18446744073709551616\n".as_slice(),
+            b"ino:37\n".as_slice(),
+        ] {
+            assert_eq!(parse_fdinfo_inode(malformed), None, "{malformed:?}");
         }
     }
 
