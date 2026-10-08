@@ -1141,7 +1141,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // measured with cargo nextest list.
     // run::display_runopts_without_a_pmu_profile retains all 957: 958, listed
     // with this node's arguments.
-    ("test.hermit_unit", 958),
+    // run::tests::a_green_run_removes_only_its_own_fatal_cores: 959.
+    ("test.hermit_unit", 959),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1439,7 +1440,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1127.
     // Eleven fatal_core::tests (core layout, zstd frames, caps, deadline,
     // dumping-thread and unreadable-memory cases): 1138.
-    ("test.detcore_unit", 1138),
+    // Four more fatal_core::tests (dump rule, lock-wait deadline, repeated
+    // process ID, Full-tier timeout): 1142.
+    ("test.detcore_unit", 1142),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1571,8 +1574,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 25 external_signal_interrupt ptrace cases that need the PMU timer
     // move to test.pmu_integration_cases: 287 - 25 = 262, listed
     // with this node's filter.
-    // The six fatal_core_capture tests: 268.
-    ("test.hermit_integration", 268),
+    // The eight fatal_core_capture tests: 270.
+    ("test.hermit_integration", 270),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -2017,8 +2020,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same thirteen SIGALRM ledger tests, re-listed: 1110.
     // And the same five SIGALRM ledger control tests, re-listed: 1123.
     // The host twin selects the same four instruction_trap tests: 1127.
-    // And the same eleven fatal_core::tests: 1138.
-    ("test.detcore_unit_on_host", 1138),
+    // And the same fifteen fatal_core::tests: 1142.
+    ("test.detcore_unit_on_host", 1142),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -2043,8 +2046,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the three stdout-file tests (286).
     // And the minimal-environment test (287, measured).
     // The host twin skips the same 25 PMU-timer cases: 262.
-    // And the same six fatal_core_capture tests: 268.
-    ("test.hermit_integration_on_host", 268),
+    // And the same eight fatal_core_capture tests: 270.
+    ("test.hermit_integration_on_host", 270),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -2102,7 +2105,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two bisect epoch tests: 956.
     // And the analyze epoch test: 957.
     // And the PMU-profile validation test: 958.
-    ("test.hermit_unit_on_host", 958),
+    // And the same fatal-core cleanup test: 959.
+    ("test.hermit_unit_on_host", 959),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

@@ -164,7 +164,10 @@ fn a_segfault_keeps_one_core_and_reports_what_it_would_without_one() {
         "unexpected core name {name}"
     );
     assert!(
-        stderr(&with).contains(&format!("kept as {name}\n")),
+        stderr(&with)
+            .lines()
+            .any(|line| line.starts_with("hermit: fatal core for thread ")
+                && line.ends_with(&format!(" (SIGSEGV): kept as {name}"))),
         "hermit did not report the core by name alone (a size or tier depends on \
          host timing and would differ between two --verify runs):\n{}",
         stderr(&with)
@@ -186,6 +189,69 @@ fn prstatus_r12(core: &[u8]) -> u64 {
     // 12-byte note header, "CORE\0" padded to 8, then elf_prstatus, whose
     // registers start at 112; r12 is the fourth.
     u64_at(notes + 20 + 112 + 3 * 8)
+}
+
+#[test]
+fn memory_excluded_with_madv_dontdump_stays_out_of_the_core() {
+    let (guest, root) = guest("dontdump");
+    let cores = root.join("cores");
+    let output = hermit(
+        &["--fatal-core-dir", cores.to_str().unwrap()],
+        &guest,
+        &["dontdump"],
+    );
+    assert!(
+        !output.status.success(),
+        "the guest must die:\n{}",
+        stderr(&output)
+    );
+    let kept = files(&cores);
+    assert_eq!(kept.len(), 1, "expected one core, found {kept:?}");
+    let core = decode_core(&cores.join(&kept[0].0));
+    let holds = |needle: &[u8]| core.windows(needle.len()).any(|window| window == needle);
+    assert!(holds(MARKER), "the core does not hold the guest's heap");
+    assert!(
+        !holds(b"HERMIT-DONTDUMP-SECRET"),
+        "the core holds memory the guest excluded with MADV_DONTDUMP"
+    );
+}
+
+#[test]
+fn files_from_other_invocations_neither_block_a_core_nor_get_removed() {
+    let (guest, root) = guest("others");
+    let cores = root.join("cores");
+    fs::create_dir_all(&cores).unwrap();
+    // Names an older scheme or another invocation could have used for the
+    // same guest process; the guest's first process is PID 3 in its namespace.
+    let others = [
+        "hermit-1-core.3.3.SIGSEGV.zst",
+        "hermit-1-0000000000000000-core.3.3.SIGSEGV.zst",
+        ".hermit-1-0000000000000000-core.3.3.SIGSEGV.zst.tmp",
+    ];
+    for name in others {
+        fs::write(cores.join(name), b"not ours").unwrap();
+    }
+    let dir = cores.to_str().unwrap();
+    let crashed = hermit(&["--fatal-core-dir", dir], &guest, &["segv"]);
+    assert!(
+        stderr(&crashed).contains(": kept as hermit-"),
+        "an existing file stopped the core:\n{}",
+        stderr(&crashed)
+    );
+    let green = hermit(&["--fatal-core-dir", dir], &guest, &["child-segv-ok"]);
+    assert!(green.status.success(), "{}", stderr(&green));
+    let left: Vec<String> = files(&cores).into_iter().map(|(name, _)| name).collect();
+    for name in others {
+        assert!(
+            left.iter().any(|kept| kept == name),
+            "{name} was removed: {left:?}"
+        );
+    }
+    assert_eq!(
+        left.len(),
+        others.len() + 1,
+        "the crashed run's core must survive the later green run: {left:?}"
+    );
 }
 
 #[test]

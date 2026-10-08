@@ -799,6 +799,46 @@ pub(crate) struct DetOptions {
 /// on it. The guest's clock does not move meanwhile; only the host waits.
 const FATAL_CORE_TIME_LIMIT: Duration = Duration::from_secs(10);
 
+/// A token that names one invocation's fatal cores and no other's: the
+/// controller's process ID, for the reader, and 64 random bits, because a
+/// later run on this host, or a run in another PID namespace sharing the
+/// directory, can have the same process ID.
+fn fatal_core_owner_token() -> String {
+    let mut nonce = [0u8; 8];
+    // SAFETY: getrandom writes at most `nonce.len()` bytes into `nonce`.
+    let filled = unsafe { libc::getrandom(nonce.as_mut_ptr().cast(), nonce.len(), 0) };
+    let nonce = if filled == nonce.len() as isize {
+        u64::from_le_bytes(nonce)
+    } else {
+        // Host time only names a file; it never reaches the guest.
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos() as u64)
+    };
+    format!("{}-{nonce:016x}", std::process::id())
+}
+
+/// Removes the files in `dir` that the invocation named by `owner` wrote:
+/// its cores and any temporary file a capture left behind. Returns how many.
+fn remove_fatal_core_files(dir: &Path, owner: &str) -> usize {
+    let prefix = format!("hermit-{owner}-");
+    let temp_prefix = format!(".{prefix}");
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if (name.starts_with(&prefix) || name.starts_with(&temp_prefix))
+            && fs::remove_file(entry.path()).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// Command-line options for the "run" subcommand.
 #[derive(Debug, Parser, Clone)]
 pub struct RunOpts {
@@ -848,10 +888,13 @@ pub struct RunOpts {
     /// Opt in to keeping a core file for each guest process that a
     /// core-dumping signal (SIGSEGV, SIGABRT, SIGBUS, ...) kills. The core is
     /// written zstd-compressed into DIR as
-    /// `hermit-<HERMIT PID>-core.<PID>.<TID>.<SIGNAL>.zst`, where PID and TID
-    /// are the guest's. Off by default: without this option no core is
-    /// written. Only ptrace-backed backends write cores. A run that exits 0
-    /// (for `--verify`, whose two runs also matched) deletes its cores again.
+    /// `hermit-<HERMIT PID>-<RANDOM>-core.<PID>.<TID>.<SIGNAL>.zst`, where PID
+    /// and TID are the guest's and RANDOM is unique to this invocation. Off by
+    /// default: without this option no core is written. Only ptrace-backed
+    /// backends write cores. A run that exits 0 (for `--verify`, whose two
+    /// runs also matched) deletes the cores it wrote again. Writing a core
+    /// stops the whole guest for up to 10 seconds of host time, which counts
+    /// against `--timeout`.
     #[clap(long, value_name = "DIR")]
     fatal_core_dir: Option<PathBuf>,
 
@@ -878,12 +921,12 @@ pub struct RunOpts {
     #[clap(skip)]
     fatal_core_run_label: Option<&'static str>,
 
-    /// Runtime-only: the controller's process ID, recorded when
-    /// `--fatal-core-dir` is opened, which names this invocation's cores. The
+    /// Runtime-only: the token naming this invocation's cores, made when
+    /// `--fatal-core-dir` is opened (see [`fatal_core_owner_token`]). The
     /// tracer computes names inside the run's PID namespace, where its own
     /// process ID is not the controller's.
     #[clap(skip)]
-    fatal_core_owner_pid: u32,
+    fatal_core_owner: String,
 
     /// Whether this invocation's epoch was captured from the host clock because
     /// neither `--epoch` nor `HERMIT_EPOCH` supplied an explicit input.
@@ -7140,8 +7183,8 @@ impl RunOpts {
     /// The name prefix of every core this run writes.
     fn fatal_core_file_prefix(&self) -> String {
         match self.fatal_core_run_label {
-            Some(label) => format!("hermit-{}-{label}-", self.fatal_core_owner_pid),
-            None => format!("hermit-{}-", self.fatal_core_owner_pid),
+            Some(label) => format!("hermit-{}-{label}-", self.fatal_core_owner),
+            None => format!("hermit-{}-", self.fatal_core_owner),
         }
     }
 
@@ -7154,7 +7197,7 @@ impl RunOpts {
             let handle = File::open(dir)
                 .with_context(|| format!("opening --fatal-core-dir {}", dir.display()))?;
             self.fatal_core_dir_handle = Some(std::sync::Arc::new(handle));
-            self.fatal_core_owner_pid = std::process::id();
+            self.fatal_core_owner = fatal_core_owner_token();
         }
         Ok(())
     }
@@ -7166,21 +7209,7 @@ impl RunOpts {
         let (Some(dir), Some(_)) = (&self.fatal_core_dir, &self.fatal_core_dir_handle) else {
             return;
         };
-        let prefix = format!("hermit-{}-", self.fatal_core_owner_pid);
-        let temp_prefix = format!(".{prefix}");
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        let mut removed = 0;
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if (name.starts_with(&prefix) || name.starts_with(&temp_prefix))
-                && fs::remove_file(entry.path()).is_ok()
-            {
-                removed += 1;
-            }
-        }
+        let removed = remove_fatal_core_files(dir, &self.fatal_core_owner);
         if removed > 0 {
             eprintln!("hermit: the run exited 0, so its {removed} fatal core file(s) were removed");
         }
@@ -7555,6 +7584,36 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
+
+    #[test]
+    fn a_green_run_removes_only_its_own_fatal_cores() {
+        let dir = tempfile::tempdir().unwrap();
+        let mine = fatal_core_owner_token();
+        let theirs = fatal_core_owner_token();
+        // Same controller process ID, as after PID reuse or in another PID
+        // namespace sharing the directory, but a different invocation.
+        assert_ne!(mine, theirs);
+        assert_eq!(mine.split('-').next(), theirs.split('-').next());
+        let files = [
+            format!("hermit-{mine}-core.3.3.SIGSEGV.zst"),
+            format!(".hermit-{mine}-core.4.4.SIGABRT.zst.tmp"),
+            format!("hermit-{theirs}-core.3.3.SIGSEGV.zst"),
+            format!(".hermit-{theirs}-core.4.4.SIGABRT.zst.tmp"),
+            "unrelated".to_string(),
+        ];
+        for file in &files {
+            fs::write(dir.path().join(file), b"x").unwrap();
+        }
+        assert_eq!(remove_fatal_core_files(dir.path(), &mine), 2);
+        let mut left: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        let mut expected = files[2..].to_vec();
+        expected.sort();
+        assert_eq!(left, expected);
+    }
 
     /// Fails its first write and accepts every later one.
     struct FailsOnce {

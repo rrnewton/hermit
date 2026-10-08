@@ -24,6 +24,15 @@
 //! partial one; when `/proc/<tid>/mem` cannot be opened at all, the core holds
 //! only the notes and the mapping layout. Neither fails the capture.
 //!
+//! A core stores only what the kernel's own dump would (see [`dump_rule`]):
+//! nothing the guest marked `MADV_DONTDUMP`, nothing of an I/O or raw-PFN
+//! mapping, and only the kinds of mapping its `coredump_filter` selects, so
+//! shared file mappings are left out by default.
+//!
+//! Every core gets a name no other core has: the caller's
+//! [`FatalCoreCapture::file_prefix`] is unique to the invocation, and a
+//! repeated guest process ID within a run gets a numbered name.
+//!
 //! The capture is best effort and bounded. One core never exceeds
 //! `max_core_bytes`; the regular files in the directory never exceed
 //! `max_total_bytes` together, counted under a directory lock that every
@@ -33,7 +42,9 @@
 //! with less memory: first only the stack the thread was running on, then
 //! only the notes (registers, signal, process identity, auxiliary vector and
 //! mapped files) and the mapping layout. A core that cannot fit even then is
-//! not written. Every failure is returned for the caller to log.
+//! not written. Once a Full core runs out of time, later captures in the same
+//! hermit process start at the Stack tier. Every failure is returned for the
+//! caller to log.
 
 use std::fs;
 use std::fs::File;
@@ -43,13 +54,17 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
+use ::procfs::process::CoredumpFlags;
 use ::procfs::process::MMPermissions;
 use ::procfs::process::MMapPath;
 use ::procfs::process::MemoryMap;
 use ::procfs::process::Process;
+use ::procfs::process::VmFlags;
 use reverie::FatalSignalExit;
 use ruzstd::encoding::CompressionLevel;
 
@@ -68,20 +83,19 @@ pub(crate) enum Outcome {
     /// The thread did not run the kernel's core dump step, so it gets no
     /// core: another thread of its process did, or none did.
     NotDumping,
-    /// This run already holds a core for the thread's process.
-    AlreadyCaptured,
     /// No tier fitted in `budget` bytes before the capture's end.
     NoRoom { budget: u64 },
 }
 
-/// How much memory a core holds.
+/// How much memory a core holds. Every tier keeps only what the kernel's own
+/// dump would: see [`dump_rule`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Tier {
-    /// Every anonymous, writable, stack, heap and vDSO mapping, and the first
-    /// page of each file mapped from offset 0 (its ELF header).
+    /// Every mapping the kernel would dump whole, and the first page of each
+    /// file mapped from offset 0 (its ELF header).
     Full,
-    /// Only the mapping holding the stack pointer and the main stack, plus
-    /// the ELF header pages.
+    /// Of those, only the mapping holding the stack pointer and the main
+    /// stack, plus the ELF header pages.
     Stack,
     /// No memory: notes and the mapping layout only.
     NotesOnly,
@@ -101,7 +115,7 @@ pub(crate) fn capture_and_log(cfg: &FatalCoreCapture, exit: &FatalSignalExit) {
             "kept as {}",
             path.file_name().unwrap_or_default().to_string_lossy()
         ),
-        Ok(Outcome::NotDumping | Outcome::AlreadyCaptured) => return,
+        Ok(Outcome::NotDumping) => return,
         Ok(Outcome::NoRoom { .. }) => {
             "not kept: no core fits within its size and time limits".to_string()
         }
@@ -122,15 +136,22 @@ pub(crate) fn capture(cfg: &FatalCoreCapture, exit: &FatalSignalExit) -> anyhow:
     }
     // A memory that is already gone still leaves the notes worth keeping.
     let mem = File::open(format!("/proc/{}/mem", exit.tid.as_raw())).ok();
-    capture_from(cfg, exit, mem.as_ref())
+    capture_from(cfg, exit, mem.as_ref(), &FULL_TIER_TIMED_OUT)
 }
+
+/// Set once a Full core has run out of time in this hermit process. Every
+/// capture stops the whole guest, so later crashes then go straight to the
+/// smaller tiers instead of each spending most of the time limit again.
+static FULL_TIER_TIMED_OUT: AtomicBool = AtomicBool::new(false);
 
 /// [`capture`] with the thread's memory, or `None` when it cannot be read at
 /// all, in which case only the notes and the mapping layout are kept.
+/// `full_timed_out` is [`FULL_TIER_TIMED_OUT`] outside tests.
 fn capture_from(
     cfg: &FatalCoreCapture,
     exit: &FatalSignalExit,
     mem: Option<&File>,
+    full_timed_out: &AtomicBool,
 ) -> anyhow::Result<Outcome> {
     let start = Instant::now();
     let end = capture_end(start, cfg.time_limit, exit.deadline);
@@ -139,20 +160,25 @@ fn capture_from(
     let snapshot = Snapshot::read(&process, exit)?;
     fs::create_dir_all(&cfg.dir)?;
     let _lock = DirLock::acquire(&cfg.dir, end)?;
-    let stem = format!("{}core.{}.", cfg.file_prefix, snapshot.tgid);
-    if has_entry_with_prefix(&cfg.dir, &stem)? {
-        return Ok(Outcome::AlreadyCaptured);
-    }
     let used = regular_file_bytes(&cfg.dir)?;
     let budget = cfg
         .max_core_bytes
         .min(cfg.max_total_bytes.saturating_sub(used));
-    let name = format!("{stem}{tid}.{}.zst", exit.signal.as_str());
+    let stem = format!(
+        "{}core.{}.{tid}.{}",
+        cfg.file_prefix,
+        snapshot.tgid,
+        exit.signal.as_str()
+    );
+    let name = free_name(&cfg.dir, &stem)?;
     let path = cfg.dir.join(&name);
     let temp = cfg.dir.join(format!(".{name}.tmp"));
     let span = end.saturating_duration_since(start);
     let tiers: &[(Tier, u32)] = match mem {
-        Some(_) => &[(Tier::Full, 7), (Tier::Stack, 9), (Tier::NotesOnly, 10)],
+        Some(_) if !full_timed_out.load(Ordering::Relaxed) => {
+            &[(Tier::Full, 7), (Tier::Stack, 9), (Tier::NotesOnly, 10)]
+        }
+        Some(_) => &[(Tier::Stack, 9), (Tier::NotesOnly, 10)],
         None => &[(Tier::NotesOnly, 10)],
     };
     for &(tier, tenths) in tiers {
@@ -166,7 +192,10 @@ fn capture_from(
             Err(error) => {
                 let _ = fs::remove_file(&temp);
                 match error {
-                    WriteError::OverBudget | WriteError::Deadline => continue,
+                    WriteError::Deadline if tier == Tier::Full => {
+                        full_timed_out.store(true, Ordering::Relaxed);
+                    }
+                    WriteError::OverBudget | WriteError::Deadline => {}
                     WriteError::Io(error) => return Err(error.into()),
                 }
             }
@@ -209,13 +238,18 @@ impl DirLock {
     }
 }
 
-fn has_entry_with_prefix(dir: &Path, prefix: &str) -> std::io::Result<bool> {
-    for entry in fs::read_dir(dir)? {
-        if entry?.file_name().to_string_lossy().starts_with(prefix) {
-            return Ok(true);
+/// `<stem>.zst`, or `<stem>.<n>.zst` for the first `n` that names no file yet,
+/// so a core never replaces another: a guest process ID can be reused within
+/// a run. Called under [`DirLock`], so two writers cannot pick the same name.
+fn free_name(dir: &Path, stem: &str) -> std::io::Result<String> {
+    let mut name = format!("{stem}.zst");
+    for n in 1u32.. {
+        if !dir.join(&name).try_exists()? {
+            break;
         }
+        name = format!("{stem}.{n}.zst");
     }
-    Ok(false)
+    Ok(name)
 }
 
 /// Bytes held by the regular files directly in `dir`.
@@ -236,13 +270,32 @@ struct Snapshot {
     stack_pointer: u64,
     notes: Vec<u8>,
     maps: Vec<MemoryMap>,
+    /// What may be stored of each of `maps`, by [`dump_rule`].
+    rules: Vec<Dump>,
 }
 
 impl Snapshot {
     fn read(process: &Process, exit: &FatalSignalExit) -> anyhow::Result<Self> {
         let status = process.status()?;
         let stat = process.stat()?;
-        let maps = process.maps()?.0;
+        // smaps carries the kernel's VmFlags, which say what a dump must skip;
+        // without them, keep the layout and store no memory at all.
+        let (maps, flags_known) = match process.smaps() {
+            Ok(maps) => (maps.0, true),
+            Err(_) => (process.maps()?.0, false),
+        };
+        let filter = coredump_filter(exit.tid.as_raw());
+        let rules = maps
+            .iter()
+            .map(|map| {
+                let flags = map.extension.vm_flags;
+                dump_rule(
+                    map,
+                    (flags_known && !flags.is_empty()).then_some(flags),
+                    filter,
+                )
+            })
+            .collect();
         let cmdline = process.cmdline().unwrap_or_default().join(" ");
         let auxv = fs::read(format!("/proc/{}/auxv", exit.tid.as_raw())).ok();
         let identity = Identity {
@@ -277,37 +330,28 @@ impl Snapshot {
             stack_pointer: arch::stack_pointer(&exit.regs),
             notes,
             maps,
+            rules,
         })
     }
 
     fn segments(&self, tier: Tier) -> Vec<Segment> {
         self.maps
             .iter()
-            .filter(|map| dumpable(map))
-            .map(|map| {
+            .zip(&self.rules)
+            .filter(|(map, _)| dumpable(map))
+            .map(|(map, rule)| {
                 let (start, end) = map.address;
                 let len = end - start;
-                let all = match tier {
-                    Tier::Full => {
-                        map.inode == 0
-                            || map.perms.contains(MMPermissions::WRITE)
-                            || matches!(
-                                map.pathname,
-                                MMapPath::Stack
-                                    | MMapPath::TStack(_)
-                                    | MMapPath::Heap
-                                    | MMapPath::Vdso
-                            )
-                    }
-                    Tier::Stack => {
-                        (start..end).contains(&self.stack_pointer)
-                            || matches!(map.pathname, MMapPath::Stack)
-                    }
-                    Tier::NotesOnly => false,
-                };
-                let elf_header = tier != Tier::NotesOnly
-                    && map.offset == 0
-                    && matches!(map.pathname, MMapPath::Path(_));
+                let all = rule.whole
+                    && match tier {
+                        Tier::Full => true,
+                        Tier::Stack => {
+                            (start..end).contains(&self.stack_pointer)
+                                || matches!(map.pathname, MMapPath::Stack)
+                        }
+                        Tier::NotesOnly => false,
+                    };
+                let elf_header = tier != Tier::NotesOnly && rule.elf_header;
                 let filesz = if all {
                     len
                 } else if elf_header {
@@ -324,6 +368,79 @@ impl Snapshot {
             })
             .collect()
     }
+}
+
+/// What a core may store of one mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Dump {
+    /// All of it.
+    whole: bool,
+    /// Its first page, the ELF header of a file mapped from offset 0.
+    elf_header: bool,
+}
+
+/// What the kernel's own dump (`vma_dump_size` in fs/coredump.c) would keep of
+/// `map`, given its VmFlags (`None` when unknown, which keeps nothing) and the
+/// process's `coredump_filter`:
+///
+/// - nothing of a mapping the guest excluded with `MADV_DONTDUMP` (`dd`), or
+///   of an I/O or raw-PFN mapping (`io`, `pf`), whose read could touch a
+///   device;
+/// - hugetlb and shared mappings only if the filter bit for their kind is set
+///   (shared file mappings are off by default);
+/// - anonymous memory, and a writable private file mapping, whose written
+///   pages the kernel holds as anonymous, under the anonymous-private bit; a
+///   read-only private file mapping under the file-private bit (off by
+///   default);
+/// - the first page of a file mapped from offset 0 under the ELF-headers bit.
+fn dump_rule(map: &MemoryMap, flags: Option<VmFlags>, filter: CoredumpFlags) -> Dump {
+    const NOTHING: Dump = Dump {
+        whole: false,
+        elf_header: false,
+    };
+    let Some(flags) = flags else {
+        return NOTHING;
+    };
+    if flags.intersects(VmFlags::DD | VmFlags::IO | VmFlags::PF) {
+        return NOTHING;
+    }
+    let file = matches!(map.pathname, MMapPath::Path(_));
+    let shared = flags.contains(VmFlags::SH);
+    let whole = if flags.contains(VmFlags::HT) {
+        filter.contains(if shared {
+            CoredumpFlags::SHARED_HUGEPAGES
+        } else {
+            CoredumpFlags::PROVATE_HUGEPAGES
+        })
+    } else if shared {
+        filter.contains(if file {
+            CoredumpFlags::FILEBACKED_SHARED_MAPPINGS
+        } else {
+            CoredumpFlags::ANONYMOUS_SHARED_MAPPINGS
+        })
+    } else if !file || map.perms.contains(MMPermissions::WRITE) {
+        filter.contains(CoredumpFlags::ANONYMOUS_PRIVATE_MAPPINGS)
+            || (file && filter.contains(CoredumpFlags::FILEBACKED_PRIVATE_MAPPINGS))
+    } else {
+        filter.contains(CoredumpFlags::FILEBACKED_PRIVATE_MAPPINGS)
+    };
+    Dump {
+        whole,
+        elf_header: file && map.offset == 0 && filter.contains(CoredumpFlags::ELF_HEADERS),
+    }
+}
+
+/// The thread's `/proc/<tid>/coredump_filter`, or the kernel default (0x33:
+/// anonymous private and shared, ELF headers, private hugetlb) when it cannot
+/// be read. Unknown bits are ignored.
+fn coredump_filter(tid: i32) -> CoredumpFlags {
+    fs::read_to_string(format!("/proc/{tid}/coredump_filter"))
+        .ok()
+        .and_then(|text| u32::from_str_radix(text.trim(), 16).ok())
+        .map_or(
+            CoredumpFlags::from_bits_truncate(0x33),
+            CoredumpFlags::from_bits_truncate,
+        )
 }
 
 /// Whether a mapping can appear in a core: procfs cannot read the vsyscall
@@ -854,6 +971,121 @@ mod tests {
             .sum()
     }
 
+    fn map(pathname: MMapPath, perms: MMPermissions, offset: u64) -> MemoryMap {
+        MemoryMap {
+            address: (0x1000, 0x3000),
+            perms,
+            offset,
+            dev: (0, 0),
+            inode: u64::from(matches!(pathname, MMapPath::Path(_))),
+            pathname,
+            extension: Default::default(),
+        }
+    }
+
+    #[test]
+    fn the_dump_rule_keeps_what_the_kernel_would() {
+        use MMPermissions as P;
+        let default = CoredumpFlags::from_bits_truncate(0x33);
+        let rd = VmFlags::RD | VmFlags::MR;
+        let rw = rd | VmFlags::WR | VmFlags::MW;
+        let lib = || MMapPath::Path("/lib/libc.so.6".into());
+        let whole = |m: &MemoryMap, flags, filter| dump_rule(m, Some(flags), filter).whole;
+        let heap = map(MMapPath::Heap, P::READ | P::WRITE | P::PRIVATE, 0);
+        assert!(whole(&heap, rw, default), "anonymous private memory");
+        assert!(!whole(&heap, rw | VmFlags::DD, default), "MADV_DONTDUMP");
+        assert!(!whole(&heap, rw | VmFlags::IO, default), "an I/O mapping");
+        assert!(
+            !whole(&heap, rw | VmFlags::PF, default),
+            "a raw-PFN mapping"
+        );
+        assert!(!whole(&heap, rw, CoredumpFlags::empty()), "filter 0");
+        assert_eq!(
+            dump_rule(&heap, None, default),
+            dump_rule(&heap, Some(rw | VmFlags::DD), default)
+        );
+        let shared_file = map(lib(), P::READ | P::WRITE | P::SHARED, 0);
+        assert!(
+            !whole(&shared_file, rw | VmFlags::SH, default),
+            "shared file, default"
+        );
+        assert!(whole(
+            &shared_file,
+            rw | VmFlags::SH,
+            default | CoredumpFlags::FILEBACKED_SHARED_MAPPINGS
+        ));
+        let data = map(lib(), P::READ | P::WRITE | P::PRIVATE, 0x2000);
+        assert!(whole(&data, rw, default), "a written private file mapping");
+        let text = map(lib(), P::READ | P::EXECUTE | P::PRIVATE, 0);
+        let rule = dump_rule(&text, Some(rd | VmFlags::EX), default);
+        assert!(!rule.whole && rule.elf_header, "{rule:?}");
+        let no_headers = default - CoredumpFlags::ELF_HEADERS;
+        assert!(!dump_rule(&text, Some(rd | VmFlags::EX), no_headers).elf_header);
+        assert!(!dump_rule(&text, Some(rd | VmFlags::DD), default).elf_header);
+    }
+
+    #[test]
+    fn the_lock_wait_gives_up_at_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = DirLock::acquire(dir.path(), Instant::now()).unwrap();
+        let start = Instant::now();
+        let error = DirLock::acquire(dir.path(), start + Duration::from_millis(50))
+            .err()
+            .expect("a second writer took a held lock");
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert!(start.elapsed() >= Duration::from_millis(50));
+        drop(held);
+        DirLock::acquire(dir.path(), Instant::now()).unwrap();
+    }
+
+    #[test]
+    fn a_repeated_process_id_gets_a_new_name_instead_of_being_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let exit = own_exit(true, None);
+        let fresh = AtomicBool::new(false);
+        let mut paths = Vec::new();
+        for _ in 0..2 {
+            let Outcome::Written { path } = capture_from(&cfg, &exit, None, &fresh).unwrap() else {
+                panic!("the second core of a repeated process ID was not kept");
+            };
+            paths.push(path);
+        }
+        assert_ne!(paths[0], paths[1]);
+        assert!(paths.iter().all(|path| path.exists()));
+        let name = paths[1].file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.ends_with(".SIGSEGV.1.zst"), "{name}");
+    }
+
+    #[test]
+    fn after_a_full_core_runs_out_of_time_later_cores_start_smaller() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let mem = File::open("/proc/self/mem").unwrap();
+        let flag = AtomicBool::new(false);
+        let late = own_exit(true, Some(Instant::now()));
+        capture_from(&cfg, &late, Some(&mem), &flag).unwrap();
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "a timed-out Full core was not remembered"
+        );
+        let full = AtomicBool::new(false);
+        let Outcome::Written { path: big } =
+            capture_from(&cfg, &own_exit(true, None), Some(&mem), &full).unwrap()
+        else {
+            panic!("no Full core");
+        };
+        let Outcome::Written { path: small } =
+            capture_from(&cfg, &own_exit(true, None), Some(&mem), &flag).unwrap()
+        else {
+            panic!("no core after the timeout");
+        };
+        assert!(
+            stored_memory(&small) < stored_memory(&big),
+            "the core after a timeout was not smaller"
+        );
+    }
+
     #[test]
     fn a_thread_that_did_not_dump_gets_no_core() {
         let dir = tempfile::tempdir().unwrap();
@@ -869,9 +1101,13 @@ mod tests {
     #[test]
     fn unreadable_memory_still_keeps_the_notes() {
         let dir = tempfile::tempdir().unwrap();
-        let Outcome::Written { path } =
-            capture_from(&config(dir.path()), &own_exit(true, None), None).unwrap()
-        else {
+        let Outcome::Written { path } = capture_from(
+            &config(dir.path()),
+            &own_exit(true, None),
+            None,
+            &AtomicBool::new(false),
+        )
+        .unwrap() else {
             panic!("no core was kept without memory");
         };
         assert_eq!(
@@ -895,7 +1131,11 @@ mod tests {
     #[test]
     fn a_passed_cleanup_deadline_keeps_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let outcome = capture(&config(dir.path()), &own_exit(true, Some(Instant::now()))).unwrap();
+        // A local flag, so this timeout leaves the process-wide one alone.
+        let mem = File::open("/proc/self/mem").unwrap();
+        let flag = AtomicBool::new(false);
+        let late = own_exit(true, Some(Instant::now()));
+        let outcome = capture_from(&config(dir.path()), &late, Some(&mem), &flag).unwrap();
         assert!(matches!(outcome, Outcome::NoRoom { .. }), "{outcome:?}");
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
     }

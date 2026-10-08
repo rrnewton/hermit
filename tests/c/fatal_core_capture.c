@@ -10,6 +10,8 @@
  * Guest for hermit-cli/tests/fatal_core_capture.rs.
  *
  *   segv          dirty 1 MiB of heap, put MARKER at its start, segfault
+ *   dontdump      like segv, but first put SECRET in a page excluded from
+ *                 cores with madvise(MADV_DONTDUMP)
  *   children MIB...  fork one child per argument, one at a time, that
  *                 dirties that many MiB of incompressible heap and segfaults;
  *                 exit 1
@@ -23,11 +25,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #define MARKER "HERMIT-FATAL-CORE-MARKER"
 #define THREAD_MARKER 0x4845524d49543132u
+#define SECRET "HERMIT-DONTDUMP-SECRET"
 
 /* Volatile so that no store to the heap is dropped as dead. */
 static unsigned char* volatile heap;
@@ -109,6 +113,15 @@ int main(int argc, char** argv) {
   const char* mode = argc > 1 ? argv[1] : "";
   if (strcmp(mode, "segv") == 0) {
     dirty_and_segfault(1, 1);
+  } else if (strcmp(mode, "dontdump") == 0) {
+    char* page =
+        mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page == MAP_FAILED || madvise(page, 4096, MADV_DONTDUMP) != 0) {
+      perror("mmap/madvise");
+      exit(3);
+    }
+    memcpy(page, SECRET, sizeof(SECRET));
+    dirty_and_segfault(1, 1);
   } else if (strcmp(mode, "children") == 0) {
     fork_segfaulting_children(argc - 2, argv + 2);
     return 1;
@@ -121,7 +134,7 @@ int main(int argc, char** argv) {
   }
   fprintf(
       stderr,
-      "usage: %s segv | children MIB... | child-segv-ok | threads\n",
+      "usage: %s segv | dontdump | children MIB... | child-segv-ok | threads\n",
       argv[0]);
   return 2;
 }
