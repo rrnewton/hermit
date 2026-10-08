@@ -3777,29 +3777,28 @@ impl Scheduler {
         // is ready to run in normal order.
     }
 
-    fn choose_futex_wakees(
+    /// `--fuzz-futexes`: a random sample of `num_woken` of the matching waiters.
+    fn choose_fuzzed_futex_wakees(
         &mut self,
         vec: &mut Vec<FutexWaiter>,
         num_woken: usize,
     ) -> Vec<FutexWaiter> {
-        if self.fuzz_futexes {
-            let rng = &mut self.fuzz_prng;
-            debug!(
-                "[fuzz-futexes] selecting {} tids, pre shuffle: {:?}",
-                num_woken,
-                vec.iter().map(|x| x.dettid).collect::<Vec<DetTid>>()
-            );
+        let rng = &mut self.fuzz_prng;
+        debug!(
+            "[fuzz-futexes] selecting {} tids, pre shuffle: {:?}",
+            num_woken,
+            vec.iter().map(|x| x.dettid).collect::<Vec<DetTid>>()
+        );
 
-            // No need to actually use the results here since vec was mutated:
-            let (_extracted, _remain) = &vec[..].partial_shuffle(rng, num_woken);
+        // No need to actually use the results here since vec was mutated:
+        let (_extracted, _remain) = &vec[..].partial_shuffle(rng, num_woken);
 
-            info!(
-                "[fuzz-futexes] selecting {} tids, post shuffle: {:?}",
-                num_woken,
-                vec.iter().map(|x| x.dettid).collect::<Vec<DetTid>>()
-            );
-        }
-        // just take the first N, in whatever deterministic order they are in:
+        info!(
+            "[fuzz-futexes] selecting {} tids, post shuffle: {:?}",
+            num_woken,
+            vec.iter().map(|x| x.dettid).collect::<Vec<DetTid>>()
+        );
+        // `partial_shuffle` leaves its random sample at the end of the slice.
         vec.split_off(vec.len() - num_woken)
     }
 
@@ -3830,12 +3829,31 @@ impl Scheduler {
             max_to_wake,
             vec.len(),
         );
-        let mut matching = take_matching_futex_waiters(&mut vec, wake_mask);
-        let num_woken: usize = std::cmp::min(matching.len(), max_to_wake.try_into().unwrap());
-        let to_wake = self.choose_futex_wakees(&mut matching, num_woken);
-
-        assert_eq!(to_wake.len(), num_woken);
-        vec.extend(matching);
+        let max_to_wake: usize = max_to_wake.try_into().unwrap();
+        let to_wake = if self.fuzz_futexes {
+            let mut matching = take_matching_futex_waiters(&mut vec, wake_mask);
+            let num_woken = std::cmp::min(matching.len(), max_to_wake);
+            let to_wake = self.choose_fuzzed_futex_wakees(&mut matching, num_woken);
+            assert_eq!(to_wake.len(), num_woken);
+            vec.extend(matching);
+            to_wake
+        } else {
+            // Wake the longest waiters whose bitset matches first, as Linux does
+            // for waiters of equal priority, and keep every other waiter in the
+            // order it arrived: waiters are appended as their waits are committed,
+            // so the list is in arrival order.
+            let mut to_wake = Vec::new();
+            let mut kept = Vec::with_capacity(vec.len());
+            for waiter in vec.drain(..) {
+                if to_wake.len() < max_to_wake && waiter.bitset & wake_mask != 0 {
+                    to_wake.push(waiter);
+                } else {
+                    kept.push(waiter);
+                }
+            }
+            vec = kept;
+            to_wake
+        };
         // Put back what wasn't woken up:
         if !vec.is_empty() {
             let junk = self.blocked.futex_waiters.insert(futexid, vec);
@@ -10712,6 +10730,112 @@ mod test {
         assert!(scheduler.run_queue.contains_tid(target));
         assert!(scheduler.inbound_signals(target).is_empty());
         assert!(is_futex_request(&scheduler.next_turns[&target]));
+    }
+
+    /// A `FUTEX_WAKE` of one waiter wakes the longest waiter, as Linux does for
+    /// waiters of equal priority. Waking the newest one let a thread that re-waits
+    /// after every wake take every wake, and an older waiter never ran
+    /// (https://github.com/rrnewton/hermit/issues/3917).
+    #[test]
+    fn a_futex_wake_takes_the_longest_waiter_first() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let waiters = [100, 101, 102].map(DetTid::from_raw);
+        let waker = DetTid::from_raw(103);
+        let futex = FutexID::private(MmId::initial(DetPid::from_raw(100)), 0x404110);
+        for waiter in waiters {
+            register_known_thread(&mut scheduler, waiter);
+            scheduler.sleep_futex_waiter(&waiter, futex, None, u32::MAX, None);
+        }
+        for (woken, waiter) in waiters.into_iter().enumerate() {
+            assert_eq!(scheduler.wake_futex_waiters(waker, futex, 1, u32::MAX), 1);
+            for (index, other) in waiters.into_iter().enumerate() {
+                assert_eq!(
+                    scheduler.is_parked_futex_waiter(other),
+                    index > woken,
+                    "after wake {woken}, waiter {other:?}"
+                );
+            }
+            assert!(scheduler.run_queue.contains_tid(waiter));
+        }
+    }
+
+    /// A `FUTEX_WAKE` of several wakes the longest waiters, and they join the
+    /// run queue in the order they started waiting.
+    #[test]
+    fn a_futex_wake_of_several_takes_the_longest_waiters_in_order() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let waiters = [100, 101, 102, 103].map(DetTid::from_raw);
+        let futex = FutexID::private(MmId::initial(DetPid::from_raw(100)), 0x404110);
+        for waiter in waiters {
+            register_known_thread(&mut scheduler, waiter);
+            scheduler.sleep_futex_waiter(&waiter, futex, None, u32::MAX, None);
+        }
+        assert_eq!(
+            scheduler.wake_futex_waiters(DetTid::from_raw(104), futex, 2, u32::MAX),
+            2
+        );
+        assert_eq!(
+            scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
+            waiters[..2]
+        );
+        assert!(
+            waiters[2..]
+                .iter()
+                .all(|&waiter| scheduler.is_parked_futex_waiter(waiter))
+        );
+    }
+
+    /// A `FUTEX_WAKE_BITSET` that matches only some waiters leaves the others
+    /// in the order they arrived, so a later wake still takes the longest
+    /// waiter (Linux `futex_wake` walks one list in arrival order and skips
+    /// the waiters whose bitset does not match).
+    #[test]
+    fn a_partial_bitset_wake_keeps_the_other_waiters_in_arrival_order() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let waker = DetTid::from_raw(103);
+        let futex = FutexID::private(MmId::initial(DetPid::from_raw(100)), 0x404110);
+        let waiters = [(100, 0b01), (101, 0b01), (102, 0b10)]
+            .map(|(tid, bitset)| (DetTid::from_raw(tid), bitset));
+        for (waiter, bitset) in waiters {
+            register_known_thread(&mut scheduler, waiter);
+            scheduler.sleep_futex_waiter(&waiter, futex, None, bitset, None);
+        }
+        let parked = |scheduler: &Scheduler| {
+            waiters
+                .iter()
+                .map(|&(waiter, _)| scheduler.is_parked_futex_waiter(waiter))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(scheduler.wake_futex_waiters(waker, futex, 1, 0b01), 1);
+        assert_eq!(parked(&scheduler), [false, true, true]);
+        assert_eq!(scheduler.wake_futex_waiters(waker, futex, 1, u32::MAX), 1);
+        assert_eq!(parked(&scheduler), [false, false, true]);
+        assert_eq!(scheduler.wake_futex_waiters(waker, futex, 1, u32::MAX), 1);
+        assert_eq!(parked(&scheduler), [false, false, false]);
+    }
+
+    /// The wakes Detcore issues for an exiting thread also take the longest
+    /// waiter: the one-waiter wake of `CLONE_CHILD_CLEARTID` (several threads
+    /// joining one) and the one-waiter wake of a robust-list futex.
+    #[test]
+    fn exit_wakes_take_the_longest_waiter_first() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let exiting = DetTid::from_raw(99);
+        let waiters = [100, 101, 102].map(DetTid::from_raw);
+        let futex = FutexID::private(MmId::initial(DetPid::from_raw(99)), 0x404110);
+        for waiter in waiters {
+            register_known_thread(&mut scheduler, waiter);
+            scheduler.sleep_futex_waiter(&waiter, futex, None, u32::MAX, None);
+        }
+        scheduler.wake_futex_child_cleartid(futex, exiting);
+        assert!(!scheduler.is_parked_futex_waiter(waiters[0]));
+        assert!(scheduler.is_parked_futex_waiter(waiters[1]));
+        assert_eq!(
+            scheduler.wake_futex_waiters_after_exit(&[(exiting, futex)]),
+            vec![1]
+        );
+        assert!(!scheduler.is_parked_futex_waiter(waiters[1]));
+        assert!(scheduler.is_parked_futex_waiter(waiters[2]));
     }
 
     /// The scheduler under the condition that turns on its model of which thread
