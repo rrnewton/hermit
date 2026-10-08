@@ -764,6 +764,290 @@ fn liteinst_in_guest_tool_directory_reads_stay_out_of_the_guest_heap() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
 }
 
+/// The in-guest runtime installs the Detcore Tool from a constructor that
+/// runs before the program's `main`, inside the guest. Everything that
+/// installation allocates (the coordinator's configuration, the Tool, the
+/// runtime's tables) must stay out of the guest's C library heap: its sizes
+/// follow host state, so the guest's heap layout, and every heap address its
+/// syscalls pass, followed host state too. The configuration lists every mount
+/// of the guest's mount namespace, which starts as a copy of the caller's.
+/// Extra mounts, forced here with `--mount` (each adds one entry), move the
+/// guest's heap. A host mount appearing or disappearing between the two runs
+/// of `--verify` would move it the same way; that this is what made
+/// compat/python3 under in-guest-trap fail 1 of 10 at its first syscall
+/// (`readlink`, whose path buffer is on the heap) is inferred, not
+/// observed: the failing run recorded no mount counts. The fixture
+/// prints the heap at `main`'s entry and where its first allocation lands:
+/// under both in-guest backends and with zero to three extra mounts, the heap
+/// must hold exactly what it holds natively and the first allocation must
+/// land at the same address every time.
+#[test]
+fn liteinst_in_guest_runtime_leaves_the_guest_heap_as_the_program_made_it() {
+    let _guard = hermit_run_guard();
+    let build_root = process_build_root("liteinst-guest-heap");
+    fs::create_dir_all(&build_root).expect("failed to create the guest directory");
+    let guest = build_root.join("runtime_leaves_guest_heap_empty");
+    let compiled = Command::new("cc")
+        .args(["-O2", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/liteinst_runtime_leaves_guest_heap_empty.c"),
+        )
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the guest");
+    assert!(compiled.status.success(), "{compiled:?}");
+
+    let native = Command::new(&guest)
+        .output()
+        .expect("failed to run the guest natively");
+    assert!(native.status.success(), "{native:?}");
+    let native_stdout = String::from_utf8_lossy(&native.stdout).into_owned();
+    let native_heap = native_stdout
+        .lines()
+        .next()
+        .expect("the guest prints its heap at main")
+        .to_owned();
+    assert!(native_heap.starts_with("heap at main: "), "{native_stdout}");
+
+    let mut first_run: Option<(String, String)> = None;
+    for (backend, selected) in [
+        ("liteinst", IN_GUEST_SELECTED),
+        ("in-guest-trap", IN_GUEST_TRAP_SELECTED),
+    ] {
+        for extra_mounts in 0..=3 {
+            let label = format!("--backend={backend} with {extra_mounts} extra mounts");
+            let output = Command::new(hermit_binary())
+                .args(["--log=error", "--backend", backend, "run"])
+                .args([
+                    "--max-timeslice=disabled",
+                    "--strict",
+                    "--base-env=minimal",
+                    "--mount=type=tmpfs,target=/test",
+                    "--workdir=/test",
+                ])
+                .args((0..extra_mounts).map(|_| "--mount=type=tmpfs,target=/test"))
+                .arg("--")
+                .arg(&guest)
+                .stdin(Stdio::null())
+                .output()
+                .expect("failed to run Hermit");
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "{label}: status={:?}\nstdout={stdout}\nstderr={stderr}",
+                output.status,
+            );
+            assert!(
+                stderr.lines().any(|line| line == selected),
+                "{label}: {stderr}"
+            );
+            let mut lines = stdout.lines();
+            let heap = lines.next().unwrap_or_default();
+            assert_eq!(
+                heap, native_heap,
+                "{label}: the in-guest runtime left allocations in the guest's heap \
+                 (native: {native_heap})\n{stdout}"
+            );
+            let first_allocation = lines.next().unwrap_or_default().to_owned();
+            assert!(
+                first_allocation.starts_with("first allocation: 0x"),
+                "{label}: {stdout}"
+            );
+            match &first_run {
+                None => first_run = Some((label, first_allocation)),
+                Some((first_label, expected)) => assert_eq!(
+                    &first_allocation, expected,
+                    "{label} placed the guest's first allocation elsewhere than {first_label}"
+                ),
+            }
+        }
+    }
+}
+
+/// A fork child's runtime state is rebuilt from the fork's return path inside
+/// the child, outside any Tool callback, and binding the child's branch
+/// counter there allocated its box through the child's malloc whenever the
+/// host's PMU let it bind (and not when it could not): the child's heap then
+/// held one more chunk than the parent's, and the child's first allocation
+/// landed after it. The fixture prints the child's heap after one syscall and
+/// its first allocation, and the parent's after the child exits. Under both
+/// in-guest backends every line must match the native run once the addresses
+/// are set aside, and the child's first allocation must land where the
+/// parent's does.
+///
+/// This host's counter binds, so this covers the successful binding; Hermit
+/// gives the guest no way to make it fail (the guest's own seccomp filters are
+/// refused). Reverie's `clock_allocations` test covers binding that fails, by
+/// denying perf_event_open to one thread.
+#[test]
+fn liteinst_in_guest_fork_child_heap_is_the_parents() {
+    let _guard = hermit_run_guard();
+    let build_root = process_build_root("liteinst-guest-heap");
+    fs::create_dir_all(&build_root).expect("failed to create the guest directory");
+    let guest = build_root.join("fork_child_heap");
+    let compiled = Command::new("cc")
+        .args(["-O2", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/liteinst_fork_child_heap.c"),
+        )
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the guest");
+    assert!(compiled.status.success(), "{compiled:?}");
+    // Each line without its address, and the addresses of the child's and the
+    // parent's first allocations.
+    fn split(stdout: &str) -> (Vec<String>, Option<String>, Option<String>) {
+        let mut lines = Vec::new();
+        let (mut child, mut parent) = (None, None);
+        for line in stdout.lines() {
+            let (text, first) = match line.split_once(" first=") {
+                Some((text, first)) => (text, Some(first.to_owned())),
+                None => (line, None),
+            };
+            if text.starts_with("child:") {
+                child = first;
+            } else if text.starts_with("parent after wait:") {
+                parent = first;
+            }
+            lines.push(text.to_owned());
+        }
+        (lines, child, parent)
+    }
+
+    let native = Command::new(&guest)
+        .output()
+        .expect("failed to run the guest natively");
+    assert!(native.status.success(), "{native:?}");
+    let native_stdout = String::from_utf8_lossy(&native.stdout).into_owned();
+    let (native_lines, native_child, native_parent) = split(&native_stdout);
+    assert_eq!(native_lines.len(), 4, "{native_stdout}");
+    assert_eq!(native_child, native_parent, "{native_stdout}");
+
+    for (backend, selected) in [
+        ("liteinst", IN_GUEST_SELECTED),
+        ("in-guest-trap", IN_GUEST_TRAP_SELECTED),
+    ] {
+        let output = Command::new(hermit_binary())
+            .args(["--log=error", "--backend", backend, "run"])
+            .args([
+                "--max-timeslice=disabled",
+                "--strict",
+                "--base-env=minimal",
+                "--mount=type=tmpfs,target=/test",
+                "--workdir=/test",
+                "--",
+            ])
+            .arg(&guest)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run Hermit");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{backend}: status={:?}\nstdout={stdout}\nstderr={stderr}",
+            output.status,
+        );
+        assert!(
+            stderr.lines().any(|line| line == selected),
+            "{backend}: {stderr}"
+        );
+        let (lines, child, parent) = split(&stdout);
+        assert_eq!(
+            lines, native_lines,
+            "{backend}: the in-guest runtime left allocations in a heap \
+             (native:\n{native_stdout})\n{stdout}"
+        );
+        assert!(child.is_some(), "{backend}: {stdout}");
+        assert_eq!(
+            child, parent,
+            "{backend}: the child's first allocation landed elsewhere than the parent's\n{stdout}"
+        );
+    }
+}
+
+/// With guest SIGALRM handlers admitted (REVERIE_LITEINST_SIGALRM_HANDLERS=1
+/// with site patching off), installation also records which file is the C
+/// library. It found it with `dlopen(RTLD_NOLOAD)`, which allocates through
+/// the C library's malloc on the library's first direct open, so a chunk
+/// stayed in the guest's heap before `main` (704 bytes in use instead of
+/// none). The fixture allocates nothing itself; it reports the heap at
+/// `main`'s entry, installs a SIGALRM handler, takes one SIGALRM and reports
+/// the heap again. Under `--backend=in-guest-trap` and under
+/// `--backend=liteinst` with site patching off, the handler must be admitted
+/// and every line must match the native run.
+#[test]
+fn liteinst_in_guest_admitted_sigalrm_leaves_the_guest_heap_as_the_program_made_it() {
+    let _guard = hermit_run_guard();
+    let build_root = process_build_root("liteinst-guest-heap");
+    fs::create_dir_all(&build_root).expect("failed to create the guest directory");
+    let guest = build_root.join("sigalrm_heap");
+    let compiled = Command::new("cc")
+        .args(["-O2", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/liteinst_sigalrm_heap.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the guest");
+    assert!(compiled.status.success(), "{compiled:?}");
+    let native = Command::new(&guest)
+        .output()
+        .expect("failed to run the guest natively");
+    assert!(native.status.success(), "{native:?}");
+    let native_stdout = String::from_utf8_lossy(&native.stdout).into_owned();
+    assert!(
+        native_stdout
+            .lines()
+            .any(|line| line == "install=0 pause=-1 errno=4 runs=1"),
+        "{native_stdout}"
+    );
+
+    for (backend, selected, site_patching) in [
+        ("in-guest-trap", IN_GUEST_TRAP_SELECTED, None),
+        (
+            "liteinst",
+            IN_GUEST_SELECTED,
+            Some("--env=REVERIE_LITEINST_SITE_PATCHING=0"),
+        ),
+    ] {
+        let output = Command::new(hermit_binary())
+            .args(["--log=error", "--backend", backend, "run"])
+            .args([
+                "--max-timeslice=disabled",
+                "--strict",
+                "--base-env=minimal",
+                "--mount=type=tmpfs,target=/test",
+                "--workdir=/test",
+                "--env=REVERIE_LITEINST_SIGALRM_HANDLERS=1",
+            ])
+            .args(site_patching)
+            .arg("--")
+            .arg(&guest)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run Hermit");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{backend}: status={:?}\nstdout={stdout}\nstderr={stderr}",
+            output.status,
+        );
+        assert!(
+            stderr.lines().any(|line| line == selected),
+            "{backend}: {stderr}"
+        );
+        assert_eq!(
+            stdout, native_stdout,
+            "{backend}: the admitted in-guest runtime left allocations in the guest's heap"
+        );
+    }
+}
+
 #[test]
 fn liteinst_in_guest_detcore_micro_suite() {
     let _guard = hermit_run_guard();
