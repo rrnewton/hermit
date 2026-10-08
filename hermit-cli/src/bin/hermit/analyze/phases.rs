@@ -740,12 +740,25 @@ impl AnalyzeOpts {
         self.refuse_unqualified_trial_timeout()?;
         self.install_trial_pmu_config()?;
         self.refuse_strict_with_inexact_branch_counter()?;
-        // Not implemented yet:
-        if self.run1_schedule.is_some() {
-            unimplemented!()
-        }
-        if self.run2_schedule.is_some() {
-            unimplemented!()
+        // `--run1-schedule` and `--run2-schedule` parse but have no
+        // implementation. Refuse them before any workspace or trial, rather
+        // than panicking here.
+        let unimplemented: Vec<&str> = [
+            (self.run1_schedule.is_some(), "--run1-schedule"),
+            (self.run2_schedule.is_some(), "--run2-schedule"),
+        ]
+        .into_iter()
+        .filter_map(|(given, option)| given.then_some(option))
+        .collect();
+        if !unimplemented.is_empty() {
+            return Err(
+                anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                    "hermit analyze does not implement {}. Identify a run by a preemption record \
+                 (--run1-preemptions or --run2-preemptions, written by `hermit run \
+                 --record-preemptions-to`) or by a seed (--run1-seed or --run2-seed).",
+                    unimplemented.join(" or ")
+                )),
+            );
         }
         // The trials that replay these records start from the epoch they were
         // recorded under (https://github.com/rrnewton/hermit/issues/3870).
@@ -1263,5 +1276,50 @@ mod tests {
             prepared_analysis(dir, None, None, &[&recorded, "--epoch", OTHER]).unwrap_err(),
             &format!("pass --epoch={RECORDED_RFC3339}"),
         );
+    }
+
+    /// Through `main`: `--run1-schedule` and `--run2-schedule` parse but have
+    /// no implementation, so `hermit analyze` refuses them before any
+    /// workspace or trial, naming the options that work. Before, `main`
+    /// reached `unimplemented!()` and the process panicked (exit 101).
+    #[test]
+    fn analyze_refuses_the_unimplemented_schedule_inputs_before_any_trial() {
+        for (options, named) in [
+            (
+                &["--run1-schedule=/nonexistent/run1.json"][..],
+                "--run1-schedule",
+            ),
+            (
+                &["--run2-schedule=/nonexistent/run2.json"][..],
+                "--run2-schedule",
+            ),
+            (
+                &[
+                    "--run1-schedule=/nonexistent/run1.json",
+                    "--run2-schedule=/nonexistent/run2.json",
+                ][..],
+                "--run1-schedule or --run2-schedule",
+            ),
+        ] {
+            let mut argv = vec!["hermit", "analyze"];
+            argv.extend(options);
+            argv.extend(["--", "/bin/true"]);
+            let args = crate::Args::try_parse_from(&argv).unwrap();
+            let crate::Subcommand::Analyze(mut analyze) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            let error = analyze.main(&args.global).unwrap_err();
+            refused(
+                error,
+                &format!(
+                    "hermit analyze does not implement {named}. Identify a run by a preemption \
+                     record (--run1-preemptions or --run2-preemptions"
+                ),
+            );
+            assert!(
+                analyze.tmp_dir.is_none(),
+                "{options:?}: a workspace was created before the refusal"
+            );
+        }
     }
 }

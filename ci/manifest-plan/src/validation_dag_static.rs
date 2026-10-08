@@ -1155,7 +1155,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // all 960: 961, listed with this node's arguments.
     // backends::tests::a_dbt_run_whose_evidence_records_a_determinism_loss_is_not_compared
     // retains all 961: 962, listed with this node's arguments.
-    ("test.hermit_unit", 962),
+    // analyze::phases::tests::analyze_refuses_the_unimplemented_schedule_inputs_before_any_trial
+    // retains all 962: 963, measured with cargo nextest list.
+    ("test.hermit_unit", 963),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2141,7 +2143,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the analyze network-trace epoch test: 960.
     // And the record timer-support test: 961.
     // And the DBT determinism-loss evidence test: 962.
-    ("test.hermit_unit_on_host", 962),
+    // And the analyze schedule-input refusal test: 963.
+    ("test.hermit_unit_on_host", 963),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

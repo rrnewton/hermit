@@ -1213,9 +1213,10 @@ mod tests {
 
     /// Analyze's trials apply `--skid-margin`: its preflight records it as the
     /// skid margin of Reverie's per-process PMU configuration, so a later
-    /// margin is refused. `main` panics on the unimplemented `--run1-schedule` right
-    /// after that preflight. This relies on nextest running each test in a
-    /// process of its own, as the validation DAG does.
+    /// margin is refused. `main` refuses the unimplemented `--run1-schedule`
+    /// right after that preflight, which stops it before any workspace. This
+    /// relies on nextest running each test in a process of its own, as the
+    /// validation DAG does.
     #[test]
     fn analyze_installs_the_trials_skid_margin() {
         let argv = [
@@ -1230,12 +1231,13 @@ mod tests {
         let crate::Subcommand::Analyze(mut options) = args.command else {
             panic!("{argv:?} is not analyze")
         };
-        let reached_run1_schedule =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| options.main(&args.global)));
+        // The refusal that follows the preflight, not an earlier one.
+        let error = options.main(&args.global).unwrap_err();
         assert!(
-            reached_run1_schedule.is_err(),
-            "the preflight refused: {:?}",
-            reached_run1_schedule.ok()
+            error
+                .to_string()
+                .contains("hermit analyze does not implement --run1-schedule"),
+            "main stopped before reaching the --run1-schedule refusal: {error:#}"
         );
         // A second margin is refused once one is recorded. Neither recording
         // reads the host's CPU, so this holds on a host Reverie has no PMU

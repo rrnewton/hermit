@@ -110,7 +110,8 @@ pub struct AnalyzeOpts {
     )]
     pub run1_preemptions: Option<PathBuf>,
 
-    /// Load target execution from hermit run --record-schedule-to.
+    /// Not implemented: `hermit analyze` refuses this option (exit 122).
+    /// Identify the target run with --run1-preemptions or --run1-seed.
     #[clap(
         long,
         conflicts_with = "run1_seed",
@@ -138,7 +139,8 @@ pub struct AnalyzeOpts {
     )]
     pub run2_preemptions: Option<PathBuf>,
 
-    /// Load baseline execution from hermit run --record-schedule-to.
+    /// Not implemented: `hermit analyze` refuses this option (exit 122).
+    /// Identify the baseline run with --run2-preemptions or --run2-seed.
     #[clap(
         long,
         conflicts_with = "run2_seed",
