@@ -2274,12 +2274,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // race deterministically (see detcore-model `happens_before`). It
         // requires sequentialized threads (enforced by the CLI) so the scheduler
         // owns ordering.
-        if guest
-            .config()
-            .happens_before
-            .as_ref()
-            .is_some_and(|p| p.has_syscall_count_anchor_at(new_count))
-        {
+        if guest.config().happens_before.as_ref().is_some_and(|p| {
+            p.may_have_syscall_count_anchor_at(guest.thread_state().dettid, new_count)
+        }) {
             let request = guest.thread_state().mk_request(
                 ResourceID::HappensBeforeCheckpoint(new_count),
                 Permission::R,

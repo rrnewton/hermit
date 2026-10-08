@@ -381,6 +381,18 @@ impl HappensBeforeProgram {
             .any(|a| matches!(a.position, Position::SyscallCount(n) if n == count))
     }
 
+    /// Like [`Self::has_syscall_count_anchor_at`], but for one thread: true when
+    /// an anchor at exactly `count` names `dettid`, or names its thread by spawn
+    /// ordinal (which only the scheduler can resolve, so the guest side must
+    /// ask). Other threads reaching the same count no longer take a scheduler
+    /// turn, so a spec leaves their schedule untouched.
+    pub fn may_have_syscall_count_anchor_at(&self, dettid: DetTid, count: u64) -> bool {
+        self.anchors.values().any(|a| {
+            matches!(a.position, Position::SyscallCount(n) if n == count)
+                && a.thread.dettid.is_none_or(|d| d == dettid)
+        })
+    }
+
     /// Anchors whose position kind the current scheduler does not yet enforce
     /// (everything other than [`Position::SyscallCount`]). Reported so a run does
     /// not silently ignore an authored ordering constraint it cannot honor.
