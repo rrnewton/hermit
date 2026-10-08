@@ -43,6 +43,11 @@ raw probe status and stderr remain visible; store errors are distinct from
 Podman's absent-image status 1. Inspection has a 10-second bound and a 2-second
 forced-stop grace. Admission neither builds nor loads an image.
 
+Each node's wrapper call repeats the check just before its run. There, an
+absent image still fails the node, but a query that only timed out (a saturated
+host) is logged and the run proceeds: `podman run --pull=never` is itself the
+exact check, so a missing image fails at the run and nothing is fetched.
+
 ## Image provenance and repins
 
 `image.digest` is accepted only with the checked-in

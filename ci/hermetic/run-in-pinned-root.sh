@@ -72,7 +72,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# $1 is "admission" for --check-image and "late" before a node's own run.
 check_pinned_image() {
+    local caller=$1
     if [[ -z "$digest" ]]; then
         [[ -f "$DIGEST_FILE" ]] || {
             echo "run-in-pinned-root: no --digest and no $DIGEST_FILE." >&2
@@ -103,6 +105,15 @@ check_pinned_image() {
         echo "run-in-pinned-root: image $digest is not present locally (Podman status 1)." >&2
         echo "  This path does not fall back to a tag or to the host." >&2
         echo "  Rebuild it from the committed lock: ci/hermetic/build-image.sh" >&2
+    elif [[ "$caller" == late && ( "$status" == 124 || "$status" == 137 ) ]]; then
+        # A timed-out query says nothing about the image: on 2026-10-08, with
+        # the host at load average 780, a query that normally takes 0.05 s
+        # missed the bound for 25 nodes, which then failed as if their tests
+        # had. Before a node's run, the run itself is the exact check: it uses
+        # --pull=never, so a missing image still fails there and nothing is
+        # fetched. Admission (--check-image) keeps refusing on a timeout.
+        echo "run-in-pinned-root: inspection of $digest timed out (probe status $status; 10s query bound); the run below uses --pull=never and fails if the image is absent." >&2
+        return 0
     else
         echo "run-in-pinned-root: inspection unavailable for $digest (probe status $status; 10s query bound, 2s forced-stop grace)." >&2
     fi
@@ -115,7 +126,7 @@ if "$check_image"; then
         exit 2
     }
     status=0
-    check_pinned_image || status=$?
+    check_pinned_image admission || status=$?
     exit "$status"
 fi
 
@@ -137,7 +148,7 @@ fi
 # silently produce a run that is not hermetic while still reporting success --
 # which is worse than not running at all, because the receipt would claim a
 # pinned root it did not use.
-check_pinned_image || exit $?
+check_pinned_image late || exit $?
 
 pinned_home="$out/home"
 # `agent-utils/rs/bin/*` deliberately keeps its Cargo target, provenance lock,
@@ -440,7 +451,10 @@ fi
 # `--network=none` is the point, not a precaution: if the run can reach the
 # network it can pick up something the lock does not describe, and the rebuild
 # guarantee is void. CARGO_NET_OFFLINE in the image makes that fail loudly.
+# --pull=never: the exact digest must already be in the local store; the run
+# never fetches it, so a missing image fails here rather than being pulled.
 exec podman run --rm \
+    --pull=never \
     --cgroups=disabled \
     --privileged \
     --hostname=hermetic-container.local \
