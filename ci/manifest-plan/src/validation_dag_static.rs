@@ -1465,7 +1465,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retains all 1150: 1151, listed with this node's arguments.
     // Four fatal_core::tests (orphaned temp files, the helper-thread wait, a
     // panicking helper, an abandoned capture): 1151 + 4 = 1155.
-    ("test.detcore_unit", 1155),
+    // syscalls::signal::rt_sigsuspend_tests::rt_sigsuspend_sleeps_under_the_mask_detcore_read
+    // retains all 1151: 1152, listed with this node's arguments.
+    ("test.detcore_unit", 1156),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1824,7 +1826,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/3877) retain all 211: 213.
     // a_sigchld_sent_at_an_rt_sigsuspend_request_wakes_the_call retains all
     // 213: 214, listed with this node's arguments.
-    ("test.cli", 214),
+    // a_shared_sigsuspend_mask_rewritten_before_the_call_runs_does_not_stall_the_run
+    // retains all 214: 215, listed with this node's arguments.
+    ("test.cli", 215),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -1974,7 +1978,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // both too: 173.
     // The rt_sigsuspend SIGCHLD wake test starts no LiteInst guest either and
     // needs no PMU (it disables the timeslice): 174, listed.
-    ("test.cli_on_host", 174),
+    // So does the shared-mask rewrite test: 175, listed.
+    ("test.cli_on_host", 175),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 55),
@@ -2058,7 +2063,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the schedstats sanitizer test: 1150.
     // And the rt_sigsuspend request signal test: 1151.
     // And the same four fatal_core::tests: 1155.
-    ("test.detcore_unit_on_host", 1155),
+    // And the rt_sigsuspend mask-copy test: 1152.
+    ("test.detcore_unit_on_host", 1156),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

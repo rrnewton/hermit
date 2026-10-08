@@ -421,9 +421,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
 
         let temporary_mask = read_kernel_sigset(guest, mask_addr).await?;
+        // The real call sleeps under a private copy of the mask read here, not
+        // under the guest's buffer. The scheduler decides from this copy which
+        // signals can end the call (`Resources::blocked_signal_mask`), and
+        // another process sharing the buffer (MAP_SHARED) may rewrite it before
+        // the call runs; Linux copies the mask when the call starts, and from
+        // the guest's view the call has already started. The guard keeps the
+        // copy alive until the call returns.
         let mut stack = guest.stack().await;
         let pending_addr = stack.push(0_u64);
-        let pending_guard = stack.commit()?;
+        let mask_copy = stack.push(temporary_mask);
+        let scratch_guard = stack.commit()?;
         let pending_out = AddrMut::<libc::sigset_t>::from_raw(pending_addr.as_raw())
             .expect("stack address must be non-null");
         let pending_call = syscalls::RtSigpending::new()
@@ -431,13 +439,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_sigsetsize(KERNEL_SIGSET_SIZE);
         guest.inject_with_retry(pending_call).await?;
         let pending: u64 = guest.memory().read_value(pending_addr)?;
-        drop(pending_guard);
+        let call = call.with_mask(Some(mask_copy.cast()));
 
         // The scheduler records the mask the call sleeps under, read here in
         // this thread's turn, to choose a SIGCHLD target while the thread is
         // outside the runnable set (`Resources::blocked_signal_mask`).
         let installed_mask = kernel_installed_signal_mask(temporary_mask);
-        if pending & !temporary_mask != 0 {
+        let result = if pending & !temporary_mask != 0 {
             // The kernel will consume an already-pending signal as soon as it
             // atomically installs the temporary mask. Keep this immediate case
             // out of the terminal-wait classification; the real syscall still
@@ -447,7 +455,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             self.record_or_replay_rt_sigsuspend(guest, call, installed_mask)
                 .await
-        }
+        };
+        drop(scratch_guard);
+        result
     }
 
     /// rt_sigaction
@@ -1092,5 +1102,201 @@ mod appropriated_signal_tests {
     /// mirrored copy would keep passing if `appropriated_reason` were gutted.
     fn reports(signum: i32, handler: u64) -> bool {
         appropriated_reason(signum, handler).is_some()
+    }
+}
+
+#[cfg(test)]
+mod rt_sigsuspend_tests {
+    use reverie::GlobalRPC;
+    use reverie::GlobalTool;
+    use reverie::Pid;
+    use reverie::Tool;
+    use reverie::syscalls::LocalMemory;
+    use reverie::syscalls::Syscall;
+    use reverie::syscalls::SyscallInfo;
+
+    use super::*;
+    use crate::Config;
+    use crate::GlobalState;
+    use crate::ThreadState;
+    use crate::syscalls::threads::kernel_sigset_bit;
+
+    /// Scratch memory for the guest's stack: room for the call's two cells.
+    const ARENA_WORDS: usize = 4;
+
+    struct SuspendStack {
+        arena: usize,
+        used: usize,
+    }
+
+    struct SuspendStackGuard;
+
+    impl Drop for SuspendStackGuard {
+        fn drop(&mut self) {}
+    }
+
+    impl reverie::Stack for SuspendStack {
+        type StackGuard = SuspendStackGuard;
+
+        fn size(&self) -> usize {
+            self.used
+        }
+        fn capacity(&self) -> usize {
+            ARENA_WORDS * std::mem::size_of::<u64>()
+        }
+        fn push<'stack, T>(&mut self, value: T) -> Addr<'stack, T> {
+            assert!(self.used + std::mem::size_of::<T>() <= self.capacity());
+            let address = self.arena + self.used;
+            self.used += std::mem::size_of::<T>().next_multiple_of(8);
+            // SAFETY: the arena is a live, 8-byte aligned buffer owned by the
+            // guest, and the assertion above keeps `T` inside it.
+            unsafe { std::ptr::write(address as *mut T, value) };
+            Addr::from_raw(address).unwrap()
+        }
+        fn reserve<'stack, T>(&mut self) -> AddrMut<'stack, T> {
+            panic!("rt_sigsuspend pushes its scratch cells")
+        }
+        fn commit(self) -> Result<Self::StackGuard, Errno> {
+            Ok(SuspendStackGuard)
+        }
+    }
+
+    /// A guest whose `rt_sigsuspend` caller's mask lives at `caller_mask`. The
+    /// call's `rt_sigpending` probe, which runs after Detcore read that mask
+    /// and before the real call, rewrites it to `rewritten`, as another
+    /// process sharing the buffer could while the call waits for its turn.
+    /// Every mask a real `rt_sigsuspend` is given is kept in `suspended_under`.
+    struct SuspendGuest {
+        config: Config,
+        thread: ThreadState<()>,
+        arena: Box<[u64; ARENA_WORDS]>,
+        caller_mask: usize,
+        rewritten: KernelSigset,
+        suspended_under: Vec<KernelSigset>,
+    }
+
+    #[reverie::tool]
+    impl GlobalRPC<GlobalState> for SuspendGuest {
+        async fn send_rpc(
+            &self,
+            message: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            panic!(
+                "an unsequentialized rt_sigsuspend sends no RPC: {:?}",
+                message.2
+            )
+        }
+        fn config(&self) -> &Config {
+            &self.config
+        }
+    }
+
+    #[reverie::tool]
+    impl Guest<Detcore> for SuspendGuest {
+        type Memory = LocalMemory;
+        type Stack = SuspendStack;
+
+        fn tid(&self) -> Pid {
+            Pid::from_raw(1)
+        }
+        fn pid(&self) -> Pid {
+            Pid::from_raw(1)
+        }
+        fn ppid(&self) -> Option<Pid> {
+            None
+        }
+        fn memory(&self) -> Self::Memory {
+            LocalMemory::new()
+        }
+        fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
+            &mut self.thread
+        }
+        fn thread_state(&self) -> &ThreadState<()> {
+            &self.thread
+        }
+        async fn regs(&mut self) -> libc::user_regs_struct {
+            panic!("rt_sigsuspend must not read registers")
+        }
+        async fn stack(&mut self) -> Self::Stack {
+            SuspendStack {
+                arena: self.arena.as_mut_ptr() as usize,
+                used: 0,
+            }
+        }
+        async fn daemonize(&mut self) {
+            panic!("rt_sigsuspend must not daemonize")
+        }
+        async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
+            let (number, args) = syscall.into_parts();
+            match Syscall::from_raw(number, args) {
+                // read_kernel_sigset's validation probe.
+                Syscall::RtSigprocmask(call) if call.how() == -1 => Err(Errno::EINVAL),
+                Syscall::RtSigpending(call) => {
+                    let set = call.set().expect("rt_sigpending without a set");
+                    LocalMemory::new().write_value(set.cast::<KernelSigset>(), &0)?;
+                    // SAFETY: `caller_mask` is the test's live, aligned buffer.
+                    unsafe {
+                        std::ptr::write(self.caller_mask as *mut KernelSigset, self.rewritten)
+                    };
+                    Ok(0)
+                }
+                Syscall::RtSigsuspend(call) => {
+                    let mask = call.mask().expect("rt_sigsuspend without a mask");
+                    self.suspended_under
+                        .push(LocalMemory::new().read_value(mask.cast::<KernelSigset>())?);
+                    Err(Errno::EINTR)
+                }
+                other => panic!("rt_sigsuspend injected {other:?}"),
+            }
+        }
+        async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> reverie::Never {
+            panic!("rt_sigsuspend must not retire the guest")
+        }
+        fn set_timer(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+            panic!("rt_sigsuspend must not set a timer")
+        }
+        fn set_timer_precise(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+            panic!("rt_sigsuspend must not set a timer")
+        }
+        fn read_clock(&mut self) -> Result<u64, Error> {
+            panic!("rt_sigsuspend must not read a clock")
+        }
+    }
+
+    /// The real `rt_sigsuspend` sleeps under the mask Detcore read when it
+    /// handled the call, the one the scheduler is given, even if the guest's
+    /// buffer changes before the call runs. Linux copies the mask when the call
+    /// starts, and from the guest's view it has started. Before, the call ran
+    /// with the guest's pointer: another process sharing the buffer could make
+    /// it block a signal the scheduler had counted on to end it, and the
+    /// scheduler would hold every other thread waiting for that wake.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rt_sigsuspend_sleeps_under_the_mask_detcore_read() {
+        let config = Config::default();
+        assert!(!config.sequentialize_threads);
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
+        let unblocks_sigchld: KernelSigset = kernel_sigset_bit(libc::SIGUSR2);
+        let blocks_sigchld = unblocks_sigchld | kernel_sigset_bit(libc::SIGCHLD);
+        let mut caller_mask: Box<KernelSigset> = Box::new(unblocks_sigchld);
+        let caller_address = &mut *caller_mask as *mut KernelSigset as usize;
+        let mut guest = SuspendGuest {
+            thread: ThreadState::new(DetPid::from_raw(1), &config, ()),
+            config: config.clone(),
+            arena: Box::new([u64::MAX; ARENA_WORDS]),
+            caller_mask: caller_address,
+            rewritten: blocks_sigchld,
+            suspended_under: Vec::new(),
+        };
+        let call = syscalls::RtSigsuspend::new()
+            .with_mask(Addr::from_raw(caller_address))
+            .with_sigsetsize(KERNEL_SIGSET_SIZE);
+
+        let result = tool.handle_rt_sigsuspend(&mut guest, call).await;
+        assert!(
+            matches!(result, Err(Error::Errno(Errno::EINTR))),
+            "{result:?}"
+        );
+        assert_eq!(*caller_mask, blocks_sigchld, "the buffer was rewritten");
+        assert_eq!(guest.suspended_under, [unblocks_sigchld]);
     }
 }
