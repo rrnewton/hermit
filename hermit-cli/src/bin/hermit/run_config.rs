@@ -489,6 +489,8 @@ fn lenient_command(command: &Command) -> Command {
             if let Some(shorts) = arg.get_all_short_aliases() {
                 lenient = lenient.short_aliases(shorts);
             }
+            // A global option may follow the subcommand, as on a typed command line.
+            lenient = lenient.global(arg.is_global_set());
             lenient = match shape(arg) {
                 Some(Shape::Flag | Shape::Count) => lenient.action(ArgAction::Count),
                 _ => lenient
@@ -745,6 +747,10 @@ mod tests {
         ),
         ("max-log-bytes", &["--max-log-bytes=8G"]),
         ("backend", &["--backend", "ptrace"]),
+        (
+            "unsafe-ignore-host-seccomp",
+            &["--unsafe-ignore-host-seccomp"],
+        ),
     ];
 
     /// The `run` rows of the sample table; see [`GLOBAL_SAMPLES`].
@@ -1377,6 +1383,32 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("--config was given 2 times"), "{error}");
+    }
+
+    /// A global option given after the subcommand, as clap allows for one
+    /// declared global, is saved in the `global` section and recognised on a
+    /// command line that loads a config.
+    #[test]
+    fn a_global_option_after_the_subcommand_is_saved_and_loaded() {
+        let command_line = argv(&[], &["--unsafe-ignore-host-seccomp"], GUEST);
+        let (before, after, saved) = save_and_load(&command_line);
+        assert_eq!(before, after);
+        assert_eq!(
+            saved.global["unsafe-ignore-host-seccomp"], true,
+            "{saved:?}"
+        );
+        assert!(!saved.run.contains_key("unsafe-ignore-host-seccomp"));
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = config_file(
+            &directory,
+            "schema: hermit-run-config/v1\nprogram: /bin/true\n",
+        );
+        let expanded = load(&path, &["--unsafe-ignore-host-seccomp"]);
+        assert!(
+            run_options(&expanded).global.unsafe_ignore_host_seccomp,
+            "{expanded:?}"
+        );
     }
 
     /// The names `--save-config` substitutes resolved values under are real

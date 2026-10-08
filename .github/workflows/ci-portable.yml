@@ -294,6 +294,11 @@ jobs:
           # selftest.scorecard node, which has full history. Depth two is kept
           # because no audit proves that no other preflight node reads HEAD^.
           fetch-depth: 2
+      # Hermit refuses to start a guest under an inherited seccomp filter
+      # (https://github.com/rrnewton/hermit/issues/3942); record that the hosted
+      # runner has none, so a refusal here would be explained by this line.
+      - name: Report the runner's seccomp state
+        run: grep -E '^(Seccomp|Seccomp_filters|NoNewPrivs):' /proc/self/status
       # The constructed preflight starts with pre.submodules, which verifies
       # every recorded submodule without repairing it. Materialize that exact
       # recorded set before asking the gate to inspect it.

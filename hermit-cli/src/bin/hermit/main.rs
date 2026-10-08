@@ -25,6 +25,7 @@ mod gdb_watch_helper;
 mod global_opts;
 mod guest_capture;
 mod host_capabilities;
+mod host_seccomp;
 mod image;
 mod instruction_map;
 mod list;
@@ -460,6 +461,24 @@ impl Subcommand {
         Ok(())
     }
 
+    /// Whether this invocation starts a guest, and so must first check for an
+    /// inherited seccomp filter (`host_seccomp::admit`).
+    fn starts_guest(&self) -> bool {
+        match self {
+            Subcommand::Run(_)
+            | Subcommand::Strace(_)
+            | Subcommand::Replay(_)
+            | Subcommand::Analyze(_)
+            | Subcommand::Bisect(_) => true,
+            Subcommand::Record(record) => record.starts_recording(),
+            Subcommand::Oci(oci) => oci.starts_guest(),
+            Subcommand::HostCapabilities(_)
+            | Subcommand::Version(_)
+            | Subcommand::LogDiff(_)
+            | Subcommand::InstructionMap(_) => false,
+        }
+    }
+
     /// The `--verify-json` path this invocation will publish a verdict to, if
     /// any. Only the two subcommands that can produce a verification verdict
     /// have one.
@@ -507,6 +526,12 @@ impl Subcommand {
             write_pending_verification_json(path)?;
         }
         self.validate_backend_scope(global.backend)?;
+        // After the verdict stamp above, so a refused run leaves a no-result
+        // verdict rather than a previous run's, and before anything starts a
+        // guest or reads its stdin.
+        if self.starts_guest() {
+            host_seccomp::admit(global.unsafe_ignore_host_seccomp)?;
+        }
         match self {
             Subcommand::HostCapabilities(x) => x.main(),
             Subcommand::Version(x) => x.main(),

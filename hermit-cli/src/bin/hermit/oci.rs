@@ -104,6 +104,11 @@ fn require_store() -> Result<PodmanStore, Error> {
 }
 
 impl OciOpts {
+    /// Whether this `hermit oci` subcommand starts a guest.
+    pub(crate) fn starts_guest(&self) -> bool {
+        matches!(self.command, OciSubcommand::Run(_))
+    }
+
     /// Resolve the embedded run's omitted epoch at the same outer process
     /// boundary as a top-level `hermit run` invocation.
     pub(crate) fn capture_default_run_epoch(
