@@ -662,16 +662,7 @@ fn workloads() -> &'static [Workload] {
             .parent()
             .expect("hermit-cli should be inside the repository");
         let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("record-replay-workloads");
-        fs::create_dir_all(&build_root).expect("failed to create workload build directory");
-        let generation = build_root.join(format!(
-            "generation-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system time precedes Unix epoch")
-                .as_nanos()
-        ));
-        record_workloads::standalone(repository, &generation, env!("CARGO"))
+        record_workloads::standalone(repository, &build_root, env!("CARGO"))
             .unwrap_or_else(|error| panic!("record/replay standalone preparation failed: {error}"))
     })
 }
