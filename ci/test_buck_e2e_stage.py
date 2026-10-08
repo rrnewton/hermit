@@ -18,6 +18,19 @@ failed background build stops stage with its exit status and its log; a failed
 detcore-dbt build stops stage and both running background builds with it, and each
 background build's own child gets the SIGTERM too (cargo does not pass it on, so stage
 signals the build's whole process group).
+
+Both classes above stage in place (HERMIT_BUCK_STAGE_REPRODUCIBLE=0): the check and the
+builds are the same code under reproducible staging, which only re-runs stage from a
+copy. StageReproducibleTest covers that wrapper, with the same fake cargo. The builds
+run in the fixed directory's copy of the checkout, with CARGO_HOME reached through the
+fixed directory's symlink and SOURCE_DATE_EPOCH at HEAD's commit time, and the copy, the
+symlink and the holder note are removed afterwards; a failed build keeps the previous
+staging and returns its status; a stage that cannot take the lock within
+HERMIT_BUCK_STAGE_LOCK_TIMEOUT fails naming the holder, runs no build and leaves the
+holder's note alone; a missing host package is refused before the lock; and an
+uncommitted change is refused even when the copy cannot read a submodule whose .git file
+names its gitdir by a relative path (git status fails there and prints nothing), and a
+status git cannot read at all is refused rather than taken as clean.
 """
 
 from __future__ import annotations
@@ -36,6 +49,8 @@ TOOLS = ("patchelf", "readelf", "strip", "cmake")
 LIBS = ("libunwind.so.8", "libunwind-x86_64.so.8")
 # Commands stage runs on its way to the check and just after it.
 HOST_COMMANDS = ("dirname", "realpath", "rm", "mkdir", "git", "cp", "python3", "du", "cut", "cat")
+# And the reproducible-staging wrapper's own.
+WRAPPER_COMMANDS = ("flock", "ln", "date")
 DOC = '(docs/BUCK2_OSS.md, "Host prerequisites for Buck validation")'
 
 
@@ -67,7 +82,8 @@ class StagePrerequisiteTest(unittest.TestCase):
         return self.bin / name
 
     def run_stage(self, *args: str, **env: str) -> subprocess.CompletedProcess:
-        base = {"PATH": str(self.bin), "HOME": str(self.tmp), "HERMIT_STAGE_HOST_LIBDIR": str(self.libdir)}
+        base = {"PATH": str(self.bin), "HOME": str(self.tmp), "HERMIT_STAGE_HOST_LIBDIR": str(self.libdir),
+                "HERMIT_BUCK_STAGE_REPRODUCIBLE": "0"}
         base.update(env)
         return subprocess.run(["/bin/bash", str(self.stage), *args], env=base, capture_output=True,
                               text=True, timeout=60)
@@ -168,6 +184,12 @@ if os.environ.get("FAKE_CARGO_CHILDREN"):
 note("start")
 with open(log, "a") as f:
     f.write(f"argv {label} {json.dumps(args)}\n")
+    cargo_home = os.environ.get("CARGO_HOME")
+    f.write(f"env {label} " + json.dumps({
+        "CARGO_HOME": cargo_home,
+        "CARGO_HOME_TARGET": os.path.realpath(cargo_home) if cargo_home else None,
+        "SOURCE_DATE_EPOCH": os.environ.get("SOURCE_DATE_EPOCH"),
+    }) + "\n")
 print(f"fake cargo {label} output", file=sys.stderr)
 if os.environ.get("FAKE_CARGO_FAIL") == label:
     # Fail only once every named build (comma-separated) has started, so the test sees
@@ -225,7 +247,7 @@ class StageCargoOverlapTest(unittest.TestCase):
 
     def run_stage(self, **env: str) -> subprocess.CompletedProcess:
         base = {"PATH": str(self.bin), "HOME": str(self.tmp), "HERMIT_STAGE_HOST_LIBDIR": str(self.libdir),
-                "FAKE_CARGO_LOG": str(self.log)}
+                "FAKE_CARGO_LOG": str(self.log), "HERMIT_BUCK_STAGE_REPRODUCIBLE": "0"}
         base.update(env)
         return subprocess.run(["/bin/bash", str(self.stage), "--from-cargo"], env=base, capture_output=True,
                               text=True, timeout=60)
@@ -234,12 +256,15 @@ class StageCargoOverlapTest(unittest.TestCase):
         rows = []
         self.target_dirs = {}
         self.argv = {}
+        self.env = {}
         for line in self.log.read_text().splitlines():
             parts = line.split()
             if parts[0] in ("strip", "install"):
                 rows.append((parts[0], parts[-1], 0.0))
             elif parts[0] == "argv":
                 self.argv[parts[1]] = json.loads(line.split(" ", 2)[2])
+            elif parts[0] == "env":
+                self.env[parts[1]] = json.loads(line.split(" ", 2)[2])
             else:
                 rows.append((parts[0], parts[1], float(parts[2])))
                 self.target_dirs[parts[1]] = parts[3]
@@ -343,6 +368,121 @@ class StageCargoOverlapTest(unittest.TestCase):
             os.kill(pid, 9)
         except ProcessLookupError:
             pass
+
+
+class StageReproducibleTest(unittest.TestCase):
+    """The reproducible-staging wrapper, in StageCargoOverlapTest's committed scratch checkout."""
+
+    events = StageCargoOverlapTest.events
+
+    def setUp(self) -> None:
+        StageCargoOverlapTest.setUp(self)
+        for name in WRAPPER_COMMANDS:
+            real = shutil.which(name)
+            self.assertIsNotNone(real, name)
+            (self.bin / name).symlink_to(real)
+        self.tree = self.stage.parent.parent.parent
+        self.fixed = self.tmp / ".cache" / "hermit-buck-stage"
+        self.cargo_home = self.tmp / "cargo-home"
+        self.cargo_home.mkdir()
+        self.sentinel = self.stage.parent / "staged" / "SENTINEL"
+        self.sentinel.parent.mkdir()
+        self.sentinel.write_text("previous staging\n")
+
+    def run_stage(self, **env: str) -> subprocess.CompletedProcess:
+        base = {"PATH": str(self.bin), "HOME": str(self.tmp), "HERMIT_STAGE_HOST_LIBDIR": str(self.libdir),
+                "FAKE_CARGO_LOG": str(self.log), "CARGO_HOME": str(self.cargo_home)}
+        base.update(env)
+        return subprocess.run(["/bin/bash", str(self.stage), "--from-cargo"], env=base, capture_output=True,
+                              text=True, timeout=60)
+
+    def assert_cleaned_up_and_previous_staging_kept(self, proc: subprocess.CompletedProcess) -> None:
+        for leftover in (self.fixed / "src", self.fixed / "cargo", Path(f"{self.fixed}.holder")):
+            self.assertFalse(leftover.exists() or leftover.is_symlink(), f"{leftover} left behind: {proc.stderr}")
+        self.assertEqual(self.sentinel.read_text(), "previous staging\n", proc.stderr)
+
+    def test_builds_run_in_the_fixed_copy_with_a_fixed_cargo_home_and_epoch(self) -> None:
+        proc = self.run_stage(FAKE_CARGO_FAIL="detcore-dbt", FAKE_CARGO_FAIL_AFTER_START="hermit,release")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.events()
+        target = str(self.fixed / "src" / "target")
+        self.assertEqual(self.target_dirs["release"], target)
+        self.assertEqual(self.target_dirs["detcore-dbt"], target)
+        self.assertEqual(self.target_dirs["hermit"], target + "/stage-hermit")
+        epoch = subprocess.run(["git", "-C", str(self.tree), "log", "-1", "--format=%ct", "HEAD"],
+                               capture_output=True, text=True, check=True).stdout.strip()
+        self.assertEqual(sorted(self.env), ["detcore-dbt", "hermit", "release"])
+        for label, env in self.env.items():
+            self.assertEqual(env, {"CARGO_HOME": str(self.fixed / "cargo"),
+                                   "CARGO_HOME_TARGET": str(self.cargo_home.resolve()),
+                                   "SOURCE_DATE_EPOCH": epoch}, label)
+        self.assert_cleaned_up_and_previous_staging_kept(proc)
+
+    def test_a_failed_build_returns_its_status_and_keeps_the_previous_staging(self) -> None:
+        proc = self.run_stage(FAKE_CARGO_FAIL="release", FAKE_CARGO_FAIL_STATUS="7")
+        self.assertEqual(proc.returncode, 7, proc.stderr)
+        self.assertIn("the release build of hermit-manifest-plan failed (exit 7)", proc.stderr)
+        self.assert_cleaned_up_and_previous_staging_kept(proc)
+
+    def test_a_stage_that_cannot_take_the_lock_fails_naming_the_holder(self) -> None:
+        import fcntl
+        self.fixed.mkdir(parents=True)
+        holder = Path(f"{self.fixed}.holder")
+        holder.write_text("pid 4242 since 2026-10-08T00:00:00Z for /elsewhere\n")
+        with open(f"{self.fixed}.lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            proc = self.run_stage(HERMIT_BUCK_STAGE_LOCK_TIMEOUT="1")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn(f"timed out after 1s waiting for {self.fixed}.lock", proc.stderr)
+        self.assertIn("pid 4242 since 2026-10-08T00:00:00Z for /elsewhere", proc.stderr)
+        self.assertFalse(self.log.exists(), "a build ran without the lock")
+        self.assertEqual(holder.read_text(), "pid 4242 since 2026-10-08T00:00:00Z for /elsewhere\n")
+        self.assertEqual(self.sentinel.read_text(), "previous staging\n")
+
+    def test_a_missing_host_package_is_refused_before_the_lock(self) -> None:
+        (self.bin / "patchelf").unlink()
+        proc = self.run_stage()
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("ci/buck-e2e/stage: patchelf is missing", proc.stderr)
+        self.assertFalse(Path(f"{self.fixed}.lock").exists(), proc.stderr)
+
+    def test_an_uncommitted_change_is_refused_even_when_the_copy_cannot_read_a_submodule(self) -> None:
+        # A submodule whose .git file names its gitdir relatively, as agent-utils does:
+        # valid in the checkout, dangling from the fixed directory's copy.
+        git = ["git", "-c", "user.email=t@example.invalid", "-c", "user.name=t", "-c", "commit.gpgsign=false"]
+        sub = self.tree / "sub"
+        sub.mkdir()
+        (sub / "file").write_text("sub\n")
+        subprocess.run(git + ["init", "-q", f"--separate-git-dir={self.tmp / 'sub-gitdir'}", str(sub)], check=True)
+        (sub / ".git").write_text("gitdir: ../../sub-gitdir\n")
+        subprocess.run(git + ["-C", str(sub), "add", "file"], check=True)
+        subprocess.run(git + ["-C", str(sub), "commit", "-qm", "sub"], check=True)
+        subprocess.run(git + ["-C", str(self.tree), "add", "sub"], check=True)
+        subprocess.run(git + ["-C", str(self.tree), "commit", "-qm", "add sub"], check=True)
+        (self.tree / ".gitignore").write_text("ci/buck-e2e/staged/\nuncommitted\n")
+        proc = self.run_stage()
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("ci/buck-e2e/stage: commit first", proc.stderr)
+        self.assertFalse(self.log.exists(), "a build ran from an uncommitted tree")
+        self.assert_cleaned_up_and_previous_staging_kept(proc)
+
+    def test_a_status_that_git_cannot_read_is_refused_not_taken_as_clean(self) -> None:
+        # The same submodule, its gitdir then removed: git status fails in the checkout too.
+        git = ["git", "-c", "user.email=t@example.invalid", "-c", "user.name=t", "-c", "commit.gpgsign=false"]
+        sub = self.tree / "sub"
+        sub.mkdir()
+        (sub / "file").write_text("sub\n")
+        subprocess.run(git + ["init", "-q", f"--separate-git-dir={self.tmp / 'sub-gitdir'}", str(sub)], check=True)
+        subprocess.run(git + ["-C", str(sub), "add", "file"], check=True)
+        subprocess.run(git + ["-C", str(sub), "commit", "-qm", "sub"], check=True)
+        subprocess.run(git + ["-C", str(self.tree), "add", "sub"], check=True)
+        subprocess.run(git + ["-C", str(self.tree), "commit", "-qm", "add sub"], check=True)
+        shutil.rmtree(self.tmp / "sub-gitdir")
+        proc = self.run_stage()
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn(f"ci/buck-e2e/stage: cannot read the status of {self.tree}", proc.stderr)
+        self.assertFalse(self.log.exists(), "a build ran without a readable status")
+        self.assert_cleaned_up_and_previous_staging_kept(proc)
 
 
 if __name__ == "__main__":
