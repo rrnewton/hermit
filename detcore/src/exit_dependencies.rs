@@ -40,8 +40,6 @@
 //! adds that through [`set_backend_advice`].
 
 use std::os::fd::RawFd;
-use std::os::unix::fs::FileTypeExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
@@ -117,15 +115,48 @@ pub fn device_exit_dependency(rdev: u64) -> Option<&'static str> {
 /// its holder serve, or `None`. A descriptor that cannot be read is not
 /// refused.
 pub fn descriptor_exit_dependency(fd_link: &Path) -> Option<&'static str> {
-    if std::fs::read_link(fd_link).is_ok_and(|target| target.as_os_str() == SECCOMP_NOTIFY_LINK) {
+    use std::os::unix::ffi::OsStrExt;
+
+    use crate::util::raw_syscall;
+    // Raw readlinkat and newfstatat (see crate::util::raw_syscall): the
+    // in-guest runtime runs this inside the guest before Detcore installs.
+    let link = std::ffi::CString::new(fd_link.as_os_str().as_bytes()).ok()?;
+    let mut target = [0_u8; 64];
+    let length = unsafe {
+        raw_syscall(
+            libc::SYS_readlinkat,
+            [
+                libc::AT_FDCWD as u64,
+                link.as_ptr() as u64,
+                target.as_mut_ptr() as u64,
+                target.len() as u64,
+                0,
+                0,
+            ],
+        )
+    };
+    if length >= 0 && &target[..length as usize] == SECCOMP_NOTIFY_LINK.as_bytes() {
         return Some("a seccomp user-notification listener");
     }
     // Follows the descriptor to the file it refers to.
-    let metadata = std::fs::metadata(fd_link).ok()?;
-    if !metadata.file_type().is_char_device() {
+    let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+    let status = unsafe {
+        raw_syscall(
+            libc::SYS_newfstatat,
+            [
+                libc::AT_FDCWD as u64,
+                link.as_ptr() as u64,
+                (&raw mut metadata) as u64,
+                0,
+                0,
+                0,
+            ],
+        )
+    };
+    if status != 0 || metadata.st_mode & libc::S_IFMT != libc::S_IFCHR {
         return None;
     }
-    device_exit_dependency(metadata.rdev())
+    device_exit_dependency(metadata.st_rdev)
 }
 
 /// The first descriptor listed in `fd_directory` (a `/proc/<pid>/fd`
