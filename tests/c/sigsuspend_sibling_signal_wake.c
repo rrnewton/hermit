@@ -95,6 +95,16 @@
  * outside the call, so defect 2 reaches it: the child's rt_sigsuspend
  * finishes with ERESTARTNOHAND in one run and ERESTARTSYS in another, and
  * strict verify diverges although the wait status is the same.
+ *
+ * The phases in which a signal must not end the wait (ignored-alarm,
+ * ignored-chld and raw-blocked) also check when it ended, as
+ * `external_signal_interrupt.c` checks its polls: no sooner than the waking
+ * signal's delay, timed from before the sibling is created, and less than
+ * WAKE_OVERSHOOT_MS after it (`woke_in_bounds`). A wait that the discarded or
+ * blocked signal ended fails the lower bound, and a waiter that missed the
+ * waking signal and slept on until a later event fails the upper one. The
+ * phase line prints the result and the handler count, never the time, so the
+ * output is the same natively and under Hermit.
  */
 
 #define _GNU_SOURCE
@@ -119,6 +129,13 @@
 
 #define SIGNAL_BIT(sig) (UINT64_C(1) << ((sig) - 1))
 
+/* When the waking signal is sent, timed from before the sibling is created:
+ * `sibling` sleeps three seconds, and `block_usr1_before_wait` sends its
+ * blocked SIGUSR1 after one second and SIGUSR2 after two. */
+#define SIBLING_WAKE_MS 3000L
+#define RAW_BLOCKED_WAKE_MS 2000L
+#define WAKE_OVERSHOOT_MS 50L
+
 static volatile sig_atomic_t usr1_runs = 0;
 static volatile sig_atomic_t usr1_on_waiter = 0;
 static volatile sig_atomic_t usr2_runs = 0;
@@ -129,6 +146,33 @@ static pid_t waiter_tid;
 static _Atomic uint64_t raw_mask;
 static atomic_int sibling_ready;
 static atomic_int waiter_entering;
+
+static long ms_between(const struct timespec* start, const struct timespec* end) {
+  return (end->tv_sec - start->tv_sec) * 1000L +
+      (end->tv_nsec - start->tv_nsec) / 1000000L;
+}
+
+/* Whether a wait timed from `start` to `end` ended in
+ * [wake_ms, wake_ms + WAKE_OVERSHOOT_MS). The time goes to stderr only when it
+ * did not, so stdout stays the same natively and under Hermit. */
+static int woke_in_bounds(
+    const char* name,
+    const struct timespec* start,
+    const struct timespec* end,
+    long wake_ms) {
+  long elapsed = ms_between(start, end);
+  int ok = elapsed >= wake_ms && elapsed < wake_ms + WAKE_OVERSHOOT_MS;
+  if (!ok) {
+    fprintf(
+        stderr,
+        "%s wait ended after %ld ms, outside [%ld, %ld)\n",
+        name,
+        elapsed,
+        wake_ms,
+        wake_ms + WAKE_OVERSHOOT_MS);
+  }
+  return ok;
+}
 
 static void on_usr1(int signo) {
   (void)signo;
@@ -169,6 +213,8 @@ static int phase(const char* name, int fork_child) {
     }
   }
 
+  struct timespec start, end;
+  clock_gettime(CLOCK_MONOTONIC, &start);
   pthread_t thread;
   if (pthread_create(&thread, NULL, sibling, NULL) != 0) {
     puts("SIGSUSPEND_SIBLING_PTHREAD_CREATE_FAILED");
@@ -183,6 +229,8 @@ static int phase(const char* name, int fork_child) {
   errno = 0;
   int rc = sigsuspend(&empty);
   int eintr = rc == -1 && errno == EINTR;
+  clock_gettime(CLOCK_MONOTONIC, &end);
+  int in_bounds = woke_in_bounds(name, &start, &end, SIBLING_WAKE_MS);
 
   if (pthread_join(thread, NULL) != 0) {
     puts("SIGSUSPEND_SIBLING_PTHREAD_JOIN_FAILED");
@@ -201,15 +249,17 @@ static int phase(const char* name, int fork_child) {
   /* Report booleans and counts rather than strerror(3) so the output cannot
    * depend on the ambient locale. */
   printf(
-      "%s rc=%d eintr=%d usr2_runs=%d usr2_on_waiter=%d child_status=%d\n",
+      "%s rc=%d eintr=%d usr2_runs=%d usr2_on_waiter=%d child_status=%d "
+      "woke_in_bounds=%d\n",
       name,
       rc,
       eintr,
       (int)usr2_runs,
       (int)usr2_on_waiter,
-      child_status);
+      child_status,
+      in_bounds);
   return !(rc == -1 && eintr && usr2_runs == 1 && usr2_on_waiter &&
-           child_status == (fork_child ? 7 : -1));
+           child_status == (fork_child ? 7 : -1) && in_bounds);
 }
 
 static void sleep_one_second(void) {
@@ -287,6 +337,8 @@ static int raw_phase(const char* name, void* (*sibling_main)(void*)) {
   atomic_store(&sibling_ready, 0);
   atomic_store(&waiter_entering, 0);
 
+  struct timespec start, end;
+  clock_gettime(CLOCK_MONOTONIC, &start);
   pthread_t thread;
   if (pthread_create(&thread, NULL, sibling_main, NULL) != 0) {
     puts("SIGSUSPEND_SIBLING_PTHREAD_CREATE_FAILED");
@@ -301,6 +353,7 @@ static int raw_phase(const char* name, void* (*sibling_main)(void*)) {
   errno = 0;
   long rc = syscall(SYS_rt_sigsuspend, (void*)&raw_mask, sizeof(uint64_t));
   int eintr = rc == -1 && errno == EINTR;
+  clock_gettime(CLOCK_MONOTONIC, &end);
   int usr1_in_wait = usr1_runs;
   int usr2_in_wait = usr2_runs;
 
@@ -341,9 +394,14 @@ static int raw_phase(const char* name, void* (*sibling_main)(void*)) {
              usr1_pending + usr2_pending == 1 && usr1_runs == 1 &&
              usr2_runs == 1 && on_waiter);
   }
+  /* raw-blocked: the blocked SIGUSR1 must not end the wait, so it ends only
+   * with the SIGUSR2 sent two seconds after the sibling started. */
+  int bounded = sibling_main == block_usr1_before_wait;
+  int in_bounds =
+      bounded && woke_in_bounds(name, &start, &end, RAW_BLOCKED_WAKE_MS);
   printf(
       "%s rc=%ld eintr=%d usr1_in_wait=%d usr2_in_wait=%d usr1_pending=%d "
-      "usr2_pending=%d usr1_runs=%d usr2_runs=%d on_waiter=%d\n",
+      "usr2_pending=%d usr1_runs=%d usr2_runs=%d on_waiter=%d",
       name,
       rc,
       eintr,
@@ -354,6 +412,10 @@ static int raw_phase(const char* name, void* (*sibling_main)(void*)) {
       (int)usr1_runs,
       (int)usr2_runs,
       on_waiter);
+  if (bounded) {
+    printf(" woke_in_bounds=%d", in_bounds);
+  }
+  putchar('\n');
   if (sibling_main == send_usr1) {
     return !(rc == -1 && eintr && usr1_in_wait == 1 && usr2_in_wait == 0 &&
              usr1_pending == 0 && usr2_pending == 0 && usr1_runs == 1 &&
@@ -361,7 +423,7 @@ static int raw_phase(const char* name, void* (*sibling_main)(void*)) {
   }
   return !(rc == -1 && eintr && usr1_in_wait == 0 && usr2_in_wait == 1 &&
            usr1_pending == 1 && usr2_pending == 0 && usr1_runs == 1 &&
-           usr2_runs == 1 && on_waiter);
+           usr2_runs == 1 && on_waiter && in_bounds);
 }
 
 /* restart-handled (see the comment at the top). Returns 0 on success. */
