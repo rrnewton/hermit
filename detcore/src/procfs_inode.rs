@@ -92,6 +92,11 @@ const PROC_BLOCK_SIZE: i64 = 1024;
 /// The bit every path key sets, which no 32-bit procfs inode number has.
 const PATH_KEY_BIT: u64 = 1 << 63;
 
+/// The device of the key Detcore gives a file whose device it could not
+/// learn. Linux device numbers have a 12-bit major and a 20-bit minor number,
+/// so no file's device number is this one.
+pub(crate) const UNKNOWN_DEVICE: u64 = u64::MAX;
+
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 
 /// Continues a 64-bit FNV-1a hash from `hash` over `bytes`.
