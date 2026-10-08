@@ -1462,16 +1462,19 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // scheduler::test::a_signal_sent_at_an_rt_sigsuspend_request_arms_the_call_it_wakes
     // retains all 1150: 1151, listed with this node's arguments.
     // procfs_inode::tests::{a_procfs_entry_names_its_path_whatever_its_host_inode,
+    // a_path_names_its_process_and_thread,
+    // a_path_within_procfs_does_not_depend_on_the_mount,
     // dot_entries_name_the_directory_and_its_parent,
-    // mountinfo_names_procfs_devices_by_type,
+    // mountinfo_names_procfs_mounts_by_type,
     // only_anonymous_devices_with_1024_byte_blocks_may_be_procfs,
     // other_directories_keep_host_keys, path_keys_cannot_equal_procfs_inodes,
-    // this_process_finds_its_own_procfs_entries} and tool_global::tests::{
+    // this_process_reads_its_own_procfs_entries} and tool_global::tests::{
     // a_numbered_host_inode_keeps_its_number_when_its_path_is_named,
-    // a_rebuilt_procfs_entry_keeps_its_number, procfs_aliases_share_one_number,
+    // a_rebuilt_procfs_entry_keeps_its_number,
+    // a_reused_task_id_names_new_procfs_entries, procfs_aliases_share_one_number,
     // a_write_to_a_rebuilt_procfs_entry_sets_the_mtime_of_its_number}
-    // (rebuilt procfs entries keep their numbers) retain all 1151: 1162.
-    ("test.detcore_unit", 1162),
+    // (rebuilt procfs entries keep their numbers) retain all 1151: 1165.
+    ("test.detcore_unit", 1165),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1518,10 +1521,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // inode_reuse::nothing_is_retired_without_sequentialized_threads (the same
     // reviews) retains all 87 (measured 88).
     // procfs_inode::{a_rebuilt_proc_fd_entry_keeps_its_number,
+    // a_rebuilt_entry_reached_through_self_keeps_its_number,
     // a_procfs_entry_reached_by_two_paths_keeps_one_number,
+    // an_entry_detcore_cannot_name_records_a_determinism_loss,
     // the_proc_root_link_count_does_not_count_host_processes,
-    // a_write_to_a_procfs_file_moves_its_mtime} retain all 88 (measured 92).
-    ("test.detcore_misc", 92),
+    // the_proc_root_link_count_through_the_cwd_does_not_count_host_processes,
+    // a_write_to_a_procfs_file_moves_its_mtime} retain all 88 (measured 95).
+    ("test.detcore_misc", 95),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -1994,7 +2000,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
     // The host node carries the identical tests_misc selection.
-    ("test.detcore_misc_on_host", 92),
+    ("test.detcore_misc_on_host", 95),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -2067,8 +2073,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same seven signal phase 1 table tests, re-listed: 1134.
     // And the schedstats sanitizer test: 1150.
     // And the rt_sigsuspend request signal test: 1151.
-    // The host twin selects the same eleven procfs inode tests: 1151 + 11 = 1162.
-    ("test.detcore_unit_on_host", 1162),
+    // The host twin selects the same fourteen procfs inode tests: 1151 + 14 = 1165.
+    ("test.detcore_unit_on_host", 1165),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
