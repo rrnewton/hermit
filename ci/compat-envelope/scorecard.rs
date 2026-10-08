@@ -84,6 +84,7 @@ use hermit_manifest_plan::stress_series::SeriesOutcome;
 use hermit_manifest_plan::stress_series::SeriesPayload;
 use hermit_manifest_plan::stress_series::SeriesProducer;
 use hermit_manifest_plan::stress_series::SeriesRow;
+use hermit_manifest_plan::stress_series::SeriesRuntimeMeasurement;
 use hermit_manifest_plan::stress_series::SeriesSchema;
 use hermit_manifest_plan::stress_series::SourceDepth;
 use serde::Deserialize;
@@ -15681,6 +15682,94 @@ fn is_naked_native(id: &CellId) -> bool {
     id.mode == "naked" && id.backend == "native"
 }
 
+/// A verify row of an earlier series schema (stress-series/v1 or v2) labelled
+/// "diverged" whose own retained verify report shows that it compared
+/// nothing.
+///
+/// Those schemas' writer wrote "diverged" for every verify that did not
+/// match, including one whose first run was rejected, so that the guest never
+/// ran a second time. A row cannot show that by itself: a missing second-run
+/// summary is not enough, because a DBT verify compares its two runs and
+/// records no run summaries at all. The run's verify report can, so each row
+/// listed here carries that report byte for byte, and is withdrawn only while
+/// the row agrees with it ([`no_comparison_verify`]).
+struct NoComparisonVerify {
+    /// The row's `event_id`.
+    event_id: &'static str,
+    /// The row's cell.
+    cell: &'static str,
+    /// The row's source tree.
+    tree: &'static str,
+    /// Where validation retained the report, under the parent repository on
+    /// the row's host.
+    report_path: &'static str,
+    /// The report, byte for byte.
+    report: &'static str,
+    /// The report's SHA-256.
+    report_sha256: &'static str,
+}
+
+/// The verify report each row of [`NO_COMPARISON_VERIFY_ROWS`] retained (the
+/// two files are byte-identical, final newline included): the verdict is
+/// `no_result` because the first run exited 1, nothing was compared, and only
+/// the first run is summarized.
+const FIRST_RUN_REJECTED_REPORT: &str = concat!(
+    r#"{"verified":false,"bitwise_parity":false,"verdict":"no_result","no_result_reason":{"kind":"first_run_rejected","exit_code":1,"signal":null,"stdout_bytes":0,"stderr_bytes":0},"infrastructure_error":null,"comparison":null,"compared_log_messages":null,"runtime":{"run1":{"scheduler_turns":3,"virtual_nanoseconds":2012500,"syscalls":3}},"guest_exit_code":1,"guest_signal":null,"first_divergent_scheduler_turn":null,"first_divergent_virtual_nanoseconds":null,"first_divergent_record":null,"first_divergent_syscall":null,"first_divergent_left_message":null,"first_divergent_right_message":null}"#,
+    "\n"
+);
+
+/// The rows whose divergence label [`no_comparison_verify`] withdraws. They
+/// were the only determinism failures of their two cells, which every other
+/// observation measured as passing.
+const NO_COMPARISON_VERIFY_ROWS: &[NoComparisonVerify] = &[
+    NoComparisonVerify {
+        event_id: "series-fcbc1a0d35a78e285a64923021267f203c24507b5c78d593c53f266d3f8e2d07",
+        cell: "c-programs/pidfd-poll-self/verify/ptrace",
+        tree: "f2be3d81c9cb609443bd34c4611683e2bfccf728",
+        report_path: "ignored/validate/artifacts/validate-mega-lander-f2be3d81c9cb-1788029440105392158-943353-05df4e6f/e2e/runs/validate-mega-lander-f2be3d81c9cb-1788029440105392158-943353-05df4e6f/c-programs-pidfd-poll-self-verify-ptrace/verify-1.json",
+        report: FIRST_RUN_REJECTED_REPORT,
+        report_sha256: "0b202a8990c12b48e925c66e51f3942d968a81064aefe0dce90fb10857b7fc36",
+    },
+    NoComparisonVerify {
+        event_id: "series-d6f81ef9f2acdcdaeaf52eba65af06dc1f5a929163a8c7008d8b9cec0b0cde31",
+        cell: "c-programs/procfs-positioned-probe/verify/ptrace",
+        tree: "0ecc03c0fd710c599392429d2b8a2d066365c578",
+        report_path: "ignored/validate/artifacts/validate-type-audit-0ecc03c0fd71-1788039974018309187-1967248-359e94c7/e2e/runs/validate-type-audit-0ecc03c0fd71-1788039974018309187-1967248-359e94c7/c-programs-procfs-positioned-probe-verify-ptrace/verify-1.json",
+        report: FIRST_RUN_REJECTED_REPORT,
+        report_sha256: "0b202a8990c12b48e925c66e51f3942d968a81064aefe0dce90fb10857b7fc36",
+    },
+];
+
+/// The entry of [`NO_COMPARISON_VERIFY_ROWS`] for `row`, when `row` is an
+/// earlier schema's verify labelled "diverged" and agrees with the entry and
+/// its report: same cell and tree; the report's verdict is `no_result` for a
+/// rejected first run, with no comparison and no second-run summary; and the
+/// row records the report's first-run summary and no second run.
+fn no_comparison_verify(row: &SeriesRow, id: &CellId) -> Option<&'static NoComparisonVerify> {
+    if row.schema == SeriesSchema::V3
+        || id.mode != "verify"
+        || row.series.outcome != SeriesOutcome::Diverged
+    {
+        return None;
+    }
+    let entry = NO_COMPARISON_VERIFY_ROWS
+        .iter()
+        .find(|entry| entry.event_id == row.event_id)?;
+    let report: JsonValue = serde_json::from_str(entry.report).ok()?;
+    let report_run1: SeriesRuntimeMeasurement =
+        serde_json::from_value(report["runtime"]["run1"].clone()).ok()?;
+    let runtime = row.series.runtime.as_ref()?;
+    (row.series.cell == entry.cell
+        && row.series.tree == entry.tree
+        && report["verdict"] == "no_result"
+        && report["no_result_reason"]["kind"] == "first_run_rejected"
+        && report["comparison"].is_null()
+        && report["runtime"]["run2"].is_null()
+        && runtime.run1.as_ref() == Some(&report_run1)
+        && runtime.run2.is_none())
+    .then_some(entry)
+}
+
 fn series_evidence(row: &SeriesRow, id: &CellId) -> Option<SeriesEvidence> {
     // Native attempt/diversity evidence belongs to the canonical series. The
     // legacy cells.json observation shape cannot represent it without losing
@@ -15736,6 +15825,9 @@ fn series_evidence(row: &SeriesRow, id: &CellId) -> Option<SeriesEvidence> {
     let result = match (row.series.outcome, id.mode.as_str()) {
         (SeriesOutcome::Passed, _) => Some(ObservedResult::Pass),
         (SeriesOutcome::Diverged, "replay") => Some(ObservedResult::ReplayFailure),
+        // A verify that its own retained report shows compared nothing. Every
+        // other divergence, with run summaries or without, stays a failure.
+        (SeriesOutcome::Diverged, "verify") if no_comparison_verify(row, id).is_some() => None,
         (SeriesOutcome::Diverged, _) => Some(ObservedResult::DeterminismFailure),
         (
             SeriesOutcome::NoResult
@@ -15943,6 +16035,11 @@ fn apply_series_rows_inner(
                 if is_naked_native(&cell.id) {
                     skipped.push(format!(
                         "{label}: naked/native evidence is canonical-series-only and is not projected into legacy cells.json observations"
+                    ));
+                } else if let Some(entry) = no_comparison_verify(row, &cell.id) {
+                    skipped.push(format!(
+                        "{label}: labelled \"diverged\", but its verify report ({}, sha256 {}) says the first run was rejected and nothing was compared",
+                        entry.report_path, entry.report_sha256
                     ));
                 } else {
                     skipped.push(format!(
@@ -47959,5 +48056,167 @@ mod series_comparison_tests {
         assert_eq!(parity, parity_summary_without_store(&plain_cells));
         assert_eq!(parity.rows_read, 0);
         assert!(parity.runs.is_empty());
+    }
+}
+
+/// The earlier series schemas labelled every verify that did not match
+/// "diverged". Only a row whose own retained verify report shows that it
+/// compared nothing loses that label; every other divergence, with or without
+/// run summaries, stays a determinism failure.
+#[cfg(test)]
+mod legacy_verify_divergence_tests {
+    use super::*;
+
+    /// The published stress-series/v2 rows of [`NO_COMPARISON_VERIFY_ROWS`]
+    /// (the ledger's series/hermit/<host>/2026-08.jsonl), byte for byte except
+    /// for the host name, which the portable-paths check keeps out of `ci/`.
+    const PUBLISHED_ROWS: [&str; 2] = [
+        r#"{"emitted_at": "2026-08-29T19:17:06Z", "event_id": "series-fcbc1a0d35a78e285a64923021267f203c24507b5c78d593c53f266d3f8e2d07", "event_type": "series.observation", "host": "fixture-host", "producer": "validate", "run_id": "validate-mega-lander-f2be3d81c9cb-1788029440105392158-943353-05df4e6f", "schema": "stress-series/v2", "series": {"cell": "c-programs/pidfd-poll-self/verify/ptrace", "depth": {"hermit": {"commits": 2501, "first_parent": 2426}, "reverie": {"commits": 1000, "first_parent": 985}}, "host_capabilities": {"cpuid-faulting": {"evidence": "arch_prctl(ARCH_SET_CPUID, 0) = 0; /proc/cpuinfo advertises cpuid_fault", "present": true}, "kvm": {"evidence": "open(/dev/kvm, O_RDWR) = ok; /proc/cpuinfo advertises vmx or svm", "present": true}}, "kernel_version": "7.1.3-0_fbk0_rc18_0_gd373cd4b8dbf", "machine_shortname": "fixture-host", "main_ancestry": true, "num_runs": 1, "outcome": "diverged", "run_index": 1, "runtime": {"run1": {"scheduler_turns": 3, "syscalls": 3, "virtual_nanoseconds": 2012500}, "wall_time_max_ms": 1127, "wall_time_min_ms": 1127}, "source_tree_dirty": false, "tree": "f2be3d81c9cb609443bd34c4611683e2bfccf728"}, "team": "hermit"}"#,
+        r#"{"emitted_at": "2026-08-29T22:09:50Z", "event_id": "series-d6f81ef9f2acdcdaeaf52eba65af06dc1f5a929163a8c7008d8b9cec0b0cde31", "event_type": "series.observation", "host": "fixture-host", "producer": "validate", "run_id": "validate-type-audit-0ecc03c0fd71-1788039974018309187-1967248-359e94c7", "schema": "stress-series/v2", "series": {"cell": "c-programs/procfs-positioned-probe/verify/ptrace", "depth": {"hermit": {"commits": 2506, "first_parent": 2431}, "reverie": {"commits": 1000, "first_parent": 985}}, "host_capabilities": {"cpuid-faulting": {"evidence": "arch_prctl(ARCH_SET_CPUID, 0) = 0; /proc/cpuinfo advertises cpuid_fault", "present": true}, "kvm": {"evidence": "open(/dev/kvm, O_RDWR) = ok; /proc/cpuinfo advertises vmx or svm", "present": true}}, "kernel_version": "7.1.3-0_fbk0_rc18_0_gd373cd4b8dbf", "machine_shortname": "fixture-host", "main_ancestry": false, "num_runs": 1, "outcome": "diverged", "run_index": 1, "runtime": {"run1": {"scheduler_turns": 3, "syscalls": 3, "virtual_nanoseconds": 2012500}, "wall_time_max_ms": 1111, "wall_time_min_ms": 1111}, "source_tree_dirty": false, "tree": "0ecc03c0fd710c599392429d2b8a2d066365c578"}, "team": "hermit"}"#,
+    ];
+
+    fn published_row(index: usize) -> JsonValue {
+        serde_json::from_str(PUBLISHED_ROWS[index]).unwrap()
+    }
+
+    /// A verify of the same cell at another commit whose two runs matched, as
+    /// both published cells also have; a projection in which every row was
+    /// skipped is not written at all.
+    fn passed_row(cell: &str) -> JsonValue {
+        let mut row = published_row(0);
+        row["event_id"] = "series-fixture-passed".into();
+        row["run_id"] = "fixture-passed-run".into();
+        row["series"]["cell"] = cell.into();
+        row["series"]["outcome"] = "passed".into();
+        row["series"]["tree"] = "1".repeat(40).into();
+        row["series"]["runtime"]["run2"] = row["series"]["runtime"]["run1"].clone();
+        row
+    }
+
+    /// Project `row` and a passed row of its cell onto a manifest holding only
+    /// that cell.
+    fn project(row: JsonValue) -> (TrackedCell, ProjectObservationsOutcome) {
+        let cell = row["series"]["cell"].as_str().unwrap().to_string();
+        let mut parts = cell.rsplitn(3, '/');
+        let backend = parts.next().unwrap();
+        let mode = parts.next().unwrap();
+        let test = parts.next().unwrap();
+        let rows = [row.clone(), passed_row(&cell)]
+            .map(|row| serde_json::from_value::<SeriesRow>(row).expect("a published row shape"));
+        let mut tracked = TrackedCells {
+            schema: SCHEMA,
+            projection: None,
+            cells: vec![TrackedCell {
+                id: CellId {
+                    lane: "portable".into(),
+                    category: "c-programs".into(),
+                    test: test.into(),
+                    mode: mode.into(),
+                    backend: backend.into(),
+                },
+                status: CellStatus::Green,
+                ci_disabled_reason: None,
+                not_applicable_reason: None,
+                last_tested: None,
+                observations: Vec::new(),
+                measurement: MeasurementState::NeverMeasured,
+                green_removal_reason: None,
+            }],
+        };
+        let outcome =
+            apply_series_rows(Path::new("/absent-host-results"), &mut tracked, &rows, None)
+                .expect("the rows project");
+        refresh_measurement(&mut tracked);
+        (tracked.cells.remove(0), outcome)
+    }
+
+    fn assert_withdrawn(index: usize) {
+        let entry = &NO_COMPARISON_VERIFY_ROWS[index];
+        let (cell, outcome) = project(published_row(index));
+        assert_eq!(outcome.skipped.len(), 1, "{:?}", outcome.skipped);
+        assert!(
+            outcome.skipped[0].contains(entry.event_id)
+                && outcome.skipped[0].contains("says the first run was rejected")
+                && outcome.skipped[0].contains(entry.report_sha256),
+            "{:?}",
+            outcome.skipped
+        );
+        assert_eq!(cell.observations.len(), 1, "{:?}", cell.observations);
+        assert_eq!(
+            cell.observations[0].results,
+            BTreeSet::from([ObservedResult::Pass])
+        );
+        assert_eq!(cell.measurement, MeasurementState::MeasuredAndPassed);
+    }
+
+    fn assert_determinism_failure(row: JsonValue) {
+        let (cell, outcome) = project(row);
+        assert!(outcome.skipped.is_empty(), "{:?}", outcome.skipped);
+        assert!(
+            cell.observations
+                .iter()
+                .any(|observation| observation.results
+                    == BTreeSet::from([ObservedResult::DeterminismFailure])),
+            "{:?}",
+            cell.observations
+        );
+        assert_eq!(cell.measurement, MeasurementState::DivergedUnlocated);
+    }
+
+    #[test]
+    fn each_listed_report_is_the_retained_file() {
+        assert_eq!(FIRST_RUN_REJECTED_REPORT.len(), 589);
+        for (index, entry) in NO_COMPARISON_VERIFY_ROWS.iter().enumerate() {
+            assert_eq!(
+                format!("{:x}", Sha256::digest(entry.report.as_bytes())),
+                entry.report_sha256
+            );
+            let row = published_row(index);
+            assert_eq!(row["event_id"], entry.event_id);
+            assert_eq!(row["series"]["cell"], entry.cell);
+            assert_eq!(row["series"]["tree"], entry.tree);
+            assert!(entry.report_path.ends_with("/verify-1.json"));
+        }
+    }
+
+    #[test]
+    fn a_verify_whose_report_shows_a_rejected_first_run_compared_nothing() {
+        assert_withdrawn(0);
+        assert_withdrawn(1);
+    }
+
+    /// The same row under any other event id: the label alone, with only a
+    /// first-run summary, does not show that nothing was compared.
+    #[test]
+    fn an_unlisted_verify_with_only_a_first_run_summary_is_a_failure() {
+        let mut row = published_row(0);
+        row["event_id"] = "series-fixture-unlisted".into();
+        assert_determinism_failure(row);
+    }
+
+    /// What the stress-series/v2 writer recorded for a DBT verify that
+    /// compared its runs and diverged: no run summaries, only wall times.
+    #[test]
+    fn a_divergence_without_run_summaries_is_a_failure() {
+        let mut row = published_row(0);
+        row["event_id"] = "series-fixture-dbt".into();
+        row["series"]["cell"] = "c-programs/pidfd-poll-self/verify/dbt".into();
+        let runtime = row["series"]["runtime"].as_object_mut().unwrap();
+        runtime.remove("run1");
+        assert_determinism_failure(row);
+    }
+
+    /// A listed row withdraws its label only while it agrees with its report.
+    #[test]
+    fn a_listed_row_that_disagrees_with_its_report_is_a_failure() {
+        let mut second_run = published_row(0);
+        second_run["series"]["runtime"]["run2"] = second_run["series"]["runtime"]["run1"].clone();
+        assert_determinism_failure(second_run);
+        let mut other_first_run = published_row(0);
+        other_first_run["series"]["runtime"]["run1"]["syscalls"] = 4.into();
+        assert_determinism_failure(other_first_run);
+        let mut other_tree = published_row(0);
+        other_tree["series"]["tree"] = "2".repeat(40).into();
+        assert_determinism_failure(other_tree);
     }
 }
