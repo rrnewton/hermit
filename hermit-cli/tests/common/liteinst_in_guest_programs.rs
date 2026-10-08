@@ -534,6 +534,194 @@ fn liteinst_in_guest_sigalrm_handler_is_virtual_and_published() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), not_admitted);
 }
 
+/// Compiles one of the SIGALRM guests in `tests/fixtures`.
+fn sigalrm_fixture(name: &str) -> std::path::PathBuf {
+    let build_root = process_build_root(&format!("liteinst-{name}"));
+    fs::create_dir_all(&build_root).expect("failed to create the SIGALRM guest directory");
+    let guest = build_root.join(name);
+    let compiled = Command::new("cc")
+        .args(["-O2", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(format!("{name}.c")),
+        )
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the SIGALRM guest");
+    assert!(compiled.status.success(), "{compiled:?}");
+    guest
+}
+
+/// Runs a SIGALRM guest whose handler is delivered before a syscall that has
+/// not run (the I4 addendum's point c), once without --verify, where its
+/// output must be `expected` (the program's output on native Linux), then
+/// with --verify, which must refuse the run: each such delivery records a
+/// determinism loss, since the handler cannot see the interrupted rcx and r11
+/// Linux would show it.
+fn assert_entry_delivery_runs_and_refuses_verification(
+    guest: &Path,
+    extra_args: &[&str],
+    expected: &str,
+) {
+    let output = liteinst_command("info")
+        .args(extra_args)
+        .arg("--env=REVERIE_LITEINST_SITE_PATCHING=0")
+        .arg("--env=REVERIE_LITEINST_SIGALRM_HANDLERS=1")
+        .arg("--")
+        .arg(guest)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run Hermit LiteInst");
+    let output = assert_liteinst_in_guest_output(output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+    let output = liteinst_command("info")
+        .arg("--verify")
+        .args(extra_args)
+        .arg("--env=REVERIE_LITEINST_SITE_PATCHING=0")
+        .arg("--env=REVERIE_LITEINST_SIGALRM_HANDLERS=1")
+        .arg("--")
+        .arg(guest)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run Hermit LiteInst with --verify");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "verification matched: {stderr}");
+    assert!(
+        stderr.contains("run 1: determinism loss recorded: ")
+            && stderr.contains("before a syscall that has not run"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Determinism verified"), "{stderr}");
+}
+
+/// Signal phase 1, the I4 addendum: a SIGALRM that becomes pending while a
+/// handler blocks it runs as soon as that handler returns, before the guest's
+/// next syscall (a write, or exit_group), as Linux delivers it at the
+/// handler's rt_sigreturn; never nested inside the handler. A handler that
+/// adds SIGALRM to its saved mask returns with it blocked, and the next runs
+/// when sigprocmask unblocks it (an ordinary completion delivery). The
+/// handlers query their mask, and the guest's alarm and pause after them still
+/// work. The output is the program's output on native Linux; --verify refuses
+/// the run (see `assert_entry_delivery_runs_and_refuses_verification`).
+#[test]
+fn liteinst_in_guest_sigalrm_pending_at_handler_return_runs_before_the_next_syscall() {
+    let _guard = hermit_run_guard();
+    let guest = sigalrm_fixture("liteinst_sigalrm_entry_delivery");
+    assert_entry_delivery_runs_and_refuses_verification(
+        &guest,
+        &[],
+        "handler 1 start\nhandler 1 end\nhandler 2 blocked=1\nafter pause\n\
+         handler 3 start\nhandler 3 end\nblocked after return\nhandler 4 blocked=1\n\
+         after unblock\nhandler 5 start\nhandler 5 end\nhandler 6 blocked=1\n",
+    );
+}
+
+/// Signal phase 1: a SIGALRM that expires while the guest runs only trapped
+/// CPUID instructions. With a logical target timeslice the scheduler yields
+/// at those traps and the alarm commits there; its handler runs before the
+/// guest's next syscall (exit_group), as on Linux, where it runs during the
+/// loop. The output matches native; --verify refuses the run (see
+/// `assert_entry_delivery_runs_and_refuses_verification`).
+#[test]
+fn liteinst_in_guest_sigalrm_committed_at_an_instruction_trap_runs_before_exit() {
+    let _guard = hermit_run_guard();
+    let guest = sigalrm_fixture("liteinst_sigalrm_cpuid_loop_then_exit");
+    assert_entry_delivery_runs_and_refuses_verification(
+        &guest,
+        &["--target-timeslice=100000"],
+        "handler ran\n",
+    );
+}
+
+/// Signal phase 1: a SIGALRM Detcore took that the runtime cannot deliver as
+/// prepared. With Hermit started at RLIMIT_SIGPENDING 0 the kernel sends the
+/// runtime's instance without its siginfo (a signal below SIGRTMIN is sent
+/// even when its siginfo cannot be queued), so the trampoline refuses it and
+/// the process ends before the guest resumes: it never prints "resumed". The
+/// run records a determinism loss, which verification reports.
+#[test]
+fn liteinst_in_guest_an_undeliverable_sigalrm_is_a_loss_and_stops_the_guest() {
+    use std::os::unix::process::CommandExt;
+    let _guard = hermit_run_guard();
+    let guest = sigalrm_fixture("liteinst_sigalrm_delivery_lost");
+    let mut command = liteinst_command("info");
+    command
+        .arg("--verify")
+        .arg("--env=REVERIE_LITEINST_SITE_PATCHING=0")
+        .arg("--env=REVERIE_LITEINST_SIGALRM_HANDLERS=1")
+        .arg("--")
+        .arg(&guest)
+        .stdin(Stdio::null());
+    // SAFETY: setrlimit is async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            let mut limit: libc::rlimit = std::mem::zeroed();
+            if libc::getrlimit(libc::RLIMIT_SIGPENDING, &mut limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            limit.rlim_cur = 0;
+            if libc::setrlimit(libc::RLIMIT_SIGPENDING, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        })
+    };
+    let output = command.output().expect("failed to run Hermit LiteInst");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stdout} {stderr}");
+    assert!(!stdout.contains("resumed"), "{stdout} {stderr}");
+    assert!(
+        stderr.contains("run 1: determinism loss recorded: process "),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Determinism verified"), "{stderr}");
+}
+
+/// Signal phase 1, step I4: with handlers admitted, an alarm expiry that is
+/// due at a syscall's completion runs the guest's SIGALRM handler. `alarm(1)`
+/// then `pause()`: the handler runs once, sees SIGALRM with si_code SI_KERNEL
+/// (128, what Linux reports for an alarm) and SIGALRM blocked inside it, pause
+/// returns EINTR and the mask is restored. A one-shot ITIMER_REAL that expires
+/// while SIGALRM is blocked runs nothing until sigprocmask unblocks it, and has
+/// run once when that call returns. The run is verified deterministic.
+#[test]
+fn liteinst_in_guest_sigalrm_handler_runs_at_syscall_completion() {
+    let _guard = hermit_run_guard();
+    let build_root = process_build_root("liteinst-sigalrm-delivery");
+    fs::create_dir_all(&build_root).expect("failed to create the SIGALRM guest directory");
+    let guest = build_root.join("sigalrm_delivery");
+    let compiled = Command::new("cc")
+        .args(["-O2", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/liteinst_sigalrm_delivery.c"),
+        )
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the SIGALRM guest");
+    assert!(compiled.status.success(), "{compiled:?}");
+    let output = liteinst_command("info")
+        .arg("--verify")
+        .arg("--env=REVERIE_LITEINST_SITE_PATCHING=0")
+        .arg("--env=REVERIE_LITEINST_SIGALRM_HANDLERS=1")
+        .arg("--")
+        .arg(&guest)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run Hermit LiteInst");
+    let output = assert_liteinst_in_guest_output(output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "install=0 errno=0\n\
+         pause=-1 errno=4 runs=1 signal=14 code=128 blocked_inside=1 blocked_after=0\n\
+         unblock: before=0 after=1 blocked_after=0\n"
+    );
+}
+
 /// In-guest LiteInst runs the Detcore Tool inside the guest, so the Tool must
 /// keep out of the guest's C library heap. Installing a SIGALRM handler makes
 /// Detcore list the kernel's descriptor table; listed with glibc's opendir,

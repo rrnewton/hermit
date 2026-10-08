@@ -25,6 +25,8 @@ pub(crate) use network_trace::received_descriptors;
 mod network_trace;
 pub(crate) mod robust_list;
 mod signal;
+/// The guest's virtual SIGALRM blocked bit (signal phase 1).
+pub(crate) use signal::virtual_sigalrm_blocked;
 pub(crate) mod socket_timestamp_ioctl;
 mod sysinfo;
 mod threads;

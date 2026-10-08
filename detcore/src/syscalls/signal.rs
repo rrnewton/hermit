@@ -220,6 +220,29 @@ where
     Ok((handled, mask & kernel_sigset_bit(libc::SIGALRM) != 0))
 }
 
+/// The guest's virtual SIGALRM blocked bit, read from the runtime (which
+/// answers the query from its virtual state).
+pub(crate) async fn virtual_sigalrm_blocked<G, T>(guest: &mut G) -> Result<bool, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let mut stack = guest.stack().await;
+    let mask = stack.reserve::<KernelSigset>();
+    let _stack_guard = stack.commit()?;
+    guest
+        .inject(
+            syscalls::RtSigprocmask::new()
+                .with_how(libc::SIG_BLOCK)
+                .with_set(None)
+                .with_oldset(Some(mask.cast()))
+                .with_sigsetsize(KERNEL_SIGSET_SIZE),
+        )
+        .await?;
+    let mask: KernelSigset = guest.memory().read_value(mask)?;
+    Ok(mask & kernel_sigset_bit(libc::SIGALRM) != 0)
+}
+
 /// Validate the entire action through the kernel before copying it privately.
 /// A partial `read_value` can fall back to ptrace for its final eight bytes,
 /// which would read through a protected page. SIGKILL accepts no new action,
@@ -648,6 +671,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let (handled, blocked) = virtual_sigalrm_state(guest).await?;
         sigalrm_refuses(guest, SigalrmControl::Publish { handled, blocked }).await;
         guest.thread_state_mut().sigalrm_handled = handled;
+        guest.thread_state_mut().sigalrm_blocked_published = blocked;
         Ok(())
     }
 
@@ -657,8 +681,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
     ) -> Result<(), Error> {
-        let (_, blocked) = virtual_sigalrm_state(guest).await?;
+        let blocked = virtual_sigalrm_blocked(guest).await?;
         sigalrm_refuses(guest, SigalrmControl::PublishBlocked(blocked)).await;
+        guest.thread_state_mut().sigalrm_blocked_published = blocked;
         Ok(())
     }
 
