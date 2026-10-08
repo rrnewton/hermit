@@ -1120,9 +1120,9 @@ mod tests {
     /// count its RR_COMPAT_EXPECTED guard held before ci/compat/corpus-rr.json
     /// was retired), each the replay cell of its row's own test, carrying the
     /// rr run type alone and none of the verify cell's settings, and select
-    /// only the 51 that record and replay: each of the other 88 stays enabled
-    /// with `ci: false` and the issue of the clock-read refusal that stops its
-    /// recording. A row moved into or out of the run type, a second test for a
+    /// the 137 that record and replay: the other 2 stay enabled with
+    /// `ci: false` and the issue of the replay divergence that fails them. A
+    /// row moved into or out of the run type, a second test for a
     /// program, the rr run type reaching a verify cell, or an unselected cell
     /// quietly reselected, fails here.
     #[test]
@@ -1162,14 +1162,14 @@ mod tests {
                     let reason = &replay["ci_disabled_reason"]["ptrace"];
                     assert_eq!(reason["result"], "replay-failure", "{id}");
                     assert_eq!(
-                        reason["evidence"], "https://github.com/rrnewton/hermit/issues/3519",
+                        reason["evidence"], "https://github.com/rrnewton/hermit/issues/3934",
                         "{id}"
                     );
                     refused += 1;
                 }
             }
         }
-        assert_eq!((gated, refused), (51, 88));
+        assert_eq!((gated, refused), (137, 2));
     }
 
     #[test]

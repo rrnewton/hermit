@@ -247,29 +247,19 @@ corpus:
           validate.sh): replay diverges at replayer/mod.rs:776 after a
           clean record
         rows: [strip, gprof, gcov]
-    # Measured red on 2026-10-02 with the release Hermit built from
-    # 97ae0ccef: through this bucket, and through the retired
-    # rrcompat.<program> command, where each exits 122 at its first clock
-    # read (81 at gettimeofday, 4 at clock_gettime, 3 at time).
+    # Measured red on 2026-10-08 at 27eab6dc, after record mode began
+    # recording clock reads: of the 88 rows that stopped at their first clock
+    # read on 2026-10-02, 86 now record and replay at canonical bitwise parity
+    # and these 2 diverge, make in 3 of 3 runs and node in 4 of 4.
     unselected:
       - result: replay-failure
-        evidence: https://github.com/rrnewton/hermit/issues/3519
+        evidence: https://github.com/rrnewton/hermit/issues/3934
         reason: >-
-          Record mode refuses every clock read (gettimeofday,
-          clock_gettime, time) as an unsupported syscall, and the recording
-          stops with exit status 122
-        rows:
-          [
-            addr2line, as, awk, bash, bc, bzip2, cal, c++filt, chmod, chrt,
-            cmp, column, comm, cp, cpp, cut, date, dc, dd, diff, egrep,
-            elfedit, env, expand, factor, fgrep, file, find, flock, fmt,
-            fold, gcc, git, grep, gzip, hexdump, iconv, install, java, join,
-            ld, logger, logname, lua-direct, make, mkdir, mkfifo, mv, nl, nm,
-            node, objcopy, objdump, od, paste, perl-direct, ptx, python3,
-            ranlib, readelf, rev, rm, rmdir, ruby, sed, seq, shuf, size,
-            sort, split, sqlite3, strings, tac, tar, taskset, tcl, tee,
-            touch, tr, tsort, tty, unexpand, uniq, xargs, xxd, xz, "yes", zstd
-          ]
+          The replay readmits a different backgrounded thread than the
+          recording did at the same scheduler turn: record mode's choice of
+          which completed external-I/O call to readmit depends on host timing
+          and is not recorded
+        rows: [make, node]
   # The strict run type (scripts/validate.rs --strict-compat-only): every row
   # of ci/compat/corpus-strict.json once more on ptrace, under --strict and
   # Hermit's strict --verify with none of the corpus's relaxations, so
