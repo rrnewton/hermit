@@ -1762,7 +1762,7 @@
       "disposition": "manifest-test",
       "path": "tests/c/sigsuspend_sibling_signal_wake.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
-      "why": "tests/c/sigsuspend_sibling_signal_wake.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and runs in blocking GitHub CI; it asserts that an rt_sigsuspend wait that an ignored SIGALRM or a default-ignored SIGCHLD reaches first ends only with a sibling thread's tgkill, with -1 and EINTR and one handler run on the waiting thread, so the scheduler must arm the waiting thread's rt_sigsuspend for the release barrier when a sibling's signal can wake it and await that thread's own report"
+      "why": "tests/c/sigsuspend_sibling_signal_wake.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and runs in blocking GitHub CI; it asserts that an rt_sigsuspend wait that an ignored SIGALRM or a default-ignored SIGCHLD reaches first ends only with a sibling thread's tgkill, with -1 and EINTR and one handler run on the waiting thread, so the scheduler must arm the waiting thread's rt_sigsuspend for the release barrier when a sibling's signal can wake it and await that thread's own report; four raw phases pass rt_sigsuspend a 64-bit mask word that a sibling rewrites before or while the waiter enters the call, and require that only a signal the installed mask admits ends the wait and that the run never hangs"
     },
     {
       "disposition": "manifest-test",
