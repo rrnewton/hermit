@@ -859,7 +859,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // config::tests::target_timeslice_syscalls_only_never_enters_the_legacy_form
     // (lane qemu-rcb, https://github.com/rrnewton/hermit/pull/3859) retains
     // all 996: 997.
-    ("test.regular_crates", 997),
+    // happens_before::tests::has_syscall_count_anchor_at_is_exact (detcore-model,
+    // https://github.com/rrnewton/hermit/issues/3877) retains all 997: 998.
+    ("test.regular_crates", 998),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1796,7 +1798,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // verify_digest_records_an_unobservable_recvmsg_and_keeps_the_kernel_result retains all 209: 210, re-listed. It starts no LiteInst guest, so test.cli_on_host selects it too.
     // liteinst_in_guest_programs::liteinst_in_guest_user_address_limit_queries_keep_the_guest_errno
     // retains all 210: 211, measured with cargo nextest list --profile ci.
-    ("test.cli", 211),
+    // happens_before_inert_spec_adds_no_per_syscall_scheduler_turns and
+    // happens_before_edge_reverses_two_processes_writes
+    // (https://github.com/rrnewton/hermit/issues/3877) retain all 211: 213.
+    ("test.cli", 213),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -1941,7 +1946,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the unobserved-digest verify test too: 171.
     // The user-address-limit errno test starts an in-guest LiteInst guest, so
     // it joins the exact-name filterset: 171, listed the same way.
-    ("test.cli_on_host", 171),
+    // The two happens-before tests (inert turn count, ordering edge) start no
+    // LiteInst guest, so the filterset is unchanged and the host twin selects
+    // both too: 173.
+    ("test.cli_on_host", 173),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 55),
@@ -2193,7 +2201,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the two review-fix tests listed there make 994.
     // The compare_io_buffers refusal test listed there retains all 995: 996.
     // The host twin selects the same detcore-model legacy-form test: 997.
-    ("test.regular_crates_on_host", 997),
+    // It selects the detcore-model checkpoint-filter test too: 998.
+    ("test.regular_crates_on_host", 998),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
