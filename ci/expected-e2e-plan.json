@@ -20715,6 +20715,2862 @@
       ],
       "test": "util-c/pmu-skid",
       "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "applications",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "python3"
+      ],
+      "test": "applications/timed-progress-bar",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "bin-c",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "bin-c/posix-timer-test",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/aio-refusal",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/append-pwrite",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/bind-getsockname",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/cachestat-refusal",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/child-subreaper-refusal",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/close-range-fds",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/copy-file-range-refusal",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/cwd-roundtrip",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/dbt-copied-tiocgpgrp",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/dbt-exec-failure",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/epoll-pwait2",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/epoll-readiness",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/eventfd-semantics",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/faccessat2-flags",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/fadvise-hints",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/fallocate-extents",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/fchmod-bits",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/fchmodat2-flags",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/fcntl-owner",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/file-backed-mmap",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/file-io-roundtrip",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/flock-lifecycle",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/fp-reduction-nondeterminism",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/fsync-durability",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/ftruncate-sparse",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/get-robust-list-child",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/getcpu",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/getitimer-determinism-probe",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/getrusage-self-accounting",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/getsockopt-null",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/hello-alarm",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/hello-nostdlib",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/hello-signals",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/inline-syscall-sites",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/inotify-watch",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/io-uring-ring-determinism",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/ioctl-fionread",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/ioctl-siocethtool",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/kcmp-refusal",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/keyctl-passthrough",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/linkat-flags",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/mce-kill-refusal",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/membarrier-query",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/memfd-create",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/meminfo-available-deterministic",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/meminfo-cached-deterministic",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/meminfo-free-deterministic",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/memorypress",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/mempolicy-default",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/mincore-residency",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/mixed-inline-and-libc-syscalls",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/mkdir-rmdir",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/mknod-special",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/mmap-layout-pointer-order",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/mmap-stress-determinism",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/msync-writeback",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/name-to-handle-at-eopnotsupp",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/name-to-handle-directory-eopnotsupp",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/name-to-handle-empty-path-eopnotsupp",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/name-to-handle-refusal",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/name-to-handle-regular-eopnotsupp",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/nanosleep-par",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/netlink-autobind-generic",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/netlink-autobind-route",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/netlink-autobind-usersock",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/netns-cookie-tcp4",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/netns-cookie-tcp6",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/netns-cookie-udp4",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/no-new-privs-refusal",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/o-tmpfile-anon",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/openat-flags",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/openat2-refusal",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/path-file-ops",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/pause-alarm-interrupt",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/periodic-setitimer-delivery",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/personality-domain",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/pidfd-open-self",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/pidfd-poll-self",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/pidfd-waitid-child",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/pipe-capacity",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/pipe-capacity-pin",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/pipe-ipc",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/pipe-multiwriter-ordering",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/pipe2-flags",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/poll-readiness",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/ppoll-readv",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/prctl-dumpable",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/prctl-option-policy",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/prctl-pdeathsig",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/pread64-nostdlib",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/preadv2-flags",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/print-memaddrs",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/proc-fd-link-aliases",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/proc-fdinfo",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/procfs-positioned-probe",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/ptrace-attach-eperm",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/ptrace-seize-eperm",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/pty-nr-count",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/racewrite-nostdlib",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/rcx-canonicalization",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/readdir-entries",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/record-lock",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/record-replay-file-state-regular-sink",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/record-replay-setsockopt",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/recvmsg-scm-rights-mmap",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/rename-ops",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/renameat2-flags",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/robust-list",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/sched-setattr-batch",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/sched-setattr-idle",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/sched-setattr-other",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/seccomp-refusal",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/sendfile-copy",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/session-identity",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/set-tid-address",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/setitimer-determinism",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/short-io-split-identity",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/shutdown-socketpair",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/signalfd-create",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/so-incoming-cpu-udp4",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/socket-cookie-tcp",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/socket-cookie-udp",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/socket-cookie-unix",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/socket-options",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/socket-timestamp-edge-cases",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/socket-timestamp-timespec",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/socket-timestamp-timeval",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/socketpair-flags",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/sockname-unnamed",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/stat-metadata-identity",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/statfs-free-determinism",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/static-nolibc-syscall-sites",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/statx-metadata",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/symlink-ops",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/sync-file-range",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/syscall-quick-wins",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/sysinfo",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/sysv-ipc-refusal",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/thp-disable",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/timer-create-determinism",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/umask-mode",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/uname",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/uname-identity",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/unix-autobind-dgram",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/unix-autobind-seqpacket",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/unix-autobind-stream",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/utimensat-determinism",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/vectored-file-io",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/vectored-io",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/vforkexec",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/wait-on-child",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "debugger-c",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "debugger-c/debuggee",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "determinism-stress-c",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "determinism-stress-c/fork-tree",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "determinism-stress-c",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "determinism-stress-c/mmap-fork-shared",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "determinism-stress-c",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "determinism-stress-c/pipe-chain",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "determinism-stress-c",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "determinism-stress-c/pipe-prefill",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "language-runtimes",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "rustc"
+      ],
+      "test": "language-runtimes/rust-hashmap-iteration",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "shared-futex-c",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "shared-futex-c/qemu-hello",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "system-utils",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "du"
+      ],
+      "test": "system-utils/du-tree-summary",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "system-utils",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "system-utils/errno-path-identity",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "system-utils",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "system-utils/file-timestamp-identity",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "system-utils",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "find"
+      ],
+      "test": "system-utils/find-tree-metadata",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "system-utils",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "system-utils/record-getpid",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "system-utils",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "system-utils/shm-coherency-identity",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "system-utils",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "system-utils/startup-tls-guards",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "util-c",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "util-c/pmu-skid",
+      "timeout_seconds": 57
     }
   ],
   "schema": 1

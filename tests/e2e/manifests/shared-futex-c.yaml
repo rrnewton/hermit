@@ -99,11 +99,12 @@ test:
         ci:
           ptrace: true
           kvm: true
+          dbt: true
         backends_enabled:
           - ptrace
           - kvm
+          - dbt
         backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         expected_guest_exit:
