@@ -15037,7 +15037,8 @@ fn verdict_refusals(
         );
     }
     // A DELIBERATE, NARROW EXCEPTION (https://github.com/rrnewton/hermit/issues/3915):
-    // a label selection of envelope-only or qemu-l2-only whose every planned
+    // a label selection of envelope-only or qemu-l2-only, or the hosted CI
+    // preflight's hosted-portable --selected selection, whose every planned
     // node is declared test-free and passed (declared_test_free_selection)
     // measures zero by design, and is the only zero accepted here. Its ledger row still has executed_tests 0 and a
     // non-full profile, which the qualifying-receipt predicate refuses
@@ -16412,6 +16413,16 @@ fn test_free_selection_verdict_bracket() -> Result<(), String> {
         ("full", "selected", "full --selected gate.manifest"),
         ("full", "full", "a full plan reduced to its preflight"),
         (
+            "hosted-portable",
+            "label",
+            "a hosted-portable label run reduced to its preflight",
+        ),
+        (
+            "hosted-portable",
+            "only",
+            "a hosted-portable profile outside --selected",
+        ),
+        (
             "envelope-only",
             "only",
             "an envelope-only profile outside label selection",
@@ -16449,6 +16460,43 @@ fn test_free_selection_verdict_bracket() -> Result<(), String> {
                 "test-free verdict: a label selection of {profile} made of declared nodes must pass, got exit {exit}"
             ));
         }
+    // The hosted CI preflight (`ci/run-node.sh portable <preflight_nodes>`:
+    // `--hosted-portable-only --selected`) of the five declared nodes passes.
+    let counts = derive_run_counts(
+        &preflight_outcomes,
+        &[],
+        None,
+        None,
+        (TEST_FREE_SELECTED_PROFILE, "selected"),
+        &preflight_tags,
+        real,
+    );
+    let exit = exit_code_with_verdict_refusals(0, &run_verdict_refusals(None, 0, &counts));
+    if !counts.test_free_selection || exit != 0 {
+        return Err(format!(
+            "test-free verdict: the hosted preflight (hosted-portable --selected) of the declared nodes must pass, got exit {exit}"
+        ));
+    }
+    // ... but not with an undeclared, uncounted node beside them.
+    let mut with_test = preflight_tags.clone();
+    with_test.insert("test.unit".to_string());
+    let mut with_test_outcomes = preflight_outcomes.clone();
+    with_test_outcomes.push(passed("test.unit", None));
+    let counts = derive_run_counts(
+        &with_test_outcomes,
+        &[],
+        None,
+        None,
+        (TEST_FREE_SELECTED_PROFILE, "selected"),
+        &with_test,
+        real,
+    );
+    let exit = exit_code_with_verdict_refusals(0, &run_verdict_refusals(None, 0, &counts));
+    if counts.test_free_selection || exit != NO_RESULT_EXIT_CODE as u8 {
+        return Err(format!(
+            "test-free verdict: a hosted --selected run with an uncounted test node must stay refused (exit {NO_RESULT_EXIT_CODE}), got exit {exit}"
+        ));
+    }
     }
 
     // The exception lifts only the zero-count refusal.
@@ -21911,22 +21959,33 @@ fn with_declared_test_free_zeroes(
 /// (https://github.com/rrnewton/hermit/issues/3915).
 const TEST_FREE_PROFILES: [&str; 2] = ["envelope-only", "qemu-l2-only"];
 
+/// The profile whose `--selected` selections may be wholly test-free by
+/// design: GitHub CI's hosted preflight job runs
+/// `ci/run-node.sh portable <preflight_nodes>`, which is
+/// `--hosted-portable-only --selected <nodes>` over the five declared
+/// test-free preflight nodes. Its ledger row has a non-full profile and
+/// executed_tests 0, which the qualifying-receipt predicate refuses
+/// (profile "full", executed_tests_min 1), so it is never landing evidence.
+const TEST_FREE_SELECTED_PROFILE: &str = "hosted-portable";
+
 /// Whether a measured zero is the declared shape of this selection rather than
 /// a vacuous run (https://github.com/rrnewton/hermit/issues/3915). True only
-/// for a LABEL selection of one of TEST_FREE_PROFILES, with no compatibility
-/// matrix and a nonempty plan, whose EVERY planned node is declared test-free and
-/// passed. The profile and selection-mode conjuncts matter: `--selective` when
-/// the selector skips, `--only full gate.manifest` and
-/// `full --selected gate.manifest` all plan only the five declared preflight
-/// nodes, and must keep the zero-test refusal.
+/// for a LABEL selection of one of TEST_FREE_PROFILES, or a `--selected`
+/// selection of TEST_FREE_SELECTED_PROFILE (the hosted CI preflight), with no
+/// compatibility matrix and a nonempty plan, whose EVERY planned node is
+/// declared test-free and passed. The profile and selection-mode conjuncts
+/// matter: `--selective` when the selector skips, `--only full gate.manifest`,
+/// `full --selected gate.manifest` and a hosted-portable label run reduced to
+/// its preflight all plan only the five declared preflight nodes, and must
+/// keep the zero-test refusal.
 fn declared_test_free_selection(
     shape: &SelectionShape<'_>,
     planned_tags: &BTreeSet<String>,
     outcomes: &[StepOutcome],
     declared: impl Fn(&str) -> bool,
 ) -> bool {
-    TEST_FREE_PROFILES.contains(&shape.profile)
-        && shape.selection_mode == "label"
+    ((TEST_FREE_PROFILES.contains(&shape.profile) && shape.selection_mode == "label")
+        || (shape.profile == TEST_FREE_SELECTED_PROFILE && shape.selection_mode == "selected"))
         && !shape.compat_selected
         && !planned_tags.is_empty()
         && planned_tags.iter().all(|tag| {
