@@ -133,7 +133,7 @@ rest are experimental or specialized. If you are just getting started, use the
 default and skip the rest of this section. See [Architecture](#architecture)
 for how a backend fits into the whole system.
 
-Hermit accepts `--backend=ptrace|dbt|liteinst|sabre|kvm|e9patch` as a global
+Hermit accepts `--backend=ptrace|dbt|liteinst|in-guest-trap|sabre|kvm|e9patch` as a global
 option before the subcommand. Backend scope is command-specific: every backend
 supports `run`; KVM also supports `analyze` and `bisect`, which launch `run`
 trials; e9patch also supports `record`, and SaBRe also supports `strace`;
@@ -173,6 +173,22 @@ set-user-ID or non-x86-64 programs, programs with a `DT_PREINIT_ARRAY`, and
 anything other than a regular file. A guest may `fork`, and `vfork` runs as a copying fork; creating
 a thread and `exec` are not supported yet. The default Hermit namespace path is
 supported; `--no-namespace` remains an explicit option for trusted guests.
+
+`--backend=in-guest-trap` is the same in-guest runtime with syscall site
+patching off: no syscall site is rewritten, and every trapped syscall reaches
+Detcore through the seccomp `SIGSYS` fallback. Hermit sets
+`REVERIE_LITEINST_SITE_PATCHING=0` in the guest's environment itself and refuses
+(exit 122) a run whose environment sets that variable to anything else; select
+`--backend=liteinst` to patch syscall sites. Because a constructor of one of the
+program's own shared libraries runs before the runtime's and could change that
+variable, every guest process image also compares the settings its runtime
+actually captured (site patching off, statistics collected) with Hermit's
+request, which reaches it over the coordinator connection, and refuses to run
+the program when they differ; and Hermit refuses (exit 122) any in-guest-trap
+run whose LiteInst statistics report a patched or candidate site, or that no
+guest process reported. It has the same feature, prerequisites and refusals as `liteinst`, and its
+run summary's dispatch record is named `in-guest-trap` and reports no patched
+site.
 
 The `dbt`, `sabre`, and `e9patch` selections require optional CLI features as
 well as runtime resources. Build both with:
