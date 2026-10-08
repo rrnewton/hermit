@@ -1190,7 +1190,34 @@ fi
 # re-entrant RDTSC refused); no file under reverie-dbt, the root Cargo.toml, third-party or rust-toolchain.toml
 # changes, so the four budget inputs are unchanged. Carry, not recalibration:
 # no new timing sample or >=5-sample replacement claim is made.
-expected_pin=23ca5355678059c7acd598d3a989af7143885947
+# CARRY TO 7e3dda49c47a90fe817586ad58382be74cb34df3 (2026-10-08): from
+# 23ca5355678059c7acd598d3a989af7143885947. The five commits change reverie-ptrace (the
+# fatal-signal tests run under a hard core limit of 0; a test fixture's core
+# limit), experimental/reverie-sabre (a pre-plugin resource-limit read) and
+# reverie-dbt/build.rs, which IS an input to the DynamoRIO SDK recipe key:
+# blob e05db6238bf07c96d8a850c5635a8c48590f20b7 -> ff1eeb32b140ae477894126af21296723c1ba582
+# (https://github.com/rrnewton/reverie/pull/969 and https://github.com/rrnewton/reverie/pull/974). Every
+# other key input is unchanged by git object id: reverie-dbt/vendor/dynamorio is tree
+# 117d54d744df23921c531d0fe08537249f5a510a, reverie-dbt/Cargo.toml is blob
+# 0e24d047d544a3daae2d6350270b26ceb74139d1, native/CMakeLists.txt is blob
+# bcfb298a4f87ed190d7fdc52393e01d1245a8fe3, third-party is tree
+# fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a, the root Cargo.toml is blob
+# 395eddb164895c7c59ff7db11d0a6105d0c69d30 and rust-toolchain.toml is blob
+# b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9. The build.rs change does not change
+# what is built: it adds -ffile-prefix-map/-fdebug-prefix-map for the staging
+# and source directories and a SOURCE_DATE_EPOCH (default 0) to the configure
+# and build environment, so the install no longer depends on the build path.
+# Measured, not argued: 3+3 cold builds (fresh target dir, cache MISS then
+# PUBLISHED), alternating, jobs=16, on one development host:
+#   old key f85df40daa25: 13.98s, 13.77s, 13.30s (223.70, 220.25, 212.75 job-seconds)
+#   new key c941bff007f8: 13.24s, 13.10s, 13.10s (211.92, 209.62, 209.62 job-seconds)
+# Both installs hold the same 109 files. Across target directories the new
+# install's executables and shared libraries are byte-identical, where 46 files
+# differed at the old pin; 18 static archives and the two install-provenance
+# files still differ. Carry, not recalibration: these samples sit far below
+# the 1050 effective-job-second threshold and make no >=5-sample replacement
+# claim.
+expected_pin=7e3dda49c47a90fe817586ad58382be74cb34df3
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
