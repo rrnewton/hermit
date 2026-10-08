@@ -3788,6 +3788,29 @@ pub enum SigalrmControl {
     /// admission. Never refused: a SIGALRM already due is recorded as a
     /// determinism loss (design closure 1).
     UnadmittedStdioIo,
+    /// Before a guest SIGALRM handler is installed in the caller's process
+    /// (phase 1 step I3, design section 6): refused once any guest armed a
+    /// kernel producer of SIGALRM, anywhere in the run.
+    InstallHandler,
+    /// Before the caller's process changes its SIGALRM handler to `SIG_DFL`:
+    /// refused while the process has a pending entry, which would take the
+    /// default action inside the callback (design section 6).
+    HandlerToDefault,
+    /// Whether the caller's process has a pending entry, for `rt_sigpending`
+    /// ("refused" is true when it has one). Never changes anything.
+    PendingEntry,
+    /// Records the caller's process's SIGALRM disposition and the caller's
+    /// "SIGALRM virtually blocked" bit, after its runtime changed them inside
+    /// this turn. Never refused.
+    Publish {
+        /// Whether the process's SIGALRM disposition is a guest handler.
+        handled: bool,
+        /// Whether the caller's virtual mask blocks SIGALRM.
+        blocked: bool,
+    },
+    /// Records the caller's "SIGALRM virtually blocked" bit, after its runtime
+    /// changed its mask inside this turn. Never refused.
+    PublishBlocked(bool),
 }
 
 /// Messages to the global object.

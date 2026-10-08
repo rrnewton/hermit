@@ -24,6 +24,7 @@ use reverie::syscalls::Timespec;
 use tracing::info;
 
 use crate::Detcore;
+use crate::fd::FdType;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
@@ -32,6 +33,7 @@ use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::syscalls::threads::KERNEL_SIGSET_SIZE;
 use crate::syscalls::threads::KernelSigaction;
 use crate::syscalls::threads::KernelSigset;
+use crate::syscalls::threads::kernel_sigset_bit;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::SigalrmControl;
 use crate::tool_global::alarm_remaining;
@@ -40,6 +42,7 @@ use crate::tool_global::refuse_sigalrm;
 use crate::tool_global::register_alarm;
 use crate::tool_global::resolve_kill_targets;
 use crate::tool_global::resource_request;
+use crate::tool_global::sigalrm_refuses;
 use crate::tool_global::thread_observe_time;
 use crate::types::DetPid;
 use crate::types::DetTid;
@@ -170,6 +173,43 @@ where
         }
     }
     Ok(guest.memory().read_value(address.cast())?)
+}
+
+/// Signal phase 1: the guest's SIGALRM disposition (a guest handler or not)
+/// and SIGALRM blocked bit, as its runtime keeps them virtual, read back with
+/// a query `rt_sigaction` and `rt_sigprocmask` that the runtime answers from
+/// its virtual state.
+async fn virtual_sigalrm_state<G, T>(guest: &mut G) -> Result<(bool, bool), Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let mut stack = guest.stack().await;
+    let action = stack.reserve::<KernelSigaction>();
+    let mask = stack.reserve::<KernelSigset>();
+    let _stack_guard = stack.commit()?;
+    guest
+        .inject(
+            syscalls::RtSigaction::new()
+                .with_signum(libc::SIGALRM)
+                .with_action(None)
+                .with_old_action(Some(action.cast()))
+                .with_sigsetsize(KERNEL_SIGSET_SIZE),
+        )
+        .await?;
+    guest
+        .inject(
+            syscalls::RtSigprocmask::new()
+                .with_how(libc::SIG_BLOCK)
+                .with_set(None)
+                .with_oldset(Some(mask.cast()))
+                .with_sigsetsize(KERNEL_SIGSET_SIZE),
+        )
+        .await?;
+    let action: KernelSigaction = guest.memory().read_value(action)?;
+    let mask: KernelSigset = guest.memory().read_value(mask)?;
+    let handled = action.handler != libc::SIG_DFL as u64 && action.handler != libc::SIG_IGN as u64;
+    Ok((handled, mask & kernel_sigset_bit(libc::SIGALRM) != 0))
 }
 
 /// Validate the entire action through the kernel before copying it privately.
@@ -507,7 +547,25 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             return Ok(0);
         }
-        Ok(if let Some(kernel_action) = kernel_action {
+        // Signal phase 1 (step I3): on a backend that keeps a handled SIGALRM
+        // virtual, the scheduler's ledger must agree with the runtime.
+        let phase1 = self.cfg.backend.virtualizes_guest_sigalrm
+            && call.signum() == libc::SIGALRM
+            && kernel_action.is_some();
+        let was_handled = guest.thread_state().sigalrm_handled;
+        let to_handler = kernel_action.is_some_and(|action| {
+            action.handler != libc::SIG_DFL as u64 && action.handler != libc::SIG_IGN as u64
+        });
+        if phase1 {
+            if to_handler {
+                self.refuse_sigalrm_handler(guest).await?;
+            } else if was_handled
+                && kernel_action.is_some_and(|action| action.handler == libc::SIG_DFL as u64)
+            {
+                refuse_sigalrm(guest, SigalrmControl::HandlerToDefault).await?;
+            }
+        }
+        let result = if let Some(kernel_action) = kernel_action {
             // The kernel treats `action` as input. Sanitize a private copy instead
             // of writing through the guest pointer: the input may be read-only,
             // and changing it would make the syscall wrapper observable.
@@ -518,10 +576,67 @@ impl<T: RecordOrReplay> Detcore<T> {
             let _stack_guard = stack.commit()?;
             guest
                 .inject(call.with_action(Some(sanitized_action.cast())))
-                .await?
+                .await
         } else {
-            guest.inject(call).await?
-        })
+            guest.inject(call).await
+        };
+        // Publish the state the runtime now holds whenever the disposition may
+        // have changed: from a handler, or to one the runtime did not refuse.
+        // Any result counts, since an EFAULT copying the old action out comes
+        // after the change. A default or ignored action set while none is
+        // handled changes nothing the scheduler records, so it costs nothing.
+        if phase1 && (was_handled || (to_handler && result != Err(Errno::EPERM))) {
+            self.publish_virtual_sigalrm(guest).await?;
+        }
+        Ok(result?)
+    }
+
+    /// Signal phase 1's Detcore-side refusals of a new guest SIGALRM handler,
+    /// each EPERM before anything changes (design section 6 and closure 5):
+    /// threads not sequentialized (`alarm` would arm a kernel timer), a
+    /// signalfd in the process's descriptor table, and a kernel producer of
+    /// SIGALRM armed anywhere in the run.
+    async fn refuse_sigalrm_handler<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
+        if !guest.config().sequentialize_threads {
+            return Err(Errno::EPERM.into());
+        }
+        // The model's own signalfds, and any the kernel's table holds that
+        // the model labels otherwise (an inherited descriptor).
+        let holds_signalfd = guest
+            .thread_state()
+            .file_metadata
+            .lock()
+            .expect("file metadata mutex poisoned")
+            .file_handles
+            .values()
+            .any(|fd| fd.ty() == FdType::Signalfd)
+            || crate::sigalrm_phase1::process_holds_signalfd(guest.pid().as_raw());
+        if holds_signalfd {
+            return Err(Errno::EPERM.into());
+        }
+        Ok(refuse_sigalrm(guest, SigalrmControl::InstallHandler).await?)
+    }
+
+    /// Read the guest's SIGALRM disposition and blocked bit back from the
+    /// runtime (which answers these queries from its virtual state), then
+    /// publish them to the scheduler and record the disposition in the thread
+    /// state, inside this call's turn.
+    async fn publish_virtual_sigalrm<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
+        let (handled, blocked) = virtual_sigalrm_state(guest).await?;
+        sigalrm_refuses(guest, SigalrmControl::Publish { handled, blocked }).await;
+        guest.thread_state_mut().sigalrm_handled = handled;
+        Ok(())
+    }
+
+    /// After a guest call that may have changed its virtual mask in a process
+    /// that handles SIGALRM, publish its SIGALRM blocked bit.
+    async fn publish_virtual_sigalrm_blocked<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Result<(), Error> {
+        let (_, blocked) = virtual_sigalrm_state(guest).await?;
+        sigalrm_refuses(guest, SigalrmControl::PublishBlocked(blocked)).await;
+        Ok(())
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -535,6 +650,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         // The kernel checks sigsetsize before copying from either user pointer.
         validate_kernel_sigset_size(call.sigsetsize())?;
 
+        let result = self.rt_sigprocmask_inner(guest, call).await;
+        if self.cfg.backend.virtualizes_guest_sigalrm && guest.thread_state().sigalrm_handled {
+            // Signal phase 1: the scheduler's blocked bit follows the virtual
+            // mask, whatever the call returned (an EFAULT copying the old set
+            // out comes after the change).
+            self.publish_virtual_sigalrm_blocked(guest).await?;
+        }
+        result
+    }
+
+    async fn rt_sigprocmask_inner<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::RtSigprocmask,
+    ) -> Result<i64, Error> {
         if call.how() != libc::SIG_BLOCK && call.how() != libc::SIG_SETMASK {
             Ok(guest.inject_with_retry(call).await?)
         } else if let Some(set) = call.set() {
@@ -882,6 +1012,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::RtSigpending,
     ) -> Result<i64, Error> {
+        // Signal phase 1 refuses rt_sigpending in a process that handles
+        // SIGALRM (`sigalrm_phase1`), so the ledger's entry never needs to be
+        // shown here.
         Ok(self.record_or_replay(guest, call).await?)
     }
 }

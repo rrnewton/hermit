@@ -5893,13 +5893,16 @@ mod tests {
     /// refusal (Reverie d78f770f), `failed_gettimeofday_may_store_host_time`
     /// the guest's storable-memory report (Reverie 8bfb450e) and
     /// `user_address_limit` the guest's user address limit query (Reverie
-    /// 6f75cc4c). Three fields are newer than that transcription:
+    /// 6f75cc4c). Four fields are newer than that transcription:
     /// `process_exits_complete_asynchronously` (Reverie 056c8cac), true only
     /// for in-guest LiteInst, whose process exits complete some time after the
     /// tool grants them, `supports_madv_dontneed` (Reverie 8d8697aa), true for
     /// every backend, and `reports_child_exit_publication` (Reverie 9cb6f7b7),
     /// true for ptrace and e9patch, whose tracer reports when the kernel
-    /// publishes a process's exit to its parent.
+    /// publishes a process's exit to its parent, and
+    /// `virtualizes_guest_sigalrm` (Reverie 7142ff8c), true only for in-guest
+    /// LiteInst, whose runtime keeps a guest SIGALRM handler virtual (signal
+    /// phase 1).
     fn golden_backend_capabilities(backend: Backend) -> serde_json::Value {
         let sabre = backend == Backend::Sabre;
         let kvm = backend == Backend::Kvm;
@@ -5916,6 +5919,7 @@ mod tests {
             "needs_killed_thread_rpc_cancellation": in_guest_liteinst || sabre || dbt || kvm,
             "reports_physical_process_exits": sabre,
             "process_exits_complete_asynchronously": in_guest_liteinst,
+            "virtualizes_guest_sigalrm": in_guest_liteinst,
             "signal_interrupts_external_syscalls": sabre,
             "tracks_process_children": !dbt,
             "runs_exit_robust_list": backend == Backend::Ptrace,

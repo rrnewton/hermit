@@ -1635,9 +1635,10 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// This inverts [`to_legacy_backend_json`] for every capability value the keys
 /// can express, which includes every backend's own constant except for
 /// capabilities added after the legacy form froze: those never enter it, as
-/// `record_host_inputs` does not, and read back as their default. The only one
-/// is `process_exits_complete_asynchronously`, true only for in-guest
-/// LiteInst, which never travels through this DBT-only form.
+/// `record_host_inputs` does not, and read back as their default. There are
+/// two, `process_exits_complete_asynchronously` and
+/// `virtualizes_guest_sigalrm`, both true only for in-guest LiteInst, which
+/// never travels through this DBT-only form.
 ///
 /// `kvm_shared_dequeue_timers` supplies no capability. It was read into a
 /// `Config` field that chose the controlled signal path, and that choice is
@@ -2360,6 +2361,7 @@ mod tests {
     /// [`process_exits_complete_asynchronously_never_enters_the_legacy_form`]).
     fn legacy_expressible(mut backend: BackendCapabilities) -> BackendCapabilities {
         backend.process_exits_complete_asynchronously = false;
+        backend.virtualizes_guest_sigalrm = false;
         backend
     }
 
@@ -2766,6 +2768,7 @@ mod tests {
             ..Config::default()
         };
         assert!(on.backend.process_exits_complete_asynchronously);
+        assert!(on.backend.virtualizes_guest_sigalrm);
         let off = Config {
             backend: legacy_expressible(on.backend),
             ..on.clone()
@@ -2776,8 +2779,10 @@ mod tests {
             !json.contains("process_exits_complete_asynchronously"),
             "{json}"
         );
+        assert!(!json.contains("virtualizes_guest_sigalrm"), "{json}");
         let decoded = from_legacy_backend_json(&json).unwrap();
         assert!(!decoded.backend.process_exits_complete_asynchronously);
+        assert!(!decoded.backend.virtualizes_guest_sigalrm);
         let array = positional(&json);
         assert!(
             !from_legacy_backend_json(&array)

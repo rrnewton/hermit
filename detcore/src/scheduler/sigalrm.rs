@@ -103,9 +103,6 @@ impl Scheduler {
     /// default discards a pending entry, as Linux discards a pending signal that
     /// becomes ignored. The runtime refuses the change to default while an
     /// entry is pending, so a default-acted signal is never discarded here.
-    // Called by the runtime's control messages, which arrive with its handler
-    // admission (phase 1 step I3); until then only tests call it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_sigalrm_handled(&mut self, process: DetPid, handled: bool) {
         if handled {
             self.sigalrm.handled.insert(process);
@@ -127,6 +124,53 @@ impl Scheduler {
     /// producer arming is refused, and a recurring `ITIMER_REAL` is refused in
     /// a handling process.
     pub(crate) fn sigalrm_control(&mut self, thread: DetTid, control: SigalrmControl) -> bool {
+        // The runtime's publications (phase 1 step I3) record what its
+        // runtime already changed inside the caller's turn; they hold whether
+        // or not any process handles SIGALRM yet.
+        let process = self.sigchld_process(thread);
+        match control {
+            SigalrmControl::Publish { handled, blocked } => {
+                self.set_sigalrm_handled(process, handled);
+                self.set_sigalrm_blocked(thread, blocked);
+                return false;
+            }
+            SigalrmControl::PublishBlocked(blocked) => {
+                self.set_sigalrm_blocked(thread, blocked);
+                return false;
+            }
+            _ => {}
+        }
+        // Its questions, like every other control, are refused to a caller
+        // without the serial grant while any process handles SIGALRM: the
+        // answer could race a commit. (A handling process is sequentialized,
+        // so its own calls hold the grant.)
+        if !self.sigalrm.handled.is_empty() && !self.holds_serial_grant(thread) {
+            return true;
+        }
+        match control {
+            SigalrmControl::InstallHandler => {
+                // Also refused while the caller's process has a recurring
+                // ITIMER_REAL armed: phase 1 does not model one in a handling
+                // process (it is refused once a handler exists, too).
+                let recurring = self
+                    .blocked
+                    .timed_waiters
+                    .alarm_state(process)
+                    .is_some_and(|(_, interval)| interval != crate::types::LogicalTime::ZERO);
+                let refused = self.sigalrm_producer_armed() || recurring;
+                if refused {
+                    info!(
+                        "[dtid {}] SIGALRM handler refused: a guest armed a kernel producer of SIGALRM, or its process has a recurring ITIMER_REAL (signal phase 1).",
+                        thread
+                    );
+                }
+                return refused;
+            }
+            SigalrmControl::HandlerToDefault | SigalrmControl::PendingEntry => {
+                return self.sigalrm.pending.contains(&process);
+            }
+            _ => {}
+        }
         if self.sigalrm.handled.is_empty() {
             if control == SigalrmControl::ArmProducer {
                 self.sigalrm.producer_armed = true;
@@ -151,7 +195,12 @@ impl Scheduler {
                 self.sigalrm.handled.contains(&self.sigchld_process(target))
             }
             SigalrmControl::SendToUnnamed | SigalrmControl::ArmProducer => true,
-            SigalrmControl::UnadmittedStdioIo => unreachable!("answered above"),
+            SigalrmControl::UnadmittedStdioIo
+            | SigalrmControl::InstallHandler
+            | SigalrmControl::HandlerToDefault
+            | SigalrmControl::PendingEntry
+            | SigalrmControl::Publish { .. }
+            | SigalrmControl::PublishBlocked(_) => unreachable!("answered above"),
             SigalrmControl::ArmRecurringTimer => {
                 self.sigalrm.handled.contains(&self.sigchld_process(thread))
             }
@@ -167,9 +216,6 @@ impl Scheduler {
 
     /// Whether any guest armed a kernel producer of SIGALRM; a handler
     /// installation is refused once one has.
-    // Read by the runtime's handler admission (phase 1 step I3); until then
-    // only tests call it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn sigalrm_producer_armed(&self) -> bool {
         self.sigalrm.producer_armed
     }
@@ -177,9 +223,6 @@ impl Scheduler {
     /// Records `thread`'s "SIGALRM virtually blocked" bit, published by its
     /// runtime inside the turn of the call that changed its mask (and at
     /// handler admission).
-    // Called by the runtime's control messages, which arrive with its handler
-    // admission (phase 1 step I3); until then only tests call it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_sigalrm_blocked(&mut self, thread: DetTid, blocked: bool) {
         self.sigalrm.blocked.insert(thread, blocked);
     }

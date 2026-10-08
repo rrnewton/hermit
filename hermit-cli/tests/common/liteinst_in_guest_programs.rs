@@ -449,6 +449,91 @@ fn liteinst_in_guest_heap_growth_avoids_trampoline_mappings() {
     );
 }
 
+/// Signal phase 1, step I3: with guest SIGALRM handlers admitted (and site
+/// patching off, as phase 1 requires), the guest's handler is installed
+/// virtually and Detcore learns of it: the phase 1 table then refuses a
+/// socket, a fork and rt_sigpending with EOPNOTSUPP; an expiry while SIGALRM
+/// is blocked is held in the scheduler's ledger, so a change to SIG_DFL is
+/// refused with EPERM; SIG_IGN then discards it and the socket succeeds. With
+/// handlers not admitted (the default), the installation is refused with
+/// EPERM as before and nothing changes. Both runs are verified deterministic.
+#[test]
+fn liteinst_in_guest_sigalrm_handler_is_virtual_and_published() {
+    let _guard = hermit_run_guard();
+    let build_root = process_build_root("liteinst-sigalrm");
+    fs::create_dir_all(&build_root).expect("failed to create the SIGALRM guest directory");
+    let guest = build_root.join("sigalrm_virtual_handler");
+    let compiled = Command::new("cc")
+        .args(["-O2", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/liteinst_sigalrm_virtual_handler.c"),
+        )
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the SIGALRM guest");
+    assert!(compiled.status.success(), "{compiled:?}");
+    for (admitted, expected) in [
+        (
+            "1",
+            "install=0 errno=0\nquery_is_handler=1\nsigpending=-1 errno=95\n\
+             socket=refused errno=95\nfork=refused errno=95\nto_default=-1 errno=1\n\
+             ignore=0\nsocket_after=ok errno=0\n",
+        ),
+        (
+            "0",
+            "install=-1 errno=1\nquery_is_handler=0\nsigpending=0 errno=0\n\
+             socket=ok errno=0\nfork=ok errno=0\nto_default=0 errno=0\n\
+             ignore=0\nsocket_after=ok errno=0\n",
+        ),
+    ] {
+        let output = liteinst_command("info")
+            .arg("--verify")
+            .arg("--env=REVERIE_LITEINST_SITE_PATCHING=0")
+            .arg(format!(
+                "--env=REVERIE_LITEINST_SIGALRM_HANDLERS={admitted}"
+            ))
+            .arg("--")
+            .arg(&guest)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run Hermit LiteInst");
+        let output = assert_liteinst_in_guest_output(output);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            expected,
+            "admitted={admitted}"
+        );
+    }
+    // A signalfd inherited on stdin (a run without --verify keeps the
+    // caller's stdin) refuses the handler although Detcore's model labels
+    // stdin a regular file: the run then behaves as with handlers not
+    // admitted.
+    let not_admitted = "install=-1 errno=1\nquery_is_handler=0\nsigpending=0 errno=0\n\
+                        socket=ok errno=0\nfork=ok errno=0\nto_default=0 errno=0\n\
+                        ignore=0\nsocket_after=ok errno=0\n";
+    let signalfd = {
+        use std::os::fd::FromRawFd;
+        let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe { libc::sigemptyset(&mut mask) };
+        unsafe { libc::sigaddset(&mut mask, libc::SIGUSR2) };
+        let raw = unsafe { libc::signalfd(-1, &mask, libc::SFD_CLOEXEC) };
+        assert!(raw >= 0, "signalfd: {}", std::io::Error::last_os_error());
+        unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) }
+    };
+    let output = liteinst_command("info")
+        .arg("--env=REVERIE_LITEINST_SITE_PATCHING=0")
+        .arg("--env=REVERIE_LITEINST_SIGALRM_HANDLERS=1")
+        .arg("--")
+        .arg(&guest)
+        .stdin(Stdio::from(signalfd))
+        .output()
+        .expect("failed to run Hermit LiteInst");
+    let output = assert_liteinst_in_guest_output(output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), not_admitted);
+}
+
 #[test]
 fn liteinst_in_guest_detcore_micro_suite() {
     let _guard = hermit_run_guard();

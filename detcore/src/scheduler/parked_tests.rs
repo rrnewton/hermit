@@ -4082,6 +4082,88 @@ fn a_sigalrm_handling_process_refuses_sends_to_it_and_every_producer() {
     assert!(s.sigalrm_control(handler, SigalrmControl::ArmRecurringTimer));
 }
 
+/// The runtime's publications (phase 1 step I3) record its process's
+/// disposition and its thread's blocked bit; a handler installation is
+/// refused once any producer was armed; a change to `SIG_DFL` is refused, and
+/// the pending question answered, by the process's own pending entry.
+#[test]
+fn the_runtimes_sigalrm_publications_and_questions() {
+    let mut s = liteinst_scheduler();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    let pid = DetPid::from_raw(100);
+    let (other, _, _) = add(&mut s, 200, 200);
+    assert!(!s.sigalrm_control(tid, SigalrmControl::InstallHandler));
+    assert!(!s.sigalrm_control(
+        tid,
+        SigalrmControl::Publish {
+            handled: true,
+            blocked: true
+        }
+    ));
+    assert!(s.sigalrm_handled(pid));
+    s.set_running_for_test(tid);
+    assert!(!s.sigalrm_control(tid, SigalrmControl::PendingEntry));
+    assert!(!s.sigalrm_control(tid, SigalrmControl::HandlerToDefault));
+    // Blocked: an expiry adds an entry that is not due.
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+    assert!(s.sigalrm_pending(pid));
+    assert!(s.sigalrm_control(tid, SigalrmControl::PendingEntry));
+    assert!(s.sigalrm_control(tid, SigalrmControl::HandlerToDefault));
+    assert!(!s.sigalrm_control(tid, SigalrmControl::PublishBlocked(false)));
+    // Another process has no entry of its own.
+    s.set_running_for_test(other);
+    assert!(!s.sigalrm_control(other, SigalrmControl::PendingEntry));
+    // Unhandled again: the entry is discarded with the disposition.
+    s.set_running_for_test(tid);
+    assert!(!s.sigalrm_control(
+        tid,
+        SigalrmControl::Publish {
+            handled: false,
+            blocked: false
+        }
+    ));
+    assert!(!s.sigalrm_handled(pid));
+    assert!(!s.sigalrm_pending(pid));
+    // A recurring ITIMER_REAL armed in the caller's process refuses a
+    // handler installation; a one-shot one does not, and neither does
+    // another process's recurring timer.
+    s.set_running_for_test(tid);
+    s.register_alarm(
+        pid,
+        tid,
+        LogicalTime::ZERO,
+        LogicalTime::from_secs(5),
+        LogicalTime::ZERO,
+        Signal::SIGALRM,
+    );
+    assert!(!s.sigalrm_control(tid, SigalrmControl::InstallHandler));
+    s.register_alarm(
+        pid,
+        tid,
+        LogicalTime::ZERO,
+        LogicalTime::from_secs(5),
+        LogicalTime::from_secs(1),
+        Signal::SIGALRM,
+    );
+    assert!(s.sigalrm_control(tid, SigalrmControl::InstallHandler));
+    s.set_running_for_test(other);
+    assert!(!s.sigalrm_control(other, SigalrmControl::InstallHandler));
+    s.set_running_for_test(tid);
+    s.register_alarm(
+        pid,
+        tid,
+        LogicalTime::ZERO,
+        LogicalTime::ZERO,
+        LogicalTime::ZERO,
+        Signal::SIGALRM,
+    );
+    assert!(!s.sigalrm_control(tid, SigalrmControl::InstallHandler));
+    // A producer armed while nothing is handled is recorded, and from then
+    // on every handler installation is refused.
+    assert!(!s.sigalrm_control(other, SigalrmControl::ArmProducer));
+    assert!(s.sigalrm_control(tid, SigalrmControl::InstallHandler));
+}
+
 /// While a process handles SIGALRM, a sender that does not hold the serial
 /// grant is refused whatever it asks: its question could race a commit.
 #[test]

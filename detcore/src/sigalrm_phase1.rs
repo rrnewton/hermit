@@ -146,6 +146,25 @@ pub(crate) fn kernel_provenance(pid: i32, fd: i32) -> Phase1Provenance {
     provenance_from(statfs_type(&link), mount, resolved.as_deref())
 }
 
+/// Whether a `/proc/<pid>/fd/<fd>` link target names a signalfd.
+pub(crate) fn link_is_signalfd(target: &Path) -> bool {
+    target.as_os_str() == "anon_inode:[signalfd]"
+}
+
+/// Whether process `pid` holds a signalfd, from the kernel's own descriptor
+/// table (`/proc/<pid>/fd`), so an inherited one counts whatever Detcore's
+/// model calls it. A table that cannot be read counts as holding one.
+pub(crate) fn process_holds_signalfd(pid: i32) -> bool {
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return true;
+    };
+    entries.into_iter().any(|entry| {
+        entry.map_or(true, |entry| {
+            std::fs::read_link(entry.path()).is_ok_and(|target| link_is_signalfd(&target))
+        })
+    })
+}
+
 /// [`kernel_provenance`] from its kernel facts: the file system type, the
 /// mount's root and mount point, and the resolved path.
 fn provenance_from(
@@ -431,6 +450,29 @@ mod tests {
         let mut names: Vec<_> = list.iter().map(|sysno| sysno.name()).collect();
         names.sort_unstable();
         names
+    }
+
+    /// The kernel's descriptor table, not the model, decides whether the
+    /// process holds a signalfd: one created here is found by its link.
+    #[test]
+    fn a_signalfd_in_the_kernels_table_is_found() {
+        use std::os::fd::FromRawFd;
+        use std::os::fd::OwnedFd;
+        assert!(link_is_signalfd(Path::new("anon_inode:[signalfd]")));
+        assert!(!link_is_signalfd(Path::new("anon_inode:[eventfd]")));
+        assert!(!link_is_signalfd(Path::new("/dev/null")));
+        let pid = std::process::id() as i32;
+        let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe { libc::sigemptyset(&mut mask) };
+        unsafe { libc::sigaddset(&mut mask, libc::SIGUSR2) };
+        let raw = unsafe { libc::signalfd(-1, &mask, libc::SFD_CLOEXEC) };
+        assert!(raw >= 0);
+        let signalfd = unsafe { OwnedFd::from_raw_fd(raw) };
+        assert!(process_holds_signalfd(pid));
+        drop(signalfd);
+        // No longer necessarily false: the test binary may hold another; so
+        // check only that a process without a readable table counts as one.
+        assert!(process_holds_signalfd(-1));
     }
 
     /// The table's exact membership is pinned, and every syscall outside it is
