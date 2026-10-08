@@ -14,7 +14,7 @@
 //        inode_identity_views stdio-getdents > DIR
 //        inode_identity_views stdout-alias-maps PATH 1<> PATH
 //        inode_identity_views stdout-pipe-links | READER
-//        inode_identity_views listed-inodes DIR
+//        inode_identity_views listed-inodes DIR [FD]
 //
 // Detcore keys its deterministic inodes on a raw device and inode together
 // (https://github.com/rrnewton/hermit/issues/3307). Every interface that
@@ -120,14 +120,20 @@
 //   goes to stderr, on a line beginning "stdout-pipe-links ": one field per
 //   view, "agrees" or "differs".
 //
-// listed-inodes DIR
-//   Lists DIR with getdents64 and prints one line per entry, "NAME D_INO", in
-//   the order the call returns them. Every entry other than "." and ".." must
-//   report the st_ino fstatat (AT_SYMLINK_NOFOLLOW) reports for its name
-//   relative to DIR. The program calls neither fstatfs nor statx itself, so
-//   the owning test can start Hermit under a seccomp filter that refuses a
-//   call Detcore may inject to choose how it numbers the entries, and compare
-//   what each run lists.
+// listed-inodes DIR [FD]
+//   Prints "pid PID", opens DIR (and, given FD, moves that descriptor to FD),
+//   prints "directory descriptor FD" and flushes stdout, then lists DIR
+//   through that descriptor with getdents64 and prints one line per entry,
+//   "NAME D_INO", in the order the call returns them, and flushes stdout
+//   again after the last. Every entry other than "." and ".." must report the
+//   st_ino fstatat (AT_SYMLINK_NOFOLLOW) reports for its name relative to DIR.
+//   Then it prints "maps descriptor FD" for /proc/self/maps and each line of
+//   that file prefixed "maps ". The program calls neither fstatfs nor statx
+//   itself and makes no lstat with AT_NO_AUTOMOUNT, so the owning test can
+//   start Hermit under a seccomp filter aimed at the lstat Detcore injects for
+//   each listed entry and compare what each run prints, or see where a run
+//   that ended early stopped. An FD no other code uses
+//   lets a filter rule match calls on the listed directory alone.
 
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -1136,9 +1142,20 @@ static int stdout_pipe_links(void) {
 // ---------------------------------------------------------------------------
 // listed-inodes
 
-static int listed_inodes(const char* path) {
+static int listed_inodes(const char* path, const char* descriptor) {
+  printf("pid %ld\n", (long)getpid());
   int directory = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   CHECK(directory >= 0);
+  if (descriptor != NULL) {
+    char* end = NULL;
+    long wanted = strtol(descriptor, &end, 10);
+    CHECK(*descriptor != '\0' && *end == '\0' && wanted > 2 && wanted < 1024);
+    CHECK(dup3(directory, (int)wanted, O_CLOEXEC) == wanted);
+    CHECK(close(directory) == 0);
+    directory = (int)wanted;
+  }
+  printf("directory descriptor %d\n", directory);
+  CHECK(fflush(stdout) == 0);
   char buffer[4096] __attribute__((aligned(8)));
   for (;;) {
     long count = syscall(SYS_getdents64, directory, buffer, sizeof(buffer));
@@ -1168,7 +1185,16 @@ static int listed_inodes(const char* path) {
       offset += entry->d_reclen;
     }
   }
+  CHECK(fflush(stdout) == 0);
   CHECK(close(directory) == 0);
+  FILE* maps = fopen("/proc/self/maps", "re");
+  CHECK(maps != NULL);
+  printf("maps descriptor %d\n", fileno(maps));
+  char line[4096];
+  while (fgets(line, sizeof(line), maps) != NULL) {
+    printf("maps %s", line);
+  }
+  CHECK(fclose(maps) == 0);
   return 0;
 }
 
@@ -1197,14 +1223,14 @@ int main(int argc, char** argv) {
   if (argc == 2 && strcmp(argv[1], "stdout-pipe-links") == 0) {
     return stdout_pipe_links();
   }
-  if (argc == 3 && strcmp(argv[1], "listed-inodes") == 0) {
-    return listed_inodes(argv[2]);
+  if ((argc == 3 || argc == 4) && strcmp(argv[1], "listed-inodes") == 0) {
+    return listed_inodes(argv[2], argc == 4 ? argv[3] : NULL);
   }
   fprintf(
       stderr,
       "usage: %s scm-getdents DIR | maps-stat [DIR] | maps-stat-full-table | "
       "proc-fd-links | stdio-mmap-sentinel | stdio-getdents | "
-      "stdout-alias-maps PATH | stdout-pipe-links | listed-inodes DIR\n",
+      "stdout-alias-maps PATH | stdout-pipe-links | listed-inodes DIR [FD]\n",
       argv[0]);
   return 2;
 }

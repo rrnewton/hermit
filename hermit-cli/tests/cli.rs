@@ -59,6 +59,11 @@ mod liteinst_in_guest_programs;
 #[path = "common/inode_identity_views.rs"]
 mod inode_identity_views;
 
+// Seccomp filters a test installs in the process that becomes Hermit; shared
+// with the procfs_determinism binary.
+#[path = "common/inherited_seccomp.rs"]
+mod inherited_seccomp;
+
 #[path = "common/readonly_proc.rs"]
 mod readonly_proc;
 
@@ -15677,118 +15682,120 @@ fn run_timeout_leaves_a_guest_that_finishes_in_time_alone() {
     );
 }
 
-/// Hold `fstatfs` in hermit and everything it starts, and make it a new
-/// session leader. A `SECCOMP_RET_USER_NOTIF` filter sends `fstatfs` to a
-/// listener that nothing answers, as a container supervisor that has stopped
-/// answering would, and allows every other call. The listener is left open
-/// without `FD_CLOEXEC`, so hermit inherits it and holds it while it runs,
-/// and so does every child hermit forks; with no listener left the call
-/// would fail with `ENOSYS` instead of waiting. The session lets the caller
-/// find every process the run leaves, as [`spawn_timed_run`] does.
-fn hold_fstatfs_in_a_new_session(command: &mut Command) {
-    // SAFETY: The callback makes only async-signal-safe syscalls before exec.
+/// What [`run_true_under_an_inherited_filter`] saw.
+struct FilteredTrueRun {
+    /// `None` when the run was still going at the test's bound and the test
+    /// killed it.
+    status: Option<std::process::ExitStatus>,
+    elapsed: Duration,
+    /// When the test killed the run at its bound: what Hermit's process was
+    /// waiting in just before, its kernel wait channel (`/proc/PID/wchan`) and
+    /// its system call (`/proc/PID/syscall`: the call number, 1 for `write`,
+    /// then its arguments, the descriptor first). Empty when the run ended.
+    waiting_in: String,
+    /// Processes of the run's session still alive 5 s after it ended, as
+    /// "PID (COMM)". The test kills them.
+    survivors: Vec<String>,
+    /// What the run wrote to stderr, when the caller asked for a pipe this
+    /// function reads.
+    stderr: String,
+}
+
+impl FilteredTrueRun {
+    fn describe(&self) -> String {
+        format!(
+            "status {:?} after {:?} (None: killed at the test's bound, waiting in {:?}); \
+             processes left in its session: {:?}; stderr:\n{}",
+            self.status, self.elapsed, self.waiting_in, self.survivors, self.stderr
+        )
+    }
+}
+
+/// The rule that holds the one call only the launcher's former seccomp probe
+/// child made: `statx` with `AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT` and the
+/// mask `STATX_INO`. A `SECCOMP_RET_USER_NOTIF` verdict whose listener nobody
+/// answers keeps that call waiting until its caller is killed. Neither Hermit,
+/// nor Detcore, nor `/bin/true` makes that call (Rust's standard library asks
+/// `statx` for `STATX_ALL`), so after the probe's removal the rule reaches
+/// nothing.
+fn hold_the_former_probe_statx() -> inherited_seccomp::Rule {
+    inherited_seccomp::Rule {
+        nr: libc::SYS_statx,
+        args: &[
+            (2, inherited_seccomp::INJECTED_LOOKUP_FLAGS),
+            (3, libc::STATX_INO),
+        ],
+        verdict: libc::SECCOMP_RET_USER_NOTIF,
+    }
+}
+
+/// Run `hermit <global> run --timeout 5 -- /bin/true` as a new session leader
+/// under `filter`, which the process installs just before it executes Hermit,
+/// so that Hermit, every process it starts and the guest inherit it. `stderr`
+/// is the run's stderr; a [`Stdio::piped`] one is read here. The test waits at
+/// most 30 s (times [`dap_wall_timeout_multiplier`]), which ends a hang well
+/// before nextest's per-test kill so the test reports it itself, with what
+/// Hermit was waiting in; then what is left in the session has 5 s to go, is
+/// recorded, and is killed.
+fn run_true_under_an_inherited_filter(
+    filter: inherited_seccomp::Filter,
+    global: &[&str],
+    stderr: Stdio,
+) -> FilteredTrueRun {
+    let mut args = global.to_vec();
+    args.extend(["run", "--timeout", "5", "--", "/bin/true"]);
+    let mut command = hermit_command(&args);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr)
+        .env("LC_ALL", "C");
+    // SAFETY: `setsid` is async-signal-safe, allocates nothing, and runs in the
+    // forked child, not yet a session leader, before the filter's step.
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
-            let mut filter = [
-                libc::sock_filter {
-                    code: 0x20, // BPF_LD | BPF_W | BPF_ABS
-                    jt: 0,
-                    jf: 0,
-                    k: 0, // offsetof(seccomp_data, nr)
-                },
-                libc::sock_filter {
-                    code: 0x15, // BPF_JMP | BPF_JEQ | BPF_K
-                    jt: 0,
-                    jf: 1, // another call: allow
-                    k: libc::SYS_fstatfs as u32,
-                },
-                libc::sock_filter {
-                    code: 0x06, // BPF_RET | BPF_K
-                    jt: 0,
-                    jf: 0,
-                    k: libc::SECCOMP_RET_USER_NOTIF,
-                },
-                libc::sock_filter {
-                    code: 0x06,
-                    jt: 0,
-                    jf: 0,
-                    k: libc::SECCOMP_RET_ALLOW,
-                },
-            ];
-            let program = libc::sock_fprog {
-                len: filter.len() as u16,
-                filter: filter.as_mut_ptr(),
-            };
-            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            let listener = libc::syscall(
-                libc::SYS_seccomp,
-                libc::SECCOMP_SET_MODE_FILTER,
-                libc::SECCOMP_FILTER_FLAG_NEW_LISTENER,
-                &program as *const libc::sock_fprog,
-            );
-            if listener < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::fcntl(listener as libc::c_int, libc::F_SETFD, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
             Ok(())
         });
     }
-}
-
-/// `hermit run --timeout=1 -- /bin/true` under a seccomp filter that holds
-/// `fstatfs` and whose supervisor never answers (see
-/// [`hold_fstatfs_in_a_new_session`]) ends by name within a few seconds and
-/// leaves no process behind (Codex review round 11 of
-/// https://github.com/rrnewton/hermit/pull/3255, finding 3). Hermit itself
-/// makes no `fstatfs` call before its seccomp question; the question's probe
-/// child does, and waits there until it is killed. The launcher used to wait
-/// for that child without a bound, so this run never ended, `--timeout`
-/// included. It now waits at most what remains of the run's bound (here
-/// less than the 1 s of `--timeout`, not the 10 s it waits without one),
-/// kills and reaps the child, warns, and, with the bound used up, ends the
-/// run with 124 and `class=run-timeout` without starting a guest.
-#[test]
-fn run_timeout_bounds_a_seccomp_probe_whose_supervisor_never_answers() {
-    let _lock = hermit_run_guard();
-    let mut command = hermit_command(&["run", "--timeout", "1", "--", "/bin/true"]);
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .env("LC_ALL", "C");
-    hold_fstatfs_in_a_new_session(&mut command);
+    filter.install_before_exec(&mut command);
     let mut child = command
         .spawn()
-        .expect("spawn hermit run --timeout=1 with fstatfs held");
+        .expect("spawn hermit run --timeout 5 under an inherited seccomp filter");
     let session = child.id() as i32;
-    let mut pipe = child.stderr.take().unwrap();
-    let reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = std::io::Read::read_to_end(&mut pipe, &mut bytes);
-        bytes
+    let reader = child.stderr.take().map(|mut pipe| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut pipe, &mut bytes);
+            bytes
+        })
     });
-    // The run should end about 1 s after it starts; the old one never did.
-    // This bound ends the test well before nextest's per-test kill, so it
-    // reports a hang itself.
-    let (status, elapsed) = wait_at_most(
-        &mut child,
-        Duration::from_secs(30).mul_f64(dap_wall_timeout_multiplier()),
-    );
-    // Whatever hermit left in its session, the probe child included, has
-    // until this moment to go; then it is killed, so that a failing run
-    // neither leaks a process nor keeps the stderr pipe open for the reader.
+    let bound = Duration::from_secs(30).mul_f64(dap_wall_timeout_multiplier());
+    let start = Instant::now();
+    let mut waiting_in = String::new();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if start.elapsed() >= bound {
+            let read = |file: &str| {
+                fs::read_to_string(format!("/proc/{session}/{file}")).unwrap_or_default()
+            };
+            waiting_in = format!("{} {}", read("wchan").trim(), read("syscall").trim());
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let elapsed = start.elapsed();
     let drain_until = Instant::now() + Duration::from_secs(5);
     while !run_timeout_pids_in_session(session).is_empty() && Instant::now() < drain_until {
         thread::sleep(Duration::from_millis(20));
     }
-    let survivors: Vec<String> = run_timeout_pids_in_session(session)
+    let survivors = run_timeout_pids_in_session(session)
         .into_iter()
         .map(|pid| {
             let comm = fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
@@ -15800,36 +15807,85 @@ fn run_timeout_bounds_a_seccomp_probe_whose_supervisor_never_answers() {
         // ESRCH. SIGKILL ends a call that a seccomp supervisor holds.
         unsafe { libc::kill(pid, libc::SIGKILL) };
     }
-    let stderr = String::from_utf8_lossy(&reader.join().unwrap()).into_owned();
-    assert_eq!(
-        status.and_then(|status| status.code()),
-        Some(124),
-        "the run must end with the deadline's 124; it ended {status:?} after {elapsed:?} \
-         (None: killed at the test's bound). stderr:\n{stderr}"
+    let run = FilteredTrueRun {
+        status,
+        elapsed,
+        waiting_in,
+        survivors,
+        stderr: reader
+            .map(|reader| String::from_utf8_lossy(&reader.join().unwrap()).into_owned())
+            .unwrap_or_default(),
+    };
+    eprintln!("{}", run.describe());
+    run
+}
+
+/// A run whose stderr nobody reads ends normally under a seccomp supervisor
+/// that never answers (Codex review round 12 of
+/// https://github.com/rrnewton/hermit/pull/3255, finding 3). The launcher
+/// used to ask, in a child process, whether its inherited filter let Detcore
+/// make the calls Detcore injects while listing a directory. A supervisor that
+/// never answered the child's `statx` held it until the run's bound was used
+/// up; the launcher then killed the child and wrote a warning to stderr with a
+/// plain, blocking `write`. With stderr a full pipe whose reader never reads,
+/// that write never returned, which was before the run's 124 and before the
+/// fallback alarm was armed, so the run never ended. Nothing is asked now: no
+/// child, no warning, and `/bin/true` exits 0.
+///
+/// The log goes to `--log-file`, as in
+/// [`max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe_nobody_reads`],
+/// so that none of Hermit's own lines reaches stderr. Without it Hermit writes
+/// its virtual-time epoch line there, and that write, which predates the
+/// probe, waits on a full pipe for as long as nobody reads it (only
+/// `--max-log-bytes` makes such a diagnostic give up instead); this test is not
+/// about that write. The
+/// probe's warning went to stderr whatever `--log-file` said.
+#[test]
+fn a_run_whose_stderr_nobody_reads_ends_under_an_unanswered_seccomp_supervisor() {
+    let _lock = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let log = directory.path().join("hermit.log");
+    let (_unread, write_end) = full_unread_stderr_pipe();
+    let run = run_true_under_an_inherited_filter(
+        inherited_seccomp::Filter::new(&[hold_the_former_probe_statx()]),
+        &["--log-file", log.to_str().unwrap()],
+        Stdio::from(write_end),
     );
     assert!(
-        stderr.contains("class=run-timeout") && stderr.contains("bound of 1 seconds"),
-        "the bound must fire by name and with its seconds. stderr:\n{stderr}"
+        run.status.and_then(|status| status.code()) == Some(0) && run.survivors.is_empty(),
+        "the run must exit 0 and leave no process: {}",
+        run.describe()
     );
-    const WARNING: &str = "the seccomp probe child did not exit within ";
-    let probe_ms = stderr
-        .split_once(WARNING)
-        .and_then(|(_, rest)| rest.split_once(" ms"))
-        .and_then(|(ms, _)| ms.parse::<u64>().ok());
+}
+
+/// A run ends normally under a seccomp supervisor that never answers and a
+/// filter that refuses `kill(..., SIGKILL)` with `EPERM` (Codex review round
+/// 12 of https://github.com/rrnewton/hermit/pull/3255, remaining gap S1). The
+/// launcher's former probe child, held as described above, was killed at the
+/// bound with `kill(pid, SIGKILL)`, whose result was ignored, and then reaped
+/// with a blocking `waitpid`; with that `kill` refused, the child stayed held
+/// and the launcher waited for it forever. Nothing is forked now, and the run
+/// makes no such `kill` before `/bin/true` exits 0.
+#[test]
+fn a_run_ends_under_an_unanswered_seccomp_supervisor_that_refuses_its_kill() {
+    let _lock = hermit_run_guard();
+    let run = run_true_under_an_inherited_filter(
+        inherited_seccomp::Filter::new(&[
+            hold_the_former_probe_statx(),
+            inherited_seccomp::Rule {
+                nr: libc::SYS_kill,
+                args: &[(1, libc::SIGKILL as u32)],
+                verdict: libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+            },
+        ]),
+        &[],
+        Stdio::piped(),
+    );
     assert!(
-        probe_ms.is_some_and(|ms| ms <= 1000),
-        "the probe must be waited for at most what remains of the 1 s bound, and say so \
-         ({probe_ms:?} ms). stderr:\n{stderr}"
+        run.status.and_then(|status| status.code()) == Some(0) && run.survivors.is_empty(),
+        "the run must exit 0 and leave no process: {}",
+        run.describe()
     );
-    assert!(
-        survivors.is_empty(),
-        "the run left processes in its session: {survivors:?}. stderr:\n{stderr}"
-    );
-    assert!(
-        elapsed < Duration::from_secs(8).mul_f64(dap_wall_timeout_multiplier()),
-        "the run took {elapsed:?} for a 1 s bound. stderr:\n{stderr}"
-    );
-    eprintln!("the run ended after {elapsed:?}; stderr:\n{stderr}");
 }
 
 /// The SIGALRM fallback fires, is named, and reports the deadline code.

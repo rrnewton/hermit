@@ -14270,119 +14270,71 @@ pub(crate) mod inject_fstat_scratch {
     // maps, and on the KVM backend each mapping moves where a later guest
     // `mmap` lands. Every listed entry is now keyed by its own `lstat` on
     // every filesystem: nothing settles, `lower` is keyed on the device its
-    // `lstat` reports, and no entry is asked whether it is a mount root, so
-    // the guest reads the same records, and Detcore makes the same transient
-    // mappings, whatever `seccomp_may_refuse_entry_lookup_syscalls` says (it
-    // no longer chooses anything). The name records Codex's scenario.
+    // `lstat` reports, and no entry is asked whether it is a mount root. The
+    // name records Codex's scenario.
     #[tokio::test]
     async fn getdents_keys_a_settled_layer_overlays_mount_root_as_stat_and_every_do() {
-        let mut runs = Vec::new();
-        for every in [false, true] {
-            let (_dir_a, fd_a, _, device) = directory_with_entries();
-            let (_dir_b, fd_b, _, device_b) = directory_with_entries();
-            assert_eq!(device, device_b, "precondition: one filesystem");
-            let scratch = Pages::map(1, 1);
-            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
-            guest.answers_determinize_inode = true;
-            guest.answers_determinize_device = true;
-            guest.fstatfs_answer = Some(Ok(libc::OVERLAYFS_SUPER_MAGIC));
-            guest.config.seccomp_may_refuse_entry_lookup_syscalls = every;
-            for fd in [fd_a, fd_b] {
-                tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
-                    .await
-                    .expect("precondition: Detcore tracks the directory");
-            }
-            read_as_layered_overlay_directory(&mut guest, false, device);
-            let (read, _) = getdents64_records_of(&tool, &mut guest, fd_b).await;
-            assert!(
-                read.as_ref().is_ok_and(|len| *len > 0),
-                "Every {every}, B: {read:?}"
-            );
-
-            read_as_layered_overlay_directory(&mut guest, true, device);
-            let keyed_before = guest.determinized.lock().unwrap().len();
-            let statx_before = guest.statx_paths.len();
-            let mapped_before = guest.mapped.len();
-            let injected_before = guest.injected.len();
-            let (read, records) = getdents64_records_of(&tool, &mut guest, fd_a).await;
-            assert!(
-                read.as_ref().is_ok_and(|len| *len > 0),
-                "Every {every}, A: {read:?}"
-            );
-            let keyed = guest.determinized.lock().unwrap()[keyed_before..].to_vec();
-            let asked_whether_mounts = guest.statx_paths[statx_before..].to_vec();
-            let mappings: Vec<usize> = guest.mapped[mapped_before..]
-                .iter()
-                .map(|(_, len)| *len)
-                .collect();
-            let mapping_calls: Vec<Sysno> = guest.injected[injected_before..]
-                .iter()
-                .copied()
-                .filter(|sysno| matches!(sysno, Sysno::mmap | Sysno::munmap | Sysno::statx))
-                .collect();
-            close_unless_detcore_did(&guest, fd_a);
-            close_unless_detcore_did(&guest, fd_b);
-
-            let stat_of_lower = tool
-                .determinize_stat(
-                    &mut guest,
-                    stat_answer(OTHER_DEVICE, 300, libc::S_IFREG | 0o644),
-                    None,
-                )
+        let (_dir_a, fd_a, _, device) = directory_with_entries();
+        let (_dir_b, fd_b, _, device_b) = directory_with_entries();
+        assert_eq!(device, device_b, "precondition: one filesystem");
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        guest.answers_determinize_inode = true;
+        guest.answers_determinize_device = true;
+        guest.fstatfs_answer = Some(Ok(libc::OVERLAYFS_SUPER_MAGIC));
+        for fd in [fd_a, fd_b] {
+            tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
                 .await
-                .expect("the stat of A's lower is determinized")
-                .inode;
-            assert_eq!(
-                listed_inode(&records, b"lower"),
-                stat_of_lower,
-                "Every {every}: A lists its bound lower with the d_ino its stat reports as st_ino"
-            );
-            assert!(
-                keyed.contains(&RawInode::new(OTHER_DEVICE, 300)),
-                "Every {every}: A's bound lower is keyed on the device its lstat reports: \
-                 {keyed:?}"
-            );
-            assert_eq!(
-                asked_whether_mounts,
-                Vec::<Vec<u8>>::new(),
-                "Every {every}: no entry of A is asked whether it is a mount"
-            );
-            // Each entry is keyed once, in the order listed. `.` is each
-            // run's own temporary directory, so its raw key differs between
-            // the runs; no other entry's may.
-            assert_eq!(keyed.len(), records.len(), "Every {every}: {keyed:?}");
-            let keyed: Vec<(Vec<u8>, RawInode)> = records
-                .iter()
-                .map(|(name, _)| name.clone())
-                .zip(keyed)
-                .filter(|(name, _)| name != b".")
-                .collect();
-            runs.push((every, records, keyed, mappings, mapping_calls));
+                .expect("precondition: Detcore tracks the directory");
         }
-        let (_, records, keyed, mappings, mapping_calls) = &runs[0];
-        let (_, every_records, every_keyed, every_mappings, every_mapping_calls) = &runs[1];
+        read_as_layered_overlay_directory(&mut guest, false, device);
+        let (read, _) = getdents64_records_of(&tool, &mut guest, fd_b).await;
+        assert!(read.as_ref().is_ok_and(|len| *len > 0), "B: {read:?}");
+
+        read_as_layered_overlay_directory(&mut guest, true, device);
+        let keyed_before = guest.determinized.lock().unwrap().len();
+        let statx_before = guest.statx_paths.len();
+        let (read, records) = getdents64_records_of(&tool, &mut guest, fd_a).await;
+        assert!(read.as_ref().is_ok_and(|len| *len > 0), "A: {read:?}");
+        let keyed = guest.determinized.lock().unwrap()[keyed_before..].to_vec();
+        let asked_whether_mounts = guest.statx_paths[statx_before..].to_vec();
+        close_unless_detcore_did(&guest, fd_a);
+        close_unless_detcore_did(&guest, fd_b);
+
+        let stat_of_lower = tool
+            .determinize_stat(
+                &mut guest,
+                stat_answer(OTHER_DEVICE, 300, libc::S_IFREG | 0o644),
+                None,
+            )
+            .await
+            .expect("the stat of A's lower is determinized")
+            .inode;
         assert_eq!(
-            records, every_records,
-            "the guest reads the same records of A on the settled overlay as under Every"
+            listed_inode(&records, b"lower"),
+            stat_of_lower,
+            "A lists its bound lower with the d_ino its stat reports as st_ino"
+        );
+        assert!(
+            keyed.contains(&RawInode::new(OTHER_DEVICE, 300)),
+            "A's bound lower is keyed on the device its lstat reports: \
+                 {keyed:?}"
         );
         assert_eq!(
-            keyed, every_keyed,
-            "A's entries have the same keys on the settled overlay as under Every"
+            asked_whether_mounts,
+            Vec::<Vec<u8>>::new(),
+            "no entry of A is asked whether it is a mount"
         );
-        assert_eq!(
-            (mappings, mapping_calls),
-            (every_mappings, every_mapping_calls),
-            "listing A on the settled overlay makes the same transient mappings as under Every, \
-             so a later guest mmap lands alike on the KVM backend"
-        );
+        // Each entry is keyed once, in the order listed.
+        assert_eq!(keyed.len(), records.len(), "{keyed:?}");
     }
 
     // Codex review of https://github.com/rrnewton/hermit/pull/3255, round
-    // 11, F4. The launcher asks, in its own mount namespace, whether an
-    // inherited seccomp filter may refuse the questions the narrow policies
-    // asked beyond `Every`'s. A supervisor that answers `statx` there but
-    // refuses it with `EPERM` in the container's namespace passed that
-    // question and then refused the settle pass's mount-root question, and
+    // 11, F4. The launcher used to ask, in its own mount namespace, whether
+    // an inherited seccomp filter might refuse the questions the narrow
+    // policies asked beyond `Every`'s. A supervisor that answered `statx`
+    // there but refused it with `EPERM` in the container's namespace passed
+    // that question and then refused the settle pass's mount-root question, and
     // the refusal ended the guest; at the base, which asked inside the
     // container, the run used `Every`, which asks no such question. Every
     // listed entry is now keyed by its own `lstat` on every filesystem, so
@@ -14412,13 +14364,11 @@ pub(crate) mod inject_fstat_scratch {
             Refused::Mmap(Errno::EPERM),
             Refused::Munmap(Errno::EPERM),
         ] {
-            let every = refused == Refused::NothingUnderEvery;
             let (_dir, fd, _, device) = directory_with_entries();
             let scratch = Pages::map(1, 1);
             let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
             guest.answers_determinize_inode = true;
             guest.fstatfs_answer = Some(Ok(libc::OVERLAYFS_SUPER_MAGIC));
-            guest.config.seccomp_may_refuse_entry_lookup_syscalls = every;
             match refused {
                 Refused::NothingUnderEvery => {}
                 Refused::Statx(errno) => guest.entry_statx_error = Some(errno),
@@ -14900,105 +14850,93 @@ pub(crate) mod inject_fstat_scratch {
             for tracked in [false, true] {
                 let (dir, device) = directory_of_one_letter_names();
                 let dot = std::fs::metadata(dir.path()).unwrap().ino();
-                let mut runs = Vec::new();
-                for every in [false, true] {
-                    let fd = std::fs::File::open(dir.path()).unwrap().into_raw_fd();
-                    let scratch = Pages::map(1, 1);
-                    let (tool, mut guest) =
-                        ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
-                    guest.answers_determinize_inode = true;
-                    guest.config.seccomp_may_refuse_entry_lookup_syscalls = every;
-                    guest.fstatfs_answer = Some(Ok(libc::OVERLAYFS_SUPER_MAGIC));
-                    guest.getdents_inode_answers = vec![
-                        (b"..".to_vec(), SCRIPTED_PARENT_INODE),
-                        (b"a".to_vec(), 300),
-                        (b"b".to_vec(), 301),
-                    ];
-                    let layer_file =
-                        |ino: u64| Ok(stat_answer(OTHER_DEVICE, ino, libc::S_IFREG | 0o644));
-                    guest.fstatat_answers = vec![
-                        (
-                            b"..".to_vec(),
-                            Ok(stat_answer(
-                                OTHER_DEVICE,
-                                SCRIPTED_PARENT_INODE,
-                                libc::S_IFDIR | 0o755,
-                            )),
-                        ),
-                        (b"a".to_vec(), layer_file(300)),
-                        (b"b".to_vec(), layer_file(301)),
-                    ];
-                    if unmap_refused {
-                        guest.munmap_error_of_len = Some((host_page_size(), Errno::EPERM));
-                    }
-                    if tracked {
-                        tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
-                            .await
-                            .expect("precondition: Detcore tracks the directory");
-                    }
-                    let mut calls = Vec::new();
-                    while calls.len() < 8 {
-                        let call = listing_call(&tool, &mut guest, fd, 24).await;
-                        let last = call.read != Ok(24);
-                        calls.push(call);
-                        if last {
-                            break;
-                        }
-                    }
-                    close_unless_detcore_did(&guest, fd);
-                    let label =
-                        format!("every {every}, tracked {tracked}, unmap refused {unmap_refused}");
-                    let (last, batches) = calls.split_last().unwrap();
-                    assert_eq!(last.read, Ok(0), "{label}: the listing ends: {calls:?}");
-                    let mut keys: Vec<(String, RawInode)> = Vec::new();
-                    for batch in batches {
-                        assert_eq!(
-                            batch.records.len(),
-                            1,
-                            "{label}: one entry per call: {batch:?}"
-                        );
-                        keys.extend(keyed_names(batch));
-                    }
-                    keys.sort_by(|(one, _), (other, _)| one.cmp(other));
-                    assert_eq!(
-                        keys,
-                        named(&[
-                            (".", RawInode::new(device, dot)),
-                            ("..", RawInode::new(OTHER_DEVICE, SCRIPTED_PARENT_INODE)),
-                            ("a", RawInode::new(OTHER_DEVICE, 300)),
-                            ("b", RawInode::new(OTHER_DEVICE, 301)),
-                        ]),
-                        "{label}: each entry is keyed once, as Every keys it"
-                    );
-                    for call in &calls {
-                        assert!(
-                            call.mapped
-                                .iter()
-                                .chain(&call.unmapped)
-                                .all(|len| tracked && *len == snapshot),
-                            "{label}: a call maps and unmaps nothing but the directory snapshot's \
-                             buffer, and on an untracked descriptor nothing: {call:?}"
-                        );
-                        assert!(
-                            !call.injected.contains(&Sysno::statx)
-                                && !call.injected.contains(&Sysno::fstatfs),
-                            "{label}: no call asks a mount-root statx or the filesystem type: \
-                             {call:?}"
-                        );
-                    }
-                    let mut mapped: Vec<usize> = guest.mapped.iter().map(|(_, len)| *len).collect();
-                    let mut unmapped: Vec<usize> =
-                        guest.unmapped.iter().map(|(_, len)| *len).collect();
-                    mapped.sort();
-                    unmapped.sort();
-                    assert_eq!(mapped, unmapped, "{label}: every mapping is removed");
-                    runs.push(calls);
+                let fd = std::fs::File::open(dir.path()).unwrap().into_raw_fd();
+                let scratch = Pages::map(1, 1);
+                let (tool, mut guest) =
+                    ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+                guest.answers_determinize_inode = true;
+                guest.fstatfs_answer = Some(Ok(libc::OVERLAYFS_SUPER_MAGIC));
+                guest.getdents_inode_answers = vec![
+                    (b"..".to_vec(), SCRIPTED_PARENT_INODE),
+                    (b"a".to_vec(), 300),
+                    (b"b".to_vec(), 301),
+                ];
+                let layer_file =
+                    |ino: u64| Ok(stat_answer(OTHER_DEVICE, ino, libc::S_IFREG | 0o644));
+                guest.fstatat_answers = vec![
+                    (
+                        b"..".to_vec(),
+                        Ok(stat_answer(
+                            OTHER_DEVICE,
+                            SCRIPTED_PARENT_INODE,
+                            libc::S_IFDIR | 0o755,
+                        )),
+                    ),
+                    (b"a".to_vec(), layer_file(300)),
+                    (b"b".to_vec(), layer_file(301)),
+                ];
+                if unmap_refused {
+                    guest.munmap_error_of_len = Some((host_page_size(), Errno::EPERM));
                 }
+                if tracked {
+                    tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
+                        .await
+                        .expect("precondition: Detcore tracks the directory");
+                }
+                let mut calls = Vec::new();
+                while calls.len() < 8 {
+                    let call = listing_call(&tool, &mut guest, fd, 24).await;
+                    let last = call.read != Ok(24);
+                    calls.push(call);
+                    if last {
+                        break;
+                    }
+                }
+                close_unless_detcore_did(&guest, fd);
+                let label = format!("tracked {tracked}, unmap refused {unmap_refused}");
+                let (last, batches) = calls.split_last().unwrap();
+                assert_eq!(last.read, Ok(0), "{label}: the listing ends: {calls:?}");
+                let mut keys: Vec<(String, RawInode)> = Vec::new();
+                for batch in batches {
+                    assert_eq!(
+                        batch.records.len(),
+                        1,
+                        "{label}: one entry per call: {batch:?}"
+                    );
+                    keys.extend(keyed_names(batch));
+                }
+                keys.sort_by(|(one, _), (other, _)| one.cmp(other));
                 assert_eq!(
-                    runs[0], runs[1],
-                    "tracked {tracked}, unmap refused {unmap_refused}: each call returns, keys, \
-                     injects, maps and unmaps exactly what the same call of Every's listing does"
+                    keys,
+                    named(&[
+                        (".", RawInode::new(device, dot)),
+                        ("..", RawInode::new(OTHER_DEVICE, SCRIPTED_PARENT_INODE)),
+                        ("a", RawInode::new(OTHER_DEVICE, 300)),
+                        ("b", RawInode::new(OTHER_DEVICE, 301)),
+                    ]),
+                    "{label}: each entry is keyed once, as Every keys it"
                 );
+                for call in &calls {
+                    assert!(
+                        call.mapped
+                            .iter()
+                            .chain(&call.unmapped)
+                            .all(|len| tracked && *len == snapshot),
+                        "{label}: a call maps and unmaps nothing but the directory snapshot's \
+                             buffer, and on an untracked descriptor nothing: {call:?}"
+                    );
+                    assert!(
+                        !call.injected.contains(&Sysno::statx)
+                            && !call.injected.contains(&Sysno::fstatfs),
+                        "{label}: no call asks a mount-root statx or the filesystem type: \
+                             {call:?}"
+                    );
+                }
+                let mut mapped: Vec<usize> = guest.mapped.iter().map(|(_, len)| *len).collect();
+                let mut unmapped: Vec<usize> = guest.unmapped.iter().map(|(_, len)| *len).collect();
+                mapped.sort();
+                unmapped.sort();
+                assert_eq!(mapped, unmapped, "{label}: every mapping is removed");
             }
         }
     }
@@ -15037,64 +14975,52 @@ pub(crate) mod inject_fstat_scratch {
             for tracked in [false, true] {
                 let (dir, first_fd, _, device) = directory_with_entries();
                 assert_eq!(unsafe { libc::close(first_fd) }, 0);
-                let mut runs = Vec::new();
-                for every in [false, true] {
-                    let fd = std::fs::File::open(dir.path()).unwrap().into_raw_fd();
-                    let scratch = Pages::map(1, 1);
-                    let (tool, mut guest) =
-                        ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
-                    guest.answers_determinize_inode = true;
-                    guest.config.seccomp_may_refuse_entry_lookup_syscalls = every;
-                    guest.fstatfs_answer = Some(Ok(libc::OVERLAYFS_SUPER_MAGIC));
-                    read_as_layered_overlay_directory(&mut guest, true, device);
-                    match answer {
-                        Answer::NotAMountRoot => guest.statx_mount_roots.clear(),
-                        Answer::AMountRoot => {}
-                        Answer::Refused => guest.entry_statx_error = Some(Errno::EPERM),
-                        Answer::WithoutTheAttribute => {
-                            guest.statx_without_mount_root_attribute = true
-                        }
-                    }
-                    if tracked {
-                        tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
-                            .await
-                            .expect("precondition: Detcore tracks the directory");
-                    }
-                    let listed = listing_call(&tool, &mut guest, fd, page_size()).await;
-                    let end = listing_call(&tool, &mut guest, fd, page_size()).await;
-                    close_unless_detcore_did(&guest, fd);
-                    let label = format!("{answer:?}, tracked {tracked}, every {every}");
-                    assert!(
-                        listed.read.as_ref().is_ok_and(|len| *len > 0) && end.read == Ok(0),
-                        "{label}: {listed:?} then {end:?}"
-                    );
-                    let lengths = |mappings: &[(usize, usize)]| -> Vec<usize> {
-                        mappings.iter().map(|(_, len)| *len).collect()
-                    };
-                    let (mapped, unmapped) = (lengths(&guest.mapped), lengths(&guest.unmapped));
-                    assert!(
-                        mapped
-                            .iter()
-                            .chain(&unmapped)
-                            .all(|len| tracked && *len == snapshot)
-                            && mapped == unmapped,
-                        "{label}: the listing maps and unmaps nothing but the directory \
+                let fd = std::fs::File::open(dir.path()).unwrap().into_raw_fd();
+                let scratch = Pages::map(1, 1);
+                let (tool, mut guest) =
+                    ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+                guest.answers_determinize_inode = true;
+                guest.fstatfs_answer = Some(Ok(libc::OVERLAYFS_SUPER_MAGIC));
+                read_as_layered_overlay_directory(&mut guest, true, device);
+                match answer {
+                    Answer::NotAMountRoot => guest.statx_mount_roots.clear(),
+                    Answer::AMountRoot => {}
+                    Answer::Refused => guest.entry_statx_error = Some(Errno::EPERM),
+                    Answer::WithoutTheAttribute => guest.statx_without_mount_root_attribute = true,
+                }
+                if tracked {
+                    tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
+                        .await
+                        .expect("precondition: Detcore tracks the directory");
+                }
+                let listed = listing_call(&tool, &mut guest, fd, page_size()).await;
+                let end = listing_call(&tool, &mut guest, fd, page_size()).await;
+                close_unless_detcore_did(&guest, fd);
+                let label = format!("{answer:?}, tracked {tracked}");
+                assert!(
+                    listed.read.as_ref().is_ok_and(|len| *len > 0) && end.read == Ok(0),
+                    "{label}: {listed:?} then {end:?}"
+                );
+                let lengths = |mappings: &[(usize, usize)]| -> Vec<usize> {
+                    mappings.iter().map(|(_, len)| *len).collect()
+                };
+                let (mapped, unmapped) = (lengths(&guest.mapped), lengths(&guest.unmapped));
+                assert!(
+                    mapped
+                        .iter()
+                        .chain(&unmapped)
+                        .all(|len| tracked && *len == snapshot)
+                        && mapped == unmapped,
+                    "{label}: the listing maps and unmaps nothing but the directory \
                          snapshot's buffer, and on an untracked descriptor nothing: mapped \
                          {mapped:?}, unmapped {unmapped:?}"
-                    );
-                    assert_eq!(
-                        guest.statx_paths,
-                        Vec::<Vec<u8>>::new(),
-                        "{label}: no mount-root statx"
-                    );
-                    assert_eq!(guest.fstatfs_calls, Vec::new(), "{label}: no fstatfs");
-                    runs.push([listed, end]);
-                }
-                assert_eq!(
-                    runs[0], runs[1],
-                    "{answer:?}, tracked {tracked}: the listing returns, keys, injects, maps and \
-                     unmaps exactly what Every's listing does"
                 );
+                assert_eq!(
+                    guest.statx_paths,
+                    Vec::<Vec<u8>>::new(),
+                    "{label}: no mount-root statx"
+                );
+                assert_eq!(guest.fstatfs_calls, Vec::new(), "{label}: no fstatfs");
             }
         }
     }
@@ -15151,21 +15077,16 @@ pub(crate) mod inject_fstat_scratch {
     /// Runs `steps` on a fresh scripted guest over the directory at `path`,
     /// configured by `script`, on a descriptor Detcore tracks, then lists the
     /// directory whole twice, each time on a fresh descriptor it does not
-    /// track. With `every`, the guest's configuration says that the
-    /// launcher's seccomp filter may refuse the classification calls, which
-    /// chose `Every` for every listing before every listing was `Every`:
-    /// Every's reference run. Returns each read's effects and how many
-    /// SIGSYS the guest was sent.
+    /// track. Returns each read's effects and how many SIGSYS the guest was
+    /// sent.
     async fn run_listing_history(
         path: &std::path::Path,
         script: &dyn Fn(&mut ScriptedGuest),
-        every: bool,
         steps: &[ListingStep],
     ) -> (Vec<ListingCall>, usize) {
         let scratch = Pages::map(1, 1);
         let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
         guest.answers_determinize_inode = true;
-        guest.config.seccomp_may_refuse_entry_lookup_syscalls = every;
         script(&mut guest);
         let fd = std::fs::File::open(path).unwrap().into_raw_fd();
         tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
@@ -15250,11 +15171,9 @@ pub(crate) mod inject_fstat_scratch {
     // mount-root attribute, btrfs, Ceph, ext4), a history of listings on a
     // tracked descriptor (whole reads, a read past the end, rewinds, 64-byte
     // batches, seeks into the middle) and two whole listings on untracked
-    // descriptors: with fixed `lstat` answers, each read returns the same
-    // records, sends the same numbering requests (count, order and keys),
-    // and injects the same calls as Every's run of the same history; every
-    // key is the one Every's rule gives the entry by name; the two names of
-    // one file get one number; and no SIGSYS is sent.
+    // descriptors: with fixed `lstat` answers, every key is the one Every's
+    // rule gives the entry by name; the two names of one file get one
+    // number; and no SIGSYS is sent.
     #[tokio::test]
     async fn getdents_keys_and_numbers_as_every_does_through_a_scripted_listing_history() {
         #[derive(Clone, Copy, Debug)]
@@ -15324,9 +15243,7 @@ pub(crate) mod inject_fstat_scratch {
                     Classified::Ext4 => guest.fstatfs_answer = Some(Ok(libc::EXT4_SUPER_MAGIC)),
                 }
             };
-            let (calls, sigsys) = run_listing_history(dir.path(), &script, false, &steps).await;
-            let (every_calls, every_sigsys) =
-                run_listing_history(dir.path(), &script, true, &steps).await;
+            let (calls, sigsys) = run_listing_history(dir.path(), &script, &steps).await;
             let every_key = |name: &str| match name {
                 "." => RawInode::new(device, dot),
                 ".." => RawInode::new(OTHER_DEVICE, SCRIPTED_PARENT_INODE),
@@ -15335,13 +15252,7 @@ pub(crate) mod inject_fstat_scratch {
                 "vanished" => RawInode::new(device, WIDE_VANISHED_INODE),
                 other => panic!("unexpected entry {other:?}"),
             };
-            assert_eq!(calls.len(), every_calls.len());
-            for (read, (call, every_call)) in calls.iter().zip(&every_calls).enumerate() {
-                assert_eq!(
-                    call, every_call,
-                    "{classified:?}, read {read}: the read returns the records, sends the \
-                     numbering requests and injects the calls of Every's same read"
-                );
+            for (read, call) in calls.iter().enumerate() {
                 for (name, key) in keyed_names(call) {
                     assert_eq!(
                         key,
@@ -15361,11 +15272,7 @@ pub(crate) mod inject_fstat_scratch {
                      {numbers:?}"
                 );
             }
-            assert_eq!(
-                (sigsys, every_sigsys),
-                (0, 0),
-                "{classified:?}: no listing sends a SIGSYS"
-            );
+            assert_eq!(sigsys, 0, "{classified:?}: no listing sends a SIGSYS");
         }
     }
 
@@ -15668,10 +15575,10 @@ pub(crate) mod inject_fstat_scratch {
     // F2. A seccomp filter the guest inherited may trap an injected `fstatfs`
     // (`SECCOMP_RET_TRAP`): the ptrace backend then reports `ENOSYS` and
     // requeues the `SIGSYS`, which reaches the guest for a call it never
-    // made. No listing injects an `fstatfs` any more, whether or not
-    // `seccomp_may_refuse_entry_lookup_syscalls` is set, so the guest gets
-    // no `SIGSYS` in either run; every entry is asked, and keyed alike in
-    // both. Both getdents paths, two reads each.
+    // made. No listing injects an `fstatfs` any more, so the guest gets no
+    // `SIGSYS` whether such a filter traps the call or the call fails with
+    // `ENOSYS`; every entry is asked, and keyed alike in both runs. Both
+    // getdents paths, two reads each.
     #[tokio::test]
     async fn getdents_where_seccomp_may_refuse_the_lookup_injects_no_fstatfs() {
         for tracked in [false, true] {
@@ -15683,7 +15590,6 @@ pub(crate) mod inject_fstat_scratch {
                 let (tool, mut guest) =
                     ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
                 guest.answers_determinize_inode = true;
-                guest.config.seccomp_may_refuse_entry_lookup_syscalls = inherited;
                 if inherited {
                     guest.fstatfs_traps = true;
                 } else {

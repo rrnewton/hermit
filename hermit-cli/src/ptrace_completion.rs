@@ -386,10 +386,10 @@ pub(crate) struct Control {
     epoch: Cell<u64>,
 }
 impl Control {
-    fn new(timeout: Option<crate::RunDeadline>) -> Self {
+    fn new(timeout: Option<Duration>) -> Self {
         Self {
             termination: RefCell::new(None),
-            timeout: timeout.map(|deadline| (deadline.at(), deadline.limit())),
+            timeout: timeout.map(|d| (Instant::now() + d, d)),
             expired: Cell::new(false),
             received_failure: Cell::new(false),
             cancellation_deadline: Cell::new(None),
@@ -492,20 +492,6 @@ fn reject_nested_runtime() -> Result<(), RecoveryRefusal> {
 /// Installs the whole operation before its first poll. `make` must only construct
 /// a future; every ordinary effect and all owned guards belong inside that future.
 pub(crate) fn run<T, F, Make>(timeout: Option<Duration>, make: Make) -> Result<T, Error>
-where
-    T: 'static,
-    F: Future<Output = Result<T, Error>> + 'static,
-    Make: FnOnce(Rc<Control>) -> F,
-{
-    run_until(timeout.map(crate::RunDeadline::starting_now), make)
-}
-
-/// [`run`] with the bound measured to `timeout`, which the caller may have
-/// started before this was called.
-pub(crate) fn run_until<T, F, Make>(
-    timeout: Option<crate::RunDeadline>,
-    make: Make,
-) -> Result<T, Error>
 where
     T: 'static,
     F: Future<Output = Result<T, Error>> + 'static,

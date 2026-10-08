@@ -15,6 +15,9 @@ mod readonly_proc;
 #[path = "common/inode_identity_views.rs"]
 mod inode_identity_views;
 
+#[path = "common/inherited_seccomp.rs"]
+mod inherited_seccomp;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
@@ -25,6 +28,8 @@ use std::process::Command;
 use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+use std::time::Duration;
+use std::time::Instant;
 
 use nix::mount::MsFlags;
 use nix::mount::mount;
@@ -1962,151 +1967,196 @@ fn untracked_directory_descriptor_lists_entries_with_stat_inodes() {
     assert_eq!(stdout, inode_identity_views::scm_getdents_expected_stdout());
 }
 
-#[cfg(target_arch = "x86_64")]
-const AUDIT_ARCH_NATIVE: u32 = 0xc000_003e; // AUDIT_ARCH_X86_64
-#[cfg(target_arch = "aarch64")]
-const AUDIT_ARCH_NATIVE: u32 = 0xc000_00b7; // AUDIT_ARCH_AARCH64
+/// The descriptor the listed-inodes runs below list their directory through.
+/// Nothing else in Hermit or the guest uses it, so a seccomp rule on it
+/// reaches only calls on the listed directory, and not, for example, an
+/// `fstatfs` Hermit makes on a descriptor of its own.
+const LISTED_DESCRIPTOR: u32 = 600;
 
-/// A seccomp program that answers `verdict` for system call `nr` and allows
-/// every other call; a call made through another architecture's calling
-/// convention kills the process.
-fn seccomp_program(nr: libc::c_long, verdict: u32) -> [libc::sock_filter; 7] {
-    let statement = |code: u32, k: u32| libc::sock_filter {
-        code: code as u16,
-        jt: 0,
-        jf: 0,
-        k,
-    };
-    let jump_if_equal = |k: u32, jt: u8, jf: u8| libc::sock_filter {
-        code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
-        jt,
-        jf,
-        k,
-    };
-    let load_word = |offset: u32| statement(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, offset);
-    let ret = |verdict: u32| statement(libc::BPF_RET | libc::BPF_K, verdict);
-    [
-        // struct seccomp_data: nr at offset 0, arch at offset 4.
-        load_word(4),
-        jump_if_equal(AUDIT_ARCH_NATIVE, 1, 0),
-        ret(libc::SECCOMP_RET_KILL_PROCESS),
-        load_word(0),
-        jump_if_equal(u32::try_from(nr).unwrap(), 0, 1),
-        ret(verdict),
-        ret(libc::SECCOMP_RET_ALLOW),
-    ]
+/// The runner's wall-clock timeout multiplier, which also scales its 57 s
+/// per-test kill (`.config/nextest.toml`): unset is 1, and anything else must
+/// be a finite number greater than zero.
+fn wall_timeout_multiplier() -> f64 {
+    const NAME: &str = "HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER";
+    match std::env::var(NAME) {
+        Err(std::env::VarError::NotPresent) => 1.0,
+        Ok(text) => match text.parse::<f64>() {
+            Ok(value) if value.is_finite() && value > 0.0 => value,
+            _ => panic!("{NAME} must be a finite number greater than zero, got {text:?}"),
+        },
+        Err(std::env::VarError::NotUnicode(_)) => panic!("{NAME} must be valid UTF-8"),
+    }
 }
 
-/// List `directory` with the listed-inodes mode of
-/// tests/c/fixtures/inode_identity_views.c, failing on any unsuccessful exit,
-/// and return what it printed with Hermit's log. With `filter`, the process
-/// that becomes Hermit installs it (after no_new_privs) before it executes
-/// Hermit, so Hermit, every thread it starts and every guest inherit it, as
-/// they would a container runtime's filter.
+/// How one listed-inodes run ended and what it printed.
+struct ListedRun {
+    /// `None` when the run was still going after 20 s (times the runner's
+    /// multiplier) and the test killed it, so that a hang fails here, with
+    /// what the run printed, before the runner's own kill.
+    status: Option<std::process::ExitStatus>,
+    elapsed: Duration,
+    stdout: String,
+    stderr: String,
+    /// Processes of the run's session still alive 5 s after it ended, as
+    /// "PID (COMM)". The test kills them.
+    survivors: Vec<String>,
+}
+
+impl ListedRun {
+    fn describe(&self) -> String {
+        format!(
+            "status {:?} after {:?}; processes left in its session: {:?}\nstdout:\n{}\nstderr:\n{}",
+            self.status, self.elapsed, self.survivors, self.stdout, self.stderr
+        )
+    }
+
+    /// The run's exit code; `None` when a signal ended it or the test killed
+    /// it.
+    fn code(&self) -> Option<i32> {
+        self.status.and_then(|status| status.code())
+    }
+}
+
+/// Every live process of session `session`, from /proc. The comm field is
+/// parenthesised and may itself contain spaces and parentheses, so the fields
+/// after it are counted from its LAST `)`; the session is the fourth.
+fn session_pids(session: i32) -> Vec<i32> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|pid| {
+            fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    let after_comm = &stat[stat.rfind(')')? + 1..];
+                    after_comm.split_whitespace().nth(3)?.parse::<i32>().ok()
+                })
+                == Some(session)
+        })
+        .collect()
+}
+
+fn read_in_a_thread(
+    mut pipe: impl std::io::Read + Send + 'static,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = pipe.read_to_end(&mut bytes);
+        bytes
+    })
+}
+
+/// List `directory` through [`LISTED_DESCRIPTOR`] with the listed-inodes
+/// mode of tests/c/fixtures/inode_identity_views.c, on the ptrace backend,
+/// with `--timeout=<timeout>` when given. The process that becomes Hermit
+/// leads a new session, so the test finds every process the run leaves; with
+/// `filter`, it also installs that filter just before it executes Hermit, so
+/// Hermit, every thread it starts and every guest inherit it, as they would a
+/// container runtime's filter.
 fn run_listed_inodes(
     guest: &Path,
     directory: &Path,
-    filter: Option<[libc::sock_filter; 7]>,
-) -> (String, String) {
+    timeout: Option<u32>,
+    filter: Option<inherited_seccomp::Filter>,
+) -> ListedRun {
     let mut command = Command::new(hermit_test::hermit_binary());
+    command.args(["--log=error", "run"]);
+    if let Some(seconds) = timeout {
+        command.arg(format!("--timeout={seconds}"));
+    }
     command.args([
-        // Debug logs the configuration Detcore starts the guest with.
-        "--log=debug",
-        "run",
         "--base-env=minimal",
         "--no-virtualize-cpuid",
         "--max-timeslice=disabled",
         "--",
     ]);
-    command.arg(guest).arg("listed-inodes").arg(directory);
+    command
+        .arg(guest)
+        .arg("listed-inodes")
+        .arg(directory)
+        .arg(LISTED_DESCRIPTOR.to_string());
     hermit_test::configure_guest_execution(&mut command);
     // After configure_guest_execution, which rebuilds the command.
-    if let Some(program) = filter {
-        // SAFETY: prctl and seccomp are async-signal-safe, and the program
-        // was copied into the closure before the fork; the kernel copies it
-        // again, so nothing is allocated after the fork.
-        unsafe {
-            command.pre_exec(move || {
-                let fprog = libc::sock_fprog {
-                    len: program.len() as u16,
-                    filter: program.as_ptr() as *mut libc::sock_filter,
-                };
-                if libc::prctl(
-                    libc::PR_SET_NO_NEW_PRIVS,
-                    1 as libc::c_ulong,
-                    0 as libc::c_ulong,
-                    0 as libc::c_ulong,
-                    0 as libc::c_ulong,
-                ) == 0
-                    && libc::syscall(
-                        libc::SYS_seccomp,
-                        libc::SECCOMP_SET_MODE_FILTER as libc::c_long,
-                        0 as libc::c_long,
-                        &fprog as *const libc::sock_fprog as libc::c_long,
-                    ) == 0
-                {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
-                }
-            });
-        }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: setsid and setrlimit are async-signal-safe and allocate
+    // nothing. They run in the forked child, not yet a session leader, before
+    // the filter's step. A core limit of 0, which Hermit and its guest
+    // inherit, keeps a guest a filter kills with SIGSYS (whose default action
+    // dumps core) from writing a core file.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let no_core = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::setrlimit(libc::RLIMIT_CORE, &no_core) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    if let Some(filter) = filter {
+        filter.install_before_exec(&mut command);
     }
     let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
-    assert!(
-        output.status.success(),
-        "listed-inodes guest failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    (
-        String::from_utf8(output.stdout).expect("listed-inodes output should be UTF-8"),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-    )
-}
-
-/// The launcher's answer as Detcore logged it in the configuration it started
-/// the guest with: true when an inherited filter may refuse a lookup call, so
-/// Detcore numbers every entry from its own lstat.
-fn logged_seccomp_answer(log: &str) -> bool {
-    let field = "seccomp_may_refuse_entry_lookup_syscalls";
-    let falses = log.matches(&format!("{field}: false,")).count();
-    let trues = log.matches(&format!("{field}: true,")).count();
-    match (falses, trues) {
-        (0, 0) => panic!("Hermit logged no {field} in its configuration:\n{log}"),
-        (_, 0) => false,
-        (0, _) => true,
-        _ => panic!("Hermit logged both answers for {field}:\n{log}"),
+    let start = Instant::now();
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
+    let session = child.id() as i32;
+    let stdout = read_in_a_thread(child.stdout.take().expect("stdout is piped"));
+    let stderr = read_in_a_thread(child.stderr.take().expect("stderr is piped"));
+    let bound = Duration::from_secs(20).mul_f64(wall_timeout_multiplier());
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait for hermit") {
+            break Some(status);
+        }
+        if start.elapsed() >= bound {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let elapsed = start.elapsed();
+    let drain_until = Instant::now() + Duration::from_secs(5);
+    while !session_pids(session).is_empty() && Instant::now() < drain_until {
+        std::thread::sleep(Duration::from_millis(20));
     }
+    let survivors = session_pids(session)
+        .into_iter()
+        .map(|pid| {
+            let comm = fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+            format!("{pid} ({})", comm.trim())
+        })
+        .collect();
+    for pid in session_pids(session) {
+        // SAFETY: kill touches no memory of this process, and a stale pid
+        // fails with ESRCH. SIGKILL also ends a call a supervisor holds.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    let run = ListedRun {
+        status,
+        elapsed,
+        stdout: String::from_utf8_lossy(&stdout.join().expect("read stdout")).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr.join().expect("read stderr")).into_owned(),
+        survivors,
+    };
+    eprintln!("{rendered}\n{}", run.describe());
+    run
 }
 
-// The launcher asks whether a seccomp filter Hermit inherits may refuse a call
-// Detcore injects to choose how getdents numbers a directory's entries
-// (`fstatfs`, and on an overlay `mmap`, `statx` and `munmap`). Where one may,
-// Detcore numbers every entry from its own lstat and makes none of those
-// choosing calls (`seccomp_may_refuse_entry_lookup_syscalls`); it still maps
-// and unmaps the buffer each directory snapshot is read into. The numbers a
-// guest lists must not depend on which way was chosen. This lists one directory
-// three times: with no filter; under a filter that refuses only swapon, where
-// the launcher's child finds the lookup calls allowed; and under a filter that
-// fails statx with EPERM, as an allowlist profile does for a call it does not
-// list, so the launcher answers that a lookup call may be refused. Every run
-// must succeed, report the answer expected under its filter, so that the
-// comparison covers both ways of numbering entries, and print the same lines.
-//
-// No run here traps or fails fstatfs itself. The ptrace backend calls fstatfs
-// on a /proc descriptor when it takes over the guest's first process, so under
-// such a filter Hermit stops before the guest starts, whichever way the
-// launcher answered. The launcher's answer to those filters is tested in
-// hermit-cli/src/lib.rs.
-#[test]
-fn listed_inode_numbers_do_not_depend_on_an_inherited_seccomp_filter() {
-    let _guard = hermit_run_lock();
-    let guest = inode_identity_views::compile_guest("listed-inodes");
+/// A directory with three files, a directory and a symbolic link to list.
+fn listed_directory() -> tempfile::TempDir {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("directory to list");
     for name in ["alpha", "beta", "gamma"] {
         fs::write(directory.path().join(name), name).expect("create a file to list");
@@ -2114,50 +2164,536 @@ fn listed_inode_numbers_do_not_depend_on_an_inherited_seccomp_filter() {
     fs::create_dir(directory.path().join("delta")).expect("create a directory to list");
     std::os::unix::fs::symlink("alpha", directory.path().join("epsilon"))
         .expect("create a symlink to list");
+    directory
+}
 
-    let (unfiltered, log) = run_listed_inodes(&guest, directory.path(), None);
-    let mut names: Vec<&str> = unfiltered
-        .lines()
+/// `run` succeeded without leaving a process behind and printed the guest's
+/// pid, [`LISTED_DESCRIPTOR`], every entry of [`listed_directory`] (each with
+/// the inode number its lstat reports, which the guest itself checks), and
+/// its maps.
+fn assert_complete_listing(run: &ListedRun, description: &str) {
+    assert!(
+        run.status.is_some_and(|status| status.success()) && run.survivors.is_empty(),
+        "{description}: {}",
+        run.describe()
+    );
+    let lines: Vec<&str> = run.stdout.lines().collect();
+    assert!(
+        lines.first().is_some_and(|line| line.starts_with("pid "))
+            && lines.get(1) == Some(&format!("directory descriptor {LISTED_DESCRIPTOR}").as_str()),
+        "{description}: {}",
+        run.describe()
+    );
+    let mut names: Vec<&str> = lines[2..]
+        .iter()
+        .take_while(|line| !line.starts_with("maps descriptor "))
         .map(|line| line.split(' ').next().unwrap_or(line))
         .collect();
     names.sort_unstable();
     assert_eq!(
         names,
         [".", "..", "alpha", "beta", "delta", "epsilon", "gamma"],
-        "listing without a filter:\n{unfiltered}"
+        "{description}: {}",
+        run.describe()
     );
     assert!(
-        !logged_seccomp_answer(&log),
-        "with no filter of the test's own the launcher answered that a lookup call may be \
-         refused; does this test run under an inherited seccomp filter?"
+        lines
+            .iter()
+            .any(|line| line.starts_with("maps descriptor "))
+            && lines
+                .iter()
+                .any(|line| line.starts_with("maps ") && !line.starts_with("maps descriptor ")),
+        "{description}: {}",
+        run.describe()
     );
+}
 
-    for (description, filter, answer) in [
-        (
-            "a filter that refuses only swapon",
-            seccomp_program(
-                libc::SYS_swapon,
-                libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
-            ),
-            false,
-        ),
-        (
-            "a filter that fails statx with EPERM",
-            seccomp_program(
-                libc::SYS_statx,
-                libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
-            ),
-            true,
-        ),
-    ] {
-        let (listing, log) = run_listed_inodes(&guest, directory.path(), Some(filter));
-        assert_eq!(
-            logged_seccomp_answer(&log),
-            answer,
-            "the launcher's answer under {description}"
-        );
-        assert_eq!(listing, unfiltered, "{description} changed the listing");
+/// What a listing guest prints before its first getdents: its pid and the
+/// descriptor, taken from `unfiltered`'s complete listing.
+fn printed_before_the_listing(unfiltered: &ListedRun) -> String {
+    let mut lines = unfiltered.stdout.lines();
+    format!(
+        "{}\n{}\n",
+        lines.next().expect("the pid line"),
+        lines.next().expect("the descriptor line")
+    )
+}
+
+/// What a listing guest prints before it opens /proc/self/maps: its pid, the
+/// descriptor and every entry, taken from `unfiltered`'s complete listing.
+fn printed_before_the_maps(unfiltered: &ListedRun) -> String {
+    unfiltered
+        .stdout
+        .lines()
+        .take_while(|line| !line.starts_with("maps descriptor "))
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
+/// A filter that refuses only swapon, which no run here calls: a filter is
+/// installed, and it reaches nothing.
+fn refuse_only_swapon() -> inherited_seccomp::Rule {
+    inherited_seccomp::Rule {
+        nr: libc::SYS_swapon,
+        args: &[],
+        verdict: libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
     }
+}
+
+/// The lstat Detcore injects for each listed entry, `newfstatat(dirfd, name,
+/// buf, AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT)`, answered with `verdict`. The
+/// guest's own lstat passes `AT_SYMLINK_NOFOLLOW` alone, so the rule never
+/// reaches it.
+fn injected_lstat_gets(verdict: u32) -> inherited_seccomp::Filter {
+    inherited_seccomp::Filter::new(&[inherited_seccomp::Rule {
+        nr: libc::SYS_newfstatat,
+        args: &[(3, inherited_seccomp::INJECTED_LOOKUP_FLAGS)],
+        verdict,
+    }])
+}
+
+// The common case: Hermit runs under a seccomp filter it inherits (from a
+// container runtime, say) that allows the lstat Detcore injects for each
+// listed entry. The guest must see exactly what it sees without a filter: the
+// same pid, descriptors, names, inode numbers and maps. The filter refuses
+// only swapon, which nothing here calls, and kills the process on any fstatfs
+// or statx of the listed directory: calls Detcore used to inject to choose how
+// to number entries and must not make any more (the guest itself makes
+// neither), so the guest's survival shows they are absent. An fstatfs Hermit
+// makes on a descriptor of its own is not affected.
+#[test]
+fn an_inherited_seccomp_filter_that_allows_the_lookups_changes_nothing_a_guest_sees() {
+    let _guard = hermit_run_lock();
+    let guest = inode_identity_views::compile_guest("listed-inodes-allowing-filter");
+    let directory = listed_directory();
+    let unfiltered = run_listed_inodes(&guest, directory.path(), None, None);
+    assert_complete_listing(&unfiltered, "without a filter");
+    let kill = libc::SECCOMP_RET_KILL_PROCESS;
+    let filtered = run_listed_inodes(
+        &guest,
+        directory.path(),
+        None,
+        Some(inherited_seccomp::Filter::new(&[
+            refuse_only_swapon(),
+            inherited_seccomp::Rule {
+                nr: libc::SYS_fstatfs,
+                args: &[(0, LISTED_DESCRIPTOR)],
+                verdict: kill,
+            },
+            inherited_seccomp::Rule {
+                nr: libc::SYS_statx,
+                args: &[(0, LISTED_DESCRIPTOR)],
+                verdict: kill,
+            },
+        ])),
+    );
+    assert_complete_listing(
+        &filtered,
+        "a filter that refuses only swapon and kills on fstatfs or statx of the listed directory",
+    );
+    assert_eq!(
+        filtered.stdout, unfiltered.stdout,
+        "the filter changed what the guest printed"
+    );
+}
+
+// A filter that fails every statx with EPERM, as an allowlist profile does for
+// a call it does not list, and allows the lstat Detcore injects for each
+// listed entry. The guest lists the directory as it does without a filter.
+// When it then reads /proc/self/maps, Detcore asks the guest to statx a mapped
+// file (the guest's own executable) to find the superblock of the mount it is
+// on, and the filter refuses that statx, so Detcore ends the run with an
+// error: the guest has printed its pid, descriptor and entries and nothing
+// after them. Without that statx (Hermit before
+// https://github.com/rrnewton/hermit/pull/3255 made none), the guest reads the
+// maps completely under the same filter. The design review of that pull
+// request states R4 as: "No new guest-visible side effects: KVM mmap cursor,
+// guest descriptor numbers, guest PIDs, extra signals." Ending a run that the
+// same filter let finish is a new guest-visible side effect, so this case
+// leaves R4 unmet, and the test asserts what Detcore does, not what R4 asks.
+#[test]
+fn maps_unsatisfied_r4_a_filter_failing_every_statx_ends_the_run_at_the_maps() {
+    let _guard = hermit_run_lock();
+    let guest = inode_identity_views::compile_guest("listed-inodes-statx-eperm-filter");
+    let directory = listed_directory();
+    let unfiltered = run_listed_inodes(&guest, directory.path(), None, None);
+    assert_complete_listing(&unfiltered, "without a filter");
+    let refused = run_listed_inodes(
+        &guest,
+        directory.path(),
+        None,
+        Some(inherited_seccomp::Filter::new(&[inherited_seccomp::Rule {
+            nr: libc::SYS_statx,
+            args: &[],
+            verdict: libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        }])),
+    );
+    assert_eq!(
+        refused.stdout,
+        printed_before_the_maps(&unfiltered),
+        "the guest must have printed its pid, descriptor and entries and nothing of its maps: {}",
+        refused.describe()
+    );
+    assert!(
+        STATX_REFUSED_RUN_ENDED.matches(&refused),
+        "expected {STATX_REFUSED_RUN_ENDED:?}: {}",
+        refused.describe()
+    );
+}
+
+// A filter that fails the injected lstat with EACCES, one of the answers that
+// say only that the name cannot be looked up, while the guest's own lstat of
+// the same name succeeds: a supervisor answering Hermit's call and the guest's
+// differently. Detcore then numbers each entry from the directory's device and
+// the listed inode, which for these entries (none is a mount point) is the key
+// the guest's own lstat finds, so the guest sees what it sees without a filter.
+#[test]
+fn a_filter_failing_only_the_injected_lstat_with_eacces_changes_nothing_a_guest_sees() {
+    let _guard = hermit_run_lock();
+    let guest = inode_identity_views::compile_guest("listed-inodes-eacces-filter");
+    let directory = listed_directory();
+    let unfiltered = run_listed_inodes(&guest, directory.path(), None, None);
+    assert_complete_listing(&unfiltered, "without a filter");
+    let filtered = run_listed_inodes(
+        &guest,
+        directory.path(),
+        None,
+        Some(injected_lstat_gets(
+            libc::SECCOMP_RET_ERRNO | libc::EACCES as u32,
+        )),
+    );
+    assert_complete_listing(&filtered, "with the injected lstat failing with EACCES");
+    assert_eq!(
+        filtered.stdout, unfiltered.stdout,
+        "the filter changed what the guest printed"
+    );
+}
+
+// An inherited filter that refuses the injected lstat with EPERM, an answer
+// that says nothing about the name, as an allowlist profile that does not list
+// newfstatat would. Detcore cannot number the entries without that lstat, so
+// it ends the run with an error before the guest's getdents returns: the guest
+// has printed its pid and descriptor and nothing after them. Without the
+// per-entry lookup (Hermit before https://github.com/rrnewton/hermit/pull/3255
+// made none), the guest lists the directory completely under the same filter.
+// The design review of that pull request states R4 as: "No new guest-visible
+// side effects: KVM mmap cursor, guest descriptor numbers, guest PIDs, extra
+// signals." Ending a run that the same filter let finish is a new
+// guest-visible side effect, so this case leaves R4 unmet, and the test
+// asserts what Detcore does, not what R4 asks.
+#[test]
+fn getdents_unsatisfied_r4_a_filter_refusing_the_injected_lstat_ends_the_run() {
+    let _guard = hermit_run_lock();
+    let guest = inode_identity_views::compile_guest("listed-inodes-refusing-filter");
+    let directory = listed_directory();
+    let unfiltered = run_listed_inodes(&guest, directory.path(), None, None);
+    assert_complete_listing(&unfiltered, "without a filter");
+    let refused = run_listed_inodes(
+        &guest,
+        directory.path(),
+        None,
+        Some(injected_lstat_gets(
+            libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        )),
+    );
+    assert_eq!(
+        refused.stdout,
+        printed_before_the_listing(&unfiltered),
+        "the guest must have printed its pid and descriptor and no entry: {}",
+        refused.describe()
+    );
+    assert!(
+        REFUSED_RUN_ENDED.matches(&refused),
+        "expected {REFUSED_RUN_ENDED:?}: {}",
+        refused.describe()
+    );
+}
+
+// A supervisor that never answers the injected lstat (SECCOMP_RET_USER_NOTIF,
+// with the listener held open and unread): the lstat waits, so the guest's
+// getdents does not return, until `--timeout` ends the run with 124 and names
+// itself on stderr, leaving no process behind. Without the per-entry lookup
+// (Hermit before https://github.com/rrnewton/hermit/pull/3255 made none), the
+// guest lists the directory and exits 0 under the same filter. The design
+// review of that pull request states R4 as: "No new guest-visible side
+// effects: KVM mmap cursor, guest descriptor numbers, guest PIDs, extra
+// signals." A getdents that does not return is a new guest-visible side
+// effect, so this case leaves R4 unmet, and the test asserts what Detcore
+// does, not what R4 asks.
+#[test]
+fn getdents_unsatisfied_r4_an_unanswered_supervisor_holds_the_listing_until_the_timeout() {
+    let _guard = hermit_run_lock();
+    let guest = inode_identity_views::compile_guest("listed-inodes-unanswered-filter");
+    let directory = listed_directory();
+    let unfiltered = run_listed_inodes(&guest, directory.path(), None, None);
+    assert_complete_listing(&unfiltered, "without a filter");
+    let timeout = 3;
+    let held = run_listed_inodes(
+        &guest,
+        directory.path(),
+        Some(timeout),
+        Some(injected_lstat_gets(libc::SECCOMP_RET_USER_NOTIF)),
+    );
+    assert_eq!(
+        held.stdout,
+        printed_before_the_listing(&unfiltered),
+        "the guest must have printed its pid and descriptor and no entry: {}",
+        held.describe()
+    );
+    assert!(
+        held.code() == Some(124)
+            && held.stderr.contains("class=run-timeout")
+            && held.elapsed >= Duration::from_secs(timeout.into())
+            && held.survivors.is_empty(),
+        "the run must be held until its {timeout} s timeout, which must end it with 124 and \
+         class=run-timeout and leave no process: {}",
+        held.describe()
+    );
+}
+
+// A filter that answers the injected lstat with SECCOMP_RET_TRAP: the kernel
+// does not make the call and sends the guest thread SIGSYS, and Detcore ends
+// the run with an error. Without the per-entry lookup (Hermit before
+// https://github.com/rrnewton/hermit/pull/3255 made none), the guest lists the
+// directory and exits 0 under the same filter. The design review of that pull
+// request states R4 as: "No new guest-visible side effects: KVM mmap cursor,
+// guest descriptor numbers, guest PIDs, extra signals." The SIGSYS is one of
+// the extra signals R4 names, and ending a run that the same filter let finish
+// is a new guest-visible side effect, so this case leaves R4 unmet, and the
+// test asserts what Detcore does, not what R4 asks.
+#[test]
+fn getdents_unsatisfied_r4_a_filter_trapping_the_injected_lstat_stops_the_listing() {
+    let _guard = hermit_run_lock();
+    let guest = inode_identity_views::compile_guest("listed-inodes-trap-filter");
+    let directory = listed_directory();
+    let unfiltered = run_listed_inodes(&guest, directory.path(), None, None);
+    assert_complete_listing(&unfiltered, "without a filter");
+    let trapped = run_listed_inodes(
+        &guest,
+        directory.path(),
+        Some(5),
+        Some(injected_lstat_gets(libc::SECCOMP_RET_TRAP)),
+    );
+    assert_eq!(
+        trapped.stdout,
+        printed_before_the_listing(&unfiltered),
+        "the guest must have printed its pid and descriptor and no entry: {}",
+        trapped.describe()
+    );
+    assert!(
+        TRAPPED_RUN_ENDED.matches(&trapped),
+        "expected {TRAPPED_RUN_ENDED:?}: {}",
+        trapped.describe()
+    );
+}
+
+// A filter that answers the injected lstat with SECCOMP_RET_KILL_PROCESS: the
+// kernel kills the guest's whole process with SIGSYS before the call is made.
+// Without the per-entry lookup (Hermit before
+// https://github.com/rrnewton/hermit/pull/3255 made none), the guest lists the
+// directory and exits 0 under the same filter. The design review of that pull
+// request states R4 as: "No new guest-visible side effects: KVM mmap cursor,
+// guest descriptor numbers, guest PIDs, extra signals." The SIGSYS is one of
+// the extra signals R4 names, so this case leaves R4 unmet, and the test
+// asserts what Detcore does, not what R4 asks.
+#[test]
+fn getdents_unsatisfied_r4_a_filter_killing_on_the_injected_lstat_kills_the_guest() {
+    let _guard = hermit_run_lock();
+    let guest = inode_identity_views::compile_guest("listed-inodes-kill-filter");
+    let directory = listed_directory();
+    let unfiltered = run_listed_inodes(&guest, directory.path(), None, None);
+    assert_complete_listing(&unfiltered, "without a filter");
+    let killed = run_listed_inodes(
+        &guest,
+        directory.path(),
+        Some(5),
+        Some(injected_lstat_gets(libc::SECCOMP_RET_KILL_PROCESS)),
+    );
+    assert_eq!(
+        killed.stdout,
+        printed_before_the_listing(&unfiltered),
+        "the guest must have printed its pid and descriptor and no entry: {}",
+        killed.describe()
+    );
+    assert!(
+        KILLED_RUN_ENDED.matches(&killed),
+        "expected {KILLED_RUN_ENDED:?}: {}",
+        killed.describe()
+    );
+}
+
+/// How a run that did not complete ended: with an exit code or a signal,
+/// with texts its stderr contains, and with no process left in its session.
+#[derive(Debug)]
+struct RunEnded {
+    ended: Ended,
+    stderr_contains: &'static [&'static str],
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Ended {
+    Code(i32),
+    Signal(i32),
+}
+
+impl RunEnded {
+    fn matches(&self, run: &ListedRun) -> bool {
+        use std::os::unix::process::ExitStatusExt;
+        let ended = run.status.and_then(|status| match status.code() {
+            Some(code) => Some(Ended::Code(code)),
+            None => status.signal().map(Ended::Signal),
+        });
+        ended.as_ref() == Some(&self.ended)
+            && self
+                .stderr_contains
+                .iter()
+                .all(|text| run.stderr.contains(text))
+            && run.survivors.is_empty()
+    }
+}
+
+/// Detcore refuses to number an entry whose injected lstat failed with an
+/// errno that says nothing about the name, and Hermit ends the run with its
+/// internal-failure code, 125.
+const REFUSED_RUN_ENDED: RunEnded = RunEnded {
+    ended: Ended::Code(125),
+    stderr_contains: &[
+        "HERMIT_INTERNAL_FAILURE class=cli-error",
+        "could not ask the guest to lstat the directory entry ",
+        "EPERM (Operation not permitted); refusing rather than keying the file's identity on \
+         another source",
+    ],
+};
+/// A trapped call is not made and returns ENOSYS, which Detcore refuses like
+/// any errno that says nothing about the name.
+const TRAPPED_RUN_ENDED: RunEnded = RunEnded {
+    ended: Ended::Code(125),
+    stderr_contains: &[
+        "HERMIT_INTERNAL_FAILURE class=cli-error",
+        "could not ask the guest to lstat the directory entry ",
+        "ENOSYS (Invalid system call number); refusing rather than keying the file's identity \
+         on another source",
+    ],
+};
+/// The kernel kills the guest with SIGSYS, and Hermit ends with the guest's
+/// signal.
+const KILLED_RUN_ENDED: RunEnded = RunEnded {
+    ended: Ended::Signal(libc::SIGSYS),
+    stderr_contains: &["guest terminated by signal", "signal=SIGSYS"],
+};
+/// Detcore refuses to key a mapped file whose superblock it could not ask
+/// about, and Hermit ends the run with its internal-failure code, 125.
+const STATX_REFUSED_RUN_ENDED: RunEnded = RunEnded {
+    ended: Ended::Code(125),
+    stderr_contains: &[
+        "HERMIT_INTERNAL_FAILURE class=cli-error",
+        "could not ask the guest to statx ",
+        "EPERM (Operation not permitted); refusing rather than keying the file's identity on \
+         another source",
+    ],
+};
+
+// A program that runs Hermit through the library (`hermit::run_with_output`)
+// starts its guest in its own PID namespace, not in a new one as `hermit run`
+// does, so a process the library forks before the guest shifts the pid the
+// guest sees (Detcore passes getpid through). Here the test runs itself twice
+// in a fresh PID namespace, once unfiltered and once under a filter (installed
+// on every thread) that refuses only swapon, and each time runs the
+// listed-inodes guest through the library. The two guests must print the same
+// pid, descriptor, entries and maps: the filter must not make the library fork
+// anything before the guest, or change what the guest sees.
+#[test]
+fn an_inherited_seccomp_filter_starts_no_process_before_a_library_guest() {
+    const INNER: &str = "HERMIT_LISTED_INODES_LIBRARY_INNER";
+    const GUEST: &str = "HERMIT_LISTED_INODES_LIBRARY_GUEST";
+    const DIRECTORY: &str = "HERMIT_LISTED_INODES_LIBRARY_DIRECTORY";
+    const OUTPUT: &str = "HERMIT_LISTED_INODES_LIBRARY_OUTPUT";
+    const NAME: &str = "an_inherited_seccomp_filter_starts_no_process_before_a_library_guest";
+    if let Some(mode) = std::env::var_os(INNER) {
+        let _guard = hermit_run_lock();
+        match mode.to_str() {
+            Some("unfiltered") => {}
+            Some("filtered") => {
+                inherited_seccomp::Filter::new(&[refuse_only_swapon()]).install_on_this_process()
+            }
+            _ => panic!("{INNER} must be unfiltered or filtered, got {mode:?}"),
+        }
+        let path = |name: &str| {
+            PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("{name} is unset")))
+        };
+        let mut command = ReverieCommand::new(path(GUEST));
+        command
+            .arg("listed-inodes")
+            .arg(path(DIRECTORY))
+            .arg(LISTED_DESCRIPTOR.to_string());
+        // As in chroot_mountinfo_subset_keeps_fdinfo_identity_consistent: the
+        // library does not downgrade the default timeslice when the PMU is
+        // unusable, and nothing here needs preemption.
+        let config = hermit::DetConfig {
+            max_timeslice: None,
+            ..Default::default()
+        };
+        let output = hermit::run_with_output(command, config, false, &None)
+            .expect("run the listing guest through the library");
+        assert_eq!(
+            output.status,
+            reverie::process::ExitStatus::Exited(0),
+            "{mode:?} library run:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::write(path(OUTPUT), &output.stdout).expect("write the guest's output");
+        return;
+    }
+
+    let _guard = hermit_run_lock();
+    let guest = inode_identity_views::compile_guest("listed-inodes-library");
+    let directory = listed_directory();
+    let outputs = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("output directory");
+    let mut printed = Vec::new();
+    for mode in ["unfiltered", "filtered"] {
+        let output_path = outputs.path().join(mode);
+        let mut command = ReverieCommand::new(std::env::current_exe().expect("find test binary"));
+        command
+            .args(["--exact", NAME, "--nocapture"])
+            .env(INNER, mode)
+            .env(GUEST, &guest)
+            .env(DIRECTORY, directory.path())
+            .env(OUTPUT, &output_path)
+            .map_root()
+            .unshare(Namespace::MOUNT | Namespace::PID)
+            .mount(Mount::proc().allow_readonly_fallback());
+        let output = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build the namespace test runtime")
+            .block_on(command.output())
+            .expect("launch the library run in its own PID namespace");
+        assert_eq!(
+            output.status,
+            reverie::process::ExitStatus::Exited(0),
+            "{mode} library run in its own PID namespace:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = fs::read_to_string(&output_path).expect("read the guest's output");
+        eprintln!("{mode} library guest printed:\n{stdout}");
+        printed.push(stdout);
+    }
+    for (mode, stdout) in ["unfiltered", "filtered"].iter().zip(&printed) {
+        let run = ListedRun {
+            status: Some(std::os::unix::process::ExitStatusExt::from_raw(0)),
+            elapsed: Duration::ZERO,
+            stdout: stdout.clone(),
+            stderr: String::new(),
+            survivors: Vec::new(),
+        };
+        assert_complete_listing(&run, mode);
+    }
+    assert_eq!(
+        printed[1], printed[0],
+        "the filter changed what the library's guest printed"
+    );
 }
 
 // Detcore gives the guest's descriptors 0, 1 and 2 one cached stat when it

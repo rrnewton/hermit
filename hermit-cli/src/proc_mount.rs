@@ -17,7 +17,7 @@ use reverie::Pid;
 pub const READONLY_WARNING: &str =
     "hermit: warning: /proc is mounted read-only; guest writes to procfs may fail with EROFS.\n";
 
-pub(crate) fn write_warning(warning: &str) {
+fn write_warning(warning: &str) {
     // While --max-log-bytes is in force, termination must not depend on this
     // write: the loop below waits as long as a full stderr pipe stays unread.
     // write_without_waiting makes one attempt that cannot block and drops the
