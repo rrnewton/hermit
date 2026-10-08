@@ -142,6 +142,14 @@ pub struct EventSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<PhaseSpec>,
 
+    /// Restrict the named `syscall` to calls whose first argument is this file
+    /// descriptor, for example `{"syscall": "writev", "fd": 9, "nth": 3}`: the
+    /// thread's third `writev` to fd 9. Only valid with `syscall`, and only for
+    /// a syscall whose first argument is a file descriptor
+    /// ([`syscall_takes_fd_first`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fd: Option<i32>,
+
     /// A raw instruction pointer, as a hex string like `"0x401f3c"` or decimal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rip: Option<String>,
@@ -266,7 +274,21 @@ pub enum Position {
     /// When the thread's RCB clock reaches this absolute value.
     Rcb(u64),
 
-    /// The `nth` occurrence of a specific syscall, optionally phase-qualified.
+    /// The `nth` occurrence of a specific syscall on the thread, optionally
+    /// phase-qualified and restricted to one file descriptor. The occurrence is
+    /// counted per thread, over that thread's calls that match `sysno` (and
+    /// `fd`), so an anchor needs no calibration run to find a syscall count.
+    ///
+    /// Two properties to know when writing one:
+    /// - What is counted is syscall *entries*, the same unit as
+    ///   [`Position::SyscallCount`]. A matching call that a signal interrupts
+    ///   and the kernel restarts is entered, and counted, again.
+    /// - Like every anchor, it fires at the prehook: an edge orders the BEFORE
+    ///   thread *reaching* its syscall, not that syscall's effect. Under the
+    ///   default scheduler the BEFORE syscall completes before the held thread
+    ///   is re-admitted (equal priorities run in queue order); a run that
+    ///   reorders runnable threads (chaos) or a BEFORE syscall that takes
+    ///   several scheduler turns can let the AFTER thread's effect land first.
     Syscall {
         /// The syscall number.
         sysno: Sysno,
@@ -274,6 +296,8 @@ pub enum Position {
         phase: Option<SyscallPhase>,
         /// 1-based occurrence.
         nth: u64,
+        /// Restrict to calls whose first argument is this file descriptor.
+        fd: Option<i32>,
     },
 
     /// The `nth` execution of the instruction at an absolute address. The address
@@ -300,8 +324,16 @@ impl fmt::Display for Position {
         match self {
             Position::SyscallCount(n) => write!(f, "after {} syscalls", n),
             Position::Rcb(m) => write!(f, "at RCB {}", m),
-            Position::Syscall { sysno, phase, nth } => {
+            Position::Syscall {
+                sysno,
+                phase,
+                nth,
+                fd,
+            } => {
                 write!(f, "{}", sysno.name())?;
+                if let Some(fd) = fd {
+                    write!(f, "(fd={})", fd)?;
+                }
                 if let Some(p) = phase {
                     write!(f, "@{:?}", p)?;
                 }
@@ -337,6 +369,105 @@ impl fmt::Display for Anchor {
         }
         write!(f, "]")
     }
+}
+
+impl Anchor {
+    /// True for an enforced syscall-occurrence anchor: a [`Position::Syscall`]
+    /// with no phase or the prehook phase. The anchor fires at the prehook of
+    /// the thread's `nth` matching syscall, the point where every enforced
+    /// anchor fires. Other phases are not enforced.
+    pub fn is_syscall_occurrence(&self) -> bool {
+        matches!(
+            self.position,
+            Position::Syscall {
+                phase: None | Some(SyscallPhase::Prehook),
+                ..
+            }
+        )
+    }
+
+    /// The per-thread counter this anchor's occurrences are counted in: its
+    /// syscall number and fd, or `None` for any other kind of anchor.
+    pub fn occurrence_key(&self) -> Option<OccurrenceKey> {
+        match &self.position {
+            Position::Syscall { sysno, fd, .. } if self.is_syscall_occurrence() => {
+                Some((*sysno as usize, *fd))
+            }
+            _ => None,
+        }
+    }
+
+    /// True when this is an enforced syscall-occurrence anchor and a call to
+    /// `sysno` with first argument `arg0` is one of the calls it counts.
+    pub fn syscall_occurrence_matches(&self, sysno: Sysno, arg0: usize) -> bool {
+        match &self.position {
+            Position::Syscall {
+                sysno: want, fd, ..
+            } if self.is_syscall_occurrence() && *want == sysno => {
+                // A file descriptor is an `int`: the kernel reads the low 32
+                // bits of the register.
+                fd.is_none_or(|fd| arg0 as u32 as i32 == fd)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The key of one per-thread occurrence counter: a syscall number and an
+/// optional file descriptor ([`Anchor::occurrence_key`]).
+pub type OccurrenceKey = (usize, Option<i32>);
+
+/// One thread's syscall-occurrence counters
+/// ([`HappensBeforeProgram::count_syscall_occurrences`]).
+pub type OccurrenceCounters = BTreeMap<OccurrenceKey, u64>;
+
+/// True when `sysno`'s first argument is a file descriptor, so an anchor may
+/// restrict it with `fd`. The list is the fd-first syscalls a guest is likely to
+/// anchor on; an `fd` on any other syscall is refused when the spec is loaded
+/// rather than matched against an argument that is not a descriptor.
+pub fn syscall_takes_fd_first(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        Sysno::read
+            | Sysno::write
+            | Sysno::readv
+            | Sysno::writev
+            | Sysno::pread64
+            | Sysno::pwrite64
+            | Sysno::preadv
+            | Sysno::pwritev
+            | Sysno::preadv2
+            | Sysno::pwritev2
+            | Sysno::close
+            | Sysno::fsync
+            | Sysno::fdatasync
+            | Sysno::ioctl
+            | Sysno::fcntl
+            | Sysno::lseek
+            | Sysno::fstat
+            | Sysno::ftruncate
+            | Sysno::fallocate
+            | Sysno::flock
+            | Sysno::getdents64
+            | Sysno::sendto
+            | Sysno::recvfrom
+            | Sysno::sendmsg
+            | Sysno::recvmsg
+            | Sysno::sendmmsg
+            | Sysno::recvmmsg
+            | Sysno::accept
+            | Sysno::accept4
+            | Sysno::connect
+            | Sysno::bind
+            | Sysno::listen
+            | Sysno::shutdown
+            | Sysno::epoll_wait
+            | Sysno::epoll_pwait
+            | Sysno::epoll_ctl
+            | Sysno::dup
+            | Sysno::dup2
+            | Sysno::dup3
+    )
 }
 
 /// A normalized happens-before edge between two anchors.
@@ -388,13 +519,66 @@ impl HappensBeforeProgram {
         })
     }
 
-    /// Anchors whose position kind the current scheduler does not yet enforce
-    /// (everything other than [`Position::SyscallCount`]). Reported so a run does
-    /// not silently ignore an authored ordering constraint it cannot honor.
-    pub fn unenforced_positions(&self) -> impl Iterator<Item = &Anchor> {
+    /// True when the program has any enforced syscall-occurrence anchor
+    /// ([`Anchor::is_syscall_occurrence`]), so the guest must count its calls.
+    pub fn has_syscall_occurrence_anchors(&self) -> bool {
+        self.anchors.values().any(Anchor::is_syscall_occurrence)
+    }
+
+    /// Count one syscall entry of thread `dettid` (`sysno`, first argument
+    /// `arg0`) in that thread's `counters`, and return the names of the
+    /// syscall-occurrence anchors this entry is the `nth` occurrence of.
+    ///
+    /// `counters` belongs to one thread and is kept with its other per-thread
+    /// counts (the syscall count that count anchors use), so it starts at zero
+    /// for every new thread. It counts, per distinct (syscall, fd) an anchor
+    /// names, every entry of that thread that matches; an entry that matches
+    /// both an fd-specific and an fd-agnostic anchor counts toward each. An
+    /// entry is counted exactly once, when the thread enters the syscall, so a
+    /// thread held at an anchor and re-admitted does not count again. The
+    /// result names anchors on `dettid` or on a spawn ordinal; the scheduler
+    /// resolves spawn ordinals and fires only the anchors on this thread.
+    pub fn count_syscall_occurrences(
+        &self,
+        counters: &mut OccurrenceCounters,
+        dettid: DetTid,
+        sysno: Sysno,
+        arg0: usize,
+    ) -> Vec<String> {
+        let keys: BTreeSet<OccurrenceKey> = self
+            .anchors
+            .values()
+            .filter(|a| a.syscall_occurrence_matches(sysno, arg0))
+            .filter_map(Anchor::occurrence_key)
+            .collect();
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        for key in &keys {
+            *counters.entry(*key).or_insert(0) += 1;
+        }
         self.anchors
             .values()
-            .filter(|a| !matches!(a.position, Position::SyscallCount(_)))
+            .filter(|a| {
+                a.syscall_occurrence_matches(sysno, arg0)
+                    && a.thread.dettid.is_none_or(|d| d == dettid)
+            })
+            .filter(|a| match (&a.position, a.occurrence_key()) {
+                (Position::Syscall { nth, .. }, Some(key)) => counters.get(&key) == Some(nth),
+                _ => false,
+            })
+            .map(|a| a.name.clone())
+            .collect()
+    }
+
+    /// Anchors whose position kind the current scheduler does not yet enforce:
+    /// everything other than [`Position::SyscallCount`] and the syscall
+    /// occurrence anchors ([`Anchor::is_syscall_occurrence`]). Reported so a run
+    /// does not silently ignore an authored ordering constraint it cannot honor.
+    pub fn unenforced_positions(&self) -> impl Iterator<Item = &Anchor> {
+        self.anchors.values().filter(|a| {
+            !matches!(a.position, Position::SyscallCount(_)) && !a.is_syscall_occurrence()
+        })
     }
 }
 
@@ -420,6 +604,19 @@ pub enum HappensBeforeError {
         event: String,
         /// The unparseable name.
         name: String,
+    },
+    /// An event set `fd` without `syscall`.
+    FdWithoutSyscall {
+        /// The offending event name.
+        event: String,
+    },
+    /// An event set `fd` on a syscall whose first argument is not a file
+    /// descriptor ([`syscall_takes_fd_first`]).
+    FdNotFirstArgument {
+        /// The offending event name.
+        event: String,
+        /// The syscall name.
+        syscall: String,
     },
     /// A RIP string could not be parsed as an address.
     BadRip {
@@ -482,6 +679,17 @@ impl fmt::Display for HappensBeforeError {
             HappensBeforeError::UnknownSyscall { event, name } => {
                 write!(f, "event '{}' names unknown syscall '{}'", event, name)
             }
+            HappensBeforeError::FdWithoutSyscall { event } => write!(
+                f,
+                "event '{}' sets 'fd' without 'syscall'; 'fd' restricts a named syscall",
+                event
+            ),
+            HappensBeforeError::FdNotFirstArgument { event, syscall } => write!(
+                f,
+                "event '{}' sets 'fd' on syscall '{}', whose first argument is not a file \
+                 descriptor",
+                event, syscall
+            ),
             HappensBeforeError::BadRip { event, text } => {
                 write!(f, "event '{}' has unparseable rip '{}'", event, text)
             }
@@ -616,6 +824,12 @@ impl HappensBeforeSpec {
             });
         }
 
+        if ev.fd.is_some() && ev.syscall.is_none() {
+            return Err(HappensBeforeError::FdWithoutSyscall {
+                event: name.to_string(),
+            });
+        }
+
         let nth = ev.nth.unwrap_or(1);
         let position = if let Some(n) = ev.syscalls {
             Position::SyscallCount(n)
@@ -626,10 +840,17 @@ impl HappensBeforeSpec {
                 event: name.to_string(),
                 name: sc.clone(),
             })?;
+            if ev.fd.is_some() && !syscall_takes_fd_first(sysno) {
+                return Err(HappensBeforeError::FdNotFirstArgument {
+                    event: name.to_string(),
+                    syscall: sc.clone(),
+                });
+            }
             Position::Syscall {
                 sysno,
                 phase: ev.phase.map(Into::into),
                 nth,
+                fd: ev.fd,
             }
         } else if let Some(rip) = &ev.rip {
             let addr = parse_rip(rip).ok_or_else(|| HappensBeforeError::BadRip {
@@ -1028,6 +1249,128 @@ mod tests {
         assert!(!prog.may_have_syscall_count_anchor_at(DetTid::from_raw(7), 40));
     }
 
+    /// `{"syscall": "writev", "fd": 9, "nth": 3}` is the thread's third
+    /// `writev` to fd 9: a syscall-occurrence anchor that needs no calibration.
+    #[test]
+    fn syscall_fd_anchor_normalizes_and_displays() {
+        let prog = HappensBeforeSpec::from_json(
+            r#"{"version": 1,
+                "events": {"m": {"thread": "7", "syscall": "writev", "fd": 9, "nth": 3}}}"#,
+        )
+        .unwrap()
+        .normalize()
+        .unwrap();
+        let anchor = &prog.anchors["m"];
+        assert_eq!(
+            anchor.position,
+            Position::Syscall {
+                sysno: Sysno::writev,
+                phase: None,
+                nth: 3,
+                fd: Some(9),
+            }
+        );
+        assert_eq!(anchor.position.to_string(), "writev(fd=9)#3");
+        assert!(anchor.is_syscall_occurrence());
+        assert_eq!(prog.unenforced_positions().count(), 0);
+    }
+
+    /// `fd` restricts a named syscall whose first argument is a descriptor; set
+    /// anywhere else it is refused by name when the spec is loaded, never
+    /// matched against an argument that is not a descriptor.
+    #[test]
+    fn syscall_fd_anchor_is_refused_where_it_cannot_apply() {
+        let err = HappensBeforeSpec::from_json(
+            r#"{"version": 1, "events": {"x": {"thread": "7", "syscalls": 5, "fd": 9}}}"#,
+        )
+        .unwrap()
+        .normalize()
+        .unwrap_err();
+        assert_eq!(
+            err,
+            HappensBeforeError::FdWithoutSyscall {
+                event: "x".to_string()
+            }
+        );
+        let err = HappensBeforeSpec::from_json(
+            r#"{"version": 1, "events": {"y": {"thread": "7", "syscall": "getpid", "fd": 9}}}"#,
+        )
+        .unwrap()
+        .normalize()
+        .unwrap_err();
+        assert_eq!(
+            err,
+            HappensBeforeError::FdNotFirstArgument {
+                event: "y".to_string(),
+                syscall: "getpid".to_string()
+            }
+        );
+        assert!(err.to_string().contains("'y'"), "{err}");
+    }
+
+    /// Occurrences are counted per thread over the calls that match: the
+    /// anchor's syscall and, when it has one, its fd (the register's low 32
+    /// bits). The second matching `writev` to fd 9 reaches an `nth: 2` anchor
+    /// even with non-matching calls in between, an fd-agnostic anchor counts
+    /// every fd, a spawn-ordinal anchor is returned on any thread (the
+    /// scheduler resolves it), and a posthook anchor is never counted and is
+    /// reported as unenforced.
+    #[test]
+    fn count_syscall_occurrences_is_exact_per_thread() {
+        let prog = HappensBeforeSpec::from_json(
+            r#"{"version": 1,
+                "threads": {"S1": {"spawn_ordinal": 1}},
+                "events": {"fd9": {"thread": "7", "syscall": "writev", "fd": 9, "nth": 2},
+                           "anyfd": {"thread": "7", "syscall": "writev", "nth": 3},
+                           "spawned": {"thread": "S1", "syscall": "write", "fd": 1},
+                           "post": {"thread": "7", "syscall": "close", "phase": "post"}}}"#,
+        )
+        .unwrap()
+        .normalize()
+        .unwrap();
+        assert!(prog.has_syscall_occurrence_anchors());
+        let t7 = DetTid::from_raw(7);
+        let t8 = DetTid::from_raw(8);
+        let mut c7 = OccurrenceCounters::new();
+        let count = |c: &mut OccurrenceCounters, t, sysno, arg0| {
+            prog.count_syscall_occurrences(c, t, sysno, arg0)
+        };
+        assert!(count(&mut c7, t7, Sysno::writev, 9).is_empty());
+        // Another fd and another syscall do not count toward fd9.
+        assert!(count(&mut c7, t7, Sysno::writev, 8).is_empty());
+        assert!(count(&mut c7, t7, Sysno::write, 9).is_empty());
+        // Low 32 bits: this is fd 9, the second, and the third writev of any fd.
+        assert_eq!(
+            count(&mut c7, t7, Sysno::writev, 0x1_0000_0009),
+            ["anyfd", "fd9"]
+        );
+        assert!(count(&mut c7, t7, Sysno::writev, 9).is_empty());
+        // Thread 8 has its own counters; anchors on thread 7 are never its.
+        let mut c8 = OccurrenceCounters::new();
+        assert!(count(&mut c8, t8, Sysno::writev, 9).is_empty());
+        assert!(count(&mut c8, t8, Sysno::writev, 9).is_empty());
+        // A spawn-ordinal anchor is returned on any thread at its nth.
+        assert_eq!(count(&mut c8, t8, Sysno::write, 1), ["spawned"]);
+        assert!(count(&mut c8, t8, Sysno::write, 2).is_empty());
+        // A posthook anchor is not enforced, never counted.
+        assert!(count(&mut c7, t7, Sysno::close, 3).is_empty());
+        assert!(!c7.contains_key(&(Sysno::close as usize, None)));
+        let unenforced: Vec<&str> = prog
+            .unenforced_positions()
+            .map(|a| a.name.as_str())
+            .collect();
+        assert_eq!(unenforced, ["post"]);
+        // A count anchor is not a syscall-occurrence anchor and is unaffected.
+        assert!(!prog.may_have_syscall_count_anchor_at(t7, 2));
+        let count_only = HappensBeforeSpec::from_json(
+            r#"{"version": 1, "events": {"a": {"thread": "7", "syscalls": 2}}}"#,
+        )
+        .unwrap()
+        .normalize()
+        .unwrap();
+        assert!(!count_only.has_syscall_occurrence_anchors());
+    }
+
     #[test]
     fn parse_and_normalize_rfc_example() {
         let spec = HappensBeforeSpec::from_json(spec_json()).unwrap();
@@ -1052,7 +1395,12 @@ mod tests {
 
         // Syscall anchor parses the name and phase.
         match &prog.anchors["lockA"].position {
-            Position::Syscall { sysno, phase, nth } => {
+            Position::Syscall {
+                sysno,
+                phase,
+                nth,
+                fd: None,
+            } => {
                 assert_eq!(*sysno, Sysno::futex);
                 assert_eq!(*phase, Some(SyscallPhase::Posthook));
                 assert_eq!(*nth, 5);

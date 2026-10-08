@@ -545,9 +545,14 @@ fn blocking_request_is_ready(
 /// a seed lottery. An anchor "fires" when its thread is granted passage past the
 /// corresponding checkpoint (see [`Scheduler::hb_checkpoint`]).
 ///
-/// Only [`Position::SyscallCount`] anchors are enforced in this milestone. Other
-/// position kinds are retained for diagnostics but never fire; [`HbRuntime::new`]
-/// warns about them so a run never silently ignores an ordering constraint.
+/// Two position kinds are enforced: [`Position::SyscallCount`] and the syscall
+/// occurrence anchors (`Anchor::is_syscall_occurrence`, "the thread's Nth
+/// `writev` to fd 9"), which the guest counts per thread and names in its
+/// checkpoint ([`HbRuntime::occurrence_anchors_on`]). Other position kinds are retained
+/// for diagnostics but never fire; [`HbRuntime::new`] warns about them so a run
+/// never silently ignores an ordering constraint. A syscall-occurrence anchor
+/// that never fires is refused by name when the scheduler finishes
+/// ([`HbRuntime::unfired_occurrence_report`]).
 #[derive(Debug)]
 struct HbRuntime {
     /// The validated, normalized program (anchors indexed by name, plus edges).
@@ -627,6 +632,68 @@ impl HbRuntime {
             })
             .map(|a| a.name.clone())
             .collect()
+    }
+
+    /// Of the syscall-occurrence anchors a checkpoint names (the guest counted
+    /// them reached on its thread), the ones that are syscall-occurrence
+    /// anchors on `dettid`: its own dettid, or a spawn ordinal that resolves to
+    /// it. A name that is not such an anchor on this thread is ignored.
+    fn occurrence_anchors_on(&self, dettid: DetTid, names: &[String]) -> Vec<String> {
+        names
+            .iter()
+            .filter(|name| {
+                self.program.anchors.get(*name).is_some_and(|a| {
+                    a.is_syscall_occurrence() && self.thread_matches(&a.thread, dettid)
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The refusal for syscall-occurrence anchors that never fired, or `None`
+    /// when every one fired. Such an anchor names a point the guest never
+    /// reached (or reached fewer than `nth` times), so an edge it is part of
+    /// was never exercised; the run must say so rather than pass. Lists the
+    /// anchors in name order, each with its position and the edges that use
+    /// it, and carries no host-dependent text, so it is byte-identical across
+    /// runs. Count anchors are not covered: an unreached count anchor is
+    /// silently ignored, as before.
+    fn unfired_occurrence_report(&self) -> Option<String> {
+        let unfired: Vec<String> = self
+            .program
+            .anchors
+            .values()
+            .filter(|a| a.is_syscall_occurrence() && !self.fired.contains(&a.name))
+            .map(|a| {
+                let edges: Vec<String> = self
+                    .program
+                    .edges
+                    .iter()
+                    .filter(|e| e.before == a.name || e.after == a.name)
+                    .map(|e| format!("{} -> {}", e.before, e.after))
+                    .collect();
+                format!(
+                    "  anchor '{}' on thread {}: {} never fired (edges: {})",
+                    a.name,
+                    a.thread.label,
+                    a.position,
+                    if edges.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        edges.join(", ")
+                    }
+                )
+            })
+            .collect();
+        if unfired.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "HERMIT_HB_ANCHOR_NEVER_FIRED: {} happens-before syscall-occurrence anchor(s) never \
+             fired before the guest finished, so the ordering they name was not exercised:\n{}",
+            unfired.len(),
+            unfired.join("\n")
+        ))
     }
 
     /// True when anchor `name` is the AFTER endpoint of a Hard edge whose BEFORE
@@ -1597,6 +1664,18 @@ async fn sched_loop_inner(
                 && sched.pending_run_queue_removals.is_empty()
                 && !sched.control_barrier()
             {
+                // A syscall-occurrence anchor that never fired names an ordering
+                // the run never exercised: refuse by name instead of passing.
+                // Printed like the deadlock report (no timestamp), so it is
+                // byte-identical across runs.
+                if let Some(report) = sched
+                    .happens_before
+                    .as_ref()
+                    .and_then(HbRuntime::unfired_occurrence_report)
+                {
+                    eprintln!("{}", report);
+                    std::process::exit(detcore_model::HERMIT_POLICY_REFUSAL_EXIT);
+                }
                 info!("[scheduler] run queue empty, exiting sched_loop.");
                 if let Some(observer) = &observer {
                     observer("run queue empty; scheduler completed");
@@ -2376,13 +2455,19 @@ impl Scheduler {
     /// queue until a later firing wakes it. Mirrors the `SleepUntil` park/skip
     /// protocol: the request/response ivars are left intact so the re-admitted
     /// thread re-evaluates this same checkpoint on its next turn.
-    fn hb_checkpoint(&mut self, dettid: DetTid, count: u64) -> Result<(), SkipTurn> {
+    fn hb_checkpoint(
+        &mut self,
+        dettid: DetTid,
+        count: u64,
+        occurrence_anchors: &[String],
+    ) -> Result<(), SkipTurn> {
         let (reached, blocked) = {
             let hb = self
                 .happens_before
                 .as_ref()
                 .expect("hb checkpoint issued without a happens-before program");
-            let reached = hb.anchors_at_syscall(dettid, count);
+            let mut reached = hb.anchors_at_syscall(dettid, count);
+            reached.extend(hb.occurrence_anchors_on(dettid, occurrence_anchors));
             let blocked = reached.iter().any(|name| hb.anchor_blocked(name));
             (reached, blocked)
         };
@@ -6137,7 +6222,10 @@ impl Scheduler {
             // A guest thread checking in at a happens-before anchor point. Delegate
             // to the enforcement logic, which either grants passage (firing anchors)
             // or parks the thread until its gating BEFORE anchor fires.
-            ResourceID::HappensBeforeCheckpoint(count) => self.hb_checkpoint(dettid, *count),
+            ResourceID::HappensBeforeCheckpoint(count) => self.hb_checkpoint(dettid, *count, &[]),
+            ResourceID::HappensBeforeSyscallCheckpoint { count, anchors } => {
+                self.hb_checkpoint(dettid, *count, anchors)
+            }
 
             // A host-async SIGCHLD (a guest child process exited) is delivered to
             // the parent at a moment decided by host timing. Committing that turn
@@ -13561,6 +13649,62 @@ mod test {
             "the gate's checkpoint request was replaced: {:?}",
             request.resources.keys().collect::<Vec<_>>()
         );
+    }
+
+    /// One syscall can reach a count anchor and a syscall-occurrence anchor at
+    /// once (the commit claims both are evaluated): the checkpoint must fire
+    /// both. Of the occurrence anchors the guest names, only those on this
+    /// thread fire; a spawn-ordinal anchor that resolves to another thread, and
+    /// a name that is not an anchor, are ignored.
+    #[test]
+    fn checkpoint_fires_count_and_occurrence_anchors_reached_at_one_syscall() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        scheduler.happens_before = Some(hb_runtime(
+            r#"{"version": 1,
+                "threads": {"S2": {"spawn_ordinal": 2}},
+                "events": {"count": {"thread": "5", "syscalls": 13},
+                           "occ": {"thread": "5", "syscall": "writev", "fd": 9, "nth": 2},
+                           "other": {"thread": "S2", "syscall": "writev", "fd": 9, "nth": 2}}}"#,
+        ));
+        let named = ["occ", "other", "missing"].map(str::to_owned);
+        assert!(
+            scheduler
+                .hb_checkpoint(DetTid::from_raw(5), 13, &named)
+                .is_ok()
+        );
+        let hb = scheduler.happens_before.as_ref().unwrap();
+        let fired: Vec<&str> = hb.fired.iter().map(String::as_str).collect();
+        assert_eq!(fired, ["count", "occ"]);
+        assert!(hb.wake_pending);
+    }
+
+    /// A syscall-occurrence anchor that never fired is refused by name when the
+    /// run finishes, with its position and the edges that use it. A count
+    /// anchor that never fired is not part of the refusal (unchanged behavior),
+    /// and once every occurrence anchor has fired there is nothing to refuse.
+    #[test]
+    fn unfired_occurrence_anchor_is_reported_by_name() {
+        let mut hb = hb_runtime(
+            r#"{"version": 1,
+                "events": {"c": {"thread": "3", "syscalls": 1000000000},
+                           "w": {"thread": "5", "syscall": "writev", "fd": 9, "nth": 2}},
+                "edges": [{"before": "c", "after": "w", "strength": "hard"}]}"#,
+        );
+        let report = hb
+            .unfired_occurrence_report()
+            .expect("an unfired occurrence anchor must be refused");
+        assert!(
+            report.starts_with("HERMIT_HB_ANCHOR_NEVER_FIRED: 1 happens-before"),
+            "{report}"
+        );
+        assert!(
+            report.contains("anchor 'w' on thread 5: writev(fd=9)#2 never fired (edges: c -> w)"),
+            "{report}"
+        );
+        assert!(!report.contains("anchor 'c'"), "{report}");
+        hb.fired.insert("w".to_owned());
+        assert!(hb.unfired_occurrence_report().is_none());
     }
 
     /// The enforcement predicates that drive `hb_checkpoint`: an anchor is

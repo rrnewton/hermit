@@ -1554,6 +1554,13 @@ pub struct ThreadStats {
     /// A simple count of how many syscalls have been handled on this thread.
     pub syscall_count: u64,
 
+    /// This thread's happens-before syscall-occurrence counters: per (syscall,
+    /// fd) a syscall-occurrence anchor names, how many of this thread's
+    /// syscall entries matched (`HappensBeforeProgram::count_syscall_occurrences`).
+    /// Empty unless the run has such an anchor; zero for every new thread, like
+    /// `syscall_count`.
+    pub hb_occurrences: detcore_model::happens_before::OccurrenceCounters,
+
     /// How many register-file samples this thread has CONSIDERED for `--detlog-regs`.
     ///
     /// This is the cadence index, and it exists because no pre-existing counter is a clean

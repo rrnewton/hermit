@@ -8643,6 +8643,201 @@ fn happens_before_process_exit_with_a_held_worker_exits_zero() {
     );
 }
 
+/// A spec written against `tests/c/hb_two_threads.c` with syscall-occurrence
+/// anchors: "thread T's 1st `write` to fd 1". No calibration run, no syscall
+/// count. The main thread is dettid 3 and its pthread worker dettid 5, which
+/// Hermit allocates deterministically.
+fn fd_anchor_order_spec(directory: &Path, name: &str, first: &str, second: &str) -> String {
+    let spec = directory.join(name);
+    fs::write(
+        &spec,
+        format!(
+            r#"{{"version": 1,
+                "events": {{"first_writes": {{"thread": "{first}", "syscall": "write", "fd": 1, "nth": 1}},
+                            "second_writes": {{"thread": "{second}", "syscall": "write", "fd": 1, "nth": 1}}}},
+                "edges": [{{"before": "first_writes", "after": "second_writes", "strength": "hard"}}]}}"#
+        ),
+    )
+    .unwrap();
+    spec.to_str().unwrap().to_owned()
+}
+
+/// Syscall-occurrence anchors order two threads without calibration. The
+/// same guest runs under two specs that differ only in which thread's first
+/// `write` to fd 1 comes first; each output must follow its spec. One of the
+/// two orders reverses the guest's default order, and that run must show the
+/// thread held at its gate, so the test fails if the anchors never act (a
+/// spec that is silently ignored leaves the default order in both runs).
+#[test]
+fn happens_before_fd_anchors_order_two_threads_without_calibration() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = hb_two_threads_guest().to_str().unwrap().to_owned();
+    let args = ["run", "--strict", "--", guest.as_str()];
+    let default_run = hermit(&args);
+    assert_success(&default_run, &args);
+    let default_stdout = String::from_utf8_lossy(&default_run.stdout).into_owned();
+    for (name, first, second, expected) in [
+        ("main-first.json", "3", "5", "main!\nworker\n"),
+        ("worker-first.json", "5", "3", "worker\nmain!\n"),
+    ] {
+        let spec = fd_anchor_order_spec(directory.path(), name, first, second);
+        let args = [
+            "--log",
+            "info",
+            "run",
+            "--strict",
+            "--happens-before",
+            spec.as_str(),
+            "--",
+            guest.as_str(),
+        ];
+        let ordered = hermit(&args);
+        let log = stderr(&ordered);
+        assert_success(&ordered, &args);
+        assert_eq!(
+            String::from_utf8_lossy(&ordered.stdout),
+            expected,
+            "{name}: thread {first}'s first write to fd 1 did not come before thread {second}'s"
+        );
+        if expected != default_stdout {
+            assert!(
+                log.contains(&format!(
+                    "SKIP dettid {second} held at happens-before anchor(s) [\"second_writes\"]"
+                )),
+                "{name} reversed the default order {default_stdout:?} without holding thread \
+                 {second} at its gate"
+            );
+        }
+    }
+}
+
+/// A syscall-occurrence anchor that never fires is refused by name: the
+/// guest's worker never writes to fd 77, so the anchor naming its first such
+/// write never fires, and the run must fail with HERMIT_HB_ANCHOR_NEVER_FIRED
+/// naming it, after the guest itself completed, rather than exit 0 with the
+/// edge unexercised.
+#[test]
+fn happens_before_fd_anchor_that_never_fires_is_refused_by_name() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = hb_two_threads_guest().to_str().unwrap().to_owned();
+    let spec = directory.path().join("phantom.json");
+    fs::write(
+        &spec,
+        r#"{"version": 1,
+            "events": {"main_writes": {"thread": "3", "syscall": "write", "fd": 1, "nth": 1},
+                       "phantom": {"thread": "5", "syscall": "write", "fd": 77, "nth": 1}},
+            "edges": [{"before": "main_writes", "after": "phantom", "strength": "hard"}]}"#,
+    )
+    .unwrap();
+    let spec = spec.to_str().unwrap().to_owned();
+    let args = [
+        "run",
+        "--strict",
+        "--happens-before",
+        spec.as_str(),
+        "--",
+        guest.as_str(),
+    ];
+    let output = hermit(&args);
+    let log = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "a happens-before anchor that never fired must end the run with the policy-refusal \
+         status, not the guest's:\n{log}"
+    );
+    assert!(
+        log.contains("HERMIT_HB_ANCHOR_NEVER_FIRED: 1 happens-before syscall-occurrence anchor(s)")
+            && log.contains(
+                "anchor 'phantom' on thread 5: write(fd=77)#1 never fired (edges: main_writes -> phantom)"
+            ),
+        "no refusal naming the anchor that never fired:\n{log}"
+    );
+    assert!(!log.contains("anchor 'main_writes'"), "{log}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("worker\n") && stdout.contains("main!\n"),
+        "the guest did not complete before the refusal: {stdout:?}"
+    );
+}
+
+/// A shell guest whose backgrounded child writes three lines with other
+/// syscalls (`read`) in between, while the parent writes three lines.
+const HB_FD_NTH_GUEST: [&str; 3] = [
+    "/bin/sh",
+    "-c",
+    "(echo c1; read x < /proc/self/stat; echo c2; read x < /proc/self/stat; echo c3) & \
+     echo p1; echo p2; echo p3; wait",
+];
+
+/// Syscall-occurrence anchors past the first occurrence, end to end. The
+/// child (the first spawned thread, `spawn_ordinal` 1) and the parent
+/// (dettid 3) each write three lines to fd 1, the child with non-matching
+/// `read`s in between. One spec requires the child's 3rd write before the
+/// parent's 2nd, the other the parent's 3rd before the child's 2nd; each
+/// output must respect its edge, and a run whose order differs from the
+/// default must show a thread held at the gate.
+#[test]
+fn happens_before_fd_anchor_counts_past_the_first_occurrence() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut args = vec!["run", "--strict", "--"];
+    args.extend(HB_FD_NTH_GUEST);
+    let default_run = hermit(&args);
+    assert_success(&default_run, &args);
+    let default_stdout = String::from_utf8_lossy(&default_run.stdout).into_owned();
+    for (name, first, first_nth, second, second_nth, before, after) in [
+        ("child-c3-first.json", "child", 3, "parent", 2, "c3", "p2"),
+        ("parent-p3-first.json", "parent", 3, "child", 2, "p3", "c2"),
+    ] {
+        let spec = directory.path().join(name);
+        fs::write(
+            &spec,
+            format!(
+                r#"{{"version": 1,
+                    "threads": {{"parent": {{"dettid": 3}}, "child": {{"spawn_ordinal": 1}}}},
+                    "events": {{"first_writes": {{"thread": "{first}", "syscall": "write", "fd": 1, "nth": {first_nth}}},
+                                "second_writes": {{"thread": "{second}", "syscall": "write", "fd": 1, "nth": {second_nth}}}}},
+                    "edges": [{{"before": "first_writes", "after": "second_writes", "strength": "hard"}}]}}"#
+            ),
+        )
+        .unwrap();
+        let spec = spec.to_str().unwrap().to_owned();
+        let mut args = vec![
+            "--log",
+            "info",
+            "run",
+            "--strict",
+            "--happens-before",
+            spec.as_str(),
+            "--",
+        ];
+        args.extend(HB_FD_NTH_GUEST);
+        let ordered = hermit(&args);
+        let log = stderr(&ordered);
+        assert_success(&ordered, &args);
+        let stdout = String::from_utf8_lossy(&ordered.stdout).into_owned();
+        let lines: Vec<&str> = stdout.lines().collect();
+        let at = |line: &str| {
+            lines
+                .iter()
+                .position(|l| *l == line)
+                .unwrap_or_else(|| panic!("{name}: no line {line:?} in {stdout:?}"))
+        };
+        assert!(
+            at(before) < at(after),
+            "{name}: {first}'s write #{first_nth} ({before}) did not come before {second}'s \
+             write #{second_nth} ({after}): {stdout:?}"
+        );
+        if stdout != default_stdout {
+            assert!(
+                log.contains("held at happens-before anchor(s) [\"second_writes\"]"),
+                "{name} changed the default order {default_stdout:?} to {stdout:?} without \
+                 holding a thread at the gate"
+            );
+        }
+    }
+}
+
 /// `--hb-list-events` prints the resolved spec and exits 0 without running
 /// the guest; the anchors it cannot resolve are named on stderr.
 #[test]

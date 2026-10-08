@@ -862,8 +862,12 @@ pub struct RunOpts {
     /// Path to a happens-before specification (JSON; see RFC #1146) that places
     /// deterministic ordering edges between anchored events. Anchor code
     /// locations (`func`, `file:line`) are resolved against the guest program's
-    /// debug info. Scheduler enforcement is not yet wired; combine with
-    /// `--hb-list-events` to preview how the spec resolves against the binary.
+    /// debug info. The scheduler enforces anchors that name "the thread's Nth
+    /// syscall" and anchors that name a syscall, optionally on one file
+    /// descriptor ({"syscall": "writev", "fd": 9, "nth": 3}); a syscall anchor
+    /// that never fires ends the run with HERMIT_HB_ANCHOR_NEVER_FIRED. Combine
+    /// with `--hb-list-events` to preview how the spec resolves against the
+    /// binary.
     #[clap(long, value_name = "filepath")]
     happens_before: Option<PathBuf>,
 
@@ -5157,7 +5161,24 @@ impl RunOpts {
             // Resolve the spec against the guest binary's debug info now and cache
             // it so every subsequent `effective_det_config()` (including both
             // `--verify` runs) hands the scheduler the identical resolved program.
-            self.resolved_happens_before = Some(self.load_and_resolve_happens_before()?);
+            let program = self.load_and_resolve_happens_before()?;
+            // Syscall-occurrence anchors are counted and enforced by the Detcore
+            // that traces the guest from outside, on the ptrace backend. Backends
+            // that run Detcore inside the guest never receive the program, so every
+            // such anchor would end the run as "never fired", blaming the guest.
+            // Refuse up front instead.
+            if backend != Backend::Ptrace
+                && let Some(anchor) = program.anchors.values().find(|a| a.is_syscall_occurrence())
+            {
+                anyhow::bail!(
+                    "--happens-before anchor '{}' ({}) is a syscall-occurrence anchor, which is \
+                     enforced only on the ptrace backend; this run selected the {:?} backend",
+                    anchor.name,
+                    anchor.position,
+                    backend
+                );
+            }
+            self.resolved_happens_before = Some(program);
         }
         if backend == Backend::E9patch {
             self.prepare_e9patch_program()?;

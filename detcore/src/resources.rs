@@ -326,6 +326,20 @@ pub enum ResourceID {
     /// syscall count observed by the guest.
     HappensBeforeCheckpoint(u64),
 
+    /// A happens-before checkpoint at a syscall that is the `nth` occurrence of
+    /// one or more syscall-occurrence anchors on this thread (a named syscall,
+    /// optionally on one file descriptor, counted by the guest per thread).
+    /// Carries the post-increment syscall count, so count anchors at the same
+    /// syscall are evaluated too, and the names of the anchors reached. The
+    /// scheduler fires those that resolve to this thread.
+    HappensBeforeSyscallCheckpoint {
+        /// The post-increment syscall count observed by the guest.
+        count: u64,
+        /// The syscall-occurrence anchors this syscall is the `nth` occurrence
+        /// of, in name order.
+        anchors: Vec<String>,
+    },
+
     /// A real `rt_sigsuspend` executing outside the runnable set while the kernel
     /// atomically installs its temporary signal mask. Unlike arbitrary external
     /// IO, this operation cannot complete without a signal.

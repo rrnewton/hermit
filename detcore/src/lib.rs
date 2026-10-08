@@ -2577,13 +2577,42 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // race deterministically (see detcore-model `happens_before`). It
         // requires sequentialized threads (enforced by the CLI) so the scheduler
         // owns ordering.
-        if guest.config().happens_before.as_ref().is_some_and(|p| {
-            p.may_have_syscall_count_anchor_at(guest.thread_state().dettid, new_count)
-        }) {
-            let request = guest.thread_state().mk_request(
-                ResourceID::HappensBeforeCheckpoint(new_count),
-                Permission::R,
-            );
+        //
+        // A syscall-occurrence anchor ("the thread's Nth writev to fd 9") is
+        // counted here, in this thread's own counters, once per syscall entry;
+        // the thread checks in only when a call is some such anchor's nth
+        // occurrence, naming the anchors it reached.
+        let hb_checkpoint = if guest.config().happens_before.is_some() {
+            let dettid = guest.thread_state().dettid;
+            let mut counters = std::mem::take(&mut guest.thread_state_mut().stats.hb_occurrences);
+            let program = guest
+                .config()
+                .happens_before
+                .as_ref()
+                .expect("checked above");
+            let reached = if program.has_syscall_occurrence_anchors() {
+                let (sysno, args) = call.into_parts();
+                program.count_syscall_occurrences(&mut counters, dettid, sysno, args.arg0)
+            } else {
+                Vec::new()
+            };
+            let checkpoint = if !reached.is_empty() {
+                Some(ResourceID::HappensBeforeSyscallCheckpoint {
+                    count: new_count,
+                    anchors: reached,
+                })
+            } else if program.may_have_syscall_count_anchor_at(dettid, new_count) {
+                Some(ResourceID::HappensBeforeCheckpoint(new_count))
+            } else {
+                None
+            };
+            guest.thread_state_mut().stats.hb_occurrences = counters;
+            checkpoint
+        } else {
+            None
+        };
+        if let Some(checkpoint) = hb_checkpoint {
+            let request = guest.thread_state().mk_request(checkpoint, Permission::R);
             resource_request(guest, request).await;
         }
 

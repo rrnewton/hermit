@@ -301,6 +301,22 @@ pub fn load_program(path: &Path) -> anyhow::Result<HappensBeforeProgram> {
     let program = spec
         .normalize()
         .with_context(|| format!("normalizing happens-before spec: {}", path.display()))?;
+    // A syscall anchor is enforced at the prehook of the thread's nth matching
+    // call. One authored for the polling or posthook phase cannot be enforced,
+    // and ignoring it would let a run pass with its ordering unexercised.
+    if let Some(anchor) = program
+        .anchors
+        .values()
+        .find(|a| matches!(a.position, Position::Syscall { .. }) && !a.is_syscall_occurrence())
+    {
+        anyhow::bail!(
+            "happens-before spec {}: anchor '{}' ({}) names a syscall phase other than \
+             'prehook'; syscall anchors are enforced only at the prehook",
+            path.display(),
+            anchor.name,
+            anchor.position
+        );
+    }
     Ok(program)
 }
 
@@ -460,5 +476,33 @@ mod tests {
         assert_eq!(missing, vec!["A".to_string()]);
 
         let _ = std::fs::remove_dir_all(bin.parent().unwrap());
+    }
+
+    /// A syscall anchor authored for the posthook (or polling) phase cannot be
+    /// enforced, so loading the spec refuses it by name instead of running with
+    /// the ordering ignored. The same anchor at the prehook (or with no phase)
+    /// loads.
+    #[test]
+    fn load_program_refuses_a_syscall_anchor_it_cannot_enforce() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = dir.path().join("post.json");
+        std::fs::write(
+            &spec,
+            r#"{"version": 1,
+                "events": {"closed": {"thread": "3", "syscall": "close", "fd": 4, "phase": "post"}}}"#,
+        )
+        .unwrap();
+        let err = load_program(&spec).unwrap_err().to_string();
+        assert!(
+            err.contains("anchor 'closed'") && err.contains("enforced only at the prehook"),
+            "{err}"
+        );
+        std::fs::write(
+            &spec,
+            r#"{"version": 1,
+                "events": {"closed": {"thread": "3", "syscall": "close", "fd": 4, "phase": "pre"}}}"#,
+        )
+        .unwrap();
+        assert!(load_program(&spec).is_ok());
     }
 }
