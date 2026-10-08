@@ -1182,6 +1182,8 @@ mod tests {
         // Host-network and namespace-less routes, and output paths every
         // trial would share (`RunOpts::options_trials_refuse`).
         for (run_arg, named) in [
+            ("--strace-only", "--strace-only"),
+            ("--no-sequentialize-threads", "--no-sequentialize-threads"),
             ("--network=host", "--network=host"),
             ("--no-namespace", "--no-namespace"),
             ("--gdbserver", "--gdbserver"),
@@ -1297,6 +1299,16 @@ mod tests {
                 None,
                 "--record-networking=requested.trace",
                 "refuse --record-networking=requested.trace",
+            ),
+            (
+                None,
+                "--strace-only",
+                "refuse --strace-only in the run arguments",
+            ),
+            (
+                None,
+                "--no-sequentialize-threads",
+                "refuse --no-sequentialize-threads in the run arguments",
             ),
             (
                 None,

@@ -250,6 +250,14 @@ mod tests {
                 "refuse --record-networking=requested.trace",
             ),
             (
+                &["--strace-only"][..],
+                "refuse --strace-only in the run arguments",
+            ),
+            (
+                &["--no-sequentialize-threads"][..],
+                "refuse --no-sequentialize-threads in the run arguments",
+            ),
+            (
                 &["--network=host"][..],
                 "refuse --network=host in the run arguments",
             ),

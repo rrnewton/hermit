@@ -5484,6 +5484,17 @@ impl RunOpts {
                               would remain";
         [
             (
+                self.strace_only,
+                "--strace-only",
+                "it turns off thread sequentialization and the rest of determinization, and the \
+                 trials' schedule search needs both",
+            ),
+            (
+                self.no_sequentialize_threads,
+                "--no-sequentialize-threads",
+                "the trials' schedule search needs sequentialized threads",
+            ),
+            (
                 self.network == NetworkingMode::Host,
                 "--network=host",
                 "it puts every trial on the host network, so the trials are no longer reproducible",
