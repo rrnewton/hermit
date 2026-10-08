@@ -1681,6 +1681,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::ExitGroup,
     ) -> Result<i64, Error> {
+        // Where the kernel also notifies the parent, the scheduler sends the
+        // parent's SIGCHLD itself and gives it the siginfo Linux would
+        // (`scheduler::child_exit_sigchld`): CLD_EXITED and the exit code.
+        if self.cfg.backend.reports_child_exit_publication {
+            let uid = real_uid(guest.tid().as_raw()).unwrap_or_else(|| unsafe { libc::getuid() });
+            crate::tool_global::child_exit_sigchld(
+                guest,
+                crate::scheduler::child_exit_sigchld::ChildExitSigchldControl::ExitStatus {
+                    code: libc::CLD_EXITED,
+                    status: call.status() & 0xff,
+                    uid,
+                },
+            )
+            .await;
+        }
         let request = guest.thread_state().mk_request(
             ResourceID::Exit {
                 group: true,
@@ -4412,4 +4427,16 @@ mod tests {
              KEEP_POLICY must substitute that same value"
         );
     }
+}
+
+/// The real uid of thread `tid`, from `/proc/<tid>/status`.
+fn real_uid(tid: i32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{tid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }

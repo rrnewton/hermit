@@ -665,6 +665,9 @@ impl Scheduler {
                 self.blocked.sigchld_deferred.remove(&deferred);
                 self.blocked.sigchld_ready.insert(deferred);
                 self.run_queue.push_eager_io_repoll(deferred);
+                if let SignalTimerId::ChildExit { child, .. } = id {
+                    self.child_exit_sigchld.stand_in(parent, child);
+                }
             } else {
                 // Where the scheduler models signal targets, send to the thread
                 // the kernel gives this shared-queue `SIGCHLD`: the child's
@@ -678,7 +681,12 @@ impl Scheduler {
                 } else {
                     tid
                 };
-                self.fire_alarm(parent, target, signal);
+                let SignalTimerId::ChildExit { child, .. } = id else {
+                    unreachable!("matched a ChildExit timer");
+                };
+                if !self.send_child_exit_sigchld(parent, target, child) {
+                    self.fire_alarm(parent, target, signal);
+                }
             }
         } else {
             self.fire_alarm(id.process(), tid, signal);
