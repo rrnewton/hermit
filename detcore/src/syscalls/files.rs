@@ -4238,7 +4238,27 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// has no `/proc`. Nor when the guest's thread IDs do not name host tasks
     /// (see [`procfs_inode::guest_tids_name_host_tasks`]), as there is then no
     /// `/proc/<tid>` to read.
+    ///
+    /// Nor when a seccomp filter the guest inherited may apply to its calls
+    /// (`Config::inherited_seccomp`): naming a path injects an `openat` and a
+    /// `close` into the guest, which such a filter can answer without running,
+    /// with a descriptor the guest already holds, or hold until a listener
+    /// replies. Detcore refuses before it injects anything, and records a
+    /// determinism loss that names the filter mode.
+    ///
+    /// The guest's `errno` is what it was: under SaBRe, Detcore shares libc,
+    /// and so `errno`, with the guest thread it handles (see
+    /// [`procfs_inode::preserving_errno`]).
     async fn procfs_entry<G: Guest<Self>>(
+        guest: &mut G,
+        stat: &DetStat,
+        target: StatTarget<'_>,
+    ) -> ProcfsEntry {
+        procfs_inode::preserving_errno(Self::name_procfs_entry(guest, stat, target)).await
+    }
+
+    /// [`Self::procfs_entry`], which restores the guest's `errno` afterwards.
+    async fn name_procfs_entry<G: Guest<Self>>(
         guest: &mut G,
         stat: &DetStat,
         target: StatTarget<'_>,
@@ -4251,6 +4271,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             || !procfs_inode::may_be_procfs(stat.dev, stat.blksize)
         {
             return ProcfsEntry::NotProcfs;
+        }
+        if let Some(mode) = guest.config().inherited_seccomp.filter_mode() {
+            Self::record_procfs_loss(
+                guest,
+                format!(
+                    "a seccomp filter the guest inherited may apply to its calls (mode: {mode})"
+                ),
+            )
+            .await;
+            return ProcfsEntry::Unknown;
         }
         let mounts = match procfs_inode::procfs_mounts(guest.tid().as_raw(), stat.dev) {
             Ok(Some(mounts)) => mounts,

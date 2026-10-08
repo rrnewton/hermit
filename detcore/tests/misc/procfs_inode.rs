@@ -27,12 +27,14 @@ use std::ffi::CString;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
 use std::os::fd::IntoRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::time::Duration;
 
 use detcore::Config;
 use detcore::Detcore;
+use detcore::InheritedSeccomp;
 use reverie::ExitStatus;
 
 fn config() -> Config {
@@ -40,14 +42,21 @@ fn config() -> Config {
         sequentialize_threads: true,
         max_timeslice: None,
         virtualize_metadata: true,
+        // As Hermit does: the guest inherits this thread's seccomp filters.
+        inherited_seccomp: InheritedSeccomp::measure(),
         ..Default::default()
     }
 }
 
 /// Run `guest` under Detcore and require that it exits 0.
 fn under_detcore(guest: impl FnOnce() + Send) {
+    under_detcore_with(config(), guest)
+}
+
+/// Run `guest` under Detcore with `config` and require that it exits 0.
+fn under_detcore_with(config: Config, guest: impl FnOnce() + Send) {
     let (output, _) =
-        detcore_testutils::test_fn_with_config::<Detcore, _>(guest, config(), true).unwrap();
+        detcore_testutils::test_fn_with_config::<Detcore, _>(guest, config, true).unwrap();
     assert_eq!(
         output.status,
         ExitStatus::Exited(0),
@@ -470,41 +479,42 @@ const ERESTARTSYS: u32 = 512;
 #[cfg(target_arch = "x86_64")]
 const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
 
-/// Make `close(FILTERED_FD)` return `-errno` without running, in this thread
-/// and the processes it forks, as a seccomp filter a guest inherits from
-/// whatever started it can. Detcore refuses a guest's own `seccomp(2)`.
 #[cfg(target_arch = "x86_64")]
-fn filter_close(errno: u32) {
-    let load = |offset: u32| libc::sock_filter {
+fn load(offset: u32) -> libc::sock_filter {
+    libc::sock_filter {
         code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
         jt: 0,
         jf: 0,
         k: offset,
-    };
-    let jump_if = |value: u32, jt: u8, jf: u8| libc::sock_filter {
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn jump_if(value: u32, jt: u8, jf: u8) -> libc::sock_filter {
+    libc::sock_filter {
         code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
         jt,
         jf,
         k: value,
-    };
-    let ret = |action: u32| libc::sock_filter {
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn ret(action: u32) -> libc::sock_filter {
+    libc::sock_filter {
         code: (libc::BPF_RET | libc::BPF_K) as u16,
         jt: 0,
         jf: 0,
         k: action,
-    };
-    // seccomp_data: nr at 0, arch at 4, and the low half of args[0] at 16.
-    let mut program = [
-        load(4),
-        jump_if(AUDIT_ARCH_X86_64, 1, 0),
-        ret(libc::SECCOMP_RET_ALLOW),
-        load(0),
-        jump_if(libc::SYS_close as u32, 0, 3),
-        load(16),
-        jump_if(FILTERED_FD as u32, 0, 1),
-        ret(libc::SECCOMP_RET_ERRNO | errno),
-        ret(libc::SECCOMP_RET_ALLOW),
-    ];
+    }
+}
+
+/// Install `program` as a seccomp filter of this thread and the processes it
+/// forks, as a filter a guest inherits from whatever started it can; Detcore
+/// refuses a guest's own `seccomp(2)`. `flags` are `seccomp(2)`'s, and the
+/// result is what it returns.
+#[cfg(target_arch = "x86_64")]
+fn install(program: &mut [libc::sock_filter], flags: libc::c_ulong) -> libc::c_long {
     let fprog = libc::sock_fprog {
         len: program.len() as u16,
         filter: program.as_mut_ptr(),
@@ -517,21 +527,151 @@ fn filter_close(errno: u32) {
         libc::syscall(
             libc::SYS_seccomp,
             libc::SECCOMP_SET_MODE_FILTER,
-            0,
+            flags,
             &fprog as *const libc::sock_fprog,
         )
     };
-    assert_eq!(installed, 0, "seccomp: {}", std::io::Error::last_os_error());
+    assert!(
+        installed >= 0,
+        "seccomp: {}",
+        std::io::Error::last_os_error()
+    );
+    installed
+}
+
+/// Make `close(FILTERED_FD)` return `-errno` without running.
+#[cfg(target_arch = "x86_64")]
+fn filter_close(errno: u32) {
+    // seccomp_data: nr at 0, arch at 4, and the low half of args[0] at 16.
+    let mut program = [
+        load(4),
+        jump_if(AUDIT_ARCH_X86_64, 1, 0),
+        ret(libc::SECCOMP_RET_ALLOW),
+        load(0),
+        jump_if(libc::SYS_close as u32, 0, 3),
+        load(16),
+        jump_if(FILTERED_FD as u32, 0, 1),
+        ret(libc::SECCOMP_RET_ERRNO | errno),
+        ret(libc::SECCOMP_RET_ALLOW),
+    ];
+    assert_eq!(install(&mut program, 0), 0);
+}
+
+/// Give `action` to every `openat` with exactly the flags of the open Detcore
+/// injects to name a path it must not follow, `O_PATH | O_CLOEXEC |
+/// O_NOFOLLOW`, and return what `seccomp(2)` returned for `flags`. The filter
+/// applies to the test process too, which opens other paths with `O_PATH`
+/// while it starts the guest, so it matches the flags exactly.
+#[cfg(target_arch = "x86_64")]
+fn filter_naming_opens(action: u32, flags: libc::c_ulong) -> libc::c_long {
+    const NAMING: u32 = (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u32;
+    // seccomp_data: nr at 0, arch at 4, and the low half of args[2] at 32.
+    let mut program = [
+        load(4),
+        jump_if(AUDIT_ARCH_X86_64, 1, 0),
+        ret(libc::SECCOMP_RET_ALLOW),
+        load(0),
+        jump_if(libc::SYS_openat as u32, 0, 3),
+        load(32),
+        jump_if(NAMING, 0, 1),
+        ret(action),
+        ret(libc::SECCOMP_RET_ALLOW),
+    ];
+    install(&mut program, flags)
+}
+
+/// The determinism loss Detcore records, before it injects any call, for a
+/// guest that inherits the one filter a test installed.
+const ONE_INHERITED_FILTER: &str = "procfs inode numbers: a seccomp filter the guest inherited may apply to its calls (mode: filter, with 1 filter)";
+
+/// A filter the guest inherits can make the `O_PATH` open that names a path
+/// return 0 without running, as if it had opened descriptor 0, so the close
+/// that follows it would close the guest's descriptor 0. Detcore refuses to
+/// name the entry before it injects the open, and descriptor 0 stays open.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn an_inherited_filter_that_fakes_an_open_leaves_descriptor_0_open() {
+    filter_naming_opens(libc::SECCOMP_RET_ERRNO, 0);
+    under_detcore(|| {
+        let stat = File::open("/proc/self/stat").unwrap().into_raw_fd();
+        assert_eq!(unsafe { libc::dup2(stat, 0) }, 0, "dup2 onto 0");
+        std::fs::symlink_metadata("/proc/self/stat").unwrap();
+        assert!(
+            unsafe { libc::fcntl(0, libc::F_GETFD) } >= 0,
+            "the guest's descriptor 0 was closed"
+        );
+    });
+    assert_eq!(
+        detcore::detlog::determinism_loss().as_deref(),
+        Some(ONE_INHERITED_FILTER)
+    );
+}
+
+/// A filter the guest inherits can hand the `O_PATH` open to a supervisor
+/// that never answers, here one that holds the listener and reads nothing,
+/// which would stop the guest for good. Detcore refuses to name the entry
+/// before it injects the open, so the guest's own stat completes. (Were the
+/// open injected, the test would hang until the test runner's timeout.)
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn an_inherited_filter_that_suspends_an_open_does_not_stop_the_guest() {
+    let listener = filter_naming_opens(
+        libc::SECCOMP_RET_USER_NOTIF,
+        libc::SECCOMP_FILTER_FLAG_NEW_LISTENER,
+    );
+    let listener = unsafe { std::os::fd::OwnedFd::from_raw_fd(listener as i32) };
+    under_detcore(|| {
+        std::fs::symlink_metadata("/proc/self/stat").unwrap();
+    });
+    drop(listener);
+    assert_eq!(
+        detcore::detlog::determinism_loss().as_deref(),
+        Some(ONE_INHERITED_FILTER)
+    );
+}
+
+/// Under SaBRe, Detcore shares libc, and so `errno`, with the guest thread
+/// whose call it handles, so naming an entry must leave the guest's `errno`
+/// as it was. These tests run Detcore under ptrace, in another process,
+/// where it cannot change it, so this pins the guest's view; Detcore's unit
+/// tests pin the guard itself.
+#[test]
+fn naming_an_entry_leaves_the_guests_errno() {
+    under_detcore(|| {
+        const SENTINEL: i32 = 4242;
+        let path = CString::new("/proc/self/stat").unwrap();
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        unsafe { *libc::__errno_location() = SENTINEL };
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_newfstatat,
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        let errno = unsafe { *libc::__errno_location() };
+        assert_eq!(result, 0, "newfstatat failed");
+        assert_eq!(errno, SENTINEL, "naming the entry changed errno");
+    });
+    assert_eq!(detcore::detlog::determinism_loss(), None);
 }
 
 /// Run a guest that fills the descriptors below `FILTERED_FD`, so that the
 /// `O_PATH` descriptor Detcore opens to name a procfs path takes it, and then
 /// stats a procfs path. The filter leaves that descriptor open in the guest,
-/// so the run must record a determinism loss, and must end.
+/// so the run must record a determinism loss, and must end. The configuration
+/// says the guest inherits no filter, as a measurement that missed this one
+/// would, so Detcore injects its calls and its close checks catch the filter.
 #[cfg(target_arch = "x86_64")]
 fn stat_a_procfs_path_with_close_filtered(errno: u32) -> Option<String> {
     filter_close(errno);
-    under_detcore(|| {
+    let config = Config {
+        inherited_seccomp: InheritedSeccomp::Disabled,
+        ..config()
+    };
+    under_detcore_with(config, || {
         let open = |fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0;
         assert!(!open(FILTERED_FD), "{FILTERED_FD} is open from the start");
         let null = File::open("/dev/null").unwrap().into_raw_fd();
