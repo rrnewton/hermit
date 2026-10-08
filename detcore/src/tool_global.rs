@@ -3351,6 +3351,9 @@ impl GlobalState {
                 }
                 FutexAction::WakeRequest(num_threads) => {
                     let num = sched.wake_futex_waiters(dettid, futexid, num_threads, mask);
+                    if self.cfg.yields_after_futex_wake(num) {
+                        sched.requeue_futex_waker(dettid);
+                    }
                     return Some(SchedValue::Value(num));
                 }
                 FutexAction::WakeFinished(_num_threads) => {

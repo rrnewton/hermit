@@ -12,6 +12,7 @@ use std::mem::MaybeUninit;
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time;
@@ -1274,6 +1275,53 @@ fn rdtsc_inside_a_spinlock_does_not_end_a_target_timeslice() {
     );
 }
 
+/// With `--futex-wake-yields`, a thread that releases a contended
+/// mutex yields right after its `FUTEX_WAKE`, behind the waiter it woke, so the
+/// waiter takes the mutex before the releaser can re-take it
+/// (https://github.com/rrnewton/hermit/issues/3874).
+///
+/// The holder keeps a `std::sync::Mutex` for nearly all of each round and makes
+/// no syscall except the wake in its unlock. The waiter starts while the holder
+/// has the mutex and blocks on it in the futex. With the policy it takes the
+/// mutex at the holder's first release. By default the holder's 1 ms target has
+/// not expired at the wake, so it keeps running, re-takes the mutex uncontended
+/// in every later round, and the waiter can get it only when a PMU-maximum
+/// preemption lands in the short window outside the mutex: in 500 rounds that
+/// never happened, and the waiter got the mutex only when the holder stopped,
+/// after 347,995,390 virtual ns.
+#[test]
+fn a_futex_wake_hands_a_contended_mutex_to_the_waiter() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        sequentialize_threads: true,
+        target_timeslice: std::num::NonZeroU64::new(1_000_000),
+        max_timeslice: std::num::NonZeroU64::new(5_000_000),
+        futex_wake_yields: true,
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(contended_mutex_handoff, config, true);
+}
+
+/// Two runs of the mutex handoff with `--futex-wake-yields` produce the same
+/// output and the same Detcore log.
+#[test]
+fn a_futex_wake_handoff_is_deterministic() {
+    let config = detcore::Config {
+        virtualize_time: true,
+        sequentialize_threads: true,
+        target_timeslice: std::num::NonZeroU64::new(1_000_000),
+        max_timeslice: std::num::NonZeroU64::new(5_000_000),
+        futex_wake_yields: true,
+        ..Default::default()
+    };
+    detcore_testutils::det_test_fn_with_config(
+        true,
+        contended_mutex_handoff,
+        config,
+        detcore_testutils::expect_success,
+    );
+}
+
 /// Two threads that alternate `sched_yield` and clock reads, printing every
 /// value read, so the output is the clock's whole trajectory across turns.
 fn clock_reads_across_yields() {
@@ -1354,6 +1402,186 @@ fn a_finite_poll_times_out_with_a_small_scheduler_turn_cost() {
         config,
         true,
     );
+}
+
+/// Waits on a futex, wakes it from the main thread, and prints the wake count
+/// and whether the waiter had run by the time the wake returned. With
+/// `wait` false nobody waits, so the wake finds no waiter.
+fn futex_wake_snapshot(wait: bool) {
+    static GATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static READY: AtomicBool = AtomicBool::new(false);
+    static SEEN: AtomicBool = AtomicBool::new(false);
+    let mut waiter = Some(thread::spawn(move || {
+        READY.store(true, Ordering::Release);
+        if wait {
+            while GATE.load(Ordering::Acquire) == 0 {
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_futex,
+                        GATE.as_ptr(),
+                        libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
+                        0,
+                        ptr::null::<libc::timespec>(),
+                    )
+                };
+            }
+        }
+        SEEN.store(true, Ordering::Release);
+    }));
+    while !READY.load(Ordering::Acquire) {
+        unsafe { libc::sched_yield() };
+    }
+    if wait {
+        // Turns for the waiter to park; the wake count below shows it did.
+        unsafe { libc::sched_yield() };
+        unsafe { libc::sched_yield() };
+    } else {
+        waiter.take().unwrap().join().unwrap();
+    }
+    GATE.store(1, Ordering::Release);
+    let woken = unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            GATE.as_ptr(),
+            libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
+            1,
+        )
+    };
+    let seen = SEEN.load(Ordering::Acquire);
+    if let Some(waiter) = waiter {
+        waiter.join().unwrap();
+    }
+    // libtest captures `println!` in the forked guest, so write to fd 1.
+    let line = format!("wake={woken} seen={}\n", seen as u8);
+    unsafe { libc::write(1, line.as_ptr().cast(), line.len()) };
+}
+
+/// Runs `guest` under `config` and returns its standard output.
+fn guest_stdout(guest: fn(), config: detcore::Config) -> String {
+    let (output, _) = test_fn_with_config::<Detcore, _>(guest, config, true).unwrap();
+    assert_eq!(output.status, reverie::ExitStatus::Exited(0));
+    String::from_utf8(output.stdout).unwrap()
+}
+
+/// A preemption record of a run with `--futex-wake-yields` replays to the
+/// same schedule: the replay requeues and yields at the same wakes. The
+/// woken waiter has run by the time the wake returns, in the record and in
+/// its replay; without the policy it has not, so the observation can tell
+/// the two apart. A wake that finds no waiter yields in neither.
+#[test]
+fn a_futex_wake_yield_survives_a_preemption_record_and_replay() {
+    let base = detcore::Config {
+        virtualize_time: true,
+        sequentialize_threads: true,
+        ..Default::default()
+    };
+    let round_trip = |guest: fn(), yields: bool| {
+        let record = std::env::temp_dir().join(format!(
+            "hermit-futex-wake-yield-{}-{yields}-{:p}.json",
+            std::process::id(),
+            guest as *const ()
+        ));
+        let config = detcore::Config {
+            futex_wake_yields: yields,
+            ..base.clone()
+        };
+        let recorded = guest_stdout(
+            guest,
+            detcore::Config {
+                record_preemptions: true,
+                record_preemptions_to: Some(record.clone()),
+                ..config.clone()
+            },
+        );
+        let replayed = guest_stdout(
+            guest,
+            detcore::Config {
+                replay_preemptions_from: Some(record.clone()),
+                ..config
+            },
+        );
+        std::fs::remove_file(&record).unwrap();
+        assert_eq!(recorded, replayed, "yields={yields}");
+        recorded
+    };
+    assert_eq!(
+        round_trip(|| futex_wake_snapshot(true), true),
+        "wake=1 seen=1\n"
+    );
+    assert_eq!(
+        round_trip(|| futex_wake_snapshot(true), false),
+        "wake=1 seen=0\n"
+    );
+    assert_eq!(
+        round_trip(|| futex_wake_snapshot(false), true),
+        "wake=0 seen=1\n"
+    );
+}
+
+/// The guest of the two mutex-handoff tests: a holder that keeps a
+/// `std::sync::Mutex` for nearly all of each round and a waiter that needs it
+/// once. Fails if the waiter waits 20 ms of virtual time or more.
+fn contended_mutex_handoff() {
+    fn monotonic_ns() -> u64 {
+        let mut now = MaybeUninit::<libc::timespec>::uninit();
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_clock_gettime,
+                libc::CLOCK_MONOTONIC,
+                now.as_mut_ptr(),
+            )
+        };
+        assert_eq!(result, 0);
+        let now = unsafe { now.assume_init() };
+        now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64
+    }
+    fn spin(iterations: u64) {
+        let mut work = 0u64;
+        for i in 0..iterations {
+            work = std::hint::black_box(work.wrapping_add(i));
+        }
+    }
+
+    let mutex = Arc::new(std::sync::Mutex::new(()));
+    let acquired = Arc::new(AtomicBool::new(false));
+    let waited_ns = Arc::new(AtomicU64::new(0));
+    let mut guard = mutex.lock().unwrap();
+    let waiter = {
+        let mutex = Arc::clone(&mutex);
+        let acquired = Arc::clone(&acquired);
+        let waited_ns = Arc::clone(&waited_ns);
+        thread::spawn(move || {
+            let start = monotonic_ns();
+            let held = mutex.lock().unwrap();
+            waited_ns.store(monotonic_ns() - start, Ordering::Relaxed);
+            acquired.store(true, Ordering::Release);
+            drop(held);
+        })
+    };
+
+    let mut round: u64 = 0;
+    while !acquired.load(Ordering::Acquire) && round < 500 {
+        round += 1;
+        spin(20_000);
+        drop(guard);
+        spin(50 + round % 37);
+        guard = mutex.lock().unwrap();
+    }
+    drop(guard);
+    waiter.join().unwrap();
+
+    let waited = waited_ns.load(Ordering::Relaxed);
+    if waited >= 20_000_000 {
+        // The forked-test harness reports a guest panic without its
+        // message, and libtest captures `eprintln!`, so write the
+        // reason to fd 2 directly.
+        let why = format!(
+            "waiter took the mutex after {waited} virtual ns, holder round {round}: \
+             the releaser kept re-taking it after waking the waiter\n"
+        );
+        unsafe { libc::write(2, why.as_ptr().cast(), why.len()) };
+        panic!("mutex waiter starved");
+    }
 }
 
 /// Each committed scheduler turn adds `--scheduler-turn-cost` virtual
