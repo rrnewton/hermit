@@ -283,6 +283,7 @@ pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_in_guest_programs::liteinst_in_guest_unscheduled_deaths_complete_and_refuse_verification",
     "liteinst_in_guest_programs::liteinst_in_guest_user_address_limit_queries_keep_the_guest_errno",
     "liteinst_in_guest_programs::liteinst_in_guest_virtual_identity_and_time",
+    "liteinst_in_guest_refuses_a_guest_socket_at_the_forwarding_number",
     "liteinst_in_guest_verify_compares_the_records_the_guest_forwards",
     "liteinst_in_guest_verify_forwards_records_by_the_cli_filters_per_target_answer",
     "liteinst_in_guest_verify_log_keeps_records_in_ptraces_order",
