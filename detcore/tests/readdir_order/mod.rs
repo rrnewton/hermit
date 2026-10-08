@@ -891,7 +891,7 @@ fn long_name_past_writable_end_returns_entries_before_it() {
     run_five_times(long_name_past_writable_end_guest);
 }
 
-fn seek_during_first_read_guest(root: &tempfile::TempDir) {
+fn seek_during_first_read_guest(root: &tempfile::TempDir, trials: std::ops::Range<usize>) {
     let mut expected = vec![".".to_owned(), "..".to_owned()];
     expected.extend(sorted_names());
 
@@ -902,7 +902,9 @@ fn seek_during_first_read_guest(root: &tempfile::TempDir) {
     // it restarts the stream; neither may land in the middle of reading the
     // host directory. (Unbounded rewinds landing there would keep the read
     // from ever reaching the end, so a broken lock would hang, not fail.)
-    for trial in 0..20 {
+    // `trials` names this run's share of the 20 trials by their global trial
+    // numbers; the four tests below each run five of them.
+    for trial in trials {
         let dir = File::open(root.path()).unwrap();
         let fd = dir.as_raw_fd();
         let start = std::sync::Barrier::new(2);
@@ -944,9 +946,44 @@ fn seek_during_first_read_guest(root: &tempfile::TempDir) {
     println!("seek during first read ok");
 }
 
+// The 20 trials run as four tests of five trials each, so that each test stays
+// within the counted runner's per-test CPU budget; each test still runs its
+// guest five times on a fresh scrambled directory and requires the same
+// output from every run.
 #[test]
-fn seek_during_first_read_leaves_stream_whole() {
-    run_five_times_on(scrambled_directory, seek_during_first_read_guest, false);
+fn seek_during_first_read_leaves_stream_whole_trials_00_to_04() {
+    run_five_times_on(
+        scrambled_directory,
+        |root| seek_during_first_read_guest(root, 0..5),
+        false,
+    );
+}
+
+#[test]
+fn seek_during_first_read_leaves_stream_whole_trials_05_to_09() {
+    run_five_times_on(
+        scrambled_directory,
+        |root| seek_during_first_read_guest(root, 5..10),
+        false,
+    );
+}
+
+#[test]
+fn seek_during_first_read_leaves_stream_whole_trials_10_to_14() {
+    run_five_times_on(
+        scrambled_directory,
+        |root| seek_during_first_read_guest(root, 10..15),
+        false,
+    );
+}
+
+#[test]
+fn seek_during_first_read_leaves_stream_whole_trials_15_to_19() {
+    run_five_times_on(
+        scrambled_directory,
+        |root| seek_during_first_read_guest(root, 15..20),
+        false,
+    );
 }
 
 /// A directory holding `count` names from `name`, created in both orders:
