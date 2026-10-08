@@ -1718,11 +1718,19 @@ fn materialize_buck_e2e(cfg: &mut DagConfig) -> Result<(), String> {
     cells_deps.push(BUCK_STAGE_TAG.into());
     cells_deps.sort();
     cells.deps = cells_deps;
-    // Kept from the node that also staged: the stage's share of the 2066 CPU-s
-    // e2e.buck_cells used in the validation of hermit f53e746779 is not
-    // recorded, so nothing here measures the cells alone, and running the
-    // cells is strictly less work than the node that also staged.
-    cells.timeout = 3600;
+    // Measured: across the 131 e2e.buck_cells runs in the retained step
+    // profiles of one development host (2026-09 to 2026-10-08), median 164 s,
+    // p95 520 s, max 831 s, 6 over 600 s, none over 1000 s, none timed out;
+    // the slowest are Buck RE downloads, which buck2 does not time out.
+    // 2400 s is 2.9 times that maximum and equals check.lint_checks, the
+    // largest other node budget in the full selection, so it costs the
+    // preparation reserve nothing. It was 3600 s, carried from the node that
+    // also staged. The committed selection is never clamped to the time left
+    // after preparation, so a 3600 s node made every buck-runner full
+    // validation refuse once its preparation passed the 600 s that a 4200 s
+    // run budget left (https://github.com/rrnewton/hermit/issues/3896; see
+    // committed_full_selections_survive_a_slow_preparation).
+    cells.timeout = 2400;
     // dagrun gives a step the time it started (DAGRUN_STEP_STARTED_MONOTONIC_NS)
     // but not its wall bound; validate-node keeps the Buck invocation records
     // only in what is left of this one. The committed Buck selection is never
@@ -5861,6 +5869,48 @@ sys.exit(37)
         assert!(error.contains("Buck E2E"), "{error}");
     }
 
+    /// ci-hub's whole-run budget for a full validation
+    /// (`hermit_run_timeout_seconds` in dev-hermit
+    /// ci-hub/validate/start_unit.py, for its 4800 s lock child deadline).
+    const CI_HUB_FULL_RUN_BUDGET_S: i64 = 4200;
+    /// Preparation a full validation must survive: scripts/validate.rs anchors
+    /// the run epoch before locks, freshness checks, plan construction and the
+    /// cgroup re-exec, and hands dagrun only what is left, while a committed
+    /// selection's node budgets are never clamped to it. Measured preparation
+    /// on one development host: 65 s and 134 s typically, 734 s at worst
+    /// (https://github.com/rrnewton/hermit/issues/3896).
+    const PREPARATION_RESERVE_S: i64 = 1200;
+
+    #[test]
+    fn committed_full_selections_survive_a_slow_preparation() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let full = select_steps_by_labels(&committed, &["full".to_string()]).unwrap();
+        let buck = buck_e2e_selection(&committed).unwrap();
+        for (name, selection) in [("full", &full), ("full with the Buck runner", &buck)] {
+            // The refusal of https://github.com/rrnewton/hermit/issues/3896:
+            // 734 s of preparation left 3466 s, and dagrun refused every node
+            // because e2e.buck_cells declared 3600 s.
+            let after_734 = dagrun::scheduler::steps_violating_run_timeout(
+                selection,
+                CI_HUB_FULL_RUN_BUDGET_S - 734,
+            );
+            assert!(
+                after_734.is_empty(),
+                "{name}: after 734 s of preparation dagrun refuses {after_734:?}"
+            );
+            let after_reserve = dagrun::scheduler::steps_violating_run_timeout(
+                selection,
+                CI_HUB_FULL_RUN_BUDGET_S - PREPARATION_RESERVE_S,
+            );
+            assert!(
+                after_reserve.is_empty(),
+                "{name}: these committed nodes leave less than {PREPARATION_RESERVE_S} s of the \
+                 {CI_HUB_FULL_RUN_BUDGET_S} s run budget for preparation, so a slow preparation \
+                 makes dagrun refuse the whole run: {after_reserve:?}"
+            );
+        }
+    }
+
     #[test]
     fn buck_cells_hand_validate_node_their_wall_bound() {
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
@@ -5873,10 +5923,10 @@ sys.exit(37)
         }
         let mut committed_cells = committed.clone();
         let node = cells_node(&mut committed_cells);
-        assert_eq!(node.timeout, 3600);
+        assert_eq!(node.timeout, 2400);
         assert_eq!(
             node.env.get(BUCK_STEP_WALL_ENV).map(String::as_str),
-            Some("3600")
+            Some("2400")
         );
 
         let mut missing = committed.clone();
@@ -5884,9 +5934,9 @@ sys.exit(37)
         let mut longer = committed.clone();
         cells_node(&mut longer)
             .env
-            .insert(BUCK_STEP_WALL_ENV.into(), "3601".into());
+            .insert(BUCK_STEP_WALL_ENV.into(), "2401".into());
         let mut shortened = committed.clone();
-        cells_node(&mut shortened).timeout = 1800;
+        cells_node(&mut shortened).timeout = 900;
         let mut unbounded = committed.clone();
         cells_node(&mut unbounded).timeout = 0;
         cells_node(&mut unbounded)

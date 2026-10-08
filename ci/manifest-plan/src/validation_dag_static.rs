@@ -867,7 +867,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retains all 999: 1000, listed with this node's arguments.
     // config::tests::in_guest_detlog_forward_policy_never_enters_the_legacy_form
     // (detcore-model) retains all 1000: 1001, listed with this node's arguments.
-    ("test.regular_crates", 1001),
+    // validation_dag::tests::committed_full_selections_survive_a_slow_preparation
+    // (hermit-manifest-plan, https://github.com/rrnewton/hermit/issues/3896)
+    // retains all 1001: 1002, measured by the validate of 7ec8f5fb.
+    ("test.regular_crates", 1002),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2288,7 +2291,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // It selects the detcore-model checkpoint-filter test too: 999.
     // And the detcore-dbt determinism-loss record test: 1000.
     // And the same in_guest_detlog_forward_policy legacy-form test: 1001.
-    ("test.regular_crates_on_host", 1001),
+    // And the same committed-selection preparation test: 1002.
+    ("test.regular_crates_on_host", 1002),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

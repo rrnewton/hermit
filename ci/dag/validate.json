@@ -13392,7 +13392,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1001",
+        "NEXTEST_EXPECTED_EXECUTED": "1002",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -34204,7 +34204,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1001",
+        "NEXTEST_EXPECTED_EXECUTED": "1002",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -43539,11 +43539,11 @@
         "setup.manifest_plan"
       ],
       "env": {
-        "HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS": "3600"
+        "HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS": "2400"
       },
       "networkonly": false,
       "engine_only": false,
-      "timeout": 3600,
+      "timeout": 2400,
       "cpu_timeout": 14400,
       "jobs_flag": "",
       "jobs_env": "CARGO_BUILD_JOBS",

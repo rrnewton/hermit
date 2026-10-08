@@ -7347,7 +7347,11 @@ fn effective_run_timeout(
 /// enforcing, and what it enforces is the REMAINDER, not the nominal figure. A
 /// ceiling that is merely smaller than the nominal budget therefore inverts once
 /// preparation has spent enough of the epoch. Keeping one grace band below the
-/// remainder makes that inversion unreachable at any preparation time.
+/// remainder makes that inversion unreachable at any preparation time, for the
+/// plans it is applied to: those without a committed selection. A committed
+/// selection is never clamped (see the call site), so its budgets must leave
+/// room for preparation themselves
+/// (https://github.com/rrnewton/hermit/issues/3896).
 fn derived_wall_ceiling(remaining_s: i64) -> i64 {
     (remaining_s - scope_grace_s(remaining_s)).max(1)
 }
@@ -27066,6 +27070,17 @@ fn run(
     // nothing. Deriving the ceiling here makes the inversion unreachable instead of
     // making it fit for one particular preparation time -- the same fixed-versus-
     // derived defect as a node pinned at 120s losing to a 120.03s measurement.
+    //
+    // Only for a plan without a committed selection. A committed selection must
+    // reach the scheduler byte-identical to ci/dag/validate.json
+    // (require_committed_scheduler_input), so its node budgets are never
+    // clamped, and the inversion stays reachable for it: a full validation
+    // whose preparation took 734 s of a 4200 s budget refused every node over
+    // e2e.buck_cells' then 3600 s (https://github.com/rrnewton/hermit/issues/3896).
+    // For committed selections the room is kept in the committed budgets
+    // instead, and committed_full_selections_survive_a_slow_preparation (in
+    // ci/manifest-plan/src/validation_dag.rs) holds them to a preparation
+    // reserve.
     if plan.committed_selection.is_none() {
         if let Some(remaining) = remaining_budget_s(deadline_ns) {
             clamp_wall(&mut plan, derived_wall_ceiling(remaining));
@@ -27240,6 +27255,15 @@ fn run(
                         .to_string(),
                 ))
                 .collect(),
+            );
+        }
+        // The scheduler is handed only what preparation left. Say how much that
+        // was, so a refusal that names a node budget also shows where the time
+        // went (https://github.com/rrnewton/hermit/issues/3896).
+        if let Some(remaining) = remaining_budget_s(deadline_ns) {
+            eprintln!(
+                "validate: preparation used {}s of the {secs}s whole-run budget; {remaining}s remain for the DAG",
+                (secs - remaining).max(0)
             );
         }
     }
