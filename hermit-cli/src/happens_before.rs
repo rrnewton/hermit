@@ -30,6 +30,7 @@ use detcore_model::happens_before::CodeLocation;
 use detcore_model::happens_before::HappensBeforeProgram;
 use detcore_model::happens_before::HappensBeforeSpec;
 use detcore_model::happens_before::Position;
+use detcore_model::happens_before::syscall_never_reaches_tracer;
 use object::Object;
 use object::ObjectSection;
 use object::ObjectSymbol;
@@ -304,26 +305,78 @@ pub fn load_program(path: &Path) -> anyhow::Result<HappensBeforeProgram> {
     Ok(program)
 }
 
-/// Refuse a program the run cannot enforce as written: a syscall anchor for
-/// the polling or posthook phase. Syscall anchors are enforced at the prehook
-/// of the thread's nth matching call; ignoring one authored for another phase
-/// would let a run pass with its ordering unexercised. Applied on the run path
-/// only, so `--hb-list-events` can still preview such a spec.
+/// How a run will execute the guest, as far as happens-before enforcement is
+/// concerned ([`refuse_unenforceable_anchors`]).
+#[derive(Debug, Clone, Copy)]
+pub struct HbLaunch<'a> {
+    /// The selected backend's name, for messages.
+    pub backend: &'a str,
+    /// True when the backend is ptrace, where Detcore traces the guest from
+    /// outside and receives the happens-before program.
+    pub ptrace: bool,
+    /// True for `--namespace-only` (alias `--lite`): no interception and no
+    /// scheduler at all.
+    pub namespace_only: bool,
+    /// True for `--passthru-opt`: only an allow-list of syscalls is intercepted.
+    pub passthru_opt: bool,
+}
+
+/// Refuse, before anything is launched or any input is read, a program the run
+/// cannot enforce as written:
+/// - a syscall anchor for the polling or posthook phase (syscall anchors are
+///   enforced at the prehook of the thread's nth matching call);
+/// - a syscall-occurrence anchor when the run bypasses interception
+///   (`--namespace-only`), uses a backend other than ptrace (in-guest Detcore
+///   never receives the program), or runs with `--passthru-opt` (some
+///   syscalls are left unintercepted);
+/// - a syscall anchor on a syscall that never reaches Detcore
+///   ([`syscall_never_reaches_tracer`]).
+///
+/// Ignoring any of these would let a run pass, or blame the guest, with the
+/// ordering unexercised. Applied on the run path only, so `--hb-list-events`
+/// can still preview such a spec.
 pub fn refuse_unenforceable_anchors(
     program: &HappensBeforeProgram,
     path: &Path,
+    launch: HbLaunch<'_>,
 ) -> anyhow::Result<()> {
-    if let Some(anchor) = program
-        .anchors
-        .values()
-        .find(|a| matches!(a.position, Position::Syscall { .. }) && !a.is_syscall_occurrence())
-    {
+    for anchor in program.anchors.values() {
+        let Position::Syscall { sysno, .. } = &anchor.position else {
+            continue;
+        };
+        let refusal = if !anchor.is_syscall_occurrence() {
+            "names a syscall phase other than 'prehook'; syscall anchors are enforced only at \
+             the prehook"
+                .to_owned()
+        } else if syscall_never_reaches_tracer(*sysno) {
+            format!(
+                "names {}, which never reaches Hermit's tracer: it runs untraced so the \
+                 signal frame is restored safely",
+                sysno.name()
+            )
+        } else if launch.namespace_only {
+            "is a syscall-occurrence anchor, but --namespace-only runs the guest without \
+             interception or a scheduler"
+                .to_owned()
+        } else if !launch.ptrace {
+            format!(
+                "is a syscall-occurrence anchor, which is enforced only on the ptrace backend; \
+                 this run selected the {} backend",
+                launch.backend
+            )
+        } else if launch.passthru_opt {
+            "is a syscall-occurrence anchor, which needs every syscall intercepted; \
+             --passthru-opt leaves some unintercepted"
+                .to_owned()
+        } else {
+            continue;
+        };
         anyhow::bail!(
-            "happens-before spec {}: anchor '{}' ({}) names a syscall phase other than \
-             'prehook'; syscall anchors are enforced only at the prehook",
+            "happens-before spec {}: anchor '{}' ({}) {}",
             path.display(),
             anchor.name,
-            anchor.position
+            anchor.position,
+            refusal
         );
     }
     Ok(())
@@ -487,35 +540,104 @@ mod tests {
         let _ = std::fs::remove_dir_all(bin.parent().unwrap());
     }
 
-    /// A syscall anchor authored for the posthook (or polling) phase cannot be
-    /// enforced, so the run path refuses it by name instead of running with the
-    /// ordering ignored; `load_program` itself (shared with `--hb-list-events`)
-    /// still loads it for preview. The same anchor at the prehook passes.
+    /// Every launch-time refusal names its anchor, and a spec the run can
+    /// enforce passes: phase (posthook), an unobservable syscall
+    /// (rt_sigreturn), namespace-only, a non-ptrace backend and --passthru-opt.
+    /// `load_program` itself (shared with `--hb-list-events`) still loads all of
+    /// these for preview.
     #[test]
-    fn run_path_refuses_a_syscall_anchor_it_cannot_enforce() {
+    fn launch_refuses_every_anchor_it_cannot_enforce() {
         let dir = tempfile::tempdir().unwrap();
-        let spec = dir.path().join("post.json");
-        std::fs::write(
-            &spec,
+        let spec = dir.path().join("spec.json");
+        let ptrace = HbLaunch {
+            backend: "Ptrace",
+            ptrace: true,
+            namespace_only: false,
+            passthru_opt: false,
+        };
+        let check = |json: &str, launch: HbLaunch<'_>| -> Result<(), String> {
+            std::fs::write(&spec, json).unwrap();
+            let program = load_program(&spec).expect("every spec here loads for preview");
+            refuse_unenforceable_anchors(&program, &spec, launch).map_err(|e| e.to_string())
+        };
+        let fd_anchor = r#"{"version": 1,
+            "events": {"w": {"thread": "3", "syscall": "write", "fd": 1}}}"#;
+        let err = check(
             r#"{"version": 1,
                 "events": {"closed": {"thread": "3", "syscall": "close", "fd": 4, "phase": "post"}}}"#,
+            ptrace,
         )
-        .unwrap();
-        let program = load_program(&spec).expect("a posthook anchor still loads for preview");
-        let err = refuse_unenforceable_anchors(&program, &spec)
-            .unwrap_err()
-            .to_string();
+        .unwrap_err();
         assert!(
             err.contains("anchor 'closed'") && err.contains("enforced only at the prehook"),
             "{err}"
         );
-        std::fs::write(
-            &spec,
-            r#"{"version": 1,
-                "events": {"closed": {"thread": "3", "syscall": "close", "fd": 4, "phase": "pre"}}}"#,
+        let err = check(
+            r#"{"version": 1, "events": {"ret": {"thread": "3", "syscall": "rt_sigreturn"}}}"#,
+            ptrace,
         )
-        .unwrap();
-        let program = load_program(&spec).unwrap();
-        assert!(refuse_unenforceable_anchors(&program, &spec).is_ok());
+        .unwrap_err();
+        assert!(
+            err.contains("anchor 'ret'") && err.contains("never reaches Hermit's tracer"),
+            "{err}"
+        );
+        let err = check(
+            fd_anchor,
+            HbLaunch {
+                namespace_only: true,
+                ..ptrace
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("anchor 'w'") && err.contains("--namespace-only"),
+            "{err}"
+        );
+        let err = check(
+            fd_anchor,
+            HbLaunch {
+                backend: "Kvm",
+                ptrace: false,
+                ..ptrace
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("anchor 'w'") && err.contains("the Kvm backend"),
+            "{err}"
+        );
+        let err = check(
+            fd_anchor,
+            HbLaunch {
+                passthru_opt: true,
+                ..ptrace
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("anchor 'w'") && err.contains("--passthru-opt"),
+            "{err}"
+        );
+        assert!(check(fd_anchor, ptrace).is_ok());
+        assert!(
+            check(
+                r#"{"version": 1,
+                    "events": {"closed": {"thread": "3", "syscall": "close", "fd": 4, "phase": "pre"}}}"#,
+                ptrace
+            )
+            .is_ok()
+        );
+        // A count anchor is not refused on any of these launches.
+        let count_only = r#"{"version": 1, "events": {"c": {"thread": "3", "syscalls": 5}}}"#;
+        assert!(
+            check(
+                count_only,
+                HbLaunch {
+                    namespace_only: true,
+                    ..ptrace
+                }
+            )
+            .is_ok()
+        );
     }
 }

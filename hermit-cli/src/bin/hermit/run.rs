@@ -46,6 +46,7 @@ use hermit::Shebang;
 use hermit::SkidOvershootError;
 use hermit::canonical_verdict::Verdict;
 use hermit::happens_before::DebugInfoResolver;
+use hermit::happens_before::HbLaunch;
 use hermit::happens_before::describe_anchor;
 use hermit::happens_before::load_program;
 use hermit::happens_before::refuse_unenforceable_anchors;
@@ -5037,6 +5038,10 @@ impl RunOpts {
         // reason: a refused run must not consume its input. It is also above the
         // DBT arm below, which returns without reaching `RunOpts::run`.
         self.refuse_unsupervised_log_cap(global.max_log_bytes)?;
+        // Also before stdin is read and before any backend is probed: a
+        // happens-before spec this launch cannot enforce needs neither, so it
+        // is refused at once rather than after input or availability checks.
+        self.refuse_unenforceable_happens_before()?;
         if self.verify {
             validate_log_level(global)?;
         }
@@ -5163,41 +5168,6 @@ impl RunOpts {
             // it so every subsequent `effective_det_config()` (including both
             // `--verify` runs) hands the scheduler the identical resolved program.
             let program = self.load_and_resolve_happens_before()?;
-            refuse_unenforceable_anchors(
-                &program,
-                self.happens_before
-                    .as_deref()
-                    .expect("checked by is_some above"),
-            )?;
-            // Syscall-occurrence anchors are counted and enforced by the Detcore
-            // that traces the guest from outside, on the ptrace backend. Backends
-            // that run Detcore inside the guest never receive the program, so every
-            // such anchor would end the run as "never fired", blaming the guest.
-            // Refuse up front instead.
-            if backend != Backend::Ptrace
-                && let Some(anchor) = program.anchors.values().find(|a| a.is_syscall_occurrence())
-            {
-                anyhow::bail!(
-                    "--happens-before anchor '{}' ({}) is a syscall-occurrence anchor, which is \
-                     enforced only on the ptrace backend; this run selected the {:?} backend",
-                    anchor.name,
-                    anchor.position,
-                    backend
-                );
-            }
-            // `--passthru-opt` intercepts only an allow-list of syscalls, so a
-            // syscall-occurrence anchor on any other call could never be
-            // counted, and the run would blame the guest for never reaching it.
-            if self.det_opts.det_config.passthru_opt
-                && let Some(anchor) = program.anchors.values().find(|a| a.is_syscall_occurrence())
-            {
-                anyhow::bail!(
-                    "--happens-before anchor '{}' ({}) is a syscall-occurrence anchor, which \
-                     needs every syscall intercepted; --passthru-opt leaves some unintercepted",
-                    anchor.name,
-                    anchor.position
-                );
-            }
             self.resolved_happens_before = Some(program);
         }
         if backend == Backend::E9patch {
@@ -6085,6 +6055,36 @@ impl RunOpts {
             }
         }
         Ok(program)
+    }
+
+    /// Refuse a `--happens-before` spec this launch cannot enforce
+    /// (`refuse_unenforceable_anchors`): a phase other than the prehook, an
+    /// unobservable syscall, or a syscall-occurrence anchor on a launch without
+    /// full ptrace interception. Needs only the spec, not the guest program, so
+    /// it runs before stdin is read or a backend is probed.
+    fn refuse_unenforceable_happens_before(&self) -> Result<(), Error> {
+        let Some(path) = self.happens_before.as_deref() else {
+            return Ok(());
+        };
+        if self.hb_list_events {
+            return Ok(());
+        }
+        let backend = self.selected_backend();
+        let program = load_program(path)?;
+        let backend_name = format!("{:?}", backend);
+        refuse_unenforceable_anchors(
+            &program,
+            path,
+            HbLaunch {
+                backend: &backend_name,
+                ptrace: backend == Backend::Ptrace,
+                namespace_only: self.namespace_only,
+                passthru_opt: self.det_opts.det_config.passthru_opt,
+            },
+        )
+        // A spec the launch cannot enforce is a policy refusal (exit 122), not
+        // a Hermit failure.
+        .map_err(|error| error.context(super::container::PolicyRefusal))
     }
 
     fn list_happens_before_events(&self) -> Result<ExitStatus, Error> {

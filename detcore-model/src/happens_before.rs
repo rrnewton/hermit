@@ -419,6 +419,14 @@ impl Anchor {
     }
 }
 
+/// True for a syscall that never reaches Hermit's tracer on the ptrace
+/// backend, whatever Detcore subscribes to: Reverie lets `rt_sigreturn` run
+/// untraced from its private page so a signal frame is restored safely. A
+/// syscall anchor on one could never fire, so the run refuses it.
+pub fn syscall_never_reaches_tracer(sysno: Sysno) -> bool {
+    sysno == Sysno::rt_sigreturn
+}
+
 /// The key of one per-thread occurrence counter: a syscall number and an
 /// optional file descriptor ([`Anchor::occurrence_key`]).
 pub type OccurrenceKey = (usize, Option<i32>);

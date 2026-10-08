@@ -679,8 +679,15 @@ impl HbRuntime {
                 }) {
                     let before = &self.program.anchors[&edge.before];
                     lines.push(format!(
-                        "  anchor '{}' on thread {}: {} never fired; it holds dtid {} at anchor '{}'",
-                        before.name, before.thread.label, before.position, dettid, after
+                        "  anchor '{}' on thread {}: {} never fired; it holds dtid {} at anchor \
+                         '{}' (edge {} -> {})",
+                        before.name,
+                        before.thread.label,
+                        before.position,
+                        dettid,
+                        after,
+                        edge.before,
+                        edge.after
                     ));
                 }
             }

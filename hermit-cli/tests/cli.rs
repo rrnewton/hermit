@@ -8451,8 +8451,10 @@ fn happens_before_gate_that_cannot_open_reports_a_deadlock() {
         "a gate that cannot open must end with the policy-refusal status: {log}"
     );
     assert!(
-        log.contains("anchor 'never' on thread 3: after 1000000000 syscalls never fired; it holds dtid 3 at anchor 'gate'")
-            && log.contains("held at a happens-before gate whose BEFORE anchor cannot fire")
+        log.contains(
+            "anchor 'never' on thread 3: after 1000000000 syscalls never fired; it holds dtid 3 \
+             at anchor 'gate' (edge never -> gate)"
+        ) && log.contains("held at a happens-before gate whose BEFORE anchor cannot fire")
             && log.contains("HappensBeforeCheckpoint(50)"),
         "no refusal naming the gate's BEFORE anchor, with the deadlock report:\n{log}"
     );
@@ -8904,7 +8906,7 @@ fn happens_before_before_anchor_that_never_fires_is_refused_by_name() {
         log.contains("HERMIT_HB_ANCHOR_NEVER_FIRED: happens-before BEFORE anchor(s) never fired")
             && log.contains(
                 "anchor 'phantom_before' on thread 5: write(fd=77)#1 never fired; it holds dtid 3 \
-                 at anchor 'main_writes'"
+                 at anchor 'main_writes' (edge phantom_before -> main_writes)"
             ),
         "no refusal naming the BEFORE anchor that never fired:\n{log}"
     );
@@ -8948,6 +8950,122 @@ fn happens_before_hold_in_a_vfork_child_is_refused_by_name() {
     assert!(
         log.contains("HERMIT_HB_HOLD_IN_VFORK_CHILD: happens-before anchor(s) [\"child_dup2\"]"),
         "no refusal naming the anchor that would hold the vfork child:\n{log}"
+    );
+}
+
+/// A syscall-occurrence anchor on a launch that bypasses interception is
+/// refused by name before the guest starts, under both spellings of the
+/// option: `--namespace-only` runs the guest with no tracer and no scheduler,
+/// so the anchor could not be enforced and the run used to pass silently.
+#[test]
+fn happens_before_fd_anchor_is_refused_without_interception() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let spec = directory.path().join("echo-phantom.json");
+    fs::write(
+        &spec,
+        r#"{"version": 1,
+            "events": {"phantom": {"thread": "3", "syscall": "write", "fd": 77}}}"#,
+    )
+    .unwrap();
+    let spec = spec.to_str().unwrap().to_owned();
+    for spelling in ["--namespace-only", "--lite"] {
+        let args = [
+            "run",
+            spelling,
+            "--happens-before",
+            spec.as_str(),
+            "--",
+            "/bin/echo",
+            "ran",
+        ];
+        let output = hermit(&args);
+        let log = stderr(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{spelling}: an anchor that cannot be enforced must be refused:\n{log}"
+        );
+        assert!(
+            log.contains(
+                "anchor 'phantom' (write(fd=77)#1) is a syscall-occurrence anchor, but \
+                 --namespace-only runs the guest without interception or a scheduler"
+            ),
+            "{spelling}: no refusal naming the anchor:\n{log}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).is_empty(),
+            "{spelling}: the guest ran although the spec was refused"
+        );
+    }
+}
+
+/// A launch that refuses the spec must not first wait for input. With
+/// `--verify`, Hermit reads stdin to its end to replay it in both runs; the
+/// refusal of a syscall-occurrence anchor on another backend needs no input, so
+/// with an undrained stdin pipe it must still come promptly, before any
+/// backend is probed.
+#[test]
+fn happens_before_unsupported_fd_anchor_is_refused_before_reading_stdin() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let spec = directory.path().join("kvm-phantom.json");
+    fs::write(
+        &spec,
+        r#"{"version": 1,
+            "events": {"phantom": {"thread": "3", "syscall": "write", "fd": 77}}}"#,
+    )
+    .unwrap();
+    let spec = spec.to_str().unwrap().to_owned();
+    let mut child = hermit_command(&[
+        "--backend=kvm",
+        "run",
+        "--strict",
+        "--verify",
+        "--happens-before",
+        spec.as_str(),
+        "--",
+        "/bin/true",
+    ])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("failed to spawn hermit");
+    // Hold the stdin pipe's writer open for the whole wait: a run that reads
+    // its input first never returns.
+    let stdin_writer = child.stdin.take().expect("stdin is piped");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut timed_out = false;
+    loop {
+        match child.try_wait().expect("failed to poll hermit") {
+            Some(_) => break,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                timed_out = true;
+                break;
+            }
+            None => thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    drop(stdin_writer);
+    let output = child
+        .wait_with_output()
+        .expect("failed to collect hermit output");
+    let log = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        !timed_out,
+        "the refusal waited for stdin: no exit within 60s with an open stdin pipe\n{log}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "an unsupported anchor must be a policy refusal:\n{log}"
+    );
+    assert!(
+        log.contains(
+            "anchor 'phantom' (write(fd=77)#1) is a syscall-occurrence anchor, which is \
+             enforced only on the ptrace backend; this run selected the Kvm backend"
+        ),
+        "no refusal naming the anchor:\n{log}"
     );
 }
 
