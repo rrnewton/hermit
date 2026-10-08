@@ -635,12 +635,22 @@ fn proc_self_mountinfo_is_deterministic() {
             command.env("TMPDIR", host_tmpdir.path());
         })
     };
-    let first = read();
-    for run in 2..=RUNS {
-        assert_eq!(first, read(), "mountinfo differed on run {run}");
+    // Each guest starts from a copy of this process's mount table, and host
+    // mounts stay visible by design. Linux detaches a bind in every namespace
+    // when something renames over its mountpoint, as a `git config` write does
+    // to a bind-mounted `.git/config`, so a host change between runs is a
+    // changed input. Compare only batches read while the host table held
+    // still; within them every run must still match byte for byte.
+    let runs = assert_runs_equal_while_host_mountinfo_stable(
+        || (0..RUNS).map(|_| read()).collect::<Vec<_>>(),
+        "mountinfo changed across runs",
+    );
+    let first = &runs[0];
+    for (index, contents) in runs.iter().enumerate().skip(1) {
+        assert_eq!(first, contents, "mountinfo differed on run {}", index + 1);
     }
     {
-        let contents = &first;
+        let contents = first;
         let text = std::str::from_utf8(contents).expect("mountinfo should be UTF-8");
         assert!(!text.contains("/tmpvol/.tmp"));
         assert!(text.lines().all(|line| line.contains(" - ")));
