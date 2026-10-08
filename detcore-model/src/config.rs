@@ -142,6 +142,24 @@ pub struct Config {
     #[clap(skip)]
     pub guest_may_inherit_a_terminal: bool,
 
+    /// The forwarding policy (`detcore::detlog::ForwardPolicy::encode`) every
+    /// in-guest Tool must forward its DETLOG records with, on the socket Hermit
+    /// passed it (`hermit run --verify` under SaBRe or in-guest LiteInst);
+    /// `None` when no socket is passed.
+    ///
+    /// The host sets it, not a flag, and every Tool image receives it in the
+    /// configuration handshake on its coordinator connection, which guest code
+    /// cannot change. A Tool image whose forwarder is missing, or forwards by
+    /// another policy (guest code that ran first changed its private
+    /// forwarding variables, so some records would be dropped before they are
+    /// counted), then reports every forwarded-record count as UNCOUNTED
+    /// (`detcore::detlog::require_forwarding`), so verification refuses the run
+    /// instead of accepting a log without those records. Like
+    /// `guest_may_inherit_a_terminal`, it has no legacy key.
+    #[serde(default)]
+    #[clap(skip)]
+    pub in_guest_detlog_forward_policy: Option<String>,
+
     /// Epoch of the logical time.
     ///
     /// This is the datetime from which all time and date modtimes begin and
@@ -1498,7 +1516,8 @@ impl Default for Config {
 /// only DBT, whose launcher collects no host inputs. So is
 /// [`Config::backend_supports_blocked_wait_signal_interruption`], which
 /// is false for DBT, and [`Config::guest_may_inherit_a_terminal`], which only
-/// that capability reads. So is [`Config::target_timeslice_syscalls_only`],
+/// that capability reads, and [`Config::in_guest_detlog_forward_policy`],
+/// which is unset for DBT. So is [`Config::target_timeslice_syscalls_only`],
 /// added after this form froze; DBT runs without a PMU maximum, where the
 /// option has no effect. Every other field is serialized exactly as
 /// `serde_json::to_string(config)` serializes it.
@@ -1827,11 +1846,14 @@ mod legacy_backend_json {
     /// `target_timeslice_syscalls_only` came after the legacy form froze; the
     /// legacy form never carried it, so it is never written and reads as false,
     /// the behaviour every legacy reader already has.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 5] = [
+    /// `in_guest_detlog_forward_policy` is unset for DBT (its runtime forwards
+    /// no records on a socket), so it is never written and reads as unset.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 6] = [
         "backend",
         "record_host_inputs",
         "backend_supports_blocked_wait_signal_interruption",
         "guest_may_inherit_a_terminal",
+        "in_guest_detlog_forward_policy",
         "target_timeslice_syscalls_only",
     ];
 
@@ -1923,7 +1945,8 @@ mod legacy_backend_json {
     /// elements as the legacy backend keys, and neither the field it asks for
     /// there nor [`Config::record_host_inputs`],
     /// [`Config::backend_supports_blocked_wait_signal_interruption`],
-    /// [`Config::guest_may_inherit_a_terminal`] or
+    /// [`Config::guest_may_inherit_a_terminal`],
+    /// [`Config::in_guest_detlog_forward_policy`] or
     /// [`Config::target_timeslice_syscalls_only`] takes an element. Each gets a
     /// placeholder; [`super::from_legacy_backend_json`] replaces the first.
     struct LegacyPositions<'f, 'l, A> {
@@ -1960,6 +1983,11 @@ mod legacy_backend_json {
                     | "guest_may_inherit_a_terminal"
                     | "target_timeslice_syscalls_only",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
+                // Unset, as its serde default is.
+                Some("in_guest_detlog_forward_policy") => seed
+                    .deserialize(serde_json::Value::Null)
+                    .map(Some)
+                    .map_err(<A::Error as de::Error>::custom),
                 _ => self.inner.next_element_seed(seed),
             }
         }
@@ -2202,6 +2230,7 @@ mod legacy_backend_json {
                 "record_host_inputs"
                 | "backend_supports_blocked_wait_signal_interruption"
                 | "guest_may_inherit_a_terminal"
+                | "in_guest_detlog_forward_policy"
                 | "target_timeslice_syscalls_only" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
@@ -2269,6 +2298,7 @@ mod tests {
         );
         assert!(!config.backend_supports_blocked_wait_signal_interruption);
         assert!(!config.guest_may_inherit_a_terminal);
+        assert!(config.in_guest_detlog_forward_policy.is_none());
     }
 
     #[test]
@@ -2661,8 +2691,9 @@ mod tests {
     /// The legacy form's positions are `Config`'s fields in declaration order
     /// with the fifteen legacy keys where `backend` stands and no
     /// `record_host_inputs`, `backend_supports_blocked_wait_signal_interruption`,
-    /// `guest_may_inherit_a_terminal` or `target_timeslice_syscalls_only`, which
-    /// is the key order the encoder writes.
+    /// `guest_may_inherit_a_terminal`, `in_guest_detlog_forward_policy` or
+    /// `target_timeslice_syscalls_only`, which is the key order the encoder
+    /// writes.
     #[test]
     fn legacy_positions_are_the_encoded_key_order() {
         let names = legacy_backend_keys(&Config::default()).map(|(name, _)| name);
@@ -2680,6 +2711,7 @@ mod tests {
                 "record_host_inputs"
                 | "backend_supports_blocked_wait_signal_interruption"
                 | "guest_may_inherit_a_terminal"
+                | "in_guest_detlog_forward_policy"
                 | "target_timeslice_syscalls_only" => {}
                 other => expected.push(other.to_owned()),
             }
@@ -2692,10 +2724,10 @@ mod tests {
         assert_eq!(keys, expected);
         // `backend` becomes fifteen keys; `record_host_inputs`,
         // `backend_supports_blocked_wait_signal_interruption`,
-        // `guest_may_inherit_a_terminal` and `target_timeslice_syscalls_only`
-        // none.
+        // `guest_may_inherit_a_terminal`, `in_guest_detlog_forward_policy` and
+        // `target_timeslice_syscalls_only` none.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len() + 10, keys.len());
+        assert_eq!(fields.len() + 9, keys.len());
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -2795,6 +2827,29 @@ mod tests {
     /// `guest_may_inherit_a_terminal` never enters the legacy form, whatever
     /// its value: the guest-visible string stays the legacy bytes, and it reads
     /// back as false from both the object and the array form.
+    /// `in_guest_detlog_forward_policy` is unset for DBT, so the legacy form
+    /// never carries it, and it reads back as unset.
+    #[test]
+    fn in_guest_detlog_forward_policy_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            in_guest_detlog_forward_policy: Some("1".to_owned()),
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("in_guest_detlog_forward_policy"), "{json}");
+        assert!(
+            from_legacy_backend_json(&json)
+                .unwrap()
+                .in_guest_detlog_forward_policy
+                .is_none()
+        );
+    }
+
     #[test]
     fn guest_may_inherit_a_terminal_never_enters_the_legacy_form() {
         let off = Config {

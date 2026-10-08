@@ -4448,9 +4448,9 @@ impl RunOpts {
     }
 
     /// A Unix `SOCK_SEQPACKET` pair for one verification run's forwarded
-    /// DETLOG records, when the run hosts Detcore inside the guest through
-    /// LiteInst: the guest's runtime sends each record as one message on the
-    /// sending end, a descriptor Reverie protects from the guest, so the
+    /// DETLOG records, when the run hosts Detcore inside the guest (in-guest
+    /// LiteInst or SaBRe): the guest's runtime sends each record as one message
+    /// on the sending end, a descriptor Reverie protects from the guest, so the
     /// guest's own output never mixes with them
     /// (`hermit::forward_in_guest_detlogs_to`). Returns the sending end and the
     /// receiving end; inside the run's container, the coordinator writes what
@@ -4459,7 +4459,7 @@ impl RunOpts {
     fn forwarded_detlog_channel(
         &self,
     ) -> Result<Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)>, Error> {
-        if !self.uses_in_guest_liteinst() {
+        if !self.uses_in_guest_liteinst() && !self.uses_sabre() {
             return Ok(None);
         }
         let mut pair = [-1; 2];
@@ -4498,12 +4498,12 @@ impl RunOpts {
 
     /// Moves the DETLOG records this run's in-guest Tool forwarded into the
     /// run's log and returns how many are syscall records, or `None` when the
-    /// backend forwards none. SaBRe's plugin forwards them on the guest's
-    /// standard error, from which they are cut out and appended. In-guest
-    /// LiteInst sends them on its own socket (`socket`), whose records the
-    /// coordinator already wrote into the log in order during the run; they
-    /// are only counted here, and a run whose socket carried anything but
-    /// records is refused.
+    /// backend forwards none. In-guest LiteInst and SaBRe send them on their
+    /// own socket (`socket`), whose records the coordinator already wrote into
+    /// the log in order during the run; they are only counted here, and a run
+    /// whose socket carried anything but records is refused. Without the
+    /// socket, SaBRe's plugin forwards them on the guest's standard error, from
+    /// which they are cut out and appended.
     fn take_forwarded_detlogs(
         &self,
         log: &Path,
@@ -4524,6 +4524,12 @@ impl RunOpts {
     /// `--namespace-only` runs no backend, so it never does.
     fn uses_in_guest_liteinst(&self) -> bool {
         !self.namespace_only && self.selected_backend() == Backend::Liteinst
+    }
+
+    /// Whether this run hosts Detcore inside the guest through SaBRe.
+    /// `--namespace-only` runs no backend, so it never does.
+    fn uses_sabre(&self) -> bool {
+        !self.namespace_only && self.selected_backend() == Backend::Sabre
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED

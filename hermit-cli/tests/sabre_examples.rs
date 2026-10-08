@@ -782,11 +782,503 @@ fn sabre_forwards_a_target_scoped_detlog_filter_as_ptrace_applies_it() {
     assert_eq!(sabre, ptrace);
 }
 
+/// A verification's run log keeps the guest's records in the order they
+/// happen, as the live stream does: the SaBRe plugin sends each one on the
+/// socket `--verify` passes, from a descriptor reverie-sabre keeps from the
+/// guest, and the coordinator writes it at its thread's scheduler turn. So the
+/// run log matches ptrace's through the post-exec AT_RANDOM record. When the
+/// plugin forwarded records on the guest's stderr, they were cut out after the
+/// run and appended, and the SaBRe run log diverged from ptrace's at the third
+/// record.
+#[test]
+fn sabre_verify_log_keeps_forwarded_records_in_ptraces_order() {
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let through_post_exec = |records: Vec<String>, label: &str| {
+        let end = records
+            .iter()
+            .position(|record| record.contains("] init auxv AT_RANDOM value to "))
+            .unwrap_or_else(|| panic!("{label} logged no AT_RANDOM record: {records:#?}"));
+        records[..=end].to_vec()
+    };
+    let ptrace = verify_run(None, &["/bin/true"], "ptrace /bin/true");
+    let sabre = verify_run(Some(&loader), &["/bin/true"], "SaBRe /bin/true");
+    assert_eq!(
+        through_post_exec(sabre.records, "SaBRe"),
+        through_post_exec(ptrace.records, "ptrace")
+    );
+}
+
+/// A guest that dup2s onto every descriptor from 1024 to 1039 (where
+/// reverie-sabre keeps, and keeps moving, the forwarding socket) and then
+/// closes them all still runs to the end under `--verify --verify-strict`:
+/// each dup2 succeeds as it would without forwarding, and records keep
+/// reaching the run log after the moves and the cleanup, through the final
+/// write of "alive". With a socket that did not move, the dup2 onto its number
+/// failed with EBADF.
+#[test]
+fn sabre_verify_survives_a_guest_dup_onto_the_forwarding_socket() {
+    const GUEST: &str = "import os\n\
+        for fd in range(1024, 1040):\n\
+        \x20   assert os.dup2(1, fd) == fd, fd\n\
+        os.closerange(3, 1100)\n\
+        print('alive', flush=True)\n";
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let run = verify_run(
+        Some(&loader),
+        &["/usr/bin/python3", "-c", GUEST],
+        "SaBRe python3 dup2 onto 1024..1039",
+    );
+    assert_eq!(String::from_utf8_lossy(&run.output.stdout), "alive\n");
+    // Records keep arriving after every move and after the cleanup: the
+    // cleanup's last record and the final write of "alive" are both in the
+    // log, in that order, with the write's result.
+    let position = |needle: &str| {
+        run.records
+            .iter()
+            .rposition(|record| record.contains(needle))
+            .unwrap_or_else(|| panic!("no {needle:?} record in the run log: {:#?}", run.records))
+    };
+    // os.closerange is one close_range(3, 1099) where Python has it (the
+    // pinned root's), and one close per descriptor where it does not (the
+    // host's): either way it reaches 1099, the socket's number range included.
+    let cleanup = run
+        .records
+        .iter()
+        .rposition(|record| {
+            record.contains("inbound syscall: close(1099)")
+                || record.contains("inbound syscall: close_range(3, 1099,")
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no close(1099) or close_range(3, 1099, ...) record in the run log: {:#?}",
+                run.records
+            )
+        });
+    let alive = position("write(1, ");
+    assert!(
+        position("inbound syscall: dup2(1, 1039)") < cleanup && cleanup < alive,
+        "dup2 onto 1039, the last close and the write of \"alive\" are out of order: {:#?}",
+        run.records
+    );
+    assert!(
+        run.records[alive..]
+            .iter()
+            .any(|record| record.contains("finish syscall #") && record.contains("write(1, ")),
+        "the write of \"alive\" has no finished record: {:#?}",
+        run.records
+    );
+}
+
+/// A guest that disturbs the forwarding socket before the SaBRe plugin can
+/// adopt it (an executable `.preinit_array` function runs before the plugin's
+/// first intercepted syscall, and closes it) cannot make `--verify` accept a
+/// log with records missing: every guest thread tells the coordinator, with its
+/// next request, how many records it produced, and the coordinator records a
+/// determinism loss when fewer arrived, so the comparison is refused. Before
+/// that count, the plugin fell back to stderr unnoticed and the run's log kept
+/// only the coordinator's records.
+#[test]
+fn sabre_verify_refuses_when_forwarded_records_go_missing() {
+    const GUEST: &str = r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static void drop_tool_output(int argc, char **argv, char **envp) {
+  (void)argc;
+  (void)argv;
+  for (char **entry = envp; *entry; entry++)
+    if (strncmp(*entry, "REVERIE_SABRE_TOOL_OUTPUT_FD=", 29) == 0)
+      close(atoi(*entry + 29));
+}
+__attribute__((section(".preinit_array"), used)) static void (*preinit)(int, char **, char **) =
+    drop_tool_output;
+
+int main(void) {
+  for (int i = 0; i < 20; i++) getpid();
+  puts("done");
+  return 0;
+}
+"#;
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("sabre-dropped-transport-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest directory");
+    let guest = compile_guest(dir.path(), "drop", GUEST);
+    let report = dir.path().join("verify.json");
+    let mut command = Command::new(hermit_binary());
+    command
+        .arg("--log=info")
+        .env("HERMIT_SABRE_BINARY", &loader)
+        .args(["--backend", "sabre", "run", "--strict", COMPARISON_EPOCH])
+        .args(["--verify", "--verify-strict", "--verify-json"])
+        .arg(&report)
+        .arg("--")
+        .arg(&guest);
+    let (status, stderr) =
+        run_expecting_failure(command, "SaBRe guest that drops the forwarding socket");
+    assert!(
+        !status.success(),
+        "verification accepted the run:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("forwarded records lost: thread"),
+        "the refusal does not name the lost records:\n{stderr}"
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+    assert_eq!(report["verdict"], "no_result", "{report}");
+    assert_eq!(report["bitwise_parity"], false, "{report}");
+}
+
+/// A guest whose preinit code (which runs before the plugin can adopt the
+/// forwarding socket) closes the socket and points its own stderr at a file of
+/// its own. The plugin was asked for the socket and could not adopt it, so it
+/// must not fall back to stderr: no Tool record may land in the guest's file,
+/// and the records it could not forward are refused as lost.
+#[test]
+fn sabre_verify_writes_no_tool_record_into_a_guest_stderr_file() {
+    const GUEST: &str = r#"
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static void take_stderr(int argc, char **argv, char **envp) {
+  (void)argc;
+  (void)argv;
+  for (char **entry = envp; *entry; entry++)
+    if (strncmp(*entry, "REVERIE_SABRE_TOOL_OUTPUT_FD=", 29) == 0)
+      close(atoi(*entry + 29));
+  int file = open("guest-stderr.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (file < 0 || dup2(file, 2) != 2) _exit(3);
+  close(file);
+}
+__attribute__((section(".preinit_array"), used)) static void (*preinit)(int, char **, char **) =
+    take_stderr;
+
+int main(void) {
+  for (int i = 0; i < 20; i++) getpid();
+  static const char line[] = "guest line\n";
+  if (write(2, line, sizeof line - 1) != (ssize_t)(sizeof line - 1)) return 4;
+  return 0;
+}
+"#;
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("sabre-guest-stderr-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest directory");
+    let guest = compile_guest(dir.path(), "stderr", GUEST);
+    let mut command = Command::new(hermit_binary());
+    command
+        .current_dir(dir.path())
+        .arg("--log=info")
+        .env("HERMIT_SABRE_BINARY", &loader)
+        .args(["--backend", "sabre", "run", "--strict", COMPARISON_EPOCH])
+        .args(["--verify", "--verify-strict", "--"])
+        .arg(&guest);
+    let (status, stderr) = run_expecting_failure(command, "SaBRe guest that takes over its stderr");
+    assert!(
+        !status.success(),
+        "verification accepted the run:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("forwarded records lost: thread"),
+        "the refusal does not name the lost records:\n{stderr}"
+    );
+    let file = std::fs::read_to_string(dir.path().join("guest-stderr.txt"))
+        .expect("the guest did not create its stderr file");
+    assert_eq!(
+        file, "guest line\n",
+        "the guest's stderr file holds bytes the guest did not write"
+    );
+}
+
+/// A guest whose preinit code closes the forwarding socket and puts a socket
+/// pair of its own at that number. The plugin must not adopt the guest's
+/// socket: the guest's peer must receive no Tool record, and the records the
+/// plugin could not forward are refused as lost.
+#[test]
+fn sabre_verify_sends_no_tool_record_to_a_guest_socket_at_the_passed_number() {
+    const GUEST: &str = r#"
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+static int peer = -1;
+
+static void replace_tool_output(int argc, char **argv, char **envp) {
+  (void)argc;
+  (void)argv;
+  for (char **entry = envp; *entry; entry++) {
+    if (strncmp(*entry, "REVERIE_SABRE_TOOL_OUTPUT_FD=", 29) == 0) {
+      int passed = atoi(*entry + 29);
+      int pair[2];
+      close(passed);
+      if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) _exit(3);
+      if (pair[0] != passed && dup2(pair[0], passed) != passed) _exit(4);
+      if (pair[0] != passed) close(pair[0]);
+      peer = pair[1];
+    }
+  }
+}
+__attribute__((section(".preinit_array"), used)) static void (*preinit)(int, char **, char **) =
+    replace_tool_output;
+
+int main(void) {
+  for (int i = 0; i < 20; i++) getpid();
+  if (peer < 0) return 5;
+  char buffer[4096];
+  ssize_t got = recv(peer, buffer, sizeof buffer, MSG_DONTWAIT);
+  if (got >= 0) {
+    fprintf(stderr, "guest socket received %zd tool bytes\n", got);
+    return 6;
+  }
+  return errno == EAGAIN ? 0 : 7;
+}
+"#;
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("sabre-guest-socket-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest directory");
+    let guest = compile_guest(dir.path(), "socket", GUEST);
+    let mut command = Command::new(hermit_binary());
+    command
+        .arg("--log=info")
+        .env("HERMIT_SABRE_BINARY", &loader)
+        .args(["--backend", "sabre", "run", "--strict", COMPARISON_EPOCH])
+        .args(["--verify", "--verify-strict", "--"])
+        .arg(&guest);
+    let (status, stderr) =
+        run_expecting_failure(command, "SaBRe guest that replaces the forwarding socket");
+    assert!(
+        !stderr.contains("guest socket received"),
+        "a Tool record reached the guest's socket:\n{stderr}"
+    );
+    assert!(
+        !status.success(),
+        "verification accepted the run:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("forwarded records lost: thread"),
+        "the refusal does not name the lost records:\n{stderr}"
+    );
+}
+
+/// A guest that execs itself, where the new image's preinit code removes the
+/// plugin's private forwarding policy variable. That must never make the new
+/// image's records vanish while the run is still compared: either the image
+/// still forwards (measured: the plugin reads its settings at the first
+/// intercepted syscall, which the dynamic loader makes before any preinit code
+/// runs), so it forwards exactly as many records as the same guest without the
+/// removal, or, if an image ever comes up without a forwarder, the coordinator's
+/// requirement (`Config::in_guest_detlog_forward_policy`, sent in the connection
+/// handshake, not the environment) refuses the run as uncounted.
+#[test]
+fn sabre_verify_never_loses_an_exec_image_that_drops_its_forwarding_settings() {
+    const GUEST: &str = r#"
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static void drop_forwarding(int argc, char **argv, char **envp) {
+  (void)envp;
+  if (DROP && argc > 1 && strcmp(argv[1], "child") == 0)
+    unsetenv("REVERIE_SABRE_HERMIT_FORWARD_DETLOG");
+}
+__attribute__((section(".preinit_array"), used)) static void (*preinit)(int, char **, char **) =
+    drop_forwarding;
+
+int main(int argc, char **argv) {
+  for (int i = 0; i < 20; i++) getpid();
+  if (argc > 1) return 0;
+  char *child[] = {argv[0], "child", NULL};
+  execv("/proc/self/exe", child);
+  return 3;
+}
+"#;
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("sabre-exec-drops-forwarding-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest directory");
+    let run = |drop: bool| {
+        let source = format!("#define DROP {}\n{GUEST}", i32::from(drop));
+        let guest = compile_guest(dir.path(), if drop { "drops" } else { "keeps" }, &source);
+        let mut command = Command::new(hermit_binary());
+        command
+            .arg("--log=info")
+            .env("HERMIT_SABRE_BINARY", &loader)
+            .args(["--backend", "sabre", "run", "--strict", COMPARISON_EPOCH])
+            .args(["--verify", "--verify-strict", "--"])
+            .arg(&guest);
+        run_expecting_failure(command, "SaBRe guest that execs itself")
+    };
+    let records = |stderr: &str| -> Option<String> {
+        stderr
+            .lines()
+            .find(|line| line.contains("SaBRe syscall DETLOG records included:"))
+            .map(str::to_owned)
+    };
+    let (kept_status, kept) = run(false);
+    assert!(
+        kept_status.success(),
+        "the plain exec guest was refused:\n{kept}"
+    );
+    let (dropped_status, dropped) = run(true);
+    if dropped_status.success() {
+        assert_eq!(
+            records(&dropped),
+            records(&kept),
+            "removing the forwarding variable changed the forwarded records of an accepted run:\n{dropped}"
+        );
+        assert!(records(&kept).is_some(), "{kept}");
+    } else {
+        assert!(
+            dropped.contains("forwarded records uncounted"),
+            "the refusal does not name the uncounted records:\n{dropped}"
+        );
+    }
+}
+
+/// Compiles C `source` into `dir/name` and returns the executable's path.
+fn compile_guest(dir: &Path, name: &str, source: &str) -> PathBuf {
+    let source_path = dir.join(format!("{name}.c"));
+    std::fs::write(&source_path, source).unwrap();
+    let guest = dir.join(name);
+    let build = Command::new("cc")
+        .args(["-O1", "-Wall", "-Werror", "-o"])
+        .arg(&guest)
+        .arg(&source_path)
+        .output()
+        .expect("failed to compile the guest");
+    assert!(
+        build.status.success(),
+        "guest compilation failed:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    guest
+}
+
+/// Runs `command` to its end (at most 45 s), with stdout and stderr in files,
+/// and returns its status and stderr, whatever the status.
+fn run_expecting_failure(mut command: Command, label: &str) -> (std::process::ExitStatus, String) {
+    let stderr = tempfile::Builder::new()
+        .prefix("sabre-expected-failure-")
+        .tempfile_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the stderr file");
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr.reopen().expect("failed to reopen the stderr file"))
+        .process_group(0);
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to start {label}: {error}"));
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll the run") {
+            break status;
+        }
+        if started.elapsed() >= Duration::from_secs(45) {
+            kill_process_group(child.id(), label);
+            panic!("{label} did not finish within 45 s");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    (
+        status,
+        std::fs::read_to_string(stderr.path()).unwrap_or_default(),
+    )
+}
+
+struct VerifyRun {
+    output: Output,
+    /// The DETLOG records of run 1's retained log.
+    records: Vec<String>,
+}
+
+/// Runs `argv` under `--verify --verify-strict` at INFO (on SaBRe with
+/// `backend`'s loader, else on ptrace), requires a bitwise match, and returns
+/// the output and run 1's retained records.
+fn verify_run(backend: Option<&Path>, argv: &[&str], label: &str) -> VerifyRun {
+    let logs = tempfile::Builder::new()
+        .prefix("sabre-verify-log-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the verification log directory");
+    let report = logs.path().join("verify.json");
+    let mut command = Command::new(hermit_binary());
+    command.arg("--log=info");
+    if let Some(loader) = backend {
+        command
+            .env("HERMIT_SABRE_BINARY", loader)
+            .args(["--backend", "sabre"]);
+    }
+    command
+        .arg("run")
+        .args([
+            "--strict",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            COMPARISON_EPOCH,
+            "--verify",
+            "--verify-strict",
+            "--keep-logs",
+        ])
+        .arg("--verify-log-dir")
+        .arg(logs.path())
+        .arg("--verify-json")
+        .arg(&report)
+        .arg("--")
+        .args(argv)
+        .stdin(Stdio::null());
+    let output = run_bounded(command, label, None);
+    assert!(
+        output.status.success(),
+        "{label} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&report).unwrap_or_else(|error| panic!("{label} report: {error}")),
+    )
+    .unwrap();
+    assert_eq!(report["bitwise_parity"], true, "{label}: {report}");
+    let run1 = std::fs::read_dir(logs.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.starts_with("run1_log_"))
+        })
+        .unwrap_or_else(|| panic!("{label} kept no run 1 log"));
+    let records = detlog_records(&std::fs::read_to_string(run1).unwrap());
+    VerifyRun { output, records }
+}
+
 /// The DETLOG records of one `/bin/true` run's live INFO stream, where the host
-/// and the SaBRe guest both write their records as they happen. (A
-/// verification's run log does not yet keep that order: it appends the guest's
-/// forwarded records after the host's.) `rust_log` replaces `--log=info` with
-/// that `RUST_LOG` filter.
+/// and the SaBRe guest both write their records as they happen. `rust_log`
+/// replaces `--log=info` with that `RUST_LOG` filter.
 fn live_detlog_records(backend: Option<&Path>, label: &str, rust_log: Option<&str>) -> Vec<String> {
     let mut command = Command::new(hermit_binary());
     match rust_log {

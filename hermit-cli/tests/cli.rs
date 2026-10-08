@@ -15664,6 +15664,92 @@ fn liteinst_in_guest_verify_survives_a_guest_stderr_without_a_reader() {
     assert!(run.syscall_records > 0);
 }
 
+/// A guest whose own shared library's constructor, which the loader runs
+/// before the in-guest runtime's constructor, closes the forwarding socket and
+/// puts a socket pair of its own at that number. The runtime must not adopt the
+/// guest's socket, which would send Tool records to the guest: it refuses to
+/// start, before any record is sent. (Adopting it, the run was refused only
+/// afterwards, as "forwarded records lost", with the records already in the
+/// guest's socket.) An executable's own `.preinit_array` is refused earlier.
+#[test]
+#[cfg(feature = "liteinst")]
+fn liteinst_in_guest_refuses_a_guest_socket_at_the_forwarding_number() {
+    const LIBRARY: &str = r#"
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+extern char **environ;
+__attribute__((constructor)) static void replace_tool_output(void) {
+  for (char **entry = environ; *entry; entry++) {
+    if (strncmp(*entry, "HERMIT_LITEINST_FORWARD_DETLOG=", 31) == 0) {
+      int passed = atoi(*entry + 31);
+      int pair[2];
+      close(passed);
+      if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) != 0) _exit(3);
+      if (pair[0] != passed && dup2(pair[0], passed) != passed) _exit(4);
+    }
+  }
+}
+"#;
+    let _lock = hermit_run_guard();
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let compile = |args: &[&str]| {
+        let build = Command::new("cc")
+            .current_dir(dir.path())
+            .args(args)
+            .output()
+            .expect("failed to run cc");
+        assert!(
+            build.status.success(),
+            "guest compilation failed:\n{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+    };
+    fs::write(dir.path().join("replace.c"), LIBRARY).unwrap();
+    fs::write(dir.path().join("main.c"), "int main(void) { return 0; }\n").unwrap();
+    compile(&[
+        "-shared",
+        "-fPIC",
+        "-O1",
+        "-Wall",
+        "-Werror",
+        "-o",
+        "libreplace.so",
+        "replace.c",
+    ]);
+    let rpath = format!("-Wl,-rpath,{}", dir.path().display());
+    compile(&["-O1", "-o", "guest", "main.c", "-L.", "-lreplace", &rpath]);
+    let guest = dir.path().join("guest");
+    let guest = guest.to_str().expect("UTF-8 temporary path");
+    let args = [
+        "--backend",
+        "liteinst",
+        "run",
+        "--max-timeslice=disabled",
+        "--verify",
+        "--",
+        guest,
+    ];
+    let output = hermit_command(&args)
+        .env_remove("RUST_LOG")
+        .env_remove("HERMIT_LOG")
+        .env_remove("HERMIT_LOG_FILE")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run hermit");
+    let stderr = stderr(&output);
+    assert!(!output.status.success(), "the run was accepted:\n{stderr}");
+    assert!(
+        !stderr.contains("forwarded records lost"),
+        "the runtime adopted the guest's socket and sent records to it:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("exited before connecting to the coordinator"),
+        "the runtime did not refuse to start:\n{stderr}"
+    );
+}
+
 /// Forwarded records count against the log's size bound
 /// (`HERMIT_LOG_MAX_BYTES`), and a log they push past it still ends in the
 /// truncation marker, so the comparison is refused (`no_result`) instead of

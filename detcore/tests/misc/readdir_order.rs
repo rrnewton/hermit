@@ -70,7 +70,7 @@ fn run_five_times_hashing_buffers(guest: fn()) {
     // these tests check nothing (portable run 37383177918). A sink that drops
     // every record, for every target, makes the hashing independent of the
     // log level.
-    _ = detcore::detlog::set_forwarder(|_, _, _| {}, detcore::detlog::ForwardPolicy::all());
+    _ = detcore::detlog::set_forwarder(|_, _, _, _| {}, detcore::detlog::ForwardPolicy::all());
     assert!(detcore::detlog::forwards_target("detcore::io_buffers"));
     let config = Config {
         sequentialize_threads: true,

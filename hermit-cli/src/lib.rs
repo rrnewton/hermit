@@ -1738,6 +1738,10 @@ fn resolve_sabre_binary() -> Result<PathBuf, Error> {
 const SABRE_RPC_SOCKET_ENV: &str = "REVERIE_SABRE_HERMIT_RPC_SOCKET";
 #[cfg(feature = "sabre")]
 const SABRE_DETLOG_FORWARD_ENV: &str = "REVERIE_SABRE_HERMIT_FORWARD_DETLOG";
+/// `reverie_sabre::TOOL_OUTPUT_ENV`: the descriptor reverie-sabre protects
+/// for the in-guest tool's own output. Hermit does not link reverie-sabre.
+#[cfg(feature = "sabre")]
+const SABRE_TOOL_OUTPUT_ENV: &str = "REVERIE_SABRE_TOOL_OUTPUT_FD";
 /// `detcore_liteinst::DETLOG_FORWARD_ENV`; that crate is a preload `cdylib`, so
 /// Hermit cannot import the constant.
 #[cfg(feature = "liteinst")]
@@ -1746,12 +1750,12 @@ const LITEINST_DETLOG_FORWARD_ENV: &str = "HERMIT_LITEINST_FORWARD_DETLOG";
 #[cfg(feature = "liteinst")]
 const LITEINST_DETLOG_FORWARD_POLICY_ENV: &str = "HERMIT_LITEINST_FORWARD_DETLOG_POLICY";
 
-/// Where in-guest LiteInst runs in this process forward Detcore's DETLOG
-/// records; see [`forward_in_guest_detlogs_to`].
+/// Where in-guest LiteInst and SaBRe runs in this process forward Detcore's
+/// DETLOG records; see [`forward_in_guest_detlogs_to`].
 static IN_GUEST_DETLOG_SINK: Mutex<Option<std::os::fd::OwnedFd>> = Mutex::new(None);
 
-/// Makes the in-guest LiteInst runs this process starts forward the DETLOG
-/// records Detcore logs inside the guest to `socket`, the sending end of a Unix
+/// Makes the in-guest LiteInst and SaBRe runs this process starts forward the
+/// DETLOG records Detcore logs inside the guest to `socket`, the sending end of a Unix
 /// `SOCK_SEQPACKET` pair. `hermit run --verify` gives each run its own pair and
 /// reads the records from the other end into that run's log. Each record is one
 /// message, one line (`detcore::detlog::forwarded_line`).
@@ -1784,6 +1788,23 @@ fn request_liteinst_detlog_forwarding(
     if !policy.forwards_any() {
         return Ok(None);
     }
+    let Some(duplicate) = inheritable_in_guest_detlog_socket()? else {
+        return Ok(None);
+    };
+    command.env(
+        LITEINST_DETLOG_FORWARD_ENV,
+        detcore::detlog::tool_output_env_value(duplicate.as_raw_fd())?,
+    );
+    command.env(LITEINST_DETLOG_FORWARD_POLICY_ENV, policy.encode());
+    Ok(Some(duplicate))
+}
+
+/// An inheritable duplicate of the socket chosen with
+/// [`forward_in_guest_detlogs_to`], or `None` when none was chosen. The
+/// caller passes its number to the guest and keeps it open until the guest
+/// has started.
+#[cfg(any(feature = "sabre", feature = "liteinst"))]
+fn inheritable_in_guest_detlog_socket() -> Result<Option<std::os::fd::OwnedFd>, Error> {
     let sink = IN_GUEST_DETLOG_SINK.lock().unwrap();
     let Some(socket) = sink.as_ref() else {
         return Ok(None);
@@ -1795,13 +1816,9 @@ fn request_liteinst_detlog_forwarding(
             .context("duplicating the in-guest DETLOG forwarding socket"));
     }
     // SAFETY: fcntl returned a new descriptor this function now owns.
-    let duplicate = unsafe { std::os::fd::OwnedFd::from_raw_fd(duplicate) };
-    command.env(
-        LITEINST_DETLOG_FORWARD_ENV,
-        duplicate.as_raw_fd().to_string(),
-    );
-    command.env(LITEINST_DETLOG_FORWARD_POLICY_ENV, policy.encode());
-    Ok(Some(duplicate))
+    Ok(Some(unsafe {
+        std::os::fd::OwnedFd::from_raw_fd(duplicate)
+    }))
 }
 #[cfg(feature = "sabre")]
 const SABRE_PATH_EVIDENCE_ENV: &str = "HERMIT_SABRE_PATH_EVIDENCE";
@@ -2027,6 +2044,14 @@ async fn run_sabre(
     capture_output: bool,
 ) -> Result<Output, Error> {
     let path_evidence_file = std::env::var_os(SABRE_PATH_EVIDENCE_ENV).map(PathBuf::from);
+    // Whether this run passes the plugin a DETLOG socket (below), in which case
+    // every Tool image must forward on it; see
+    // detcore::Config::in_guest_detlog_forward_policy.
+    let mut config = config;
+    let policy = in_guest_detlog_forward_policy();
+    config.in_guest_detlog_forward_policy = (policy.forwards_any()
+        && IN_GUEST_DETLOG_SINK.lock().unwrap().is_some())
+    .then(|| policy.encode());
     let sabre = resolve_sabre_binary()?;
     let plugin = sabre_runtime_library_path()
         .map_err(|error| anyhow!("failed to locate the Detcore SaBRe plugin: {error}"))?;
@@ -2090,9 +2115,24 @@ async fn run_sabre(
     // Per emitting module, as each in-process `detlog!` callsite asks tracing:
     // asking only about `detcore` dropped every record a target-scoped
     // RUST_LOG (warn,detcore::random=info) keeps under ptrace.
+    command.env_remove(SABRE_TOOL_OUTPUT_ENV);
     let detlog_policy = in_guest_detlog_forward_policy();
+    // Kept open until the guest has started (it inherits its own copy).
+    let mut _detlog_descriptor = None;
     if detlog_policy.forwards_any() {
         command.env(SABRE_DETLOG_FORWARD_ENV, detlog_policy.encode());
+        // With a socket (`hermit run --verify`), the plugin sends each record
+        // on it from a descriptor reverie-sabre protects from the guest, and
+        // the coordinator writes each thread's records into the log at that
+        // thread's scheduler turns, as for in-guest LiteInst. Without one it
+        // writes them to the guest's standard error.
+        if let Some(socket) = inheritable_in_guest_detlog_socket()? {
+            command.env(
+                SABRE_TOOL_OUTPUT_ENV,
+                detcore::detlog::tool_output_env_value(socket.as_raw_fd())?,
+            );
+            _detlog_descriptor = Some(socket);
+        }
     }
     command.env_remove("SABRE_BINARY");
     command.env_remove("SABRE_PLUGIN");
@@ -3558,6 +3598,12 @@ async fn dispatch_backend(
                 &mut command,
                 &in_guest_detlog_forward_policy(),
             )?;
+            // Every Tool image must forward on that socket, by that policy;
+            // see detcore::Config::in_guest_detlog_forward_policy.
+            let mut config = config;
+            config.in_guest_detlog_forward_policy = _detlog_descriptor
+                .is_some()
+                .then(|| in_guest_detlog_forward_policy().encode());
             let preload = liteinst_tool_runtime_library_path()?;
             let exits = std::sync::Arc::new(in_guest_exits::InGuestExitAdmission::default());
             let (exit_status, mut global_state, dispatch_stats) =
@@ -3855,6 +3901,12 @@ async fn dispatch_output_backend(
                 &mut command,
                 &in_guest_detlog_forward_policy(),
             )?;
+            // Every Tool image must forward on that socket, by that policy;
+            // see detcore::Config::in_guest_detlog_forward_policy.
+            let mut config = config;
+            config.in_guest_detlog_forward_policy = _detlog_descriptor
+                .is_some()
+                .then(|| in_guest_detlog_forward_policy().encode());
             let preload = liteinst_tool_runtime_library_path()?;
             let exits = std::sync::Arc::new(in_guest_exits::InGuestExitAdmission::default());
             let (output, mut global_state, dispatch_stats) =
@@ -6951,9 +7003,13 @@ mod tests {
         let duplicate = request_liteinst_detlog_forwarding(&mut command, &scoped)
             .unwrap()
             .expect("a policy that forwards a target requests forwarding");
+        let passed = env(&command, LITEINST_DETLOG_FORWARD_ENV)
+            .flatten()
+            .expect("the descriptor is passed");
         assert_eq!(
-            env(&command, LITEINST_DETLOG_FORWARD_ENV),
-            Some(Some(duplicate.as_raw_fd().to_string()))
+            detcore::detlog::tool_output_env_target(&passed),
+            Some(duplicate.as_raw_fd()),
+            "{passed}"
         );
         let sent = env(&command, LITEINST_DETLOG_FORWARD_POLICY_ENV)
             .flatten()
