@@ -24,16 +24,24 @@ test:
           sabre: false
           kvm: true
           dbt: true
+          liteinst: true
+          in-guest-trap: true
         backends_enabled:
           - ptrace
           - sabre
           - kvm
           - dbt
-        backends_disabled:
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+          - liteinst
+          - in-guest-trap
+        backends_disabled: {}
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       naked:
         ci: false
         backends_enabled: []
@@ -163,16 +171,24 @@ test:
           ptrace: true
           sabre: false
           dbt: true
+          liteinst: true
+          in-guest-trap: true
         backends_enabled:
           - ptrace
           - sabre
           - dbt
+          - liteinst
+          - in-guest-trap
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       naked:
         ci: false
         backends_enabled: []
@@ -362,16 +378,24 @@ test:
           kvm: true
           sabre: false
           dbt: true
+          liteinst: true
+          in-guest-trap: true
         backends_enabled:
           - ptrace
           - kvm
           - sabre
           - dbt
-        backends_disabled:
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+          - liteinst
+          - in-guest-trap
+        backends_disabled: {}
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       naked:
         ci: false
         backends_enabled: []
@@ -430,14 +454,22 @@ test:
           sabre: true
           kvm: true
           dbt: true
+          liteinst: true
+          in-guest-trap: true
         backends_enabled:
           - ptrace
           - sabre
           - kvm
           - dbt
-        backends_disabled:
-          liteinst: This determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+          - liteinst
+          - in-guest-trap
+        backends_disabled: {}
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       naked:
         ci: false
         backends_enabled: []
