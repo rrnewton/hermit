@@ -196,16 +196,15 @@ fn socket_receive_timestamps_use_logical_time() {
                 String::from_utf8_lossy(&realtime.stdout),
                 String::from_utf8_lossy(&realtime.stderr)
             );
-            let seconds: i64 = String::from_utf8_lossy(&realtime.stdout)
-                .trim()
-                .split_once('.')
-                .expect("guest should print a timeval")
-                .0
-                .parse()
-                .expect("guest should print numeric timeval seconds");
-            assert!(
-                seconds >= 1_704_067_200,
-                "--no-virtualize-time returned the fixed logical epoch: {seconds}"
+            // The guest checks the timestamp against its own clock_gettime,
+            // which reads the host clock under --no-virtualize-time, and
+            // prints "timestamp=ok" only if it is within a second of it (it
+            // printed the raw timeval before 6f2969722b29).
+            assert_eq!(
+                String::from_utf8_lossy(&realtime.stdout).trim(),
+                "timestamp=ok",
+                "host-clock socket timestamp case: stderr:\n{}",
+                String::from_utf8_lossy(&realtime.stderr)
             );
         }
     }
