@@ -38,6 +38,7 @@ test:
         backends_enabled:
           - ptrace
           - kvm
+          - dbt
         guest_args:
           ptrace:
             - "53"
@@ -45,8 +46,10 @@ test:
           kvm:
             - "53"
             - "5"
+          dbt:
+            - "53"
+            - "5"
         backends_disabled:
-          dbt: DBT application coverage is owned by backend parity
           sabre: SaBRe does not yet determinize busy-wait polling on virtual wall-clock advancement; main validation has observed verify failure under load
           liteinst: LiteInst application coverage is owned by backend compatibility
       replay:

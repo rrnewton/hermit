@@ -10641,9 +10641,12 @@ mod tests {
         // Its KVM verify cell joins on 2026-10-08 (the KVM zero-class
         // qualification: three non-vacuous canonical passes on the validation
         // host), also with the default timeouts and no calibration change.
+        // Its DBT verify cell joins the same day on the same evidence (the DBT
+        // zero-class qualification), again with the default timeouts.
         assert_eq!(
             regular_sink,
             BTreeSet::from([
+                ("verify", Some("dbt")),
                 ("verify", Some("kvm")),
                 ("verify", Some("ptrace")),
                 ("verify", Some("sabre"))
