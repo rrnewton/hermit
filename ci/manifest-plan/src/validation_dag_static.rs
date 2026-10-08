@@ -1449,7 +1449,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // process ID, Full-tier timeout): 1142.
     // Seven signal phase 1 table tests (five in sigalrm_phase1, two in
     // tool_global; step I1b part 2), re-listed: 1134.
-    ("test.detcore_unit", 1149),
+    // procfs::tests::self_sched_hides_schedstats_fields retains all 1149:
+    // 1150, listed with this node's arguments.
+    ("test.detcore_unit", 1150),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2029,7 +2031,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same four instruction_trap tests: 1127.
     // And the same fifteen fatal_core::tests: 1142.
     // And the same seven signal phase 1 table tests, re-listed: 1134.
-    ("test.detcore_unit_on_host", 1149),
+    // And the schedstats sanitizer test: 1150.
+    ("test.detcore_unit_on_host", 1150),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

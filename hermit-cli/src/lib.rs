@@ -4826,11 +4826,9 @@ mod tests {
                 "{release:?}"
             );
         }
-        // This host runs the tests, so it is at the floor.
-        assert_eq!(
-            in_guest_liteinst_kernel_gap(&running_kernel_release()),
-            None
-        );
+        // No assertion about the kernel running the tests: that would make
+        // the test's result depend on the host, and the releases above
+        // already test both sides of the floor.
     }
 
     #[test]

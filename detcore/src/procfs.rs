@@ -2815,6 +2815,18 @@ fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
             // forward-compatible numeric telemetry deterministic without
             // accepting malformed or negative unknown fields.
             Some("0")
+        } else if right
+            .trim()
+            .parse::<f64>()
+            .is_ok_and(|value| value.is_finite() && !value.is_sign_negative())
+            && right.trim().contains('.')
+        {
+            // With kernel.sched_schedstats=1 the kernel adds nanosecond fields
+            // printed as milliseconds with six decimals (sum_sleep_runtime,
+            // wait_max, avg_atom, ...; kernel/sched/debug.c,
+            // proc_sched_show_task). They are host timing, so they become
+            // zero; refusing them emptied the whole file for the guest.
+            Some("0.000000")
         } else {
             return Vec::new();
         };
@@ -6320,6 +6332,47 @@ new.kernel.counter : 0\n\
 current_node=0, numa_group_id=0\n\
 numa_faults node=0 task_private=0 task_shared=0 group_private=0 group_shared=0\n"
         );
+    }
+
+    // With kernel.sched_schedstats=1 the kernel adds these lines, printed with
+    // "%-45s:%14Ld.%06ld" and "%-45s:%21Ld" (kernel/sched/debug.c,
+    // proc_sched_show_task); avg_atom prints -1 as 0.000001. Each value
+    // becomes zero, and the file still reaches the guest.
+    #[test]
+    fn self_sched_hides_schedstats_fields() {
+        let core = "cat (3, #threads: 1)\n\
+se.exec_start : 377650149.445644\n\
+se.vruntime : 133948666.432951\n\
+se.sum_exec_runtime : 3.637972\n";
+        let decimal = |label: &str, value: &str| format!("{label:<45}:{value:>21}\n");
+        let mut contents = core.to_owned();
+        let mut expected = "cat (0, #threads: 1)\n\
+se.exec_start : 0.000000\n\
+se.vruntime : 0.000000\n\
+se.sum_exec_runtime : 0.000000\n"
+            .to_owned();
+        for (label, value, zero) in [
+            ("sum_sleep_runtime", "1234.567890", "0.000000"),
+            ("wait_max", "2.500000", "0.000000"),
+            ("wait_count", "7", "0"),
+            ("avg_atom", "0.000001", "0.000000"),
+        ] {
+            contents.push_str(&decimal(label, value));
+            expected.push_str(&format!("{label:<45}: {zero}\n"));
+        }
+        assert_eq!(
+            String::from_utf8(sanitize_self_sched(contents.as_bytes())).unwrap(),
+            expected
+        );
+
+        // A negative or non-finite unknown field still fails closed.
+        for value in ["-1.500000", "inf"] {
+            let refused = format!("{core}{}", decimal("wait_max", value));
+            assert!(
+                sanitize_self_sched(refused.as_bytes()).is_empty(),
+                "{value}"
+            );
+        }
     }
 
     #[test]

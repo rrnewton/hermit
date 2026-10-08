@@ -2002,10 +2002,14 @@ fn futex_wait_bitset_timeout_is_absolute_and_removes_waiter() {
     });
 }
 
+// Interception of getrandom and the random devices needs no timer, so the
+// test runs without one: with the default timer it returned early on every
+// host without perf counters (every GitHub-hosted runner), and on a host
+// whose counters work but whose CPU Reverie has no PMU profile for it would
+// have panicked reading the clock.
 #[test]
 fn getrandom_intercepted() {
-    reverie_ptrace::ret_without_perf!();
-    detcore_testutils::det_test_fn(|| {
+    det_test_fn_without_pmu(|| {
         let mut got: u64 = 0;
         assert_eq!(
             unsafe { libc::syscall(libc::SYS_getrandom, &mut got as *const u64 as u64, 8, 0) },
