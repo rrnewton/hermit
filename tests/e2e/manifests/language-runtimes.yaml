@@ -715,8 +715,8 @@ test:
           - ptrace
           - sabre
           - kvm
+          - dbt
         backends_disabled:
-          dbt: DBT Rust qualification is tracked by backend compatibility
           liteinst: LiteInst Rust qualification is tracked by backend compatibility
       replay:
         ci: false
