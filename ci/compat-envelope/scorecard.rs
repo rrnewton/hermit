@@ -13455,14 +13455,117 @@ fn typed_comparison_digest(comparison: &impl Serialize) -> Result<String, String
     ))
 }
 
-fn binding_observations<'a>(
-    tracked: &'a TrackedCells,
+/// Each tracked cell under its identity. A writer check visits every binding,
+/// and scanning every cell for each one was quadratic: with 502k series rows,
+/// binding checks were 66% of a 445-second projection.
+struct CellsById<'a>(BTreeMap<&'a CellId, Vec<&'a TrackedCell>>);
+
+impl<'a> CellsById<'a> {
+    fn new(tracked: &'a TrackedCells) -> Self {
+        let mut cells = BTreeMap::<_, Vec<_>>::new();
+        for cell in &tracked.cells {
+            cells.entry(&cell.id).or_default().push(cell);
+        }
+        Self(cells)
+    }
+}
+
+/// Whether every item of `old` equals some item of `new`. `key` must be
+/// derived only from fields equality compares, so equal items share a key and
+/// each lookup compares one bucket instead of all of `new`.
+fn all_contained<'a, T: PartialEq, K: Ord>(
+    old: &'a [T],
+    new: &'a [T],
+    key: impl Fn(&'a T) -> K,
+) -> bool {
+    let mut candidates = BTreeMap::<K, Vec<&T>>::new();
+    for item in new {
+        candidates.entry(key(item)).or_default().push(item);
+    }
+    old.iter().all(|item| {
+        candidates
+            .get(&key(item))
+            .is_some_and(|bucket| bucket.contains(&item))
+    })
+}
+
+fn binding_lookup_key(binding: &ComparisonAttemptBinding) -> (&CellId, &str, &str, &str, u64) {
+    (
+        &binding.cell,
+        &binding.hermit_sha,
+        &binding.run_id,
+        &binding.evidence_sha256,
+        binding.attempt,
+    )
+}
+
+#[cfg(test)]
+mod all_contained_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// An item whose equality checks are counted. `key` is one of the
+    /// compared fields, as the containment key must be.
+    struct Counted<'a> {
+        key: u64,
+        rest: u64,
+        comparisons: &'a Cell<u64>,
+    }
+
+    impl PartialEq for Counted<'_> {
+        fn eq(&self, other: &Self) -> bool {
+            self.comparisons.set(self.comparisons.get() + 1);
+            self.key == other.key && self.rest == other.rest
+        }
+    }
+
+    fn items<'a>(comparisons: &'a Cell<u64>, pairs: &[(u64, u64)]) -> Vec<Counted<'a>> {
+        pairs
+            .iter()
+            .map(|&(key, rest)| Counted {
+                key,
+                rest,
+                comparisons,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn containment_compares_whole_items_within_their_key() {
+        let comparisons = Cell::new(0);
+        let new = items(&comparisons, &[(1, 10), (2, 20), (2, 21)]);
+        let contained =
+            |old: &[(u64, u64)]| all_contained(&items(&comparisons, old), &new, |item| item.key);
+        assert!(contained(&[]));
+        assert!(contained(&[(2, 21), (1, 10), (2, 21)]));
+        assert!(!contained(&[(1, 11)]), "same key, another item");
+        assert!(!contained(&[(3, 10)]), "no item under the key");
+    }
+
+    /// The work stays linear in the number of items: the writer check this
+    /// serves compared every old binding with every new one, 66% of a
+    /// 445-second projection over 502k series rows.
+    #[test]
+    fn containment_of_distinct_keys_compares_each_item_once() {
+        const N: u64 = 20_000;
+        let comparisons = Cell::new(0);
+        let pairs = (0..N).map(|key| (key, key * 7)).collect::<Vec<_>>();
+        let old = items(&comparisons, &pairs);
+        let new = items(&comparisons, &pairs);
+        assert!(all_contained(&old, &new, |item| item.key));
+        assert_eq!(comparisons.get(), N);
+    }
+}
+
+fn binding_observations<'a: 'b, 'b>(
+    cells: &'b CellsById<'a>,
     binding: &'a ComparisonAttemptBinding,
-) -> impl Iterator<Item = &'a Observation> {
-    tracked
-        .cells
-        .iter()
-        .filter(|cell| cell.id == binding.cell)
+) -> impl Iterator<Item = &'a Observation> + 'b {
+    cells
+        .0
+        .get(&binding.cell)
+        .into_iter()
+        .flatten()
         .flat_map(|cell| &cell.observations)
         .filter(|observation| {
             observation.event_ids.is_empty()
@@ -13471,11 +13574,19 @@ fn binding_observations<'a>(
         })
 }
 
+#[cfg(test)]
 fn bound_canonical_comparisons<'a>(
     tracked: &'a TrackedCells,
     binding: &'a ComparisonAttemptBinding,
 ) -> Vec<&'a CanonicalComparison> {
-    binding_observations(tracked, binding)
+    bound_canonical_comparisons_in(&CellsById::new(tracked), binding)
+}
+
+fn bound_canonical_comparisons_in<'a>(
+    cells: &CellsById<'a>,
+    binding: &'a ComparisonAttemptBinding,
+) -> Vec<&'a CanonicalComparison> {
+    binding_observations(cells, binding)
         .flat_map(|observation| &observation.canonical_comparisons)
         .filter(|comparison| {
             comparison.hermit_sha == binding.hermit_sha
@@ -13486,11 +13597,19 @@ fn bound_canonical_comparisons<'a>(
         .collect()
 }
 
+#[cfg(test)]
 fn bound_parity_comparisons<'a>(
     tracked: &'a TrackedCells,
     binding: &'a ComparisonAttemptBinding,
 ) -> Vec<&'a RecordedBackendParityComparison> {
-    binding_observations(tracked, binding)
+    bound_parity_comparisons_in(&CellsById::new(tracked), binding)
+}
+
+fn bound_parity_comparisons_in<'a>(
+    cells: &CellsById<'a>,
+    binding: &'a ComparisonAttemptBinding,
+) -> Vec<&'a RecordedBackendParityComparison> {
+    binding_observations(cells, binding)
         .flat_map(|observation| &observation.backend_parity_comparisons)
         .filter(|comparison| {
             comparison.hermit_sha == binding.hermit_sha
@@ -13513,6 +13632,7 @@ fn archive_retiring_catalogue_comparisons(
     let Some(old) = comparison_attempt_bindings(tracked) else {
         return Ok(());
     };
+    let cells = CellsById::new(tracked);
     let mut canonical = Vec::new();
     let mut parity = Vec::new();
     for binding in &old.bindings {
@@ -13524,7 +13644,7 @@ fn archive_retiring_catalogue_comparisons(
             .iter()
             .any(|receipt| retired_comparison_key(receipt) == binding_key(binding))
         {
-            if let [comparison] = bound_canonical_comparisons(tracked, binding).as_slice() {
+            if let [comparison] = bound_canonical_comparisons_in(&cells, binding).as_slice() {
                 canonical.push(RetiredCanonicalComparison {
                     cell: binding.cell.clone(),
                     provenance: binding.provenance,
@@ -13539,7 +13659,7 @@ fn archive_retiring_catalogue_comparisons(
             .iter()
             .any(|receipt| retired_parity_key(receipt) == binding_key(binding))
         {
-            if let [comparison] = bound_parity_comparisons(tracked, binding).as_slice() {
+            if let [comparison] = bound_parity_comparisons_in(&cells, binding).as_slice() {
                 parity.push(RetiredBackendParityComparison {
                     cell: binding.cell.clone(),
                     provenance: binding.provenance,
@@ -13877,6 +13997,7 @@ fn validate_attempt_bindings(
         }
         index
     });
+    let cells = CellsById::new(tracked);
     let mut attempts = ValidatedComparisonAttempts::new();
     let mut unique_attempts = BTreeSet::new();
     for (binding, key) in envelope.bindings.iter().zip(&keys) {
@@ -13900,7 +14021,7 @@ fn validate_attempt_bindings(
             return Err("comparison-attempt binding has invalid typed provenance".into());
         }
         let base = binding_base(binding);
-        let live = binding_observations(tracked, binding)
+        let live = binding_observations(&cells, binding)
             .flat_map(direct_comparison_receipts)
             .filter(|(head, run, digest, _)| {
                 *head == binding.hermit_sha
@@ -13921,7 +14042,7 @@ fn validate_attempt_bindings(
         if let Some(archived) = archived {
             if archived.comparison.result != binding.result
                 || (!live.is_empty()
-                    && bound_canonical_comparisons(tracked, binding).as_slice()
+                    && bound_canonical_comparisons_in(&cells, binding).as_slice()
                         != [&archived.comparison])
             {
                 return Err("retired comparison conflicts with its binding or live receipt".into());
@@ -13930,7 +14051,7 @@ fn validate_attempt_bindings(
         if let Some(archived) = archived_parity {
             if archived.comparison.result != binding.result
                 || (!live.is_empty()
-                    && bound_parity_comparisons(tracked, binding).as_slice()
+                    && bound_parity_comparisons_in(&cells, binding).as_slice()
                         != [&archived.comparison])
             {
                 return Err(
@@ -13996,28 +14117,29 @@ fn preserve_attempt_bindings_for_writer(
 ) -> Result<(), String> {
     let old = comparison_attempt_bindings(before);
     let new = comparison_attempt_bindings(after);
+    let before_cells = CellsById::new(before);
+    let after_cells = CellsById::new(after);
     if let Some(old) = old {
         let new = new.ok_or("writer dropped comparison-attempt binding authority")?;
         if old.schema != new.schema
             || old.authority != new.authority
-            || old
-                .bindings
-                .iter()
-                .any(|binding| !new.bindings.contains(binding))
-            || old
-                .retired_canonical_comparisons
-                .iter()
-                .any(|receipt| !new.retired_canonical_comparisons.contains(receipt))
-            || old
-                .retired_backend_parity_comparisons
-                .iter()
-                .any(|receipt| !new.retired_backend_parity_comparisons.contains(receipt))
+            || !all_contained(&old.bindings, &new.bindings, binding_lookup_key)
+            || !all_contained(
+                &old.retired_canonical_comparisons,
+                &new.retired_canonical_comparisons,
+                retired_comparison_key,
+            )
+            || !all_contained(
+                &old.retired_backend_parity_comparisons,
+                &new.retired_backend_parity_comparisons,
+                retired_parity_key,
+            )
         {
             return Err("writer changed or removed an immutable comparison-attempt binding or retired receipt".into());
         }
         for binding in &old.bindings {
-            if !bound_parity_comparisons(before, binding).is_empty()
-                && bound_parity_comparisons(after, binding).is_empty()
+            if !bound_parity_comparisons_in(&before_cells, binding).is_empty()
+                && bound_parity_comparisons_in(&after_cells, binding).is_empty()
             {
                 return Err(
                     "only catalogue reconciliation may retire an active bound parity comparison"
@@ -14025,8 +14147,8 @@ fn preserve_attempt_bindings_for_writer(
                 );
             }
             if writer != Writer::ImportResults
-                && !bound_canonical_comparisons(before, binding).is_empty()
-                && bound_canonical_comparisons(after, binding).is_empty()
+                && !bound_canonical_comparisons_in(&before_cells, binding).is_empty()
+                && bound_canonical_comparisons_in(&after_cells, binding).is_empty()
             {
                 return Err("only import may retire an active bound canonical comparison".into());
             }
@@ -14056,8 +14178,9 @@ fn preserve_attempt_bindings_for_writer(
                 })
                 .ok_or("retired comparison requires an existing immutable binding")?;
             if writer != Writer::ImportResults
-                || bound_canonical_comparisons(before, binding).as_slice() != [&retired.comparison]
-                || !bound_canonical_comparisons(after, binding).is_empty()
+                || bound_canonical_comparisons_in(&before_cells, binding).as_slice()
+                    != [&retired.comparison]
+                || !bound_canonical_comparisons_in(&after_cells, binding).is_empty()
             {
                 return Err(
                     "only import may archive the exact original comparison it retires".into(),
@@ -14076,17 +14199,19 @@ fn archive_retired_import_comparisons(
     let Some(old) = comparison_attempt_bindings(before) else {
         return Ok(());
     };
+    let before_cells = CellsById::new(before);
+    let after_cells = CellsById::new(after);
     let mut additions = Vec::new();
     for binding in &old.bindings {
         if old
             .retired_canonical_comparisons
             .iter()
             .any(|retired| retired_comparison_key(retired) == binding_key(binding))
-            || !bound_canonical_comparisons(after, binding).is_empty()
+            || !bound_canonical_comparisons_in(&after_cells, binding).is_empty()
         {
             continue;
         }
-        if let [comparison] = bound_canonical_comparisons(before, binding).as_slice() {
+        if let [comparison] = bound_canonical_comparisons_in(&before_cells, binding).as_slice() {
             additions.push(RetiredCanonicalComparison {
                 cell: binding.cell.clone(),
                 provenance: binding.provenance,
