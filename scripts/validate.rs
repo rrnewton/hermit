@@ -2291,10 +2291,11 @@ fn scorecard_owner_reexec_self_test() -> Result<String, String> {
     for (delegated, expected_exit, expected_writeback) in [
         (true, 0, serde_json::json!({"status": "delegated"})),
         // The owning child reaches the real projection, which refuses the
-        // probe's absent ledger row: the loud write-back failure exit.
+        // probe's absent ledger row: a named write-back failure that keeps
+        // the PASSED run's exit.
         (
             false,
-            i32::from(COULD_NOT_RUN_EXIT_CODE),
+            0,
             serde_json::json!({"status": "failed", "error": no_record_error}),
         ),
     ] {
@@ -3999,8 +4000,7 @@ fn self_test() -> Result<(), String> {
         }),
     );
     let lines = run_summary_lines(&writeback_failed, std::time::Instant::now());
-    if (writeback_failed.verdict, writeback_failed.exit_code)
-        != (Verdict::Pass, COULD_NOT_RUN_EXIT_CODE)
+    if (writeback_failed.verdict, writeback_failed.exit_code) != (Verdict::Pass, 0)
         || lines.last().map(String::as_str) != Some("FINAL_VALIDATE_STATUS: PASSED")
         || !lines
             .iter()
@@ -4008,7 +4008,7 @@ fn self_test() -> Result<(), String> {
     {
         return Err(format!(
             "summary: a required scorecard write-back failure did not preserve the validation \
-             verdict, fail the command distinctly, and remain before the final status: \
+             verdict and exit, name itself, and remain before the final status: \
              verdict={:?} command_exit={} lines={lines:?}",
             writeback_failed.verdict, writeback_failed.exit_code,
         ));
@@ -4023,7 +4023,7 @@ fn self_test() -> Result<(), String> {
     )?;
     if writeback_result.final_validate_status != FinalValidateStatus::Passed
         || writeback_result.detail.is_some()
-        || writeback_result.exit_code != i32::from(COULD_NOT_RUN_EXIT_CODE)
+        || writeback_result.exit_code != 0
         || writeback_result.scorecard_writeback
             != Some(ScorecardWriteback::Failed {
                 error: "fixture refusal".into(),
@@ -4066,11 +4066,11 @@ fn self_test() -> Result<(), String> {
             writeback_delegated.exit_code, writeback_delegated.detail,
         ));
     }
-    let refusal_detail = verdict_refusals(None, 0, Some(0), false)
-        .into_iter()
-        .map(|why| format!("REFUSED ON COMPLETENESS: {why}"))
-        .collect::<Vec<_>>();
-    let refusal_exit = exit_code_with_verdict_refusals(0, &refusal_detail);
+    let refusal_detail = vec![
+        validation_completeness_detail(false, 1, 2),
+        "1 gate(s) could not determine their condition: fixture.unrun".to_string(),
+    ];
+    let refusal_exit = completed_exit_code(0, false);
     let mut genuine_could_not_run = RunSummary::new(
         completed_verdict(refusal_exit),
         refusal_exit,
@@ -4121,6 +4121,28 @@ fn self_test() -> Result<(), String> {
     {
         return Err(format!(
             "summary: framework service result lost typed status or counts: {service_result:?}"
+        ));
+    }
+    // A PASSED run whose counts are UNKNOWN is still reported as PASSED: whether
+    // it can be landing evidence is ci-hub's qualifying-receipt predicate's call.
+    let mut unknown_count_summary = RunSummary::new(Verdict::Pass, 0, "qemu-l2-only", Vec::new());
+    unknown_count_summary.nodes_executed = 2;
+    let unknown_count_path = service_result_dir.path().join("unknown-count.json");
+    publish_validation_service_result_or_refuse(
+        Some(&unknown_count_path),
+        &mut unknown_count_summary,
+    )
+    .map_err(|error| {
+        format!("summary: a PASSED result with unknown counts was refused: {error}")
+    })?;
+    if (
+        unknown_count_summary.verdict,
+        unknown_count_summary.exit_code,
+    ) != (Verdict::Pass, 0)
+    {
+        return Err(format!(
+            "summary: publishing a PASSED result with unknown counts changed the verdict: {:?} exit {}",
+            unknown_count_summary.verdict, unknown_count_summary.exit_code
         ));
     }
 
@@ -4837,10 +4859,7 @@ fn self_test() -> Result<(), String> {
     envelope_cli_bracket()?;
     verbosity_cli_bracket(&root)?;
     super_plan_bracket()?;
-    // Completeness is what a self-certifying driver is least able to check about
-    // itself, so its refusal predicate is bracketed here rather than assumed.
-    verdict_refusal_bracket()?;
-    pin_gate_receipt_bracket()?;
+    exit_fold_bracket()?;
     scorecard_writeback_scope_bracket()?;
     host_capability_bracket(&root)?;
     coverage_schema_bracket()?;
@@ -4848,8 +4867,6 @@ fn self_test() -> Result<(), String> {
     rebase_freshness_message_bracket()?;
     test_node_coverage_bracket()?;
     typed_libtest_count_bracket()?;
-    test_free_selection_verdict_bracket()?;
-    test_free_plan_wiring_bracket()?;
     ledger_gate_origin_bracket()?;
     ledger_gate_compaction_bracket()?;
     requalification_plan_bracket(&root)?;
@@ -9070,14 +9087,11 @@ fn record_scorecard_writeback(summary: &mut RunSummary, writeback: Option<Scorec
         ScorecardWriteback::Completed => Some(
             "scorecard history published to hermit_test_ledger; Hermit catalogue unchanged".into(),
         ),
-        ScorecardWriteback::Failed { error } => {
-            if summary.exit_code == 0 {
-                summary.exit_code = COULD_NOT_RUN_EXIT_CODE;
-            }
-            Some(format!(
-                "scorecard write-back FAILED after validation evidence was finalized: {error}; the validation verdict above is unchanged"
-            ))
-        }
+        // Reporting, not a product verdict: the failure is named loudly and
+        // the command keeps the validation's own exit.
+        ScorecardWriteback::Failed { error } => Some(format!(
+            "scorecard write-back FAILED after validation evidence was finalized: {error}; the validation verdict above is unchanged"
+        )),
     };
     summary.scorecard_writeback = Some(writeback);
     summary.detail.extend(detail);
@@ -14648,15 +14662,16 @@ fn ledger_run_results(
     (raw, result)
 }
 
-fn completed_exit_code(
-    effective_failures: usize,
-    no_results: usize,
-    run_timed_out: bool,
-    unexplained_runner_failure: bool,
-) -> u8 {
-    if effective_failures > 0 || unexplained_runner_failure {
+/// The run's exit, from its node results alone: 1 when any blocking node or
+/// test failed; otherwise 75 when the run could not complete (a planned node
+/// produced no product result because it did not run, was skipped behind a
+/// failure, aborted, exited 75 or ran out of budget); otherwise 0. A genuine
+/// failure is never hidden behind incompleteness. Whether a completed run is
+/// landing evidence is ci-hub's qualifying-receipt predicate's decision.
+fn completed_exit_code(effective_failures: usize, validation_complete: bool) -> u8 {
+    if effective_failures > 0 {
         1
-    } else if no_results > 0 || run_timed_out {
+    } else if !validation_complete {
         NO_RESULT_EXIT_CODE as u8
     } else {
         0
@@ -15000,80 +15015,6 @@ fn compat_summary_with_attempts(
     )
 }
 
-/// Conditions that must FAIL a run whatever the ratchet's own arithmetic says,
-/// each naming itself so the refusal is readable in the summary.
-///
-/// The defect this closes, measured 2026-08-08 on `--portable-strict-compat-only`
-/// at hermit 0f90722a6: `compatprep.hermit_release` FAILED (it is only
-/// `test -x <bin>`), all 188 `compat.*` rows were skipped as dependents, and the
-/// run printed `✅ validate PASS (exit 0) — every blocking gate passed` over a
-/// `COMPATIBILITY SUMMARY (0 measured programs)`. The cause was structural: for a
-/// compat profile the verdict was `effective_failures = compat_blocking` ALONE, so
-/// a failure in the build/prep/gate spine — precisely the thing that empties the
-/// matrix — contributed nothing, and an empty matrix has no failing rows to count.
-/// A ratchet may narrow WHICH measured rows are allowed to fail; it may never
-/// decide whether any measurement happened.
-///
-/// Pure, so `--self-test` can bracket both directions without running a DAG.
-fn verdict_refusals(
-    compat_measured: Option<usize>,
-    structural_failures: usize,
-    executed_tests: Option<i64>,
-    test_free_selection: bool,
-) -> Vec<String> {
-    let mut out = Vec::new();
-    if structural_failures > 0 {
-        out.push(format!(
-            "{structural_failures} node(s) OUTSIDE the measured matrix failed; a spine failure \
-             empties the matrix and can never be excused by the matrix's own ratchet"
-        ));
-    }
-    // `Some(0)` is a MEASURED zero and is fatal; `None` is unknown and is handled
-    // as a NON-VERDICT elsewhere. Conflating the two would turn every profile
-    // that reports no count into a red.
-    if compat_measured == Some(0) {
-        out.push(
-            "the compatibility matrix measured ZERO programs; an empty matrix is not a pass"
-                .to_string(),
-        );
-    }
-    // A DELIBERATE, NARROW EXCEPTION (https://github.com/rrnewton/hermit/issues/3915):
-    // a label selection of envelope-only or qemu-l2-only, or the hosted CI
-    // preflight's hosted-portable --selected selection, whose every planned
-    // node is declared test-free and passed (declared_test_free_selection)
-    // measures zero by design, and is the only zero accepted here. Its ledger row still has executed_tests 0 and a
-    // non-full profile, which the qualifying-receipt predicate refuses
-    // (profile "full", executed_tests_min 1), so it is never landing evidence.
-    if executed_tests == Some(0) && !test_free_selection {
-        out.push(
-            "ZERO tests executed; a run that executed nothing cannot certify anything".to_string(),
-        );
-    }
-    out
-}
-
-/// A completeness refusal is a completed attempt that cannot certify the tree,
-/// not a product failure. Preserve an earlier failure (or no-result) exactly;
-/// only replace the otherwise-successful exit that the refusal invalidates.
-fn exit_code_with_verdict_refusals(exit_code: u8, refusals: &[String]) -> u8 {
-    if exit_code == 0 && !refusals.is_empty() {
-        NO_RESULT_EXIT_CODE as u8
-    } else {
-        exit_code
-    }
-}
-
-/// Evidence retained after execution is part of certification, not the product
-/// result. Refuse an otherwise-clean certification without overwriting either
-/// an earlier refusal or a genuine product failure.
-fn exit_code_with_evidence_refusal(exit_code: u8) -> u8 {
-    if exit_code == 0 {
-        NO_RESULT_EXIT_CODE as u8
-    } else {
-        exit_code
-    }
-}
-
 fn completed_verdict(exit_code: u8) -> Verdict {
     match exit_code {
         0 => Verdict::Pass,
@@ -15082,25 +15023,31 @@ fn completed_verdict(exit_code: u8) -> Verdict {
     }
 }
 
-/// Execution completeness applies after profile-specific failure policy. A
-/// profile may allow a fully measured failing row, but no profile may turn a
-/// partial run into exit zero.
-fn exit_code_with_execution_completeness(exit_code: u8, execution_complete: bool) -> u8 {
-    if execution_complete || exit_code != 0 {
-        exit_code
-    } else {
-        NO_RESULT_EXIT_CODE as u8
+/// Both sides of [`completed_exit_code`], from planted counts only: a failure
+/// is exit 1 whether or not the run completed, an incomplete run without a
+/// failure is exit 75, and only a complete run without a failure is exit 0.
+/// Test counts and evidence retention are not inputs: an unknown or zero test
+/// count does not change the run's exit.
+fn exit_fold_bracket() -> Result<(), String> {
+    for (failures, complete, expected, verdict) in [
+        (0, true, 0, Verdict::Pass),
+        (0, false, NO_RESULT_EXIT_CODE as u8, Verdict::NoResult),
+        (1, true, 1, Verdict::Fail),
+        (3, false, 1, Verdict::Fail),
+    ] {
+        let exit = completed_exit_code(failures, complete);
+        if exit != expected || completed_verdict(exit) != verdict {
+            return Err(format!(
+                "exit fold: {failures} failure(s), complete={complete} gave exit {exit}/{:?}, expected {expected}/{verdict:?}",
+                completed_verdict(exit)
+            ));
+        }
     }
-}
-
-/// A missing pin gate invalidates a passing receipt, not an explicitly
-/// off-the-record selected run. Selected hosted jobs inherit the exact commit
-/// and a successful preflight through the external workflow dependency, and
-/// they are already forbidden from writing a ledger row or publishing a
-/// receipt. Turning a completed selected step into failure here would discard
-/// its result without strengthening any evidence claim.
-fn pin_gate_blocks_pass(exit_code: u8, pin_gate_passed: bool, off_the_record: bool) -> bool {
-    exit_code == 0 && !pin_gate_passed && !off_the_record
+    println!(
+        "  exit fold: failure -> exit 1/FAILED (complete or not), incomplete -> exit 75/COULD_NOT_RUN, \
+         complete clean -> exit 0/PASSED"
+    );
+    Ok(())
 }
 
 /// Fast exit 127 is useful missing-artifact guidance only in `--only`, whose
@@ -15623,7 +15570,7 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
             &plan.host_inapplicable,
         );
         let complete = validation_is_complete(true, &classified, &planned);
-        let exit = completed_exit_code(0, classified.no_results(), false, false);
+        let exit = completed_exit_code(0, complete);
         let (_, result) = ledger_run_results(exit, 0, classified.no_results(), false);
         (complete, exit, result)
     };
@@ -16267,426 +16214,6 @@ fn host_capability_bracket(root: &Path) -> Result<(), String> {
          it; this machine's cpuid-faulting probe says {} ({})",
         if verdict.present { "PRESENT" } else { "ABSENT" },
         verdict.evidence
-    );
-    Ok(())
-}
-
-/// Verdict-level bracket for the test-free selection exception
-/// (https://github.com/rrnewton/hermit/issues/3915). It runs the same
-/// `derive_run_counts` that run() uses, then the real verdict gate, so it
-/// fails if run() counts from the original outcomes again or if the narrow
-/// exception widens.
-fn test_free_selection_verdict_bracket() -> Result<(), String> {
-    let declared = |tag: &str| tag.starts_with("free.");
-    let passed = |tag: &str, executed: Option<u64>| {
-        StepOutcome::passed(
-            tag.to_string(),
-            1.0,
-            String::new(),
-            Some(0),
-            executed,
-            executed.map(|_| 0),
-        )
-    };
-    let planned = |tags: &[&str]| {
-        tags.iter()
-            .map(|tag| tag.to_string())
-            .collect::<BTreeSet<_>>()
-    };
-    let verdict = |outcomes: &[StepOutcome], planned: &BTreeSet<String>| {
-        let counts = derive_run_counts(
-            outcomes,
-            &[],
-            None,
-            None,
-            ("qemu-l2-only", "label"),
-            planned,
-            declared,
-        );
-        let exit = exit_code_with_verdict_refusals(0, &run_verdict_refusals(None, 0, &counts));
-        (counts, exit)
-    };
-
-    // (a) Every planned node declared and passing: an exact 0/0 that PASSES.
-    let all_declared = planned(&["free.build", "free.boot"]);
-    let (counts, exit) = verdict(
-        &[passed("free.build", None), passed("free.boot", None)],
-        &all_declared,
-    );
-    // (c) Wiring: the counts come from the declared zeroes, not the raw outcomes
-    // (which would sum to UNKNOWN).
-    if (counts.executed_tests, counts.passed_tests) != (Some(0), Some(0)) {
-        return Err(format!(
-            "test-free verdict: run counts did not come from the declared zeroes: {:?}/{:?}",
-            counts.executed_tests, counts.passed_tests
-        ));
-    }
-    if !counts.test_free_selection || exit != 0 || completed_verdict(exit) != Verdict::Pass {
-        return Err(format!(
-            "test-free verdict: an all-declared passing selection must end exit 0/PASSED, got exit {exit}/{:?}",
-            completed_verdict(exit)
-        ));
-    }
-
-    // (b) Full-shaped: a declared zero beside an undeclared test node whose
-    // counts were lost still sums to a measured zero, and is still REFUSED.
-    let (counts, exit) = verdict(
-        &[passed("free.build", None), passed("test.unit", None)],
-        &planned(&["free.build", "test.unit"]),
-    );
-    if counts.executed_tests != Some(0)
-        || counts.test_free_selection
-        || exit != NO_RESULT_EXIT_CODE as u8
-    {
-        return Err(format!(
-            "test-free verdict: a full-shaped run with no real counts must stay refused (exit {NO_RESULT_EXIT_CODE}), got exit {exit}, test_free={}",
-            counts.test_free_selection
-        ));
-    }
-    // A full-shaped run with real counts is unaffected.
-    let (counts, exit) = verdict(
-        &[passed("free.build", None), passed("test.unit", Some(398))],
-        &planned(&["free.build", "test.unit"]),
-    );
-    if counts.executed_tests != Some(398) || counts.test_free_selection || exit != 0 {
-        return Err("test-free verdict: a counted run changed under the declaration".into());
-    }
-
-    // A declared node that failed, or never reported, is not a test-free pass.
-    let mut failed = passed("free.boot", None);
-    failed.ok = false;
-    failed.reason = "test failure".into();
-    if verdict(&[passed("free.build", None), failed], &all_declared)
-        .0
-        .test_free_selection
-    {
-        return Err("test-free verdict: a failed declared node made a test-free selection".into());
-    }
-    if verdict(&[passed("free.build", None)], &all_declared)
-        .0
-        .test_free_selection
-    {
-        return Err(
-            "test-free verdict: an unreported planned node made a test-free selection".into(),
-        );
-    }
-    // A compatibility matrix or an empty plan never qualifies.
-    let label = |profile| SelectionShape {
-        profile,
-        selection_mode: "label",
-        compat_selected: false,
-    };
-    let compat_shape = SelectionShape {
-        compat_selected: true,
-        ..label("qemu-l2-only")
-    };
-    if declared_test_free_selection(
-        &compat_shape,
-        &all_declared,
-        &[passed("free.build", None), passed("free.boot", None)],
-        declared,
-    ) || declared_test_free_selection(&label("qemu-l2-only"), &BTreeSet::new(), &[], declared)
-    {
-        return Err("test-free verdict: a compatibility run or an empty plan qualified".into());
-    }
-    // Only a label selection of a test-free profile qualifies. Three reachable
-    // invocations plan only the five declared preflight nodes, with the real
-    // declarations, and must keep the zero-test refusal (review N1 of
-    // https://github.com/rrnewton/hermit/pull/3919).
-    let preflight = [
-        "pre.submodules",
-        "pre.reverie_pin",
-        "build.rust_scripts",
-        "setup.manifest_plan",
-        "gate.manifest",
-    ];
-    let preflight_tags = planned(&preflight);
-    let preflight_outcomes: Vec<StepOutcome> =
-        preflight.iter().map(|tag| passed(tag, None)).collect();
-    let real = hermit_manifest_plan::validation_dag::declared_test_free;
-    for (profile, mode, what) in [
-        (
-            "selective",
-            "selective",
-            "--selective when the selector skips",
-        ),
-        ("only-full", "only", "--only full gate.manifest"),
-        ("full", "selected", "full --selected gate.manifest"),
-        ("full", "full", "a full plan reduced to its preflight"),
-        (
-            "hosted-portable",
-            "label",
-            "a hosted-portable label run reduced to its preflight",
-        ),
-        (
-            "hosted-portable",
-            "only",
-            "a hosted-portable profile outside --selected",
-        ),
-        (
-            "quick",
-            "label",
-            "a label selection of a profile that is not test-free",
-        ),
-        (
-            "envelope-only",
-            "only",
-            "an envelope-only profile outside label selection",
-        ),
-    ] {
-        let counts = derive_run_counts(
-            &preflight_outcomes,
-            &[],
-            None,
-            None,
-            (profile, mode),
-            &preflight_tags,
-            real,
-        );
-        let exit = exit_code_with_verdict_refusals(0, &run_verdict_refusals(None, 0, &counts));
-        if counts.test_free_selection || exit != NO_RESULT_EXIT_CODE as u8 {
-            return Err(format!(
-                "test-free verdict: {what} (profile {profile}, selection {mode}) must keep the zero-test refusal (exit {NO_RESULT_EXIT_CODE}), got exit {exit}"
-            ));
-        }
-    }
-    for profile in TEST_FREE_PROFILES {
-        let counts = derive_run_counts(
-            &preflight_outcomes,
-            &[],
-            None,
-            None,
-            (profile, "label"),
-            &preflight_tags,
-            real,
-        );
-        let exit = exit_code_with_verdict_refusals(0, &run_verdict_refusals(None, 0, &counts));
-        if !counts.test_free_selection || exit != 0 {
-            return Err(format!(
-                "test-free verdict: a label selection of {profile} made of declared nodes must pass, got exit {exit}"
-            ));
-        }
-    // The hosted CI preflight (`ci/run-node.sh portable <preflight_nodes>`:
-    // `--hosted-portable-only --selected`) of the five declared nodes passes.
-    let counts = derive_run_counts(
-        &preflight_outcomes,
-        &[],
-        None,
-        None,
-        (TEST_FREE_SELECTED_PROFILE, "selected"),
-        &preflight_tags,
-        real,
-    );
-    let exit = exit_code_with_verdict_refusals(0, &run_verdict_refusals(None, 0, &counts));
-    if !counts.test_free_selection || exit != 0 {
-        return Err(format!(
-            "test-free verdict: the hosted preflight (hosted-portable --selected) of the declared nodes must pass, got exit {exit}"
-        ));
-    }
-    // ... but not with an undeclared, uncounted node beside them.
-    let mut with_test = preflight_tags.clone();
-    with_test.insert("test.unit".to_string());
-    let mut with_test_outcomes = preflight_outcomes.clone();
-    with_test_outcomes.push(passed("test.unit", None));
-    let counts = derive_run_counts(
-        &with_test_outcomes,
-        &[],
-        None,
-        None,
-        (TEST_FREE_SELECTED_PROFILE, "selected"),
-        &with_test,
-        real,
-    );
-    let exit = exit_code_with_verdict_refusals(0, &run_verdict_refusals(None, 0, &counts));
-    if counts.test_free_selection || exit != NO_RESULT_EXIT_CODE as u8 {
-        return Err(format!(
-            "test-free verdict: a hosted --selected run with an uncounted test node must stay refused (exit {NO_RESULT_EXIT_CODE}), got exit {exit}"
-        ));
-    }
-    }
-
-    // The exception lifts only the zero-count refusal.
-    if verdict_refusals(None, 1, Some(0), true).len() != 1
-        || verdict_refusals(Some(0), 0, Some(0), true).len() != 1
-    {
-        return Err(
-            "test-free verdict: the exception must not excuse a spine failure or an empty matrix"
-                .into(),
-        );
-    }
-    Ok(())
-}
-
-/// The profile, selection mode and planned tags that run() hands to the count
-/// come from real plans (review R2 of https://github.com/rrnewton/hermit/pull/3919).
-/// Each plan below is built from real arguments; every planned node is given a
-/// passing, count-free outcome; derive_plan_run_counts, which run() calls,
-/// must accept exactly the declared test-free shapes: label selections of
-/// envelope-only and qemu-l2-only, and GitHub CI's hosted preflight
-/// (`--hosted-portable-only --selected` of the five preflight nodes). quick,
-/// full and `--only full` are refused by their profile;
-/// `--qemu-l2-only --selected` is refused by its selection mode alone.
-fn test_free_plan_wiring_bracket() -> Result<(), String> {
-    let root = repo_root();
-    let tmp = std::env::temp_dir().join(format!("validate-test-free-plan-{}", std::process::id()));
-    for (argv_words, accepted) in [
-        (&["--envelope-only"][..], true),
-        (&["--qemu-l2-only"][..], true),
-        (
-            &[
-                // ci/run-node.sh portable <preflight_nodes>, as GitHub CI runs it.
-                "--hosted-portable-only",
-                "--allow-local-off-the-record-run",
-                "--selected",
-                "pre.submodules,pre.reverie_pin,build.rust_scripts,setup.manifest_plan,gate.manifest",
-                "--ignore-selected-deps",
-                "--no-label-pr",
-            ][..],
-            true,
-        ),
-        (&["quick"][..], false),
-        (&["full"][..], false),
-        (
-            &["--only", "full", "gate.manifest", "--no-label-pr"][..],
-            false,
-        ),
-        (
-            &[
-                "--qemu-l2-only",
-                "--selected",
-                "qemu.strict_l2_boot",
-                "--allow-local-off-the-record-run",
-            ][..],
-            false,
-        ),
-    ] {
-        let words: Vec<String> = argv_words.iter().map(|word| word.to_string()).collect();
-        let args = parse_argv(&words)
-            .map_err(|code| format!("test-free plan wiring: {words:?} refused with exit {code}"))?;
-        let plan = build_plan(&root, &args, &tmp)
-            .map_err(|error| format!("test-free plan wiring: {words:?}: {error}"))?;
-        let outcomes: Vec<StepOutcome> = plan_planned_tags(&plan)
-            .into_iter()
-            .map(|tag| StepOutcome::passed(tag, 1.0, String::new(), Some(0), None, None))
-            .collect();
-        let counts = derive_plan_run_counts(&plan, &outcomes, &[]);
-        let exit = exit_code_with_verdict_refusals(0, &run_verdict_refusals(None, 0, &counts));
-        let passed = exit == 0;
-        if counts.test_free_selection != accepted || passed != accepted {
-            return Err(format!(
-                "test-free plan wiring: {words:?} (profile {}, selection {}) should {} the zero-test refusal, got test_free={} exit {exit}",
-                plan.profile,
-                plan.selection_mode,
-                if accepted { "lift" } else { "keep" },
-                counts.test_free_selection
-            ));
-        }
-    }
-    let _ = std::fs::remove_dir_all(&tmp);
-    Ok(())
-}
-
-/// Two-sided bracket for [`verdict_refusals`]. Inert: no DAG, no ledger, no
-/// label, no PR — it exercises the decision function with planted counts only.
-fn verdict_refusal_bracket() -> Result<(), String> {
-    // POSITIVE 1 — the exact shape measured on 2026-08-08 must fire, and must
-    // fire for BOTH reasons rather than collapsing into one.
-    let observed = verdict_refusals(Some(0), 1, Some(20), false);
-    if observed.len() != 2 {
-        return Err(format!(
-            "verdict: the observed fail-open shape (0 measured, 1 spine failure, 20 executed) \
-             must trip 2 refusals, tripped {}: {observed:?}",
-            observed.len()
-        ));
-    }
-    // POSITIVE 2 — zero executed tests alone, with nothing else wrong.
-    if verdict_refusals(None, 0, Some(0), false).len() != 1 {
-        return Err("verdict: zero executed tests must refuse on its own".into());
-    }
-    // POSITIVE 3 — a spine failure alone, with a fully measured matrix, still
-    // refuses: 187/187 passing rows do not excuse a failed prep node.
-    if verdict_refusals(Some(187), 1, Some(862), false).len() != 1 {
-        return Err("verdict: a spine failure must refuse even with a full matrix".into());
-    }
-    // NEGATIVE 1 — a genuinely complete run must stay inert, or the gate is a
-    // blanket red rather than a predicate.
-    let clean = verdict_refusals(Some(187), 0, Some(862), false);
-    if !clean.is_empty() {
-        return Err(format!(
-            "verdict: a complete run must NOT refuse, got {clean:?}"
-        ));
-    }
-    // NEGATIVE 2 — unknown counts are not a measured zero.
-    if !verdict_refusals(None, 0, None, false).is_empty() {
-        return Err("verdict: unknown counts must not be read as a measured zero".into());
-    }
-    let zero_executed = verdict_refusals(None, 0, Some(0), false);
-    let refusal_exit = exit_code_with_verdict_refusals(0, &zero_executed);
-    if refusal_exit != NO_RESULT_EXIT_CODE as u8
-        || completed_verdict(refusal_exit) != Verdict::NoResult
-    {
-        return Err(format!(
-            "verdict: a zero-exit completeness refusal must become exit {NO_RESULT_EXIT_CODE}/COULD_NOT_RUN, got exit {refusal_exit}/{:?}",
-            completed_verdict(refusal_exit)
-        ));
-    }
-    let refusal_after_cell_retention = exit_code_with_evidence_refusal(refusal_exit);
-    let refusal_after_coverage_retention =
-        exit_code_with_evidence_refusal(refusal_after_cell_retention);
-    if refusal_after_coverage_retention != NO_RESULT_EXIT_CODE as u8
-        || completed_verdict(refusal_after_coverage_retention) != Verdict::NoResult
-    {
-        return Err(format!(
-            "verdict: post-run evidence refusals overwrote a completeness refusal: exit {refusal_after_coverage_retention}/{:?}",
-            completed_verdict(refusal_after_coverage_retention)
-        ));
-    }
-    if exit_code_with_evidence_refusal(0) != NO_RESULT_EXIT_CODE as u8
-        || exit_code_with_evidence_refusal(1) != 1
-    {
-        return Err(
-            "verdict: a post-run evidence refusal must refuse a clean run and preserve a product failure"
-                .into(),
-        );
-    }
-    let failed_exit = exit_code_with_verdict_refusals(1, &zero_executed);
-    if failed_exit != 1 || completed_verdict(failed_exit) != Verdict::Fail {
-        return Err(format!(
-            "verdict: a genuine product failure must remain exit 1/FAILED, got exit {failed_exit}/{:?}",
-            completed_verdict(failed_exit)
-        ));
-    }
-    let clean_exit = exit_code_with_verdict_refusals(0, &[]);
-    if clean_exit != 0 || completed_verdict(clean_exit) != Verdict::Pass {
-        return Err(format!(
-            "verdict: a complete clean run must remain exit 0/PASSED, got exit {clean_exit}/{:?}",
-            completed_verdict(clean_exit)
-        ));
-    }
-    println!(
-        "  verdict refusals: 3 positive(s) fire (0-measured+spine, 0-executed, spine-with-full-matrix), \
-         2 negative(s) inert (complete run, unknown counts); refusal -> exit 75/COULD_NOT_RUN, \
-         product failure -> exit 1/FAILED, clean -> exit 0/PASSED"
-    );
-    Ok(())
-}
-
-/// Both sides of [`pin_gate_blocks_pass`], using only planted booleans.
-fn pin_gate_receipt_bracket() -> Result<(), String> {
-    if !pin_gate_blocks_pass(0, false, false) {
-        return Err("pin gate: a receipt-producing pass without the gate was accepted".into());
-    }
-    for (exit_code, pin_gate_passed, off_the_record, label) in [
-        (0, true, false, "receipt-producing pass with gate"),
-        (1, false, false, "existing failure without gate"),
-        (0, false, true, "off-the-record selected pass without gate"),
-    ] {
-        if pin_gate_blocks_pass(exit_code, pin_gate_passed, off_the_record) {
-            return Err(format!("pin gate: {label} was incorrectly refused"));
-        }
-    }
-    println!(
-        "  pin gate: receipt-producing pass requires the observed gate; off-the-record selected pass does not claim a receipt"
     );
     Ok(())
 }
@@ -19542,7 +19069,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
                 .map(|o| o.tag.as_str())
                 .collect::<Vec<_>>()
                 != vec!["fixture.fail"]
-            || exit_code_with_execution_completeness(0, failed.complete) == 0
+            || completed_exit_code(0, failed.complete) == 0
         {
             return Err(format!(
                 "scheduler accounting: a failed outer node must run once and remain an incomplete red: complete={} ok={} outcomes={:?}",
@@ -19650,7 +19177,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
             || dependency_attempt_count != 1
             || dependency_result.skipped != vec!["fixture.dependency_skipped"]
             || dependent_ran.exists()
-            || exit_code_with_execution_completeness(0, dependency_result.complete) == 0
+            || completed_exit_code(0, dependency_result.complete) == 0
             || !rendered_dependency_summary
                 .contains("1 blocking failure(s): fixture.dependency_failure")
             || !rendered_dependency_summary
@@ -19696,7 +19223,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         if aborted_result.complete
             || aborted_result.ok
             || !aborted_peer_reported
-            || exit_code_with_execution_completeness(0, aborted_result.complete) == 0
+            || completed_exit_code(0, aborted_result.complete) == 0
         {
             return Err(format!(
                 "scheduler accounting: aborted required node did not force incomplete execution: complete={} ok={} aborted_peer_reported={aborted_peer_reported} outcomes={:?}",
@@ -19816,10 +19343,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
             ..Default::default()
         };
         let allowed = run_lane_once(&allowed_cfg, 1, true, 0, None, &allowed_log, None, false);
-        if !allowed.complete
-            || allowed.ok
-            || exit_code_with_execution_completeness(0, allowed.complete) != 0
-        {
+        if !allowed.complete || allowed.ok || completed_exit_code(0, allowed.complete) != 0 {
             return Err(format!(
                 "scheduler accounting: complete allowed failure was not kept distinct from incomplete execution: complete={} ok={}",
                 allowed.complete, allowed.ok
@@ -21997,98 +21521,15 @@ fn exact_passed_test_count(outcomes: &[StepOutcome]) -> Option<i64> {
     seen.then(|| i64::try_from(passed).ok()).flatten()
 }
 
-/// Count a passing node that the committed DAG declares test-free
-/// (`hermit_manifest_plan::validation_dag::TEST_FREE_STEPS`) as a demonstrated
-/// 0 executed / 0 filtered, so a selection made only of such nodes sums to an
-/// exact 0/0 instead of UNKNOWN (https://github.com/rrnewton/hermit/issues/3915).
-/// Only the copy used for counting changes. An undeclared node without counts
-/// stays UNKNOWN, and a failed declared node is not zeroed. A declared node that
-/// published counts contradicts its declaration and is refused.
-fn with_declared_test_free_zeroes(
-    outcomes: &[StepOutcome],
-    declared: impl Fn(&str) -> bool,
-) -> Result<Vec<StepOutcome>, String> {
-    let mut counted = outcomes.to_vec();
-    for outcome in &mut counted {
-        if !declared(&outcome.tag) {
-            continue;
-        }
-        if outcome.executed_tests.is_some()
-            || outcome.filtered_tests.is_some()
-            || outcome.test_results.is_some()
-        {
-            return Err(format!(
-                "{} is declared test-free (TEST_FREE_STEPS) but published test counts",
-                outcome.tag
-            ));
-        }
-        if outcome.ok {
-            outcome.executed_tests = Some(0);
-            outcome.filtered_tests = Some(0);
-        }
-    }
-    Ok(counted)
-}
-
-/// The only profiles whose label selections are wholly test-free by design
-/// (https://github.com/rrnewton/hermit/issues/3915).
-const TEST_FREE_PROFILES: [&str; 2] = ["envelope-only", "qemu-l2-only"];
-
-/// The profile whose `--selected` selections may be wholly test-free by
-/// design: GitHub CI's hosted preflight job runs
-/// `ci/run-node.sh portable <preflight_nodes>`, which is
-/// `--hosted-portable-only --selected <nodes>` over the five declared
-/// test-free preflight nodes. Its ledger row has a non-full profile and
-/// executed_tests 0, which the qualifying-receipt predicate refuses
-/// (profile "full", executed_tests_min 1), so it is never landing evidence.
-const TEST_FREE_SELECTED_PROFILE: &str = "hosted-portable";
-
-/// Whether a measured zero is the declared shape of this selection rather than
-/// a vacuous run (https://github.com/rrnewton/hermit/issues/3915). True only
-/// for a LABEL selection of one of TEST_FREE_PROFILES, or a `--selected`
-/// selection of TEST_FREE_SELECTED_PROFILE (the hosted CI preflight), with no
-/// compatibility matrix and a nonempty plan, whose EVERY planned node is
-/// declared test-free and passed. The profile and selection-mode conjuncts
-/// matter: `--selective` when the selector skips, `--only full gate.manifest`,
-/// `full --selected gate.manifest` and a hosted-portable label run reduced to
-/// its preflight all plan only the five declared preflight nodes, and must
-/// keep the zero-test refusal.
-fn declared_test_free_selection(
-    shape: &SelectionShape<'_>,
-    planned_tags: &BTreeSet<String>,
-    outcomes: &[StepOutcome],
-    declared: impl Fn(&str) -> bool,
-) -> bool {
-    ((TEST_FREE_PROFILES.contains(&shape.profile) && shape.selection_mode == "label")
-        || (shape.profile == TEST_FREE_SELECTED_PROFILE && shape.selection_mode == "selected"))
-        && !shape.compat_selected
-        && !planned_tags.is_empty()
-        && planned_tags.iter().all(|tag| {
-            let mut runs = outcomes
-                .iter()
-                .filter(|outcome| &outcome.tag == tag)
-                .peekable();
-            declared(tag) && runs.peek().is_some() && runs.all(|outcome| outcome.ok)
-        })
-}
-
-/// What a run selected, as the test-free exception needs it.
-struct SelectionShape<'a> {
-    profile: &'a str,
-    selection_mode: &'a str,
-    compat_selected: bool,
-}
-
-/// The run's test counts and the facts the verdict needs about them, derived
-/// in one place so run() cannot count from a different set of outcomes than
-/// the self-tests check.
+/// The run's test counts, derived in one place so run() cannot count from a
+/// different set of outcomes than the self-tests check. An unknown count stays
+/// `None`: whether a count qualifies a receipt is the qualifying-receipt
+/// predicate's decision, not the run verdict's.
 struct RunCounts {
     executed_tests: Option<i64>,
     passed_tests: Option<i64>,
     filtered_tests: Option<i64>,
     compatibility_count_error: Option<String>,
-    test_free_declaration_error: Option<String>,
-    test_free_selection: bool,
 }
 
 fn derive_run_counts(
@@ -22096,39 +21537,20 @@ fn derive_run_counts(
     attempts: &[NodeAttempt],
     compat: Option<CompatMode>,
     compat_prefix: Option<&str>,
-    shape: (&str, &str),
-    planned_tags: &BTreeSet<String>,
-    declared: impl Fn(&str) -> bool + Copy,
 ) -> RunCounts {
-    let declared_counts = with_declared_test_free_zeroes(outcomes, declared);
-    let test_free_declaration_error = declared_counts.as_ref().err().cloned();
-    let counted_outcomes = declared_counts.unwrap_or_else(|_| outcomes.to_vec());
     let (executed_tests, passed_tests, filtered_tests, compatibility_count_error) =
-        match run_test_counts(&counted_outcomes, attempts, compat, compat_prefix) {
+        match run_test_counts(outcomes, attempts, compat, compat_prefix) {
             Ok((executed, passed, filtered)) => (executed, passed, filtered, None),
             Err(error) => {
-                let (executed, passed, filtered) = libtest_counts(&counted_outcomes);
+                let (executed, passed, filtered) = libtest_counts(outcomes);
                 (executed, passed, filtered, Some(error))
             }
         };
-    let test_free_selection = test_free_declaration_error.is_none()
-        && declared_test_free_selection(
-            &SelectionShape {
-                profile: shape.0,
-                selection_mode: shape.1,
-                compat_selected: compat.is_some(),
-            },
-            planned_tags,
-            outcomes,
-            declared,
-        );
     RunCounts {
         executed_tests,
         passed_tests,
         filtered_tests,
         compatibility_count_error,
-        test_free_declaration_error,
-        test_free_selection,
     }
 }
 
@@ -22139,41 +21561,6 @@ fn plan_planned_tags(plan: &Plan) -> BTreeSet<String> {
         .flat_map(|cfg| cfg.steps.iter().map(|s| s.tag()))
         .chain(plan.host_inapplicable.iter().map(|n| n.tag.clone()))
         .collect()
-}
-
-/// derive_run_counts with exactly what run() knows about the plan: its
-/// compatibility mode, profile, selection mode, planned tags and the committed
-/// test-free declarations. run() calls this, and so does
-/// test_free_plan_wiring_bracket, on plans built from real arguments.
-fn derive_plan_run_counts(
-    plan: &Plan,
-    outcomes: &[StepOutcome],
-    attempts: &[NodeAttempt],
-) -> RunCounts {
-    derive_run_counts(
-        outcomes,
-        attempts,
-        plan.compat,
-        plan.compat_prefix,
-        (plan.profile.as_str(), plan.selection_mode),
-        &plan_planned_tags(plan),
-        hermit_manifest_plan::validation_dag::declared_test_free,
-    )
-}
-
-/// The verdict's completeness refusals for a run's counts. run() and the
-/// self-tests both call this, so the test-free flag they pass cannot differ.
-fn run_verdict_refusals(
-    compat_measured: Option<usize>,
-    structural_failures: usize,
-    counts: &RunCounts,
-) -> Vec<String> {
-    verdict_refusals(
-        compat_measured,
-        structural_failures,
-        counts.executed_tests,
-        counts.test_free_selection,
-    )
 }
 
 fn libtest_counts(outcomes: &[StepOutcome]) -> (Option<i64>, Option<i64>, Option<i64>) {
@@ -22467,54 +21854,6 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
     if libtest_counts(&[outcome("build.only", true, None, None)]) != (None, None, None) {
         return Err("typed libtest counts: unknown bannerless output was coerced".into());
     }
-    // https://github.com/rrnewton/hermit/issues/3915: a passing declared
-    // test-free node is a demonstrated zero; undeclared and failed nodes are not.
-    let declared = |tag: &str| tag.starts_with("free.");
-    let test_free = with_declared_test_free_zeroes(
-        &[
-            outcome("free.build", true, None, None),
-            outcome("free.probe", true, None, None),
-        ],
-        declared,
-    )?;
-    if libtest_counts(&test_free) != (Some(0), Some(0), Some(0)) {
-        return Err("test-free declarations: an all-declared passing run did not count 0/0".into());
-    }
-    let mixed = with_declared_test_free_zeroes(
-        &[
-            outcome("free.build", true, None, None),
-            outcome("test.a", true, Some(398), Some(0)),
-        ],
-        declared,
-    )?;
-    if libtest_counts(&mixed) != (Some(398), Some(398), Some(0)) {
-        return Err("test-free declarations: a declared zero changed a counted total".into());
-    }
-    let undeclared = with_declared_test_free_zeroes(
-        &[
-            outcome("free.build", true, None, None),
-            outcome("build.only", true, None, None),
-        ],
-        declared,
-    )?;
-    if undeclared[1].executed_tests.is_some() {
-        return Err("test-free declarations: an undeclared bannerless node was zeroed".into());
-    }
-    let failed_free =
-        with_declared_test_free_zeroes(&[outcome("free.build", false, None, None)], declared)?;
-    if libtest_counts(&failed_free) != (None, None, None) {
-        return Err("test-free declarations: a failed declared node was zeroed".into());
-    }
-    match with_declared_test_free_zeroes(&[outcome("free.liar", true, Some(3), Some(0))], declared)
-    {
-        Err(error) if error.contains("free.liar") && error.contains("declared test-free") => {}
-        other => {
-            return Err(format!(
-                "test-free declarations: a declared node with counts was not refused: {other:?}"
-            ));
-        }
-    }
-
     let mut exact = outcome("test.exact", false, Some(2), Some(0));
     exact.test_results = Some(vec![
         TestResult::new("case-a".into(), true, 1)?,
@@ -24334,7 +23673,7 @@ fn no_result_propagation_bracket() -> Result<(), String> {
     if outcome_is_no_result(&pass)
         || outcome_is_failure(&pass)
         || ledger_gate_result(&pass) != "pass"
-        || completed_exit_code(0, 0, false, false) != 0
+        || completed_exit_code(0, true) != 0
         || ledger_run_results(0, 0, 0, false) != ("pass", "pass")
     {
         return Err("no-result propagation: exit 0 no longer stays PASS".into());
@@ -24344,7 +23683,7 @@ fn no_result_propagation_bracket() -> Result<(), String> {
     if !outcome_is_no_result(&no_result)
         || outcome_is_failure(&no_result)
         || ledger_gate_result(&no_result) != "no_result"
-        || completed_exit_code(0, 1, false, false) != NO_RESULT_EXIT_CODE as u8
+        || completed_exit_code(0, false) != NO_RESULT_EXIT_CODE as u8
         || ledger_run_results(NO_RESULT_EXIT_CODE as u8, 0, 1, false) != ("fail", "no_result")
         || ledger_run_results(NO_RESULT_EXIT_CODE as u8, 0, 0, false) != ("fail", "no_result")
     {
@@ -24388,7 +23727,7 @@ fn no_result_propagation_bracket() -> Result<(), String> {
         if outcome_is_no_result(&failure)
             || !outcome_is_failure(&failure)
             || ledger_gate_result(&failure) != "fail"
-            || completed_exit_code(1, 0, false, false) != 1
+            || completed_exit_code(1, true) != 1
             || ledger_run_results(1, 1, 0, false) != ("fail", "fail")
         {
             return Err(format!(
@@ -24397,7 +23736,7 @@ fn no_result_propagation_bracket() -> Result<(), String> {
         }
     }
 
-    if completed_exit_code(1, 1, false, false) != 1
+    if completed_exit_code(1, false) != 1
         || ledger_run_results(1, 1, 1, false) != ("fail", "fail")
         || ledger_run_results(1, 0, 1, false) != ("fail", "fail")
         || ledger_run_results(NO_RESULT_EXIT_CODE as u8, 1, 1, false) != ("fail", "fail")
@@ -24408,16 +23747,11 @@ fn no_result_propagation_bracket() -> Result<(), String> {
 
     // A whole-run cutoff leaves selected work unmeasured. It never erases a
     // completed product failure, including an individually collected node limit.
-    if completed_exit_code(0, 1, true, false) != NO_RESULT_EXIT_CODE as u8
-        || completed_exit_code(1, 1, true, false) != 1
+    if completed_exit_code(0, false) != NO_RESULT_EXIT_CODE as u8
+        || completed_exit_code(1, false) != 1
     {
         return Err(
             "no-result propagation: run cutoff lost incomplete/product-failure distinction".into(),
-        );
-    }
-    if completed_exit_code(0, 1, false, true) != 1 {
-        return Err(
-            "no-result propagation: an unexplained runner failure was weakened to NO_RESULT".into(),
         );
     }
 
@@ -24627,11 +23961,6 @@ fn write_ledger_with_snapshot(
         .collect();
     // Failed/no-cell rows retain the configured invocation's ID too.
     let run_id = ctx.run_id.as_deref();
-    let result = if ctx.admission_provenance_error.is_some() && result == "pass" {
-        "no_result"
-    } else {
-        result
-    };
     let mut record = serde_json::json!({
         "schema_version": ledger_schema,
         "repo": "hermit",
@@ -28438,7 +27767,6 @@ fn run(
     let mut outcomes: Vec<StepOutcome> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     let mut attempts: Vec<NodeAttempt> = Vec::new();
-    let mut ok = true;
     let mut execution_complete = true;
     let mut memory_caps = MemoryCapAudit::default();
 
@@ -28468,7 +27796,6 @@ fn run(
     outcomes.extend(r.outcomes.iter().cloned());
     skipped.extend(r.skipped.iter().cloned());
     attempts.extend(r.attempts.iter().cloned());
-    ok = ok && r.ok;
     execution_complete = execution_complete && r.complete;
     run_timed_out = run_timed_out || r.run_timed_out;
     memory_caps.extend(&r.memory_caps);
@@ -28481,7 +27808,6 @@ fn run(
         outcomes.extend(r2.outcomes.iter().cloned());
         skipped.extend(r2.skipped.iter().cloned());
         attempts.extend(r2.attempts.iter().cloned());
-        ok = ok && r2.ok;
         execution_complete = execution_complete && r2.complete;
         run_timed_out = run_timed_out || r2.run_timed_out;
         memory_caps.extend(&r2.memory_caps);
@@ -28535,9 +27861,13 @@ fn run(
             &commit,
         ) {
             Ok(_) => None,
+            // The series is dev-hermit's history store; it says nothing about the
+            // product. A write failure is reported loudly and does not change the
+            // exit (on 2026-10-07 it turned three fully green full runs FAILED).
             Err(error) => {
                 eprintln!(
-                    "validate: ERROR: completed cell results were not added to the series: {error}"
+                    "validate: ERROR: completed cell results were not added to the series: {error}; \
+                     the verdict is unchanged"
                 );
                 Some(error)
             }
@@ -28558,23 +27888,19 @@ fn run(
     // Whole-run CPU, taken once in THIS process (a worker thread would see only
     // its own accounting, exactly as a bash subshell's `times` would).
     let (cpu_user, cpu_sys) = validate_runtime::process_cpu_seconds();
-    let run_counts = derive_plan_run_counts(&plan, &outcomes, &attempts);
+    let run_counts = derive_run_counts(&outcomes, &attempts, plan.compat, plan.compat_prefix);
     let executed_tests = run_counts.executed_tests;
     let passed_tests = run_counts.passed_tests;
     let filtered_tests = run_counts.filtered_tests;
     let compatibility_count_error = run_counts.compatibility_count_error.clone();
-    let test_free_declaration_error = run_counts.test_free_declaration_error.clone();
-    for error in [&test_free_declaration_error, &compatibility_count_error]
-        .into_iter()
-        .flatten()
-    {
+    if let Some(error) = &compatibility_count_error {
         eprintln!("validate: ERROR: {error}");
     }
     if executed_tests.is_none() {
         eprintln!(
-            "validate: WARNING: libtest counts are UNKNOWN for this run. A ledger row with \
-             executed_tests=null is a NON-VERDICT, not a green: no downstream completeness \
-             predicate can qualify it."
+            "validate: WARNING: test counts are UNKNOWN for this run. The verdict below is \
+             decided by the nodes; a ledger row with executed_tests=null cannot qualify a \
+             receipt."
         );
     }
 
@@ -28843,9 +28169,6 @@ fn run(
     // Compatibility ratchet, evaluated from typed outcomes.
     let mut compat_blocking = 0usize;
     let mut compat_nonblocking = BTreeSet::new();
-    // Carried to the verdict: a compat profile that measured nothing must not be
-    // able to reach PASS through an empty set of failing rows.
-    let mut compat_measured: Option<usize> = None;
     if let Some(mode) = plan.compat {
         let prefix = plan
             .compat_prefix
@@ -28853,11 +28176,10 @@ fn run(
         // No remaining compat mode has a passing floor: the rr run type's, the
         // only one, went with its per-program nodes on 2026-10-02, and its
         // bucket fails on any selected cell that fails instead.
-        let (_passed, measured, blocking, nonblocking) =
+        let (_passed, _measured, blocking, nonblocking) =
             print_compat_summary(mode, prefix, &outcomes, &attempts);
         compat_blocking = blocking.len();
         compat_nonblocking = nonblocking;
-        compat_measured = Some(measured);
         if !blocking.is_empty() {
             println!(
                 "❌ {} blocking failures ({}): {}",
@@ -28952,82 +28274,22 @@ fn run(
         .union(&compat_nonblocking)
         .cloned()
         .collect();
-    // `ok` from the runner reflects every node, including the nonblocking ones,
-    // so it is only authoritative when nothing is excused. A known exit 75
-    // fully explains why the runner returned non-ok; any other unexplained
-    // non-ok state remains a failure.
-    let unexplained_runner_failure = plan.nonblocking.is_empty()
-        && plan.compat.is_none()
-        && !ok
-        && no_results == 0
-        && failures == 0
-        && !run_timed_out
-        && !outcomes.iter().any(outcome_is_failure);
-    let mut exit_code = completed_exit_code(
-        effective_failures,
-        no_results,
-        run_timed_out,
-        unexplained_runner_failure,
-    );
+    if !validation_complete {
+        eprintln!(
+            "validate: ERROR: not every required node completed with a product result; \
+             dependency-skipped, aborted, timed-out, unreported and no-result work makes \
+             validation incomplete and cannot report PASS."
+        );
+    }
+    let mut exit_code = completed_exit_code(effective_failures, validation_complete);
     if envelope_regressed {
         exit_code = 1;
     }
     if let Some((code, _)) = &envelope_error {
         exit_code = *code;
     }
-    if series_error.is_some() {
+    if compatibility_count_error.is_some() {
         exit_code = 1;
-    }
-    if compatibility_count_error.is_some() || test_free_declaration_error.is_some() {
-        exit_code = 1;
-    }
-    if !execution_complete {
-        eprintln!(
-            "validate: ERROR: not every required node completed with a non-aborted outcome; \
-             dependency-skipped, aborted, timed-out, and unreported work makes validation \
-             incomplete and cannot report PASS."
-        );
-    }
-    exit_code = exit_code_with_execution_completeness(exit_code, validation_complete);
-
-    // Completeness is not the ratchet's to decide. A ratchet narrows WHICH
-    // measured rows may fail; it cannot answer whether anything was measured, so
-    // these conditions are checked separately and named individually.
-    let refusals = run_verdict_refusals(compat_measured, structural_failures, &run_counts);
-    if exit_code == 0 && !refusals.is_empty() {
-        for why in &refusals {
-            eprintln!("validate: ERROR: {why}");
-        }
-        eprintln!(
-            "validate: refusing to report PASS: the run did not measure enough to certify \
-             anything."
-        );
-    }
-    exit_code = exit_code_with_verdict_refusals(exit_code, &refusals);
-
-    // Receipt production is itself an enforcement path (validate.sh:1846).
-    //
-    // Every receipt-producing profile plans `pre.reverie_pin` and every lane
-    // node depends on it, so in principle a green receipt cannot happen without
-    // it. This asserts that anyway: if a future fast path, cache branch, or early
-    // return ever bypasses the pin gate, it must not emit PASS merely because the
-    // tests it did select happened to pass. An off-the-record selected subgraph
-    // is the explicit exception: it cannot write a ledger row or receipt, and
-    // the external workflow already depends on the preflight result. The
-    // archival pin is not a testing exemption, and "the DAG makes it impossible"
-    // is a structural argument, not an observation of a receipt-producing run.
-    let mut pin_gate_bypassed = false;
-    if pin_gate_blocks_pass(
-        exit_code,
-        pin_gate_passed,
-        args.allow_local_off_the_record_run,
-    ) {
-        eprintln!(
-            "validate: ERROR: this path produced a PASS without a passing {PIN_GATE_TAG} gate; \
-             refusing a passing receipt."
-        );
-        exit_code = 1;
-        pin_gate_bypassed = true;
     }
 
     // A full top-level run must carry the exact per-cell population it just
@@ -29035,10 +28297,19 @@ fn run(
     // not open or satisfy a cell-specific failure obligation. Retain the typed
     // rows before appending the ledger entry so schema 7 is emitted only when
     // the artifact has actually been published and bound by checksum.
-    let mut evidence_refusal_details = Vec::new();
+    //
+    // Evidence retained after execution decides whether this row can be a
+    // receipt, which is ci-hub's qualifying-receipt predicate's decision (it
+    // refuses a row whose admission, schema-10, per-cell or coverage evidence is
+    // missing). A retention failure is reported here and does not change the
+    // exit: on 2026-10-06 an unavailable receipt helper turned two fully green
+    // full runs into NO-RESULT.
+    let mut evidence_warnings = Vec::new();
     if let Some(error) = &ctx.admission_provenance_error {
-        evidence_refusal_details.push(format!("admission provenance unavailable: {error}"));
-        exit_code = exit_code_with_evidence_refusal(exit_code);
+        let detail =
+            format!("admission provenance unavailable: {error}; this row cannot be a receipt");
+        eprintln!("validate: WARNING: {detail}");
+        evidence_warnings.push(detail);
     }
     let should_retain_cells = plan.suite_complete || plan.cell_evidence_expected.is_some();
     let cumulative_expected = prepared_evidence.is_some();
@@ -29055,11 +28326,10 @@ fn run(
                 Ok(evidence) => Some(evidence),
                 Err(error) => {
                     let detail = format!(
-                        "cannot retain cumulative validation evidence: {error}; refusing a schema-10 receipt"
+                        "cannot retain cumulative validation evidence: {error}; this row cannot be a schema-10 receipt"
                     );
-                    eprintln!("validate: ERROR: {detail}");
-                    evidence_refusal_details.push(detail);
-                    exit_code = exit_code_with_evidence_refusal(exit_code);
+                    eprintln!("validate: WARNING: {detail}");
+                    evidence_warnings.push(detail);
                     None
                 }
             },
@@ -29090,11 +28360,10 @@ fn run(
             Ok(results) => Some(results),
             Err(error) => {
                 let detail = format!(
-                    "cannot retain complete per-cell evidence: {error}; refusing a schema-7 receipt"
+                    "cannot retain complete per-cell evidence: {error}; this row cannot be a schema-7 receipt"
                 );
-                eprintln!("validate: ERROR: {detail}");
-                evidence_refusal_details.push(detail);
-                exit_code = exit_code_with_evidence_refusal(exit_code);
+                eprintln!("validate: WARNING: {detail}");
+                evidence_warnings.push(detail);
                 None
             }
         }
@@ -29171,11 +28440,10 @@ fn run(
             }
             Err(error) => {
                 let detail = format!(
-                    "cannot retain complete coverage evidence: {error}; refusing a full receipt"
+                    "cannot retain complete coverage evidence: {error}; this row cannot be a full receipt"
                 );
-                eprintln!("validate: ERROR: {detail}");
-                evidence_refusal_details.push(detail);
-                exit_code = exit_code_with_evidence_refusal(exit_code);
+                eprintln!("validate: WARNING: {detail}");
+                evidence_warnings.push(detail);
                 None
             }
         }
@@ -29369,15 +28637,18 @@ fn run(
     if let Some((_, msg)) = &envelope_error {
         detail.push(format!("envelope comparison could not run: {msg}"));
     }
+    if let Some(error) = &series_error {
+        detail.push(format!(
+            "completed cell results could not be added to the series: {error}; the series is \
+             history only and the verdict is unchanged"
+        ));
+    }
     if let Some(error) = &compatibility_count_error {
         detail.push(format!(
             "direct compatibility rows could not produce an exact test count: {error}"
         ));
     }
-    if let Some(error) = &test_free_declaration_error {
-        detail.push(format!("a test-free declaration was contradicted: {error}"));
-    }
-    detail.extend(evidence_refusal_details);
+    detail.extend(evidence_warnings);
     if !timed_out_nodes(&outcomes).is_empty() {
         detail.push(format!(
             "{} node(s) hit a wall or CPU budget; a timeout IS a recorded result: {}",
@@ -29429,16 +28700,6 @@ fn run(
                 .join(", ")
         ));
     }
-    for why in &refusals {
-        detail.push(format!("REFUSED ON COMPLETENESS: {why}"));
-    }
-    if pin_gate_bypassed {
-        detail.push(
-            "this path reached a PASS without a passing pre.reverie_pin gate; the receipt was \
-             REFUSED and the verdict forced to fail (the archival pin is not a testing exemption)"
-                .into(),
-        );
-    }
     match executed_tests {
         Some(n) => detail.push(format!(
             "{n} test(s) executed, {} passed, {} filtered (aggregated from typed step outcomes)",
@@ -29450,8 +28711,8 @@ fn run(
                 .unwrap_or_else(|| "unknown".into())
         )),
         None => detail.push(
-            "executed_tests is UNKNOWN — this row is a NON-VERDICT and cannot qualify a receipt, \
-             whatever the exit code says"
+            "executed_tests is UNKNOWN: the verdict is the nodes' own, and this row cannot \
+             qualify a receipt"
                 .into(),
         ),
     }
@@ -32105,39 +31366,31 @@ mod final_validate_status_tests {
     use super::*;
 
     #[test]
-    fn completeness_refusal_is_not_a_product_failure() {
-        let refusals = verdict_refusals(None, 0, Some(0), false);
-        assert!(!refusals.is_empty());
-
-        let refused_exit = exit_code_with_verdict_refusals(0, &refusals);
-        assert_eq!(refused_exit, COULD_NOT_RUN_EXIT_CODE);
-        assert_eq!(completed_verdict(refused_exit), Verdict::NoResult);
+    fn the_exit_is_decided_by_node_results_alone() {
+        let incomplete = completed_exit_code(0, false);
+        assert_eq!(incomplete, COULD_NOT_RUN_EXIT_CODE);
+        assert_eq!(completed_verdict(incomplete), Verdict::NoResult);
         assert_eq!(
-            final_validate_status(completed_verdict(refused_exit)),
+            final_validate_status(completed_verdict(incomplete)),
             Some(FinalValidateStatus::CouldNotRun)
         );
-        let after_cell_retention = exit_code_with_evidence_refusal(refused_exit);
-        let after_coverage_retention = exit_code_with_evidence_refusal(after_cell_retention);
-        assert_eq!(after_coverage_retention, COULD_NOT_RUN_EXIT_CODE);
-        assert_eq!(
-            completed_verdict(after_coverage_retention),
-            Verdict::NoResult
-        );
-        assert_eq!(exit_code_with_evidence_refusal(0), COULD_NOT_RUN_EXIT_CODE);
 
-        let failed_exit = exit_code_with_verdict_refusals(1, &refusals);
-        assert_eq!(failed_exit, 1);
-        assert_eq!(completed_verdict(failed_exit), Verdict::Fail);
-        assert_eq!(
-            final_validate_status(completed_verdict(failed_exit)),
-            Some(FinalValidateStatus::Failed)
-        );
+        // A genuine failure is never hidden behind incompleteness.
+        for complete in [true, false] {
+            let failed = completed_exit_code(1, complete);
+            assert_eq!(failed, 1);
+            assert_eq!(completed_verdict(failed), Verdict::Fail);
+            assert_eq!(
+                final_validate_status(completed_verdict(failed)),
+                Some(FinalValidateStatus::Failed)
+            );
+        }
 
-        let clean_exit = exit_code_with_verdict_refusals(0, &[]);
-        assert_eq!(clean_exit, 0);
-        assert_eq!(completed_verdict(clean_exit), Verdict::Pass);
+        let clean = completed_exit_code(0, true);
+        assert_eq!(clean, 0);
+        assert_eq!(completed_verdict(clean), Verdict::Pass);
         assert_eq!(
-            final_validate_status(completed_verdict(clean_exit)),
+            final_validate_status(completed_verdict(clean)),
             Some(FinalValidateStatus::Passed)
         );
     }
@@ -32145,11 +31398,10 @@ mod final_validate_status_tests {
     #[test]
     fn schema_five_publishes_detail_only_for_could_not_run() {
         let temp = tempfile::tempdir().unwrap();
-        let refusals = verdict_refusals(None, 0, Some(0), false);
-        let expected_detail = refusals
-            .iter()
-            .map(|why| format!("REFUSED ON COMPLETENESS: {why}"))
-            .collect::<Vec<_>>();
+        let expected_detail = vec![
+            validation_completeness_detail(false, 1, 2),
+            "1 gate(s) could not determine their condition: fixture.unrun".to_string(),
+        ];
 
         let mut refused = RunSummary::new(
             Verdict::NoResult,

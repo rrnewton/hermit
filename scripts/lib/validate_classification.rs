@@ -457,7 +457,7 @@ fn fold_bracket() -> Result<(), String> {
             || classified.product_failure_nodes.len() != failed
             || classified.no_results() != usize::from(incomplete)
             || validation_is_complete(true, &classified, &planned) == incomplete
-            || super::completed_exit_code(failed, classified.no_results(), false, false)
+            || super::completed_exit_code(failed, classified.no_results() == 0)
                 != if failed > 0 {
                     1
                 } else if incomplete {
@@ -1468,9 +1468,7 @@ mod timeout_tests {
         assert_eq!(
             super::super::completed_exit_code(
                 classified.blocking_failures(&BTreeSet::new()),
-                classified.no_results(),
-                result.run_timed_out,
-                false
+                classified.no_results() == 0 && !result.run_timed_out
             ),
             1
         );
@@ -1580,9 +1578,7 @@ mod timeout_tests {
             ));
             let exit = super::super::completed_exit_code(
                 classified.blocking_failures(&BTreeSet::new()),
-                classified.no_results(),
-                result.run_timed_out,
-                false,
+                validation_is_complete(result.complete, &classified, &planned),
             );
             assert_eq!(
                 exit,
@@ -1591,10 +1587,6 @@ mod timeout_tests {
                 } else {
                     super::super::NO_RESULT_EXIT_CODE as u8
                 }
-            );
-            assert_eq!(
-                super::super::exit_code_with_execution_completeness(exit, false),
-                exit
             );
             println!(
                 "actual whole-run cutoff prior_failure={prior_failure}: {classified:?}; outcomes={:?}",

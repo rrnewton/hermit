@@ -1961,10 +1961,6 @@ for entry in Path('/proc/self/fd').iterdir():
         );
         std::fs::write(retained.artifact_path(&state), b"tampered").unwrap();
         assert!(call().is_err());
-        assert_eq!(crate::exit_code_with_evidence_refusal(0), 75);
-        for failure in [1, 2, 75, 122] {
-            assert_eq!(crate::exit_code_with_evidence_refusal(failure), failure);
-        }
     }
 
     #[test]

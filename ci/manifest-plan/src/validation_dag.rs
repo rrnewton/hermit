@@ -69,47 +69,6 @@ const CANONICAL_ADAPTER_ACCEPT_TAG: &str = "check.canonical_adapter_accept";
 const CANONICAL_ADAPTER_ACCEPT_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; python3 ./scripts/test_validate_stop_paths.py --canonical-adapter-accept-arm-only"#;
 const PINNED_ROOT_TWIN_SUFFIX: &str = "_in_pinned_root";
 
-/// Committed nodes that publish no test counts by design: builds, gates,
-/// pin checks, the envelope probes and the QEMU boot. dagrun reports such a node's
-/// counts as unknown (no structured results and no runner banner). scripts/validate.rs
-/// counts a PASSING declared node as a demonstrated 0 executed / 0 passed. Without
-/// that, a selection made only of such nodes (envelope-only, qemu-l2-only) sums to
-/// unknown counts and can never publish a PASSED service result
-/// (<https://github.com/rrnewton/hermit/issues/3915>). An undeclared node without
-/// counts stays unknown, and a declared node that does publish counts is refused
-/// rather than zeroed. Every node of the envelope-only and qemu-l2-only selections
-/// is listed; each ran without counts in those profiles on 2026-10-08.
-pub const TEST_FREE_STEPS: &[&str] = &[
-    "build.rust_scripts",
-    "envelope.build",
-    "envelope.date_l1",
-    "envelope.date_l2",
-    "envelope.date_l3",
-    "envelope.date_l4",
-    "envelope.date_rr",
-    "envelope.echo_l1",
-    "envelope.echo_l2",
-    "envelope.echo_l3",
-    "envelope.echo_l4",
-    "envelope.echo_rr",
-    "envelope.true_l1",
-    "envelope.true_l2",
-    "envelope.true_l3",
-    "envelope.true_l4",
-    "envelope.true_rr",
-    "gate.manifest",
-    "pre.reverie_pin",
-    "pre.submodules",
-    "qemu.hermit_release",
-    "qemu.strict_l2_boot",
-    "setup.manifest_plan",
-];
-
-/// Whether the committed DAG declares `tag` test-free (see [`TEST_FREE_STEPS`]).
-pub fn declared_test_free(tag: &str) -> bool {
-    TEST_FREE_STEPS.contains(&tag)
-}
-
 /// The pinned-root workspace producer is two nodes. The compile node runs the
 /// Cargo half of `build.workspace` and needs no rust-script tool, so it starts
 /// beside `build.rust_scripts_in_pinned_root` instead of after it. The prepare
@@ -5931,72 +5890,6 @@ sys.exit(37)
     /// preparation on one development host: 65 s and 134 s typically, 734 s at
     /// worst (https://github.com/rrnewton/hermit/issues/3896).
     const PREPARATION_RESERVE_S: i64 = 1200;
-
-    #[test]
-    fn test_free_declarations_name_count_free_committed_nodes() {
-        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
-        let tags: BTreeSet<String> = committed.steps.iter().map(Step::tag).collect();
-        for tag in TEST_FREE_STEPS {
-            assert!(
-                tags.contains(*tag),
-                "declared test-free node {tag} is not committed"
-            );
-            let step = committed
-                .steps
-                .iter()
-                .find(|step| step.tag() == *tag)
-                .unwrap();
-            let publishes = step.result_manifests.iter().flatten().any(|manifest| {
-                matches!(
-                    manifest,
-                    dagrun::model::ResultManifest::StructuredTestResults(_)
-                )
-            });
-            assert!(
-                !publishes,
-                "declared test-free node {tag} publishes structured test results"
-            );
-        }
-        // The selections that publish no counts at all must be wholly declared,
-        // or they still end NO-RESULT (https://github.com/rrnewton/hermit/issues/3915).
-        for label in ["envelope-only", "qemu-l2-only"] {
-            let selection = select_steps_by_labels(&committed, &[label.to_string()]).unwrap();
-            let undeclared: Vec<String> = selection
-                .steps
-                .iter()
-                .map(Step::tag)
-                .filter(|tag| !declared_test_free(tag))
-                .collect();
-            assert!(
-                undeclared.is_empty(),
-                "label {label}: undeclared nodes {undeclared:?}"
-            );
-        }
-        assert!(!declared_test_free("test.detcore_unit"));
-        // scripts/validate.rs accepts a measured zero only for a label selection
-        // of envelope-only or qemu-l2-only whose every node is declared
-        // (declared_test_free_selection, which also checks the profile). As a
-        // second guard, every other committed label, full and quick included,
-        // must plan an undeclared node.
-        let labels: BTreeSet<&str> = committed
-            .steps
-            .iter()
-            .flat_map(|step| step.labels.iter().map(String::as_str))
-            .collect();
-        for label in labels {
-            if matches!(label, "envelope-only" | "qemu-l2-only") {
-                continue;
-            }
-            let selection = select_steps_by_labels(&committed, &[label.to_string()]).unwrap();
-            assert!(
-                selection
-                    .steps
-                    .iter()
-                    .any(|step| !declared_test_free(&step.tag())),
-                "label {label} is wholly declared test-free, so a zero-test run of it would pass"
-            );
-        }
-    }
 
     #[test]
     fn committed_selections_survive_a_slow_preparation() {

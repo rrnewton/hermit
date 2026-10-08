@@ -888,7 +888,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // syscall_fd_anchor_is_refused_where_it_cannot_apply and
     // count_syscall_occurrences_is_exact_per_thread (detcore-model) retain all
     // 1011: 1014.
-    ("test.regular_crates", 1014),
+    // Removed with the test-free declarations it checked (the zero-test run
+    // refusal they existed to lift is gone): back to the same 1004.
+    ("test.regular_crates", 1013),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2460,7 +2462,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same test-free declaration test: 1005.
     // And the same six scheduler-turn-cost tests: 1011.
     // The same three detcore-model happens-before tests: 1014.
-    ("test.regular_crates_on_host", 1014),
+    // And the same test-free declaration test: 1005; removed with it: 1004.
+    ("test.regular_crates_on_host", 1013),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

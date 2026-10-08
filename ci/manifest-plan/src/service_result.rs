@@ -327,14 +327,19 @@ impl ValidationServiceResult {
                     );
                 }
             }
-            let expected_command_exit = match (
-                self.final_validate_status,
-                self.scorecard_writeback.as_ref(),
-            ) {
-                (FinalValidateStatus::Passed, Some(ScorecardWriteback::Failed { .. })) => 75,
-                _ => validation_exit,
-            };
-            if self.exit_code != expected_command_exit {
+            // A write-back failure is reported in the result; it does not
+            // change the command exit. Producers before 2026-10-08 turned a
+            // PASSED run's failed write-back into exit 75, so records they
+            // wrote stay readable.
+            let expected_command_exit = validation_exit;
+            let historical_writeback_exit = self.final_validate_status
+                == FinalValidateStatus::Passed
+                && matches!(
+                    self.scorecard_writeback,
+                    Some(ScorecardWriteback::Failed { .. })
+                )
+                && self.exit_code == 75;
+            if self.exit_code != expected_command_exit && !historical_writeback_exit {
                 return Err(format!(
                     "validation-service-result-exit_code: {} with scorecard_writeback {:?} requires {expected_command_exit}, got {}",
                     self.final_validate_status.as_str(),
@@ -379,17 +384,17 @@ impl ValidationServiceResult {
                 ));
             }
         }
-        if self.schema_version >= TEST_COUNTS_SCHEMA_VERSION
-            && self.final_validate_status == FinalValidateStatus::Passed
-        {
-            let passed = self.passed_tests.ok_or_else(|| {
-                "validation-service-result-passed_tests: current PASSED result requires an exact count"
-                    .to_string()
-            })?;
-            let executed = self.executed_tests.ok_or_else(|| {
-                "validation-service-result-executed_tests: current PASSED result requires an exact count"
-                    .to_string()
-            })?;
+        // An unknown count does not stop a PASSED result from being reported:
+        // whether a run's counts qualify it as landing evidence is ci-hub's
+        // qualifying-receipt predicate's decision (profile full, at least one
+        // executed test, passed == executed). A count that IS present must
+        // still agree with itself.
+        if let (true, Some(passed), Some(executed)) = (
+            self.schema_version >= TEST_COUNTS_SCHEMA_VERSION
+                && self.final_validate_status == FinalValidateStatus::Passed,
+            self.passed_tests,
+            self.executed_tests,
+        ) {
             if passed != executed {
                 return Err(format!(
                     "validation-service-result-passed_tests: current PASSED result requires passed_tests == executed_tests, got {passed} != {executed}"
@@ -448,21 +453,19 @@ mod tests {
     }
 
     #[test]
-    fn failed_writeback_preserves_pass_and_requires_loud_command_exit() {
+    fn failed_writeback_preserves_pass_and_its_exit() {
         let mut result = valid();
-        result.exit_code = 75;
         result.scorecard_writeback = Some(ScorecardWriteback::Failed {
             error: "fixture refusal".into(),
         });
         result.validate().unwrap();
 
-        result.exit_code = 0;
-        assert!(
-            result
-                .validate()
-                .unwrap_err()
-                .contains("requires 75, got 0")
-        );
+        // Records written before the write-back stopped changing the exit.
+        result.exit_code = 75;
+        result.validate().unwrap();
+
+        result.exit_code = 1;
+        assert!(result.validate().unwrap_err().contains("requires 0, got 1"));
     }
 
     #[test]
@@ -774,6 +777,14 @@ mod tests {
                 .unwrap_err()
                 .contains("cannot be present when executed_tests is null")
         );
+
+        // Both counts unknown: the PASSED result is reported; ci-hub's
+        // qualifying-receipt predicate, not this schema, refuses it as
+        // landing evidence.
+        let mut unknown = valid();
+        unknown.executed_tests = None;
+        unknown.passed_tests = None;
+        unknown.validate().unwrap();
     }
 
     #[test]
