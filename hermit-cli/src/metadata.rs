@@ -445,6 +445,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         backend: <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities(),
         backend_supports_blocked_wait_signal_interruption: false,
         guest_may_inherit_a_terminal: false,
+        in_guest_detlog_forward_policy: None,
         has_uts_namespace: true,
         // The path to the directory where syscalls will be recorded.
         replay_data: Some(data.to_path_buf()),

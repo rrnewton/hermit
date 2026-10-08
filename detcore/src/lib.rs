@@ -1255,6 +1255,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     fn new(pid: Pid, cfg: &Config) -> Self {
         let detpid = DetPid::from_raw(pid.into()); // TODO(T78538674): virtualize pid.
         cfg.validate_invariants();
+        if let Some(policy) = &cfg.in_guest_detlog_forward_policy {
+            // This image's forwarder was set up before the Tool (SaBRe's
+            // connect, the LiteInst constructor); without one, or with another
+            // policy, refuse.
+            detlog::require_forwarding(policy);
+        }
         // Read before any guest syscall, so a readlink of another process's
         // pipe or socket never depends on the tracer's descriptors then. The
         // outcome is kept; a failure is reported only if a guest needs it.
