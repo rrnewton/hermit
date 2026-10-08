@@ -121,12 +121,13 @@ pub const PROCFS_MOUNTINFO_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// strict verify runs (`run --strict --verify --verify-strict`, default log
 /// level, no relaxations), each on its first attempt with bitwise parity, with
 /// a stamped release build of the evidence SHA. That SHA contains every
-/// Hermit, Detcore and guest change of the series that added the cell; the
-/// series' later commits change only CI records. The runs used guest source
-/// sha256 d7a1c8e274ebc389bcea19d63c1e7021b9a238998f356c5e94b2b7e43a479222.
+/// Hermit and Detcore change of the series that added the cell; the series'
+/// later commits change no Hermit or Detcore code and not this cell's guest.
+/// The runs used guest source sha256
+/// d7a1c8e274ebc389bcea19d63c1e7021b9a238998f356c5e94b2b7e43a479222.
 pub const SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_SHA: &str =
-    "e1e53c5934652df03a8f93b4f3a9283feb9dfaf7";
-pub const SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-10-07T22:22:50Z";
+    "ae82e833ca62a47469a4121d5a62434329ea343d";
+pub const SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-10-08T05:15:27Z";
 pub const SIGSUSPEND_ALARM_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// `c-programs/external-io-signal-interrupt` verify on ptrace, a new guest for
 /// <https://github.com/rrnewton/hermit/issues/3222>: an alarm must interrupt a
@@ -137,12 +138,13 @@ pub const SIGSUSPEND_ALARM_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// consecutive strict verify runs (`run --strict --verify --verify-strict`,
 /// default log level, no relaxations), each on its first attempt with bitwise
 /// parity, with a stamped release build of the evidence SHA. That SHA contains
-/// every Hermit, Detcore and guest change of the series that added the cell;
-/// the series' later commits change only CI records. The runs used guest source
-/// sha256 e8babb4316082311cdbb50cfce2128d58b0d7482e5de7d0c29dbeaca066afa40.
+/// every Hermit and Detcore change of the series that added the cell; the
+/// series' later commits change no Hermit or Detcore code and not this cell's
+/// guest. The runs used guest source sha256
+/// e8babb4316082311cdbb50cfce2128d58b0d7482e5de7d0c29dbeaca066afa40.
 pub const EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_SHA: &str =
-    "e1e53c5934652df03a8f93b4f3a9283feb9dfaf7";
-pub const EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-10-07T22:23:05Z";
+    "ae82e833ca62a47469a4121d5a62434329ea343d";
+pub const EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-10-08T05:15:46Z";
 pub const EXTERNAL_IO_SIGNAL_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// `c-programs/sigsuspend-sibling-signal-wake` verify on ptrace, a new guest
 /// for the defects its series fixes: a sibling's `tgkill` must end an
@@ -157,13 +159,13 @@ pub const EXTERNAL_IO_SIGNAL_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// passed ten consecutive strict verify runs (`run --strict --verify
 /// --verify-strict`, default log level, no relaxations), each on its first
 /// attempt with bitwise parity, with a stamped release build of the evidence
-/// SHA. That SHA contains every Hermit, Detcore and guest change of the series
-/// that added the cell; the series' later commits change only CI records. The
-/// runs used guest source sha256
+/// SHA. That SHA contains every Hermit and Detcore change of the series that
+/// added the cell; the series' later commits change no Hermit or Detcore code
+/// and not this cell's guest. The runs used guest source sha256
 /// 551031c3380b6bb7981699390db17d5d9d8deee05b035dc474d87d056ce85831.
 pub const SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_SHA: &str =
-    "e1e53c5934652df03a8f93b4f3a9283feb9dfaf7";
-pub const SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-10-07T22:23:43Z";
+    "ae82e833ca62a47469a4121d5a62434329ea343d";
+pub const SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-10-08T05:16:42Z";
 pub const SIGSUSPEND_SIBLING_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// `c-programs/timer-copy-coalesce` verify on ptrace, a new guest for timer
 /// expiries that Hermit sends to one thread alone: a periodic ITIMER_REAL keeps
@@ -2091,29 +2093,29 @@ mod tests {
         assert_eq!(PROCFS_MOUNTINFO_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(
             SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_SHA,
-            "e1e53c5934652df03a8f93b4f3a9283feb9dfaf7"
+            "ae82e833ca62a47469a4121d5a62434329ea343d"
         );
         assert_eq!(
             SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_COMPLETED_UTC,
-            "2026-10-07T22:22:50Z"
+            "2026-10-08T05:15:27Z"
         );
         assert_eq!(SIGSUSPEND_ALARM_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(
             EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_SHA,
-            "e1e53c5934652df03a8f93b4f3a9283feb9dfaf7"
+            "ae82e833ca62a47469a4121d5a62434329ea343d"
         );
         assert_eq!(
             EXTERNAL_IO_SIGNAL_2026_09_25_EVIDENCE_COMPLETED_UTC,
-            "2026-10-07T22:23:05Z"
+            "2026-10-08T05:15:46Z"
         );
         assert_eq!(EXTERNAL_IO_SIGNAL_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(
             SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_SHA,
-            "e1e53c5934652df03a8f93b4f3a9283feb9dfaf7"
+            "ae82e833ca62a47469a4121d5a62434329ea343d"
         );
         assert_eq!(
             SIGSUSPEND_SIBLING_2026_09_25_EVIDENCE_COMPLETED_UTC,
-            "2026-10-07T22:23:43Z"
+            "2026-10-08T05:16:42Z"
         );
         assert_eq!(SIGSUSPEND_SIBLING_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(
