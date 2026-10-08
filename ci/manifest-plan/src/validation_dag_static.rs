@@ -901,7 +901,22 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // record_workloads::tests::standalone_population_is_shared_across_processes_and_pruned
     // (hermit-manifest-plan includes ci/record-replay-workloads.rs,
     // https://github.com/rrnewton/hermit/issues/3946) retains all 1017: 1018.
-    ("test.regular_crates", 1018),
+    // Removing the retired ptrace reference run's evidence types
+    // (https://github.com/rrnewton/hermit/issues/3301) deletes nine
+    // hermit-manifest-plan tests and adds two: backend_parity::tests (5, with
+    // backend_parity.rs) and ledger::schema10::tests::{
+    // reference_refusal_and_cross_divergence_never_change_the_candidate_verdict,
+    // parity_attempt_decoder_requires_every_nullable_key_and_binds_raw_reports,
+    // plans_retained_before_issue_3301_still_verify_their_parity_relations,
+    // legacy_reference_failure_and_unavailable_cross_comparison_remain_visible}
+    // go; ledger::schema10::tests::{
+    // retired_backend_parity_evidence_is_refused_and_its_absence_accepted,
+    // a_row_retained_with_the_retired_reference_run_is_excluded} come; and
+    // cpu_evidence::tests::role_references_are_local_ordered_and_not_numeric_pid_identity
+    // is renamed role_order_follows_preparation_and_timeouts_and_refuses_the_retired_reference.
+    // `cargo nextest list --profile ci -p hermit-manifest-plan`: 737 -> 730,
+    // so 1018 - 7 = 1011.
+    ("test.regular_crates", 1011),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2540,7 +2555,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two in-guest-trap tests: 1013.
     // And the same in-guest CPUID-faulting test: 1014.
     // And the same shared standalone population test: 1018.
-    ("test.regular_crates_on_host", 1018),
+    // Less the same seven retired-parity tests: 1011.
+    ("test.regular_crates_on_host", 1011),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

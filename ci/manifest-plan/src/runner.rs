@@ -32,7 +32,6 @@ use serde_json::Value as JsonValue;
 use sha2::Digest;
 use sha2::Sha256;
 
-use crate::backend_parity::BackendParityReport;
 use crate::canonical_verdict::InfrastructureError;
 use crate::canonical_verdict::Verdict;
 pub use crate::canonical_verdict::VerificationReport;
@@ -2630,11 +2629,6 @@ pub struct CellResult {
     pub execution_path: Option<JsonValue>,
     pub diversity: Option<JsonValue>,
     pub attempts: Vec<AttemptResult>,
-    /// Strict ptrace-reference comparison produced in this cell, when
-    /// explicitly requested by the runner. Same-backend verification evidence
-    /// remains in `attempts`; this field is the separate cross-backend fact.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub backend_parity: Option<BackendParityReport>,
     /// Cell-level divergence position: the FIRST attempt that located one.
     ///
     /// This mirrors `reason` exactly, which is also
@@ -2725,16 +2719,11 @@ impl CellResult {
                 &attempt.env,
             )?;
         }
-        observations.require_passing_prerequisites(self.attempts.iter().map(|attempt| {
-            (
-                attempt.index.as_str(),
-                attempt.outcome == "PASS"
-                    && attempt.status == Some(0)
-                    && attempt.signal.is_none()
-                    && !attempt.timed_out,
-                Some(attempt.timed_out),
-            )
-        }))?;
+        observations.require_timeout_prerequisites(
+            self.attempts
+                .iter()
+                .map(|attempt| (attempt.index.as_str(), Some(attempt.timed_out))),
+        )?;
         Ok(())
     }
 
@@ -7459,7 +7448,6 @@ fn run_cell_inner(
             )
         }),
         attempts: std::mem::take(attempts),
-        backend_parity: None,
         first_divergent_scheduler_turn,
         first_divergent_virtual_nanoseconds,
         first_divergent_record,
@@ -7530,7 +7518,6 @@ pub fn infrastructure_error_result(
         execution_path: None,
         diversity: None,
         attempts: Vec::new(),
-        backend_parity: None,
         // No attempt ran, so there is no divergence position to report. `None`
         // here means "never measured", which is the same value a clean run
         // produces -- see the note in the observation fold about those two
@@ -7607,7 +7594,6 @@ pub fn host_inapplicable_result(
         execution_path: None,
         diversity: None,
         attempts: Vec::new(),
-        backend_parity: None,
         first_divergent_scheduler_turn: None,
         first_divergent_virtual_nanoseconds: None,
         first_divergent_record: None,
@@ -16212,7 +16198,6 @@ backends_disabled:
             execution_path: None,
             diversity: None,
             attempts: vec![attempt_with_sabre_evidence("evidence")],
-            backend_parity: None,
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
@@ -17210,7 +17195,6 @@ exit "$(cat "$PWD/exit-status")"
             assert_eq!(result.result, Some(ObservedResult::Pass), "{backend}");
             assert_eq!(result.failure_class, None, "{backend}");
             assert_eq!(result.error_kind, None, "{backend}");
-            assert!(result.backend_parity.is_none(), "{backend}");
             assert!(!retained_parity_report, "{backend}");
             assert_eq!(result.attempts.len(), 1, "{backend}");
             assert_eq!(result.attempts[0].index, "1", "{backend}");
@@ -17259,7 +17243,6 @@ exit "$(cat "$PWD/exit-status")"
                 "{backend}"
             );
             assert_eq!(result.error_kind, None, "{backend}");
-            assert!(result.backend_parity.is_none(), "{backend}");
             assert!(!retained_parity_report, "{backend}");
             assert_eq!(result.attempts.len(), 1, "{backend}");
             assert_eq!(

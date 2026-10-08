@@ -1,4 +1,6 @@
 use super::*;
+use crate::canonical_verdict::Verdict;
+use crate::canonical_verdict::VerificationReport;
 
 fn retain_fixture(name: &str, row: &HistoryRow, plan: &[u8], cells: &[u8], tests: &[u8]) {
     use std::io::Write;
@@ -41,83 +43,111 @@ fn identity() -> CellIdentity {
     }
 }
 
-// These are synthetic parser controls, not guest measurements. The existing
-// typed parity fixture supplies complete strict reports and comparison fields.
-fn attempt(backend: &str, index: &str, report: &VerificationReport) -> ParityAttempt {
-    let raw = serde_json::to_string(report).unwrap();
-    ParityAttempt(AttemptResult {
-        index: index.into(),
-        outcome: "PASS".into(),
-        error_kind: None,
-        status: Some(0),
+/// The `e2e.manifest_backend_parity_c_on_host` command exactly as the last
+/// generator that declared it wrote it: retained bytes, not a derivation.
+const RETAINED_HOSTED_SELECTOR: &str = r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --results "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/junit.xml""########;
+
+/// A strict canonical verify report for one synthetic run pair. A parser
+/// control, not a guest measurement.
+fn canonical_report(verdict: Verdict) -> VerificationReport {
+    use crate::canonical_verdict::ComparedLogMessages;
+    use crate::canonical_verdict::ComparedLogScope;
+    use crate::canonical_verdict::ComparedOutput;
+    use crate::canonical_verdict::ComparedOutputs;
+    use crate::canonical_verdict::ComparisonReport;
+    use crate::canonical_verdict::LogCompareStrictness;
+    use crate::canonical_verdict::RecordEnvelopeReport;
+    let output = ComparedOutput {
+        exit_code: Some(0),
         signal: None,
-        timed_out: false,
-        duration_ms: 1,
-        cpu_usage_usec: Some(1),
-        observation_sha256: None,
-        argv: vec![
-            "/synthetic/fixture/hermit".into(),
-            "--backend".into(),
-            backend.into(),
-            "run".into(),
-            "--strict".into(),
-            "--verify".into(),
-            "--verify-strict".into(),
-            "--".into(),
-            "/synthetic/fixture/guest".into(),
-        ],
-        guest_argv: vec!["/synthetic/fixture/guest".into()],
-        env: BTreeMap::new(),
-        cwd: "/synthetic/fixture/work".into(),
-        shell_command: "/synthetic/fixture/hermit run a synthetic fixture".into(),
-        stdout: "fixture output".into(),
-        stderr: String::new(),
-        verification_report_sha256: Some(hex_digest(raw.as_bytes())),
-        verification_report: Some(raw),
-        runtime: report.runtime.clone(),
-        first_divergent_scheduler_turn: report.first_divergent_scheduler_turn,
-        first_divergent_virtual_nanoseconds: report.first_divergent_virtual_nanoseconds,
-        first_divergent_record: report.first_divergent_record,
-        first_divergent_syscall: report.first_divergent_syscall,
-        first_divergent_left_message: report.first_divergent_left_message.clone(),
-        first_divergent_right_message: report.first_divergent_right_message.clone(),
-        sabre_path_evidence: None,
-        sabre_path_evidence_sha256: None,
-        reason: None,
-    })
-}
-
-fn completed(number: u64, verdict: BackendParityVerdict) -> BackendParityCellAttempt {
-    let report = crate::backend_parity::tests::report(verdict);
-    BackendParityCellAttempt::Completed {
-        attempt: number,
-        candidate_attempt: attempt("kvm", "1", &report.candidate.verification),
-        reference_attempt: attempt("ptrace", "parity-reference", &report.reference.verification),
-        report: Box::new(report),
+        stdout_sha256: "a".repeat(64),
+        stdout_bytes: 4,
+        stderr_sha256: "d".repeat(64),
+        stderr_bytes: 0,
+    };
+    let matched = verdict == Verdict::Matched;
+    VerificationReport {
+        verified: matched,
+        bitwise_parity: matched,
+        verdict,
+        no_result_reason: None,
+        infrastructure_error: None,
+        comparison: Some(ComparisonReport {
+            strictness: LogCompareStrictness::Canonical,
+            display_name: Some("BitwiseInfoV1".into()),
+            compare_logs: true,
+            compare_io_buffers: Some(true),
+            log_scope: Some(ComparedLogScope::Info),
+            record_envelope: RecordEnvelopeReport::AllRecordsV1,
+            virtualize_time: Some(true),
+            strip_lines: Some(false),
+            canonicalize_addresses: Some(true),
+            full_trace: Some(true),
+            exact_remainder: Some(true),
+            stripped_prefixes: Some(vec!["real-wall-clock-prefix/v1".into()]),
+            canonicalizations: Some(vec!["host-address-to-first-appearance-ordinal/v1".into()]),
+            ignore_lines: Some(false),
+            skip_commit: Some(false),
+            skip_detlog: Some(false),
+        }),
+        compared_log_messages: Some(ComparedLogMessages { left: 2, right: 2 }),
+        compared_outputs: Some(ComparedOutputs {
+            left: output.clone(),
+            right: output,
+        }),
+        dbt_counted_branches: None,
+        runtime: None,
+        guest_exit_code: Some(0),
+        guest_signal: None,
+        first_divergent_scheduler_turn: None,
+        first_divergent_virtual_nanoseconds: None,
+        first_divergent_record: (!matched).then_some(1),
+        first_divergent_syscall: None,
+        first_divergent_left_message: None,
+        first_divergent_right_message: None,
+        exact_branch_counter: None,
     }
 }
 
-fn parity(attempts: Vec<BackendParityCellAttempt>) -> CellBackendParity {
-    CellBackendParity {
-        reference_backend: "ptrace".into(),
-        record_envelope: RecordEnvelopePolicy::CrossBackendDetcoreV1,
-        attempts,
-    }
+/// The verdict the ledger derives for a strict canonical verify cell.
+fn canonical_verdict(verdict: Verdict) -> CellVerdict {
+    let report = serde_json::to_string(&canonical_report(verdict)).unwrap();
+    super::super::cell_verdict_from_source(&serde_json::json!({
+        "mode": "verify",
+        "outcome": if verdict == Verdict::Matched { "PASS" } else { "FAIL" },
+        "relaxations": [],
+        "attempts": [{
+            "verification_report_sha256": hex_digest(report.as_bytes()),
+            "verification_report": report,
+        }],
+    }))
+    .unwrap()
 }
 
-fn fixture(parity: CellBackendParity) -> (HistoryRow, Vec<u8>, Vec<u8>, Vec<u8>) {
-    fixture_with_path(parity, ValidatePath::Full)
+/// One matched ordinary verify cell, through the same artifact, summary and
+/// plan shapes the producer writes.
+fn fixture() -> (HistoryRow, Vec<u8>, Vec<u8>, Vec<u8>) {
+    fixture_with_path(ValidatePath::Full)
 }
 
-fn fixture_with_path(
-    parity: CellBackendParity,
+fn fixture_with_path(path: ValidatePath) -> (HistoryRow, Vec<u8>, Vec<u8>, Vec<u8>) {
+    ordinary_fixture_with_path(canonical_verdict(Verdict::Matched), path)
+}
+
+/// One ordinary verify cell with `verdict`.
+fn ordinary_fixture(verdict: CellVerdict) -> (HistoryRow, Vec<u8>, Vec<u8>, Vec<u8>) {
+    ordinary_fixture_with_path(verdict, ValidatePath::Full)
+}
+
+fn ordinary_fixture_with_path(
+    verdict: CellVerdict,
     path: ValidatePath,
 ) -> (HistoryRow, Vec<u8>, Vec<u8>, Vec<u8>) {
     let id = identity();
     let tag = "e2e.manifest_backend_parity_c_on_host";
     let cfg = dag_from_json(&serde_json::json!({ "steps": [{
         "group": "e2e", "job": "manifest_backend_parity_c_on_host",
-        "cmd": crate::backend_parity_policy::HOSTED_PARITY_COMMAND,
+        "cmd": RETAINED_HOSTED_SELECTOR,
         "manifest": {"lane":"portable", "category":"backend-parity-c"},
         "result_manifests": [
             {"lane":id.lane, "category":id.category, "test":id.test, "mode":id.mode, "backend":id.backend},
@@ -143,9 +173,9 @@ fn fixture_with_path(
         test: id.test.clone(),
         mode: id.mode.clone(),
         backend: id.backend.clone(),
-        cell_verdict: parity.candidate_verdict(&id).unwrap(),
-        selected_attempt: Some(parity.candidate_attempt_number(&id).unwrap()),
-        backend_parity: RequiredNullable::Value(parity),
+        cell_verdict: verdict,
+        selected_attempt: Some(1),
+        backend_parity: RetiredBackendParity,
     };
     let mut cell_row = serde_json::to_value(&cell).unwrap();
     cell_row["run_id"] = Value::String(run_id.clone());
@@ -170,7 +200,7 @@ fn fixture_with_path(
             row_count: 1,
         },
         selected,
-        selected_backend_parity: vec![BackendParityRelation::ptrace(id)],
+        selected_backend_parity: RetiredParityPopulation,
         cells: vec![cell.summary(&run_id, &hermit_sha).unwrap()],
     };
     let test_row = TestResultArtifactRow {
@@ -230,142 +260,62 @@ fn fixture_with_path(
 
 #[test]
 fn exact_artifacts_derive_compact_summaries_and_refuse_independent_mutations() {
-    let (row, plan, cells, tests) =
-        fixture(parity(vec![completed(1, BackendParityVerdict::Matched)]));
+    let (row, plan, cells, tests) = fixture();
     let verified = row
         .verify_schema10_artifact_bytes(&plan, &cells, &tests)
         .unwrap()
         .unwrap();
-    assert!(verified.full_backend_parity && verified.full_test_results);
+    assert!(verified.full_test_results);
     assert_eq!(
         verified.cell_results.binding_contract,
         CellBindingContract::SelectedAttemptV1
     );
     assert_eq!(verified.cell_results.bound_attempts().unwrap().len(), 1);
     retain_fixture("matched", &row, &plan, &cells, &tests);
-    assert_eq!(verified.observations.len(), 3);
-    assert!(verified.missing_cells.is_empty() && verified.missing_backend_parity.is_empty());
-    for role in ["candidate_attempt", "reference_attempt"] {
-        for flag in [
-            "--strict",
-            "--no-rcb-time",
-            "--no-detlog-io-buffers",
-            "--no-virtualize-cpuid",
-            "--no-virtualize-metadata",
-            "--no-virtualize-time",
-            "--no-sequentialize-threads",
-            "--no-deterministic-io",
-            "--no-virtualize-cpuid=true",
-            "--no-unknown-future-policy",
-        ] {
-            let mut cell: Value = serde_json::from_slice(&cells).unwrap();
-            let argv = cell["backend_parity"]["attempts"][0][role]["argv"]
-                .as_array_mut()
-                .unwrap();
-            if flag == "--strict" {
-                let before = argv.len();
-                argv.retain(|arg| arg.as_str() != Some(flag));
-                assert_eq!(before - argv.len(), 1);
-            } else {
-                let separator = argv
-                    .iter()
-                    .position(|arg| arg.as_str() == Some("--"))
-                    .unwrap();
-                argv.insert(separator, Value::String(flag.into()));
-            }
-            let mut changed_cells = serde_json::to_vec(&cell).unwrap();
-            changed_cells.push(b'\n');
-            let mut changed_row = serde_json::to_value(&row).unwrap();
-            changed_row["cell_results"]["artifact"]["sha256"] = hex_digest(&changed_cells).into();
-            let changed_row: HistoryRow = serde_json::from_value(changed_row).unwrap();
-            assert!(
-                changed_row
-                    .verify_schema10_artifact_bytes(&plan, &changed_cells, &tests)
-                    .unwrap_err()
-                    .contains("strict verify role"),
-                "{role} {flag}"
-            );
-        }
-    }
-    // Ordinary-only selection remains valid ordinary evidence, but it is not
-    // a measurement of parity over an empty denominator.
-    let mut ordinary_plan: ConstructedValidationPlanV10 = serde_json::from_slice(&plan).unwrap();
-    let mut cfg = ordinary_plan.constructed_dag().unwrap();
-    cfg.steps[0].cmd = crate::backend_parity_policy::HOSTED_ORDINARY_COMMAND.into();
-    ordinary_plan.dag_json = dag_to_json(&cfg);
-    let ordinary_plan = serde_json::to_vec(&ordinary_plan).unwrap();
-    let mut ordinary_cells: Value = serde_json::from_slice(&cells).unwrap();
-    ordinary_cells["backend_parity"] = Value::Null;
-    let mut ordinary_cells = serde_json::to_vec(&ordinary_cells).unwrap();
-    ordinary_cells.push(b'\n');
-    let mut ordinary_row = serde_json::to_value(&row).unwrap();
-    ordinary_row["cell_results"]["selected_backend_parity"] = serde_json::json!([]);
-    ordinary_row["cell_results"]["cells"][0]["backend_parity"] = Value::Null;
-    ordinary_row["cell_results"]["artifact"]["sha256"] = hex_digest(&ordinary_cells).into();
-    ordinary_row["constructed_plan"]["sha256"] = hex_digest(&ordinary_plan).into();
-    ordinary_row["constructed_plan"]["bytes"] = (ordinary_plan.len() as u64).into();
-    let ordinary_row: HistoryRow = serde_json::from_value(ordinary_row).unwrap();
-    let ordinary = ordinary_row
-        .verify_schema10_artifact_bytes(&ordinary_plan, &ordinary_cells, &tests)
-        .unwrap()
-        .unwrap();
-    assert!(ordinary.cell_results.selected_backend_parity.is_empty());
-    assert!(!ordinary.full_backend_parity);
-    assert!(
-        ordinary.full_test_results
-            && ordinary.missing_cells.is_empty()
-            && ordinary.missing_backend_parity.is_empty()
-    );
-    assert_eq!(ordinary.observations.len(), 1);
+    assert!(verified.missing_cells.is_empty());
+    assert_eq!(verified.observations.len(), 1);
     assert_eq!(
-        ordinary.observations[0].relation,
+        verified.observations[0].relation,
         ComparisonRelationV10::Ordinary
     );
     assert_eq!(
-        ordinary.observations[0].verdict,
+        verified.observations[0].verdict,
         ComparisonObservationVerdictV10::Matched
     );
-    retain_fixture(
-        "ordinary-only",
-        &ordinary_row,
-        &ordinary_plan,
-        &ordinary_cells,
-        &tests,
-    );
-    let compact = serde_json::to_string(&verified.cell_results).unwrap();
-    assert!(!compact.contains("/synthetic/fixture"));
+    // The retired keys are written as the constants every older reader
+    // requires, in both the compact summary and the full artifact.
+    let compact = serde_json::to_value(&verified.cell_results).unwrap();
+    assert_eq!(compact["selected_backend_parity"], serde_json::json!([]));
+    assert_eq!(compact["cells"][0]["backend_parity"], Value::Null);
+    let artifact: Value = serde_json::from_slice(&cells).unwrap();
+    assert_eq!(artifact["backend_parity"], Value::Null);
+    // A summary that differs from the artifact it compacts is refused.
+    let mut value = serde_json::to_value(&row).unwrap();
+    value["cell_results"]["cells"][0]["cell_verdict"] =
+        serde_json::to_value(compact_cell_verdict(&CellVerdict::UnavailableWithReason {
+            comparison_tier: ComparisonTier::DeclaredButUnverifiable,
+            reason: "changed".into(),
+        }))
+        .unwrap();
+    value["cell_results"]["cells"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("evidence_binding");
+    value["cell_results"]["cells"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("selected_attempt");
+    let changed: HistoryRow = serde_json::from_value(value).unwrap();
     assert!(
-        String::from_utf8(cells.clone())
-            .unwrap()
-            .contains("/synthetic/fixture")
+        changed
+            .verify_schema10_artifact_bytes(&plan, &cells, &tests)
+            .unwrap_err()
+            .contains("compact ledger summary")
     );
-    for field in [
-        "candidate_verification_report_sha256",
-        "reference_verification_report_sha256",
-    ] {
-        let mut value = serde_json::to_value(&row).unwrap();
-        value["cell_results"]["cells"][0]["backend_parity"]["attempts"][0][field] =
-            Value::String("f".repeat(64));
-        let changed: HistoryRow = serde_json::from_value(value).unwrap();
-        assert!(
-            changed
-                .verify_schema10_artifact_bytes(&plan, &cells, &tests)
-                .unwrap_err()
-                .contains("compact ledger summary")
-        );
-    }
     let mut changed = plan.clone();
     changed.push(b' ');
     assert!(
         row.verify_schema10_artifact_bytes(&changed, &cells, &tests)
-            .is_err()
-    );
-    let mut value = serde_json::to_value(&row).unwrap();
-    value["cell_results"]["cells"][0]["backend_parity"] = Value::Null;
-    assert!(
-        serde_json::from_value::<HistoryRow>(value)
-            .unwrap()
-            .verify_schema10_artifact_bytes(&plan, &cells, &tests)
             .is_err()
     );
     let mut missing = row.clone();
@@ -382,269 +332,72 @@ fn exact_artifacts_derive_compact_summaries_and_refuse_independent_mutations() {
         .unwrap()
         .unwrap();
     assert_eq!(verified.missing_cells, [identity()]);
-    assert_eq!(
-        verified.missing_backend_parity,
-        [BackendParityRelation::ptrace(identity())]
-    );
-    assert!(!verified.full_backend_parity);
+    assert!(verified.observations.is_empty());
 }
 
+/// Rows written before https://github.com/rrnewton/hermit/issues/3301 removed
+/// the ptrace reference run could carry its cross-backend evidence. No
+/// published ledger row does, but such a row is refused at every boundary
+/// rather than read as ordinary evidence, and the key may also be absent.
 #[test]
-fn reference_refusal_and_cross_divergence_never_change_the_candidate_verdict() {
-    let complete = completed(1, BackendParityVerdict::Matched);
-    let mut reference = complete.reference_attempt().unwrap().clone();
-    reference.0.outcome = "ERROR".into();
-    reference.0.status = Some(7);
-    reference.0.error_kind = Some("incomplete-verification-evidence".into());
-    reference.0.reason = Some("/synthetic/fixture/reference exited before JSON".into());
-    reference.0.verification_report = None;
-    reference.0.verification_report_sha256 = None;
-    let unavailable = BackendParityCellAttempt::UnavailableWithReason {
-        attempt: 1,
-        candidate_attempt: complete.candidate_attempt().clone(),
-        reference_attempt: RequiredNullable::Value(reference.clone()),
-        reason: "/synthetic/fixture/reference did not finish".into(),
-    };
-    let (row, plan, cells, tests) = fixture(parity(vec![unavailable]));
-    let verified = row
-        .verify_schema10_artifact_bytes(&plan, &cells, &tests)
-        .unwrap()
-        .unwrap();
-    assert!(!verified.full_backend_parity);
-    assert_eq!(
-        verified.observations[0].verdict,
-        ComparisonObservationVerdictV10::Matched
-    );
-    assert!(matches!(
-        verified.observations[1].verdict,
-        ComparisonObservationVerdictV10::UnavailableWithReason { .. }
-    ));
-    reference.0.outcome = "PASS".into();
-    assert!(
-        reference
-            .ordinary_verdict("ptrace", "parity-reference")
-            .is_err()
-    );
-    reference.0.outcome = "ERROR".into();
-    reference.0.verification_report_sha256 = Some("a".repeat(64));
-    assert!(
-        reference
-            .ordinary_verdict("ptrace", "parity-reference")
-            .is_err()
-    );
-    let mut divergent_report: VerificationReport = serde_json::from_str(
-        complete
-            .reference_attempt()
+fn retired_backend_parity_evidence_is_refused_and_its_absence_accepted() {
+    let (row, plan, cells, tests) = fixture();
+    let refused = |value: Value| {
+        serde_json::from_value::<HistoryRow>(value)
             .unwrap()
-            .0
-            .verification_report
-            .as_ref()
-            .unwrap(),
-    )
-    .unwrap();
-    divergent_report.verdict = Verdict::Diverged;
-    divergent_report.verified = false;
-    divergent_report.bitwise_parity = false;
-    divergent_report.first_divergent_record = Some(1);
-    let mut divergent_reference = attempt("ptrace", "parity-reference", &divergent_report);
-    divergent_reference.0.outcome = "FAIL".into();
-    divergent_reference.0.status = Some(1);
-    divergent_reference.0.reason = Some("reference strict verification diverged".into());
-    let (row, plan, cells, tests) = fixture(parity(vec![
-        BackendParityCellAttempt::UnavailableWithReason {
-            attempt: 1,
-            candidate_attempt: complete.candidate_attempt().clone(),
-            reference_attempt: RequiredNullable::Value(divergent_reference),
-            reason: "reference strict verification diverged before cross comparison".into(),
-        },
-    ]));
-    let verified = row
-        .verify_schema10_artifact_bytes(&plan, &cells, &tests)
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        verified.observations[0].verdict,
-        ComparisonObservationVerdictV10::Matched
-    );
-    assert_eq!(
-        verified.observations[1].verdict,
-        ComparisonObservationVerdictV10::Diverged
-    );
-    assert!(matches!(
-        verified.observations[2].verdict,
-        ComparisonObservationVerdictV10::UnavailableWithReason { .. }
-    ));
-    assert!(!verified.full_backend_parity);
-    assert!(matches!(
-        verified.cell_results.cells[0].cell_verdict,
-        CellVerdict::ComparedAndMatched { .. }
-    ));
-    retain_fixture("reference-diverged", &row, &plan, &cells, &tests);
-    // Rehash every affected container: the parser must reject the actual
-    // contradictory operand, not merely a stale enclosing digest.
-    for mutation in [
-        "mismatched-output",
-        "invalid-digest",
-        "missing-disposition",
-        "guest-disposition",
-    ] {
-        let mut cell: Value = serde_json::from_slice(&cells).unwrap();
-        let candidate = &mut cell["backend_parity"]["attempts"][0]["candidate_attempt"];
-        let mut report: Value =
-            serde_json::from_str(candidate["verification_report"].as_str().unwrap()).unwrap();
-        match mutation {
-            "mismatched-output" => {
-                report["compared_outputs"]["right"]["stdout_sha256"] = Value::String("f".repeat(64))
-            }
-            "invalid-digest" => {
-                report["compared_outputs"]["left"]["stdout_sha256"] =
-                    Value::String("invalid".into());
-                report["compared_outputs"]["right"]["stdout_sha256"] =
-                    Value::String("invalid".into());
-            }
-            "missing-disposition" => {
-                report["compared_outputs"]["left"]["exit_code"] = Value::Null;
-                report["compared_outputs"]["right"]["exit_code"] = Value::Null;
-            }
-            "guest-disposition" => report["guest_exit_code"] = Value::from(9),
-            _ => unreachable!(),
-        }
-        let raw = serde_json::to_string(&report).unwrap();
-        let digest = hex_digest(raw.as_bytes());
-        candidate["verification_report"] = Value::String(raw);
-        candidate["verification_report_sha256"] = Value::String(digest.clone());
-        let mut changed_cells = serde_json::to_vec(&cell).unwrap();
-        changed_cells.push(b'\n');
-        let mut changed_row = serde_json::to_value(&row).unwrap();
-        changed_row["cell_results"]["cells"][0]["backend_parity"]["attempts"][0]["candidate_verification_report_sha256"] =
-            Value::String(digest);
-        changed_row["cell_results"]["artifact"]["sha256"] =
-            Value::String(hex_digest(&changed_cells));
-        let changed_row: HistoryRow = serde_json::from_value(changed_row).unwrap();
-        assert!(
-            changed_row
-                .verify_schema10_artifact_bytes(&plan, &changed_cells, &tests)
-                .is_err(),
-            "{mutation} became an ordinary match while cross comparison was unavailable"
-        );
-    }
-
-    let (row, plan, cells, tests) = fixture(parity(vec![
-        completed(1, BackendParityVerdict::Diverged),
-        completed(2, BackendParityVerdict::Matched),
-    ]));
-    let verified = row
-        .verify_schema10_artifact_bytes(&plan, &cells, &tests)
-        .unwrap()
-        .unwrap();
-    assert!(!verified.full_backend_parity);
-    assert_eq!(verified.observations.len(), 6);
-    retain_fixture("cross-diverged-then-matched", &row, &plan, &cells, &tests);
-    assert_eq!(
-        verified.observations[2].verdict,
-        ComparisonObservationVerdictV10::Diverged
-    );
-    assert_eq!(
-        verified.observations[5].verdict,
-        ComparisonObservationVerdictV10::Matched
-    );
-    assert!(matches!(
-        verified.cell_results.cells[0].cell_verdict,
-        CellVerdict::ComparedAndMatched { .. }
-    ));
-}
-
-#[test]
-fn parity_attempt_decoder_requires_every_nullable_key_and_binds_raw_reports() {
-    let diversity = br#"{"duration_ms":null,"diversity":{"normalized_entropy":0.5},"env":{"duration_ms":"guest value"},"attempts":[{"duration_ms":1,"env":{"duration_ms":"also a guest value"}}]}"#;
-    assert_eq!(
-        read_schema10_source_result(diversity).unwrap(),
-        serde_json::from_slice::<Value>(diversity).unwrap()
-    );
-    let completed = completed(1, BackendParityVerdict::Matched);
-    let candidate = completed.candidate_attempt();
-    let value = serde_json::to_value(candidate).unwrap();
-    for key in value.as_object().unwrap().keys() {
-        let mut missing = value.clone();
-        missing.as_object_mut().unwrap().remove(key);
-        assert!(
-            serde_json::from_value::<ParityAttempt>(missing).is_err(),
-            "missing {key} was accepted"
-        );
-    }
-    let mut largest_exact = value.clone();
-    largest_exact["duration_ms"] = Value::from(u64::MAX);
-    assert_eq!(
-        read_schema10_source_result(&serde_json::to_vec(&largest_exact).unwrap()).unwrap(),
-        largest_exact
-    );
-    assert_eq!(
-        serde_json::from_value::<ParityAttempt>(largest_exact)
-            .unwrap()
-            .0
-            .duration_ms,
-        u128::from(u64::MAX)
-    );
-    let text = serde_json::to_string(&value).unwrap();
-    for duration in [
-        "18446744073709551616",
-        "340282366920938463463374607431768211455",
-        "1.0",
-        "1e0",
-    ] {
-        let changed = text.replace(
-            "\"duration_ms\":1,",
-            &format!("\"duration_ms\":{duration},"),
-        );
-        assert_ne!(changed, text);
-        assert!(
-            serde_json::from_str::<ParityAttempt>(&changed).is_err(),
-            "duration {duration} was rounded or coerced"
-        );
-        assert!(
-            read_schema10_source_result(changed.as_bytes()).is_err(),
-            "original duration {duration} was rounded before exact decoding"
-        );
-    }
-    let historical = text.replace(
-        "\"duration_ms\":1,",
-        "\"duration_ms\":340282366920938463463374607431768211455,",
-    );
-    assert_eq!(
-        serde_json::from_str::<AttemptResult>(&historical)
-            .unwrap()
-            .duration_ms,
-        u128::MAX
-    );
-    let mut extra = value.clone();
-    extra["unknown"] = Value::Null;
-    assert!(serde_json::from_value::<ParityAttempt>(extra).is_err());
-    let text = serde_json::to_string(&value).unwrap();
-    let duplicate = text.replacen('{', "{\"status\":0,", 1);
-    assert!(serde_json::from_str::<ParityAttempt>(&duplicate).is_err());
-    let mut changed = candidate.clone();
-    changed.0.verification_report.as_mut().unwrap().push(' ');
-    assert!(
-        changed
-            .ordinary_verdict("kvm", "1")
+            .verify_schema10_artifact_bytes(&plan, &cells, &tests)
             .unwrap_err()
-            .contains("SHA256")
+    };
+    let mut value = serde_json::to_value(&row).unwrap();
+    value["cell_results"]["cells"][0]["backend_parity"] = serde_json::json!({"attempts": []});
+    assert!(refused(value).contains("retired backend parity evidence"));
+    let mut value = serde_json::to_value(&row).unwrap();
+    value["cell_results"]["selected_backend_parity"] = serde_json::json!([{
+        "candidate": identity(), "reference_backend": "ptrace",
+        "record_envelope": "cross_backend_detcore_v1"
+    }]);
+    assert!(refused(value).contains("retired backend parity relations"));
+    let mut artifact: Value = serde_json::from_slice(&cells).unwrap();
+    artifact["backend_parity"] = serde_json::json!({"attempts": []});
+    let mut changed_cells = serde_json::to_vec(&artifact).unwrap();
+    changed_cells.push(b'\n');
+    let mut value = serde_json::to_value(&row).unwrap();
+    value["cell_results"]["artifact"]["sha256"] = hex_digest(&changed_cells).into();
+    assert!(
+        serde_json::from_value::<HistoryRow>(value)
+            .unwrap()
+            .verify_schema10_artifact_bytes(&plan, &changed_cells, &tests)
+            .unwrap_err()
+            .contains("retired backend parity evidence")
     );
-    let mut changed = candidate.clone();
-    changed.0.argv.insert(1, "--backend=ptrace".into());
-    assert!(changed.ordinary_verdict("kvm", "1").is_err());
-    let mut changed = completed.clone();
-    if let BackendParityCellAttempt::Completed { report, .. } = &mut changed {
-        report.comparison.inputs = None;
-    }
-    assert!(changed.verdicts(&identity()).is_err());
+    // A row or artifact without the retired keys reads exactly like one
+    // carrying their constants.
+    let mut value = serde_json::to_value(&row).unwrap();
+    value["cell_results"]
+        .as_object_mut()
+        .unwrap()
+        .remove("selected_backend_parity");
+    value["cell_results"]["cells"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("backend_parity");
+    let mut artifact: Value = serde_json::from_slice(&cells).unwrap();
+    artifact.as_object_mut().unwrap().remove("backend_parity");
+    let mut absent_cells = serde_json::to_vec(&artifact).unwrap();
+    absent_cells.push(b'\n');
+    value["cell_results"]["artifact"]["sha256"] = hex_digest(&absent_cells).into();
+    let verified = serde_json::from_value::<HistoryRow>(value)
+        .unwrap()
+        .verify_schema10_artifact_bytes(&plan, &absent_cells, &tests)
+        .unwrap()
+        .unwrap();
+    assert_eq!(verified.observations.len(), 1);
 }
 
 #[test]
 fn retained_plan_refuses_changed_selection_policy_and_test_denominators() {
     generated_plan_populations_preserve_command_policy();
-    let (row, plan, cells, tests) =
-        fixture(parity(vec![completed(1, BackendParityVerdict::Matched)]));
+    let (row, plan, cells, tests) = fixture();
     let original: ConstructedValidationPlanV10 = serde_json::from_slice(&plan).unwrap();
     for mutation in [
         "command",
@@ -657,7 +410,9 @@ fn retained_plan_refuses_changed_selection_policy_and_test_denominators() {
         let mut cfg = plan.constructed_dag().unwrap();
         match mutation {
             "command" => {
-                cfg.steps[0].cmd = cfg.steps[0].cmd.replace("--parity-reference ptrace", "")
+                cfg.steps[0].cmd = cfg.steps[0]
+                    .cmd
+                    .replace(" --results ", " --parity-reference ptrace --results ")
             }
             "owned-population" => cfg.steps[0]
                 .result_manifests
@@ -699,7 +454,7 @@ fn retained_plan_refuses_changed_selection_policy_and_test_denominators() {
         assert!(
             row.verify_schema10_artifact_bytes(&bytes, &cells, &tests)
                 .is_err(),
-            "{mutation} shrank the independently selected population"
+            "{mutation} changed the independently retained plan, yet it verified"
         );
     }
 }
@@ -728,11 +483,6 @@ fn exact_rng_population(cells: &[CellIdentity], count: usize) -> bool {
             .collect::<BTreeSet<_>>()
             == expected
 }
-
-/// The `e2e.manifest_backend_parity_c` command exactly as ci/dag/validate.json
-/// emitted it at 422f3f3a4, before the Buck release-build names were forwarded.
-/// These are retained bytes rather than a derivation from the reader's constants.
-const PRE_RELEASE_ENV_PARITY_COMMAND: &str = r########"./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env CI --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env NEXTEST_TEST_THREADS --env VALIDATE_RUN_STATE -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ "$#" -gt 0 ]; then printf -v hermit_extra '\'' %q'\'' "$@"; hermit_payload+=$hermit_extra; fi && exec bash -c "$hermit_payload"' bash 'export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --parity-reference ptrace --results "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/junit.xml"'"########;
 
 /// The two backend-parity-c selector commands exactly as ci/dag/validate.json
 /// emitted them from e8007f971a72c5fd92fcf3e17e41f38811c3cac3 through
@@ -995,10 +745,6 @@ fn generated_plan_populations_preserve_command_policy() {
     // excluded backend.
     assert!(hosted_cells.len() < portable);
     assert_eq!(current_hosted.planned_cells().unwrap(), hosted_cells);
-    assert_eq!(
-        current_hosted.planned_backend_parity_relations().unwrap(),
-        Vec::new()
-    );
     // A hosted step that keeps the exclusion flag but owns the KVM cells, or
     // drops the flag but still omits them, no longer matches its selector.
     for strip_flag in [false, true] {
@@ -1113,8 +859,8 @@ fn generated_plan_populations_preserve_command_policy() {
             .collect::<Vec<_>>();
         assert_eq!(live_selected.len(), cell_count);
         assert!(exact_rng_population(&live_selected, cell_count));
-        // The live plan reads with every cell and no parity relation, and a
-        // reference flag planted on its c-programs selector is refused.
+        // The live plan reads with every cell, and a reference flag planted on
+        // its c-programs selector is refused.
         let live_plan = ConstructedValidationPlanV10 {
             schema: 1,
             run_id: format!("generated-{label}-live"),
@@ -1125,29 +871,33 @@ fn generated_plan_populations_preserve_command_policy() {
             expected_e2e_plan_json: expected_json.clone(),
         };
         assert_eq!(live_plan.planned_cells().unwrap(), live_selected);
-        assert_eq!(
-            live_plan.planned_backend_parity_relations().unwrap(),
-            Vec::new()
-        );
         let live_tag = tag.replace("backend_parity_c", "c_programs");
-        let mut planted = live.clone();
-        let step = planted
-            .steps
-            .iter_mut()
-            .find(|step| step.tag() == live_tag)
-            .unwrap();
-        assert_eq!(step.cmd.matches("--prebuilt --results").count(), 1);
-        step.cmd = step.cmd.replace(
-            "--prebuilt --results",
-            "--prebuilt --parity-reference ptrace --results",
-        );
+        let plant = |cfg: &DagConfig, tag: &str| {
+            let mut planted = cfg.clone();
+            let step = planted
+                .steps
+                .iter_mut()
+                .find(|step| step.tag() == tag)
+                .unwrap();
+            assert_eq!(step.cmd.matches("--prebuilt --results").count(), 1);
+            step.cmd = step.cmd.replace(
+                "--prebuilt --results",
+                "--prebuilt --parity-reference ptrace --results",
+            );
+            planted
+        };
         let mut planted_plan = live_plan.clone();
-        planted_plan.dag_json = dag_to_json(&planted);
+        planted_plan.dag_json = dag_to_json(&plant(&live, &live_tag));
         assert_eq!(
             planted_plan.planned_cells().unwrap_err(),
-            format!("{live_tag} has unrecognized backend parity policy")
+            format!(
+                "{live_tag} requests the retired ptrace reference run; plans that did are excluded (https://github.com/rrnewton/hermit/issues/3301)"
+            )
         );
 
+        // A plan published before the fold, with its retained selector bytes,
+        // still reads with its original cells. One that also asked for the
+        // reference run is refused.
         let selected = pre_fold_dag(&live, tag, retained_command);
         let expected_selected = pre_fold_cells
             .iter()
@@ -1156,213 +906,41 @@ fn generated_plan_populations_preserve_command_policy() {
             .collect::<Vec<_>>();
         assert_eq!(expected_selected.len(), cell_count);
         assert!(exact_rng_population(&expected_selected, cell_count));
-        for active in [false, true] {
-            let mut cfg = selected.clone();
-            let index = cfg.steps.iter().position(|step| step.tag() == tag).unwrap();
-            assert_eq!(cfg.steps[index].jobs_flag.as_deref(), Some("--jobs"));
-            let command = &mut cfg.steps[index].cmd;
-            assert!(command.matches("--parity-reference ptrace ").count() <= 1);
-            *command = command.replace("--parity-reference ptrace ", "");
-            assert_eq!(command.matches("--prebuilt --results").count(), 1);
-            if active {
-                *command = command.replace(
-                    "--prebuilt --results",
-                    "--prebuilt --parity-reference ptrace --results",
-                );
-            }
-            let plan = ConstructedValidationPlanV10 {
-                schema: 1,
-                run_id: format!(
-                    "generated-{label}-{}",
-                    if active { "parity" } else { "ordinary" }
-                ),
-                hermit_sha: "a".repeat(40),
-                path: ValidatePath::Full,
-                compatibility_selected: true,
-                dag_json: dag_to_json(&cfg),
-                expected_e2e_plan_json: pre_fold_json.clone(),
-            };
-            assert_eq!(plan.planned_cells().unwrap(), expected_selected);
-            if !active {
-                // The retained last-live bytes are the ordinary spelling.
-                assert_eq!(
-                    cfg.steps
-                        .iter()
-                        .filter(|step| step.cmd == retained_command)
-                        .count(),
-                    1
-                );
-            }
-            let expected_relations = expected_selected
+        let plan = ConstructedValidationPlanV10 {
+            schema: 1,
+            run_id: format!("generated-{label}-pre-fold"),
+            hermit_sha: "a".repeat(40),
+            path: ValidatePath::Full,
+            compatibility_selected: true,
+            dag_json: dag_to_json(&selected),
+            expected_e2e_plan_json: pre_fold_json.clone(),
+        };
+        assert_eq!(plan.planned_cells().unwrap(), expected_selected);
+        assert_eq!(
+            selected
+                .steps
                 .iter()
-                .filter(|cell| {
-                    active
-                        && cell.lane == "portable"
-                        && cell.category == "backend-parity-c"
-                        && cell.mode == "verify"
-                        && cell.backend != "ptrace"
-                })
-                .cloned()
-                .map(BackendParityRelation::ptrace)
-                .collect::<Vec<_>>();
-            // How many relations a parity reference plans follows from the
-            // committed plan, so it is not pinned; the plan must plan exactly
-            // these, and some only when its parity reference is active.
-            assert_eq!(expected_relations.is_empty(), !active);
-            assert_eq!(
-                plan.planned_backend_parity_relations().unwrap(),
-                expected_relations
-            );
-            if let Some(destination) = std::env::var_os("HERMIT_SCHEMA10_PLAN_FIXTURE_OUTPUT") {
-                use std::io::Write;
-                let destination = std::path::PathBuf::from(destination);
-                assert!(destination.is_absolute());
-                std::fs::create_dir_all(&destination).unwrap();
-                let state = if active { "parity" } else { "ordinary" };
-                for (suffix, bytes) in [
-                    ("plan.json", serde_json::to_vec(&plan).unwrap()),
-                    (
-                        "populations.json",
-                        serde_json::to_vec(&serde_json::json!({
-                            "cells":expected_selected, "backend_parity":expected_relations
-                        }))
-                        .unwrap(),
-                    ),
-                ] {
-                    let mut output = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(destination.join(format!("{label}-{state}-{suffix}")))
-                        .unwrap();
-                    output.write_all(&bytes).unwrap();
-                }
-            }
-            for mutation in [
-                "prefix",
-                "suffix",
-                "selector",
-                "unknown-node",
-                "raw-command",
-                "legacy-guard",
-                "missing-env",
-                "duplicate-env",
-                "half-release-env",
-                "current-literal-jobs",
-            ] {
-                if (mutation == "unknown-node" && !active)
-                    || (label != "full"
-                        && matches!(
-                            mutation,
-                            "raw-command"
-                                | "legacy-guard"
-                                | "missing-env"
-                                | "duplicate-env"
-                                | "half-release-env"
-                                | "current-literal-jobs"
-                        ))
-                {
-                    continue;
-                }
-                let mut changed = cfg.clone();
-                let step = &mut changed.steps[index];
-                match mutation {
-                    "prefix" => step.cmd.insert_str(0, "true; "),
-                    "suffix" => step.cmd.push_str(" --planted"),
-                    "selector" => step.manifest.as_mut().unwrap().backend = Some("kvm".into()),
-                    "unknown-node" => step.job.push_str("_unknown"),
-                    "raw-command" => {
-                        step.cmd = if active {
-                            crate::backend_parity_policy::PORTABLE_PARITY_COMMAND
-                        } else {
-                            crate::backend_parity_policy::PORTABLE_ORDINARY_COMMAND
-                        }
-                        .to_owned()
-                    }
-                    "legacy-guard" => {
-                        let quote = |value: &str| format!("'{}'", value.replace('\'', r"'\''"));
-                        let current = quote(crate::validation_dag::PINNED_ROOT_COMMAND_GUARD);
-                        let legacy = quote(crate::validation_dag::LEGACY_PINNED_ROOT_COMMAND_GUARD);
-                        assert_eq!(step.cmd.matches(&current).count(), 1);
-                        step.cmd = step.cmd.replace(&current, &legacy);
-                    }
-                    "missing-env" => {
-                        assert_eq!(step.cmd.matches(" --env CI ").count(), 1);
-                        step.cmd = step.cmd.replace(" --env CI ", " ");
-                    }
-                    "duplicate-env" => {
-                        assert_eq!(step.cmd.matches(" --env CI ").count(), 1);
-                        step.cmd = step.cmd.replace(" --env CI ", " --env CI --env CI ");
-                    }
-                    // Only the complete older run is a historical spelling.
-                    "half-release-env" => {
-                        let dotslash = " --env HERMIT_VALIDATE_BUCK_DOTSLASH ";
-                        assert_eq!(step.cmd.matches(dotslash).count(), 1);
-                        step.cmd = step.cmd.replace(dotslash, " ");
-                    }
-                    // The literal worker count predates the release-build names,
-                    // so no generator ever wrote both.
-                    "current-literal-jobs" => {
-                        assert_eq!(step.cmd.matches(" --results ").count(), 1);
-                        step.cmd = step.cmd.replace(" --results ", " --jobs 8 --results ");
-                    }
-                    _ => unreachable!(),
-                }
-                let mut changed_plan = plan.clone();
-                changed_plan.dag_json = dag_to_json(&changed);
-                assert!(
-                    changed_plan.planned_cells().is_err(),
-                    "{label}/{active}/{mutation}"
-                );
-                assert!(
-                    changed_plan.planned_backend_parity_relations().is_err(),
-                    "{label}/{active}/{mutation}"
-                );
-            }
-            // Plans retained before the parity post-pass names or the
-            // release-build names were forwarded must keep reading with the
-            // same cells and parity relations.
-            for (spelling, literal_jobs) in [
-                ("pre-epoch-env", false),
-                ("pre-release-env", false),
-                ("pre-release-env-jobs", true),
-            ] {
-                if label != "full" {
-                    continue;
-                }
-                let mut previous = cfg.clone();
-                let step = &mut previous.steps[index];
-                if spelling == "pre-epoch-env" {
-                    for name in crate::backend_parity_policy::PARITY_POST_PASS_ENV {
-                        let word = format!(" --env {name} ");
-                        assert_eq!(step.cmd.matches(&word).count(), 1, "{name}");
-                        step.cmd = step.cmd.replacen(&word, " ", 1);
-                    }
-                } else {
-                    assert_ne!(step.cmd, PRE_RELEASE_ENV_PARITY_COMMAND);
-                    step.cmd = if active {
-                        PRE_RELEASE_ENV_PARITY_COMMAND.to_owned()
-                    } else {
-                        PRE_RELEASE_ENV_PARITY_COMMAND.replacen("--parity-reference ptrace ", "", 1)
-                    };
-                }
-                if literal_jobs {
-                    assert_eq!(step.cmd.matches(" --results ").count(), 1);
-                    step.cmd = step.cmd.replace(" --results ", " --jobs 8 --results ");
-                }
-                let mut previous_plan = plan.clone();
-                previous_plan.dag_json = dag_to_json(&previous);
-                assert_eq!(
-                    previous_plan.planned_cells().unwrap(),
-                    expected_selected,
-                    "{label}/{active}/{spelling}"
-                );
-                assert_eq!(
-                    previous_plan.planned_backend_parity_relations().unwrap(),
-                    expected_relations,
-                    "{label}/{active}/{spelling}"
-                );
-            }
-        }
+                .filter(|step| step.cmd == retained_command)
+                .count(),
+            1
+        );
+        let mut planted_plan = plan.clone();
+        planted_plan.dag_json = dag_to_json(&plant(&selected, tag));
+        assert!(planted_plan.planned_cells().is_err(), "{label}");
+        // The selector still owns exactly its expected cells.
+        let mut changed = selected.clone();
+        changed
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == tag)
+            .unwrap()
+            .manifest
+            .as_mut()
+            .unwrap()
+            .backend = Some("kvm".into());
+        let mut changed_plan = plan.clone();
+        changed_plan.dag_json = dag_to_json(&changed);
+        assert!(changed_plan.planned_cells().is_err(), "{label}");
     }
 }
 
@@ -1403,10 +981,7 @@ fn selected_only_profiles_keep_schema_and_scope_at_the_verifier_boundary() {
         ValidatePath::OnlyPortable,
         ValidatePath::OnlyHostedPortable,
     ] {
-        let (mut row, plan, cells, tests) = fixture_with_path(
-            parity(vec![completed(1, BackendParityVerdict::Matched)]),
-            path,
-        );
+        let (mut row, plan, cells, tests) = fixture_with_path(path);
         row.selection_mode = Some("only".into());
         row.full_coverage = Some(false);
         row.verify_schema10_artifact_bytes(&plan, &cells, &tests)
@@ -1447,18 +1022,15 @@ fn selected_only_profiles_keep_schema_and_scope_at_the_verifier_boundary() {
 #[test]
 fn focused_artifacts_require_the_same_profile_at_every_identity_boundary() {
     let path = serde_json::from_value::<ValidatePath>("cell-requalification".into()).unwrap();
-    let (mut row, plan, cells, tests) = fixture_with_path(
-        parity(vec![completed(1, BackendParityVerdict::Matched)]),
-        path,
-    );
+    let (mut row, plan, cells, tests) = fixture_with_path(path);
     row.selection_mode = Some("targeted".into());
     let verified = row
         .verify_schema10_artifact_bytes(&plan, &cells, &tests)
         .unwrap()
         .unwrap();
-    assert!(verified.full_backend_parity && verified.full_test_results);
-    assert_eq!(verified.observations.len(), 3);
-    assert!(verified.missing_cells.is_empty() && verified.missing_backend_parity.is_empty());
+    assert!(verified.full_test_results);
+    assert_eq!(verified.observations.len(), 1);
+    assert!(verified.missing_cells.is_empty());
     assert_eq!(row.profile.as_deref(), Some("cell-requalification"));
     retain_fixture("matched-requalification", &row, &plan, &cells, &tests);
 
@@ -1522,8 +1094,7 @@ fn focused_artifacts_require_the_same_profile_at_every_identity_boundary() {
 /// guard compares against that instead of against the binding itself.
 #[test]
 fn the_live_row_decode_refuses_a_compared_verdict_whose_binding_is_inconsistent() {
-    let (row, _plan, _cells, _tests) =
-        fixture(parity(vec![completed(1, BackendParityVerdict::Matched)]));
+    let (row, _plan, _cells, _tests) = fixture();
 
     // Control: the untouched fixture decodes and really does carry a compared
     // verdict with a binding and a recorded ordinal.
@@ -1691,7 +1262,8 @@ fn decode_cell_evidence(value: Value) -> Result<CellResultsEvidenceV10, String> 
 
 #[test]
 fn exact_legacy_artifacts_remain_authenticated_without_inferred_bindings() {
-    for name in ["ordinary-only", "reference-diverged"] {
+    {
+        let name = "ordinary-only";
         let (row, plan, cells, tests) = legacy_fixture(name);
         let original = serde_json::to_value(row.cell_results.as_ref().unwrap()).unwrap();
         let verified = row
@@ -1737,9 +1309,7 @@ fn exact_legacy_artifacts_remain_authenticated_without_inferred_bindings() {
         );
         assert!(verified.full_test_results);
         assert!(verified.missing_cells.is_empty());
-        assert!(verified.missing_backend_parity.is_empty());
         assert!(verified.missing_test_producers.is_empty());
-        assert!(!verified.full_backend_parity);
         assert_eq!(verified.test_results.totals.executed_tests, 1);
         assert_eq!(verified.test_results.totals.passed_tests, 1);
         assert_eq!(verified.test_results.totals.failed_tests, 0);
@@ -1752,32 +1322,27 @@ fn exact_legacy_artifacts_remain_authenticated_without_inferred_bindings() {
                 .unwrap_err()
                 .contains("legacy-unbound")
         );
-        if name == "ordinary-only" {
-            assert!(evidence.selected_backend_parity.is_empty());
-            assert_eq!(verified.observations.len(), 1);
-            let observation = &verified.observations[0];
-            assert_eq!(observation.identity, identity());
-            assert_eq!(observation.relation, ComparisonRelationV10::Ordinary);
-            assert_eq!(observation.outer_attempt, None);
-            assert_eq!(
-                observation.verdict,
-                ComparisonObservationVerdictV10::Matched
-            );
-        }
+        assert_eq!(verified.observations.len(), 1);
+        let observation = &verified.observations[0];
+        assert_eq!(observation.identity, identity());
+        assert_eq!(observation.relation, ComparisonRelationV10::Ordinary);
+        assert_eq!(observation.outer_attempt, None);
+        assert_eq!(
+            observation.verdict,
+            ComparisonObservationVerdictV10::Matched
+        );
     }
 }
 
-/// https://github.com/rrnewton/hermit/issues/3301 removed `--parity-reference`
-/// from every newly generated plan. A plan retained before that change keeps
-/// verifying with the parity relations it was published with, both at the last
-/// parity spelling the generator emitted and as the preserved legacy producer
-/// export.
+/// https://github.com/rrnewton/hermit/issues/3301 removed the ptrace
+/// reference run. The live graph neither declares the folded backend-parity-c
+/// selectors nor asks for the run, and the exact bytes a producer exported
+/// with that run's cross-backend evidence are now refused, at the plan and at
+/// the row, rather than read as ordinary evidence. No published ledger row
+/// carried such evidence, so the refusal excludes none.
 #[test]
-fn plans_retained_before_issue_3301_still_verify_their_parity_relations() {
+fn a_row_retained_with_the_retired_reference_run_is_excluded() {
     let generated = generated_validation_dag();
-    // Slice S6 of https://github.com/rrnewton/hermit/issues/3301 then folded
-    // the two parity selectors into the c-programs pair, which selects no
-    // parity relation.
     for (retired, live) in [
         ("e2e.manifest_backend_parity_c", "e2e.manifest_c_programs"),
         (
@@ -1792,141 +1357,23 @@ fn plans_retained_before_issue_3301_still_verify_their_parity_relations() {
             .find(|step| step.tag() == live)
             .unwrap();
         assert!(!step.cmd.contains("--parity-reference"), "{live}");
-        assert!(
-            !crate::backend_parity_policy::selects_ptrace_parity(step).unwrap(),
-            "{live}"
-        );
     }
-    // The last hosted command a generator emitted is the last parity spelling
-    // minus exactly the removed flag, so a plan carrying that spelling is a
-    // pre-change plan. The last portable command is the reader's ordinary
-    // spelling under today's pinned-root wrapper.
-    assert_eq!(
-        LAST_LIVE_HOSTED_PARITY_SELECTOR,
-        crate::backend_parity_policy::HOSTED_ORDINARY_COMMAND
-    );
-    assert_eq!(
-        crate::backend_parity_policy::HOSTED_PARITY_COMMAND.replacen(
-            " --parity-reference ptrace",
-            "",
-            1
-        ),
-        LAST_LIVE_HOSTED_PARITY_SELECTOR
-    );
-    assert_eq!(
-        crate::validation_dag::refresh_pinned_root_environment(
-            "e2e.manifest_backend_parity_c",
-            crate::backend_parity_policy::PORTABLE_ORDINARY_COMMAND
-        )
-        .unwrap(),
-        LAST_LIVE_PORTABLE_PARITY_SELECTOR
-    );
-    let relation = vec![BackendParityRelation::ptrace(identity())];
-
-    let (row, plan, cells, tests) =
-        fixture(parity(vec![completed(1, BackendParityVerdict::Matched)]));
-    let retained: ConstructedValidationPlanV10 = serde_json::from_slice(&plan).unwrap();
-    assert_eq!(
-        retained.constructed_dag().unwrap().steps[0].cmd,
-        crate::backend_parity_policy::HOSTED_PARITY_COMMAND
-    );
-    assert_eq!(
-        retained.planned_backend_parity_relations().unwrap(),
-        relation
-    );
-    let verified = row
-        .verify_schema10_artifact_bytes(&plan, &cells, &tests)
-        .unwrap()
-        .unwrap();
-    assert!(verified.full_backend_parity && verified.full_test_results);
-    assert_eq!(verified.cell_results.selected_backend_parity, relation);
-    assert!(verified.missing_backend_parity.is_empty());
-
-    // Exact bytes a producer exported before the change, in the older
-    // literal-worker-count spelling, read the same way.
     let (row, plan, cells, tests) = legacy_fixture("reference-diverged");
     let retained: ConstructedValidationPlanV10 = serde_json::from_slice(&plan).unwrap();
     assert!(
-        retained.constructed_dag().unwrap().steps[0]
-            .cmd
-            .contains("--prebuilt --parity-reference ptrace --jobs 8 --results")
+        retained
+            .planned_cells()
+            .unwrap_err()
+            .contains("requests the retired ptrace reference run")
     );
-    assert_eq!(
-        retained.planned_backend_parity_relations().unwrap(),
-        relation
+    assert!(
+        row.schema10_cell_results()
+            .unwrap_err()
+            .contains("retired backend parity")
     );
-    let verified = row
-        .verify_schema10_artifact_bytes(&plan, &cells, &tests)
-        .unwrap()
-        .unwrap();
-    assert_eq!(verified.cell_results.selected_backend_parity, relation);
-}
-
-#[test]
-fn legacy_reference_failure_and_unavailable_cross_comparison_remain_visible() {
-    let (row, plan, cells, tests) = legacy_fixture("reference-diverged");
-    let verified = row
-        .verify_schema10_artifact_bytes(&plan, &cells, &tests)
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        verified.cell_results.binding_contract,
-        CellBindingContract::LegacyUnbound
-    );
-    assert_eq!(verified.cell_results.selected_backend_parity.len(), 1);
-    assert_eq!(verified.observations.len(), 3);
-    assert!(!verified.full_backend_parity);
-    let mut reference = identity();
-    reference.backend = "ptrace".into();
-    let expected_relations = [
-        (identity(), ComparisonRelationV10::Ordinary),
-        (
-            reference,
-            ComparisonRelationV10::Reference {
-                candidate: identity(),
-            },
-        ),
-        (
-            identity(),
-            ComparisonRelationV10::BackendParity {
-                reference_backend: "ptrace".into(),
-                record_envelope: RecordEnvelopePolicy::CrossBackendDetcoreV1,
-            },
-        ),
-    ];
-    for ((identity, relation), observation) in expected_relations.iter().zip(&verified.observations)
-    {
-        assert_eq!(&observation.identity, identity);
-        assert_eq!(&observation.relation, relation);
-        assert_eq!(observation.outer_attempt, Some(1));
-    }
-    assert_eq!(
-        verified.observations[0].verdict,
-        ComparisonObservationVerdictV10::Matched
-    );
-    assert_eq!(
-        verified.observations[1].verdict,
-        ComparisonObservationVerdictV10::Diverged
-    );
-    assert_eq!(
-        verified.observations[2].verdict,
-        ComparisonObservationVerdictV10::UnavailableWithReason {
-            reason: "Cross-backend comparison unavailable; exact detail is retained in the cell artifact".into(),
-        }
-    );
-    let full_cells = verified
-        .cell_results
-        .verify_cell_artifact_bytes(&cells)
-        .unwrap();
-    let RequiredNullable::Value(parity) = &full_cells[0].backend_parity else {
-        panic!("the old artifact lost its parity evidence");
-    };
-    let BackendParityCellAttempt::UnavailableWithReason { reason, .. } = &parity.attempts[0] else {
-        panic!("the old artifact lost its unavailable attempt");
-    };
-    assert_eq!(
-        reason,
-        "reference strict verification diverged before cross comparison"
+    assert!(
+        row.verify_schema10_artifact_bytes(&plan, &cells, &tests)
+            .is_err()
     );
 }
 
@@ -2028,8 +1475,7 @@ fn legacy_artifact_shape_refuses_new_keys_even_after_rehashing() {
 
 #[test]
 fn removing_a_binding_contract_cannot_retain_bound_comparison_authority() {
-    let (row, plan, cells, tests) =
-        fixture(parity(vec![completed(1, BackendParityVerdict::Matched)]));
+    let (row, plan, cells, tests) = fixture();
     let verified = row
         .verify_schema10_artifact_bytes(&plan, &cells, &tests)
         .unwrap()
@@ -2143,8 +1589,7 @@ fn raw_history_rows_refuse_duplicate_binding_contract_markers() {
             future
         );
     }
-    let (row, plan, cells, tests) =
-        fixture(parity(vec![completed(1, BackendParityVerdict::Matched)]));
+    let (row, plan, cells, tests) = fixture();
     let raw = serde_json::to_string(&row).unwrap();
     let needle = "\"binding_contract\":1";
     assert_eq!(raw.matches(needle).count(), 1);
@@ -2181,8 +1626,7 @@ fn raw_history_rows_refuse_duplicate_binding_contract_markers() {
 
 #[test]
 fn cpu_history_is_authenticated_without_changing_compact_verdicts() {
-    let (row, plan, original, tests) =
-        fixture(parity(vec![completed(1, BackendParityVerdict::Matched)]));
+    let (row, plan, original, tests) = fixture();
     row.verify_schema10_artifact_bytes(&plan, &original, &tests)
         .unwrap()
         .unwrap();
@@ -2215,9 +1659,12 @@ fn cpu_history_is_authenticated_without_changing_compact_verdicts() {
     ] {
         source[key] = original_value[key].clone();
     }
-    let operands = &original_value["backend_parity"]["attempts"][0];
-    source["attempts"] =
-        serde_json::json!([operands["candidate_attempt"], operands["reference_attempt"]]);
+    source["attempts"] = serde_json::json!([{
+        "index": "1",
+        "argv": ["/synthetic/fixture/hermit", "--backend", "kvm", "run"],
+        "cwd": "/synthetic/fixture/work",
+        "env": {},
+    }]);
     let observations = crate::cpu_evidence::tests::envelope(&source);
     let history = serde_json::json!({"version":1,"attempts":[{"state":"recorded","outer_attempt":1,"observations":observations}]});
     let check = |value: &Value| {
@@ -2246,44 +1693,14 @@ fn cpu_history_is_authenticated_without_changing_compact_verdicts() {
             "/cpu_observation_history/attempts/0/outer_attempt",
             serde_json::json!(2),
         ),
-        (
-            "/cpu_observation_history/attempts/0/observations/invocations/0/command/argv",
-            serde_json::json!(["foreign"]),
-        ),
     ] {
         let mut bad = supplied.clone();
         *bad.pointer_mut(pointer).unwrap() = value;
         assert!(check(&bad).is_err(), "{pointer}");
     }
-    let mut missing = supplied.clone();
-    missing["cpu_observation_history"]["attempts"][0]["observations"]["invocations"] =
-        serde_json::json!([]);
-    assert!(check(&missing).is_err());
     let mut unknown = supplied.clone();
     unknown["cpu_observation_history"]["future"] = Value::Bool(true);
     assert!(check(&unknown).is_err());
-    // The authenticated artifact retains typed parity attempts. Intrinsically
-    // valid CPU evidence must still agree with their actual timeout flags.
-    let mut contradicted = supplied.clone();
-    let reference = &mut contradicted["cpu_observation_history"]["attempts"][0]["observations"]["invocations"]
-        [1];
-    reference["termination"] = serde_json::json!("final_wait_cpu_budget_return");
-    reference["live"] = serde_json::json!({"state":"enabled","source":"agent_utils_paired_pidfd_stat_v1","registration":{"state":"unavailable","reason":"synthetic refusal"},"polls":0,"source_sample_calls":0,"valid_polls":0,"unavailable_polls":0,"first":null,"last":null,"high_water":null,"timeout_trigger":null,"last_error":null});
-    let intrinsic: crate::cpu_evidence::CellCpuObservationsV1 = serde_json::from_value(
-        contradicted["cpu_observation_history"]["attempts"][0]["observations"].clone(),
-    )
-    .unwrap();
-    intrinsic.validate().unwrap();
-    assert!(
-        check(&contradicted)
-            .unwrap_err()
-            .contains("retained timed_out")
-    );
-    contradicted
-        .as_object_mut()
-        .unwrap()
-        .remove("cpu_observation_history");
-    assert!(check(&contradicted).is_ok());
     // Legacy absence stays exact; removing its binding contract cannot admit a new field.
     let mut legacy = original_value.clone();
     legacy.as_object_mut().unwrap().remove("selected_attempt");
@@ -2483,8 +1900,7 @@ fn finalized_raw_verifier_keeps_complete_census_and_error_refusals() {
 
 #[test]
 fn finalized_raw_verifier_checks_recorded_population_selected_attempt_and_all_artifacts() {
-    let (mut row, plan, cells, tests) =
-        fixture(parity(vec![completed(1, BackendParityVerdict::Matched)]));
+    let (mut row, plan, cells, tests) = fixture();
     let inputs = finalized_raw_inputs(&mut row, &[1, 2]);
     assert!(
         !row.verify_finalized_raw_input_bytes(
@@ -2544,8 +1960,7 @@ fn finalized_raw_verifier_checks_recorded_population_selected_attempt_and_all_ar
 
 #[test]
 fn finalized_raw_verifier_requires_full_zero_selection_not_merely_an_empty_census() {
-    let (row, plan, _, test_bytes) =
-        fixture(parity(vec![completed(1, BackendParityVerdict::Matched)]));
+    let (row, plan, _, test_bytes) = fixture();
     let mut plan: ConstructedValidationPlanV10 = serde_json::from_slice(&plan).unwrap();
     let cfg = dag_from_json(r#"{"steps":[{"group":"test","job":"fixture","cmd":"true","result_manifests":[{"kind":"structured-test-results","schema":2,"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.fixture"}]}]}"#).unwrap();
     plan.dag_json = dag_to_json(&cfg);
@@ -2607,8 +2022,7 @@ fn finalized_raw_verifier_requires_full_zero_selection_not_merely_an_empty_censu
             .unwrap_err(),
         "schema 10 row omitted test_results"
     );
-    let (selected_row, selected_plan, _, selected_tests) =
-        fixture(parity(vec![completed(1, BackendParityVerdict::Matched)]));
+    let (selected_row, selected_plan, _, selected_tests) = fixture();
     let mut selected_row = serde_json::to_value(selected_row).unwrap();
     // Keep the genuine nonzero plan/selection while recording no cell rows.
     // Full test evidence is present, so this reaches the selected-zero guard.
@@ -2656,46 +2070,6 @@ fn finalized_raw_verifier_requires_full_zero_selection_not_merely_an_empty_censu
             .is_err(),
         "missing selected test work cannot become zero selection"
     );
-}
-
-/// One ordinary (non-parity) verify cell with `verdict`, through the same
-/// artifact, summary and plan shapes the producer writes.
-fn ordinary_fixture(verdict: CellVerdict) -> (HistoryRow, Vec<u8>, Vec<u8>, Vec<u8>) {
-    let (row, plan, cells, tests) =
-        fixture(parity(vec![completed(1, BackendParityVerdict::Matched)]));
-    let mut plan: ConstructedValidationPlanV10 = serde_json::from_slice(&plan).unwrap();
-    let mut cfg = plan.constructed_dag().unwrap();
-    cfg.steps[0].cmd = crate::backend_parity_policy::HOSTED_ORDINARY_COMMAND.into();
-    plan.dag_json = dag_to_json(&cfg);
-    let plan = serde_json::to_vec(&plan).unwrap();
-    let mut cell: CellArtifactResultV10 = {
-        let mut value: Value = serde_json::from_slice(&cells).unwrap();
-        for field in ["run_id", "hermit_sha", "source_tree_dirty"] {
-            value.as_object_mut().unwrap().remove(field);
-        }
-        serde_json::from_value(value).unwrap()
-    };
-    cell.backend_parity = RequiredNullable::Null;
-    cell.cell_verdict = verdict;
-    let mut cell_row = serde_json::to_value(&cell).unwrap();
-    cell_row["run_id"] = Value::String("fixture-v10".into());
-    cell_row["hermit_sha"] = Value::String("a".repeat(40));
-    cell_row["source_tree_dirty"] = Value::Bool(false);
-    let mut cell_bytes = serde_json::to_vec(&cell_row).unwrap();
-    cell_bytes.push(b'\n');
-    let mut row = serde_json::to_value(&row).unwrap();
-    row["cell_results"]["selected_backend_parity"] = serde_json::json!([]);
-    row["cell_results"]["cells"][0] =
-        serde_json::to_value(cell.summary("fixture-v10", &"a".repeat(40)).unwrap()).unwrap();
-    row["cell_results"]["artifact"]["sha256"] = hex_digest(&cell_bytes).into();
-    row["constructed_plan"]["sha256"] = hex_digest(&plan).into();
-    row["constructed_plan"]["bytes"] = (plan.len() as u64).into();
-    (
-        serde_json::from_value(row).unwrap(),
-        plan,
-        cell_bytes,
-        tests,
-    )
 }
 
 /// The verdict the ledger derives for a declared stripped verify cell from

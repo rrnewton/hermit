@@ -412,10 +412,10 @@ fn failure_row_blocks_pass_cache(row: &serde_json::Value, key: &CacheKey<'_>) ->
                     })
                 })
     });
-    // Schema 10 keeps reference and cross-backend outcomes separate. This
-    // conservative cache refusal grants no qualification or failure-obligation
-    // authority; those readers authenticate the complete retained artifacts.
-    let parity_divergence = i(row, "schema_version") == Some(10)
+    // Schema 10 cells carry the same ordinary verdict. This conservative
+    // cache refusal grants no qualification or failure-obligation authority;
+    // those readers authenticate the complete retained artifacts.
+    let schema10_divergence = i(row, "schema_version") == Some(10)
         && row
             .get("cell_results")
             .and_then(|v| v.get("cells"))
@@ -426,28 +426,9 @@ fn failure_row_blocks_pass_cache(row: &serde_json::Value, key: &CacheKey<'_>) ->
                         .and_then(|v| v.get("state"))
                         .and_then(serde_json::Value::as_str)
                         == Some("compared-and-diverged")
-                        || cell
-                            .get("backend_parity")
-                            .and_then(|v| v.get("attempts"))
-                            .and_then(serde_json::Value::as_array)
-                            .is_some_and(|attempts| {
-                                attempts.iter().any(|attempt| {
-                                    ["candidate", "reference"].iter().any(|role| {
-                                        attempt
-                                            .get(role)
-                                            .and_then(|v| v.get("state"))
-                                            .and_then(serde_json::Value::as_str)
-                                            == Some("compared-and-diverged")
-                                    }) || attempt
-                                        .get("cross")
-                                        .and_then(|v| v.get("state"))
-                                        .and_then(serde_json::Value::as_str)
-                                        == Some("diverged")
-                                })
-                            })
                 })
             });
-    if typed_cell_divergence || parity_divergence {
+    if typed_cell_divergence || schema10_divergence {
         return true;
     }
     let known_flaky = row.get("known_flaky_failure").and_then(|v| v.as_bool());
@@ -1309,25 +1290,16 @@ pub fn self_test() -> Result<String, String> {
         );
     }
 
-    for role in ["reference", "cross"] {
-        let mut parity_failure = failing.clone();
-        parity_failure["schema_version"] = serde_json::json!(10);
-        let state = if role == "cross" {
-            "diverged"
-        } else {
-            "compared-and-diverged"
-        };
-        parity_failure["cell_results"] = serde_json::json!({"cells":[{
-            "cell_verdict":{"state":"compared-and-matched"},
-            "backend_parity":{"attempts":[{role:{"state":state}}]}
-        }]});
-        if cache_lookup(&[parity_failure.clone(), rs_pass.clone()], "pass", &key).is_some()
-            || cache_lookup(&[rs_pass.clone(), parity_failure], "pass", &key).is_some()
-        {
-            return Err(format!(
-                "cache: an ordinary pass erased a schema-10 {role} divergence"
-            ));
-        }
+    let mut schema10_failure = failing.clone();
+    schema10_failure["schema_version"] = serde_json::json!(10);
+    schema10_failure["cell_results"] = serde_json::json!({"cells":[{
+        "cell_verdict":{"state":"compared-and-diverged"},
+        "backend_parity":null
+    }]});
+    if cache_lookup(&[schema10_failure.clone(), rs_pass.clone()], "pass", &key).is_some()
+        || cache_lookup(&[rs_pass.clone(), schema10_failure], "pass", &key).is_some()
+    {
+        return Err("cache: an ordinary pass erased a schema-10 divergence".into());
     }
 
     // The two historical orderings are both refused: fail-then-pass and

@@ -17871,7 +17871,6 @@ fn self_test(root: &Path) -> Result<(), String> {
         shell_command: "cd /repo && env LC_ALL=C hermit run".into(),
         relaxations: Vec::new(),
         execution_path: None,
-        backend_parity: None,
         diversity: None,
         attempts: vec![fixture_attempt("FAIL", 1)],
         reason: None,
@@ -21079,7 +21078,6 @@ fn self_test(root: &Path) -> Result<(), String> {
         shell_command: "cd /repo && env LC_ALL=C hermit run".into(),
         relaxations: Vec::new(),
         execution_path: None,
-        backend_parity: None,
         diversity: None,
         attempts: vec![fixture_attempt("PASS", 0)],
         reason: None,
@@ -27544,6 +27542,7 @@ mod cpu_observation_reader_tests {
         bad["cpu_observations"]["binding"]["test"] = json!("foreign");
         write(&bad);
         assert!(read_result_rows(&file).unwrap_err().contains("source row"));
+        // A role of the removed ptrace reference run is no longer a role.
         let mut bad = supplied.clone();
         bad["cpu_observations"]["invocations"][0]["role"] =
             json!({"kind":"ptrace_normalization","execution_ordinal":1});
@@ -27551,7 +27550,7 @@ mod cpu_observation_reader_tests {
         assert!(
             read_result_rows(&file)
                 .unwrap_err()
-                .contains("earlier invocation")
+                .contains("unknown variant")
         );
         for present in [JsonValue::Null, json!({"version":99})] {
             let mut bad = base.clone();
@@ -27621,29 +27620,11 @@ mod cpu_observation_reader_tests {
             attempt["cwd"] = json!("/synthetic");
             attempt["env"] = json!({});
         }
+        // The ptrace reference run and its comparison process were removed
+        // (https://github.com/rrnewton/hermit/issues/3301); a row that records
+        // them is refused.
         write(&parity);
-        assert!(read_result_rows(&file).is_ok());
-        for position in [0, 1] {
-            let mut bad = parity.clone();
-            bad["attempts"][position]["outcome"] = json!("FAIL");
-            write(&bad);
-            assert!(
-                read_result_rows(&file)
-                    .unwrap_err()
-                    .contains("passing semantic prerequisite")
-            );
-            bad.as_object_mut().unwrap().remove("cpu_observations");
-            write(&bad);
-            assert!(read_result_rows(&file).is_ok()); // historical absence is unchanged
-            let mut missing = parity.clone();
-            missing["attempts"].as_array_mut().unwrap().remove(position);
-            write(&missing);
-            assert!(
-                read_result_rows(&file)
-                    .unwrap_err()
-                    .contains("passing semantic prerequisite")
-            );
-        }
+        assert!(read_result_rows(&file).is_err());
         write(&base);
         assert!(
             read_result_rows(&file).unwrap()[0]

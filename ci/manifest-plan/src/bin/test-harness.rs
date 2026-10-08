@@ -4335,8 +4335,10 @@ report.write_bytes((root/'verification.json').read_bytes())
                 String::from_utf8_lossy(&result.stdout),
                 String::from_utf8_lossy(&result.stderr)
             );
-            let rows = fs::read_to_string(path.join("results.jsonl"))
-                .unwrap()
+            let results = fs::read_to_string(path.join("results.jsonl")).unwrap();
+            // No row carries the retired cross-backend report.
+            assert!(!results.contains("\"backend_parity\""), "{scenario}");
+            let rows = results
                 .lines()
                 .map(|line| {
                     serde_json::from_str::<hermit_manifest_plan::runner::CellResult>(line).unwrap()
@@ -4356,7 +4358,6 @@ report.write_bytes((root/'verification.json').read_bytes())
                 assert_eq!(row.execution_wall_timeout_seconds, Some(10));
                 assert_eq!(row.outcome, "PASS", "{scenario}: {row:#?}");
                 assert_eq!(row.result, Some(ObservedResult::Pass), "{scenario}");
-                assert!(row.backend_parity.is_none(), "{scenario}");
                 assert_eq!(row.attempts.len(), 1, "{scenario}: {row:#?}");
             }
             for (mode, backend) in [("verify", "ptrace"), ("verify", "kvm"), ("custom", "kvm")] {

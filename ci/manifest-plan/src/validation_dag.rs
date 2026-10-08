@@ -3593,11 +3593,10 @@ fn assert_declared_caps(cfg: &DagConfig) -> Result<(), String> {
 
 fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String> {
     // Backend parity is a scored comparison, not a gate
-    // (https://github.com/rrnewton/hermit/issues/3301). No newly constructed
-    // plan asks the harness for a ptrace reference run. Plans retained before
-    // that change stay readable through
-    // `backend_parity_policy::selects_ptrace_parity`, which this check does
-    // not touch.
+    // (https://github.com/rrnewton/hermit/issues/3301): the parity post-pass
+    // measures it from retained logs, and no plan asks the harness for a
+    // ptrace reference run. The harness refuses the flag, and the retained-plan
+    // reader refuses a plan that passed it.
     if let Some(step) = cfg
         .steps
         .iter()

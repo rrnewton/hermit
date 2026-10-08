@@ -90,17 +90,9 @@ pub enum InvocationRole {
         attempt_index: String,
         backend: RequiredNullable<String>,
     },
-    /// Read-only history: the runner no longer launches this process (its
-    /// ptrace golden-log normalization was removed for
-    /// <https://github.com/rrnewton/hermit/issues/3301>), but results written
-    /// before then still record it, and they must keep parsing and validating.
-    PtraceNormalization {
-        execution_ordinal: u64,
-    },
-    ParityComparison {
-        candidate_execution: u64,
-        reference_execution: u64,
-    },
+    // The ptrace reference run's normalization and comparison roles left
+    // with that run (https://github.com/rrnewton/hermit/issues/3301). No
+    // reader of these observations reads results written before then.
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -894,8 +886,6 @@ impl CellCpuObservationsV1 {
         }
         let mut executions = BTreeSet::new();
         let mut preparation = false;
-        let mut normalizations = BTreeSet::new();
-        let mut comparison = false;
         let mut verify_candidate: Option<&InvocationCpuObservation> = None;
         for (index, invocation) in self.invocations.iter().enumerate() {
             require(
@@ -907,25 +897,11 @@ impl CellCpuObservationsV1 {
             if let Some(previous) = index.checked_sub(1).map(|i| &self.invocations[i]) {
                 require(
                     previous.returned_without_timeout()
-                        && !matches!(previous.role, InvocationRole::ParityComparison { .. })
                         && (!matches!(previous.role, InvocationRole::Preparation)
                             || previous.completed_successfully()),
-                    "invocation follows a stopped, failed preparation, or final comparison",
+                    "invocation follows a stopped or failed preparation",
                 )?;
             }
-            let execution = |ordinal: u64| -> Result<&InvocationCpuObservation, String> {
-                let item = usize::try_from(ordinal)
-                    .ok()
-                    .and_then(|n| n.checked_sub(1))
-                    .filter(|n| *n < index)
-                    .and_then(|n| self.invocations.get(n))
-                    .ok_or("CPU role reference is not an earlier invocation")?;
-                require(
-                    matches!(item.role, InvocationRole::Execution { .. }),
-                    "CPU role does not reference execution",
-                )?;
-                Ok(item)
-            };
             match &invocation.role {
                 InvocationRole::Preparation => {
                     require(!preparation && index == 0, "repeated or late preparation")?;
@@ -941,68 +917,18 @@ impl CellCpuObservationsV1 {
                         executions.insert((attempt_index.clone(), backend.clone())),
                         "repeated execution identity",
                     )?;
-                    let expected = if attempt_index == "parity-reference" {
-                        Some("ptrace")
-                    } else {
-                        nullable(&b.backend).map(String::as_str)
-                    };
                     require(
-                        backend.as_deref() == expected,
+                        attempt_index != "parity-reference",
+                        "execution is the retired ptrace reference run",
+                    )?;
+                    require(
+                        backend.as_deref() == nullable(&b.backend).map(String::as_str),
                         "execution backend differs from its role",
                     )?;
-                    if attempt_index == "parity-reference" {
-                        require(
-                            b.mode == "verify"
-                                && nullable(&b.backend).is_some_and(|backend| backend != "ptrace")
-                                && verify_candidate
-                                    .is_some_and(|prior| prior.completed_successfully()),
-                            "parity reference lacks an earlier successful verify candidate",
-                        )?;
-                    } else if b.mode == "verify" {
+                    if b.mode == "verify" {
                         require(verify_candidate.is_none(), "repeated verify candidate")?;
                         verify_candidate = Some(invocation);
                     }
-                }
-                InvocationRole::PtraceNormalization { execution_ordinal } => {
-                    let prior = execution(*execution_ordinal)?;
-                    require(
-                        b.mode == "verify"
-                            && prior.returned_without_timeout()
-                            && invocation.ordinal.checked_sub(1) == Some(*execution_ordinal)
-                            && matches!(&prior.role, InvocationRole::Execution { backend, .. }
-                                if nullable(backend).map(String::as_str) == Some("ptrace")),
-                        "normalization does not reference a verify ptrace return without timeout",
-                    )?;
-                    require(
-                        normalizations.insert(*execution_ordinal),
-                        "repeated normalization",
-                    )?;
-                }
-                InvocationRole::ParityComparison {
-                    candidate_execution,
-                    reference_execution,
-                } => {
-                    require(
-                        !comparison && candidate_execution != reference_execution,
-                        "repeated or self comparison",
-                    )?;
-                    let candidate = execution(*candidate_execution)?;
-                    let reference = execution(*reference_execution)?;
-                    require(
-                        b.mode == "verify"
-                            && nullable(&b.backend).is_some_and(|backend| backend != "ptrace"),
-                        "comparison is not a verify non-ptrace candidate",
-                    )?;
-                    require(
-                        matches!(&candidate.role, InvocationRole::Execution{attempt_index,..} if attempt_index != "parity-reference")
-                            && matches!(&reference.role, InvocationRole::Execution{attempt_index,..} if attempt_index == "parity-reference"),
-                        "comparison roles are reversed or foreign",
-                    )?;
-                    require(
-                        candidate.completed_successfully() && reference.completed_successfully(),
-                        "comparison operand did not complete with exit zero",
-                    )?;
-                    comparison = true;
                 }
             }
         }
@@ -1033,17 +959,15 @@ impl CellCpuObservationsV1 {
         )
     }
 
-    /// Bind available semantic timeout flags and the roles requiring semantic
-    /// PASS. Failure records alone do not acquire a PASS requirement. Missing
-    /// flags remain unknown, and cannot establish a no-timeout predecessor.
-    pub fn require_passing_prerequisites<'a>(
+    /// Bind available semantic timeout flags. Missing flags remain unknown,
+    /// and cannot establish a no-timeout predecessor.
+    pub fn require_timeout_prerequisites<'a>(
         &self,
-        attempts: impl IntoIterator<Item = (&'a str, bool, Option<bool>)>,
+        attempts: impl IntoIterator<Item = (&'a str, Option<bool>)>,
     ) -> Result<(), String> {
         self.validate()?;
-        let mut passed = BTreeSet::new();
         let mut seen = BTreeMap::new();
-        for (index, is_pass, timed_out) in attempts {
+        for (index, timed_out) in attempts {
             require(
                 seen.insert(index, timed_out).is_none(),
                 "repeated retained semantic attempt",
@@ -1057,53 +981,7 @@ impl CellCpuObservationsV1 {
                     "retained timed_out differs from CPU return branch",
                 )?;
             }
-            if is_pass {
-                passed.insert(index);
-            }
         }
-        let mut required = BTreeSet::new();
-        for invocation in &self.invocations {
-            match &invocation.role {
-                InvocationRole::Execution { attempt_index, .. }
-                    if attempt_index == "parity-reference" =>
-                {
-                    let candidate = self
-                        .invocations
-                        .iter()
-                        .find_map(|item| match &item.role {
-                            InvocationRole::Execution { attempt_index, .. }
-                                if attempt_index != "parity-reference" =>
-                            {
-                                Some(attempt_index.as_str())
-                            }
-                            _ => None,
-                        })
-                        .ok_or("reference has no candidate semantic identity")?;
-                    required.insert(candidate);
-                }
-                InvocationRole::ParityComparison {
-                    candidate_execution,
-                    reference_execution,
-                } => {
-                    for ordinal in [candidate_execution, reference_execution] {
-                        let operand = self
-                            .invocations
-                            .iter()
-                            .find(|item| item.ordinal == *ordinal)
-                            .ok_or("comparison has no operand semantic identity")?;
-                        let InvocationRole::Execution { attempt_index, .. } = &operand.role else {
-                            return Err("comparison semantic prerequisite is not execution".into());
-                        };
-                        required.insert(attempt_index.as_str());
-                    }
-                }
-                _ => {}
-            }
-        }
-        require(
-            required.is_subset(&passed),
-            "CPU role lacks a retained passing semantic prerequisite",
-        )?;
         for invocation in self
             .invocations
             .iter()
@@ -1166,16 +1044,9 @@ pub fn validate_cpu_observations_in_source_row(
                     .ok_or("CPU source attempt timed_out is not a boolean")
             })
             .transpose()?;
-        prerequisites.push((
-            index,
-            attempt.get("outcome").and_then(Value::as_str) == Some("PASS")
-                && attempt.get("status").and_then(Value::as_i64) == Some(0)
-                && matches!(attempt.get("signal"), Some(Value::Null))
-                && timed_out == Some(false),
-            timed_out,
-        ));
+        prerequisites.push((index, timed_out));
     }
-    observations.require_passing_prerequisites(prerequisites)?;
+    observations.require_timeout_prerequisites(prerequisites)?;
     Ok(Some(observations))
 }
 
@@ -1994,81 +1865,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn role_references_are_local_ordered_and_not_numeric_pid_identity() {
-        let mut row = executed_row();
-        row["backend"] = json!("kvm");
-        row["attempts"][0]["index"] = json!("verify-1");
-        row["attempts"].as_array_mut().unwrap().push(
-            json!({"index":"parity-reference","argv":["reference"],"cwd":"/fixture","env":{}}),
-        );
-        for attempt in row["attempts"].as_array_mut().unwrap() {
-            attempt["outcome"] = json!("PASS");
-            attempt["status"] = json!(0);
-            attempt["signal"] = Value::Null;
-            attempt["timed_out"] = json!(false);
-        }
-        row["cpu_observations"] = envelope(&row);
-        assert!(valid(&row)); // descriptive PID17 may legitimately repeat
-        let mut comparison = row["cpu_observations"]["invocations"][0].clone();
-        comparison["ordinal"] = json!(3);
-        comparison["role"] =
-            json!({"kind":"parity_comparison","candidate_execution":1,"reference_execution":2});
-        row["cpu_observations"]["invocations"]
-            .as_array_mut()
-            .unwrap()
-            .push(comparison);
-        assert!(valid(&row));
-        for foreign in [0, 1, 3, 100] {
-            let mut bad = row.clone();
-            bad["cpu_observations"]["invocations"][2]["role"]["reference_execution"] =
-                json!(foreign);
-            assert!(!valid(&bad), "reference {foreign}");
-        }
-        let mut reversed = row.clone();
-        reversed["cpu_observations"]["invocations"][2]["role"] =
-            json!({"kind":"parity_comparison","candidate_execution":2,"reference_execution":1});
-        assert!(!valid(&reversed));
-        let mut same_backend = row.clone();
-        same_backend["backend"] = json!("ptrace");
-        same_backend["cpu_observations"]["binding"]["backend"] = json!("ptrace");
-        same_backend["cpu_observations"]["invocations"][0]["role"]["backend"] = json!("ptrace");
-        assert!(!valid(&same_backend));
-        let mut naked = row.clone();
-        naked["mode"] = json!("naked");
-        naked["cpu_observations"]["binding"]["mode"] = json!("naked");
-        assert!(!valid(&naked));
-        let mut normalized = row.clone();
-        normalized["cpu_observations"]["invocations"][2]["role"] =
-            json!({"kind":"ptrace_normalization","execution_ordinal":2});
-        assert!(valid(&normalized));
-        let mut nonzero_exit = normalized.clone();
-        nonzero_exit["cpu_observations"]["invocations"][1]["final_wait"]["raw_status"] = json!(256);
-        nonzero_exit["attempts"][1]["outcome"] = json!("FAIL");
-        nonzero_exit["attempts"][1]["status"] = json!(1);
-        assert!(valid(&nonzero_exit)); // a nonzero exit still has no timeout
-        for termination in ["wall_budget_stop", "cpu_budget_stop"] {
-            let mut timed_out_parent = normalized.clone();
-            timed_out_parent["attempts"][1]["timed_out"] = json!(true);
-            timed_out_parent["attempts"][1]["outcome"] = json!("FAIL");
-            let prior = &mut timed_out_parent["cpu_observations"]["invocations"][1];
-            prior["termination"] = json!(termination);
-            if termination == "cpu_budget_stop" {
-                prior["live"] = enabled();
-                prior["live"]["timeout_trigger"] = prior["live"]["last"].clone();
-                prior["returned_cpu_charge"] =
-                    json!({"state":"value","cpu_usec":7,"basis":"max_trigger_and_final_wait4"});
-            }
-            let mut without_normalization = timed_out_parent.clone();
-            without_normalization["cpu_observations"]["invocations"]
-                .as_array_mut()
-                .unwrap()
-                .pop();
-            assert!(valid(&without_normalization), "valid {termination} parent");
-            assert!(
-                !valid(&timed_out_parent),
-                "normalization admitted after {termination}"
-            );
-        }
+    fn role_order_follows_preparation_and_timeouts_and_refuses_the_retired_reference() {
         // Exercise whole relationships, not just an isolated role label. Failed
         // invocations remain admissible when no impossible successor is claimed.
         fn fail(invocation: &mut Value, kind: &str) {
@@ -2108,75 +1905,6 @@ pub(crate) mod tests {
                 admitted.push(label);
             }
         };
-        for kind in [
-            "nonzero",
-            "signal",
-            "nonterminal",
-            "wall",
-            "cpu",
-            "final_cpu",
-        ] {
-            for operand in [0, 1] {
-                let mut bad = row.clone();
-                fail(&mut bad["cpu_observations"]["invocations"][operand], kind);
-                bad["attempts"][operand]["timed_out"] =
-                    json!(["wall", "cpu", "final_cpu"].contains(&kind));
-                let mut alone = bad.clone();
-                keep_prefix(&mut alone, operand + 1, operand + 1);
-                assert!(valid(&alone), "failed operand alone {operand}/{kind}");
-                reject(format!("comparison operand {operand}/{kind}"), &bad);
-                if operand == 0 {
-                    keep_prefix(&mut bad, 2, 2);
-                    reject(format!("reference after candidate {kind}"), &bad);
-                }
-            }
-            let mut comparator_failed = row.clone();
-            fail(
-                &mut comparator_failed["cpu_observations"]["invocations"][2],
-                kind,
-            );
-            assert!(valid(&comparator_failed), "comparator itself {kind}");
-        }
-        for operand in [0, 1] {
-            for field in ["outcome", "status", "signal", "timed_out"] {
-                let mut bad = row.clone();
-                bad["attempts"][operand]
-                    .as_object_mut()
-                    .unwrap()
-                    .remove(field);
-                reject(format!("missing prerequisite {operand}/{field}"), &bad);
-            }
-            for outcome in ["FAIL", "ERROR"] {
-                let mut bad = row.clone();
-                bad["attempts"][operand]["outcome"] = json!(outcome);
-                reject(format!("semantic prerequisite {operand}/{outcome}"), &bad);
-                // Without supplied observations this remains the historical path.
-                bad.as_object_mut().unwrap().remove("cpu_observations");
-                assert!(valid(&bad));
-            }
-            for (field, value) in [
-                ("outcome", json!(true)),
-                ("status", json!("0")),
-                ("status", json!(0.0)),
-                ("signal", json!("none")),
-                ("timed_out", Value::Null),
-                ("timed_out", json!("false")),
-            ] {
-                let mut bad = row.clone();
-                bad["attempts"][operand][field] = value;
-                reject(format!("malformed prerequisite {operand}/{field}"), &bad);
-            }
-            let mut missing = row.clone();
-            missing["attempts"].as_array_mut().unwrap().remove(operand);
-            reject(format!("missing retained operand {operand}"), &missing);
-        }
-        let mut reference_only = row.clone();
-        reference_only["cpu_observations"]["invocations"] =
-            json!([row["cpu_observations"]["invocations"][1].clone()]);
-        reference_only["cpu_observations"]["invocations"][0]["ordinal"] = json!(1);
-        reference_only["attempts"] = json!([row["attempts"][1].clone()]);
-        reject("reference without candidate".into(), &reference_only);
-
         let mut prepared = executed_row();
         let execution = prepared["cpu_observations"]["invocations"][0].clone();
         let mut prep = execution.clone();
@@ -2220,102 +1948,39 @@ pub(crate) mod tests {
             assert!(valid(&alone));
             reject(format!("execution after ordinary timeout {kind}"), &bad);
         }
-        let mut four_roles = row.clone();
-        four_roles["cpu_observations"]["invocations"]
-            .as_array_mut()
-            .unwrap()
-            .insert(2, normalized["cpu_observations"]["invocations"][2].clone());
-        four_roles["cpu_observations"]["invocations"][3]["ordinal"] = json!(4);
-        assert!(valid(&four_roles));
-        for kind in ["nonzero", "signal", "nonterminal"] {
-            let mut continued = four_roles.clone();
-            fail(&mut continued["cpu_observations"]["invocations"][2], kind);
-            assert!(
-                valid(&continued),
-                "completed normalizer may continue {kind}"
-            );
-            let mut parent = normalized.clone();
-            fail(&mut parent["cpu_observations"]["invocations"][1], kind);
-            assert!(valid(&parent), "normalization parent need not exit0 {kind}");
-        }
-        for kind in ["wall", "cpu", "final_cpu"] {
-            let mut bad = four_roles.clone();
-            fail(&mut bad["cpu_observations"]["invocations"][2], kind);
-            let mut alone = bad.clone();
-            keep_prefix(&mut alone, 3, 2);
-            assert!(valid(&alone));
-            reject(
-                format!("comparison after normalization timeout {kind}"),
-                &bad,
-            );
-        }
-        // A retained semantic timeout cannot be erased by relabeling the CPU
-        // path CompletedWait4 to manufacture a later normalization/execution.
-        for mut successor in [normalized.clone(), ordinary.clone()] {
-            let operand = if successor["mode"] == "verify" { 1 } else { 0 };
-            successor["attempts"][operand]["timed_out"] = json!(true);
-            reject("relabelled timeout with successor".into(), &successor);
-            successor["attempts"][operand]
-                .as_object_mut()
-                .unwrap()
-                .remove("timed_out");
-            reject("unknown timeout with successor".into(), &successor);
-        }
-        // A nonterminal helper return permits normalization without becoming a
-        // successful reference prerequisite for a subsequent comparison.
-        let mut nonterminal_reference = normalized.clone();
-        fail(
-            &mut nonterminal_reference["cpu_observations"]["invocations"][1],
-            "nonterminal",
-        );
-        nonterminal_reference["attempts"][1]["outcome"] = json!("FAIL");
-        nonterminal_reference["attempts"][1]["status"] = Value::Null;
-        assert!(valid(&nonterminal_reference));
-        let mut extra = row["cpu_observations"]["invocations"][2].clone();
-        extra["ordinal"] = json!(4);
-        nonterminal_reference["cpu_observations"]["invocations"]
-            .as_array_mut()
-            .unwrap()
-            .push(extra);
-        reject(
-            "comparison after nonterminal reference and normalization".into(),
-            &nonterminal_reference,
-        );
-        let mut after_comparison = row.clone();
-        let mut extra = execution.clone();
-        extra["ordinal"] = json!(4);
-        extra["role"] = json!({"kind":"execution","attempt_index":"extra","backend":"kvm"});
-        after_comparison["cpu_observations"]["invocations"]
-            .as_array_mut()
-            .unwrap()
-            .push(extra);
-        reject("execution after comparison".into(), &after_comparison);
         let mut repeated_verify = ordinary.clone();
         repeated_verify["mode"] = json!("verify");
         repeated_verify["cpu_observations"]["binding"]["mode"] = json!("verify");
         reject("repeated verify candidate".into(), &repeated_verify);
-        let mut late_normalization = repeated_verify;
-        let mut late = normalized["cpu_observations"]["invocations"][2].clone();
-        late["role"]["execution_ordinal"] = json!(1);
-        late_normalization["cpu_observations"]["invocations"]
+        // The ptrace reference run and its normalization and comparison
+        // processes were removed (https://github.com/rrnewton/hermit/issues/3301).
+        let mut reference = executed_row();
+        reference["backend"] = json!("kvm");
+        reference["attempts"]
             .as_array_mut()
             .unwrap()
-            .push(late);
-        reject("nonadjacent normalization".into(), &late_normalization);
+            .push(json!({"index":"parity-reference","argv":["reference"],"cwd":"/fixture","env":{},"timed_out":false}));
+        reference["attempts"][0]["timed_out"] = json!(false);
+        reference["cpu_observations"] = envelope(&reference);
+        reject("retired ptrace reference execution".into(), &reference);
+        for role in [
+            json!({"kind":"ptrace_normalization","execution_ordinal":1}),
+            json!({"kind":"parity_comparison","candidate_execution":1,"reference_execution":1}),
+        ] {
+            let mut retired = executed_row();
+            let mut extra = retired["cpu_observations"]["invocations"][0].clone();
+            extra["ordinal"] = json!(2);
+            extra["role"] = role.clone();
+            retired["cpu_observations"]["invocations"]
+                .as_array_mut()
+                .unwrap()
+                .push(extra);
+            reject(format!("retired role {role}"), &retired);
+        }
         assert!(
             admitted.is_empty(),
             "impossible role relationships admitted: {admitted:?}"
         );
-
-        let mut wrong_backend = normalized.clone();
-        wrong_backend["cpu_observations"]["invocations"][2]["role"]["execution_ordinal"] = json!(1);
-        assert!(!valid(&wrong_backend));
-        let mut naked = normalized.clone();
-        naked["mode"] = json!("naked");
-        naked["cpu_observations"]["binding"]["mode"] = json!("naked");
-        assert!(!valid(&naked));
-        normalized["cpu_observations"]["invocations"][2]["role"]["execution_ordinal"] = json!(3);
-        assert!(!valid(&normalized));
     }
 
     #[test]
