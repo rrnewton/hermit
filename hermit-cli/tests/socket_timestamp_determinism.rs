@@ -67,6 +67,60 @@ fn run_in_guest_liteinst_twice(guest: &Path, args: &[&str], label: &str) -> Stri
     first
 }
 
+/// tests/c/socket_timestamp_edge_cases.c under strict ptrace verification at
+/// epochs whose fraction puts a second boundary between its first receive and
+/// its batched receive. The guest used to require the batch to share the
+/// first timestamp's whole second, so it failed there: with the preemption
+/// timer near .995 (a window of about 3 ms), and without it, where virtual time
+/// runs 500 times faster, at the epoch .564328890 a GitHub-hosted run used
+/// (https://github.com/rrnewton/hermit/actions/runs/37707343949).
+#[test]
+fn socket_timestamp_edge_cases_hold_at_every_epoch_fraction() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("socket-timestamp-epochs");
+    std::fs::create_dir_all(&build_root).expect("failed to create guest build directory");
+    let guest = build_root.join("socket_timestamp_edge_cases");
+    let compile = Command::new("cc")
+        .args(["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror"])
+        .arg(repository.join("tests/c/socket_timestamp_edge_cases.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile socket_timestamp_edge_cases");
+    assert!(
+        compile.status.success(),
+        "socket_timestamp_edge_cases compilation failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    for (epoch, timeslice) in [
+        ("2026-10-08T01:05:18.995000000+00:00", None),
+        (
+            "2026-10-08T01:05:18.564328890+00:00",
+            Some("--max-timeslice=disabled"),
+        ),
+    ] {
+        let verify = Command::new("timeout")
+            .args(["--kill-after", "5s", "90s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args(["--log=info", "--backend=ptrace", "run"])
+            .arg(format!("--epoch={epoch}"))
+            .args(timeslice)
+            .args(["--strict", "--verify", "--base-env=minimal", "--"])
+            .arg(&guest)
+            .output()
+            .expect("failed to run socket_timestamp_edge_cases");
+        let stdout = String::from_utf8_lossy(&verify.stdout);
+        let stderr = String::from_utf8_lossy(&verify.stderr);
+        assert!(
+            verify.status.success() && stdout.contains("batch=ok"),
+            "epoch {epoch} {timeslice:?}: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            verify.status
+        );
+    }
+}
+
 #[test]
 fn socket_receive_timestamps_use_logical_time() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
