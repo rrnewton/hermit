@@ -1167,13 +1167,233 @@ int main(int argc, char **argv) {
     }
 }
 
+/// A guest RDTSC runs, with Detcore's virtual value, under SaBRe: both one that
+/// is the guest's first intercepted event and one that follows its syscalls.
+///
+/// The loader's RDTSC entry points used to call the plugin's handler without
+/// the enter_plugin/exit_plugin bracket that syscalls get, so the syscalls the
+/// plugin made while handling the RDTSC came back into it as guest syscalls
+/// and waited on a lock it already held: every such guest hung, the first-event
+/// case on the tool's own construction. The guest prints the raw readings, so a
+/// bitwise strict verification also shows they are virtual: two native
+/// readings never repeat across runs.
+#[test]
+fn sabre_runs_a_guest_rdtsc_before_and_after_its_first_syscall() {
+    const GUEST: &str = r#"
+#include <stdio.h>
+#include <unistd.h>
+#include <x86intrin.h>
+
+int main(void) {
+  unsigned long long first = __rdtsc();
+  if (write(1, "start\n", 6) != 6) return 2;
+  unsigned long long second = __rdtsc();
+  printf("%llx %llx\n", first, second);
+  return first != 0 && second > first ? 0 : 3;
+}
+"#;
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("sabre-rdtsc-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest directory");
+    let guest = compile_guest(dir.path(), "rdtsc", GUEST);
+    let guest = guest.to_str().unwrap();
+    let sabre = verify_run(Some(&loader), &[guest], "SaBRe guest that reads the TSC");
+    let stdout = String::from_utf8(sabre.output.stdout).unwrap();
+    let mut lines = stdout.lines();
+    assert_eq!(lines.next(), Some("start"), "{stdout}");
+    let readings = lines
+        .next()
+        .unwrap_or_else(|| panic!("no TSC readings: {stdout}"))
+        .split(' ')
+        .map(|reading| u64::from_str_radix(reading, 16).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(readings.len(), 2, "{stdout}");
+    assert!(readings[1] > readings[0], "{stdout}");
+}
+
+/// An RDTSC in a guest signal handler gets the virtual value under SaBRe.
+///
+/// The plugin delivers such a handler with its own boundary flag still set, so
+/// an RDTSC router that served every flagged request natively handed the
+/// handler the host counter, and the printed value differed between the two
+/// verified runs.
+#[test]
+fn sabre_virtualizes_an_rdtsc_in_a_guest_signal_handler() {
+    const GUEST: &str = r#"
+#include <signal.h>
+#include <stdio.h>
+#include <x86intrin.h>
+
+static volatile unsigned long long in_handler;
+
+static void handler(int signal_number) {
+  (void)signal_number;
+  in_handler = __rdtsc();
+}
+
+int main(void) {
+  signal(SIGUSR1, handler);
+  raise(SIGUSR1);
+  printf("%llx\n", in_handler);
+  return in_handler != 0 ? 0 : 3;
+}
+"#;
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("sabre-rdtsc-handler-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest directory");
+    let guest = compile_guest(dir.path(), "rdtsc-handler", GUEST);
+    let sabre = verify_run(
+        Some(&loader),
+        &[guest.to_str().unwrap()],
+        "SaBRe guest that reads the TSC in a signal handler",
+    );
+    let stdout = String::from_utf8(sabre.output.stdout).unwrap();
+    assert!(
+        u64::from_str_radix(stdout.trim(), 16).is_ok_and(|reading| reading != 0),
+        "{stdout}"
+    );
+}
+
+/// A guest RDTSC that runs before the SaBRe plugin exists is refused, not
+/// answered with the host counter.
+///
+/// SaBRe initializes its plugin from the last `.preinit_array` entry, after the
+/// guest's own entries, so an RDTSC in one of those has no virtual value.
+#[test]
+fn sabre_refuses_a_guest_rdtsc_before_its_plugin_starts() {
+    const GUEST: &str = r#"
+#include <stdio.h>
+#include <x86intrin.h>
+
+static unsigned long long early;
+
+static void read_early(void) { early = __rdtsc(); }
+__attribute__((section(".preinit_array"), used)) static void (*preinit)(void) =
+    read_early;
+
+int main(void) {
+  printf("%llx\n", early);
+  return 0;
+}
+"#;
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("sabre-rdtsc-preinit-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest directory");
+    let guest = compile_guest(dir.path(), "rdtsc-preinit", GUEST);
+    let mut command = Command::new(hermit_binary());
+    command
+        .env("HERMIT_SABRE_BINARY", &loader)
+        .args([
+            "--backend",
+            "sabre",
+            "run",
+            "--strict",
+            COMPARISON_EPOCH,
+            "--",
+        ])
+        .arg(&guest);
+    let (status, stderr) = run_expecting_failure(command, "SaBRe guest with an early RDTSC");
+    assert!(!status.success(), "the early RDTSC was answered:\n{stderr}");
+    assert!(
+        stderr.contains("guest RDTSC before the plugin was initialized"),
+        "the refusal does not name the early RDTSC:\n{stderr}"
+    );
+}
+
+/// An RDTSC that re-enters a SaBRe tool call already in progress on its thread
+/// is refused, not left to deadlock.
+///
+/// The plugin shares the guest's symbol namespace, so the coordinator RPC's
+/// `send` can resolve to a function the guest exports. An RDTSC there runs while
+/// the tool holds the thread's state, which the RDTSC handler needs too. With no
+/// virtual value available, the run must stop with a message rather than hang
+/// or read the host counter.
+#[test]
+fn sabre_refuses_an_rdtsc_that_reenters_a_tool_call() {
+    const GUEST: &str = r#"
+#define _GNU_SOURCE
+#include <poll.h>
+#include <stdio.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <x86intrin.h>
+
+static volatile int armed;
+static volatile unsigned long long seen;
+
+ssize_t send(int fd, const void *buffer, size_t length, int flags) {
+  if (armed)
+    seen = __rdtsc();
+  return syscall(SYS_sendto, fd, buffer, length, flags, NULL, 0);
+}
+
+int main(void) {
+  armed = 1;
+  poll(NULL, 0, 0);
+  armed = 0;
+  printf("%llx\n", seen);
+  return 0;
+}
+"#;
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("sabre-rdtsc-reentry-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest directory");
+    let guest = compile_guest_with(dir.path(), "rdtsc-reentry", GUEST, &["-rdynamic"]);
+    let mut command = Command::new(hermit_binary());
+    command
+        .env("HERMIT_SABRE_BINARY", &loader)
+        .args([
+            "--backend",
+            "sabre",
+            "run",
+            "--strict",
+            COMPARISON_EPOCH,
+            "--",
+        ])
+        .arg(&guest);
+    let (status, stderr) =
+        run_expecting_failure(command, "SaBRe guest whose exported send reads the TSC");
+    assert!(
+        !status.success(),
+        "the re-entrant RDTSC was answered:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("an RDTSC re-entered a tool call already in progress"),
+        "the refusal does not name the re-entrant RDTSC:\n{stderr}"
+    );
+}
+
 /// Compiles C `source` into `dir/name` and returns the executable's path.
 fn compile_guest(dir: &Path, name: &str, source: &str) -> PathBuf {
+    compile_guest_with(dir, name, source, &[])
+}
+
+/// [`compile_guest`], passing `flags` to the compiler as well.
+fn compile_guest_with(dir: &Path, name: &str, source: &str, flags: &[&str]) -> PathBuf {
     let source_path = dir.join(format!("{name}.c"));
     std::fs::write(&source_path, source).unwrap();
     let guest = dir.join(name);
     let build = Command::new("cc")
-        .args(["-O1", "-Wall", "-Werror", "-o"])
+        .args(["-O1", "-Wall", "-Werror"])
+        .args(flags)
+        .arg("-o")
         .arg(&guest)
         .arg(&source_path)
         .output()
