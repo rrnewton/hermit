@@ -1476,7 +1476,17 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // scheduler::parked_tests::the_runtimes_sigalrm_publications_and_questions
     // and sigalrm_phase1::tests::a_signalfd_in_the_kernels_table_is_found
     // (signal phase 1 step I3) retain all 1150: 1152, re-listed.
-    ("test.detcore_unit", 1164),
+    // procfs_inode::tests::{a_procfs_entry_names_its_path_whatever_its_host_inode,
+    // dot_entries_name_the_directory_and_its_parent,
+    // mountinfo_names_procfs_devices_by_type,
+    // only_anonymous_devices_with_1024_byte_blocks_may_be_procfs,
+    // other_directories_keep_host_keys, path_keys_cannot_equal_procfs_inodes,
+    // this_process_finds_its_own_procfs_entries} and tool_global::tests::{
+    // a_numbered_host_inode_keeps_its_number_when_its_path_is_named,
+    // a_rebuilt_procfs_entry_keeps_its_number, procfs_aliases_share_one_number,
+    // a_write_to_a_rebuilt_procfs_entry_sets_the_mtime_of_its_number}
+    // (rebuilt procfs entries keep their numbers) retain all 1164: 1175.
+    ("test.detcore_unit", 1175),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1522,7 +1532,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 87).
     // inode_reuse::nothing_is_retired_without_sequentialized_threads (the same
     // reviews) retains all 87 (measured 88).
-    ("test.detcore_misc", 88),
+    // procfs_inode::{a_rebuilt_proc_fd_entry_keeps_its_number,
+    // a_procfs_entry_reached_by_two_paths_keeps_one_number,
+    // the_proc_root_link_count_does_not_count_host_processes,
+    // a_write_to_a_procfs_file_moves_its_mtime} retain all 88 (measured 92).
+    ("test.detcore_misc", 92),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -2015,8 +2029,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.app_strict_verify_on_host", 8),
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
-    // The host node carries the identical 85-test tests_misc selection.
-    ("test.detcore_misc_on_host", 88),
+    // The host node carries the identical tests_misc selection.
+    ("test.detcore_misc_on_host", 92),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -2093,7 +2107,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the rt_sigsuspend mask-copy test: 1152.
     // And the same six detlog forwarding tests: 1161.
     // And the two signal phase 1 step I3 tests: 1152.
-    ("test.detcore_unit_on_host", 1164),
+    // The host twin selects the same eleven procfs inode tests: 1164 + 11 = 1175.
+    ("test.detcore_unit_on_host", 1175),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
