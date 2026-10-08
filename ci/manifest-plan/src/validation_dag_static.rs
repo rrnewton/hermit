@@ -1498,7 +1498,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_reused_task_id_names_new_procfs_entries, procfs_aliases_share_one_number,
     // a_write_to_a_rebuilt_procfs_entry_sets_the_mtime_of_its_number}
     // (rebuilt procfs entries keep their numbers) retain all 1167: 1183.
-    ("test.detcore_unit", 1183),
+    // procfs_inode::tests::{an_entry_of_a_task_that_has_exited_is_not_named,
+    // a_path_linux_marks_deleted_names_nothing,
+    // a_procfs_object_is_told_by_its_filesystem_type} (entries of exited tasks
+    // and procfs files outside the guest's mounts) retain all 1183: 1186.
+    ("test.detcore_unit", 1186),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1552,7 +1556,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the_proc_root_link_count_does_not_count_host_processes,
     // the_proc_root_link_count_through_the_cwd_does_not_count_host_processes,
     // a_write_to_a_procfs_file_moves_its_mtime} retain all 88 (measured 96).
-    ("test.detcore_misc", 96),
+    // procfs_inode::{a_listing_keeps_its_keys_after_its_task_exits,
+    // a_close_that_never_runs_ends_in_a_determinism_loss,
+    // a_close_that_reports_success_without_running_ends_in_a_determinism_loss}
+    // (keys decided with the snapshot; the O_PATH descriptor is closed or the
+    // run records a loss) retain all 96 (measured 99).
+    ("test.detcore_misc", 99),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -2056,7 +2065,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
     // The host node carries the identical tests_misc selection.
-    ("test.detcore_misc_on_host", 96),
+    ("test.detcore_misc_on_host", 99),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -2134,8 +2143,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same six detlog forwarding tests: 1161.
     // And the two signal phase 1 step I3 tests: 1152.
     // And the three happens-before parked-thread scheduler tests: 1167.
-    // The host twin selects the same sixteen procfs inode tests: 1167 + 16 = 1183.
-    ("test.detcore_unit_on_host", 1183),
+    // The host twin selects the same nineteen procfs inode tests: 1167 + 19 = 1186.
+    ("test.detcore_unit_on_host", 1186),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
