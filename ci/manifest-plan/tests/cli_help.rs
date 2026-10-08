@@ -585,12 +585,13 @@ fn test_harness_selftest_scorecard_refuses_a_missing_helper() {
          `cargo build -p hermit-manifest-plan --bins`\n";
     let directory = non_repository_dir("selftest-missing-helper");
     // A copy, not a symlink: the helper is looked up beside the resolved
-    // executable, and a symlink resolves to the build directory.
+    // executable, and a symlink resolves to the build directory. Not a hard
+    // link either: a link changes the built binary's link count and ctime, and
+    // the validation runner refuses a prepared test input whose metadata moves
+    // while it hashes it (https://github.com/rrnewton/hermit/pull/3921).
     let harness = directory.join("test-harness");
     let built = env!("CARGO_BIN_EXE_test-harness");
-    std::fs::hard_link(built, &harness)
-        .or_else(|_| std::fs::copy(built, &harness).map(|_| ()))
-        .expect("place test-harness without its helper");
+    std::fs::copy(built, &harness).expect("place test-harness without its helper");
     let harness = harness.to_str().expect("UTF-8 temporary path");
     for helper_is_a_directory in [false, true] {
         if helper_is_a_directory {
