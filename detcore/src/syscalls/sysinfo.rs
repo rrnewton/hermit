@@ -156,6 +156,23 @@ fn validate_resource_limit_mutation(
     Ok(())
 }
 
+/// The record of a resource-limit read that a loader served before post-exec
+/// ([`crate::random::EarlyRequest::LimitRead`]), emitted by post-exec. It is
+/// the record [`Detcore::handle_prlimit64`] emits for the same read, from the
+/// same module; a `getrlimit` read records nothing, as in `handle_getrlimit`.
+pub(crate) fn record_early_limit_read(
+    call: crate::random::LimitReadCall,
+    resource: u32,
+    current: u64,
+    maximum: u64,
+) {
+    if let crate::random::LimitReadCall::Prlimit64 { pid } = call {
+        crate::detlog!(
+            "prlimit64: pid={pid}, resource={resource}, mutation=false, old={current}:{maximum}"
+        );
+    }
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)

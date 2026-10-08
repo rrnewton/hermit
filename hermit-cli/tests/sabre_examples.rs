@@ -1380,6 +1380,159 @@ int main(void) {
     );
 }
 
+/// A SaBRe guest's libc startup reads Detcore's stack limit, as under ptrace,
+/// whatever the host's limit is, and the read leaves ptrace's record.
+///
+/// The dynamic loader and libc startup run before the SaBRe plugin is
+/// initialized, and libc sizes default thread stacks from the `RLIMIT_STACK` it
+/// reads there. The loader forwards that read to Hermit, which answers it from
+/// Detcore's table; the host's limit itself is left alone, as under ptrace.
+/// Launched with a 4 MiB soft limit, the guest used to report a 4 MiB default
+/// thread stack under SaBRe and 8 MiB, Detcore's value, under ptrace.
+#[test]
+fn sabre_guest_startup_reads_detcores_stack_limit() {
+    const GUEST: &str = r#"
+#define _GNU_SOURCE
+#include <pthread.h>
+#include <stdio.h>
+#include <sys/resource.h>
+
+int main(void) {
+  pthread_attr_t attr;
+  size_t size = 0;
+  if (pthread_getattr_default_np(&attr) != 0 ||
+      pthread_attr_getstacksize(&attr, &size) != 0)
+    return 2;
+  struct rlimit limit;
+  if (getrlimit(RLIMIT_STACK, &limit) != 0)
+    return 3;
+  printf("default thread stack %zu, RLIMIT_STACK %llu\n", size,
+         (unsigned long long)limit.rlim_cur);
+  return 0;
+}
+"#;
+    // Lowering a soft limit is always allowed, so the test never depends on
+    // the host's hard limit, and 4 MiB is not Detcore's 8 MiB.
+    const HOST_SOFT_LIMIT: libc::rlim_t = 4 * 1024 * 1024;
+    const RECORD: &str =
+        "prlimit64: pid=0, resource=3, mutation=false, old=8388608:18446744073709551615";
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("sabre-stack-limit-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest directory");
+    let guest = compile_guest(dir.path(), "stack-limit", GUEST);
+    let run = |backend: Option<&Path>| {
+        let mut command = Command::new(hermit_binary());
+        if let Some(loader) = backend {
+            command
+                .env("HERMIT_SABRE_BINARY", loader)
+                .args(["--backend", "sabre"]);
+        }
+        command
+            .args(["run", "--strict", COMPARISON_EPOCH, "--"])
+            .arg(&guest)
+            .stdin(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                let mut limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_STACK, &mut limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                limit.rlim_cur = HOST_SOFT_LIMIT;
+                if libc::setrlimit(libc::RLIMIT_STACK, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let label = if backend.is_some() { "SaBRe" } else { "ptrace" };
+        let output = run_bounded(command, label, None);
+        assert!(
+            output.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let expected = "default thread stack 8388608, RLIMIT_STACK 8388608\n";
+    assert_eq!(run(None), expected, "ptrace");
+    assert_eq!(run(Some(&loader)), expected, "SaBRe");
+    // The startup read leaves the record ptrace's handler leaves. glibc's
+    // getrlimit from main is a prlimit64 too, so ptrace has two such records;
+    // SaBRe without the startup read's record had only main's.
+    let guest = guest.to_str().unwrap();
+    let count = |backend: Option<&Path>, label: &str| {
+        let records = verify_run(backend, &[guest], label).records;
+        let count = records
+            .iter()
+            .filter(|record| record.contains(RECORD))
+            .count();
+        (count, records)
+    };
+    let (ptrace, ptrace_records) = count(None, "ptrace");
+    let (sabre, sabre_records) = count(Some(&loader), "SaBRe");
+    assert_eq!(ptrace, 2, "ptrace: {ptrace_records:#?}");
+    assert_eq!(sabre, ptrace, "SaBRe: {sabre_records:#?}");
+}
+
+/// A guest that changes a resource limit before the SaBRe plugin exists is
+/// refused, rather than changing the host's limit while Detcore's table, which
+/// the guest reads later, stays the same.
+#[test]
+fn sabre_refuses_a_guest_limit_change_before_its_plugin_starts() {
+    const GUEST: &str = r#"
+#include <stdio.h>
+#include <sys/resource.h>
+
+static void lower_stack(void) {
+  struct rlimit limit = {4 * 1024 * 1024, RLIM_INFINITY};
+  setrlimit(RLIMIT_STACK, &limit);
+}
+__attribute__((section(".preinit_array"), used)) static void (*preinit)(void) =
+    lower_stack;
+
+int main(void) {
+  puts("ran");
+  return 0;
+}
+"#;
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("sabre-limit-change-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest directory");
+    let guest = compile_guest(dir.path(), "limit-change", GUEST);
+    let mut command = Command::new(hermit_binary());
+    command
+        .env("HERMIT_SABRE_BINARY", &loader)
+        .args([
+            "--backend",
+            "sabre",
+            "run",
+            "--strict",
+            COMPARISON_EPOCH,
+            "--",
+        ])
+        .arg(&guest);
+    let (status, stderr) = run_expecting_failure(command, "SaBRe guest with an early limit change");
+    assert!(
+        !status.success(),
+        "the early limit change was applied:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("guest changed a resource limit before the plugin was initialized"),
+        "the refusal does not name the early limit change:\n{stderr}"
+    );
+}
+
 /// Compiles C `source` into `dir/name` and returns the executable's path.
 fn compile_guest(dir: &Path, name: &str, source: &str) -> PathBuf {
     compile_guest_with(dir, name, source, &[])
