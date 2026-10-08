@@ -1008,15 +1008,6 @@ impl StatAt {
     }
 }
 
-/// What `Detcore::settle_overlay_entry_lookup` asked about one entry of a
-/// listing, which `Detcore::directory_entry_identity` uses rather than ask
-/// the guest's filesystem again.
-struct ToldEntry {
-    name: Vec<u8>,
-    /// The entry's `lstat`, `None` where the name reached nothing.
-    stat: Option<libc::stat>,
-}
-
 /// What the stack-scratch attempt of `Detcore::stat_guest_path` found.
 enum StackStat {
     /// The scratch held the stat: the guest's answer, `None` when its stat
@@ -1910,22 +1901,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             (Err(errno), Ok(())) | (Ok(_), Err(errno)) => Err(errno),
             (Err(Errno::EFAULT), Err(errno)) | (Err(errno), Err(_)) => Err(errno),
         }
-    }
-
-    /// The filesystem type (`f_type`) of the open file `raw_fd`, from an
-    /// injected `fstatfs` whose buffer is in the guest stack scratch (see
-    /// [`Self::inject_into_stack_buffer`]). There is no transient-page
-    /// fallback: the one caller, [`Self::directory_entry_lookup`], has a
-    /// faithful answer without the type.
-    async fn inject_fstatfs_type<G: Guest<Self>>(
-        guest: &mut G,
-        raw_fd: RawFd,
-    ) -> Result<libc::__fsword_t, Errno> {
-        let statfs: libc::statfs = Self::inject_into_stack_buffer(guest, |buf| {
-            Syscall::Fstatfs(syscalls::Fstatfs::new().with_fd(raw_fd).with_buf(Some(buf)))
-        })
-        .await?;
-        Ok(statfs.f_type)
     }
 
     /// The fallback of [`Self::inject_fstat`] and [`Self::inject_lstatat`]:
@@ -7707,7 +7682,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         let buf = call.dirent().ok_or(Errno::EFAULT)?.cast::<u8>();
         // Resolved before the real call: see `directory_device`.
         let device = self.directory_device(guest, call.fd() as RawFd).await?;
-        let lookup = self.directory_entry_lookup(guest, call.fd() as RawFd).await;
         self.serve_directory_stream(
             guest,
             GetdentsCall {
@@ -7715,7 +7689,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                 empty: Syscall::from(call.with_count(0)),
                 fd: call.fd() as i32,
                 device,
-                lookup,
                 buf,
                 capacity: call.count() as usize,
                 format: DirentFormat::Legacy,
@@ -7736,7 +7709,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         let buf = call.dirent().ok_or(Errno::EFAULT)?.cast::<u8>();
         // Resolved before the real call: see `directory_device`.
         let device = self.directory_device(guest, call.fd() as RawFd).await?;
-        let lookup = self.directory_entry_lookup(guest, call.fd() as RawFd).await;
         self.serve_directory_stream(
             guest,
             GetdentsCall {
@@ -7744,7 +7716,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                 empty: Syscall::from(call.with_count(0)),
                 fd: call.fd() as i32,
                 device,
-                lookup,
                 buf,
                 capacity: call.count() as usize,
                 format: DirentFormat::Dirent64,
@@ -7884,6 +7855,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                         })??;
                         self.move_directory_kernel_position(guest, call.fd, target)
                             .await;
+                        // Keyed now, as every snapshot is when it is
+                        // installed (see `Self::key_directory_snapshot`).
+                        self.key_directory_snapshot(guest, call).await?;
                     }
                     Ok(None) => return Ok(kernel.map(|_| 0)?),
                     Err(error) => return Err(error),
@@ -7907,37 +7881,35 @@ impl<T: RecordOrReplay> Detcore<T> {
     async fn serve_next_batch<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        mut call: GetdentsCall<'_>,
+        call: GetdentsCall<'_>,
     ) -> Result<i64, Error> {
+        self.key_directory_snapshot(guest, call).await?;
         let (start, batch, retirements) = guest.thread_state().with_detfd(call.fd, |detfd| {
             detfd.with_directory_stream(|stream| {
                 (
                     stream.position(),
-                    stream.next_batch(call.format, call.capacity),
+                    stream.next_batch(call.format, call.capacity).map(|batch| {
+                        let identities = stream.identities_of_next(batch.len());
+                        (batch, identities)
+                    }),
                     stream.snapshot_retirements(),
                 )
             })
         })??;
         let (passed, copied) = match batch {
-            Ok(batch) => {
+            Ok((batch, identities)) => {
                 let mut records = Vec::new();
                 let mut names = Vec::with_capacity(batch.len());
-                // On overlayfs, settled from the whole sorted snapshot, so
-                // that where the stream stands, and which entries the guest
-                // read before, do not change which entries are asked.
-                let told = if batch.is_empty() {
-                    Vec::new()
-                } else {
-                    self.settle_overlay_entry_lookup(guest, &mut call, None)
-                        .await?
+                // Keyed when the snapshot was installed (see
+                // `Self::key_directory_snapshot`). Only a descriptor that
+                // another thread replaced meanwhile, under
+                // --no-sequentialize-threads, serves entries without keys;
+                // they are keyed here, every one before the first numbering
+                // request (see `Self::directory_entry_identities`).
+                let identities = match identities {
+                    Some(identities) => identities,
+                    None => self.directory_entry_identities(guest, call, &batch).await?,
                 };
-                // Every entry's identity is resolved before the first
-                // numbering request, so a refused entry lookup consumes no
-                // number: how many a call consumes must not depend on which
-                // host lookup fails (see `Self::directory_entry_identities`).
-                let identities = self
-                    .directory_entry_identities(guest, &mut call, &batch, &told)
-                    .await?;
                 for (index, (entry, identity)) in batch.iter().zip(identities).enumerate() {
                     let (d_ino, _) = determinize_listed_inode(guest, identity, retirements).await;
                     let d_off = i64::try_from(start + index as u64 + 1).unwrap_or(i64::MAX);
@@ -7971,115 +7943,102 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(copied.map(|len| len as i64)?)
     }
 
+    /// Key every entry of the directory snapshot of `call.fd` by its own
+    /// `lstat` (see [`Self::directory_entry_identity`]), in the stream's
+    /// order, and keep the keys on the stream for every call that serves it,
+    /// unless that has been done since the snapshot was installed.
+    ///
+    /// The getdents that installs a snapshot calls this before it numbers or
+    /// returns anything, so each entry's `lstat` sees the file that the
+    /// snapshot's `d_ino` named. An entry served later, after its file has
+    /// lost its last name or its inode number has gone to another file, is
+    /// then numbered under the key it had when it was listed, as
+    /// `InodeSighting::Listed` expects. That costs the `lstat` of every entry
+    /// up front, also when the call returns only some entries, none
+    /// (`EINVAL`, or a count that does not fit in an `int`), or the end of
+    /// the directory. Every entry is keyed before any is numbered (see
+    /// [`Self::directory_entry_identities`]); a refused lookup leaves the
+    /// snapshot unkeyed, and a later call that serves it asks again.
+    async fn key_directory_snapshot<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: GetdentsCall<'_>,
+    ) -> Result<(), Error> {
+        let unkeyed = guest.thread_state().with_detfd(call.fd, |detfd| {
+            detfd.with_directory_stream(|stream| stream.unkeyed_entries())
+        })??;
+        let Some(entries) = unkeyed else {
+            return Ok(());
+        };
+        let identities = self
+            .directory_entry_identities(guest, call, &entries)
+            .await?;
+        // Under --no-sequentialize-threads another thread can replace the
+        // descriptor meanwhile; the stream keeps the keys only for the
+        // snapshot they were asked for.
+        let mut identities = Some(identities);
+        let _ = guest.thread_state().with_detfd(call.fd, |detfd| {
+            detfd.with_directory_stream(|stream| {
+                if let Some(identities) = identities.take() {
+                    stream.note_identities(&entries, identities);
+                }
+            })
+        });
+        Ok(())
+    }
+
     /// The raw identity that keys the deterministic inode of `entry`, read
     /// by `call` from the directory open as `call.fd`, whose device is
     /// `call.device` (see [`Self::directory_device`]).
     ///
     /// An entry's inode number is not always on the directory's device. On
     /// overlayfs with `xino=off` over layers on different filesystems, a
-    /// file's `d_ino` is its `st_ino`, but `stat` reports the layer's device.
-    /// So an entry that `call.lookup` asks (see [`EntryLookup`]) is `lstat`ed
-    /// relative to the descriptor, with `AT_SYMLINK_NOFOLLOW` because a
-    /// `d_ino` names a symbolic link itself, and `AT_NO_AUTOMOUNT` so that
-    /// asking mounts nothing. When that reports the entry's `d_ino`, the
-    /// device it reports keys the entry, so the guest's `d_ino` and `st_ino`
-    /// for the file agree, as they do natively. When it reports another
-    /// inode, `call.device` keys the entry: a mount point's entry names the
-    /// directory beneath the mount, and a btrfs subvolume's carries the
-    /// subvolume's id, and both differ from `st_ino` natively too. So does an
-    /// entry removed or replaced after the read. `call.device` also keys the
-    /// entry when the guest's filesystem answers that the name reaches
-    /// nothing (`ENOENT`, `ENOTDIR`, `ELOOP`, `ENAMETOOLONG`, or `EACCES`
-    /// from a directory that may be read but not searched). That is a guess,
-    /// not a proof. No `stat` through this name can contradict it, but the
-    /// same object may have another link, in a directory the guest can
-    /// search, whose `stat` reports it on another device; then the two views
-    /// key different identities. This is a known gap.
+    /// file's `d_ino` is its `st_ino`, but `stat` reports the layer's device;
+    /// so does a file or directory mounted over an entry whose root has the
+    /// entry's inode number, and a btrfs subvolume's root. So every entry, on
+    /// every filesystem and `.` and `..` included, is `lstat`ed relative to
+    /// the descriptor, with `AT_SYMLINK_NOFOLLOW` because a `d_ino` names a
+    /// symbolic link itself, and `AT_NO_AUTOMOUNT` so that asking mounts
+    /// nothing. When that reports the entry's `d_ino`, the device it reports
+    /// keys the entry, so the guest's `d_ino` and `st_ino` for the file agree,
+    /// as they do natively, and the entry has the key its `stat` gives it.
+    /// When it reports another inode, `call.device` keys the entry: a mount
+    /// point's entry names the directory beneath the mount, and a btrfs
+    /// subvolume's carries the subvolume's id, and both differ from `st_ino`
+    /// natively too. So does an entry removed or replaced after the read.
+    /// `call.device` also keys the entry when the guest's filesystem answers
+    /// that the name reaches nothing (`ENOENT`, `ENOTDIR`, `ELOOP`,
+    /// `ENAMETOOLONG`, or `EACCES` from a directory that may be read but not
+    /// searched). That is a guess, not a proof. No `stat` through this name
+    /// can contradict it, but the same object may have another link, in a
+    /// directory the guest can search, whose `stat` reports it on another
+    /// device; then the two views key different identities. This is a known
+    /// gap.
     ///
-    /// On overlayfs, `call.lookup` was settled before the first entry was
-    /// keyed (see [`Self::settle_overlay_entry_lookup`]), and an entry whose
-    /// `lstat` was asked for that, which is in `told` by name, is not asked
-    /// again: its answer keys it as a fresh one would.
-    ///
-    /// An entry's key depends only on its own answers, never on which
-    /// [`EntryLookup`] asked it. So on an overlay settled as
-    /// [`EntryLookup::OverlayLayerDevices`], an entry whose `lstat` reports
-    /// its `d_ino` is keyed on the device that `lstat` reports, a mount root
-    /// included (a file bind-mounted over the entry reports the mount's
-    /// source), as its `stat` and its `maps` line key it and as
-    /// [`EntryLookup::Every`] keys it, and nothing more is asked. Keying a
-    /// mount root on `call.device` there instead gave the guest a `d_ino`
-    /// other than its `st_ino` for the file, a key that depended on the
-    /// policy, which an inherited seccomp filter chooses, and an injected
-    /// mapping that [`EntryLookup::Every`] does not make, which on the KVM
-    /// backend moves where a later guest `mmap` lands (Codex review round 11
-    /// of https://github.com/rrnewton/hermit/pull/3255). A listing read
-    /// before such an overlay settles keys a mount root on `call.device`
-    /// (see [`Self::settle_overlay_entry_lookup`]), so on that kind of
-    /// overlay a mount root's key changes when the overlay settles: the first
-    /// class of the second known gap below.
-    ///
-    /// An entry that `call.lookup` does not ask is keyed on `call.device`
-    /// without a `stat`. Where its `lstat` would have reported its `d_ino` on
-    /// another device, the guest's `d_ino` and `st_ino` for it then differ
-    /// where Linux's agree. That is a second known gap, narrower than the
-    /// first: outside CephFS it needs an entry whose own `lstat` leaves the
-    /// directory's device and lands on the same inode number. The classes
-    /// are (1) a mount point, or a file bind-mounted over
-    /// another, whose mounted root or source file has the inode number of the
-    /// entry it covers. A filesystem's root has a small fixed number (1 on
-    /// procfs, sysfs and tmpfs, 2 on ext4, usually 128 on xfs, 256 on a btrfs
-    /// subvolume), so a mount of a whole filesystem needs a covered entry with
-    /// one of those numbers. On btrfs none is an ordinary entry's: every
-    /// number below 256 is reserved, and 256 is a subvolume's root, which is
-    /// asked. On ext4, 1 and 2 are reserved but 128 and 256 are ordinary, and
-    /// on tmpfs, procfs, sysfs or xfs an ordinary entry can have one. A bind
-    /// mount of a file, or of a directory other than its filesystem's root,
-    /// such as a container's `/etc/hosts` or a volume, can carry any number. A source on
-    /// the covered entry's own device has another number, or is the same file
-    /// and reports the same device. A source on another device collides in
-    /// two ways. By chance, when the numbers happen to coincide; btrfs makes
-    /// that likelier than it sounds, since each subvolume is its own device
-    /// and numbers its inodes from 256, and a snapshot keeps every number of
-    /// its source. And by identity: on an overlay whose layers share one
-    /// filesystem, and on one that folds for a file on the upper layer's
-    /// filesystem, an entry's `d_ino` is its backing file's inode number, so
-    /// that backing file, or a hard link to it, bound over the entry's own
-    /// path reports the same number on the layers' device; and on an overlay
-    /// that neither shares one filesystem nor folds, a file's `d_ino` is its
-    /// backing file's number too, which reports its layer's device. This
-    /// class is open wherever an entry is not asked: on btrfs, on an overlay
-    /// before it has settled and once it has settled as
-    /// [`EntryLookup::OverlayOwnDevice`], and on every filesystem that asks
-    /// only `..`; CephFS, and an overlay settled as
-    /// [`EntryLookup::OverlayLayerDevices`], ask every entry but `.` and
-    /// close it. (2) A filesystem other than overlayfs, CephFS
-    /// and btrfs whose `stat` reports a device per entry rather than its
-    /// superblock's, or an overlayfs whose devices do not follow the rules of
-    /// mainline's `ovl_map_dev_ino` that [`EntryLookup::Overlay`] relies on.
-    /// None is handled; bcachefs subvolumes and union filesystems
-    /// outside mainline, such as aufs and shiftfs, are not checked, and the
-    /// mainline filesystems checked are not all of them. FUSE, NFS and ecryptfs
-    /// report the superblock's device, and their submounts are mounts, class
-    /// (1).
+    /// The key depends on nothing but the entry's own `lstat`: no filesystem
+    /// type, mount-root question or mapping is consulted, and nothing one
+    /// entry or listing answered changes another's key. Detcore used to ask
+    /// only the entries that a filesystem's type said could be on another
+    /// device; Codex review round 12 of
+    /// https://github.com/rrnewton/hermit/pull/3255 found that this keyed an
+    /// unasked entry on `call.device` where its `lstat` reports another
+    /// device, and that on overlayfs which entries were asked depended on
+    /// what the run had listed before, so those shortcuts were removed and
+    /// every listing asks every entry. Nor is a first answer kept: when an
+    /// entry's `lstat` answers differently in a later listing (one that finds
+    /// the file, then `EACCES` once its directory may no longer be searched),
+    /// the later listing keys it as that answer does.
     ///
     /// Any other failure is a refusal, and `ESRCH` its errno, as for every
     /// guest stat (see [`Self::stat_guest_path`]). The getdents has already
-    /// been issued then. Each entry asked costs one injected `fstatat`.
+    /// been issued then. Each entry costs one injected `fstatat`.
     async fn directory_entry_identity<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        call: &mut GetdentsCall<'_>,
+        call: GetdentsCall<'_>,
         entry: &DirEntry,
-        told: &[ToldEntry],
     ) -> Result<RawInode, Error> {
-        if !call.lookup.asks(entry) {
-            return Ok(RawInode::new(call.device, entry.ino));
-        }
-        let stat = match told.iter().find(|told| told.name == entry.name) {
-            Some(told) => told.stat,
-            None => Self::stat_guest_path_at(guest, StatAt::entry_of(call.fd), &entry.name).await?,
-        };
+        let stat = Self::stat_guest_path_at(guest, StatAt::entry_of(call.fd), &entry.name).await?;
         Ok(match stat {
             Some(stat) if stat.st_ino == entry.ino => RawInode::new(stat.st_dev, entry.ino),
             _ => RawInode::new(call.device, entry.ino),
@@ -8098,369 +8057,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     async fn directory_entry_identities<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        call: &mut GetdentsCall<'_>,
+        call: GetdentsCall<'_>,
         entries: &[DirEntry],
-        told: &[ToldEntry],
     ) -> Result<Vec<RawInode>, Error> {
         let mut identities = Vec::with_capacity(entries.len());
         for entry in entries {
-            identities.push(
-                self.directory_entry_identity(guest, call, entry, told)
-                    .await?,
-            );
+            identities.push(self.directory_entry_identity(guest, call, entry).await?);
         }
         Ok(identities)
-    }
-
-    /// Whether the entry `name` of the directory open as `dirfd`, whose
-    /// `lstat` reported `stat`, is on the mount the directory is on, asked by
-    /// a guest `statx(dirfd, name, AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT,
-    /// STATX_INO)` in a transient page. The last component of a path either
-    /// stays on its directory's mount or crosses onto a mount over it, whose
-    /// root it then is, so the entry is on the directory's mount exactly when
-    /// `statx` does not report `STATX_ATTR_MOUNT_ROOT` (Linux 5.8; `fs/stat.c`
-    /// sets it for the root of every mount, a file bind mount included).
-    ///
-    /// `Some(false)` when the entry is a mount root, and when the guest's
-    /// filesystem answers that the name now reaches another file than `stat`
-    /// described (the entry changed between the two calls), since then this
-    /// `lstat` says nothing about the directory's mount. `Some(true)` when
-    /// the kernel does not report the attribute (`stx_attributes_mask`
-    /// without it, before Linux 5.8): it cannot tell, and the answer is taken
-    /// as it was before this was asked.
-    ///
-    /// `None` when the question cannot be asked: the guest's `mmap` of the
-    /// page, its `statx` or its `munmap` fails with any errno but `ESRCH`, as
-    /// under a seccomp filter the launcher did not see (one that refuses
-    /// `statx` only in the container's mount namespace, Codex review round 11
-    /// of https://github.com/rrnewton/hermit/pull/3255, F4). A `statx` that
-    /// reports no file at a name whose `lstat` just answered is such a
-    /// failure too: a filter can return `ENOENT` or `EACCES` as well as
-    /// `EPERM`. The caller then keys the listing as [`EntryLookup::Every`]
-    /// does, which asks no such question. `ESRCH`, the thread being gone, is
-    /// that errno, as for the `lstat` (see [`Self::stat_guest_path_at`]).
-    ///
-    /// Asked only by [`Self::settle_overlay_entry_lookup`], for a candidate
-    /// whose `lstat` would settle an overlay as
-    /// [`EntryLookup::OverlayLayerDevices`]: at most once per candidate, and
-    /// on an overlay that settles, once per run for most overlays.
-    async fn entry_is_on_the_listed_mount<G: Guest<Self>>(
-        guest: &mut G,
-        dirfd: RawFd,
-        name: &[u8],
-        stat: &libc::stat,
-    ) -> Result<Option<bool>, Error> {
-        if name.contains(&0) {
-            return Ok(Some(false));
-        }
-        let cannot_ask = |step: &str, errno: Option<Errno>| {
-            info!(
-                "could not ask whether directory entry {:?} is a mount root ({step}: {errno:?}); \
-                 the listing is keyed as Every keys it",
-                String::from_utf8_lossy(name)
-            );
-            Ok(None)
-        };
-        let statx_offset = (name.len() + 1).next_multiple_of(8);
-        let len =
-            (statx_offset + std::mem::size_of::<libc::statx>()).next_multiple_of(host_page_size());
-        let page = match map_transient_page(guest, len).await {
-            Ok(page) => page,
-            Err(Errno::ESRCH) => return Err(Error::Errno(Errno::ESRCH)),
-            Err(errno) => return cannot_ask("mmap", Some(errno)),
-        };
-        // SAFETY: the offset is within the `len` bytes just mapped.
-        let statxptr = StatxPtr(unsafe { page.add(statx_offset) }.cast::<libc::statx>());
-        let asked = Self::statx_in_page(
-            guest,
-            StatAt::entry_of(dirfd),
-            name,
-            page,
-            statxptr,
-            StatxMask::STATX_INO,
-        )
-        .await;
-        let unmapped = unmap_transient_page(guest, page, len).await;
-        let statx = match asked {
-            Ok(Some(statx)) => statx,
-            Err(Errno::ESRCH) => return Err(Error::Errno(Errno::ESRCH)),
-            Ok(None) => return cannot_ask("statx reported no file", None),
-            Err(errno) => return cannot_ask("statx", Some(errno)),
-        };
-        match unmapped {
-            Ok(()) => {}
-            Err(Errno::ESRCH) => return Err(Error::Errno(Errno::ESRCH)),
-            Err(errno) => return cannot_ask("munmap", Some(errno)),
-        }
-        let device = libc::makedev(statx.stx_dev_major, statx.stx_dev_minor);
-        if (device, statx.stx_ino) != (stat.st_dev, stat.st_ino) {
-            trace!(
-                "directory entry {:?} names another file than its lstat did",
-                String::from_utf8_lossy(name)
-            );
-            return Ok(Some(false));
-        }
-        let mount_root = libc::STATX_ATTR_MOUNT_ROOT as u64;
-        if statx.stx_attributes_mask & mount_root == 0 {
-            return Ok(Some(true));
-        }
-        Ok(Some(statx.stx_attributes & mount_root == 0))
-    }
-
-    /// On overlayfs, settle which of two kinds the overlay `call` lists is
-    /// (see [`EntryLookup::Overlay`]) before any entry of the listing is
-    /// keyed, and return the `lstat` of each entry asked for that, by name,
-    /// for [`Self::directory_entry_identity`] to use. Any other
-    /// `call.lookup` is left as it is, and nothing is asked.
-    ///
-    /// The kind is a property of the overlay, so the first answer for an
-    /// overlay is kept for the whole run (see
-    /// [`GlobalRequest::SettleOverlayEntryLookup`]), and every descriptor,
-    /// tracked or not, every later open and every alias keys the overlay's
-    /// entries alike. Until it is settled, the entries that may tell (see
-    /// [`EntryLookup::may_tell_the_overlay_kind`]) are asked in sorted order
-    /// until one tells (see [`EntryLookup::learn`]). A candidate whose `lstat`
-    /// would settle [`EntryLookup::OverlayLayerDevices`] is first asked
-    /// whether it is the root of a mount (see
-    /// [`Self::entry_is_on_the_listed_mount`]): a file bind-mounted over a
-    /// merged entry is not a file of the overlay, and can report another
-    /// device with the entry's own number on an overlay of either kind, so a
-    /// mount root tells nothing. Without that, which directory of the overlay
-    /// the run listed first chose the kind, and with it the keys of the whole
-    /// overlay (Codex review round 9 of
-    /// https://github.com/rrnewton/hermit/pull/3255). The answer
-    /// [`EntryLookup::OverlayOwnDevice`] needs no such question: only a file
-    /// of the overlay reports the overlay's device. For a stream served from
-    /// its snapshot (`buffer` `None`), they are those of the whole sorted
-    /// snapshot, not of the guest's batch, so neither the stream's position
-    /// nor which entries the guest read before changes the answer, nor which
-    /// entries are asked. Before this was settled ahead of keying, the first
-    /// such entry the guest's reads reached decided, and an entry was keyed
-    /// on one device or another depending on the read
-    /// (https://github.com/rrnewton/hermit/pull/3255).
-    ///
-    /// A read with no snapshot, of a descriptor Detcore does not track or of
-    /// a directory read in host order, asks the entries of the one kernel
-    /// `buffer` it sorted. Where such a read is the first of an overlay in
-    /// the run, the answer can come from another file than a snapshot's
-    /// first, chosen by the host's order of the directory; the two answers
-    /// differ only where that file is a mount, the first class of the second
-    /// known gap at [`Self::directory_entry_identity`], and either one is
-    /// then kept for the rest of the run. That is a known gap.
-    ///
-    /// A listing none of whose entries tells is keyed as
-    /// [`EntryLookup::OverlayOwnDevice`], and nothing is settled, so a later
-    /// listing asks again. The entries that kind leaves unasked are then
-    /// directories, which report the overlay's device on every kind, files
-    /// whose `lstat` did not report their `d_ino`, which are keyed on the
-    /// directory's device either way, and mount roots, so the key is the one
-    /// either kind gives, but for a mount point (a directory, or a file
-    /// whose `lstat` reported its `d_ino` on another device as a mount
-    /// root): the first class of the second known gap again, keyed on the
-    /// directory's device in such a listing and on its `lstat`'s device once
-    /// the overlay has settled as [`EntryLookup::OverlayLayerDevices`], as
-    /// its `stat` and [`EntryLookup::Every`] key it (see
-    /// [`Self::directory_entry_identity`]). Such a listing cannot key the
-    /// file otherwise: it is the same, answer for answer, as one of an
-    /// overlay whose layers share one filesystem, where the file is bound
-    /// over the same way and which settles as
-    /// [`EntryLookup::OverlayOwnDevice`], keying it on the directory's device
-    /// in every listing. Keying it on the directory's device once the overlay
-    /// has settled as [`EntryLookup::OverlayLayerDevices`] too, so that its
-    /// key would not change when the overlay settles (Codex review round 10
-    /// of https://github.com/rrnewton/hermit/pull/3255), made the settled
-    /// listing disagree with the file's `stat` and with
-    /// [`EntryLookup::Every`] (round 11 of the same review).
-    ///
-    /// The overlay is known by the raw device its directories report, which
-    /// Linux gives no other mounted filesystem while it is mounted; a device
-    /// number reused by another overlay after an unmount within one run
-    /// would inherit the first one's answer.
-    ///
-    /// A mount-root question that cannot be asked (see
-    /// [`Self::entry_is_on_the_listed_mount`]) keys the listing as
-    /// [`EntryLookup::Every`] keys it, which asks every entry's `lstat` and no
-    /// mount-root question: the narrow policies are an optimization of
-    /// `Every`, so a refusal of a question only they ask gives the guest
-    /// exactly `Every`'s identities and the guest continues (Codex review
-    /// round 11 of https://github.com/rrnewton/hermit/pull/3255, F4), where
-    /// the refusal used to end the guest. The refusal is no evidence of the
-    /// overlay's kind, so nothing is settled and nothing is kept on the
-    /// descriptor: the same refusal at the same point of a later listing
-    /// gives the same keys. The `lstat`s asked before it are reused, and the
-    /// listing asks for the same numbers, in the same order, as under
-    /// `Every`, so no inode number is spent that `Every` does not spend.
-    ///
-    /// A failed `lstat` that [`Self::directory_entry_identity`] would refuse
-    /// is the same refusal here, before any numbering request.
-    async fn settle_overlay_entry_lookup<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-        call: &mut GetdentsCall<'_>,
-        buffer: Option<&[DirEntry]>,
-    ) -> Result<Vec<ToldEntry>, Error> {
-        let mut told = Vec::new();
-        if call.lookup != EntryLookup::Overlay {
-            return Ok(told);
-        }
-        let mut settled = settle_overlay_entry_lookup(guest, call.device, None).await;
-        if settled.is_none() {
-            let candidates: Vec<DirEntry> = match buffer {
-                Some(buffer) => buffer
-                    .iter()
-                    .filter(|entry| EntryLookup::may_tell_the_overlay_kind(entry))
-                    .cloned()
-                    .collect(),
-                None => guest.thread_state().with_detfd(call.fd, |detfd| {
-                    detfd.with_directory_stream(|stream| {
-                        stream
-                            .entries()
-                            .iter()
-                            .filter(|entry| EntryLookup::may_tell_the_overlay_kind(entry))
-                            .cloned()
-                            .collect()
-                    })
-                })??,
-            };
-            for entry in candidates {
-                let stat =
-                    Self::stat_guest_path_at(guest, StatAt::entry_of(call.fd), &entry.name).await?;
-                let mut shown = stat
-                    .as_ref()
-                    .map(|stat| EntryLookup::Overlay.learn(&entry, stat, call.device))
-                    .filter(|shown| *shown != EntryLookup::Overlay);
-                // Only a file of the overlay itself tells which kind it is. A
-                // mount over the entry (a file bind-mounted over it) can show
-                // another device with the entry's number on either kind, but
-                // never the overlay's own, so only that answer is checked.
-                let mut refused = false;
-                if let (Some(EntryLookup::OverlayLayerDevices), Some(lstat)) = (shown, &stat) {
-                    match Self::entry_is_on_the_listed_mount(guest, call.fd, &entry.name, lstat)
-                        .await?
-                    {
-                        Some(true) => {}
-                        Some(false) => shown = None,
-                        None => refused = true,
-                    }
-                }
-                told.push(ToldEntry {
-                    name: entry.name,
-                    stat,
-                });
-                if refused {
-                    // The question this policy asks beyond `Every`'s was
-                    // refused: this listing is keyed as `Every` keys it, and
-                    // nothing is settled or kept, so a later listing asks
-                    // again.
-                    call.lookup = EntryLookup::Every;
-                    return Ok(told);
-                }
-                if let Some(shown) = shown {
-                    settled = settle_overlay_entry_lookup(guest, call.device, Some(shown)).await;
-                    break;
-                }
-            }
-        }
-        match settled {
-            Some(lookup) => {
-                call.lookup = lookup;
-                // A descriptor Detcore does not track has nowhere to keep it.
-                let _ = guest
-                    .thread_state()
-                    .with_detfd(call.fd, |detfd| detfd.set_directory_entry_lookup(lookup));
-            }
-            None => call.lookup = EntryLookup::OverlayOwnDevice,
-        }
-        Ok(told)
-    }
-
-    /// Which entries of the directory open as `fd` are `lstat`ed for the
-    /// device their inode number is on (see [`EntryLookup`]), from the type
-    /// of the directory's filesystem. A descriptor Detcore tracks keeps the
-    /// answer on its open file description, so it is asked once per open
-    /// directory, along with an overlay's settled kind (see
-    /// [`Self::settle_overlay_entry_lookup`]); for any other descriptor, each
-    /// getdents asks an injected `fstatfs` (see
-    /// [`Self::inject_fstatfs_type`]) and the overlay's settled kind afresh.
-    ///
-    /// Asking every entry is never less faithful than asking fewer: an entry
-    /// whose `lstat` does not report its `d_ino` is keyed on the directory's
-    /// device either way. So when the `fstatfs` fails or cannot be asked (an
-    /// unwritable stack scratch, for example), every entry is asked, as
-    /// before the type was consulted, and nothing is cached; the failure
-    /// never becomes the getdents' result.
-    ///
-    /// The `fstatfs` is a syscall the guest never made, run in the guest's
-    /// thread under every seccomp filter the guest runs under, and a filter's
-    /// verdict on it is not always an errno Detcore can fall back from:
-    ///
-    /// - `SECCOMP_RET_ERRNO` fails the call, and every entry is asked, as
-    ///   above.
-    /// - `SECCOMP_RET_TRAP` skips the call and sends the thread a `SIGSYS`;
-    ///   the ptrace backend reports `ENOSYS` and requeues the signal to the
-    ///   guest, which by default dies of it.
-    /// - `SECCOMP_RET_KILL_THREAD` and `SECCOMP_RET_KILL_PROCESS` kill before
-    ///   Detcore sees any result.
-    ///
-    /// The last two would make a listing signal or kill a program that runs
-    /// natively. So the `fstatfs`, and on an overlay the `mmap`, `statx` and
-    /// `munmap` with which [`Self::entry_is_on_the_listed_mount`] asks whether
-    /// an entry is a mount root, are injected only where the launcher found
-    /// that no filter may refuse them: Detcore refuses a guest's own filter,
-    /// and the launcher sets
-    /// [`crate::Config::seccomp_may_refuse_entry_lookup_syscalls`] when a
-    /// filter of the process that starts the guest, which every guest it
-    /// starts inherits, may refuse one of those calls, or when it cannot tell
-    /// (that field says how it asks, and what its answer cannot show). Then
-    /// every entry is asked, none of those calls is injected, and nothing is
-    /// cached. A filter the launcher could not see that refuses one of them
-    /// with an errno anyway (one that answers differently in the container's
-    /// mount namespace, for example) costs only the narrowing: a refused
-    /// `fstatfs` asks every entry, as above, and a refused mount-root
-    /// question keys that listing as `Every` keys it (see
-    /// [`Self::settle_overlay_entry_lookup`]). The backend's own filter, such
-    /// as the ptrace backend's, lets Detcore's injections through. The
-    /// `fstatat` of each asked entry, the
-    /// `fstat` of a directory Detcore does not track (see
-    /// [`Self::directory_device`]), and the `mmap` and `munmap` of the private
-    /// mapping a directory snapshot is read into (see
-    /// [`Self::snapshot_directory_privately`]) are injected regardless, and a
-    /// filter that traps or kills those still signals or kills the guest;
-    /// Detcore injects all four numbers for other guest calls too.
-    ///
-    /// The getdents handlers call this before the real call, after
-    /// [`Self::directory_device`].
-    async fn directory_entry_lookup<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-        fd: RawFd,
-    ) -> EntryLookup {
-        if guest.config().seccomp_may_refuse_entry_lookup_syscalls {
-            return EntryLookup::Every;
-        }
-        let cached = guest
-            .thread_state()
-            .with_detfd(fd, |detfd| detfd.directory_entry_lookup());
-        if let Ok(Some(lookup)) = cached {
-            return lookup;
-        }
-        match Self::inject_fstatfs_type(guest, fd).await {
-            Ok(f_type) => {
-                let lookup = EntryLookup::of_filesystem(f_type);
-                // A descriptor Detcore does not track has nowhere to keep it.
-                let _ = guest
-                    .thread_state()
-                    .with_detfd(fd, |detfd| detfd.set_directory_entry_lookup(lookup));
-                lookup
-            }
-            Err(errno) => {
-                info!(
-                    "fstatfs of directory fd {} failed ({}); every entry's lstat is asked.",
-                    fd, errno
-                );
-                EntryLookup::Every
-            }
-        }
     }
 
     /// The host device of the directory open as `fd`, which keys an entry's
@@ -8538,7 +8142,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     async fn sort_one_buffer<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        mut call: GetdentsCall<'_>,
+        call: GetdentsCall<'_>,
     ) -> Result<i64, Error> {
         let len = self.record_or_replay(guest, call.call).await? as usize;
         if len == 0 {
@@ -8547,11 +8151,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut entries = read_records(&guest.memory(), call.buf, len, call.format)?;
         sort_dir_entries(&mut entries);
         let mut records = Vec::with_capacity(len);
-        let told = self
-            .settle_overlay_entry_lookup(guest, &mut call, Some(&entries))
-            .await?;
         let identities = self
-            .directory_entry_identities(guest, &mut call, &entries, &told)
+            .directory_entry_identities(guest, call, &entries)
             .await?;
         for (entry, identity) in entries.iter().zip(identities) {
             let (d_ino, _) = determinize_named_inode(guest, identity).await;
@@ -9056,11 +8657,6 @@ struct GetdentsCall<'a> {
     /// another device (see `Detcore::directory_entry_identity`); resolved
     /// before the real call (see `Detcore::directory_device`).
     device: u64,
-    /// Which entries are `lstat`ed for that device at all; the others are
-    /// keyed on `device` (see `Detcore::directory_entry_lookup`). On
-    /// overlayfs it is settled before the first entry is keyed (see
-    /// `Detcore::settle_overlay_entry_lookup`).
-    lookup: EntryLookup,
     buf: AddrMut<'a, u8>,
     /// The guest's buffer size.
     capacity: usize,
@@ -9084,7 +8680,6 @@ impl<'a> GetdentsCall<'a> {
             empty: self.empty,
             fd: self.fd,
             device: self.device,
-            lookup: self.lookup,
             buf,
             capacity: count as usize,
             format: self.format,
@@ -10741,6 +10336,12 @@ pub(crate) mod inject_fstat_scratch {
         /// at position `n` of this log (from 0) is answered with
         /// `FIRST_SCRIPTED_INODE + n`, then and on every later request.
         pub(crate) determinized: std::sync::Mutex<Vec<RawInode>>,
+        /// A real `GlobalState` that answers `DeterminizeInode`,
+        /// `RetireInode`, `ForgetRetiredInode` and `RetirementCount` in place
+        /// of the scripted pool, when one is set, so that a test sees the
+        /// pool's own retirement and snapshot bookkeeping. Each
+        /// `DeterminizeInode` is still logged in `determinized`.
+        global: Option<GlobalState>,
         /// Whether `send_rpc` answers `DeterminizeDevice`. Off by default, so
         /// a test that expects no RPC still fails on one.
         pub(crate) answers_determinize_device: bool,
@@ -10777,14 +10378,6 @@ pub(crate) mod inject_fstat_scratch {
         /// `d_ino` of the entry `name`, for an inode number the test cannot
         /// give a file, such as a btrfs subvolume's.
         getdents_inode_answers: Vec<(Vec<u8>, u64)>,
-        /// (raw device, kind) of each overlay settled through
-        /// `SettleOverlayEntryLookup`, the first answer for a device kept, as
-        /// `GlobalState` keeps it. `send_rpc` answers that request always:
-        /// only a listing on overlayfs sends it.
-        settled_overlays: std::sync::Mutex<Vec<(u64, EntryLookup)>>,
-        /// (raw device, proposal) of each `SettleOverlayEntryLookup` request,
-        /// in order.
-        settle_requests: std::sync::Mutex<Vec<(u64, Option<EntryLookup>)>>,
     }
 
     /// The deterministic inode `send_rpc` gives the first `DeterminizeInode`
@@ -10841,6 +10434,7 @@ pub(crate) mod inject_fstat_scratch {
                 closed: Vec::new(),
                 answers_determinize_inode: false,
                 determinized: std::sync::Mutex::new(Vec::new()),
+                global: None,
                 answers_determinize_device: false,
                 determinized_devices: std::sync::Mutex::new(Vec::new()),
                 detlog_regions: None,
@@ -10852,8 +10446,6 @@ pub(crate) mod inject_fstat_scratch {
                 fstatfs_traps: false,
                 sigsys_queued: 0,
                 getdents_inode_answers: Vec::new(),
-                settled_overlays: std::sync::Mutex::new(Vec::new()),
-                settle_requests: std::sync::Mutex::new(Vec::new()),
             };
             (tool, guest)
         }
@@ -10896,6 +10488,21 @@ pub(crate) mod inject_fstat_scratch {
             &self,
             message: <GlobalState as GlobalTool>::Request,
         ) -> <GlobalState as GlobalTool>::Response {
+            if let Some(global) = &self.global {
+                let from = Pid::from_raw(self.thread.dettid.as_raw());
+                match &message.2 {
+                    GlobalRequest::DeterminizeInode(raw, _, _) => {
+                        self.determinized.lock().unwrap().push(*raw);
+                        return global.receive_rpc(from, message).await;
+                    }
+                    GlobalRequest::RetireInode(_)
+                    | GlobalRequest::ForgetRetiredInode(_)
+                    | GlobalRequest::RetirementCount => {
+                        return global.receive_rpc(from, message).await;
+                    }
+                    _ => {}
+                }
+            }
             match message.2 {
                 GlobalRequest::DeterminizeInode(raw, _, _) if self.answers_determinize_inode => (
                     None,
@@ -10936,26 +10543,6 @@ pub(crate) mod inject_fstat_scratch {
                 GlobalRequest::TouchFile(raw) if self.answers_touch_file => {
                     self.touched.lock().unwrap().push(raw);
                     (None, GlobalResponse::TouchFile(()))
-                }
-                GlobalRequest::SettleOverlayEntryLookup(device, proposal) => {
-                    self.settle_requests
-                        .lock()
-                        .unwrap()
-                        .push((device, proposal));
-                    let mut settled = self.settled_overlays.lock().unwrap();
-                    let known = settled
-                        .iter()
-                        .find(|(seen, _)| *seen == device)
-                        .map(|(_, lookup)| *lookup);
-                    let answer = match (known, proposal) {
-                        (Some(known), _) => Some(known),
-                        (None, Some(proposal)) => {
-                            settled.push((device, proposal));
-                            Some(proposal)
-                        }
-                        (None, None) => None,
-                    };
-                    (None, GlobalResponse::SettleOverlayEntryLookup(answer))
                 }
                 request => panic!("fd registration must not send an RPC: {request:?}"),
             }
@@ -13869,13 +13456,9 @@ pub(crate) mod inject_fstat_scratch {
     // mount point, `vanished` for an entry removed after the read, and
     // `plain` is asked for real. Both getdents paths: a descriptor Detcore
     // does not track sorts one kernel buffer, and a tracked one is served
-    // from its directory stream. `.` is the open directory, which reports
-    // the overlay's device on every overlay, so it is not asked. `lower`,
-    // the first file below 2^32 in sorted order, is asked before any entry
-    // is keyed, and on its layer's device shows that this overlay reports a
-    // layer's device for every non-directory, so every entry but `.` is
-    // asked, `lower` keyed on the answer it already gave rather than asked
-    // twice, and a tracked descriptor keeps that.
+    // from its directory stream. Every entry, `.` included, is asked once,
+    // in sorted order, on every filesystem (the scripted overlayfs once
+    // chose a narrower policy), and no listing asks the filesystem type.
     #[tokio::test]
     async fn getdents_keys_each_entry_on_the_device_its_own_lstat_reports() {
         for tracked in [false, true] {
@@ -13883,7 +13466,7 @@ pub(crate) mod inject_fstat_scratch {
             let scratch = Pages::map(1, 1);
             let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
             guest.answers_determinize_inode = true;
-            // Overlayfs, where every entry but `.` is asked until one tells.
+            // Overlayfs, which once chose a narrower policy.
             guest.fstatfs_answer = Some(Ok(libc::OVERLAYFS_SUPER_MAGIC));
             if tracked {
                 tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
@@ -13915,9 +13498,6 @@ pub(crate) mod inject_fstat_scratch {
             let keyed_before = guest.determinized.lock().unwrap().len();
 
             let returned = getdents64_of(&tool, &mut guest, fd).await;
-            let cached = guest
-                .thread_state()
-                .with_detfd(fd, |detfd| detfd.directory_entry_lookup());
             close_unless_detcore_did(&guest, fd);
 
             assert!(
@@ -13945,19 +13525,22 @@ pub(crate) mod inject_fstat_scratch {
                 .collect();
             assert_eq!(
                 asked,
-                [&b"lower"[..], b"..", b"covered", b"plain", b"vanished"]
-                    .map(|name| (name, entry_lstat)),
-                "tracked {tracked}: one lstat of each entry but ., relative to the descriptor, \
-                 lower first to settle the overlay"
+                [
+                    &b"."[..],
+                    b"..",
+                    b"covered",
+                    b"lower",
+                    b"plain",
+                    b"vanished"
+                ]
+                .map(|name| (name, entry_lstat)),
+                "tracked {tracked}: one lstat of each entry, . included, in sorted order, \
+                 relative to the descriptor"
             );
-            let expected_cache = if tracked {
-                Ok(Some(EntryLookup::OverlayLayerDevices))
-            } else {
-                Err(Errno::EBADF)
-            };
             assert_eq!(
-                cached, expected_cache,
-                "tracked {tracked}: a tracked descriptor keeps what lower showed"
+                guest.fstatfs_calls,
+                Vec::new(),
+                "tracked {tracked}: no listing asks the filesystem type"
             );
         }
     }
@@ -13965,195 +13548,180 @@ pub(crate) mod inject_fstat_scratch {
     /// A `d_ino` below 2^32 that a scripted getdents64 gives a file.
     const SCRIPTED_FILE_INODE: u64 = 300;
 
-    // The coordinator's measurement of the gate above on overlayfs, where
-    // Podman's pinned root keeps `/tmp`: asking every entry still cost the
-    // 3000-entry `readdir_order` test 5.65 GiB under the test allocator,
-    // over the validation node's 4 GiB cap. An overlay with every layer on
-    // one filesystem, or one that folds its layers' inode numbers, reports
-    // its own device for each non-directory below 2^32. The first file whose
-    // `lstat` shows that (`lower`; the directory `covered`, which could not,
-    // is not asked for it) is asked before any entry is keyed, and leaves
-    // only `..` and the entries whose `d_ino` is at least 2^32 asked for
-    // their keys. `covered`, a mount point whose `lstat` reports another
-    // device with its `d_ino`, is keyed on the directory's device in every
-    // read of this overlay; when it was read before `lower` had decided
-    // anything, it was keyed on the other device, unlike in the rewound read
-    // below (https://github.com/rrnewton/hermit/pull/3255). `plain`, whose
-    // `lstat` would report another device, is not asked and keeps the
-    // directory's, while `vanished`, carrying a folded lower-layer number, is
-    // asked and keyed on the device its `lstat` reports. `covered` and
-    // `plain` answer as a mount from another filesystem with a coinciding
-    // number would, the first class of the second known gap at
-    // `Detcore::directory_entry_identity`: keeping the directory's device
-    // shows both that they are not asked and that the gap stays as
-    // documented, the same in every read. A tracked descriptor keeps what
-    // was settled, and a second read after a rewind uses it, even where
-    // `lower` would now tell otherwise. Both getdents paths.
-    #[tokio::test]
-    async fn getdents_on_an_overlay_that_keeps_its_files_asks_only_wide_entries_after_one() {
-        const FOLDED_LOWER_INODE: u64 = (1 << 33) | 302;
-        // Below 2^32 whatever the host's numbers, so that the second read
-        // does not ask it.
-        const COVERED_INODE: u64 = 299;
-        for tracked in [false, true] {
-            let (_dir, fd, _, device) = directory_with_entries();
-            let scratch = Pages::map(1, 1);
-            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
-            guest.answers_determinize_inode = true;
-            guest.fstatfs_answer = Some(Ok(libc::OVERLAYFS_SUPER_MAGIC));
-            if tracked {
-                tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
-                    .await
-                    .expect("precondition: Detcore tracks the directory");
+    /// Where the file that replaced a listed one is, once the rest of the
+    /// listing is read (see
+    /// [`getdents_keeps_a_cross_device_entry_across_inode_reuse_as_a_same_device_one`]).
+    #[derive(Clone, Copy, Debug)]
+    enum Replacement {
+        /// The new file took the listed file's name.
+        AtTheListedName,
+        /// The listed name is gone; the new file has a name of its own.
+        Elsewhere,
+    }
+
+    /// One run of the history in
+    /// [`getdents_keeps_a_cross_device_entry_across_inode_reuse_as_a_same_device_one`],
+    /// against a real pool: the numbers of `lower` and `plain` before the
+    /// snapshot (when `numbered_first`), of their replacements, of every
+    /// entry the rest of the listing shows, and of a file numbered after
+    /// it. `reused` gives each replacement its listed file's host inode.
+    async fn cross_device_reuse_history(
+        replacement: Replacement,
+        numbered_first: bool,
+        reused: bool,
+    ) -> Vec<(String, u64)> {
+        use crate::tool_global::determinize_named_inode;
+        use crate::tool_global::forget_retired_inode;
+        use crate::tool_global::retire_inode;
+
+        let (dir, fd, inodes, device) = directory_with_entries();
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        guest.answers_determinize_inode = true;
+        guest.global = Some(<GlobalState as GlobalTool>::init_global_state(&guest.config).await);
+        // Overlayfs, where `lower` reports its layer's device.
+        guest.fstatfs_answer = Some(Ok(libc::OVERLAYFS_SUPER_MAGIC));
+        tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
+            .await
+            .expect("precondition: Detcore tracks the directory");
+        guest.getdents_inode_answers = vec![(b"lower".to_vec(), SCRIPTED_FILE_INODE)];
+        let file = libc::S_IFREG | 0o644;
+        guest.fstatat_answers = vec![(
+            b"lower".to_vec(),
+            Ok(stat_answer(OTHER_DEVICE, SCRIPTED_FILE_INODE, file)),
+        )];
+        // `lower`'s file is on its layer's device, `plain`'s on the
+        // directory's.
+        let lower = RawInode::new(OTHER_DEVICE, SCRIPTED_FILE_INODE);
+        let plain = RawInode::new(device, inodes["plain"]);
+        let mut taken: Vec<u64> = inodes.values().copied().collect();
+        for name in [".", ".."] {
+            taken.push(std::fs::metadata(dir.path().join(name)).unwrap().ino());
+        }
+        let unused = taken.iter().max().unwrap() + 1;
+        let (new_lower, new_plain) = if reused {
+            (lower, plain)
+        } else {
+            (
+                RawInode::new(OTHER_DEVICE, SCRIPTED_FILE_INODE + 50),
+                RawInode::new(device, unused),
+            )
+        };
+        let mut numbers = Vec::new();
+        if numbered_first {
+            for (name, file) in [("lower before", lower), ("plain before", plain)] {
+                let (number, _) = determinize_named_inode(&mut guest, file).await;
+                numbers.push((name.to_owned(), number.as_raw()));
             }
-            guest.getdents_inode_answers = vec![
-                (b"..".to_vec(), SCRIPTED_PARENT_INODE),
-                (b"covered".to_vec(), COVERED_INODE),
-                (b"lower".to_vec(), SCRIPTED_FILE_INODE),
-                (b"plain".to_vec(), SCRIPTED_FILE_INODE + 1),
-                (b"vanished".to_vec(), FOLDED_LOWER_INODE),
-            ];
-            guest.fstatat_answers = vec![
-                (
-                    b"..".to_vec(),
-                    Ok(stat_answer(
-                        OTHER_DEVICE,
-                        SCRIPTED_PARENT_INODE,
-                        libc::S_IFDIR | 0o755,
-                    )),
-                ),
-                (
-                    b"covered".to_vec(),
-                    Ok(stat_answer(
-                        OTHER_DEVICE,
-                        COVERED_INODE,
-                        libc::S_IFDIR | 0o755,
-                    )),
-                ),
+        }
+        // The first read fits `.` and `..`: the stream's snapshot then holds
+        // the rest, `lower`'s and `plain`'s files included.
+        let first = getdents64_sized(&tool, &mut guest, fd, 48).await;
+        assert!(
+            matches!(first, Ok(48)),
+            "precondition: the first read returns . and .., {first:?}"
+        );
+        // Both files lose their last name, and the new files are opened and
+        // numbered.
+        retire_inode(&mut guest, lower).await;
+        retire_inode(&mut guest, plain).await;
+        for (name, file) in [("new lower", new_lower), ("new plain", new_plain)] {
+            forget_retired_inode(&mut guest, file).await;
+            let (number, _) = determinize_named_inode(&mut guest, file).await;
+            numbers.push((name.to_owned(), number.as_raw()));
+        }
+        guest.fstatat_answers = match replacement {
+            Replacement::AtTheListedName => vec![
                 (
                     b"lower".to_vec(),
-                    Ok(stat_answer(
-                        device,
-                        SCRIPTED_FILE_INODE,
-                        libc::S_IFREG | 0o644,
-                    )),
+                    Ok(stat_answer(new_lower.dev, new_lower.ino, file)),
                 ),
                 (
                     b"plain".to_vec(),
-                    Ok(stat_answer(
-                        OTHER_DEVICE,
-                        SCRIPTED_FILE_INODE + 1,
-                        libc::S_IFREG | 0o644,
-                    )),
+                    Ok(stat_answer(new_plain.dev, new_plain.ino, file)),
                 ),
-                (
-                    b"vanished".to_vec(),
-                    Ok(stat_answer(
-                        OTHER_DEVICE,
-                        FOLDED_LOWER_INODE,
-                        libc::S_IFREG | 0o644,
-                    )),
-                ),
-            ];
-            let asked_before = guest.fstatat_paths.len();
-            let keyed_before = guest.determinized.lock().unwrap().len();
+            ],
+            Replacement::Elsewhere => vec![
+                (b"lower".to_vec(), Err(Errno::ENOENT)),
+                (b"plain".to_vec(), Err(Errno::ENOENT)),
+            ],
+        };
+        let (rest, records) = getdents64_records_of(&tool, &mut guest, fd).await;
+        assert!(
+            rest.as_ref().is_ok_and(|len| *len > 0),
+            "precondition: the rest of the listing is read, {rest:?}"
+        );
+        let names: Vec<&[u8]> = records.iter().map(|(name, _)| name.as_slice()).collect();
+        assert_eq!(
+            names,
+            [&b"covered"[..], b"lower", b"plain", b"vanished"],
+            "precondition: the rest of the listing"
+        );
+        for (name, ino) in &records {
+            numbers.push((format!("listed {}", String::from_utf8_lossy(name)), *ino));
+        }
+        let later = RawInode::new(device, unused + 1);
+        let (number, _) = determinize_named_inode(&mut guest, later).await;
+        numbers.push(("later".to_owned(), number.as_raw()));
+        close_unless_detcore_did(&guest, fd);
+        numbers
+    }
 
-            let returned = getdents64_of(&tool, &mut guest, fd).await;
-            let cached = guest
-                .thread_state()
-                .with_detfd(fd, |detfd| detfd.directory_entry_lookup());
-            let asked_after_first = guest.fstatat_paths.len();
-            let keyed_after_first = guest.determinized.lock().unwrap().len();
-            let mut rewound_read = None;
-            if tracked {
-                // `lower` would now teach that the overlay reports a layer's
-                // device, which would ask `covered`, `lower` and every entry
-                // after it, were the stored answer not used.
-                let lower = guest
-                    .fstatat_answers
-                    .iter_mut()
-                    .find(|(name, _)| name == b"lower")
-                    .unwrap();
-                lower.1 = Ok(stat_answer(
-                    OTHER_DEVICE,
-                    SCRIPTED_FILE_INODE,
-                    libc::S_IFREG | 0o644,
-                ));
-                let rewound = tool
-                    .handle_lseek(
-                        &mut guest,
-                        syscalls::Lseek::new()
-                            .with_fd(fd)
-                            .with_offset(0)
-                            .with_whence(Whence::SEEK_SET),
-                    )
-                    .await;
-                assert_eq!(rewound.ok(), Some(0), "the stream rewinds");
-                rewound_read = Some(getdents64_of(&tool, &mut guest, fd).await);
-            }
-            close_unless_detcore_did(&guest, fd);
-
-            assert!(
-                returned.as_ref().is_ok_and(|len| *len > 0),
-                "tracked {tracked}: {returned:?}"
-            );
-            let keyed =
-                guest.determinized.lock().unwrap()[keyed_before..keyed_after_first].to_vec();
-            let first_keys = [
-                RawInode::new(OTHER_DEVICE, SCRIPTED_PARENT_INODE),
-                RawInode::new(device, COVERED_INODE),
-                RawInode::new(device, SCRIPTED_FILE_INODE),
-                RawInode::new(device, SCRIPTED_FILE_INODE + 1),
-                RawInode::new(OTHER_DEVICE, FOLDED_LOWER_INODE),
-            ];
-            assert_eq!(
-                keyed.get(1..),
-                Some(&first_keys[..]),
-                "tracked {tracked}: .., covered, lower, plain and vanished, after ."
-            );
-            assert_eq!(
-                entries_asked(&guest, fd, asked_before)[..asked_after_first - asked_before],
-                ["lower", "..", "vanished"],
-                "tracked {tracked}: lower settles the overlay, then only .. and the entries \
-                 at or above 2^32 are asked"
-            );
-            let expected_cache = if tracked {
-                Ok(Some(EntryLookup::OverlayOwnDevice))
-            } else {
-                Err(Errno::EBADF)
-            };
-            assert_eq!(
-                cached, expected_cache,
-                "tracked {tracked}: a tracked descriptor keeps what lower showed"
-            );
-            if let Some(again) = rewound_read {
-                assert!(again.as_ref().is_ok_and(|len| *len > 0), "{again:?}");
-                assert_eq!(
-                    entries_asked(&guest, fd, asked_after_first),
-                    ["..", "vanished"],
-                    "the second read asks what the stored answer asks"
-                );
-                let keyed = guest.determinized.lock().unwrap()[keyed_after_first..].to_vec();
-                assert_eq!(
-                    keyed.get(1..),
-                    Some(
-                        &[
-                            RawInode::new(OTHER_DEVICE, SCRIPTED_PARENT_INODE),
-                            RawInode::new(device, COVERED_INODE),
-                            RawInode::new(device, SCRIPTED_FILE_INODE),
-                            RawInode::new(device, SCRIPTED_FILE_INODE + 1),
-                            RawInode::new(OTHER_DEVICE, FOLDED_LOWER_INODE),
-                        ][..]
-                    ),
-                    "the second read keys covered and lower on the directory's device, unasked"
-                );
-                assert_eq!(
-                    keyed.get(1..),
-                    Some(&first_keys[..]),
-                    "the rewound read keys every entry as the first read did"
-                );
+    // Main's pool keeps each directory-snapshot entry's own file across host
+    // inode reuse (`tool_global`'s
+    // `a_stale_directory_entry_keeps_its_file_after_the_inode_is_reused`,
+    // from the reviews of https://github.com/rrnewton/hermit/pull/3849): a
+    // program numbers file F, reads the start of F's directory, so that the
+    // stream's snapshot holds F's entry, unlinks F, creates and numbers G,
+    // then reads the rest of the listing. Whether or not the host gave G
+    // F's inode, F's entry must show the number F had when the snapshot was
+    // taken, never G's. Here the entries are keyed on their own `lstat`'s
+    // device, so the same must hold for an entry whose file is on another
+    // device than its directory, as on an overlay: `lower`, a file on its
+    // layer's device, must keep its number across inode reuse exactly as
+    // `plain`, a file on the directory's device, does. The new file takes
+    // the listed name, or the listed name is gone; F was numbered before
+    // the snapshot, or was not.
+    #[tokio::test]
+    async fn getdents_keeps_a_cross_device_entry_across_inode_reuse_as_a_same_device_one() {
+        let mut violations = Vec::new();
+        for replacement in [Replacement::AtTheListedName, Replacement::Elsewhere] {
+            for numbered_first in [true, false] {
+                let case = format!("{replacement:?}, numbered_first={numbered_first}");
+                let reused = cross_device_reuse_history(replacement, numbered_first, true).await;
+                let fresh = cross_device_reuse_history(replacement, numbered_first, false).await;
+                if reused != fresh {
+                    violations.push(format!(
+                        "{case}: host inode reuse changed a number: reused {reused:?}, \
+                         fresh {fresh:?}"
+                    ));
+                }
+                for history in [&reused, &fresh] {
+                    let number = |name: &str| {
+                        history
+                            .iter()
+                            .find(|(seen, _)| seen == name)
+                            .map(|(_, number)| *number)
+                    };
+                    for entry in ["lower", "plain"] {
+                        let listed = number(&format!("listed {entry}"));
+                        if listed == number(&format!("new {entry}")) {
+                            violations.push(format!(
+                                "{case}: {entry}'s listed entry took its new file's number: \
+                                 {history:?}"
+                            ));
+                        }
+                        if numbered_first && listed != number(&format!("{entry} before")) {
+                            violations.push(format!(
+                                "{case}: {entry}'s listed entry lost the number its file had \
+                                 when the snapshot was taken: {history:?}"
+                            ));
+                        }
+                    }
+                }
             }
         }
+        assert!(violations.is_empty(), "{violations:#?}");
     }
 
     /// The guest's `getdents64` of `fd` into a fresh buffer of `count` bytes.
@@ -14182,8 +13750,8 @@ pub(crate) mod inject_fstat_scratch {
         let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
         guest.answers_determinize_inode = true;
         guest.fstatfs_answer = Some(Ok(libc::OVERLAYFS_SUPER_MAGIC));
-        // Every number below 2^32, whatever the host's, so that only `..`
-        // is asked for its key on an overlay that keeps its files.
+        // Every number but `.`'s scripted, whatever the host's, so that each
+        // scripted `lstat` reports its entry's `d_ino`.
         guest.getdents_inode_answers = vec![
             (b"..".to_vec(), SCRIPTED_PARENT_INODE),
             (b"covered".to_vec(), SCRIPTED_FILE_INODE - 1),
@@ -14253,22 +13821,15 @@ pub(crate) mod inject_fstat_scratch {
     // overlay whose layers share one filesystem, every file reports the
     // overlay's device, but a file bind-mounted over a merged entry reports
     // the bind's source, here `plain` on `OTHER_DEVICE` with its `d_ino`.
-    // Such a file is keyed on the directory's device wherever it is not
-    // asked: the first class of the second known gap at
-    // `Detcore::directory_entry_identity`, which may stay but must be the
-    // same in every read. When the first file to reach keying decided how
-    // the overlay numbers its files, a read that reached `plain` before
-    // `lower` let `plain` decide, and keyed it on `OTHER_DEVICE`, where a
-    // sequential read keyed it on the directory's device: a read that seeks
-    // past `lower` after a buffer holding only `.` and `..`, the same
-    // through a duplicate of the descriptor, and a descriptor Detcore does
-    // not track read in buffers of one entry each. Now the overlay is
-    // settled before any entry is keyed, from its first file in sorted
-    // order, once per run, so all five reads key `plain` alike. A descriptor
-    // Detcore does not track read in such buffers before any other read of
-    // the overlay is the remaining gap, documented at
-    // `Detcore::settle_overlay_entry_lookup`: it is settled from whichever
-    // file the host returns first.
+    // When the first file to reach keying decided how the overlay numbers
+    // its files, a read that reached `plain` before `lower` let `plain`
+    // decide, and keyed it on `OTHER_DEVICE`, where a sequential read keyed
+    // it on the directory's device: a read that seeks past `lower` after a
+    // buffer holding only `.` and `..`, the same through a duplicate of the
+    // descriptor, and a descriptor Detcore does not track read in buffers of
+    // one entry each. Every listed entry is now keyed by its own `lstat` on
+    // every filesystem, so all five reads key `plain` alike, on the device
+    // its `lstat` reports, whatever was read before.
     #[tokio::test]
     async fn getdents_keys_an_overlay_entry_alike_whatever_was_read_before() {
         // Room for `.` and `..` (24 bytes each), not for `covered` too.
@@ -14397,11 +13958,11 @@ pub(crate) mod inject_fstat_scratch {
         keys.push(("untracked, whole", device, bound_file_keys(&guest, 0)));
         close_unless_detcore_did(&guest, fd);
 
-        for (read, device, keyed) in keys {
+        for (read, _, keyed) in keys {
             assert_eq!(
                 keyed,
-                [RawInode::new(device, BOUND_FILE_INODE)],
-                "{read}: plain is keyed once, on the directory's device, as in every read"
+                [RawInode::new(OTHER_DEVICE, BOUND_FILE_INODE)],
+                "{read}: plain is keyed once, on the device its lstat reports, as in every read"
             );
         }
     }
@@ -14454,27 +14015,20 @@ pub(crate) mod inject_fstat_scratch {
     }
 
     // Codex review of https://github.com/rrnewton/hermit/pull/3255, round 9,
-    // P1. The overlay's kind is settled once per run from the first file in
-    // sorted order whose `lstat` tells, but a file bind-mounted over a merged
-    // entry is not a file of the overlay: on an overlay whose layers share
-    // one filesystem it can report another device with the entry's own
-    // number, which reads as an overlay that reports a layer's device for
-    // every file. When it was taken as such, the kind of the whole overlay,
-    // and so the key of `lower` in `A`, depended on whether `A` or `B` was
-    // listed first, though both were read whole through tracked descriptors.
-    // A candidate that would settle `OverlayLayerDevices` is now asked
-    // whether it is the root of a mount (`STATX_ATTR_MOUNT_ROOT`), and a
-    // mount root tells nothing, so the overlay settles as it keeps its files
-    // in either order, from `plain` or from `B`'s `lower`, and `A`'s `lower`
-    // is keyed on the directory's device in every run: the first class of
-    // the second known gap at `Detcore::directory_entry_identity`, the same
-    // in every read. When `A` has no other file, its first listing settles
-    // nothing and is keyed as an overlay that keeps its files, which gives
-    // `lower` the same key. A kernel without the attribute (before Linux
-    // 5.8) cannot tell, and the answer is taken as before: the documented
-    // fallback.
+    // P1. A file bind-mounted over a merged entry is not a file of the
+    // overlay: on an overlay whose layers share one filesystem it can report
+    // another device with the entry's own number. When the overlay's kind
+    // was settled once per run from the first file in sorted order whose
+    // `lstat` told, such a file read as an overlay that reports a layer's
+    // device for every file, and the kind of the whole overlay, and so the
+    // key of `lower` in `A`, depended on whether `A` or `B` was listed first,
+    // though both were read whole through tracked descriptors. Every listed
+    // entry is now keyed by its own `lstat` on every filesystem, nothing is
+    // settled, and no entry is asked whether it is a mount root, so `A`'s
+    // `lower` is keyed once, on the device its `lstat` reports, in either
+    // order, whether `A` has another file (`ordinary`) or not.
     #[tokio::test]
-    async fn getdents_settles_an_overlay_alike_whichever_directory_is_read_first() {
+    async fn getdents_keys_a_bound_file_alike_whichever_overlay_directory_is_read_first() {
         for ordinary in [true, false] {
             let mut keys = Vec::new();
             for a_first in [true, false] {
@@ -14506,91 +14060,33 @@ pub(crate) mod inject_fstat_scratch {
                         read.as_ref().is_ok_and(|len| *len > 0),
                         "ordinary {ordinary}, A first {a_first}, A {a}: {read:?}"
                     );
+                    assert_eq!(
+                        guest.statx_paths[statx_before..],
+                        Vec::<Vec<u8>>::new(),
+                        "ordinary {ordinary}, A first {a_first}, A {a}: no entry is asked \
+                         whether it is a mount"
+                    );
                     if a {
                         lower_of_a = guest.determinized.lock().unwrap()[before..]
                             .iter()
                             .copied()
                             .filter(|raw| raw.ino == 300)
                             .collect();
-                        assert_eq!(
-                            guest.statx_paths[statx_before..],
-                            if a_first {
-                                vec![b"lower".to_vec()]
-                            } else {
-                                vec![]
-                            },
-                            "ordinary {ordinary}, A first {a_first}: only A's bound lower is \
-                             asked whether it is a mount, and only before the overlay settles"
-                        );
-                        if a_first {
-                            assert_eq!(
-                                guest.statx_starts.last(),
-                                Some(&(
-                                    fd,
-                                    AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_NO_AUTOMOUNT
-                                )),
-                                "the statx is asked as the lstat is, relative to the directory"
-                            );
-                        }
                     }
                 }
-                let proposals: Vec<Option<EntryLookup>> = guest
-                    .settle_requests
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .map(|(_, proposal)| *proposal)
-                    .collect();
-                assert!(
-                    !proposals.contains(&Some(EntryLookup::OverlayLayerDevices)),
-                    "ordinary {ordinary}, A first {a_first}: a mount root settled the overlay: \
-                     {proposals:?}"
-                );
-                assert!(
-                    proposals.contains(&Some(EntryLookup::OverlayOwnDevice)),
-                    "ordinary {ordinary}, A first {a_first}: the overlay settles as it keeps its \
-                     files: {proposals:?}"
-                );
                 keys.push((a_first, device, lower_of_a));
                 close_unless_detcore_did(&guest, fd_a);
                 close_unless_detcore_did(&guest, fd_b);
             }
-            for (a_first, device, keyed) in keys {
+            for (a_first, _, keyed) in keys {
                 assert_eq!(
                     keyed,
-                    [RawInode::new(device, 300)],
+                    [RawInode::new(OTHER_DEVICE, 300)],
                     "ordinary {ordinary}, A first {a_first}: A's lower is keyed once, on the \
-                     directory's device, whichever directory is read first"
+                     device its lstat reports, whichever directory is read first"
                 );
             }
         }
-    }
-
-    // The fallback of the test above: a kernel that does not report
-    // `STATX_ATTR_MOUNT_ROOT` (before Linux 5.8) cannot tell a mount root,
-    // and `A`'s bound `lower` settles the overlay as it did before the
-    // question was asked, as `Detcore::entry_is_on_the_listed_mount`
-    // documents.
-    #[tokio::test]
-    async fn getdents_takes_a_candidates_answer_where_the_kernel_cannot_tell_a_mount() {
-        let (_dir, fd, _, device) = directory_with_entries();
-        let scratch = Pages::map(1, 1);
-        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
-        guest.answers_determinize_inode = true;
-        guest.fstatfs_answer = Some(Ok(libc::OVERLAYFS_SUPER_MAGIC));
-        guest.statx_without_mount_root_attribute = true;
-        tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
-            .await
-            .expect("precondition: Detcore tracks the directory");
-        read_as_overlay_directory(&mut guest, true, true, device);
-        let read = getdents64_of(&tool, &mut guest, fd).await;
-        close_unless_detcore_did(&guest, fd);
-        assert!(read.as_ref().is_ok_and(|len| *len > 0), "{read:?}");
-        assert_eq!(guest.statx_paths, [b"lower".to_vec()]);
-        assert_eq!(
-            guest.settle_requests.lock().unwrap().last(),
-            Some(&(device, Some(EntryLookup::OverlayLayerDevices)))
-        );
     }
 
     /// Scripted answers that make the directory read next stand for one of
@@ -14641,39 +14137,23 @@ pub(crate) mod inject_fstat_scratch {
         guest.statx_mount_roots = if a { vec![b"lower".to_vec()] } else { vec![] };
     }
 
-    // Codex review of https://github.com/rrnewton/hermit/pull/3255, round
-    // 10, P1. On an overlay of the third kind, a directory whose only file
-    // is a mount root (`A`) settles nothing, so its listing is keyed as an
-    // overlay that keeps its files would key it, `lower` on the directory's
-    // device. Once another directory (`B`) had settled the overlay as one
-    // that reports a layer's device, a second read of `A` asked `lower` and
-    // keyed it on the device its `lstat` reports: the same file got two
-    // inode numbers in one run, and which one a read gave depended on the
-    // order in which the directories were listed. The round-10 fix asked
-    // such an entry whether it is a mount root on the settled overlay too,
-    // and keyed a mount root on the directory's device there as well.
-    //
-    // Round 11 of the same review, F1: that was the wrong identity. The
-    // file's `stat`, like its `maps` line and a listing under `Every`, keys
-    // it on the device its `lstat` reports, so the guest's `d_ino` for it
-    // differed from its `st_ino`, and from what a run whose inherited
-    // seccomp filter chooses `Every` lists. A listing of an overlay settled
-    // as reporting layer devices now keys each asked entry whose `lstat`
-    // reports its `d_ino` on that `lstat`'s device, a mount root included,
-    // and asks no mount-root question, so every read of `A` once the overlay
-    // has settled lists `lower` with the number its `stat` reports. Only the
-    // settle pass asks whether a file is a mount root, and a mount root is
-    // still no evidence there (round 9). The read of `A` before the overlay
-    // settles, when `A` is read first, still keys `lower` on the directory's
-    // device: that listing is the same, answer for answer, as `A`'s first
-    // listing without `plain` in
-    // `getdents_settles_an_overlay_alike_whichever_directory_is_read_first`,
-    // on an overlay whose layers share one filesystem, which settles as
-    // keeping its files and keys `lower` on the directory's device in every
-    // read. One listing cannot be keyed two ways, so that read keeps that
-    // key: the first class of the second known gap at
-    // `Detcore::directory_entry_identity`, on a listing read before the
-    // overlay settles. (The test's name records the round-10 intent.)
+    // Codex review of https://github.com/rrnewton/hermit/pull/3255, rounds
+    // 10, 11, 11b and 12 (F1). On an overlay whose `lstat` reports a layer's
+    // device for a lower-layer file, `A`'s only file, `lower`, is a mount
+    // root: a lower-layer file with a hard link to it bound over its path,
+    // so its `lstat` reports its `d_ino` on the layer's device. Round 10
+    // found that `lower` got two inode numbers in one run, depending on
+    // whether another directory (`B`) had been listed first; round 11 found
+    // that the key a listing gave it was not the one its `stat` uses; round
+    // 11b required one key in every read, in either order; round 12 let the
+    // key depend on the order again (the directory's device before `B` was
+    // listed, the layer's device after). Every listed entry is now keyed by
+    // its own `lstat` on every filesystem, so every read of `A`, in either
+    // order, keys `lower` on the device its `lstat` reports, the key its
+    // `stat` uses, and lists it with the `d_ino` that its `stat` reports as
+    // `st_ino`; and no listing asks whether an entry is a mount root. (The
+    // name records the round-10 scenario: an overlay whose `lstat` reports
+    // layer devices, read before and after another directory of it.)
     #[tokio::test]
     async fn getdents_keys_a_mount_root_alike_before_and_after_an_overlay_settles_layer_devices() {
         for a_first in [true, false] {
@@ -14701,12 +14181,6 @@ pub(crate) mod inject_fstat_scratch {
             let mut asked_whether_mounts = Vec::new();
             for &(a, fd) in order {
                 read_as_layered_overlay_directory(&mut guest, a, device);
-                let settled = guest
-                    .settled_overlays
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|(overlay, _)| *overlay == device);
                 if a && a_reads > 0 {
                     let rewound = tool
                         .handle_lseek(
@@ -14727,14 +14201,16 @@ pub(crate) mod inject_fstat_scratch {
                     "A first {a_first}, A {a}: {read:?}"
                 );
                 let keyed = guest.determinized.lock().unwrap()[before..].to_vec();
-                asked_whether_mounts.push((a, settled, guest.statx_paths[statx_before..].to_vec()));
+                asked_whether_mounts.push((a, guest.statx_paths[statx_before..].to_vec()));
                 if a {
                     a_reads += 1;
                     let keyed: Vec<RawInode> =
                         keyed.into_iter().filter(|raw| raw.ino == 300).collect();
-                    lower_of_a.push((settled, listed_inode(&records, b"lower"), keyed));
+                    lower_of_a.push((listed_inode(&records, b"lower"), keyed));
                 } else {
-                    lower_of_b.extend(keyed.into_iter().filter(|raw| raw.ino == 400));
+                    let keyed: Vec<RawInode> =
+                        keyed.into_iter().filter(|raw| raw.ino == 400).collect();
+                    lower_of_b.push(keyed);
                 }
             }
             close_unless_detcore_did(&guest, fd_a);
@@ -14751,68 +14227,29 @@ pub(crate) mod inject_fstat_scratch {
                 .await
                 .expect("the stat of A's lower is determinized")
                 .inode;
-            let proposals: Vec<Option<EntryLookup>> = guest
-                .settle_requests
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|(_, proposal)| *proposal)
-                .collect();
-            assert!(
-                proposals.contains(&Some(EntryLookup::OverlayLayerDevices)),
-                "A first {a_first}: B settles the overlay as one that reports a layer's device: \
-                 {proposals:?}"
-            );
             assert_eq!(
                 lower_of_b,
-                [RawInode::new(OTHER_DEVICE, 400)],
-                "A first {a_first}: B's lower is keyed on its layer's device"
+                [vec![RawInode::new(OTHER_DEVICE, 400)]],
+                "A first {a_first}: B's lower is keyed once, on the layer's device its lstat \
+                 reports"
             );
             assert_eq!(
-                lower_of_a
-                    .iter()
-                    .map(|(settled, _, _)| *settled)
-                    .collect::<Vec<_>>(),
-                if a_first {
-                    vec![false, true]
-                } else {
-                    vec![true]
-                },
-                "A first {a_first}: A is read before the overlay settles only when it is read first"
+                a_reads,
+                if a_first { 2 } else { 1 },
+                "precondition: A is read twice when it is read first"
             );
-            for (settled, listed, keyed) in lower_of_a {
-                if settled {
-                    assert_eq!(
-                        listed, stat_of_lower,
-                        "A first {a_first}: once the overlay has settled, every read lists A's \
-                         bound lower with the d_ino its stat reports as st_ino"
-                    );
-                    assert_eq!(
-                        keyed,
-                        [RawInode::new(OTHER_DEVICE, 300)],
-                        "A first {a_first}: once the overlay has settled, A's bound lower is \
-                         keyed as its stat is, on the device its lstat reports"
-                    );
-                } else {
-                    assert_eq!(
-                        keyed,
-                        [RawInode::new(device, 300)],
-                        "A first {a_first}: before the overlay settles, A's bound lower is keyed \
-                         as an overlay that keeps its files keys it, on the directory's device"
-                    );
-                }
-            }
-            for (a, settled, asked) in asked_whether_mounts {
-                let expected = if settled {
-                    vec![]
-                } else {
-                    vec![b"lower".to_vec()]
-                };
+            assert_eq!(
+                lower_of_a,
+                vec![(stat_of_lower, vec![RawInode::new(OTHER_DEVICE, 300)]); a_reads],
+                "A first {a_first}: every read of A, whichever directory is read first, keys its \
+                 bound lower once, on the device its lstat reports, as its stat is keyed, and \
+                 lists it with the d_ino its stat reports as st_ino"
+            );
+            for (a, asked) in asked_whether_mounts {
                 assert_eq!(
-                    asked, expected,
-                    "A first {a_first}, A {a}, settled {settled}: only the settle pass asks \
-                     whether a file is a mount, once per candidate; a listing of the settled \
-                     overlay asks no entry"
+                    asked,
+                    Vec::<Vec<u8>>::new(),
+                    "A first {a_first}, A {a}: no listing asks whether an entry is a mount root"
                 );
             }
         }
@@ -14829,12 +14266,14 @@ pub(crate) mod inject_fstat_scratch {
     // it on the device its `lstat` reports, as a listing under `Every` does:
     // the guest's `d_ino` for the file differed from its `st_ino` and
     // depended on the policy, which the launcher's inherited seccomp filter
-    // chooses. The question also mapped a transient page that `Every` never
+    // chose. The question also mapped a transient page that `Every` never
     // maps, and on the KVM backend each mapping moves where a later guest
-    // `mmap` lands. A listing of the settled overlay now keys `lower` on the
-    // device its `lstat` reports and asks no mount-root question, so the
-    // guest reads the same records, and Detcore makes the same transient
-    // mappings, under either policy.
+    // `mmap` lands. Every listed entry is now keyed by its own `lstat` on
+    // every filesystem: nothing settles, `lower` is keyed on the device its
+    // `lstat` reports, and no entry is asked whether it is a mount root, so
+    // the guest reads the same records, and Detcore makes the same transient
+    // mappings, whatever `seccomp_may_refuse_entry_lookup_syscalls` says (it
+    // no longer chooses anything). The name records Codex's scenario.
     #[tokio::test]
     async fn getdents_keys_a_settled_layer_overlays_mount_root_as_stat_and_every_do() {
         let mut runs = Vec::new();
@@ -14858,17 +14297,6 @@ pub(crate) mod inject_fstat_scratch {
             assert!(
                 read.as_ref().is_ok_and(|len| *len > 0),
                 "Every {every}, B: {read:?}"
-            );
-            let settled = guest.settle_requests.lock().unwrap().last().copied();
-            assert_eq!(
-                settled,
-                if every {
-                    None
-                } else {
-                    Some((device, Some(EntryLookup::OverlayLayerDevices)))
-                },
-                "Every {every}: B settles the overlay as one that reports a layer's device, \
-                 where the overlay policy is used"
             );
 
             read_as_layered_overlay_directory(&mut guest, true, device);
@@ -14952,17 +14380,17 @@ pub(crate) mod inject_fstat_scratch {
     // Codex review of https://github.com/rrnewton/hermit/pull/3255, round
     // 11, F4. The launcher asks, in its own mount namespace, whether an
     // inherited seccomp filter may refuse the questions the narrow policies
-    // ask beyond `Every`'s. A supervisor that answers `statx` there but
-    // refuses it with `EPERM` in the container's namespace passes that
-    // question and then refuses the settle pass's mount-root question, and
+    // asked beyond `Every`'s. A supervisor that answers `statx` there but
+    // refuses it with `EPERM` in the container's namespace passed that
+    // question and then refused the settle pass's mount-root question, and
     // the refusal ended the guest; at the base, which asked inside the
-    // container, the run used `Every`, which asks no such question. The
-    // narrow policies are an optimization of `Every`, so a refused extra
-    // question (the `statx`, whatever its errno, or the `mmap` or `munmap`
-    // of its page) now keys the listing exactly as `Every` keys it and the
-    // guest continues. The refusal is no evidence of the overlay's kind and
-    // is not kept, so the next read asks again and gets the same keys, and
-    // no inode number is spent that `Every` does not spend.
+    // container, the run used `Every`, which asks no such question. Every
+    // listed entry is now keyed by its own `lstat` on every filesystem, so
+    // no listing asks a mount-root question or maps a page for one: with the
+    // same refusals scripted (the `statx`, whatever its errno, or the `mmap`
+    // or `munmap` of a page), each read keys the listing exactly as the
+    // reference run does, the guest continues, and no inode number is spent
+    // that the reference does not spend. The name records Codex's scenario.
     #[tokio::test]
     async fn getdents_keys_a_listing_as_every_does_when_its_mount_root_question_is_refused() {
         #[derive(Clone, Copy, Debug, PartialEq)]
@@ -14973,7 +14401,7 @@ pub(crate) mod inject_fstat_scratch {
             Mmap(Errno),
             Munmap(Errno),
         }
-        // The page `Detcore::entry_is_on_the_listed_mount` maps for a short
+        // The length of the page the mount-root question mapped for a short
         // name; the listing's snapshot is a larger mapping.
         let page = host_page_size();
         let mut runs = Vec::new();
@@ -15030,12 +14458,8 @@ pub(crate) mod inject_fstat_scratch {
                 let asked_whether_mounts = guest.statx_paths[statx_before..].to_vec();
                 assert_eq!(
                     asked_whether_mounts,
-                    match refused {
-                        Refused::NothingUnderEvery | Refused::Mmap(_) => Vec::<Vec<u8>>::new(),
-                        Refused::Statx(_) | Refused::Munmap(_) => vec![b"lower".to_vec()],
-                    },
-                    "{refused:?}, read {read}: only the first candidate is asked whether it \
-                     is a mount, in every read, since a refusal is not kept"
+                    Vec::<Vec<u8>>::new(),
+                    "{refused:?}, read {read}: no entry is asked whether it is a mount"
                 );
                 assert!(
                     keyed.contains(&RawInode::new(OTHER_DEVICE, 400)),
@@ -15054,23 +14478,6 @@ pub(crate) mod inject_fstat_scratch {
                     .collect();
                 reads.push((records, keyed));
             }
-            let proposals: Vec<_> = guest
-                .settle_requests
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(_, proposal)| proposal.is_some())
-                .copied()
-                .collect();
-            assert!(
-                proposals.is_empty(),
-                "{refused:?}: a refused question is no evidence of the overlay's kind: \
-                 {proposals:?}"
-            );
-            assert!(
-                guest.settled_overlays.lock().unwrap().is_empty(),
-                "{refused:?}: nothing is settled"
-            );
             close_unless_detcore_did(&guest, fd);
             runs.push((refused, reads));
         }
@@ -15099,8 +14506,8 @@ pub(crate) mod inject_fstat_scratch {
                 let (tool, mut guest) =
                     ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
                 guest.answers_determinize_inode = true;
-                // Overlayfs, where `lower` shows a layer's device for a file,
-                // so `plain` is asked.
+                // Overlayfs, which once chose a narrower policy; every entry
+                // is asked on every filesystem.
                 guest.fstatfs_answer = Some(Ok(libc::OVERLAYFS_SUPER_MAGIC));
                 if tracked {
                     tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
@@ -15172,16 +14579,884 @@ pub(crate) mod inject_fstat_scratch {
             .collect()
     }
 
-    // https://github.com/rrnewton/hermit/pull/3255 asked every entry's
-    // `lstat`, which cost the 3000-entry `readdir_order` test 5.9 GiB and
-    // triple its time. On btrfs only two kinds of entry can carry their
-    // `st_ino` on another device: `..` of a subvolume or mount root, and the
-    // entry of the first subvolume, whose id and root inode are both 256.
-    // Those are asked and keyed on the device their `lstat` reports; an
-    // entry whose `lstat` would report another device (`lower`) is not
-    // asked and keeps the directory's. Both getdents paths.
+    /// One `getdents64` call's observable effects, for comparing a listing
+    /// with Every's: the call's result, the records the guest read, the key
+    /// of each numbering request the call sent, in order, the syscalls it
+    /// injected, and the lengths of the anonymous mappings it made and
+    /// removed.
+    #[derive(Debug, PartialEq)]
+    struct ListingCall {
+        read: Result<i64, String>,
+        records: Vec<(Vec<u8>, u64)>,
+        keys: Vec<RawInode>,
+        injected: Vec<Sysno>,
+        mapped: Vec<usize>,
+        unmapped: Vec<usize>,
+    }
+
+    /// The guest's `getdents64` of `fd` into a fresh buffer of `count`
+    /// bytes, and its [`ListingCall`] effects.
+    async fn listing_call(
+        tool: &Detcore,
+        guest: &mut ScriptedGuest,
+        fd: RawFd,
+        count: usize,
+    ) -> ListingCall {
+        let keys_before = guest.determinized.lock().unwrap().len();
+        let injected_before = guest.injected.len();
+        let mapped_before = guest.mapped.len();
+        let unmapped_before = guest.unmapped.len();
+        let mut buffer = vec![0u8; count];
+        let read = tool
+            .handle_getdents64(
+                guest,
+                syscalls::Getdents64::new()
+                    .with_fd(u32::try_from(fd).unwrap())
+                    .with_dirent(AddrMut::from_raw(buffer.as_mut_ptr() as usize))
+                    .with_count(u32::try_from(count).unwrap()),
+            )
+            .await;
+        let records = match &read {
+            Ok(len) => DirentFormat::Dirent64
+                .parse(&buffer[..usize::try_from(*len).unwrap()])
+                .expect("the guest's buffer holds whole records")
+                .into_iter()
+                .map(|entry| (entry.name, entry.ino))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        let lengths = |mappings: &[(usize, usize)]| -> Vec<usize> {
+            mappings.iter().map(|(_, len)| *len).collect()
+        };
+        ListingCall {
+            read: read.map_err(|error| format!("{error:?}")),
+            records,
+            keys: guest.determinized.lock().unwrap()[keys_before..].to_vec(),
+            injected: guest.injected[injected_before..].to_vec(),
+            mapped: lengths(&guest.mapped[mapped_before..]),
+            unmapped: lengths(&guest.unmapped[unmapped_before..]),
+        }
+    }
+
+    /// The name of each record `call` returned, with the key of its
+    /// numbering request: one request per returned entry, in the order the
+    /// entries were returned.
+    fn keyed_names(call: &ListingCall) -> Vec<(String, RawInode)> {
+        assert_eq!(
+            call.keys.len(),
+            call.records.len(),
+            "one numbering request per returned entry: {call:?}"
+        );
+        call.records
+            .iter()
+            .zip(&call.keys)
+            .map(|((name, _), key)| (String::from_utf8_lossy(name).into_owned(), *key))
+            .collect()
+    }
+
+    /// `keys` in the form [`keyed_names`] returns.
+    fn named(keys: &[(&str, RawInode)]) -> Vec<(String, RawInode)> {
+        keys.iter()
+            .map(|(name, key)| ((*name).to_owned(), *key))
+            .collect()
+    }
+
+    /// Rewinds the directory stream of `fd` to its start.
+    async fn rewind(tool: &Detcore, guest: &mut ScriptedGuest, fd: RawFd) {
+        let rewound = tool
+            .handle_lseek(
+                guest,
+                syscalls::Lseek::new()
+                    .with_fd(fd)
+                    .with_offset(0)
+                    .with_whence(Whence::SEEK_SET),
+            )
+            .await;
+        assert_eq!(rewound.ok(), Some(0), "the stream rewinds");
+    }
+
+    /// Every's key for each entry of [`directory_with_entries`] as
+    /// [`read_as_layered_overlay_directory`] scripts `A`, in the stream's
+    /// order. `dot` is the directory's own inode.
+    fn every_keys_of_a(device: u64, dot: u64) -> Vec<(String, RawInode)> {
+        named(&[
+            (".", RawInode::new(device, dot)),
+            ("..", RawInode::new(OTHER_DEVICE, SCRIPTED_PARENT_INODE)),
+            ("covered", RawInode::new(device, 299)),
+            ("lower", RawInode::new(OTHER_DEVICE, 300)),
+            ("plain", RawInode::new(device, 301)),
+            ("vanished", RawInode::new(device, 302)),
+        ])
+    }
+
+    /// Ceph's `f_type`, which the classification removed in
+    /// https://github.com/rrnewton/hermit/pull/3255 mapped to `Every`.
+    const CEPH_SUPER_MAGIC: libc::__fsword_t = 0x00c3_6400;
+
+    /// The calls that classified a listing before every listed entry was
+    /// keyed by its own `lstat`: the `fstatfs` that chose a policy by
+    /// filesystem type, and the mount-root `statx` with the `mmap` and
+    /// `munmap` of the page it was asked in.
+    #[derive(Clone, Copy, Debug)]
+    enum ClassificationCall {
+        FilesystemType,
+        MountRootStatx,
+        MountRootPageMap,
+        MountRootPageUnmap,
+    }
+
+    impl ClassificationCall {
+        const ALL: [Self; 4] = [
+            Self::FilesystemType,
+            Self::MountRootStatx,
+            Self::MountRootPageMap,
+            Self::MountRootPageUnmap,
+        ];
+
+        /// Scripts the guest's filesystem as overlayfs, with this call
+        /// refused (`EPERM`, as a seccomp filter returns) or answered.
+        fn script(self, guest: &mut ScriptedGuest, refused: bool) {
+            let page = host_page_size();
+            guest.fstatfs_answer = Some(Ok(libc::OVERLAYFS_SUPER_MAGIC));
+            guest.entry_statx_error = None;
+            guest.mmap_error_of_len = None;
+            guest.munmap_error_of_len = None;
+            if refused {
+                match self {
+                    Self::FilesystemType => guest.fstatfs_answer = Some(Err(Errno::EPERM)),
+                    Self::MountRootStatx => guest.entry_statx_error = Some(Errno::EPERM),
+                    Self::MountRootPageMap => guest.mmap_error_of_len = Some((page, Errno::EPERM)),
+                    Self::MountRootPageUnmap => {
+                        guest.munmap_error_of_len = Some((page, Errno::EPERM))
+                    }
+                }
+            }
+        }
+    }
+
+    // Codex review of https://github.com/rrnewton/hermit/pull/3255, round
+    // 12, F1. A refused classification call made a listing fall back to
+    // `Every`, and an answered one let it settle the overlay and key by
+    // that, so an unchanged entry got Every's key in one listing and
+    // another key in the next. Each call that classified a listing (the
+    // `fstatfs` of the filesystem type; the mount-root `statx`, and the
+    // `mmap` and `munmap` of its page) is refused, then answered, then
+    // refused again, with the same `lstat` answers throughout: every
+    // listing keys every entry as Every does, on a descriptor Detcore
+    // tracks (rewound between listings) and on fresh ones it does not.
     #[tokio::test]
-    async fn getdents_on_btrfs_asks_only_the_parent_and_a_first_subvolume() {
+    async fn getdents_keys_every_listing_as_every_does_when_a_classification_call_is_refused_then_answered()
+     {
+        for call in ClassificationCall::ALL {
+            for tracked in [false, true] {
+                let (dir, fd, _, device) = directory_with_entries();
+                let dot = std::fs::metadata(dir.path()).unwrap().ino();
+                let scratch = Pages::map(1, 1);
+                let (tool, mut guest) =
+                    ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+                guest.answers_determinize_inode = true;
+                read_as_layered_overlay_directory(&mut guest, true, device);
+                if tracked {
+                    tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
+                        .await
+                        .expect("precondition: Detcore tracks the directory");
+                }
+                for (listing, refused) in [true, false, true].into_iter().enumerate() {
+                    call.script(&mut guest, refused);
+                    let listed_fd = if tracked {
+                        if listing > 0 {
+                            rewind(&tool, &mut guest, fd).await;
+                        }
+                        fd
+                    } else {
+                        std::fs::File::open(dir.path()).unwrap().into_raw_fd()
+                    };
+                    let listed = listing_call(&tool, &mut guest, listed_fd, page_size()).await;
+                    if !tracked {
+                        close_unless_detcore_did(&guest, listed_fd);
+                    }
+                    assert_eq!(
+                        keyed_names(&listed),
+                        every_keys_of_a(device, dot),
+                        "{call:?}, tracked {tracked}, listing {listing} (refused {refused}): \
+                         every entry is keyed as Every keys it"
+                    );
+                }
+                close_unless_detcore_did(&guest, fd);
+            }
+        }
+    }
+
+    // Codex review of https://github.com/rrnewton/hermit/pull/3255, round
+    // 12, S2. On an overlay whose files keep the overlay's device, a file
+    // bind-mounted over an entry whose `d_ino` is a low number (2 here, as
+    // a filesystem root's is) has its `lstat` report that number on another
+    // device. The policy for that kind of overlay asked no entry whose
+    // `d_ino` is below 2^32 and keyed it on the directory's device, while
+    // its `stat` keys it on the device its `lstat` reports. Every listed
+    // entry is now keyed by its own `lstat`: the bound file is keyed on its
+    // `lstat`'s device, every other entry as Every keys it, and the guest
+    // reads the `d_ino` that its `stat` reports as `st_ino`. Both getdents
+    // paths.
+    #[tokio::test]
+    async fn getdents_keys_a_low_inode_bind_mount_root_by_its_own_lstat_on_an_overlay_that_keeps_its_files()
+     {
+        for tracked in [false, true] {
+            let (dir, fd, inodes, device) = directory_with_entries();
+            let dot = std::fs::metadata(dir.path()).unwrap().ino();
+            let scratch = Pages::map(1, 1);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.answers_determinize_inode = true;
+            guest.answers_determinize_device = true;
+            guest.fstatfs_answer = Some(Ok(libc::OVERLAYFS_SUPER_MAGIC));
+            guest.getdents_inode_answers = vec![
+                (b"..".to_vec(), SCRIPTED_PARENT_INODE),
+                (b"lower".to_vec(), 2),
+            ];
+            guest.fstatat_answers = vec![
+                (
+                    b"..".to_vec(),
+                    Ok(stat_answer(
+                        OTHER_DEVICE,
+                        SCRIPTED_PARENT_INODE,
+                        libc::S_IFDIR | 0o755,
+                    )),
+                ),
+                (
+                    b"lower".to_vec(),
+                    Ok(stat_answer(OTHER_DEVICE, 2, libc::S_IFREG | 0o644)),
+                ),
+                (
+                    b"plain".to_vec(),
+                    Ok(stat_answer(device, inodes["plain"], libc::S_IFREG | 0o644)),
+                ),
+            ];
+            guest.statx_mount_roots = vec![b"lower".to_vec()];
+            if tracked {
+                tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
+                    .await
+                    .expect("precondition: Detcore tracks the directory");
+            }
+            let listed = listing_call(&tool, &mut guest, fd, page_size()).await;
+            close_unless_detcore_did(&guest, fd);
+            let stat_of_lower = tool
+                .determinize_stat(
+                    &mut guest,
+                    stat_answer(OTHER_DEVICE, 2, libc::S_IFREG | 0o644),
+                    None,
+                )
+                .await
+                .expect("the stat of the bound file is determinized")
+                .inode;
+            assert_eq!(
+                keyed_names(&listed),
+                named(&[
+                    (".", RawInode::new(device, dot)),
+                    ("..", RawInode::new(OTHER_DEVICE, SCRIPTED_PARENT_INODE)),
+                    ("covered", RawInode::new(device, inodes["covered"])),
+                    ("lower", RawInode::new(OTHER_DEVICE, 2)),
+                    ("plain", RawInode::new(device, inodes["plain"])),
+                    ("vanished", RawInode::new(device, inodes["vanished"])),
+                ]),
+                "tracked {tracked}: the low-inode bind-mount root is keyed on the device its \
+                 lstat reports, and every entry as Every keys it"
+            );
+            assert_eq!(
+                listed_inode(&listed.records, b"lower"),
+                stat_of_lower,
+                "tracked {tracked}: the guest reads the bound file's d_ino as its stat's st_ino"
+            );
+        }
+    }
+
+    /// A temporary directory holding the files `a` and `b`, whose records,
+    /// like those of `.` and `..`, take 24 bytes each, and its device.
+    fn directory_of_one_letter_names() -> (tempfile::TempDir, u64) {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a", "b"] {
+            std::fs::write(dir.path().join(name), b"").unwrap();
+        }
+        let device = std::fs::metadata(dir.path()).unwrap().dev();
+        (dir, device)
+    }
+
+    // Codex review of https://github.com/rrnewton/hermit/pull/3255, round
+    // 12, F4. A listing read one entry per call asked the mount-root
+    // question in a transient page on every call, so it mapped and unmapped
+    // pages that Every never maps, and kept each page whose unmapping
+    // failed; on the KVM backend each mapping moves where a later guest
+    // `mmap` lands. Read in 24-byte batches, one entry per call, `.` and
+    // `..` included, on an overlay whose `lstat` reports each file on a
+    // layer's device, with the question page's unmapping answered and
+    // refused: each call injects exactly what the same call of Every's
+    // listing injects, maps and unmaps nothing but the directory snapshot's
+    // buffer (on a descriptor Detcore does not track, nothing at all), and
+    // keys its entry as Every does.
+    #[tokio::test]
+    async fn getdents_in_one_entry_batches_maps_no_page_but_the_snapshot_and_injects_what_every_does()
+     {
+        let snapshot = usize::try_from(DIRECTORY_DRAIN_COUNT).unwrap();
+        for unmap_refused in [false, true] {
+            for tracked in [false, true] {
+                let (dir, device) = directory_of_one_letter_names();
+                let dot = std::fs::metadata(dir.path()).unwrap().ino();
+                let mut runs = Vec::new();
+                for every in [false, true] {
+                    let fd = std::fs::File::open(dir.path()).unwrap().into_raw_fd();
+                    let scratch = Pages::map(1, 1);
+                    let (tool, mut guest) =
+                        ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+                    guest.answers_determinize_inode = true;
+                    guest.config.seccomp_may_refuse_entry_lookup_syscalls = every;
+                    guest.fstatfs_answer = Some(Ok(libc::OVERLAYFS_SUPER_MAGIC));
+                    guest.getdents_inode_answers = vec![
+                        (b"..".to_vec(), SCRIPTED_PARENT_INODE),
+                        (b"a".to_vec(), 300),
+                        (b"b".to_vec(), 301),
+                    ];
+                    let layer_file =
+                        |ino: u64| Ok(stat_answer(OTHER_DEVICE, ino, libc::S_IFREG | 0o644));
+                    guest.fstatat_answers = vec![
+                        (
+                            b"..".to_vec(),
+                            Ok(stat_answer(
+                                OTHER_DEVICE,
+                                SCRIPTED_PARENT_INODE,
+                                libc::S_IFDIR | 0o755,
+                            )),
+                        ),
+                        (b"a".to_vec(), layer_file(300)),
+                        (b"b".to_vec(), layer_file(301)),
+                    ];
+                    if unmap_refused {
+                        guest.munmap_error_of_len = Some((host_page_size(), Errno::EPERM));
+                    }
+                    if tracked {
+                        tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
+                            .await
+                            .expect("precondition: Detcore tracks the directory");
+                    }
+                    let mut calls = Vec::new();
+                    while calls.len() < 8 {
+                        let call = listing_call(&tool, &mut guest, fd, 24).await;
+                        let last = call.read != Ok(24);
+                        calls.push(call);
+                        if last {
+                            break;
+                        }
+                    }
+                    close_unless_detcore_did(&guest, fd);
+                    let label =
+                        format!("every {every}, tracked {tracked}, unmap refused {unmap_refused}");
+                    let (last, batches) = calls.split_last().unwrap();
+                    assert_eq!(last.read, Ok(0), "{label}: the listing ends: {calls:?}");
+                    let mut keys: Vec<(String, RawInode)> = Vec::new();
+                    for batch in batches {
+                        assert_eq!(
+                            batch.records.len(),
+                            1,
+                            "{label}: one entry per call: {batch:?}"
+                        );
+                        keys.extend(keyed_names(batch));
+                    }
+                    keys.sort_by(|(one, _), (other, _)| one.cmp(other));
+                    assert_eq!(
+                        keys,
+                        named(&[
+                            (".", RawInode::new(device, dot)),
+                            ("..", RawInode::new(OTHER_DEVICE, SCRIPTED_PARENT_INODE)),
+                            ("a", RawInode::new(OTHER_DEVICE, 300)),
+                            ("b", RawInode::new(OTHER_DEVICE, 301)),
+                        ]),
+                        "{label}: each entry is keyed once, as Every keys it"
+                    );
+                    for call in &calls {
+                        assert!(
+                            call.mapped
+                                .iter()
+                                .chain(&call.unmapped)
+                                .all(|len| tracked && *len == snapshot),
+                            "{label}: a call maps and unmaps nothing but the directory snapshot's \
+                             buffer, and on an untracked descriptor nothing: {call:?}"
+                        );
+                        assert!(
+                            !call.injected.contains(&Sysno::statx)
+                                && !call.injected.contains(&Sysno::fstatfs),
+                            "{label}: no call asks a mount-root statx or the filesystem type: \
+                             {call:?}"
+                        );
+                    }
+                    let mut mapped: Vec<usize> = guest.mapped.iter().map(|(_, len)| *len).collect();
+                    let mut unmapped: Vec<usize> =
+                        guest.unmapped.iter().map(|(_, len)| *len).collect();
+                    mapped.sort();
+                    unmapped.sort();
+                    assert_eq!(mapped, unmapped, "{label}: every mapping is removed");
+                    runs.push(calls);
+                }
+                assert_eq!(
+                    runs[0], runs[1],
+                    "tracked {tracked}, unmap refused {unmap_refused}: each call returns, keys, \
+                     injects, maps and unmaps exactly what the same call of Every's listing does"
+                );
+            }
+        }
+    }
+
+    // Codex review of https://github.com/rrnewton/hermit/pull/3255, round
+    // 12, S4. On the KVM backend the transient page of the mount-root
+    // question came from the guest's own address space, so it moved where
+    // the guest's next `mmap` landed, under the overlay policies only.
+    // Codex's reproduction (an image ending at 0x3f6f8000 with a 1 GiB
+    // arena, an earlier page hole filled, then an 8 KiB guest `mmap`)
+    // needs a KVM guest with a chosen layout, which no test harness in this
+    // repository can boot, so it is not run. What it depends on is checked
+    // instead: whatever the question would have answered (not a mount root,
+    // a mount root, refused, or without the attribute in its mask), a
+    // listing of the overlay maps and unmaps nothing but the directory
+    // snapshot's buffer (on a descriptor Detcore does not track, nothing),
+    // asks no `statx` and no `fstatfs`, and injects exactly what Every's
+    // listing does.
+    #[tokio::test]
+    async fn getdents_on_an_overlay_maps_nothing_but_the_snapshot_whatever_a_mount_root_question_would_answer()
+     {
+        #[derive(Clone, Copy, Debug)]
+        enum Answer {
+            NotAMountRoot,
+            AMountRoot,
+            Refused,
+            WithoutTheAttribute,
+        }
+        let snapshot = usize::try_from(DIRECTORY_DRAIN_COUNT).unwrap();
+        for answer in [
+            Answer::NotAMountRoot,
+            Answer::AMountRoot,
+            Answer::Refused,
+            Answer::WithoutTheAttribute,
+        ] {
+            for tracked in [false, true] {
+                let (dir, first_fd, _, device) = directory_with_entries();
+                assert_eq!(unsafe { libc::close(first_fd) }, 0);
+                let mut runs = Vec::new();
+                for every in [false, true] {
+                    let fd = std::fs::File::open(dir.path()).unwrap().into_raw_fd();
+                    let scratch = Pages::map(1, 1);
+                    let (tool, mut guest) =
+                        ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+                    guest.answers_determinize_inode = true;
+                    guest.config.seccomp_may_refuse_entry_lookup_syscalls = every;
+                    guest.fstatfs_answer = Some(Ok(libc::OVERLAYFS_SUPER_MAGIC));
+                    read_as_layered_overlay_directory(&mut guest, true, device);
+                    match answer {
+                        Answer::NotAMountRoot => guest.statx_mount_roots.clear(),
+                        Answer::AMountRoot => {}
+                        Answer::Refused => guest.entry_statx_error = Some(Errno::EPERM),
+                        Answer::WithoutTheAttribute => {
+                            guest.statx_without_mount_root_attribute = true
+                        }
+                    }
+                    if tracked {
+                        tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
+                            .await
+                            .expect("precondition: Detcore tracks the directory");
+                    }
+                    let listed = listing_call(&tool, &mut guest, fd, page_size()).await;
+                    let end = listing_call(&tool, &mut guest, fd, page_size()).await;
+                    close_unless_detcore_did(&guest, fd);
+                    let label = format!("{answer:?}, tracked {tracked}, every {every}");
+                    assert!(
+                        listed.read.as_ref().is_ok_and(|len| *len > 0) && end.read == Ok(0),
+                        "{label}: {listed:?} then {end:?}"
+                    );
+                    let lengths = |mappings: &[(usize, usize)]| -> Vec<usize> {
+                        mappings.iter().map(|(_, len)| *len).collect()
+                    };
+                    let (mapped, unmapped) = (lengths(&guest.mapped), lengths(&guest.unmapped));
+                    assert!(
+                        mapped
+                            .iter()
+                            .chain(&unmapped)
+                            .all(|len| tracked && *len == snapshot)
+                            && mapped == unmapped,
+                        "{label}: the listing maps and unmaps nothing but the directory \
+                         snapshot's buffer, and on an untracked descriptor nothing: mapped \
+                         {mapped:?}, unmapped {unmapped:?}"
+                    );
+                    assert_eq!(
+                        guest.statx_paths,
+                        Vec::<Vec<u8>>::new(),
+                        "{label}: no mount-root statx"
+                    );
+                    assert_eq!(guest.fstatfs_calls, Vec::new(), "{label}: no fstatfs");
+                    runs.push([listed, end]);
+                }
+                assert_eq!(
+                    runs[0], runs[1],
+                    "{answer:?}, tracked {tracked}: the listing returns, keys, injects, maps and \
+                     unmaps exactly what Every's listing does"
+                );
+            }
+        }
+    }
+
+    // Codex review of https://github.com/rrnewton/hermit/pull/3255, round
+    // 12, S6. A mount-root `statx` whose answer lacks STATX_ATTR_MOUNT_ROOT
+    // in its attribute mask (kernels before 5.8 do not report it) was taken
+    // to say the entry is on the listed mount, and settled the overlay from
+    // it. Every listed entry is now keyed by its own `lstat`, with no
+    // `statx`: with the attribute missing from every mask, every entry is
+    // keyed as Every keys it and no `statx` is injected. Both getdents
+    // paths.
+    #[tokio::test]
+    async fn getdents_keys_as_every_does_and_asks_no_statx_when_mount_root_masks_lack_the_attribute()
+     {
+        for tracked in [false, true] {
+            let (dir, fd, _, device) = directory_with_entries();
+            let dot = std::fs::metadata(dir.path()).unwrap().ino();
+            let scratch = Pages::map(1, 1);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.answers_determinize_inode = true;
+            guest.fstatfs_answer = Some(Ok(libc::OVERLAYFS_SUPER_MAGIC));
+            read_as_layered_overlay_directory(&mut guest, true, device);
+            guest.statx_without_mount_root_attribute = true;
+            if tracked {
+                tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
+                    .await
+                    .expect("precondition: Detcore tracks the directory");
+            }
+            let listed = listing_call(&tool, &mut guest, fd, page_size()).await;
+            close_unless_detcore_did(&guest, fd);
+            assert_eq!(
+                keyed_names(&listed),
+                every_keys_of_a(device, dot),
+                "tracked {tracked}: every entry is keyed as Every keys it"
+            );
+            assert_eq!(
+                guest.statx_paths,
+                Vec::<Vec<u8>>::new(),
+                "tracked {tracked}: no statx is injected"
+            );
+        }
+    }
+
+    /// A step of a scripted listing history on a descriptor Detcore tracks.
+    #[derive(Clone, Copy, Debug)]
+    enum ListingStep {
+        /// A `getdents64` into a buffer of this many bytes.
+        Read(usize),
+        /// An `lseek(SEEK_SET)` of the stream to this position.
+        Seek(i64),
+    }
+
+    /// Runs `steps` on a fresh scripted guest over the directory at `path`,
+    /// configured by `script`, on a descriptor Detcore tracks, then lists the
+    /// directory whole twice, each time on a fresh descriptor it does not
+    /// track. With `every`, the guest's configuration says that the
+    /// launcher's seccomp filter may refuse the classification calls, which
+    /// chose `Every` for every listing before every listing was `Every`:
+    /// Every's reference run. Returns each read's effects and how many
+    /// SIGSYS the guest was sent.
+    async fn run_listing_history(
+        path: &std::path::Path,
+        script: &dyn Fn(&mut ScriptedGuest),
+        every: bool,
+        steps: &[ListingStep],
+    ) -> (Vec<ListingCall>, usize) {
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        guest.answers_determinize_inode = true;
+        guest.config.seccomp_may_refuse_entry_lookup_syscalls = every;
+        script(&mut guest);
+        let fd = std::fs::File::open(path).unwrap().into_raw_fd();
+        tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
+            .await
+            .expect("precondition: Detcore tracks the directory");
+        let mut calls = Vec::new();
+        for step in steps {
+            match *step {
+                ListingStep::Read(count) => {
+                    calls.push(listing_call(&tool, &mut guest, fd, count).await)
+                }
+                ListingStep::Seek(position) => {
+                    let sought = tool
+                        .handle_lseek(
+                            &mut guest,
+                            syscalls::Lseek::new()
+                                .with_fd(fd)
+                                .with_offset(position)
+                                .with_whence(Whence::SEEK_SET),
+                        )
+                        .await;
+                    assert_eq!(
+                        sought.ok(),
+                        Some(position),
+                        "the stream seeks to {position}"
+                    );
+                }
+            }
+        }
+        close_unless_detcore_did(&guest, fd);
+        for _ in 0..2 {
+            let untracked = std::fs::File::open(path).unwrap().into_raw_fd();
+            calls.push(listing_call(&tool, &mut guest, untracked, page_size()).await);
+            close_unless_detcore_did(&guest, untracked);
+        }
+        (calls, guest.sigsys_queued)
+    }
+
+    /// The scripted answers of
+    /// [`getdents_keys_and_numbers_as_every_does_through_a_scripted_listing_history`]:
+    /// `..` on another device, whose `lstat` matches its `d_ino`; `covered`,
+    /// whose `lstat` reports another inode than its `d_ino`; `lower` and
+    /// `plain`, two names of one file bound from another device (mount
+    /// aliases, both mount roots); and `vanished`, gone, with a `d_ino`
+    /// wider than 32 bits.
+    fn script_listing_history(guest: &mut ScriptedGuest, device: u64) {
+        let bound = || Ok(stat_answer(OTHER_DEVICE, 300, libc::S_IFREG | 0o644));
+        guest.getdents_inode_answers = vec![
+            (b"..".to_vec(), SCRIPTED_PARENT_INODE),
+            (b"covered".to_vec(), 299),
+            (b"lower".to_vec(), 300),
+            (b"plain".to_vec(), 300),
+            (b"vanished".to_vec(), WIDE_VANISHED_INODE),
+        ];
+        guest.fstatat_answers = vec![
+            (
+                b"..".to_vec(),
+                Ok(stat_answer(
+                    OTHER_DEVICE,
+                    SCRIPTED_PARENT_INODE,
+                    libc::S_IFDIR | 0o755,
+                )),
+            ),
+            (
+                b"covered".to_vec(),
+                Ok(stat_answer(device, 5000, libc::S_IFDIR | 0o755)),
+            ),
+            (b"lower".to_vec(), bound()),
+            (b"plain".to_vec(), bound()),
+            (b"vanished".to_vec(), Err(Errno::ENOENT)),
+        ];
+        guest.statx_mount_roots = vec![b"lower".to_vec(), b"plain".to_vec()];
+    }
+
+    /// `vanished`'s `d_ino` in [`script_listing_history`].
+    const WIDE_VANISHED_INODE: u64 = (1 << 33) | 302;
+
+    // Codex review of https://github.com/rrnewton/hermit/pull/3255, round
+    // 12, the invariant test it asked for. For each way the classification
+    // could go (an overlay, its `fstatfs` refused or trapped, its mount-root
+    // `statx` or that page's mapping or unmapping refused, masks without the
+    // mount-root attribute, btrfs, Ceph, ext4), a history of listings on a
+    // tracked descriptor (whole reads, a read past the end, rewinds, 64-byte
+    // batches, seeks into the middle) and two whole listings on untracked
+    // descriptors: with fixed `lstat` answers, each read returns the same
+    // records, sends the same numbering requests (count, order and keys),
+    // and injects the same calls as Every's run of the same history; every
+    // key is the one Every's rule gives the entry by name; the two names of
+    // one file get one number; and no SIGSYS is sent.
+    #[tokio::test]
+    async fn getdents_keys_and_numbers_as_every_does_through_a_scripted_listing_history() {
+        #[derive(Clone, Copy, Debug)]
+        enum Classified {
+            Overlay,
+            FstatfsRefused,
+            FstatfsTraps,
+            StatxRefused,
+            PageMapRefused,
+            PageUnmapRefused,
+            WithoutTheMountRootAttribute,
+            Btrfs,
+            Ceph,
+            Ext4,
+        }
+        let page = page_size();
+        let steps = [
+            ListingStep::Read(page),
+            ListingStep::Read(page),
+            ListingStep::Seek(0),
+            ListingStep::Read(64),
+            ListingStep::Read(64),
+            ListingStep::Read(64),
+            ListingStep::Read(64),
+            ListingStep::Seek(2),
+            ListingStep::Read(page),
+            ListingStep::Seek(0),
+            ListingStep::Read(48),
+            ListingStep::Seek(3),
+            ListingStep::Read(page),
+        ];
+        for classified in [
+            Classified::Overlay,
+            Classified::FstatfsRefused,
+            Classified::FstatfsTraps,
+            Classified::StatxRefused,
+            Classified::PageMapRefused,
+            Classified::PageUnmapRefused,
+            Classified::WithoutTheMountRootAttribute,
+            Classified::Btrfs,
+            Classified::Ceph,
+            Classified::Ext4,
+        ] {
+            let (dir, fd, _, device) = directory_with_entries();
+            assert_eq!(unsafe { libc::close(fd) }, 0);
+            let dot = std::fs::metadata(dir.path()).unwrap().ino();
+            let script = |guest: &mut ScriptedGuest| {
+                script_listing_history(guest, device);
+                let page = host_page_size();
+                guest.fstatfs_answer = Some(Ok(libc::OVERLAYFS_SUPER_MAGIC));
+                match classified {
+                    Classified::Overlay => {}
+                    Classified::FstatfsRefused => guest.fstatfs_answer = Some(Err(Errno::EPERM)),
+                    Classified::FstatfsTraps => guest.fstatfs_traps = true,
+                    Classified::StatxRefused => guest.entry_statx_error = Some(Errno::EPERM),
+                    Classified::PageMapRefused => {
+                        guest.mmap_error_of_len = Some((page, Errno::EPERM))
+                    }
+                    Classified::PageUnmapRefused => {
+                        guest.munmap_error_of_len = Some((page, Errno::EPERM))
+                    }
+                    Classified::WithoutTheMountRootAttribute => {
+                        guest.statx_without_mount_root_attribute = true
+                    }
+                    Classified::Btrfs => guest.fstatfs_answer = Some(Ok(libc::BTRFS_SUPER_MAGIC)),
+                    Classified::Ceph => guest.fstatfs_answer = Some(Ok(CEPH_SUPER_MAGIC)),
+                    Classified::Ext4 => guest.fstatfs_answer = Some(Ok(libc::EXT4_SUPER_MAGIC)),
+                }
+            };
+            let (calls, sigsys) = run_listing_history(dir.path(), &script, false, &steps).await;
+            let (every_calls, every_sigsys) =
+                run_listing_history(dir.path(), &script, true, &steps).await;
+            let every_key = |name: &str| match name {
+                "." => RawInode::new(device, dot),
+                ".." => RawInode::new(OTHER_DEVICE, SCRIPTED_PARENT_INODE),
+                "covered" => RawInode::new(device, 299),
+                "lower" | "plain" => RawInode::new(OTHER_DEVICE, 300),
+                "vanished" => RawInode::new(device, WIDE_VANISHED_INODE),
+                other => panic!("unexpected entry {other:?}"),
+            };
+            assert_eq!(calls.len(), every_calls.len());
+            for (read, (call, every_call)) in calls.iter().zip(&every_calls).enumerate() {
+                assert_eq!(
+                    call, every_call,
+                    "{classified:?}, read {read}: the read returns the records, sends the \
+                     numbering requests and injects the calls of Every's same read"
+                );
+                for (name, key) in keyed_names(call) {
+                    assert_eq!(
+                        key,
+                        every_key(&name),
+                        "{classified:?}, read {read}: {name} is keyed by Every's rule"
+                    );
+                }
+                let numbers: Vec<u64> = call
+                    .records
+                    .iter()
+                    .filter(|(name, _)| name == b"lower" || name == b"plain")
+                    .map(|(_, ino)| *ino)
+                    .collect();
+                assert!(
+                    numbers.windows(2).all(|pair| pair[0] == pair[1]),
+                    "{classified:?}, read {read}: the two names of one file list one number: \
+                     {numbers:?}"
+                );
+            }
+            assert_eq!(
+                (sigsys, every_sigsys),
+                (0, 0),
+                "{classified:?}: no listing sends a SIGSYS"
+            );
+        }
+    }
+
+    /// The UNSATISFIED part of literal R1. The design review of
+    /// https://github.com/rrnewton/hermit/pull/3255 states R1 as: "Within
+    /// one run, every directory entry gets ONE key, and it equals Every's
+    /// key for that entry, in every policy, settlement state, listing order,
+    /// and refusal or error outcome." Both halves cannot hold when Every's
+    /// own lookup changes its outcome for an unchanged entry, and the review
+    /// named this counterexample: an unchanged bind-mounted file whose
+    /// `lstat` is refused with `EACCES` on one listing (Every keys it on the
+    /// directory's device, as an entry that cannot be looked up) and
+    /// answered on the next (Every keys it on the device its `lstat`
+    /// reports). Detcore keeps Every's key for each answer, so this file's
+    /// key, and with it its inode number, changes from listing to listing:
+    /// the file does NOT get one key in the run, and this test does not
+    /// show R1 holding. It pins the behaviour chosen instead, on every
+    /// filesystem type: the first answer is not frozen, each listing keys
+    /// the entry by its own `lstat` answer, and no listing asks the
+    /// filesystem type.
+    #[tokio::test]
+    async fn getdents_unsatisfied_r1_rekeys_a_bind_mounted_file_whose_lstat_is_refused_on_alternate_listings()
+     {
+        for f_type in [
+            libc::OVERLAYFS_SUPER_MAGIC,
+            libc::BTRFS_SUPER_MAGIC,
+            libc::EXT4_SUPER_MAGIC,
+            CEPH_SUPER_MAGIC,
+        ] {
+            let (_dir, fd, _, device) = directory_with_entries();
+            let scratch = Pages::map(1, 1);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.answers_determinize_inode = true;
+            guest.fstatfs_answer = Some(Ok(f_type));
+            guest.getdents_inode_answers = vec![(b"lower".to_vec(), 300)];
+            tool.add_fd(&mut guest, fd, OFlag::O_RDONLY, FdType::Regular)
+                .await
+                .expect("precondition: Detcore tracks the directory");
+            let mut keys_of_lower = Vec::new();
+            for (listing, refused) in [true, false, true, false].into_iter().enumerate() {
+                guest.fstatat_answers = vec![(
+                    b"lower".to_vec(),
+                    if refused {
+                        Err(Errno::EACCES)
+                    } else {
+                        Ok(stat_answer(OTHER_DEVICE, 300, libc::S_IFREG | 0o644))
+                    },
+                )];
+                if listing > 0 {
+                    rewind(&tool, &mut guest, fd).await;
+                }
+                let listed = listing_call(&tool, &mut guest, fd, page_size()).await;
+                keys_of_lower.extend(
+                    keyed_names(&listed)
+                        .into_iter()
+                        .filter(|(name, _)| name == "lower")
+                        .map(|(_, key)| key),
+                );
+            }
+            close_unless_detcore_did(&guest, fd);
+            assert_eq!(
+                keys_of_lower,
+                [
+                    RawInode::new(device, 300),
+                    RawInode::new(OTHER_DEVICE, 300),
+                    RawInode::new(device, 300),
+                    RawInode::new(OTHER_DEVICE, 300),
+                ],
+                "f_type {f_type:#x}: each listing keys the file by its own lstat answer, on the \
+                 directory's device when refused with EACCES and on the lstat's device when \
+                 answered; the first answer is not frozen (literal R1 is NOT satisfied)"
+            );
+            assert_eq!(
+                guest.fstatfs_calls,
+                Vec::new(),
+                "f_type {f_type:#x}: no listing asks the filesystem type"
+            );
+        }
+    }
+
+    // On btrfs, `..` of a subvolume or mount root and the entry of the first
+    // subvolume (whose id and root inode are both 256) carry their `st_ino`
+    // on another device. A narrower policy once asked only those two there,
+    // and left an entry whose `lstat` would report another device (`lower`,
+    // as a file bind-mounted over it does) on the directory's. Every listed
+    // entry is now keyed by its own `lstat` on every filesystem: all six are
+    // asked once, in sorted order, each is keyed on the device its `lstat`
+    // reports when that reports its `d_ino`, and no listing asks the
+    // filesystem type. Both getdents paths.
+    #[tokio::test]
+    async fn getdents_on_btrfs_keys_the_parent_and_a_first_subvolume_by_their_lstat() {
         for tracked in [false, true] {
             let (_dir, fd, inodes, device) = directory_with_entries();
             let scratch = Pages::map(1, 1);
@@ -15236,7 +15511,7 @@ pub(crate) mod inject_fstat_scratch {
                     &[
                         RawInode::new(OTHER_DEVICE, SCRIPTED_PARENT_INODE),
                         RawInode::new(OTHER_DEVICE, 256),
-                        RawInode::new(device, inodes["lower"]),
+                        RawInode::new(OTHER_DEVICE, inodes["lower"]),
                         RawInode::new(device, inodes["plain"]),
                         RawInode::new(device, inodes["vanished"]),
                     ][..]
@@ -15245,24 +15520,26 @@ pub(crate) mod inject_fstat_scratch {
             );
             assert_eq!(
                 entries_asked(&guest, fd, asked_before),
-                ["..", "covered"],
-                "tracked {tracked}: only .. and the entry whose d_ino is 256 are asked"
+                [".", "..", "covered", "lower", "plain", "vanished"],
+                "tracked {tracked}: every entry is asked once, in sorted order"
             );
             assert_eq!(
                 guest.fstatfs_calls,
-                [(fd, true)],
-                "tracked {tracked}: one fstatfs, in the guarded stack scratch"
+                Vec::new(),
+                "tracked {tracked}: no listing asks the filesystem type"
             );
         }
     }
 
-    // The same measurement: on any filesystem but overlayfs, CephFS and
-    // btrfs, `..` is the only entry asked. An ext4 mount root's `..` has inode 2, as
-    // the ext4 root above it does, so it is keyed on the device its `lstat`
-    // reports; `lower`, whose `lstat` would report another device, keeps
-    // the directory's.
+    // On ext4 and tmpfs (the two types scripted), an ext4 mount root's `..`
+    // has inode 2, as the ext4 root above it does, so it is keyed on the
+    // device its `lstat` reports. A narrower policy once asked only `..` on
+    // any filesystem but overlayfs, CephFS and btrfs, and left `lower`,
+    // whose `lstat` would report another device, on the directory's. Every
+    // listed entry is now asked and keyed by its own `lstat`, and no listing
+    // asks the filesystem type.
     #[tokio::test]
-    async fn getdents_elsewhere_asks_only_the_parent() {
+    async fn getdents_elsewhere_keys_every_entry_by_its_lstat() {
         for f_type in [0xef53, 0x0102_1994] {
             for tracked in [false, true] {
                 let (_dir, fd, inodes, device) = directory_with_entries();
@@ -15313,7 +15590,7 @@ pub(crate) mod inject_fstat_scratch {
                         &[
                             RawInode::new(OTHER_DEVICE, SCRIPTED_PARENT_INODE),
                             RawInode::new(device, inodes["covered"]),
-                            RawInode::new(device, inodes["lower"]),
+                            RawInode::new(OTHER_DEVICE, inodes["lower"]),
                             RawInode::new(device, inodes["plain"]),
                             RawInode::new(device, inodes["vanished"]),
                         ][..]
@@ -15322,18 +15599,23 @@ pub(crate) mod inject_fstat_scratch {
                 );
                 assert_eq!(
                     entries_asked(&guest, fd, asked_before),
-                    [".."],
-                    "{case}: no entry but .. is asked"
+                    [".", "..", "covered", "lower", "plain", "vanished"],
+                    "{case}: every entry is asked once, in sorted order"
+                );
+                assert_eq!(
+                    guest.fstatfs_calls,
+                    Vec::new(),
+                    "{case}: no listing asks the filesystem type"
                 );
             }
         }
     }
 
-    // Asking every entry is never less faithful than asking fewer, so an
-    // `fstatfs` that fails -- with the errno a seccomp filter's
+    // With an `fstatfs` that would fail -- with the errno a seccomp filter's
     // `SECCOMP_RET_ERRNO` gives it, or `EFAULT` from an unwritable stack
-    // scratch -- asks every entry, never fails the getdents, and is not
-    // remembered: the next getdents asks again.
+    // scratch -- every entry is asked and the getdents succeeds. No listing
+    // asks the filesystem type, so neither failure is reached, and the
+    // second getdents, at the end of the directory, asks nothing.
     #[tokio::test]
     async fn getdents_asks_every_entry_when_the_filesystem_type_is_unknown() {
         for unwritable_scratch in [false, true] {
@@ -15361,9 +15643,6 @@ pub(crate) mod inject_fstat_scratch {
 
                 let first = getdents64_of(&tool, &mut guest, fd).await;
                 let second = getdents64_of(&tool, &mut guest, fd).await;
-                let cached = guest
-                    .thread_state()
-                    .with_detfd(fd, |detfd| detfd.directory_entry_lookup());
                 close_unless_detcore_did(&guest, fd);
 
                 assert!(
@@ -15376,29 +15655,23 @@ pub(crate) mod inject_fstat_scratch {
                     [".", "..", "covered", "lower", "plain", "vanished"],
                     "{case}: every entry is asked"
                 );
-                // An unwritable scratch fails before the `fstatfs` is
-                // injected; a refused one is injected on each getdents.
                 assert_eq!(
-                    guest.fstatfs_calls.len(),
-                    if unwritable_scratch { 0 } else { 2 },
-                    "{case}: each getdents asks the type again"
+                    guest.fstatfs_calls,
+                    Vec::new(),
+                    "{case}: no getdents asks the filesystem type"
                 );
-                let expected_cache = if tracked { Ok(None) } else { Err(Errno::EBADF) };
-                assert_eq!(cached, expected_cache, "{case}: nothing is remembered");
             }
         }
     }
 
     // Codex review of https://github.com/rrnewton/hermit/pull/3255, finding
-    // F2. A seccomp filter the guest inherited may trap the injected
-    // `fstatfs` (`SECCOMP_RET_TRAP`): the ptrace backend then reports
-    // `ENOSYS` and requeues the `SIGSYS`, which reaches the guest for a call
-    // it never made. With `seccomp_may_refuse_entry_lookup_syscalls` set, which the launcher
-    // sets when a filter it runs under may refuse the call (or it cannot
-    // tell), no `fstatfs` is injected, so the
-    // guest gets no `SIGSYS`; every entry is asked and keyed exactly as when
-    // the type is unknown, and nothing is remembered. Both getdents paths,
-    // two reads each.
+    // F2. A seccomp filter the guest inherited may trap an injected `fstatfs`
+    // (`SECCOMP_RET_TRAP`): the ptrace backend then reports `ENOSYS` and
+    // requeues the `SIGSYS`, which reaches the guest for a call it never
+    // made. No listing injects an `fstatfs` any more, whether or not
+    // `seccomp_may_refuse_entry_lookup_syscalls` is set, so the guest gets
+    // no `SIGSYS` in either run; every entry is asked, and keyed alike in
+    // both. Both getdents paths, two reads each.
     #[tokio::test]
     async fn getdents_where_seccomp_may_refuse_the_lookup_injects_no_fstatfs() {
         for tracked in [false, true] {
@@ -15427,9 +15700,6 @@ pub(crate) mod inject_fstat_scratch {
 
                 let first = getdents64_of(&tool, &mut guest, fd).await;
                 let second = getdents64_of(&tool, &mut guest, fd).await;
-                let cached = guest
-                    .thread_state()
-                    .with_detfd(fd, |detfd| detfd.directory_entry_lookup());
                 close_unless_detcore_did(&guest, fd);
 
                 assert!(
@@ -15442,12 +15712,8 @@ pub(crate) mod inject_fstat_scratch {
                     [".", "..", "covered", "lower", "plain", "vanished"],
                     "{case}: every entry is asked"
                 );
-                let expected_cache = if tracked { Ok(None) } else { Err(Errno::EBADF) };
-                assert_eq!(cached, expected_cache, "{case}: nothing is remembered");
-                if inherited {
-                    assert_eq!(guest.sigsys_queued, 0, "{case}: the guest gets no SIGSYS");
-                    assert_eq!(guest.fstatfs_calls, [], "{case}: no fstatfs is injected");
-                }
+                assert_eq!(guest.sigsys_queued, 0, "{case}: the guest gets no SIGSYS");
+                assert_eq!(guest.fstatfs_calls, [], "{case}: no fstatfs is injected");
                 runs.push(guest.determinized.lock().unwrap()[keyed_before..].to_vec());
             }
             assert_eq!(
@@ -15457,14 +15723,15 @@ pub(crate) mod inject_fstat_scratch {
         }
     }
 
-    // A descriptor Detcore tracks asks its filesystem's type once, through a
-    // real `fstatfs` in the guarded stack scratch that leaves the scratch as
-    // it was, and keeps the answer on its open file description; one it does
-    // not track asks on every getdents. The answer is the real filesystem's.
+    // A real directory, read twice through a descriptor Detcore tracks and
+    // through one it does not: no getdents asks the filesystem's type (a
+    // tracked descriptor once asked it through a real `fstatfs` and kept the
+    // answer on its open file description), every entry is asked once, and
+    // nothing is written into the stack scratch while no guard is live.
     #[tokio::test]
-    async fn getdents_asks_a_tracked_directorys_filesystem_type_once() {
+    async fn getdents_asks_no_filesystem_type_and_leaves_the_stack_scratch_as_it_was() {
         for tracked in [false, true] {
-            let (dir, fd, _, device) = directory_with_entries();
+            let (_dir, fd, _, _) = directory_with_entries();
             let scratch = Pages::map(1, 1);
             let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
             guest.answers_determinize_inode = true;
@@ -15473,27 +15740,10 @@ pub(crate) mod inject_fstat_scratch {
                     .await
                     .expect("precondition: Detcore tracks the directory");
             }
-            let real = nix::sys::statfs::statfs(dir.path()).unwrap();
-            // On overlayfs (Podman's `/tmp`), `lower`, the first file in name
-            // order after the directory `covered`, can narrow it.
-            let lower = nix::sys::stat::lstat(&dir.path().join("lower")).unwrap();
-            let lower_entry = DirEntry {
-                name: b"lower".to_vec(),
-                ino: lower.st_ino,
-                off: 0,
-                ty: libc::DT_REG,
-            };
-            let expected = EntryLookup::of_filesystem(real.filesystem_type().0).learn(
-                &lower_entry,
-                &lower,
-                device,
-            );
+            let asked_before = guest.fstatat_paths.len();
 
             let first = getdents64_of(&tool, &mut guest, fd).await;
             let second = getdents64_of(&tool, &mut guest, fd).await;
-            let cached = guest
-                .thread_state()
-                .with_detfd(fd, |detfd| detfd.directory_entry_lookup());
             close_unless_detcore_did(&guest, fd);
 
             assert!(
@@ -15501,18 +15751,17 @@ pub(crate) mod inject_fstat_scratch {
                 "tracked {tracked}: {first:?}"
             );
             assert!(second.as_ref().is_ok(), "tracked {tracked}: {second:?}");
-            let expected_calls = if tracked {
-                vec![(fd, true)]
-            } else {
-                vec![(fd, true), (fd, true)]
-            };
-            assert_eq!(guest.fstatfs_calls, expected_calls, "tracked {tracked}");
+            assert_eq!(
+                guest.fstatfs_calls,
+                Vec::new(),
+                "tracked {tracked}: no getdents asks the filesystem type"
+            );
+            assert_eq!(
+                entries_asked(&guest, fd, asked_before),
+                [".", "..", "covered", "lower", "plain", "vanished"],
+                "tracked {tracked}: every entry is asked once"
+            );
             assert_eq!(guest.unguarded_scratch_writes(), 0, "tracked {tracked}");
-            if tracked {
-                assert_eq!(cached, Ok(Some(expected)), "the real filesystem's lookup");
-            } else {
-                assert_eq!(cached, Err(Errno::EBADF), "nowhere to keep it");
-            }
         }
     }
 

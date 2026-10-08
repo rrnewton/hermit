@@ -73,7 +73,6 @@ use tracing::warn;
 
 use crate::config::Config;
 use crate::consts::ROOT_DETPID;
-use crate::dirents::EntryLookup;
 use crate::fd::SharedOpenFileError;
 use crate::ivar::Ivar;
 use crate::preemptions::PreemptionReader;
@@ -988,11 +987,6 @@ pub struct GlobalState {
     /// Shared fdinfo mount-ID equivalence classes for this Detcore run.
     mount_ids: Mutex<MountIdPool>,
 
-    /// For each overlayfs, by the raw device its directories report, which
-    /// entries of its directories `getdents` `lstat`s, settled by the first
-    /// file that told (see [`GlobalRequest::SettleOverlayEntryLookup`]).
-    overlay_entry_lookups: Mutex<BTreeMap<u64, EntryLookup>>,
-
     // next port to use if input port is 0
     next_port: AtomicU16,
 
@@ -1218,7 +1212,6 @@ impl GlobalState {
                 cfg.mountinfo_mount_ids_captured,
                 &cfg.mount_id_assignment_order,
             )),
-            overlay_entry_lookups: Mutex::new(BTreeMap::new()),
             sched_handle: handle,
             cfg: cfg.clone(),
             realtime_start: SystemTime::now(),
@@ -2468,12 +2461,6 @@ impl GlobalTool for GlobalState {
             GlobalRequest::DeterminizeDevice(dev) => {
                 R::DeterminizeDevice(self.recv_determinize_device(from, dev).await)
             }
-            GlobalRequest::SettleOverlayEntryLookup(device, proposal) => {
-                R::SettleOverlayEntryLookup(
-                    self.recv_settle_overlay_entry_lookup(from, device, proposal)
-                        .await,
-                )
-            }
             GlobalRequest::DeterminizeMountId(raw_mount_id, fallback_order) => {
                 R::DeterminizeMountId(
                     self.recv_determinize_mount_id(from, raw_mount_id, fallback_order.as_deref())
@@ -3559,26 +3546,6 @@ impl GlobalState {
         det_device
     }
 
-    /// See [`GlobalRequest::SettleOverlayEntryLookup`].
-    async fn recv_settle_overlay_entry_lookup(
-        &self,
-        from: Tid,
-        raw_device: u64,
-        proposal: Option<EntryLookup>,
-    ) -> Option<EntryLookup> {
-        let _sched = self.lock_rpc_scheduler(false).await;
-        let mut settled = self.overlay_entry_lookups.lock().unwrap();
-        let answer = match proposal {
-            Some(proposal) => Some(*settled.entry(raw_device).or_insert(proposal)),
-            None => settled.get(&raw_device).copied(),
-        };
-        trace!(
-            "[detcore, dtid {}] overlay on (raw) device {}: proposed {:?}, settled {:?}",
-            from, raw_device, proposal, answer
-        );
-        answer
-    }
-
     async fn recv_determinize_mount_id(
         &self,
         from: Tid,
@@ -4257,16 +4224,6 @@ pub enum GlobalRequest {
     /// A child-exit `SIGCHLD` control message
     /// (`scheduler::child_exit_sigchld`).
     ChildExitSigchld(crate::scheduler::child_exit_sigchld::ChildExitSigchldControl),
-
-    /// Which entries of a directory on the overlayfs whose directories report
-    /// the raw device in the first field `getdents` `lstat`s (see
-    /// `Detcore::settle_overlay_entry_lookup`). With a proposal, the first
-    /// for that device settles it; with `None`, nothing is settled. The
-    /// answer is what is settled for the device, if anything, so every
-    /// descriptor of the run, tracked or not, and every later open keys the
-    /// overlay's entries alike. Appended after `ChildExitSigchld`, for the same
-    /// reason.
-    SettleOverlayEntryLookup(u64, Option<EntryLookup>),
 }
 
 /// Responses from the global object
@@ -4361,8 +4318,6 @@ pub enum GlobalResponse {
     /// `SharedOpenFile`, for the same reason.
     Sigalrm(bool),
     ChildExitSigchld(crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer),
-    /// Appended after `ChildExitSigchld`, for the same reason.
-    SettleOverlayEntryLookup(Option<EntryLookup>),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -5098,29 +5053,6 @@ where
     let resp = send_and_update_time(guest, GlobalRequest::DeterminizeDevice(raw_device)).await;
     match resp.1 {
         GlobalResponse::DeterminizeDevice(x) => x,
-        _ => unreachable!(),
-    }
-}
-
-/// Settle, or with `proposal` `None` only ask, which entries of a directory
-/// on the overlayfs whose directories report `raw_device` are `lstat`ed (see
-/// [`GlobalRequest::SettleOverlayEntryLookup`]).
-pub(crate) async fn settle_overlay_entry_lookup<G, T>(
-    guest: &mut G,
-    raw_device: u64,
-    proposal: Option<EntryLookup>,
-) -> Option<EntryLookup>
-where
-    G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
-{
-    let resp = send_and_update_time(
-        guest,
-        GlobalRequest::SettleOverlayEntryLookup(raw_device, proposal),
-    )
-    .await;
-    match resp.1 {
-        GlobalResponse::SettleOverlayEntryLookup(x) => x,
         _ => unreachable!(),
     }
 }

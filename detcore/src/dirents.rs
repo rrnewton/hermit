@@ -19,6 +19,8 @@ use reverie::syscalls::Errno;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::types::RawInode;
+
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Dirent64<'a> {
@@ -348,222 +350,6 @@ pub(crate) struct DirEntry {
     pub(crate) ty: u8,
 }
 
-/// The inode number of every btrfs subvolume's root directory
-/// (`BTRFS_FIRST_FREE_OBJECTID`), and the id of the first subvolume made on a
-/// filesystem, which is that number too.
-const BTRFS_SUBVOLUME_ROOT_INODE: u64 = 256;
-
-/// CephFS's `f_type` (`include/uapi/linux/magic.h`), which `libc` does not
-/// define.
-const CEPH_SUPER_MAGIC: libc::__fsword_t = 0x00c3_6400;
-
-/// The least `d_ino` that overlayfs can give a non-directory whose `stat`
-/// reports a layer's device while other non-directories of the same overlay
-/// report the overlay's own (see [`EntryLookup::Overlay`]).
-///
-/// That happens only on an overlay that folds its layers' inode numbers into
-/// one space (`xino`), and only to a number it could not fold. Each
-/// filesystem under the overlay has an `fsid`: 0 is the upper layer's
-/// filesystem, reserved even when there is no upper layer and shared by a
-/// lower layer on that filesystem, and each other filesystem gets the next.
-/// Folding leaves a number from `fsid` 0 as it is, on the overlay's device,
-/// and puts any other `fsid` at bit `xinoshift + 1` or above; a number is
-/// too large to fold when it has a bit at `xinoshift` or above, and then
-/// `stat` and `readdir` both give it unfolded (`ovl_map_dev_ino` in
-/// `fs/overlayfs/inode.c`, `ovl_remap_lower_ino` in
-/// `fs/overlayfs/readdir.c`). `xinoshift` is 64 less the `xino` bits, which
-/// are 32 when every layer's filesystem has 32-bit inode numbers and
-/// otherwise `ilog2(numfs - 1) + 2`, where `numfs` counts those `fsid`s
-/// (`fs/overlayfs/super.c`); a build check there keeps `ilog2` of the layer
-/// limit at most 30, so that is at most 32 bits too, and `xinoshift` is at
-/// least 32. So a number folded from a nonzero `fsid` and an unfoldable one
-/// are both at least 2^32, and on a folding overlay a non-directory whose
-/// number is below 2^32 is from `fsid` 0 and on the overlay's device.
-const OVERLAY_UNFOLDABLE_INODE_FLOOR: u64 = 1 << 32;
-
-/// Which entries of a directory Detcore `lstat`s to learn the device an
-/// entry's inode number is on, chosen once per open directory from the type
-/// of its filesystem (`fstatfs`'s `f_type`), and on overlayfs settled once per
-/// overlay, before any of its entries is keyed, by the first file that shows
-/// how the overlay numbers its files (see [`EntryLookup::learn`] and
-/// `Detcore::settle_overlay_entry_lookup`). An entry that is not asked is
-/// keyed on the directory's own device (see
-/// `Detcore::directory_entry_identity`).
-///
-/// Linux reports a `d_ino` that is the entry's `st_ino` on a device other than
-/// the directory's in these places, among the filesystems checked (see the
-/// second known gap at `Detcore::directory_entry_identity`):
-///
-/// - overlayfs whose layers are on more than one filesystem, whose
-///   non-directories report a device of their layer's own (an anonymous
-///   `pseudo_dev`, never the overlay's) when it does not fold their inode
-///   numbers into one space (`xino` off), or, when it does, for a number
-///   too large to fold, though `readdir` gives their real inode number. An
-///   overlay with every layer on one filesystem reports its own device for
-///   everything, and directories always report the overlay's device
-///   (`ovl_map_dev_ino` in `fs/overlayfs/inode.c`). `fstatfs` does not say
-///   which an overlay does, so a file of the overlay is asked first (see
-///   [`EntryLookup::Overlay`]);
-/// - CephFS, where a snapshot's files report a device of their snapshot's
-///   own but the same inode numbers as the live files, so each entry of a
-///   `.snap` directory carries its `st_ino` on its snapshot's device rather
-///   than the directory's; every entry is asked;
-/// - btrfs, where every subvolume has its own device and its root directory
-///   is inode 256, and `readdir` gives a subvolume's entry the subvolume's id
-///   as `d_ino`; only the first subvolume of a filesystem has id 256, so only
-///   an entry whose `d_ino` is 256 can match there;
-/// - `..` of a directory that is the root of a mount or of a btrfs subvolume,
-///   whose `d_ino` is the inode of the directory above it, on another device;
-///   for a mount root, Linux gives `..` the root's own inode number instead,
-///   which still matches when the two filesystems number their roots alike
-///   (two ext4 roots are both inode 2).
-///
-/// `.` is the open directory itself, whose device is the directory's.
-///
-/// Public only because the overlay's settled answer travels in a
-/// `GlobalRequest`; the module is private to Detcore.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EntryLookup {
-    /// Every entry: CephFS, or a directory whose filesystem type Detcore
-    /// did not or could not learn (see `Detcore::directory_entry_lookup`).
-    Every,
-    /// Overlayfs, before Detcore knows which of two kinds the overlay is. No
-    /// entry is keyed under this answer: before the first entry of a listing
-    /// is keyed, it is settled to [`EntryLookup::OverlayOwnDevice`] or
-    /// [`EntryLookup::OverlayLayerDevices`] (see
-    /// `Detcore::settle_overlay_entry_lookup`). It asks every entry other
-    /// than `.`, as the second of those does.
-    ///
-    /// An overlay whose layers are all on one filesystem reports its own
-    /// device for every file. One that folds its layers' inode numbers into
-    /// one space reports its own device for every non-directory whose number
-    /// it could fold, and both a number folded from a filesystem other than
-    /// the upper layer's and an unfoldable one are at least 2^32 (see
-    /// [`OVERLAY_UNFOLDABLE_INODE_FLOOR`]). So on
-    /// both kinds, only `..` and an entry whose `d_ino` is at least 2^32 can
-    /// report its `d_ino` on another device, leaving aside a mount point,
-    /// which is the first class of the second known gap at
-    /// `Detcore::directory_entry_identity` on every filesystem. Those are
-    /// [`EntryLookup::OverlayOwnDevice`]. An overlay of the third kind,
-    /// whose layers are on more than one filesystem and which does not fold,
-    /// reports a layer's device for every non-directory, whatever its number;
-    /// that is [`EntryLookup::OverlayLayerDevices`].
-    ///
-    /// A non-directory entry whose `d_ino` is below 2^32 and whose `lstat`
-    /// reports that same number tells them apart: on the first two kinds it
-    /// reports the overlay's device, which is the directory's, and on the
-    /// third its layer's, which is not. Directories decide nothing, since
-    /// they report the overlay's device on all three.
-    Overlay,
-    /// `..`, and each entry other than `.` whose `d_ino` is at least 2^32:
-    /// an overlay that reports its own device for a non-directory whose
-    /// number is below that (see [`EntryLookup::Overlay`]).
-    OverlayOwnDevice,
-    /// `..`, and each entry other than `.` whose `d_ino` is 256: btrfs.
-    BtrfsSubvolumes,
-    /// `..` only: every other filesystem.
-    ParentOnly,
-    /// Every entry other than `.`: an overlay that reports a layer's device
-    /// for its non-directories (see [`EntryLookup::Overlay`]). `.` is the
-    /// open directory, which reports the overlay's device on every overlay.
-    /// Last, so that adding it left every earlier variant's encoded tag
-    /// unchanged.
-    OverlayLayerDevices,
-}
-
-impl EntryLookup {
-    /// The entries to ask on a filesystem whose `fstatfs` reports `f_type`.
-    pub(crate) fn of_filesystem(f_type: libc::__fsword_t) -> Self {
-        if f_type == libc::OVERLAYFS_SUPER_MAGIC {
-            EntryLookup::Overlay
-        } else if f_type == CEPH_SUPER_MAGIC {
-            EntryLookup::Every
-        } else if f_type == libc::BTRFS_SUPER_MAGIC {
-            EntryLookup::BtrfsSubvolumes
-        } else {
-            EntryLookup::ParentOnly
-        }
-    }
-
-    /// Whether `entry`'s own `lstat` is asked for the device that keys it.
-    pub(crate) fn asks(self, entry: &DirEntry) -> bool {
-        let parent = entry.name == b"..";
-        let own = entry.name == b".";
-        match self {
-            EntryLookup::Every => true,
-            EntryLookup::Overlay | EntryLookup::OverlayLayerDevices => !own,
-            EntryLookup::OverlayOwnDevice => {
-                parent || (entry.ino >= OVERLAY_UNFOLDABLE_INODE_FLOOR && !own)
-            }
-            EntryLookup::BtrfsSubvolumes => {
-                parent || (entry.ino == BTRFS_SUBVOLUME_ROOT_INODE && !own)
-            }
-            EntryLookup::ParentOnly => parent,
-        }
-    }
-
-    /// Whether `entry`'s `lstat` can tell which kind an overlay is (see
-    /// [`EntryLookup::learn`]), judged from the entry alone: an entry other
-    /// than `.` and `..` whose `d_ino` is below 2^32 and whose `d_type` is not
-    /// a directory's. Its `lstat` still decides only if it reports that
-    /// `d_ino` and a non-directory.
-    pub(crate) fn may_tell_the_overlay_kind(entry: &DirEntry) -> bool {
-        entry.name != b"."
-            && entry.name != b".."
-            && entry.ino < OVERLAY_UNFOLDABLE_INODE_FLOOR
-            && entry.ty != libc::DT_DIR
-    }
-
-    /// What `entry`, read from a directory on device `directory_device` and
-    /// `lstat`ed as `stat`, shows about the overlay it is on.
-    ///
-    /// Only [`EntryLookup::Overlay`] learns, and only from a non-directory
-    /// entry other than `.` and `..` whose `d_ino` is below 2^32 and whose
-    /// `lstat` reports that `d_ino`: it becomes
-    /// [`EntryLookup::OverlayOwnDevice`] if that `lstat` reports the
-    /// directory's device, and [`EntryLookup::OverlayLayerDevices`]
-    /// otherwise. Any other entry leaves it as it was. An entry replaced
-    /// after the read usually reports another inode, and then decides
-    /// nothing; a replacement that reuses the number is a file of the same
-    /// overlay, which reports its device by the same rule, unless it is a
-    /// mount. A file bind-mounted over the entry, whose source has the
-    /// covered entry's inode number, can mislead it only toward
-    /// [`EntryLookup::OverlayLayerDevices`], since only a file of the overlay
-    /// reports the overlay's device, so before an entry that shows that kind
-    /// settles the overlay, Detcore asks whether it is the root of a mount and
-    /// takes nothing from one (see `Detcore::entry_is_on_the_listed_mount`).
-    ///
-    /// Detcore asks this of the first files of a listing in sorted order,
-    /// before any entry is keyed, and keeps the first answer that decides for
-    /// the whole overlay (see `Detcore::settle_overlay_entry_lookup`), so the
-    /// entries the guest reads first, and where it seeks, do not change it.
-    /// Before the overlay settles and once it has settled as
-    /// [`EntryLookup::OverlayOwnDevice`], a mount over an entry that is not
-    /// asked, including that entry's own backing file bound over its path, is
-    /// keyed on the directory's device: the first class of the second known
-    /// gap at `Detcore::directory_entry_identity`, as on every filesystem
-    /// that does not ask each entry. Once it has settled as
-    /// [`EntryLookup::OverlayLayerDevices`], such an entry is asked and keyed
-    /// on the device its `lstat` reports, as its `stat` is, so on that kind of
-    /// overlay its key changes when the overlay settles (see
-    /// `Detcore::settle_overlay_entry_lookup`).
-    pub(crate) fn learn(self, entry: &DirEntry, stat: &libc::stat, directory_device: u64) -> Self {
-        let decides = self == EntryLookup::Overlay
-            && entry.name != b"."
-            && entry.name != b".."
-            && entry.ino < OVERLAY_UNFOLDABLE_INODE_FLOOR
-            && stat.st_ino == entry.ino
-            && stat.st_mode & libc::S_IFMT != libc::S_IFDIR;
-        if !decides {
-            self
-        } else if stat.st_dev == directory_device {
-            EntryLookup::OverlayOwnDevice
-        } else {
-            EntryLookup::OverlayLayerDevices
-        }
-    }
-}
-
 /// Sort `.` first, `..` second, then by name bytes. Names within one
 /// directory are unique, so this is a total order on a directory's entries.
 pub(crate) fn sort_dir_entries(entries: &mut [DirEntry]) {
@@ -589,7 +375,8 @@ fn compare_dir_entries(a: &DirEntry, b: &DirEntry) -> std::cmp::Ordering {
 /// Linux returns entries in an order and with `d_off` cookies that depend on
 /// the filesystem's on-disk layout (for ext4, a hash of each name seeded per
 /// filesystem), so neither is reproducible across hosts. Detcore instead reads
-/// the whole directory on the first `getdents` call, sorts it, and serves every
+/// the whole directory on the first `getdents` call, sorts it, keys every entry
+/// by its own `lstat` (see `Detcore::key_directory_snapshot`), and serves every
 /// later call from that snapshot. The stream position is the index of the next
 /// entry, and each entry's `d_off` is the position after it, which is what
 /// `telldir` returns and `seekdir` hands back to `lseek`.
@@ -620,6 +407,11 @@ pub(crate) struct DirectoryStream {
     /// (`InodeSighting::Listed`): an entry can be returned after its file's
     /// last name is gone.
     retirements: u64,
+    /// The raw identity of each snapshot entry, in the stream's order, once
+    /// `Detcore::key_directory_snapshot` has asked every entry's `lstat`;
+    /// `None` until then, and from the next snapshot on.
+    #[serde(default)]
+    identities: Option<Vec<RawInode>>,
 }
 
 impl DirectoryStream {
@@ -637,9 +429,38 @@ impl DirectoryStream {
         self.entries.is_none()
     }
 
-    /// The whole snapshot, sorted, whatever the position; empty without one.
-    pub(crate) fn entries(&self) -> &[DirEntry] {
-        self.entries.as_deref().unwrap_or_default()
+    /// The whole snapshot, sorted, if it has one whose entries are not keyed
+    /// yet (see [`Self::note_identities`]).
+    pub(crate) fn unkeyed_entries(&self) -> Option<Vec<DirEntry>> {
+        match (&self.entries, &self.identities) {
+            (Some(entries), None) => Some(entries.clone()),
+            _ => None,
+        }
+    }
+
+    /// Keep `identities`, one per entry of `entries` in the same order, as the
+    /// keys of the snapshot's entries, if `entries` is still the snapshot and
+    /// it has none yet.
+    pub(crate) fn note_identities(&mut self, entries: &[DirEntry], identities: Vec<RawInode>) {
+        if self.identities.is_none()
+            && self.entries.as_deref() == Some(entries)
+            && identities.len() == entries.len()
+        {
+            self.identities = Some(identities);
+        }
+    }
+
+    /// The keys of the `count` entries at the stream's position, which
+    /// [`Self::next_batch`] returns, or `None` if the snapshot's entries are
+    /// not keyed.
+    pub(crate) fn identities_of_next(&self, count: usize) -> Option<Vec<RawInode>> {
+        let identities = self.identities.as_deref()?;
+        let start = usize::try_from(self.position)
+            .unwrap_or(usize::MAX)
+            .min(identities.len());
+        identities
+            .get(start..start.checked_add(count)?)
+            .map(<[RawInode]>::to_vec)
     }
 
     /// Install the entries of a whole directory, read from the kernel in host
@@ -664,6 +485,7 @@ impl DirectoryStream {
         }
         self.entries = Some(indexed.into_iter().map(|(_, entry)| entry).collect());
         self.resume = resume;
+        self.identities = None;
     }
 
     pub(crate) fn position(&self) -> u64 {
@@ -675,6 +497,7 @@ impl DirectoryStream {
         if position == 0 {
             self.entries = None;
             self.resume = Vec::new();
+            self.identities = None;
         }
         self.position = position;
     }
@@ -1493,189 +1316,44 @@ mod test {
         assert_eq!(stream.kernel_target(), 0);
     }
 
-    // https://github.com/rrnewton/hermit/pull/3255 asked every entry's
-    // `lstat`, which cost a 3000-entry directory test 5.9 GiB under the test
-    // allocator. Only CephFS asks every entry from the start now; overlayfs
-    // asks, once one file has told how the overlay numbers its files, either
-    // every entry but `.` or `..` and the entries whose `d_ino` is at least
-    // 2^32; btrfs asks `..` and an entry whose `d_ino` is 256 (the first
-    // subvolume); any other filesystem asks `..` alone.
     #[test]
-    fn entry_lookup_asks_only_where_the_filesystem_can_differ() {
-        let overlay = EntryLookup::of_filesystem(0x794c_7630);
-        let btrfs = EntryLookup::of_filesystem(0x9123_683e);
-        let ext4 = EntryLookup::of_filesystem(0xef53);
-        let tmpfs = EntryLookup::of_filesystem(0x0102_1994);
-        let ceph = EntryLookup::of_filesystem(0x00c3_6400);
-        assert_eq!(overlay, EntryLookup::Overlay);
-        assert_eq!(ceph, EntryLookup::Every);
-        assert_eq!(btrfs, EntryLookup::BtrfsSubvolumes);
-        assert_eq!(ext4, EntryLookup::ParentOnly);
-        assert_eq!(tmpfs, EntryLookup::ParentOnly);
+    fn stream_keeps_each_entrys_key_until_its_snapshot_is_dropped() {
+        let key = |ino| RawInode::new(7, ino);
+        let mut stream = DirectoryStream::default();
+        stream.install(["c", "a", "b"].into_iter().map(entry).collect());
+        let sorted = stream
+            .unkeyed_entries()
+            .expect("a fresh snapshot is not keyed");
+        assert_eq!(names(&sorted), ["a", "b", "c"]);
+        assert_eq!(stream.identities_of_next(1), None);
 
-        let with_ino = |name: &str, ino: u64| DirEntry { ino, ..entry(name) };
-        // `.` is 256, as a first subvolume's root is, so that btrfs is seen
-        // not to ask it; a wide `.` is checked for the overlay below.
-        let entries = [
-            with_ino(".", 256),
-            with_ino("..", 4096),
-            with_ino("subvolume", 256),
-            with_ino("later_subvolume", 257),
-            with_ino("file", 300),
-            with_ino("widest_upper", (1 << 32) - 1),
-            with_ino("unfoldable", 1 << 32),
-            with_ino("folded_lower", (1 << 62) | 300),
-        ];
-        let asked = |lookup: EntryLookup| -> Vec<&str> {
-            entries
-                .iter()
-                .filter(|entry| lookup.asks(entry))
-                .map(|entry| std::str::from_utf8(&entry.name).unwrap())
-                .collect()
-        };
-        let all = [
-            ".",
-            "..",
-            "subvolume",
-            "later_subvolume",
-            "file",
-            "widest_upper",
-            "unfoldable",
-            "folded_lower",
-        ];
-        assert_eq!(asked(ceph), all);
-        assert_eq!(asked(EntryLookup::Every), all);
-        assert_eq!(asked(overlay), all[1..]);
-        assert_eq!(asked(EntryLookup::OverlayLayerDevices), all[1..]);
-        assert_eq!(
-            asked(EntryLookup::OverlayOwnDevice),
-            ["..", "unfoldable", "folded_lower"]
-        );
-        assert_eq!(asked(btrfs), ["..", "subvolume"]);
-        assert_eq!(asked(ext4), [".."]);
-        assert_eq!(asked(tmpfs), [".."]);
+        // Keys asked for another snapshot, or too few, are not kept.
+        stream.note_identities(&sorted[..2], vec![key(1), key(2)]);
+        stream.note_identities(&sorted, vec![key(1), key(2)]);
+        assert!(stream.unkeyed_entries().is_some());
 
-        // `.` is never asked but where every entry is, whatever its number.
-        let wide_own = with_ino(".", 1 << 32);
-        for lookup in [
-            EntryLookup::Overlay,
-            EntryLookup::OverlayOwnDevice,
-            EntryLookup::OverlayLayerDevices,
-            EntryLookup::BtrfsSubvolumes,
-            EntryLookup::ParentOnly,
-        ] {
-            assert!(!lookup.asks(&wide_own), "{lookup:?}");
-        }
-        assert!(EntryLookup::Every.asks(&wide_own));
-    }
+        stream.note_identities(&sorted, vec![key(1), key(2), key(3)]);
+        assert_eq!(stream.unkeyed_entries(), None);
+        assert_eq!(stream.identities_of_next(2), Some(vec![key(1), key(2)]));
+        // A second answer does not replace the first.
+        stream.note_identities(&sorted, vec![key(4), key(5), key(6)]);
+        stream.advance(1);
+        assert_eq!(stream.identities_of_next(2), Some(vec![key(2), key(3)]));
+        assert_eq!(stream.identities_of_next(3), None);
+        stream.seek(3);
+        assert_eq!(stream.identities_of_next(0), Some(vec![]));
+        stream.seek(9);
+        assert_eq!(stream.identities_of_next(0), Some(vec![]));
 
-    // The overlay rule of the measurement above. The first non-directory
-    // entry below 2^32 whose `lstat` reports its `d_ino` decides: on the
-    // directory's device the overlay keeps every such file on its own device
-    // (one filesystem, or folded inode numbers), and on another it reports a
-    // layer's device for every non-directory (`xino` off over several
-    // filesystems), so every entry but `.` is asked. Nothing else decides,
-    // and nothing is learned outside overlayfs. Which entries can decide is
-    // also judged from the entry alone, before any `lstat`, so that Detcore
-    // can ask them first (see `Detcore::settle_overlay_entry_lookup`).
-    #[test]
-    fn entry_lookup_learns_the_overlay_kind_from_one_file() {
-        const DIRECTORY: u64 = 0x2a;
-        const LAYER: u64 = 0x2b;
-        let with_ino = |name: &str, ino: u64| DirEntry { ino, ..entry(name) };
-        let stat_of = |dev: u64, ino: u64, mode: libc::mode_t| {
-            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-            stat.st_dev = dev;
-            stat.st_ino = ino;
-            stat.st_mode = mode;
-            stat
-        };
-        let file = with_ino("file", 300);
-        let own_file = stat_of(DIRECTORY, 300, libc::S_IFREG | 0o644);
-        let layer_file = stat_of(LAYER, 300, libc::S_IFREG | 0o644);
-        let learned = |lookup: EntryLookup, entry: &DirEntry, stat: &libc::stat| {
-            lookup.learn(entry, stat, DIRECTORY)
-        };
-
-        assert_eq!(
-            learned(EntryLookup::Overlay, &file, &own_file),
-            EntryLookup::OverlayOwnDevice
-        );
-        assert_eq!(
-            learned(EntryLookup::Overlay, &file, &layer_file),
-            EntryLookup::OverlayLayerDevices
-        );
-        // Symbolic links, devices and sockets are non-directories too.
-        for mode in [libc::S_IFLNK, libc::S_IFCHR, libc::S_IFSOCK, libc::S_IFIFO] {
-            assert_eq!(
-                learned(EntryLookup::Overlay, &file, &stat_of(LAYER, 300, mode)),
-                EntryLookup::OverlayLayerDevices,
-                "mode {mode:o}"
-            );
-        }
-
-        let undecided = [
-            // A directory reports the overlay's device on every kind.
-            (file.clone(), stat_of(LAYER, 300, libc::S_IFDIR | 0o755)),
-            // Replaced after the read, or a mount point.
-            (file.clone(), stat_of(LAYER, 301, libc::S_IFREG | 0o644)),
-            // A folded lower-layer number or an unfoldable one may be on a
-            // layer's device even when the overlay folds.
-            (
-                with_ino("unfoldable", 1 << 32),
-                stat_of(LAYER, 1 << 32, libc::S_IFREG | 0o644),
-            ),
-            (
-                with_ino("unfoldable", 1 << 32),
-                stat_of(DIRECTORY, 1 << 32, libc::S_IFREG | 0o644),
-            ),
-            (with_ino(".", 300), layer_file),
-            (with_ino("..", 300), layer_file),
-            (with_ino(".", 300), own_file),
-            (with_ino("..", 300), own_file),
-        ];
-        for (entry, stat) in &undecided {
-            assert_eq!(
-                learned(EntryLookup::Overlay, entry, stat),
-                EntryLookup::Overlay,
-                "{entry:?} {stat:?}"
-            );
-        }
-
-        for lookup in [
-            EntryLookup::Every,
-            EntryLookup::OverlayOwnDevice,
-            EntryLookup::OverlayLayerDevices,
-            EntryLookup::BtrfsSubvolumes,
-            EntryLookup::ParentOnly,
-        ] {
-            assert_eq!(learned(lookup, &file, &own_file), lookup);
-            assert_eq!(learned(lookup, &file, &layer_file), lookup);
-        }
-
-        // Judged from the entry alone: every entry the `undecided` list above
-        // rules out by its name or number is ruled out here too, and so is a
-        // directory by its `d_type`; a file, a symbolic link and an entry
-        // whose type the filesystem did not report may tell.
-        let typed = |name: &str, ino: u64, ty: u8| DirEntry {
-            ino,
-            ty,
-            ..entry(name)
-        };
-        for (candidate, may_tell) in [
-            (typed("file", 300, libc::DT_REG), true),
-            (typed("link", 300, libc::DT_LNK), true),
-            (typed("unknown", 300, libc::DT_UNKNOWN), true),
-            (typed("directory", 300, libc::DT_DIR), false),
-            (typed("unfoldable", 1 << 32, libc::DT_REG), false),
-            (typed(".", 300, libc::DT_REG), false),
-            (typed("..", 300, libc::DT_REG), false),
-        ] {
-            assert_eq!(
-                EntryLookup::may_tell_the_overlay_kind(&candidate),
-                may_tell,
-                "{candidate:?}"
-            );
-        }
+        // A seek elsewhere keeps the keys; a rewind drops them with the
+        // snapshot, and a new snapshot is unkeyed.
+        stream.seek(1);
+        assert_eq!(stream.identities_of_next(1), Some(vec![key(2)]));
+        stream.seek(0);
+        assert_eq!(stream.unkeyed_entries(), None);
+        assert_eq!(stream.identities_of_next(0), None);
+        stream.install(["a", "b", "c"].into_iter().map(entry).collect());
+        assert!(stream.unkeyed_entries().is_some());
+        assert_eq!(stream.identities_of_next(1), None);
     }
 }
