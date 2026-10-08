@@ -15,6 +15,27 @@ use std::time::Duration;
 
 use crate::types::NANOS_PER_RCB;
 
+/// Describes `error` without asking the C library for an errno message.
+///
+/// `std::io::Error`'s `Display` and `Debug` render an operating-system error
+/// through `strerror_r`, which can call `gettext` and allocate through the C
+/// library's malloc: under in-guest LiteInst, where Detcore runs inside the
+/// guest, the guest's own heap. An operating-system error is described by its
+/// kind and number instead; any other error, or an I/O error wrapping one, as
+/// before.
+pub fn describe_io_error(error: &std::io::Error) -> String {
+    if let Some(code) = error.raw_os_error() {
+        return format!("{:?} (errno {code})", error.kind());
+    }
+    match error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<std::io::Error>())
+    {
+        Some(inner) => describe_io_error(inner),
+        None => error.to_string(),
+    }
+}
+
 #[allow(dead_code)]
 /// A simple debugging helper function that makes it easy to printf-debug through
 /// layers of stdout/stderr caputure, such as when running under buck test/tpx.
