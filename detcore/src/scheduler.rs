@@ -5822,6 +5822,12 @@ impl Scheduler {
             );
             for (dettid, op) in self.blocked.rt_sigsuspend_blockers.iter() {
                 let _ = writeln!(out, "    dtid {}: {:?}", dettid, op);
+                // The mask recorded when the call was committed, when the
+                // scheduler models signal targets: a signal it blocks cannot
+                // end the wait, which is often why nothing can.
+                if let Some(Some(mask)) = self.blocked.out_of_scheduler_masks.get(dettid) {
+                    let _ = writeln!(out, "      temporary mask {:#x}", mask);
+                }
             }
         }
 
@@ -11854,6 +11860,95 @@ mod test {
         );
         assert!(!scheduler.run_queue.contains_tid(waiter));
         assert_eq!(request_resources(&scheduler, waiter), None);
+    }
+
+    /// A signal the waiter's temporary mask blocks cannot end its
+    /// `rt_sigsuspend`, so it must not arm the waiter: the scheduler would then
+    /// wait for a report that never comes. Left in its pool, a waiter that
+    /// nothing else can wake gets the terminal deadlock verdict instead of a
+    /// hang, and the verdict names the mask.
+    #[test]
+    fn signal_blocked_by_the_rt_sigsuspend_mask_leaves_the_wait_in_its_pool() {
+        let mut scheduler = gated_scheduler();
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        let waiter = DetTid::from_raw(11);
+        let op = ExternalOpId::new(waiter, 291);
+        register_known_thread(&mut scheduler, waiter);
+        let alarm_bit = kernel_signal_bit(libc::SIGALRM);
+        commit_out_of_scheduler_call(
+            &mut scheduler,
+            waiter,
+            ResourceID::BlockingRtSigsuspend(op),
+            Some(alarm_bit),
+        );
+
+        scheduler.wake_signaled_guest(waiter, Signal::SIGALRM);
+
+        assert!(scheduler.blocked.signaled_background.is_empty());
+        assert_eq!(
+            scheduler.blocked.rt_sigsuspend_blockers.get(&waiter),
+            Some(&op)
+        );
+        assert!(!scheduler.run_queue.contains_tid(waiter));
+        assert_eq!(request_resources(&scheduler, waiter), None);
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+        let report = scheduler
+            .take_terminal_deadlock()
+            .expect("a waiter whose mask blocks the only signal is a terminal deadlock");
+        assert!(
+            report.contains("thread(s) waiting in rt_sigsuspend with no possible signal"),
+            "unexpected report:\n{report}"
+        );
+        assert!(
+            report.contains(&format!("temporary mask {:#x}", alarm_bit)),
+            "unexpected report:\n{report}"
+        );
+    }
+
+    /// The scheduler's sigset bits are the kernel's: signal n is bit n - 1, so
+    /// realtime signal 64 is bit 63, and a number outside 1..=64 has no bit.
+    /// The mask recorded for an `rt_sigsuspend` waiter is the one the kernel
+    /// installs, which never blocks SIGKILL or SIGSTOP (the syscall layer's
+    /// `kernel_installed_signal_mask`, tested with it). A signal that mask
+    /// admits arms the waiter; one it blocks does not.
+    #[test]
+    fn rt_sigsuspend_mask_uses_kernel_sigset_bits_and_cannot_block_kill_or_stop() {
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        assert_eq!(usr1, 1_u64 << (libc::SIGUSR1 - 1));
+        assert_eq!(kernel_signal_bit(64), 1_u64 << 63);
+        assert_eq!(kernel_signal_bit(63), 1_u64 << 62);
+        for out_of_range in [0, 65, -1, i32::MIN] {
+            assert_eq!(kernel_signal_bit(out_of_range), 0, "{out_of_range}");
+        }
+        // The widest mask the kernel installs.
+        let everything = !(kernel_signal_bit(libc::SIGKILL) | kernel_signal_bit(libc::SIGSTOP));
+        assert_ne!(everything & kernel_signal_bit(libc::SIGALRM), 0);
+        assert_eq!(everything & kernel_signal_bit(libc::SIGKILL), 0);
+        assert_eq!(everything & kernel_signal_bit(libc::SIGSTOP), 0);
+
+        let cases = [
+            (usr1, Signal::SIGUSR1, false),
+            (usr1, Signal::SIGALRM, true),
+            (0, Signal::SIGALRM, true),
+            (everything, Signal::SIGALRM, false),
+        ];
+        for (mask, signal, armed) in cases {
+            let mut scheduler = gated_scheduler();
+            let waiter = DetTid::from_raw(11);
+            register_known_thread(&mut scheduler, waiter);
+            commit_out_of_scheduler_call(
+                &mut scheduler,
+                waiter,
+                ResourceID::BlockingRtSigsuspend(ExternalOpId::new(waiter, 291)),
+                Some(mask),
+            );
+            scheduler.wake_signaled_guest(waiter, signal);
+            assert_eq!(
+                scheduler.blocked.signaled_background.contains(&waiter),
+                armed,
+                "mask {mask:#x}, signal {signal}"
+            );
+        }
     }
 
     /// A child-exit timer whose creator already dequeued the kernel's own
