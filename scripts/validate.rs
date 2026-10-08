@@ -22833,40 +22833,30 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         true,
     )?;
 
-    for (label, detail, want_class, want_detail) in [
-        (
-            "infrastructure",
-            "error: failed to verify the checksum for `fixture v1.0.0`",
-            FailureClass::UnderstoodInfrastructureFailure,
-            "failed to verify the checksum",
-        ),
-        (
-            "prerequisite",
-            "prepare failed for language-runtimes/lua-random.sh\nno Lua interpreter on PATH",
-            FailureClass::UnderstoodPrerequisiteFailure,
-            " on path",
-        ),
-    ] {
-        let mut classified = reported_attempt(&failed, 1);
-        let environmental = validate_runtime::environmental_block_class(detail);
-        let failure = validate_runtime::failure_class_from_detail(detail);
-        stamp_attempt_detail(
-            std::slice::from_mut(&mut classified),
-            &failed.tag,
-            environmental,
-            validate_runtime::understood_infrastructure_class(detail),
-            failure,
-        );
-        let row = ledger_gate_with_attempts(&failed, std::slice::from_ref(&classified));
-        if row["raw_failure_class"] != want_class.as_str()
-            || row["raw_failure_detail"] != want_detail
-            || row["attempts"][0]["failure_class"] != want_class.as_str()
-            || row["attempts"][0]["failure_detail"] != want_detail
-        {
-            return Err(format!(
-                "ledger gate failure class: {label} was not written as a closed class plus detail: {row}"
-            ));
-        }
+    // An owner-classified environmental denial is written as a closed class
+    // plus its detail.
+    let detail = "An action was blocked on this server based on a security policy!\n\
+                  Enforcer: FS, Reason: FILE_OPEN";
+    let want_class = FailureClass::UnderstoodInfrastructureFailure;
+    let want_detail = validate_runtime::EnvBlockClass::BpfjailerBanner.as_str();
+    let mut classified = reported_attempt(&failed, 1);
+    stamp_attempt_detail(
+        std::slice::from_mut(&mut classified),
+        &failed.tag,
+        validate_runtime::environmental_block_class(detail),
+        validate_runtime::understood_infrastructure_class(detail),
+        validate_runtime::failure_class_from_detail(detail),
+    );
+    let row = ledger_gate_with_attempts(&failed, std::slice::from_ref(&classified));
+    if row["raw_failure_class"] != want_class.as_str()
+        || row["raw_failure_detail"] != want_detail
+        || row["attempts"][0]["failure_class"] != want_class.as_str()
+        || row["attempts"][0]["failure_detail"] != want_detail
+    {
+        return Err(format!(
+            "ledger gate failure class: an environmental denial was not written as a closed \
+             class plus detail: {row}"
+        ));
     }
     typed_gate_round_trip_bracket()?;
     println!("  ledger gate origin: fallback, terminal attempts, and failure classes stayed typed");

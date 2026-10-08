@@ -86,9 +86,11 @@ fn refused_without_writing_any_report(attempt: &NodeAttempt) -> bool {
     refusal_cause(attempt).is_some_and(|cause| cause.starts_with(RESULTS_NEVER_WRITTEN))
 }
 
-/// The one case with no evidence in either direction: the node's own command
-/// succeeded, and the only thing marking it not-ok is a report that was never
-/// written. Nothing failed that anybody measured.
+/// The node's own command succeeded, and the only thing marking it not-ok is a
+/// report that was never written. That is not product-failure EVIDENCE (no
+/// measured condition failed), so it does not outrank an infrastructure
+/// diagnosis; with no diagnosis, the node is still a failure (see
+/// [`attempt_classification`]).
 ///
 /// The command's own status is tested here rather than inferred from where
 /// this is called. A node that exited nonzero DID fail a condition; a missing
@@ -186,16 +188,10 @@ pub(super) fn attempt_classification(attempt: &NodeAttempt) -> NodeClassificatio
     if attempt.understood_infrastructure_class.is_some() {
         return NodeClassification::UnderstoodInfrastructureFailure;
     }
-    // Last, so that every measured condition above still wins: a node whose
-    // command succeeded and whose required report was never written produced
-    // no evidence either way. `no_result` keeps it out of the failure count
-    // and equally out of any green evidence for landing, which is both halves
-    // of the ruling. It is deliberately NOT UnderstoodInfrastructureFailure:
-    // nothing here diagnosed a cause, and that bucket is projected with a
-    // named cause it would have to leave empty.
-    if absent_report_is_the_only_failure(attempt) {
-        return NodeClassification::NoResult;
-    }
+    // Everything else that completed not-ok failed, including a node whose
+    // command exited 0 but never wrote the structured test report it is
+    // required to write: that is a defect of the node, so it is a failure of
+    // the node rather than a separate "undetermined" class.
     NodeClassification::ProductFailure
 }
 
@@ -477,8 +473,8 @@ fn fold_bracket() -> Result<(), String> {
     Ok(())
 }
 
-/// A report that was never written is an absence of evidence, not a failure --
-/// and every other measured condition still outranks that absence.
+/// A report that was never written is a failure of the node that owed it, and
+/// every other measured condition still outranks that absence.
 ///
 /// The fixture deliberately starts from a plain failing outcome with NO
 /// infrastructure diagnosis, so the only thing that can satisfy the
@@ -503,10 +499,9 @@ fn absent_report_bracket() -> Result<(), String> {
     let unreadable = "cannot read structured test results /src/counts.json: \
                       No such file or directory (os error 2)";
 
-    if attempt_classification(&refused_only(never_written)) != NodeClassification::NoResult {
+    if attempt_classification(&refused_only(never_written)) != NodeClassification::ProductFailure {
         return Err(
-            "classification: a report that was never written was reported as a product failure"
-                .into(),
+            "classification: a node that never wrote its required report was not a failure".into(),
         );
     }
     for (label, cause) in [("malformed", malformed), ("unreadable", unreadable)] {
@@ -532,7 +527,11 @@ fn absent_report_bracket() -> Result<(), String> {
     }
     // The legacy reason contract, which older attempts are still read back with.
     for (label, cause, want) in [
-        ("never written", never_written, NodeClassification::NoResult),
+        (
+            "never written",
+            never_written,
+            NodeClassification::ProductFailure,
+        ),
         ("malformed", malformed, NodeClassification::ProductFailure),
     ] {
         let mut legacy = reported_attempt(&clean, 1);
@@ -612,9 +611,9 @@ fn absent_report_bracket() -> Result<(), String> {
     }
     // The projection a consumer actually reads, and it must not invent a cause.
     let gate = super::ledger_gate_with_attempts(&clean, &[refused_only(never_written)]);
-    if gate["result"] != "no_result" || gate["failure_class"] != "no_result" {
+    if gate["result"] != "fail" || gate["failure_class"] != "product_failure" {
         return Err(format!(
-            "classification: absent-report projection did not read as no_result; gate={gate}"
+            "classification: absent-report projection did not read as a failure; gate={gate}"
         ));
     }
     Ok(())
@@ -931,7 +930,7 @@ pub(super) fn self_test() -> Result<String, String> {
     product_evidence_bracket()?;
     absent_report_bracket()?;
     populations_bracket()?;
-    Ok("classification: exact selected populations; stale/raw fold agreement; failed tests and node limits outrank infrastructure; an unwritten required report is undetermined rather than failed; missing super repetitions remain unmeasured".into())
+    Ok("classification: exact selected populations; stale/raw fold agreement; failed tests and node limits outrank infrastructure; an unwritten required report fails its node; missing super repetitions remain unmeasured".into())
 }
 
 #[cfg(test)]
@@ -947,7 +946,7 @@ mod tests {
         product_evidence_bracket().unwrap();
     }
     #[test]
-    fn an_unwritten_report_is_undetermined_and_never_outranks_a_measured_condition() {
+    fn an_unwritten_report_fails_its_node_and_never_outranks_a_measured_condition() {
         absent_report_bracket().unwrap();
     }
     #[test]
@@ -1093,10 +1092,10 @@ mod tests {
     /// the identical step, differing only in whether the report is produced,
     /// passes. So the absence is the single variable.
     #[test]
-    fn a_real_lane_that_writes_no_required_report_is_undetermined_not_failed() {
+    fn a_real_lane_that_writes_no_required_report_is_a_failure() {
         let dir = tempfile::tempdir().unwrap();
         for (name, write_report, wanted) in [
-            ("absent", false, NodeClassification::NoResult),
+            ("absent", false, NodeClassification::ProductFailure),
             ("wrote", true, NodeClassification::Pass),
         ] {
             // Exits 0 either way. A command that failed on its own would be a
