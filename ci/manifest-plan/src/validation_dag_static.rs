@@ -884,7 +884,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_configured_turn_charge_refuses_to_saturate_the_clock,
     // the_default_turn_charge_still_saturates} (lane qemu-rcb,
     // https://github.com/rrnewton/hermit/pull/3885) retain all 1005: 1011.
-    ("test.regular_crates", 1011),
+    // happens_before::tests::syscall_fd_anchor_normalizes_and_displays,
+    // syscall_fd_anchor_is_refused_where_it_cannot_apply and
+    // count_syscall_occurrences_is_exact_per_thread (detcore-model) retain all
+    // 1011: 1014.
+    ("test.regular_crates", 1014),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1193,7 +1197,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Thirteen run_config::tests and three run::saved_config_* tests of the
     // loadable run config (`hermit run --config` / `--save-config`) retain all
     // 981: 997.
-    ("test.hermit_unit", 997),
+    // happens_before::tests::launch_refuses_every_anchor_it_cannot_enforce
+    // retains all 997: 998.
+    ("test.hermit_unit", 998),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1535,7 +1541,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // scheduler::parked_tests::a_refused_turn_charge_returns_before_a_controlled_observation
     // (lane qemu-rcb, https://github.com/rrnewton/hermit/pull/3885) retain all
     // 1184: 1186.
-    ("test.detcore_unit", 1186),
+    // scheduler::test::checkpoint_fires_count_and_occurrence_anchors_reached_at_one_syscall
+    // and unfired_occurrence_anchor_is_reported_by_name retain all 1186: 1188.
+    ("test.detcore_unit", 1188),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1956,7 +1964,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run_config_saved_by_one_run_reproduces_it and
     // run_config_refuses_an_unknown_key_with_the_working_spelling retain all
     // 232: 234. Neither starts a LiteInst guest, so test.cli_on_host selects both.
-    ("test.cli", 234),
+    // The syscall-occurrence anchor tests
+    // happens_before_fd_anchors_order_two_threads_without_calibration,
+    // happens_before_fd_anchor_that_never_fires_is_refused_by_name,
+    // happens_before_fd_anchor_counts_past_the_first_occurrence,
+    // happens_before_before_anchor_that_never_fires_is_refused_by_name,
+    // happens_before_hold_in_a_vfork_child_is_refused_by_name,
+    // happens_before_fd_anchor_is_refused_without_interception and
+    // happens_before_unsupported_fd_anchor_is_refused_before_reading_stdin
+    // retain all 234: 241.
+    ("test.cli", 241),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2137,7 +2154,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // CPUID-faulting exact-name filterset: 185 - 1 = 184.
     // a_child_exit_is_notified_once_with_linuxs_siginfo: 185.
     // And the two run_config_ tests: 187.
-    ("test.cli_on_host", 187),
+    // The seven happens-before fd-anchor tests start no LiteInst guest: 194.
+    ("test.cli_on_host", 194),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 55),
@@ -2232,7 +2250,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two signal phase 1 step I4 tests: 1173.
     // And the ten child-exit SIGCHLD tests: 1184.
     // And the same two refused-turn-charge tests: 1186.
-    ("test.detcore_unit_on_host", 1186),
+    // And the two happens-before syscall-occurrence scheduler tests: 1188.
+    ("test.detcore_unit_on_host", 1188),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -2328,7 +2347,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same seven accept stand-in and peer-address tests: 980.
     // And the scheduler-turn-cost CLI test: 981.
     // And the same sixteen run config tests: 997.
-    ("test.hermit_unit_on_host", 997),
+    // The same launch refusal test: 998.
+    ("test.hermit_unit_on_host", 998),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -2423,7 +2443,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two detcore-model replaying tests listed there: 1004.
     // And the same test-free declaration test: 1005.
     // And the same six scheduler-turn-cost tests: 1011.
-    ("test.regular_crates_on_host", 1011),
+    // The same three detcore-model happens-before tests: 1014.
+    ("test.regular_crates_on_host", 1014),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
