@@ -120,6 +120,7 @@ static FORK_CHILD_GETRANDOM_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGSUSPEND_AFTER_WNOHANG_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGSUSPEND_SHARED_MASK_REWRITE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGSUSPEND_SHARED_STACK_MASK_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SIGCHLD_ONCE_PER_CHILD_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLONE_EXIT_SIGNAL_EFFECTIVE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "liteinst")]
 static LITEINST_IN_GUEST_WAIT_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -778,6 +779,32 @@ fn sigsuspend_shared_mask_rewrite_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "sigsuspend-shared-mask-rewrite guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn sigchld_once_per_child_exit_guest() -> &'static Path {
+    SIGCHLD_ONCE_PER_CHILD_EXIT_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("sigchld-once-per-child-exit");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the sigchld-once-per-child-exit guest directory");
+        let guest = build_root.join("sigchld_once_per_child_exit");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/sigchld_once_per_child_exit.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the sigchld-once-per-child-exit guest");
+        assert!(
+            output.status.success(),
+            "sigchld-once-per-child-exit guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -6592,6 +6619,39 @@ fn a_sigsuspend_mask_on_a_shared_stack_below_the_red_zone_is_copied_elsewhere() 
     let output = hermit(&args);
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "sigchld=1 sigusr1=1\n");
+    assert!(
+        stderr(&output).contains("Determinism verified"),
+        "missing verification success marker:\n{}",
+        stderr(&output)
+    );
+}
+
+/// tests/c/sigchld_once_per_child_exit.c: one SIGCHLD per child exit, with
+/// Linux's siginfo (https://github.com/rrnewton/hermit/issues/3895). The
+/// child exits with `_exit(7)`, and the parent keeps SIGCHLD unblocked for a
+/// second after its first one, so a second SIGCHLD for the exit would be
+/// delivered too. Both the kernel and the scheduler send one; the first
+/// delivered stands for the exit, the other is dropped, and the scheduler's
+/// carries CLD_EXITED, the child's pid and the status instead of the
+/// tracer's SI_USER.
+#[test]
+fn a_child_exit_is_notified_once_with_linuxs_siginfo() {
+    let _guard = hermit_run_guard();
+    let guest = sigchld_once_per_child_exit_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let args = [
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--",
+        guest,
+        "exit-group",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "sigchld=1 code=1 pid=child status=7\n");
     assert!(
         stderr(&output).contains("Determinism verified"),
         "missing verification success marker:\n{}",

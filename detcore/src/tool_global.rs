@@ -1774,6 +1774,18 @@ impl GlobalTool for GlobalState {
             let refused = self.sched.lock().unwrap().sigalrm_control(dtid, control);
             return (None, R::Sigalrm(refused));
         }
+        // A child-exit SIGCHLD control message: like the SIGALRM ledger's, it
+        // carries no logical time and its answer carries none back. It
+        // records an exit status in the sender's own turn, or answers at a
+        // signal stop, which no scheduler state waits for.
+        if let GlobalRequest::ChildExitSigchld(control) = request {
+            let answer = self
+                .sched
+                .lock()
+                .unwrap()
+                .child_exit_sigchld_control(dtid, control);
+            return (None, R::ChildExitSigchld(answer));
+        }
         if let GlobalRequest::SignalDequeued {
             detpid,
             identity,
@@ -1984,6 +1996,9 @@ impl GlobalTool for GlobalState {
             }
             GlobalRequest::Sigalrm(_) => {
                 unreachable!("SIGALRM ledger control answered before clock accounting")
+            }
+            GlobalRequest::ChildExitSigchld(_) => {
+                unreachable!("child-exit SIGCHLD control answered before clock accounting")
             }
             GlobalRequest::ParkedRequest(rs, pid, capability) => {
                 let (response, _) = self
@@ -4113,6 +4128,9 @@ pub enum GlobalRequest {
     /// scheduler accounting (see [`sigalrm_refuses`]). Appended after
     /// `SharedOpenFile`, for the same reason.
     Sigalrm(SigalrmControl),
+    /// A child-exit `SIGCHLD` control message
+    /// (`scheduler::child_exit_sigchld`).
+    ChildExitSigchld(crate::scheduler::child_exit_sigchld::ChildExitSigchldControl),
 }
 
 /// Responses from the global object
@@ -4206,6 +4224,7 @@ pub enum GlobalResponse {
     /// Whether the SIGALRM ledger refused the control message. Appended after
     /// `SharedOpenFile`, for the same reason.
     Sigalrm(bool),
+    ChildExitSigchld(crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -5385,6 +5404,24 @@ where
     let response = send_and_update_time(guest, GlobalRequest::HostTimedSignals(dettid)).await;
     match response.1 {
         GlobalResponse::HostTimedSignals(signals) => signals,
+        _ => unreachable!(),
+    }
+}
+
+/// The scheduler's answer to a child-exit `SIGCHLD` control message from the
+/// calling thread (`Scheduler::child_exit_sigchld_control`). It carries no
+/// logical time either way.
+pub(crate) async fn child_exit_sigchld<G, T>(
+    guest: &mut G,
+    control: crate::scheduler::child_exit_sigchld::ChildExitSigchldControl,
+) -> crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::ChildExitSigchld(control)).await;
+    match response.1 {
+        GlobalResponse::ChildExitSigchld(answer) => answer,
         _ => unreachable!(),
     }
 }

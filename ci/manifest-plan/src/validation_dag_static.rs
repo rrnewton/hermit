@@ -1514,7 +1514,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and completed_syscall_projection_tests::a_completed_syscall_shows_its_result_and_return_address
     // (signal phase 1 step I4) retain all 1171: 1173, listed with this node's
     // arguments.
-    ("test.detcore_unit", 1174),
+    // The nine scheduler::child_exit_sigchld tests and
+    // scheduler::test::a_child_exit_timer_sends_nothing_after_the_kernels_copy
+    // (one SIGCHLD per child exit) retain all 1174: 1184, run with this node's
+    // arguments.
+    ("test.detcore_unit", 1184),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1926,7 +1930,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // liteinst_in_guest_an_undeliverable_sigalrm_is_a_loss_and_stops_the_guest (signal
     // phase 1 step I4) retain all 227: 231, listed with this node's arguments. They join
     // the same hosted filterset; test.cli_on_host does not change.
-    ("test.cli", 231),
+    // a_child_exit_is_notified_once_with_linuxs_siginfo retains all 231: 232,
+    // run with this node's arguments. It starts no LiteInst guest, so
+    // test.cli_on_host selects it too.
+    ("test.cli", 232),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2095,7 +2102,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // liteinst_in_guest_refuses_a_guest_socket_at_the_forwarding_number starts
     // an in-guest LiteInst guest (CPUID faulting), so it joins the hosted
     // CPUID-faulting exact-name filterset: 185 - 1 = 184.
-    ("test.cli_on_host", 184),
+    // a_child_exit_is_notified_once_with_linuxs_siginfo: 185.
+    ("test.cli_on_host", 185),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 55),
@@ -2188,7 +2196,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the rt_sigsuspend cross-task signal test: 1169, listed.
     // And the directory-listing test: 1171.
     // And the two signal phase 1 step I4 tests: 1173.
-    ("test.detcore_unit_on_host", 1174),
+    // And the ten child-exit SIGCHLD tests: 1184.
+    ("test.detcore_unit_on_host", 1184),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

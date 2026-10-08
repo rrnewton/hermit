@@ -828,6 +828,41 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Whether a `SIGCHLD` that stopped this thread is delivered, on a backend
+    /// that reports child-exit publication, where both the kernel and the
+    /// scheduler send a child's exit `SIGCHLD` (`scheduler::child_exit_sigchld`).
+    /// The first one delivered for a child's exit stands for it, and a copy
+    /// of either kind that arrives after it is not delivered. The scheduler's
+    /// copy (`SI_USER` from this tracer) is delivered with the siginfo Linux
+    /// gives the parent. Any other `SIGCHLD` is delivered as it is.
+    async fn child_exit_sigchld_delivers<G: Guest<Self>>(&self, guest: &mut G) -> bool {
+        use scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
+        use scheduler::child_exit_sigchld::OwnCopy;
+        let Some(info) = guest.signal_info() else {
+            return true;
+        };
+        let Some(control) = scheduler::child_exit_sigchld::control_for(&info, std::process::id())
+        else {
+            return true;
+        };
+        match tool_global::child_exit_sigchld(guest, control).await {
+            ChildExitSigchldAnswer::Claimed(dropped) => !dropped,
+            ChildExitSigchldAnswer::OwnCopy(OwnCopy::Duplicate) => false,
+            ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(own)) => {
+                if let Err(errno) = guest.set_signal_info(own.to_bytes()) {
+                    warn!(
+                        "[dtid {}] the SIGCHLD for child {} keeps the tracer's siginfo: {}",
+                        guest.thread_state().dettid,
+                        own.pid,
+                        errno
+                    );
+                }
+                true
+            }
+            _ => true,
+        }
+    }
+
     async fn pre_handler_hook<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1808,6 +1843,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // other tool reports for this, and it keeps 122 meaning one thing.
             unrecoverable_shutdown(guest, detcore_model::HERMIT_SIGINT_DEATH_EXIT).await
         } else {
+            if signal == Signal::SIGCHLD
+                && self.cfg.backend.reports_child_exit_publication
+                && !self.child_exit_sigchld_delivers(guest).await
+            {
+                return Ok(None);
+            }
             self.pre_handler_hook(guest, false, CheckIn::Event).await;
 
             // For `hermit run --verify`: a guest that faulted on an illegal
@@ -1870,6 +1911,59 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
             self.post_handler_hook(guest, CheckIn::Event).await;
             Ok(Some(signal))
+        }
+    }
+
+    /// A `SIGCHLD` the backend passes on without reporting it is dropped when
+    /// it is the kernel's copy of a child-exit notification the scheduler
+    /// sends itself (`scheduler::child_exit_sigchld`). A copy the scheduler
+    /// sent is kept, with the siginfo the tracer gave it: this hook cannot
+    /// replace it.
+    async fn filter_unreported_signal<R: GlobalRPC<Self::GlobalState>>(
+        &self,
+        rpc: &R,
+        unreported: reverie::UnreportedSignal,
+    ) -> bool {
+        use scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
+        use scheduler::child_exit_sigchld::OwnCopy;
+        if unreported.signal() != Signal::SIGCHLD
+            || !self.cfg.backend.reports_child_exit_publication
+        {
+            return true;
+        }
+        let Some(control) = unreported
+            .siginfo()
+            .and_then(|info| scheduler::child_exit_sigchld::control_for(&info, std::process::id()))
+        else {
+            return true;
+        };
+        // The control message carries no logical time; the scheduler answers
+        // it before any clock accounting.
+        let tid = DetTid::from_raw(unreported.tid().as_raw());
+        let (_, response) = rpc
+            .send_rpc((
+                DetTime::default(),
+                MmId::initial(tid),
+                tool_global::GlobalRequest::ChildExitSigchld(control),
+            ))
+            .await;
+        match response {
+            tool_global::GlobalResponse::ChildExitSigchld(ChildExitSigchldAnswer::Claimed(
+                dropped,
+            )) => !dropped,
+            tool_global::GlobalResponse::ChildExitSigchld(ChildExitSigchldAnswer::OwnCopy(
+                OwnCopy::Duplicate,
+            )) => false,
+            tool_global::GlobalResponse::ChildExitSigchld(ChildExitSigchldAnswer::OwnCopy(
+                OwnCopy::Deliver(own),
+            )) => {
+                warn!(
+                    "[dtid {}] the SIGCHLD for child {} passed on unreported keeps the tracer's siginfo",
+                    tid, own.pid
+                );
+                true
+            }
+            _ => true,
         }
     }
 
