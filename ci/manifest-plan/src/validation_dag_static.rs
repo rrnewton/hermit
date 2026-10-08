@@ -1955,7 +1955,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retains all 18: 19.
     // sabre_verify_never_loses_an_exec_image_that_drops_its_forwarding_settings
     // retains all 19: 20.
-    ("test.sabre_examples", 20),
+    // sabre_runs_a_guest_rdtsc_before_and_after_its_first_syscall retains all
+    // 20: 21 (measured with cargo nextest list).
+    // sabre_virtualizes_an_rdtsc_in_a_guest_signal_handler and
+    // sabre_refuses_a_guest_rdtsc_before_its_plugin_starts retain all 21: 23.
+    // sabre_refuses_an_rdtsc_that_reenters_a_tool_call retains all 23: 24.
+    ("test.sabre_examples", 24),
     ("test.hermit_modes", 21),
     ("test.app_strict_verify", 8),
     ("test.command_strict_verify", 9),
@@ -2393,7 +2398,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests (16), the same missing-records refusal test (17), and the same
     // guest-stderr-file test (18), and the same guest-socket test (19).
     // And the same exec-image forwarding test: 20.
-    ("test.sabre_examples_on_host", 20),
+    // And the same guest-RDTSC test: 21, and the same signal-handler and
+    // early RDTSC tests: 23, and the same re-entrant RDTSC test: 24.
+    ("test.sabre_examples_on_host", 24),
 ];
 
 pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {
