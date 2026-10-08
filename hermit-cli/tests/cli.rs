@@ -110,6 +110,8 @@ static DBT_LOG_ENV_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "liteinst")]
 static LITEINST_INERT_RUNTIME: OnceLock<PathBuf> = OnceLock::new();
 static EXEC_CLOCK_CONTINUITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static HB_TWO_THREADS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static HB_SOURCE_THEN_FUTEX_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_LSEEK_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_INODE_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REPLAY_EPOCH_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -530,6 +532,57 @@ fn exec_clock_continuity_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "exec-clock-continuity guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn hb_two_threads_guest() -> &'static Path {
+    HB_TWO_THREADS_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("hb-two-threads");
+        fs::create_dir_all(&build_root).expect("failed to create hb-two-threads guest directory");
+        let guest = build_root.join("hb_two_threads");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/hb_two_threads.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile hb-two-threads guest");
+        assert!(
+            output.status.success(),
+            "hb-two-threads guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn hb_source_then_futex_guest() -> &'static Path {
+    HB_SOURCE_THEN_FUTEX_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("hb-source-then-futex");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create hb-source-then-futex guest directory");
+        let guest = build_root.join("hb_source_then_futex");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/hb_source_then_futex.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile hb-source-then-futex guest");
+        assert!(
+            output.status.success(),
+            "hb-source-then-futex guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -7848,6 +7901,297 @@ fn happens_before_edge_reverses_two_processes_writes() {
         first.dettid,
         first.count
     );
+}
+
+/// A `--happens-before` spec costs scheduler turns only on the threads it
+/// names. The spec names the child of the two-process guest at its third
+/// syscall (a count the parent also passes) and the parent at a count it never
+/// reaches, so nothing is ever parked: the only effect is the checkpoint turn
+/// at the child's anchor. With a thread-agnostic filter every thread passing
+/// an anchored count checked in, here the parent too, and its extra turn
+/// shifted the schedule of a thread the spec does not mention (on a QEMU guest
+/// the main loop passes small counts within the first second, so an anchor
+/// chosen on a vCPU thread from a reference run fell on another timeline).
+#[test]
+fn happens_before_spec_adds_checkpoint_turns_only_on_named_threads() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut args = vec!["--log", "info", "run", "--strict", "--"];
+    args.extend(HB_ORDER_GUEST);
+    let calibration = hermit(&args);
+    assert_success(&calibration, &args);
+    let writes = logged_stdout_writes(&stderr(&calibration));
+    let (Some(parent), Some(child)) = (
+        writes.iter().find(|w| w.len == 7),
+        writes.iter().find(|w| w.len == 6),
+    ) else {
+        panic!(
+            "no parent and child write(1, ..) in the INFO log; found {} writes",
+            writes.len()
+        );
+    };
+    assert!(
+        child.count > 3 && parent.count > 3,
+        "both processes must pass syscall 3 (child wrote at {}, parent at {})",
+        child.count,
+        parent.count
+    );
+    let spec = directory.path().join("child-only.json");
+    fs::write(
+        &spec,
+        format!(
+            r#"{{"version": 1,
+                "events": {{"child_early": {{"thread": "{}", "syscalls": 3}},
+                            "parent_never": {{"thread": "{}", "syscalls": 1000000000}}}},
+                "edges": [{{"before": "child_early", "after": "parent_never", "strength": "hard"}}]}}"#,
+            child.dettid, parent.dettid
+        ),
+    )
+    .unwrap();
+    let turns = |with_spec: bool| -> u64 {
+        let summary = directory
+            .path()
+            .join(if with_spec { "spec.json" } else { "base.json" });
+        let summary_arg = format!("--summary-json={}", summary.display());
+        let spec_str = spec.to_str().unwrap().to_owned();
+        let mut args = vec!["run", "--strict", summary_arg.as_str()];
+        if with_spec {
+            args.extend(["--happens-before", spec_str.as_str()]);
+        }
+        args.push("--");
+        args.extend(HB_ORDER_GUEST);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&summary).expect("the summary was not written"))
+                .expect("the summary is not JSON");
+        report["sched_turns"]
+            .as_u64()
+            .expect("summary has no sched_turns")
+    };
+    let base = turns(false);
+    let with_spec = turns(true);
+    assert_eq!(
+        with_spec,
+        base + 1,
+        "a spec naming only the child (dettid {}) at syscall 3 should add exactly its one \
+         checkpoint turn to the {base} of the plain run; a thread-agnostic filter adds the \
+         parent's (dettid {}) too",
+        child.dettid,
+        parent.dettid
+    );
+}
+
+/// A hard edge orders two threads of ONE process (the worker's dettid is not
+/// its process's detpid, so a filter or anchor that confused the two would
+/// gate the wrong thread or none). Calibration as in the two-process test: an
+/// INFO run finds each thread's `write(1, ..)` and syscall count ("worker\n"
+/// is 7 bytes, "main!\n" 6). The edge fires at the second writer's write and
+/// gates the first writer's, so the default order must reverse. The BEFORE
+/// anchor sits at the write itself, not the next syscall: in this guest the
+/// main thread's next syscall is the futex wait in `pthread_join`, and an
+/// anchor on a blocking wait of the BEFORE thread currently ends in a false
+/// "Deadlock detected" (https://github.com/rrnewton/hermit/issues/3149).
+#[test]
+fn happens_before_edge_reverses_two_threads_writes() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = hb_two_threads_guest().to_str().unwrap().to_owned();
+    let args = ["--log", "info", "run", "--strict", "--", guest.as_str()];
+    let calibration = hermit(&args);
+    assert_success(&calibration, &args);
+    let default_stdout = String::from_utf8_lossy(&calibration.stdout).into_owned();
+    let writes = logged_stdout_writes(&stderr(&calibration));
+    let (Some(worker), Some(main)) = (
+        writes.iter().find(|w| w.len == 7),
+        writes.iter().find(|w| w.len == 6),
+    ) else {
+        panic!(
+            "no worker and main write(1, ..) in the INFO log; found {} writes",
+            writes.len()
+        );
+    };
+    assert_ne!(
+        worker.dettid, main.dettid,
+        "the two writes came from one thread"
+    );
+    let (first, second, reversed) = match default_stdout.as_str() {
+        "worker\nmain!\n" => (worker, main, "main!\nworker\n"),
+        "main!\nworker\n" => (main, worker, "worker\nmain!\n"),
+        other => panic!("unexpected default output {other:?}"),
+    };
+    let spec = directory.path().join("reverse-threads.json");
+    fs::write(
+        &spec,
+        format!(
+            r#"{{"version": 1,
+                "events": {{"second_writes": {{"thread": "{}", "syscalls": {}}},
+                            "first_writes": {{"thread": "{}", "syscalls": {}}}}},
+                "edges": [{{"before": "second_writes", "after": "first_writes", "strength": "hard"}}]}}"#,
+            second.dettid, second.count, first.dettid, first.count
+        ),
+    )
+    .unwrap();
+    let spec = spec.to_str().unwrap().to_owned();
+    let args = [
+        "run",
+        "--strict",
+        "--happens-before",
+        spec.as_str(),
+        "--",
+        guest.as_str(),
+    ];
+    let ordered = hermit(&args);
+    assert_success(&ordered, &args);
+    assert_eq!(
+        String::from_utf8_lossy(&ordered.stdout),
+        reversed,
+        "the edge {}:{} < {}:{} did not reverse the default order {default_stdout:?}",
+        second.dettid,
+        second.count,
+        first.dettid,
+        first.count
+    );
+}
+
+/// Every `finish syscall #N: futex(ADDR, OP, ..)` line in a Hermit INFO log, as
+/// (dettid, N, OP).
+fn logged_futex_calls(log: &str) -> Vec<(u64, u64, u64)> {
+    log.lines()
+        .filter_map(|line| {
+            let after_dtid = line.split_once("[syscall][detcore, dtid ")?.1;
+            let (dettid, rest) = after_dtid.split_once(']')?;
+            let rest = rest.split_once("finish syscall #")?.1;
+            let (count, rest) = rest.split_once(": futex(")?;
+            let op = rest.split_once(", ")?.1.split_once(',')?.0;
+            Some((
+                dettid.trim().parse().ok()?,
+                count.parse().ok()?,
+                op.trim().parse().ok()?,
+            ))
+        })
+        .collect()
+}
+
+/// Index of the first INFO line finishing syscall `count` of `dettid`.
+fn finish_line(log: &str, dettid: u64, count: u64) -> Option<usize> {
+    let needle = format!("[syscall][detcore, dtid {dettid}] finish syscall #{count}:");
+    log.lines().position(|line| line.contains(&needle))
+}
+
+/// A source whose thread blocks right after firing must still let the target
+/// pass (https://github.com/rrnewton/hermit/issues/3149). The guest's parent
+/// makes eight getpids and then FUTEX_WAITs on a word its forked child sets
+/// and wakes after 256 getpids. The edge is "parent's last getpid" before "a
+/// child getpid in the middle of its loop", so the child is parked, the
+/// parent's source fires, and the parent blocks: only the child, whose gate
+/// just opened, can run. The scheduler used to re-admit it only at
+/// `step3_peek`, after the empty-queue step had already classified the state
+/// as a futex deadlock (exit 125). The test requires completion, proves the
+/// child was actually held (otherwise it shows nothing), and that the target
+/// finished only after the source.
+#[test]
+fn happens_before_source_then_blocking_wait_lets_the_target_pass() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = hb_source_then_futex_guest().to_str().unwrap().to_owned();
+    let args = ["--log", "info", "run", "--strict", "--", guest.as_str()];
+    let calibration = hermit(&args);
+    assert_success(&calibration, &args);
+    let futexes = logged_futex_calls(&stderr(&calibration));
+    // FUTEX_WAIT is op 0, FUTEX_WAKE op 1 (no FUTEX_PRIVATE_FLAG on a shared map).
+    let Some(&(parent, wait_count, _)) = futexes.iter().find(|f| f.2 == 0) else {
+        panic!("no FUTEX_WAIT in the calibration log: {futexes:?}");
+    };
+    let Some(&(child, wake_count, _)) = futexes.iter().find(|f| f.2 == 1 && f.0 != parent) else {
+        panic!("no child FUTEX_WAKE in the calibration log: {futexes:?}");
+    };
+    assert!(
+        wake_count > 200,
+        "the child's wake came at its syscall {wake_count}; its 256-getpid loop should precede it"
+    );
+    let source = wait_count - 1;
+    let target = wake_count - 128;
+    let spec = directory.path().join("source-then-futex.json");
+    fs::write(
+        &spec,
+        format!(
+            r#"{{"version": 1,
+                "events": {{"source": {{"thread": "{parent}", "syscalls": {source}}},
+                            "target": {{"thread": "{child}", "syscalls": {target}}}}},
+                "edges": [{{"before": "source", "after": "target", "strength": "hard"}}]}}"#
+        ),
+    )
+    .unwrap();
+    let spec = spec.to_str().unwrap().to_owned();
+    let args = [
+        "--log",
+        "info",
+        "run",
+        "--strict",
+        "--happens-before",
+        spec.as_str(),
+        "--",
+        guest.as_str(),
+    ];
+    let ordered = hermit(&args);
+    let log = stderr(&ordered);
+    assert_success(&ordered, &args);
+    assert_eq!(String::from_utf8_lossy(&ordered.stdout), "wake-completed\n");
+    assert!(
+        log.contains(&format!("SKIP dettid {child} held at happens-before")),
+        "the child (dettid {child}) was never held at its gate, so the test exercised nothing"
+    );
+    let (Some(source_done), Some(target_done)) = (
+        finish_line(&log, parent, source),
+        finish_line(&log, child, target),
+    ) else {
+        panic!("source {parent}:{source} or target {child}:{target} missing from the INFO log");
+    };
+    assert!(
+        source_done < target_done,
+        "the target {child}:{target} finished (line {target_done}) before the source \
+         {parent}:{source} (line {source_done})"
+    );
+}
+
+/// A gate whose BEFORE anchor can never fire, on the only thread left, is a
+/// deadlock to report (https://github.com/rrnewton/hermit/issues/3149). A held
+/// thread is in neither the run queue nor a blocked pool, so the scheduler loop
+/// used to conclude that no threads were left and exit, leaving the guest to
+/// hang without a report. It must now fail promptly, naming the gate.
+#[test]
+fn happens_before_gate_that_cannot_open_reports_a_deadlock() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let spec = directory.path().join("never-open.json");
+    fs::write(
+        &spec,
+        r#"{"version": 1,
+            "events": {"never": {"thread": "3", "syscalls": 1000000000},
+                       "gate": {"thread": "3", "syscalls": 50}},
+            "edges": [{"before": "never", "after": "gate", "strength": "hard"}]}"#,
+    )
+    .unwrap();
+    let spec = spec.to_str().unwrap().to_owned();
+    let args = [
+        "run",
+        "--strict",
+        "--happens-before",
+        spec.as_str(),
+        "--",
+        "/bin/sh",
+        "-c",
+        "i=0; while [ $i -lt 100 ]; do read x < /proc/self/stat; i=$((i+1)); done; echo done",
+    ];
+    let output = hermit(&args);
+    let log = stderr(&output);
+    assert!(
+        !output.status.success(),
+        "a gate that cannot open let the run succeed: {log}"
+    );
+    assert!(
+        log.contains("held at a happens-before gate whose BEFORE anchor cannot fire")
+            && log.contains("HappensBeforeCheckpoint(50)"),
+        "no deadlock report naming the gate:\n{log}"
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).is_empty());
 }
 
 /// `--hb-list-events` prints the resolved spec and exits 0 without running

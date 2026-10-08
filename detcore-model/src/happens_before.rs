@@ -370,15 +370,22 @@ impl HappensBeforeProgram {
         })
     }
 
-    /// True when some anchor, on any thread, sits at exactly
-    /// [`Position::SyscallCount`]`(count)`. The scheduler's checkpoint is a no-op
-    /// for every other count, so the guest side issues it only when this holds:
-    /// one scheduler round trip per anchor instead of one per syscall on every
-    /// thread (QEMU's main loop alone makes about a million syscalls a run).
-    pub fn has_syscall_count_anchor_at(&self, count: u64) -> bool {
-        self.anchors
-            .values()
-            .any(|a| matches!(a.position, Position::SyscallCount(n) if n == count))
+    /// True when thread `dettid` must check in with the scheduler at its
+    /// syscall number `count`: some anchor sits at exactly
+    /// [`Position::SyscallCount`]`(count)` and names `dettid`, or names its
+    /// thread by spawn ordinal (which only the scheduler can resolve, so the
+    /// guest side must ask). For any other (thread, count) the scheduler's
+    /// checkpoint finds no anchor and does nothing, so skipping it changes no
+    /// gate. It costs one scheduler round trip per anchor its thread reaches,
+    /// not one per syscall (<https://github.com/rrnewton/hermit/issues/3877>),
+    /// and threads a spec does not name keep their schedule: a count another
+    /// thread passes early (QEMU's main loop makes about a million syscalls a
+    /// run) no longer adds a scheduler turn there.
+    pub fn may_have_syscall_count_anchor_at(&self, dettid: DetTid, count: u64) -> bool {
+        self.anchors.values().any(|a| {
+            matches!(a.position, Position::SyscallCount(n) if n == count)
+                && a.thread.dettid.is_none_or(|d| d == dettid)
+        })
     }
 
     /// Anchors whose position kind the current scheduler does not yet enforce
@@ -985,35 +992,40 @@ mod tests {
         }"#
     }
 
-    /// The guest-side checkpoint filter is exact: true only at a count some
-    /// syscall-count anchor names, false one below and one above it, and false
-    /// at numbers that belong to other position kinds (an RCB value, a
+    /// The guest-side checkpoint filter is exact per thread: true for the named
+    /// dettid at exactly its anchored count, false for another dettid or for
+    /// count +/- 1 or at count 0, true for every thread at a spawn-ordinal
+    /// anchor's count (the guest side cannot resolve ordinals), and false at
+    /// numbers that belong to other position kinds (an RCB value, a
     /// syscall-by-name occurrence).
     #[test]
-    fn has_syscall_count_anchor_at_is_exact() {
-        let prog = HappensBeforeSpec::from_json(spec_json())
-            .unwrap()
-            .normalize()
-            .unwrap();
-        assert_eq!(prog.anchors["scA"].position, Position::SyscallCount(10));
-        assert!(prog.has_syscall_count_anchor_at(10));
-        assert!(!prog.has_syscall_count_anchor_at(9));
-        assert!(!prog.has_syscall_count_anchor_at(11));
-        assert!(!prog.has_syscall_count_anchor_at(0));
-        assert_eq!(prog.anchors["rcbB"].position, Position::Rcb(123456));
-        assert!(!prog.has_syscall_count_anchor_at(123456));
-        let syscall_nths: Vec<u64> = prog
-            .anchors
-            .values()
-            .filter_map(|a| match a.position {
-                Position::Syscall { nth, .. } => Some(nth),
-                _ => None,
-            })
-            .collect();
-        assert!(!syscall_nths.is_empty());
-        for nth in syscall_nths.into_iter().filter(|n| *n != 10) {
-            assert!(!prog.has_syscall_count_anchor_at(nth), "nth {nth}");
-        }
+    fn may_have_syscall_count_anchor_at_is_exact_per_thread() {
+        let prog = HappensBeforeSpec::from_json(
+            r#"{"version": 1,
+                "threads": {"T7": {"dettid": 7}, "S2": {"spawn_ordinal": 2}},
+                "events": {"a": {"thread": "T7", "syscalls": 10},
+                           "b": {"thread": "S2", "syscalls": 20},
+                           "c": {"thread": "T7", "rcbs": 30},
+                           "d": {"thread": "T7", "syscall": "futex", "phase": "pre", "nth": 40}},
+                "edges": [{"before": "a", "after": "b"}]}"#,
+        )
+        .unwrap()
+        .normalize()
+        .unwrap();
+        assert!(prog.may_have_syscall_count_anchor_at(DetTid::from_raw(7), 10));
+        assert!(!prog.may_have_syscall_count_anchor_at(DetTid::from_raw(8), 10));
+        assert!(!prog.may_have_syscall_count_anchor_at(DetTid::from_raw(7), 9));
+        assert!(!prog.may_have_syscall_count_anchor_at(DetTid::from_raw(7), 11));
+        assert!(prog.may_have_syscall_count_anchor_at(DetTid::from_raw(7), 20));
+        assert!(prog.may_have_syscall_count_anchor_at(DetTid::from_raw(8), 20));
+        assert!(!prog.may_have_syscall_count_anchor_at(DetTid::from_raw(8), 21));
+        assert!(!prog.may_have_syscall_count_anchor_at(DetTid::from_raw(7), 30));
+        assert!(!prog.may_have_syscall_count_anchor_at(DetTid::from_raw(7), 0));
+        assert!(matches!(
+            prog.anchors["d"].position,
+            Position::Syscall { nth: 40, .. }
+        ));
+        assert!(!prog.may_have_syscall_count_anchor_at(DetTid::from_raw(7), 40));
     }
 
     #[test]

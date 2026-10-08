@@ -1495,8 +1495,16 @@ async fn sched_loop_inner(
             if sched.backend_failed() {
                 return;
             }
+            // A thread held at a happens-before gate is in neither the run queue
+            // nor `blocked`, but it is still a live thread: without this the loop
+            // exited while it waited and the guest hung with no scheduler and no
+            // deadlock report (https://github.com/rrnewton/hermit/issues/3149).
             if sched.run_queue.is_empty()
                 && sched.blocked.is_empty()
+                && sched
+                    .happens_before
+                    .as_ref()
+                    .is_none_or(|hb| hb.parked.is_empty())
                 && sched.pending_physical_process_exits.is_empty()
                 && sched.pending_run_queue_admissions.is_empty()
                 && sched.pending_run_queue_removals.is_empty()
@@ -2318,10 +2326,12 @@ impl Scheduler {
     /// untouched, so no request needs re-filling. Deterministic: parked threads
     /// are iterated in `DetTid` order.
     ///
-    /// Called from `step3_peek` *before* the turn's `tentative_pop`, the only
-    /// safe point to push to the run queue: anchors fire deep inside
-    /// `block_for_one_resource` while a selection transaction is live, so the
-    /// actual re-admission must be deferred to here.
+    /// Called from `step2d_decide_empty_queue` (so the empty-queue
+    /// classification sees threads whose gate just opened) and from
+    /// `step3_peek` *before* the turn's `tentative_pop`. Both are points with no
+    /// live selection transaction: anchors fire deep inside
+    /// `block_for_one_resource` while a selection is live, so the actual
+    /// re-admission must be deferred to one of them.
     fn hb_flush_wakes(&mut self) {
         match self.happens_before.as_mut() {
             Some(hb) if hb.wake_pending => hb.wake_pending = false,
@@ -3337,6 +3347,12 @@ impl Scheduler {
         });
         self.pending_run_queue_admissions.remove(dtid);
         let _ = self.remove_futex_waiter(dtid);
+        // A killed thread must not keep the scheduler loop alive as a parked
+        // happens-before thread; a force-unblocked one is re-queued and
+        // re-evaluates its gate (re-parking if it is still closed).
+        if let Some(hb) = self.happens_before.as_mut() {
+            hb.parked.remove(dtid);
+        }
     }
 
     fn remove_futex_waiter(&mut self, dettid: &DetTid) -> bool {
@@ -4991,6 +5007,13 @@ impl Scheduler {
         if !self.blocked.rt_sigsuspend_blockers.is_empty() {
             classes.push("thread(s) waiting in rt_sigsuspend with no possible signal");
         }
+        if self
+            .happens_before
+            .as_ref()
+            .is_some_and(|hb| !hb.parked.is_empty())
+        {
+            classes.push("thread(s) held at a happens-before gate whose BEFORE anchor cannot fire");
+        }
         if classes.is_empty() {
             // Defensive: every caller fires with at least one class present.
             "thread(s) blocked with no possible wake".to_owned()
@@ -5215,6 +5238,25 @@ impl Scheduler {
         &mut self,
         global_time: &Arc<Mutex<GlobalTime>>,
     ) -> Result<(), SkipTurn> {
+        // Re-admit happens-before threads whose gate a source opened since the
+        // last turn BEFORE classifying the queue. The anchor fired inside a
+        // committed turn, so membership here is a function of guest execution;
+        // without this, a source thread that blocks right after firing (say, in
+        // a FUTEX_WAIT the parked target would later wake) left an empty queue
+        // that was classified as a futex deadlock before `step3_peek` could
+        // flush the wake (https://github.com/rrnewton/hermit/issues/3149). No
+        // selection transaction is live here; this step already pushes timed
+        // wakes to the queue.
+        self.hb_flush_wakes();
+        // Threads still parked after the flush wait on a source that has not
+        // fired. They are blocked, not gone: an empty queue with only them (and
+        // no timer or external input that could let a source run) is a deadlock
+        // to report, not an exit to fizzle into
+        // (https://github.com/rrnewton/hermit/issues/3149).
+        let hb_parked_empty = self
+            .happens_before
+            .as_ref()
+            .is_none_or(|hb| hb.parked.is_empty());
         let timed_empty = self.blocked.timed_waiters.is_empty();
         let external_waits_empty = self.blocked.external_io_blockers.is_empty()
             && self.blocked.child_waiters.is_empty()
@@ -5223,8 +5265,11 @@ impl Scheduler {
         let futex_empty = self.blocked.no_futex_waiters();
 
         if self.run_queue.is_empty() {
-            let logically_empty =
-                futex_empty && timed_empty && external_waits_empty && rt_sigsuspend_empty;
+            let logically_empty = futex_empty
+                && timed_empty
+                && external_waits_empty
+                && rt_sigsuspend_empty
+                && hb_parked_empty;
             // Report the empty state from logical state alone, BEFORE the
             // physical-exit wait below and once per empty state. Both halves are
             // what make the line a function of Detcore scheduling.
@@ -5314,7 +5359,9 @@ impl Scheduler {
             // When the run queue is empty, we sometimes need to give things a kick.
             if logically_empty {
                 return Err(SkipTurn);
-            } else if timed_empty && external_waits_empty && (!futex_empty || !rt_sigsuspend_empty)
+            } else if timed_empty
+                && external_waits_empty
+                && (!futex_empty || !rt_sigsuspend_empty || !hb_parked_empty)
             {
                 return Err(self.report_terminal_deadlock());
             } else if !timed_empty {
@@ -12927,6 +12974,62 @@ mod test {
             .normalize()
             .unwrap();
         HbRuntime::new(program)
+    }
+
+    /// A spec whose only edge gates dettid 5 on dettid 3, for the empty-queue
+    /// tests below.
+    const HB_GATE_SPEC: &str = r#"{"version": 1,
+        "events": {"src": {"thread": "3", "syscalls": 42},
+                   "dst": {"thread": "5", "syscalls": 43}},
+        "edges": [{"before": "src", "after": "dst", "strength": "hard"}]}"#;
+
+    /// A source fired and opened a parked thread's gate (`wake_pending`), and
+    /// the source thread then left the run queue: the empty-queue step must
+    /// re-admit the parked thread before it classifies the state, not report a
+    /// deadlock (https://github.com/rrnewton/hermit/issues/3149).
+    #[test]
+    fn empty_queue_step_readmits_a_parked_thread_whose_gate_opened() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let target = DetTid::from_raw(5);
+        let mut hb = hb_runtime(HB_GATE_SPEC);
+        hb.fired.insert("src".to_owned());
+        hb.parked.insert(target);
+        hb.wake_pending = true;
+        scheduler.happens_before = Some(hb);
+        scheduler.priorities.insert(target, DEFAULT_PRIORITY);
+
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_ok());
+        assert!(scheduler.run_queue.contains_tid(target));
+        let hb = scheduler.happens_before.as_ref().unwrap();
+        assert!(hb.parked.is_empty() && !hb.wake_pending);
+        assert!(scheduler.take_terminal_deadlock().is_none());
+    }
+
+    /// The nearby case that must NOT wake: the target is parked and no source
+    /// has fired, nothing else can run, so no anchor can ever fire. The
+    /// empty-queue step must report a terminal deadlock naming the gate rather
+    /// than treat the scheduler as empty (https://github.com/rrnewton/hermit/issues/3149).
+    #[test]
+    fn empty_queue_step_reports_a_parked_thread_whose_gate_cannot_open() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let target = DetTid::from_raw(5);
+        let mut hb = hb_runtime(HB_GATE_SPEC);
+        hb.parked.insert(target);
+        scheduler.happens_before = Some(hb);
+
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+        assert!(!scheduler.run_queue.contains_tid(target));
+        let report = scheduler
+            .take_terminal_deadlock()
+            .expect("a parked thread with no possible source must be a reported deadlock");
+        assert!(
+            report.contains("held at a happens-before gate whose BEFORE anchor cannot fire"),
+            "{report}"
+        );
     }
 
     /// The enforcement predicates that drive `hb_checkpoint`: an anchor is
