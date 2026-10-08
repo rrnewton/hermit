@@ -98,9 +98,39 @@ fn init_detlog_forwarder() {
         }
     };
 
-    // Stderr is protected by reverie-sabre and is captured separately during
-    // verification.
-    let _ = detcore::detlog::set_forwarder(detcore::detlog::forward_to_stderr, policy);
+    // With the socket `hermit run --verify` passes, each record goes to it from
+    // the descriptor reverie-sabre protects from the guest, tagged with the
+    // sending thread, and the coordinator writes it into the log at that
+    // thread's scheduler turn, as for in-guest LiteInst. Without one, records
+    // go to stderr, which reverie-sabre keeps open and verification captures
+    // separately.
+    // A socket that was requested but could not be adopted (closed or replaced
+    // before adoption, or given up) never falls back to stderr, which the
+    // guest may have pointed at a file of its own: its records are counted and
+    // dropped, and the coordinator refuses the run (detlog::check_forwarded_count).
+    let forwarder: detcore::detlog::DetlogForwarder =
+        if sabre::tool_output_fd().is_some() || sabre::tool_output_requested() {
+            // If reverie-sabre ever has to give the socket up (a guest dup onto
+            // its number with no free descriptor to move it to), the coordinator
+            // reads this and refuses the run's records as incomplete.
+            sabre::set_retirement_message(detcore::detlog::FORWARDING_RETIRED_NOTICE);
+            forward_detlog_to_socket
+        } else {
+            detcore::detlog::forward_to_stderr
+        };
+    let _ = detcore::detlog::set_forwarder(forwarder, policy);
+}
+
+/// Sends one Detcore record on the coordinator's DETLOG socket.
+fn forward_detlog_to_socket(
+    target: &str,
+    record_suffix: &str,
+    index: u64,
+    message: std::fmt::Arguments<'_>,
+) {
+    sabre::with_tool_output(|socket| {
+        detcore::detlog::send_forwarded_record(socket, target, record_suffix, index, message)
+    });
 }
 
 fn remember_coordinator_socket(

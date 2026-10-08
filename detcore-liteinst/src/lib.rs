@@ -20,9 +20,13 @@ use std::path::Path;
 // in-guest Detcore constructor boundary.
 
 /// Private opt-in, set by Hermit, for forwarding the in-guest Tool's
-/// deterministic INFO records: the number of an inherited socket (the sending
-/// end of a Unix `SOCK_SEQPACKET` pair) to send them on. The constructor
-/// removes it from the guest's environment, moves the socket to a number
+/// deterministic INFO records: the number and identity of an inherited socket
+/// (the sending end of a Unix `SOCK_SEQPACKET` pair) to send them on
+/// (`detcore::detlog::tool_output_env_value`). The constructor removes it from
+/// the guest's environment (scrubbing its bytes), refuses to start when the
+/// number no longer names that socket (guest `.preinit_array` code, which runs
+/// before this constructor, closed it or put a socket of its own there), moves
+/// the socket to a number
 /// Reverie reserves and protects from the guest
 /// (`reverie_liteinst::reserve_tool_output_fd`), and sends each record there
 /// as one message, where Hermit's `--verify` reads them into the run's log. The
@@ -45,6 +49,13 @@ pub const DETLOG_FORWARD_POLICY_ENV: &str = "HERMIT_LITEINST_FORWARD_DETLOG_POLI
 #[unsafe(link_section = ".init_array")]
 static DETCORE_LITEINST_INIT: unsafe extern "C" fn() = detcore_liteinst_initialize;
 
+/// The identity (`st_dev`, `st_ino`) of the DETLOG socket Hermit passed, once
+/// it is reserved. Until `install_tool` protects the reserved number, guest
+/// code (a signal handler a guest library's constructor installed) could
+/// replace it, so the constructor checks it again after installation and
+/// every record's send checks it too.
+static TOOL_OUTPUT_IDENTITY: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+
 /// Installs Detcore in the current guest process.
 ///
 /// The `.init_array` entry above runs this once per process image, before
@@ -66,15 +77,18 @@ pub unsafe extern "C" fn detcore_liteinst_initialize() {
     // SAFETY: the loader runs constructors while the process is still
     // single-threaded, so nothing reads the environment concurrently.
     unsafe {
+        // The value names a host socket identity: zero its bytes in the
+        // environment block too, which /proc/self/environ shows.
+        scrub_env(DETLOG_FORWARD_ENV);
         std::env::remove_var(DETLOG_FORWARD_ENV);
         std::env::remove_var(DETLOG_FORWARD_POLICY_ENV);
     }
     if let Some(value) = forward_request {
-        let Some(fd) = value
+        let Some((fd, identity)) = value
             .to_str()
-            .and_then(|value| value.parse::<libc::c_int>().ok())
+            .and_then(detcore::detlog::parse_tool_output_env_value)
         else {
-            fail("the DETLOG forwarding descriptor is not a descriptor number");
+            fail("the DETLOG forwarding descriptor value is unreadable");
         };
         // Hermit sends the policy with the descriptor; without a readable one
         // this process cannot forward the records ptrace would log.
@@ -90,12 +104,37 @@ pub unsafe extern "C" fn detcore_liteinst_initialize() {
             )),
             None => fail("the DETLOG forwarding policy is missing"),
         };
-        // SAFETY: the process is still single-threaded and Detcore is not yet
-        // installed, which is when the reservation must be made.
-        match unsafe {
-            reverie_liteinst::reserve_tool_output_fd(fd, detcore::detlog::FORWARDING_RETIRED_NOTICE)
-        } {
+        // A signal handler installed by guest code that ran before this
+        // constructor could otherwise replace the number between the identity
+        // check and the reservation; and the reserved copy, which is what the
+        // Tool keeps, must itself be the socket Hermit passed.
+        let blocked = block_signals();
+        let reserved = if detcore::detlog::socket_identity(fd) != Some(identity) {
+            Err(
+                "it is not the socket Hermit passed (guest code that ran before this \
+                 constructor closed or replaced it)"
+                    .to_owned(),
+            )
+        } else {
+            // SAFETY: the process is still single-threaded and Detcore is not
+            // yet installed, which is when the reservation must be made.
+            match unsafe {
+                reverie_liteinst::reserve_tool_output_fd(
+                    fd,
+                    detcore::detlog::FORWARDING_RETIRED_NOTICE,
+                )
+            } {
+                Ok(reserved) if detcore::detlog::socket_identity(reserved) == Some(identity) => {
+                    Ok(reserved)
+                }
+                Ok(_) => Err("the reserved copy is not the socket Hermit passed".to_owned()),
+                Err(error) => Err(error.to_string()),
+            }
+        };
+        restore_signals(&blocked);
+        match reserved {
             Ok(_) => {
+                let _ = TOOL_OUTPUT_IDENTITY.set(identity);
                 let _ = detcore::detlog::set_forwarder(forward_detlog, policy);
             }
             Err(error) => fail(&format!(
@@ -164,9 +203,63 @@ impl detcore::OpenFileControlTransport for CoordinatorOpenFiles {
 
 /// Sends one Detcore record on the reserved socket. Its number can move when the
 /// guest `dup2`s onto it, so it is read for each record.
-fn forward_detlog(target: &str, record_suffix: &str, message: std::fmt::Arguments<'_>) {
+fn forward_detlog(target: &str, record_suffix: &str, index: u64, message: std::fmt::Arguments<'_>) {
     if let Some(socket) = reverie_liteinst::tool_output_fd() {
-        detcore::detlog::send_forwarded_record(socket, target, record_suffix, message);
+        // Never to a descriptor that is not the passed socket; the record is
+        // then counted and missing, so the run is refused.
+        if TOOL_OUTPUT_IDENTITY
+            .get()
+            .is_none_or(|identity| detcore::detlog::socket_identity(socket) != Some(*identity))
+        {
+            return;
+        }
+        detcore::detlog::send_forwarded_record(socket, target, record_suffix, index, message);
+    }
+}
+
+/// Blocks every signal this thread can block; returns the mask it replaced.
+fn block_signals() -> libc::sigset_t {
+    // SAFETY: sigfillset and pthread_sigmask write only the given sets.
+    unsafe {
+        let mut all: libc::sigset_t = std::mem::zeroed();
+        let mut previous: libc::sigset_t = std::mem::zeroed();
+        libc::sigfillset(&mut all);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &all, &mut previous);
+        previous
+    }
+}
+
+fn restore_signals(previous: &libc::sigset_t) {
+    // SAFETY: pthread_sigmask reads only the given set.
+    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, previous, std::ptr::null_mut()) };
+}
+
+/// Overwrites the bytes of `key`'s entry in the environment block with zeros.
+///
+/// # Safety
+///
+/// The process must be single-threaded.
+unsafe fn scrub_env(key: &str) {
+    unsafe extern "C" {
+        static environ: *const *mut libc::c_char;
+    }
+    let mut prefix = key.as_bytes().to_vec();
+    prefix.push(b'=');
+    // SAFETY: `environ` is a NULL-terminated array of NUL-terminated strings.
+    unsafe {
+        let mut slot = environ;
+        while !slot.is_null() && !(*slot).is_null() {
+            let entry = *slot;
+            let bytes = std::ffi::CStr::from_ptr(entry).to_bytes();
+            if bytes.starts_with(&prefix) {
+                std::ptr::write_bytes(
+                    entry.cast::<u8>().add(prefix.len()),
+                    0,
+                    bytes.len() - prefix.len(),
+                );
+            }
+            slot = slot.add(1);
+        }
     }
 }
 
