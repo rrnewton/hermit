@@ -15667,7 +15667,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1005",
+        "NEXTEST_EXPECTED_EXECUTED": "1016",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -15716,7 +15716,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "980",
+        "NEXTEST_EXPECTED_EXECUTED": "992",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -15765,7 +15765,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1184",
+        "NEXTEST_EXPECTED_EXECUTED": "1304",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -15814,7 +15814,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "88",
+        "NEXTEST_EXPECTED_EXECUTED": "50",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--test\",\"tests_misc\"]"
       },
       "networkonly": false,
@@ -15888,7 +15888,7 @@
       "group": "test",
       "job": "detcore_readdir_order",
       "desc": "Detcore directory-listing order cases (tests_readdir_order, system allocator, serial execution)",
-      "description": "The 39 directory-listing order tests (detcore/tests/readdir_order/mod.rs) ran in tests_misc until 2026-10-08 and now form their own test binary, which installs no #[global_allocator]: tests_misc's test allocator (common/test-allocator) never frees, so each of these tests, which list directories of up to 3000 entries five times over, kept every byte it had ever allocated. Without a global allocator the binary needs no static_pic link style in detcore/BUCK either. The selection and its serial -j 1 are the ones these tests had in test.detcore_misc, and the hosted twin test.detcore_readdir_order_on_host carries the same selection. MEMORY CALIBRATED 2026-10-08 on the measurement host recorded for test.detcore_readdir_order in docs/TESTING_ENVIRONMENTS.md (\"Named measurement hosts\"), debug profile: cargo nextest run --profile ci -p hermit-detcore --test tests_readdir_order -j 1, with every test process under /usr/bin/time -v, ran 39 of 39 tests. The largest per-test peak resident set was 28835840 bytes with Detcore's per-filesystem entry lookups and 28811264 bytes with every listed entry looked up by its own lstat (forced by a temporary one-line change; https://github.com/rrnewton/hermit/pull/3255 makes that Detcore's only lookup), and the selection took 36.8 s and 61.2 s of wall time respectively. The 1-GiB scheduling baseline rounds the larger peak up to a whole GiB, the 3-GiB hard cap adds 2 GiB of headroom, and est_duration_s rounds the 61.2-s wall time up to 62 seconds.",
+      "description": "The 39 directory-listing order tests (detcore/tests/readdir_order/mod.rs) ran in tests_misc until 2026-10-08 and now form their own test binary, which installs no #[global_allocator]: tests_misc's test allocator (common/test-allocator) never frees, so each of these tests, which list directories of up to 3000 entries five times over, kept every byte it had ever allocated. In the new binary seek_during_first_read_leaves_stream_whole runs as four tests of five of its 20 trials each, so that each test stays within the counted runner's per-test CPU limit: 42 tests. Without a global allocator the binary needs no static_pic link style in detcore/BUCK either. The selection and its serial -j 1 are the ones these tests had in test.detcore_misc, and the hosted twin test.detcore_readdir_order_on_host carries the same selection. MEMORY CALIBRATED 2026-10-08 on the measurement host recorded for test.detcore_readdir_order in docs/TESTING_ENVIRONMENTS.md (\"Named measurement hosts\"), debug profile: cargo nextest run --profile ci -p hermit-detcore --test tests_readdir_order -j 1, with every test process under /usr/bin/time -v, ran 39 of 39 tests. The largest per-test peak resident set was 28835840 bytes with Detcore's per-filesystem entry lookups and 28811264 bytes with every listed entry looked up by its own lstat (forced by a temporary one-line change; https://github.com/rrnewton/hermit/pull/3255 makes that Detcore's only lookup), and the selection took 36.8 s and 61.2 s of wall time respectively. RE-MEASURED 2026-10-08 the same way once that pull request looks every listed entry up by its own lstat when its directory's snapshot is taken and the seek test runs as four tests: 42 of 42 tests, largest per-test peak 28762112 bytes, 84.2 s of wall time; this node's own command (the counted runner, --profile ci, -j 1) ran the same 42 tests in 92.6 s of wall time. The 1-GiB scheduling baseline rounds the largest peak up to a whole GiB, the 3-GiB hard cap adds 2 GiB of headroom, and est_duration_s rounds the 92.6-s wall time up to 93 seconds.",
       "labels": [
         "full",
         "portable"
@@ -15912,7 +15912,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "39",
+        "NEXTEST_EXPECTED_EXECUTED": "42",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--test\",\"tests_readdir_order\"]"
       },
       "networkonly": false,
@@ -15923,7 +15923,7 @@
       "jobs_env": null,
       "hint": {
         "resources": {},
-        "est_duration_s": 62.0,
+        "est_duration_s": 93.0,
         "rss_baseline_bytes": 1073741824,
         "hard_mem_max_bytes": 3221225472,
         "classification": "cpu-bound",
@@ -16067,7 +16067,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "270",
+        "NEXTEST_EXPECTED_EXECUTED": "289",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"aio_nr_determinism\",\"--test\",\"arch_status_determinism\",\"--test\",\"chaos_sched_yield_progress\",\"--test\",\"chaos_stress_pmu_detection\",\"--test\",\"child_time_rpc\",\"--test\",\"chown_virtual_root_identity\",\"--test\",\"cli_owned_lifecycle\",\"--test\",\"clock_determinism\",\"--test\",\"clock_discipline_determinism\",\"--test\",\"clock_passthrough\",\"--test\",\"container_init_deadline\",\"--test\",\"cpufreq_avg_determinism\",\"--test\",\"dispatch_stats\",\"--test\",\"epoll_determinism\",\"--test\",\"epoll_pwait_zero_timeout_progress\",\"--test\",\"external_signal_interrupt\",\"--test\",\"fatal_core_capture\",\"--test\",\"file_nr_determinism\",\"--test\",\"first_seen_mtime\",\"--test\",\"fp_reduction_determinism\",\"--test\",\"futex2_refusal\",\"--test\",\"hashseed_determinism\",\"--test\",\"inode_nr_determinism\",\"--test\",\"kernel_keyring\",\"--test\",\"key_users_determinism\",\"--test\",\"mmap_determinism\",\"--test\",\"node_vmstat_determinism\",\"--test\",\"numa_maps_determinism\",\"--test\",\"perf_event_refusal\",\"--test\",\"pidfd_creation\",\"--test\",\"process_isolation_refusals\",\"--test\",\"proc_fdinfo_determinism\",\"--test\",\"proc_locks_determinism\",\"--test\",\"procfs_determinism\",\"--test\",\"procfs_positioned_determinism\",\"--test\",\"pty_nr_determinism\",\"--test\",\"python_stdlib\",\"--test\",\"reopened_pipe_progress\",\"--test\",\"robust_futex_owner_death\",\"--test\",\"run_evidence\",\"--test\",\"self_sched_determinism\",\"--test\",\"self_schedstat_determinism\",\"--test\",\"signal_determinism\",\"--test\",\"smaps_determinism\",\"--test\",\"smaps_rollup_determinism\",\"--test\",\"softnet_stat_determinism\",\"--test\",\"sockstat_determinism\",\"--test\",\"swaps_determinism\",\"--test\",\"thp_stats_determinism\",\"--test\",\"utimensat_mtime\",\"--test\",\"verification_report_cli\",\"--test\",\"verification_report_consumers\",\"--test\",\"verify_claim_names_its_limit\",\"--test\",\"writev_determinism\",\"--test\",\"zero_copy_pipe_fallback\"]"
       },
       "networkonly": false,
@@ -16225,7 +16225,7 @@
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
         "HERMIT_REQUIRE_DAP": "1",
         "HERMIT_REQUIRE_DAP_GDB": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "232",
+        "NEXTEST_EXPECTED_EXECUTED": "237",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -16277,7 +16277,7 @@
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
         "HERMIT_REQUIRE_DAP": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "185",
+        "NEXTEST_EXPECTED_EXECUTED": "188",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -16329,7 +16329,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "24",
+        "NEXTEST_EXPECTED_EXECUTED": "25",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"sabre_examples\"]"
       },
       "networkonly": false,
@@ -37697,7 +37697,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1005",
+        "NEXTEST_EXPECTED_EXECUTED": "1016",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -37743,7 +37743,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "980",
+        "NEXTEST_EXPECTED_EXECUTED": "992",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -37789,7 +37789,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1184",
+        "NEXTEST_EXPECTED_EXECUTED": "1292",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -37835,7 +37835,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "88",
+        "NEXTEST_EXPECTED_EXECUTED": "50",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--test\",\"tests_misc\"]"
       },
       "networkonly": false,
@@ -37906,7 +37906,7 @@
       "group": "test",
       "job": "detcore_readdir_order_on_host",
       "desc": "Detcore directory-listing order cases (tests_readdir_order, system allocator, serial execution)",
-      "description": "The 39 directory-listing order tests (detcore/tests/readdir_order/mod.rs) ran in tests_misc until 2026-10-08 and now form their own test binary, which installs no #[global_allocator]: tests_misc's test allocator (common/test-allocator) never frees, so each of these tests, which list directories of up to 3000 entries five times over, kept every byte it had ever allocated. Without a global allocator the binary needs no static_pic link style in detcore/BUCK either. The selection and its serial -j 1 are the ones these tests had in test.detcore_misc, and the hosted twin test.detcore_readdir_order_on_host carries the same selection. MEMORY CALIBRATED 2026-10-08 on the measurement host recorded for test.detcore_readdir_order in docs/TESTING_ENVIRONMENTS.md (\"Named measurement hosts\"), debug profile: cargo nextest run --profile ci -p hermit-detcore --test tests_readdir_order -j 1, with every test process under /usr/bin/time -v, ran 39 of 39 tests. The largest per-test peak resident set was 28835840 bytes with Detcore's per-filesystem entry lookups and 28811264 bytes with every listed entry looked up by its own lstat (forced by a temporary one-line change; https://github.com/rrnewton/hermit/pull/3255 makes that Detcore's only lookup), and the selection took 36.8 s and 61.2 s of wall time respectively. The 1-GiB scheduling baseline rounds the larger peak up to a whole GiB, the 3-GiB hard cap adds 2 GiB of headroom, and est_duration_s rounds the 61.2-s wall time up to 62 seconds.",
+      "description": "The 39 directory-listing order tests (detcore/tests/readdir_order/mod.rs) ran in tests_misc until 2026-10-08 and now form their own test binary, which installs no #[global_allocator]: tests_misc's test allocator (common/test-allocator) never frees, so each of these tests, which list directories of up to 3000 entries five times over, kept every byte it had ever allocated. In the new binary seek_during_first_read_leaves_stream_whole runs as four tests of five of its 20 trials each, so that each test stays within the counted runner's per-test CPU limit: 42 tests. Without a global allocator the binary needs no static_pic link style in detcore/BUCK either. The selection and its serial -j 1 are the ones these tests had in test.detcore_misc, and the hosted twin test.detcore_readdir_order_on_host carries the same selection. MEMORY CALIBRATED 2026-10-08 on the measurement host recorded for test.detcore_readdir_order in docs/TESTING_ENVIRONMENTS.md (\"Named measurement hosts\"), debug profile: cargo nextest run --profile ci -p hermit-detcore --test tests_readdir_order -j 1, with every test process under /usr/bin/time -v, ran 39 of 39 tests. The largest per-test peak resident set was 28835840 bytes with Detcore's per-filesystem entry lookups and 28811264 bytes with every listed entry looked up by its own lstat (forced by a temporary one-line change; https://github.com/rrnewton/hermit/pull/3255 makes that Detcore's only lookup), and the selection took 36.8 s and 61.2 s of wall time respectively. RE-MEASURED 2026-10-08 the same way once that pull request looks every listed entry up by its own lstat when its directory's snapshot is taken and the seek test runs as four tests: 42 of 42 tests, largest per-test peak 28762112 bytes, 84.2 s of wall time; this node's own command (the counted runner, --profile ci, -j 1) ran the same 42 tests in 92.6 s of wall time. The 1-GiB scheduling baseline rounds the largest peak up to a whole GiB, the 3-GiB hard cap adds 2 GiB of headroom, and est_duration_s rounds the 92.6-s wall time up to 93 seconds.",
       "labels": [
         "hosted-portable"
       ],
@@ -37927,7 +37927,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "39",
+        "NEXTEST_EXPECTED_EXECUTED": "42",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--test\",\"tests_readdir_order\"]"
       },
       "networkonly": false,
@@ -37938,7 +37938,7 @@
       "jobs_env": null,
       "hint": {
         "resources": {},
-        "est_duration_s": 62.0,
+        "est_duration_s": 93.0,
         "rss_baseline_bytes": 1073741824,
         "hard_mem_max_bytes": 3221225472,
         "classification": "cpu-bound",
@@ -38076,7 +38076,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "270",
+        "NEXTEST_EXPECTED_EXECUTED": "288",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"aio_nr_determinism\",\"--test\",\"arch_status_determinism\",\"--test\",\"chaos_sched_yield_progress\",\"--test\",\"chaos_stress_pmu_detection\",\"--test\",\"child_time_rpc\",\"--test\",\"chown_virtual_root_identity\",\"--test\",\"cli_owned_lifecycle\",\"--test\",\"clock_determinism\",\"--test\",\"clock_discipline_determinism\",\"--test\",\"clock_passthrough\",\"--test\",\"container_init_deadline\",\"--test\",\"cpufreq_avg_determinism\",\"--test\",\"dispatch_stats\",\"--test\",\"epoll_determinism\",\"--test\",\"epoll_pwait_zero_timeout_progress\",\"--test\",\"external_signal_interrupt\",\"--test\",\"fatal_core_capture\",\"--test\",\"file_nr_determinism\",\"--test\",\"first_seen_mtime\",\"--test\",\"fp_reduction_determinism\",\"--test\",\"futex2_refusal\",\"--test\",\"hashseed_determinism\",\"--test\",\"inode_nr_determinism\",\"--test\",\"kernel_keyring\",\"--test\",\"key_users_determinism\",\"--test\",\"mmap_determinism\",\"--test\",\"node_vmstat_determinism\",\"--test\",\"numa_maps_determinism\",\"--test\",\"perf_event_refusal\",\"--test\",\"pidfd_creation\",\"--test\",\"process_isolation_refusals\",\"--test\",\"proc_fdinfo_determinism\",\"--test\",\"proc_locks_determinism\",\"--test\",\"procfs_determinism\",\"--test\",\"procfs_positioned_determinism\",\"--test\",\"pty_nr_determinism\",\"--test\",\"python_stdlib\",\"--test\",\"reopened_pipe_progress\",\"--test\",\"robust_futex_owner_death\",\"--test\",\"run_evidence\",\"--test\",\"self_sched_determinism\",\"--test\",\"self_schedstat_determinism\",\"--test\",\"signal_determinism\",\"--test\",\"smaps_determinism\",\"--test\",\"smaps_rollup_determinism\",\"--test\",\"softnet_stat_determinism\",\"--test\",\"sockstat_determinism\",\"--test\",\"swaps_determinism\",\"--test\",\"thp_stats_determinism\",\"--test\",\"utimensat_mtime\",\"--test\",\"verification_report_cli\",\"--test\",\"verification_report_consumers\",\"--test\",\"verify_claim_names_its_limit\",\"--test\",\"writev_determinism\",\"--test\",\"zero_copy_pipe_fallback\"]"
       },
       "networkonly": false,
@@ -38174,7 +38174,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "24",
+        "NEXTEST_EXPECTED_EXECUTED": "25",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"sabre_examples\"]"
       },
       "networkonly": false,

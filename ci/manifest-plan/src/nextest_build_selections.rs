@@ -617,8 +617,17 @@ mod tests {
             );
             // 287 listed, less the 25 external_signal_interrupt ptrace cases
             // that need the PMU timer, which test.pmu_integration_cases
-            // runs, plus the eight fatal_core_capture tests.
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "270");
+            // runs, plus the eight fatal_core_capture tests and the 19
+            // procfs_determinism tests of
+            // https://github.com/rrnewton/hermit/pull/3255. The hosted twin
+            // also leaves out the btrfs maps-proof case
+            // (HOSTED_PORTABLE_BTRFS_INTEGRATION_TESTS in validation_dag.rs).
+            let expected = if tag == "test.hermit_integration" {
+                "289"
+            } else {
+                "288"
+            };
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], expected);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

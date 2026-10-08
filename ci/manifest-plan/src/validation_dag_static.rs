@@ -879,7 +879,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/3871) retain all 1002: 1004.
     // validation_dag::tests::test_free_declarations_name_count_free_committed_nodes
     // (https://github.com/rrnewton/hermit/issues/3915) retains all 1004: 1005.
-    ("test.regular_crates", 1005),
+    // The eleven tests of https://github.com/rrnewton/hermit/pull/3255 (five detcore-dbt
+    // runtime-tree and errno tests, four detcore-model config::tests round
+    // trips and two validation_dag::tests hosted-twin exclusions) retain all
+    // 1005: 1016, listed with this node's arguments.
+    ("test.regular_crates", 1016),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1182,7 +1186,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Two more replayer::accept_stand_in_tests and five recorder::network
     // tests of the user read and the accepted socket's peer address (the same
     // pull request) retain all 973: 980.
-    ("test.hermit_unit", 980),
+    // The twelve tests of https://github.com/rrnewton/hermit/pull/3255 (seven
+    // dbt_detconfig_omit_tests, three backend-option tests::*,
+    // metadata::tests::record_version_rejects_pre_raw_identity_inode_streams and
+    // run::tests::rejected_first_run_is_reported_before_unusable_forwarded_records)
+    // retain all 980: 992, listed with this node's arguments.
+    ("test.hermit_unit", 992),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1520,7 +1529,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // scheduler::test::a_child_exit_timer_sends_nothing_after_the_kernels_copy
     // (one SIGCHLD per child exit) retain all 1174: 1184, run with this node's
     // arguments.
-    ("test.detcore_unit", 1184),
+    // The 120 tests of https://github.com/rrnewton/hermit/pull/3255 at its head (74
+    // syscalls::files::inject_fstat_scratch, two
+    // syscalls::files::procfs_wiring_guard, 16 syscalls::namespace::tests,
+    // eleven tool_global::tests, nine procfs::tests, four
+    // identity_lookup_refusal_tests, three memory::tests and one
+    // dirents::test) retain all 1184: 1304, listed with this node's arguments.
+    ("test.detcore_unit", 1304),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1566,13 +1581,23 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 87).
     // inode_reuse::nothing_is_retired_without_sequentialized_threads (the same
     // reviews) retains all 87 (measured 88).
-    ("test.detcore_misc", 88),
+    // The 39 readdir_order tests leave for their own tests_readdir_order
+    // binary (test.detcore_readdir_order), and
+    // tight_stack_maps::maps_read_succeeds_without_writable_stack_below_rsp
+    // (https://github.com/rrnewton/hermit/pull/3255) joins: the 49 identities that
+    // stay are retained, 50 listed with this node's arguments.
+    ("test.detcore_misc", 50),
     ("test.detcore_parallel", 5),
     // The 39 readdir_order tests leave tests_misc for their own
     // tests_readdir_order binary, which installs no test allocator: all 39,
     // listed with cargo nextest list --profile ci -p hermit-detcore --test
     // tests_readdir_order.
-    ("test.detcore_readdir_order", 39),
+    // seek_during_first_read_leaves_stream_whole becomes four tests of five
+    // of its 20 trials each,
+    // seek_during_first_read_leaves_stream_whole_trials_00_to_04 to
+    // _trials_15_to_19 (https://github.com/rrnewton/hermit/pull/3255): the
+    // other 38 identities are retained, 42 listed with this node's arguments.
+    ("test.detcore_readdir_order", 42),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
     // identities: 28 + 2 = 30.
@@ -1658,7 +1683,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // move to test.pmu_integration_cases: 287 - 25 = 262, listed
     // with this node's filter.
     // The eight fatal_core_capture tests: 270.
-    ("test.hermit_integration", 270),
+    // The 19 procfs_determinism maps, link, listing, inherited-seccomp-filter
+    // and unsatisfied-lookup tests of https://github.com/rrnewton/hermit/pull/3255
+    // retain all 270: 289, listed with this node's arguments.
+    ("test.hermit_integration", 289),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -1940,7 +1968,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_child_exit_is_notified_once_with_linuxs_siginfo retains all 231: 232,
     // run with this node's arguments. It starts no LiteInst guest, so
     // test.cli_on_host selects it too.
-    ("test.cli", 232),
+    // liteinst_in_guest_programs::{liteinst_in_guest_maps_inodes_equal_stat_inodes,
+    // liteinst_in_guest_untracked_directory_descriptor_lists_stat_inodes},
+    // max_log_bytes_verify_reports_the_cap_status_when_run1_crosses_it,
+    // a_run_ends_under_an_unanswered_seccomp_supervisor_that_refuses_its_kill and
+    // a_run_whose_stderr_nobody_reads_ends_under_an_unanswered_seccomp_supervisor
+    // (https://github.com/rrnewton/hermit/pull/3255) retain all 232: 237, listed with
+    // this node's arguments.
+    ("test.cli", 237),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -1967,7 +2002,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // sabre_virtualizes_an_rdtsc_in_a_guest_signal_handler and
     // sabre_refuses_a_guest_rdtsc_before_its_plugin_starts retain all 21: 23.
     // sabre_refuses_an_rdtsc_that_reenters_a_tool_call retains all 23: 24.
-    ("test.sabre_examples", 24),
+    // sabre_other_process_links_resolve_with_a_full_descriptor_table
+    // (https://github.com/rrnewton/hermit/pull/3255) retains all 24: 25, listed with
+    // this node's arguments.
+    ("test.sabre_examples", 25),
     ("test.hermit_modes", 21),
     ("test.app_strict_verify", 8),
     ("test.command_strict_verify", 9),
@@ -2115,7 +2153,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // an in-guest LiteInst guest (CPUID faulting), so it joins the hosted
     // CPUID-faulting exact-name filterset: 185 - 1 = 184.
     // a_child_exit_is_notified_once_with_linuxs_siginfo: 185.
-    ("test.cli_on_host", 185),
+    // Of the five tests https://github.com/rrnewton/hermit/pull/3255 adds to test.cli,
+    // the two liteinst_in_guest_programs tests start in-guest LiteInst guests
+    // and join the exact-name filterset (49 names); the max-log-bytes test and
+    // the two unanswered-supervisor tests retain all 185: 237 - 49 = 188,
+    // listed with this node's arguments.
+    ("test.cli_on_host", 188),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 55),
@@ -2124,12 +2167,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.app_strict_verify_on_host", 8),
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
-    // The host node carries the identical 85-test tests_misc selection.
-    ("test.detcore_misc_on_host", 88),
+    // After the same readdir_order move and the same added tight-stack maps
+    // test, the host node carries the identical selection: 50, listed with
+    // this node's arguments.
+    ("test.detcore_misc_on_host", 50),
     ("test.detcore_parallel_on_host", 5),
     // The host node carries the identical tests_readdir_order selection: 39,
     // listed the same way.
-    ("test.detcore_readdir_order_on_host", 39),
+    // After the same split of the seek-during-first-read test, the identical
+    // selection: 42, listed with this node's arguments.
+    ("test.detcore_readdir_order_on_host", 42),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
     // io_buffers::event_tests::
@@ -2212,7 +2259,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the directory-listing test: 1171.
     // And the two signal phase 1 step I4 tests: 1173.
     // And the ten child-exit SIGCHLD tests: 1184.
-    ("test.detcore_unit_on_host", 1184),
+    // And the same 120 tests of https://github.com/rrnewton/hermit/pull/3255 except
+    // the twelve unique-mount-ID cases
+    // (HOSTED_PORTABLE_UNIQUE_MOUNT_ID_DETCORE_TESTS in validation_dag.rs):
+    // 1304 - 12 = 1292, listed with this node's arguments.
+    ("test.detcore_unit_on_host", 1292),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -2238,7 +2289,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the minimal-environment test (287, measured).
     // The host twin skips the same 25 PMU-timer cases: 262.
     // And the same eight fatal_core_capture tests: 270.
-    ("test.hermit_integration_on_host", 270),
+    // And the same 19 procfs_determinism tests of
+    // https://github.com/rrnewton/hermit/pull/3255 except the btrfs maps-proof case
+    // (HOSTED_PORTABLE_BTRFS_INTEGRATION_TESTS in validation_dag.rs):
+    // 289 - 1 = 288, listed with this node's arguments.
+    ("test.hermit_integration_on_host", 288),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -2305,7 +2360,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two shutdown replay tests: 971.
     // And the same two accept stand-in tests: 973.
     // And the same seven accept stand-in and peer-address tests: 980.
-    ("test.hermit_unit_on_host", 980),
+    // And the same twelve tests of https://github.com/rrnewton/hermit/pull/3255: 992,
+    // listed with this node's arguments.
+    ("test.hermit_unit_on_host", 992),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -2399,7 +2456,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same committed-selection preparation test: 1002.
     // And the two detcore-model replaying tests listed there: 1004.
     // And the same test-free declaration test: 1005.
-    ("test.regular_crates_on_host", 1005),
+    // And the same eleven tests of https://github.com/rrnewton/hermit/pull/3255: 1016,
+    // listed with this node's arguments.
+    ("test.regular_crates_on_host", 1016),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
@@ -2410,7 +2469,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same exec-image forwarding test: 20.
     // And the same guest-RDTSC test: 21, and the same signal-handler and
     // early RDTSC tests: 23, and the same re-entrant RDTSC test: 24.
-    ("test.sabre_examples_on_host", 24),
+    // And the same full-descriptor-table link test: 25, listed with this
+    // node's arguments.
+    ("test.sabre_examples_on_host", 25),
 ];
 
 pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {
@@ -4862,7 +4923,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"test"########,
         job: r########"detcore_readdir_order"########,
         desc: r########"Detcore directory-listing order cases (tests_readdir_order, system allocator, serial execution)"########,
-        description: r########"The 39 directory-listing order tests (detcore/tests/readdir_order/mod.rs) ran in tests_misc until 2026-10-08 and now form their own test binary, which installs no #[global_allocator]: tests_misc's test allocator (common/test-allocator) never frees, so each of these tests, which list directories of up to 3000 entries five times over, kept every byte it had ever allocated. Without a global allocator the binary needs no static_pic link style in detcore/BUCK either. The selection and its serial -j 1 are the ones these tests had in test.detcore_misc, and the hosted twin test.detcore_readdir_order_on_host carries the same selection. MEMORY CALIBRATED 2026-10-08 on the measurement host recorded for test.detcore_readdir_order in docs/TESTING_ENVIRONMENTS.md ("Named measurement hosts"), debug profile: cargo nextest run --profile ci -p hermit-detcore --test tests_readdir_order -j 1, with every test process under /usr/bin/time -v, ran 39 of 39 tests. The largest per-test peak resident set was 28835840 bytes with Detcore's per-filesystem entry lookups and 28811264 bytes with every listed entry looked up by its own lstat (forced by a temporary one-line change; https://github.com/rrnewton/hermit/pull/3255 makes that Detcore's only lookup), and the selection took 36.8 s and 61.2 s of wall time respectively. The 1-GiB scheduling baseline rounds the larger peak up to a whole GiB, the 3-GiB hard cap adds 2 GiB of headroom, and est_duration_s rounds the 61.2-s wall time up to 62 seconds."########,
+        description: r########"The 39 directory-listing order tests (detcore/tests/readdir_order/mod.rs) ran in tests_misc until 2026-10-08 and now form their own test binary, which installs no #[global_allocator]: tests_misc's test allocator (common/test-allocator) never frees, so each of these tests, which list directories of up to 3000 entries five times over, kept every byte it had ever allocated. In the new binary seek_during_first_read_leaves_stream_whole runs as four tests of five of its 20 trials each, so that each test stays within the counted runner's per-test CPU limit: 42 tests. Without a global allocator the binary needs no static_pic link style in detcore/BUCK either. The selection and its serial -j 1 are the ones these tests had in test.detcore_misc, and the hosted twin test.detcore_readdir_order_on_host carries the same selection. MEMORY CALIBRATED 2026-10-08 on the measurement host recorded for test.detcore_readdir_order in docs/TESTING_ENVIRONMENTS.md ("Named measurement hosts"), debug profile: cargo nextest run --profile ci -p hermit-detcore --test tests_readdir_order -j 1, with every test process under /usr/bin/time -v, ran 39 of 39 tests. The largest per-test peak resident set was 28835840 bytes with Detcore's per-filesystem entry lookups and 28811264 bytes with every listed entry looked up by its own lstat (forced by a temporary one-line change; https://github.com/rrnewton/hermit/pull/3255 makes that Detcore's only lookup), and the selection took 36.8 s and 61.2 s of wall time respectively. RE-MEASURED 2026-10-08 the same way once that pull request looks every listed entry up by its own lstat when its directory's snapshot is taken and the seek test runs as four tests: 42 of 42 tests, largest per-test peak 28762112 bytes, 84.2 s of wall time; this node's own command (the counted runner, --profile ci, -j 1) ran the same 42 tests in 92.6 s of wall time. The 1-GiB scheduling baseline rounds the largest peak up to a whole GiB, the 3-GiB hard cap adds 2 GiB of headroom, and est_duration_s rounds the 92.6-s wall time up to 93 seconds."########,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,
@@ -4879,7 +4940,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         env: &[],
         hint: HintSpec {
             resources: &[],
-            est_duration_s: 62.0,
+            est_duration_s: 93.0,
             rss_baseline_bytes: Some(1073741824),
             hard_mem_max_bytes: Some(3221225472),
             classification: StepClass::CpuBound,
