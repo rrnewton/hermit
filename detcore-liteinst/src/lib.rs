@@ -69,13 +69,19 @@ static TOOL_OUTPUT_IDENTITY: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLo
 /// is still single-threaded and before any seccomp filter is active.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn detcore_liteinst_initialize() {
-    // Until Detcore is installed, this library's Rust allocations would come
-    // from the guest's own malloc (outside a Tool callback the runtime's
-    // allocator forwards there), so what this setup reads (environment values,
-    // the /proc/self/fd listing and its links) would stay in the guest's heap
-    // after it is freed, where the guest's own allocations find it. Allocate
-    // from the runtime's private Tool heap instead, as a Tool callback does.
-    let private_allocations = reverie_inguest::guest::alloc::enter_dispatch();
+    // Outside a Tool callback this library's Rust allocations would come from
+    // the guest's own malloc (the runtime's allocator forwards there), so what
+    // this constructor reads and builds (environment values, the
+    // /proc/self/fd listing and its links, the Tool installed below and the
+    // configuration it receives, the open file channel) would stay in the
+    // guest's heap, where the guest's own allocations find it before `main`.
+    // Its sizes follow host state (the configuration lists every mount the
+    // guest's namespace holds), so the guest's heap layout would differ
+    // between two runs of one program. Allocate everything from the runtime's
+    // private Tool heap instead, as a Tool callback does, until the
+    // constructor returns: the guest's heap is then exactly what the program
+    // itself made.
+    let _private_allocations = reverie_inguest::guest::alloc::enter_dispatch();
     let Some(socket) = std::env::var_os(reverie_liteinst::COORDINATOR_ENV) else {
         fail("the coordinator socket environment variable is missing");
     };
@@ -170,7 +176,6 @@ pub unsafe extern "C" fn detcore_liteinst_initialize() {
             "cannot list the descriptors this process started with: {error}"
         )),
     }
-    drop(private_allocations);
     // SAFETY: the loader runs constructors before any application thread
     // exists and before the application can install a seccomp filter, which is
     // the window `install_tool` requires.
