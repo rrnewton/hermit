@@ -1190,7 +1190,15 @@ fi
 # re-entrant RDTSC refused); no file under reverie-dbt, the root Cargo.toml, third-party or rust-toolchain.toml
 # changes, so the four budget inputs are unchanged. Carry, not recalibration:
 # no new timing sample or >=5-sample replacement claim is made.
-expected_pin=23ca5355678059c7acd598d3a989af7143885947
+# CARRY TO 35b79fa9b1c1e36f8e158b51d61c2d84430d20db (2026-10-08): from
+# 23ca5355678059c7acd598d3a989af7143885947. The three commits change reverie-inguest (79e975e6: the
+# Tool heap moves to anonymous memory; 35b79fa9: the RCB clock binds in the
+# private allocation scope, with a new test) and reverie-liteinst (dae11c3b: a
+# Tool is installed in the private allocation scope); no file under
+# reverie-dbt, the root Cargo.toml, third-party or rust-toolchain.toml
+# changes, so the four budget inputs are unchanged. Carry, not recalibration:
+# no new timing sample or >=5-sample replacement claim is made.
+expected_pin=35b79fa9b1c1e36f8e158b51d61c2d84430d20db
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
