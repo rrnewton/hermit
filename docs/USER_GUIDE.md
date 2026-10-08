@@ -694,6 +694,28 @@ args: [-c, echo $FOO$BAR]
 - `hermit oci run`, `hermit analyze` and `hermit bisect` do not load run
   configs.
 
+## Inherited Seccomp Filters
+
+A seccomp filter installed by whatever launched Hermit, such as a container
+runtime's default profile, is inherited by Hermit and every guest, and cannot be
+removed. It can make system calls fail in ways the guest observes, and Hermit
+records nothing about it, so the same command could behave differently inside
+and outside the container. Hermit therefore refuses to start a guest (exit 122)
+when `/proc/self/status` reports `Seccomp: 1` or `Seccomp: 2`. The refusal
+names the mode and the filter count.
+
+- Run Hermit where no filter is inherited. A filter cannot be removed from
+  inside a running container; for Docker, create the container with
+  `--security-opt seccomp=unconfined`.
+- Or pass `--unsafe-ignore-host-seccomp` (before or after the subcommand; in a
+  run config, `global: {unsafe-ignore-host-seccomp: true}`) to run anyway. The
+  run may not reproduce wherever the filter differs. Hermit prints a warning
+  and records the filter's mode and count in the INFO log, including the
+  `--run-evidence-dir` log.
+
+Declaring an acknowledged host filter in the run config is tracked in
+<https://github.com/rrnewton/hermit/issues/3942> and not implemented.
+
 ## Troubleshooting
 
 ### Program Not Found Or Not Executable

@@ -2657,6 +2657,7 @@ fn record_replay_output_failures_with_env(
         &|command| {
             command.envs(envs.iter().copied());
         },
+        &[],
         expected,
     )
 }
@@ -2668,6 +2669,7 @@ fn record_replay_output_failures_with(
     program: &Path,
     args: &[&str],
     configure: &dyn Fn(&mut Command),
+    hermit_global: &[&str],
     expected: &str,
 ) -> (Vec<String>, Vec<String>) {
     let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
@@ -2676,6 +2678,7 @@ fn record_replay_output_failures_with(
     record
         .args(["--kill-after=5s", "45s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(hermit_global)
         .args(["--log=off", "record", "start", "--record-timeout=30"])
         .arg(format!("--data-dir={}", data_dir.path().display()))
         .arg("--")
@@ -2686,6 +2689,7 @@ fn record_replay_output_failures_with(
     replay
         .args(["--kill-after=5s", "45s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(hermit_global)
         .args(["--log=off", "replay", "--autopilot"])
         .arg(format!("--data-dir={}", data_dir.path().display()));
     let mut failures = Vec::new();
@@ -3113,6 +3117,7 @@ fn assert_accept_in_turn_recording_refuses(mode: &str, envs: &[(&str, &str)], re
         &|command| {
             command.envs(envs.iter().copied());
         },
+        &[],
         refusal,
     );
 }
@@ -3125,6 +3130,7 @@ fn assert_recording_refuses(
     program: &Path,
     args: &[&str],
     configure: &dyn Fn(&mut Command),
+    hermit_global: &[&str],
     refusal: &str,
 ) {
     let data_dir = tempfile::tempdir().expect("failed to create recording directory");
@@ -3133,6 +3139,7 @@ fn assert_recording_refuses(
     command
         .args(["--kill-after=5s", "45s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(hermit_global)
         .args(["--log=off", "record", "start", "--record-timeout=30"])
         .arg(format!("--data-dir={}", data_dir.path().display()))
         .arg("--")
@@ -3414,6 +3421,10 @@ fn record_replay_accept_entry_cases_match_linux() {
 /// Makes every `pidfd_open(pid, PIDFD_THREAD)` in this process and its
 /// descendants fail with `EINVAL`, as Linux before 6.9 does, and lets every
 /// other system call through.
+/// Global options for a hermit whose test installs a seccomp filter in it:
+/// the filter is inherited, which hermit refuses unless told to ignore it.
+const UNDER_HOST_FILTER: &[&str] = &["--unsafe-ignore-host-seccomp"];
+
 fn deny_thread_pidfds(command: &mut Command) {
     const PIDFD_THREAD: u32 = libc::O_EXCL as u32;
     const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
@@ -3510,6 +3521,7 @@ fn record_accept_on_a_non_leader_without_thread_pidfds() {
         &workload("c_record_replay_accept_in_turn").path,
         &["worker-queued"],
         &deny_thread_pidfds,
+        UNDER_HOST_FILTER,
         "worker-queued: accept=fd nonleader=1\n",
     );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
@@ -3518,6 +3530,7 @@ fn record_accept_on_a_non_leader_without_thread_pidfds() {
         &workload("c_record_replay_accept_copyout").path,
         &["private-table"],
         &deny_thread_pidfds,
+        UNDER_HOST_FILTER,
         ACCEPT_SET_REFUSAL,
     );
 }

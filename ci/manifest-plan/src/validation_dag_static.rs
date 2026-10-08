@@ -1251,7 +1251,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // happens_before_spec_load_errors_are_refusals_except_host_read_failures}
     // (bin hermit, https://github.com/rrnewton/hermit/issues/3943) retain all
     // 1009: 1011.
-    ("test.hermit_unit", 1011),
+    // Three host_seccomp::tests and run_config's global-option-after-the-
+    // subcommand test (the inherited seccomp filter refusal,
+    // https://github.com/rrnewton/hermit/issues/3942) retain all 1009: 1013.
+    ("test.hermit_unit", 1015),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2070,7 +2073,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // LiteInst guest, so test.cli_on_host selects it too.
     // happens_before_unusable_spec_is_a_named_policy_refusal
     // (https://github.com/rrnewton/hermit/issues/3943) retains all 246: 247.
-    ("test.cli", 247),
+    // run_refuses_an_inherited_seccomp_filter and
+    // run_under_an_inherited_seccomp_filter_with_the_unsafe_override_is_recorded
+    // retain all 246: 248. Neither starts a LiteInst guest, so
+    // test.cli_on_host selects both.
+    ("test.cli", 249),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2261,7 +2268,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // join the exact-name filterset: 187 + 4 - 4 = 187.
     // And the DBT syscall-numbering test: 188.
     // The happens-before unusable-spec refusal test starts no LiteInst guest: 196.
-    ("test.cli_on_host", 196),
+    // And the two inherited-seccomp tests: 197.
+    ("test.cli_on_host", 198),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 55),
@@ -2463,7 +2471,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the nine in-guest-trap tests: 1006.
     // And the same version 2 frame-descriptor test: 998.
     // And the same two happens-before refusal tests: 1011.
-    ("test.hermit_unit_on_host", 1011),
+    // And the same four inherited-seccomp tests: 1013.
+    ("test.hermit_unit_on_host", 1015),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

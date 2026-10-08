@@ -277,6 +277,19 @@ fn hermit_command(args: &[&str]) -> Command {
     command
 }
 
+/// Hermit refuses to start a guest under an inherited seccomp filter unless
+/// told to ignore it; the tests that install one on purpose say so.
+const UNSAFE_IGNORE_HOST_SECCOMP: &str = "--unsafe-ignore-host-seccomp";
+
+/// [`hermit_command`] for a test that installs a seccomp filter in hermit's
+/// process: the filter is inherited, so the command ignores it explicitly.
+fn hermit_command_under_host_filter(args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command.arg(UNSAFE_IGNORE_HOST_SECCOMP);
+    append_hermit_args(&mut command, args);
+    command
+}
+
 fn hermit(args: &[&str]) -> Output {
     hermit_command(args)
         .output()
@@ -1632,6 +1645,86 @@ fn deny_syscall(command: &mut Command, syscall: libc::c_long) {
     }
 }
 
+/// A seccomp filter hermit inherits is an input it does not record, so by
+/// default hermit refuses to start the guest: a policy refusal before anything
+/// runs, naming the filter and the two ways forward
+/// (https://github.com/rrnewton/hermit/issues/3942).
+#[test]
+fn run_refuses_an_inherited_seccomp_filter() {
+    let _guard = hermit_run_guard();
+    let args = ["run", "--", "/bin/echo", "the guest ran"];
+    let mut command = hermit_command(&args);
+    deny_syscall(&mut command, libc::SYS_acct);
+    let output = command.stdin(Stdio::null()).output().unwrap();
+    let stderr = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{stderr}"
+    );
+    assert_eq!(stdout(&output), "", "the guest must not start");
+    for expected in [
+        "hermit inherited a seccomp filter (Seccomp: 2 (filter mode), Seccomp_filters: ",
+        "an input hermit does not record",
+        "`--security-opt seccomp=unconfined`",
+        "--unsafe-ignore-host-seccomp",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "missing {expected:?} in:\n{stderr}"
+        );
+    }
+}
+
+/// `--unsafe-ignore-host-seccomp` starts the guest anyway, warns on stderr,
+/// records the filter in the INFO log, and is saved in a run config so that
+/// loading it repeats the choice. It may follow the subcommand.
+#[test]
+fn run_under_an_inherited_seccomp_filter_with_the_unsafe_override_is_recorded() {
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let log = directory.path().join("hermit.log");
+    let config = directory.path().join("run.yaml");
+    let log_arg = format!("--log-file={}", log.display());
+    let config_arg = format!("--save-config={}", config.display());
+    let args = [
+        "--log=info",
+        log_arg.as_str(),
+        "run",
+        UNSAFE_IGNORE_HOST_SECCOMP,
+        config_arg.as_str(),
+        "--",
+        "/bin/echo",
+        "the guest ran",
+    ];
+    let mut command = hermit_command(&args);
+    deny_syscall(&mut command, libc::SYS_acct);
+    let output = command.stdin(Stdio::null()).output().unwrap();
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "the guest ran\n");
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains(
+            "WARNING: --unsafe-ignore-host-seccomp: hermit is starting the guest under a \
+             seccomp filter it inherited (Seccomp: 2 (filter mode), Seccomp_filters: "
+        ),
+        "{stderr}"
+    );
+    let log = fs::read_to_string(&log).unwrap();
+    assert!(
+        log.lines().any(|line| line.contains(
+            " INFO hermit::host_seccomp: unverified host seccomp filter: Seccomp: 2 (filter mode)"
+        )),
+        "{log}"
+    );
+    let saved: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+    assert_eq!(
+        saved["global"]["unsafe-ignore-host-seccomp"], true,
+        "{saved:?}"
+    );
+}
+
 /// Deny `ioctl(fd, TCGETS)`, the terminal query behind glibc's `isatty`, with
 /// `errno` in hermit and everything it starts, and leave every other ioctl
 /// alone. A terminal then looks to `isatty` like something that is not a
@@ -1915,6 +2008,8 @@ fn set_seccomp_filter(filter: &mut [libc::sock_filter]) -> std::io::Result<()> {
 
 fn readonly_proc_command(args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    // The mount filter below is inherited, which hermit refuses by default.
+    command.arg(UNSAFE_IGNORE_HOST_SECCOMP);
     // The inherited validation workdir is sufficient for these read-only guests.
     // A fresh /test tmpfs mount would also be denied by the flags-zero filter.
     append_hermit_args_using_outer_mount(&mut command, args);
@@ -2034,7 +2129,7 @@ fn namespace_only_readonly_proc_warning_tolerates_denied_statfs() {
         "--",
         "/bin/true",
     ];
-    let mut command = hermit_command(&args);
+    let mut command = hermit_command_under_host_filter(&args);
     // Deny only the diagnostic probe; container mounts must still complete.
     deny_syscall(&mut command, libc::SYS_statfs);
     let output = command
@@ -6975,7 +7070,7 @@ fn run_reports_denied_ptrace_and_seccomp_capabilities() {
             ],
         ),
     ] {
-        let mut command = hermit_command(&[
+        let mut command = hermit_command_under_host_filter(&[
             "run",
             "--max-timeslice=disabled",
             "--no-virtualize-cpuid",
@@ -7432,7 +7527,8 @@ fn max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe_nobody_reads() {
 fn max_log_bytes_exits_promptly_when_perf_is_unavailable_and_stderr_is_a_full_pipe() {
     {
         let _lock = hermit_run_guard();
-        let mut command = hermit_command(&["run", "--timeout", "120", "--", "/bin/true"]);
+        let mut command =
+            hermit_command_under_host_filter(&["run", "--timeout", "120", "--", "/bin/true"]);
         deny_syscall(&mut command, libc::SYS_perf_event_open);
         let output = command
             .stdin(Stdio::null())
@@ -7446,7 +7542,11 @@ fn max_log_bytes_exits_promptly_when_perf_is_unavailable_and_stderr_is_a_full_pi
             output.status
         );
     }
-    CappedRun::default().assert_exits_promptly_with_full_unread_stderr(|command| {
+    CappedRun {
+        global: &[UNSAFE_IGNORE_HOST_SECCOMP],
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|command| {
         deny_syscall(command, libc::SYS_perf_event_open);
     });
 }
@@ -9406,8 +9506,14 @@ fn max_log_bytes_without_a_log_file_exits_promptly_when_statx_is_denied_and_the_
     // Premise: hermit runs, and logs to stderr, without statx (the Rust
     // standard library falls back to fstatat). Uncapped, so the log takes the
     // plain write it always took.
-    let mut premise =
-        hermit_command(&["--log=debug", "run", "--timeout", "120", "--", "/bin/true"]);
+    let mut premise = hermit_command_under_host_filter(&[
+        "--log=debug",
+        "run",
+        "--timeout",
+        "120",
+        "--",
+        "/bin/true",
+    ]);
     premise.stdin(Stdio::null()).env("LC_ALL", "C");
     deny_syscall(&mut premise, libc::SYS_statx);
     let (status, elapsed, stderr) = stderr_when_read(&mut premise);
@@ -9430,7 +9536,7 @@ fn max_log_bytes_without_a_log_file_exits_promptly_when_statx_is_denied_and_the_
         "--",
     ];
     args.extend(LOG_CAP_NOISY_GUEST);
-    let mut command = hermit_command(&args);
+    let mut command = hermit_command_under_host_filter(&args);
     command.stdin(Stdio::null()).env("LC_ALL", "C");
     deny_syscall(&mut command, libc::SYS_statx);
     let status = exit_status_with_full_unread_stderr(&mut command);
@@ -9455,7 +9561,7 @@ fn max_log_bytes_without_a_log_file_still_logs_to_a_read_stderr_when_statx_is_de
         "--",
     ];
     args.extend(LOG_CAP_NOISY_GUEST);
-    let mut command = hermit_command(&args);
+    let mut command = hermit_command_under_host_filter(&args);
     command.stdin(Stdio::null()).env("LC_ALL", "C");
     deny_syscall(&mut command, libc::SYS_statx);
     let (status, elapsed, stderr) = stderr_when_read(&mut command);
@@ -9536,8 +9642,14 @@ fn max_log_bytes_without_a_log_file_exits_promptly_when_the_stat_of_stderr_never
     // Premise: uncapped, nothing hermit or the guest does stats stderr, so
     // the run neither waits on the held calls nor needs them, and it logs to
     // stderr.
-    let mut premise =
-        hermit_command(&["--log=debug", "run", "--timeout", "120", "--", "/bin/true"]);
+    let mut premise = hermit_command_under_host_filter(&[
+        "--log=debug",
+        "run",
+        "--timeout",
+        "120",
+        "--",
+        "/bin/true",
+    ]);
     premise.stdin(Stdio::null()).env("LC_ALL", "C");
     deny_statx_and_hold_the_stat_of_stderr(&mut premise);
     let (status, elapsed, stderr) = stderr_when_read(&mut premise);
@@ -9562,7 +9674,7 @@ fn max_log_bytes_without_a_log_file_exits_promptly_when_the_stat_of_stderr_never
         "--",
     ];
     args.extend(LOG_CAP_NOISY_GUEST);
-    let mut command = hermit_command(&args);
+    let mut command = hermit_command_under_host_filter(&args);
     command.stdin(Stdio::null()).env("LC_ALL", "C");
     deny_statx_and_hold_the_stat_of_stderr(&mut command);
     let status = exit_status_with_full_unread_stderr(&mut command);
@@ -9579,8 +9691,14 @@ fn capped_run_exits_promptly_on_a_full_pipe_with_the_file_type_queries_on_stderr
     // Premise: hermit runs, and logs to stderr, when no file-type query on
     // stderr answers. Uncapped, so the log takes the plain write it always
     // took.
-    let mut premise =
-        hermit_command(&["--log=debug", "run", "--timeout", "120", "--", "/bin/true"]);
+    let mut premise = hermit_command_under_host_filter(&[
+        "--log=debug",
+        "run",
+        "--timeout",
+        "120",
+        "--",
+        "/bin/true",
+    ]);
     premise.stdin(Stdio::null()).env("LC_ALL", "C");
     deny_file_type_queries_on_stderr(&mut premise, errno);
     let (status, elapsed, stderr) = stderr_when_read(&mut premise);
@@ -9605,7 +9723,7 @@ fn capped_run_exits_promptly_on_a_full_pipe_with_the_file_type_queries_on_stderr
         "--",
     ];
     args.extend(LOG_CAP_NOISY_GUEST);
-    let mut command = hermit_command(&args);
+    let mut command = hermit_command_under_host_filter(&args);
     command.stdin(Stdio::null()).env("LC_ALL", "C");
     deny_file_type_queries_on_stderr(&mut command, errno);
     let status = exit_status_with_full_unread_stderr(&mut command);
@@ -9717,8 +9835,14 @@ fn capped_run_exits_promptly_on_a_full_terminal_with_the_terminal_query_denied(e
     let _lock = hermit_run_guard();
     // Premise: hermit runs, and logs to stderr, when the terminal query is
     // denied. Uncapped, so the log takes the plain write it always took.
-    let mut premise =
-        hermit_command(&["--log=debug", "run", "--timeout", "120", "--", "/bin/true"]);
+    let mut premise = hermit_command_under_host_filter(&[
+        "--log=debug",
+        "run",
+        "--timeout",
+        "120",
+        "--",
+        "/bin/true",
+    ]);
     premise.stdin(Stdio::null()).env("LC_ALL", "C");
     deny_terminal_query(&mut premise, errno);
     let (status, elapsed, stderr) = stderr_when_read(&mut premise);
@@ -9743,7 +9867,7 @@ fn capped_run_exits_promptly_on_a_full_terminal_with_the_terminal_query_denied(e
         "--",
     ];
     args.extend(LOG_CAP_NOISY_GUEST);
-    let mut command = hermit_command(&args);
+    let mut command = hermit_command_under_host_filter(&args);
     command.stdin(Stdio::null()).env("LC_ALL", "C");
     deny_terminal_query(&mut command, errno);
     let (master, slave) = full_unread_pseudo_terminal();

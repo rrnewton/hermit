@@ -158,6 +158,17 @@ pub struct GlobalOpts {
     /// must come before the subcommand, e.g. `hermit --backend ptrace run ...`.
     #[clap(long, value_enum, value_name = "BACKEND")]
     pub backend: Option<Backend>,
+
+    /// UNSAFE: start the guest even though hermit inherited a seccomp filter from whatever
+    /// launched it, such as a container runtime's default profile. Without this option hermit
+    /// refuses (exit 122) when /proc/self/status reports such a filter: the filter is an input
+    /// hermit does not record, and it can make system calls fail in ways the guest observes, so
+    /// the run may not reproduce where the filter differs. With it, hermit prints a warning and
+    /// records the filter's mode and count in the INFO log, including the --run-evidence-dir
+    /// log. It may be given before or after the subcommand; a run config holds it as
+    /// `global: {unsafe-ignore-host-seccomp: true}`.
+    #[clap(long, global = true)]
+    pub unsafe_ignore_host_seccomp: bool,
 }
 
 impl GlobalOpts {
@@ -301,6 +312,20 @@ impl GlobalOpts {
     /// Linux PID slot is needed.
     #[must_use = "This function returns a guard that should not be immediately dropped"]
     pub fn init_tracing_for_backend(&self, backend: Backend) -> Option<TracingGuard> {
+        let guard = self.install_tracing_for_backend(backend);
+        // A run admitted under --unsafe-ignore-host-seccomp says so in every
+        // log it writes, the run-evidence log included, from its first record.
+        if let Some(host) = crate::host_seccomp::unverified() {
+            ::tracing::info!(
+                target: "hermit::host_seccomp",
+                "unverified host seccomp filter: {} (admitted by --unsafe-ignore-host-seccomp)",
+                host.describe()
+            );
+        }
+        guard
+    }
+
+    fn install_tracing_for_backend(&self, backend: Backend) -> Option<TracingGuard> {
         if let Some(handle) = &self.log_file_handle {
             // Each subscriber needs an owned File; `try_clone` dups the descriptor,
             // so every run writes through the same host-side open file.
@@ -375,6 +400,7 @@ mod tests {
             log_file_handle: None,
             run_evidence_log_handle: None,
             run_evidence_write_error: None,
+            unsafe_ignore_host_seccomp: false,
             backend: None,
         }
     }
