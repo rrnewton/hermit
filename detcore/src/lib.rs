@@ -2261,20 +2261,24 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         };
 
         // Happens-before enforcement checkpoint. When the run carries a
-        // happens-before program with syscall-count anchors, every intercepted
-        // syscall checks in with the scheduler at its prehook, carrying this
-        // thread's running syscall count. The scheduler fires any anchor at
-        // `Position::SyscallCount(new_count)` on this thread and parks the thread
-        // (out of the run queue) when that anchor is the AFTER endpoint of a Hard
-        // edge whose BEFORE endpoint has not fired yet. This is the gate that
-        // makes an authored partial order reproduce a known race deterministically
-        // (see detcore-model `happens_before`). It requires sequentialized
-        // threads (enforced by the CLI) so the scheduler owns ordering.
+        // happens-before program and some anchor, on any thread, sits at exactly
+        // `Position::SyscallCount(new_count)`, this syscall checks in with the
+        // scheduler at its prehook, carrying this thread's running syscall count.
+        // The scheduler fires any anchor at that count on this thread and parks
+        // the thread (out of the run queue) when that anchor is the AFTER
+        // endpoint of a Hard edge whose BEFORE endpoint has not fired yet. For
+        // any other count the scheduler would find no anchor and do nothing, so
+        // the request is skipped: one scheduler round trip per anchored count
+        // rather than per syscall (https://github.com/rrnewton/hermit/issues/3877).
+        // This is the gate that makes an authored partial order reproduce a known
+        // race deterministically (see detcore-model `happens_before`). It
+        // requires sequentialized threads (enforced by the CLI) so the scheduler
+        // owns ordering.
         if guest
             .config()
             .happens_before
             .as_ref()
-            .is_some_and(|p| p.has_syscall_count_anchors())
+            .is_some_and(|p| p.has_syscall_count_anchor_at(new_count))
         {
             let request = guest.thread_state().mk_request(
                 ResourceID::HappensBeforeCheckpoint(new_count),

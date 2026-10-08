@@ -370,14 +370,15 @@ impl HappensBeforeProgram {
         })
     }
 
-    /// True when any anchor addresses a [`Position::SyscallCount`]. The scheduler
-    /// only issues per-syscall happens-before checkpoints when this holds, so a
-    /// program made entirely of not-yet-enforced positions adds no per-syscall
-    /// overhead.
-    pub fn has_syscall_count_anchors(&self) -> bool {
+    /// True when some anchor, on any thread, sits at exactly
+    /// [`Position::SyscallCount`]`(count)`. The scheduler's checkpoint is a no-op
+    /// for every other count, so the guest side issues it only when this holds:
+    /// one scheduler round trip per anchor instead of one per syscall on every
+    /// thread (QEMU's main loop alone makes about a million syscalls a run).
+    pub fn has_syscall_count_anchor_at(&self, count: u64) -> bool {
         self.anchors
             .values()
-            .any(|a| matches!(a.position, Position::SyscallCount(_)))
+            .any(|a| matches!(a.position, Position::SyscallCount(n) if n == count))
     }
 
     /// Anchors whose position kind the current scheduler does not yet enforce
@@ -982,6 +983,37 @@ mod tests {
             {"before": "scA", "after": "rcbB", "strength": "soft"}
           ]
         }"#
+    }
+
+    /// The guest-side checkpoint filter is exact: true only at a count some
+    /// syscall-count anchor names, false one below and one above it, and false
+    /// at numbers that belong to other position kinds (an RCB value, a
+    /// syscall-by-name occurrence).
+    #[test]
+    fn has_syscall_count_anchor_at_is_exact() {
+        let prog = HappensBeforeSpec::from_json(spec_json())
+            .unwrap()
+            .normalize()
+            .unwrap();
+        assert_eq!(prog.anchors["scA"].position, Position::SyscallCount(10));
+        assert!(prog.has_syscall_count_anchor_at(10));
+        assert!(!prog.has_syscall_count_anchor_at(9));
+        assert!(!prog.has_syscall_count_anchor_at(11));
+        assert!(!prog.has_syscall_count_anchor_at(0));
+        assert_eq!(prog.anchors["rcbB"].position, Position::Rcb(123456));
+        assert!(!prog.has_syscall_count_anchor_at(123456));
+        let syscall_nths: Vec<u64> = prog
+            .anchors
+            .values()
+            .filter_map(|a| match a.position {
+                Position::Syscall { nth, .. } => Some(nth),
+                _ => None,
+            })
+            .collect();
+        assert!(!syscall_nths.is_empty());
+        for nth in syscall_nths.into_iter().filter(|n| *n != 10) {
+            assert!(!prog.has_syscall_count_anchor_at(nth), "nth {nth}");
+        }
     }
 
     #[test]
