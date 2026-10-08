@@ -632,7 +632,7 @@ fn verify_signal_report_cannot_hold_agreed_guest_stdout() {
         nonblocking: false,
         stdout_too: true,
     };
-    let (status, delivered) = run_against_an_undrained_pipe(
+    let Some((status, delivered)) = run_against_an_undrained_pipe(
         &[
             "run",
             "--verify",
@@ -641,7 +641,9 @@ fn verify_signal_report_cannot_hold_agreed_guest_stdout() {
         ],
         &script,
         pipe,
-    );
+    ) else {
+        return;
+    };
     assert_eq!(
         status.code(),
         Some(HERMIT_VERIFICATION_DIVERGENCE_EXIT),
@@ -879,7 +881,9 @@ fn assert_signal_report_cannot_hold_the_disposition(
         .copied()
         .chain(["run", "--verify", "--base-env=minimal"])
         .collect();
-    let (status, delivered) = run_against_an_undrained_pipe(&args, &script, pipe);
+    let Some((status, delivered)) = run_against_an_undrained_pipe(&args, &script, pipe) else {
+        return;
+    };
     assert_eq!(
         status.code(),
         Some(HERMIT_INTERNAL_FAILURE_EXIT),
@@ -914,11 +918,19 @@ struct UndrainedPipe {
 
 /// Run hermit with `hermit_args` and then `-- /bin/sh -c script`, its stderr
 /// `pipe`, and return its status, within a bound, and what reached the pipe.
+///
+/// Returns `None`, after saying why, when Linux will not give the pipe the
+/// requested size. Once a user's pipes hold more than
+/// `/proc/sys/fs/pipe-user-pages-soft` pages, new pipes get two pages and an
+/// unprivileged F_SETPIPE_SZ cannot grow them (EPERM). On a busy shared host
+/// that made the 16 KiB case fail with "pipe capacity left: 8192 right: 16384"
+/// although hermit was never run. A pipe that is larger than requested still
+/// fails, because each test's geometry depends on the exact size.
 fn run_against_an_undrained_pipe(
     hermit_args: &[&str],
     script: &str,
     pipe: UndrainedPipe,
-) -> (std::process::ExitStatus, String) {
+) -> Option<(std::process::ExitStatus, String)> {
     use std::os::unix::io::FromRawFd;
 
     let mut fds = [0i32; 2];
@@ -926,10 +938,28 @@ fn run_against_an_undrained_pipe(
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
     let (read_fd, write_fd) = (fds[0], fds[1]);
     // SAFETY: fcntl on descriptors this test owns.
-    let capacity = unsafe {
-        libc::fcntl(write_fd, libc::F_SETPIPE_SZ, pipe.bytes);
-        libc::fcntl(write_fd, libc::F_GETPIPE_SZ)
-    };
+    let set = unsafe { libc::fcntl(write_fd, libc::F_SETPIPE_SZ, pipe.bytes) };
+    let set_error = std::io::Error::last_os_error();
+    // SAFETY: as above.
+    let capacity = unsafe { libc::fcntl(write_fd, libc::F_GETPIPE_SZ) };
+    if (set < 0 && set_error.raw_os_error() == Some(libc::EPERM)) || capacity < pipe.bytes {
+        // SAFETY: both descriptors are this test's and are not used again.
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+        let soft = fs::read_to_string("/proc/sys/fs/pipe-user-pages-soft")
+            .unwrap_or_else(|error| format!("unreadable ({error})"));
+        eprintln!(
+            "skipping: Linux would not size the pipe to {} bytes (F_SETPIPE_SZ returned {set}: \
+             {set_error}; the pipe holds {capacity} bytes). This user's pipes are probably over \
+             fs.pipe-user-pages-soft = {} pages, which caps new pipes at two pages.",
+            pipe.bytes,
+            soft.trim()
+        );
+        return None;
+    }
+    assert!(set >= 0, "F_SETPIPE_SZ({}) failed: {set_error}", pipe.bytes);
     assert_eq!(capacity, pipe.bytes, "pipe capacity");
     let waiting = vec![b'.'; pipe.waiting];
     // SAFETY: `waiting` is valid for its length; it fits in the empty pipe.
@@ -991,5 +1021,5 @@ fn run_against_an_undrained_pipe(
     let status = status.unwrap_or_else(|| {
         panic!("hermit had not exited after {deadline:?}\ndelivered:\n{delivered}")
     });
-    (status, delivered)
+    Some((status, delivered))
 }
