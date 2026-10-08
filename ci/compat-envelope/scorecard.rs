@@ -16853,6 +16853,8 @@ fn write_scorecard_snapshot_fixture(path: &Path, value: &JsonValue) -> Result<St
 /// JSONL shards instead of silently projecting a different tree than the one
 /// visible to the caller.
 fn snapshot_series_source(series_root: &Path) -> Result<SeriesSourceSnapshot, String> {
+    use std::os::unix::ffi::OsStrExt;
+
     let canonical = fs::canonicalize(series_root).map_err(|e| {
         format!(
             "series root {} does not exist or cannot be resolved: {e}. An unreachable source is \
@@ -16997,32 +16999,41 @@ fn snapshot_series_source(series_root: &Path) -> Result<SeriesSourceSnapshot, St
         ));
     }
 
+    // Every committed shard from ONE `git cat-file --batch`: a `git show` per
+    // shard started one process per shard (6,009 for the published store on
+    // 2026-10-07, each fanning out further through a git wrapper).
+    if let Some(path) = committed_shards
+        .iter()
+        .find(|path| path.as_os_str().as_bytes().contains(&b'\n'))
+    {
+        // `--batch` reads one object name per line.
+        return Err(format!(
+            "series shard path {:?} contains a newline",
+            path.display()
+        ));
+    }
+    let names = committed_shards
+        .iter()
+        .map(|relative_shard| format!("{source_commit}:{}", relative_shard.display()))
+        .collect::<Vec<_>>();
+    let objects = git_cat_file_batch(&repository, &names)?.ok_or_else(|| {
+        format!("cannot read the series shards from source commit {source_commit}")
+    })?;
     let mut shards = Vec::with_capacity(committed_shards.len());
-    for relative_shard in committed_shards {
-        let committed = Command::new("git")
-            .args([
-                "--no-replace-objects",
-                "show",
-                &format!("{source_commit}:{}", relative_shard.display()),
-            ])
-            .current_dir(&repository)
-            .output()
-            .map_err(|e| {
-                format!(
-                    "cannot read series shard {} from source commit {source_commit}: {e}",
+    for (relative_shard, object) in committed_shards.into_iter().zip(objects) {
+        let committed = match object {
+            Some((kind, bytes)) if kind == "blob" => bytes,
+            _ => {
+                return Err(format!(
+                    "git show failed for series shard {} at source commit {source_commit}",
                     relative_shard.display()
-                )
-            })?;
-        if !committed.status.success() {
-            return Err(format!(
-                "git show failed for series shard {} at source commit {source_commit}",
-                relative_shard.display()
-            ));
-        }
+                ));
+            }
+        };
         let worktree_path = repository.join(&relative_shard);
         let working = fs::read(&worktree_path)
             .map_err(|e| format!("cannot read series shard {}: {e}", worktree_path.display()))?;
-        if committed.stdout != working {
+        if committed != working {
             return Err(format!(
                 "series source is not represented exactly by commit {source_commit}; worktree shard {} differs from the committed snapshot",
                 relative_shard.display()
@@ -17037,7 +17048,7 @@ fn snapshot_series_source(series_root: &Path) -> Result<SeriesSourceSnapshot, St
         })?;
         shards.push(SeriesSourceShard {
             display_path: series_root.join(within_source),
-            bytes: committed.stdout,
+            bytes: committed,
         });
     }
     let origin = Command::new("git")
@@ -20111,6 +20122,87 @@ fn commands_tier_git(repo: &Path, args: &[&str]) -> Result<(), String> {
         .success()
         .then_some(())
         .ok_or_else(|| format!("git {} failed", args.join(" ")))
+}
+
+#[cfg(test)]
+mod series_snapshot_git_tests {
+    use super::*;
+
+    const SHARDS: usize = 40;
+    const COUNT_FILE: &str = "SCORECARD_TEST_GIT_COUNT_FILE";
+
+    /// Reading a committed series snapshot starts a fixed number of git
+    /// processes however many shards it has: one `git cat-file --batch` for
+    /// every shard, not one `git show` each (6,009 for the published store on
+    /// 2026-10-07). A counting `git` first on PATH sees every git process the
+    /// snapshot starts. Run in a fresh process, since PATH is process-wide.
+    #[test]
+    fn a_series_snapshot_reads_every_shard_with_a_fixed_number_of_git_processes() {
+        let name = "series_snapshot_git_tests::a_series_snapshot_reads_every_shard_with_a_fixed_number_of_git_processes";
+        let Some(count_file) = env::var_os(COUNT_FILE) else {
+            let shim = tempfile::tempdir().unwrap();
+            let real_git = env::split_paths(&env::var_os("PATH").unwrap())
+                .map(|dir| dir.join("git"))
+                .find(|candidate| candidate.is_file())
+                .expect("git is on PATH");
+            let git = shim.path().join("git");
+            fs::write(
+                &git,
+                format!(
+                    "#!/bin/sh\nprintf 'x\\n' >> \"${COUNT_FILE}\"\nexec '{}' \"$@\"\n",
+                    real_git.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&git, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+            let mut path = vec![shim.path().to_path_buf()];
+            path.extend(env::split_paths(&env::var_os("PATH").unwrap()));
+            let status = Command::new(env::current_exe().unwrap())
+                .args(["--exact", name])
+                .env("PATH", env::join_paths(path).unwrap())
+                .env(COUNT_FILE, shim.path().join("count"))
+                .status()
+                .unwrap();
+            assert!(status.success(), "child test failed with {status}");
+            return;
+        };
+        let count = || fs::read_to_string(&count_file).map_or(0, |text| text.lines().count());
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path();
+        commands_tier_git(repo, &["init", "--quiet"]).unwrap();
+        let dir = repo.join("series/hermit/fixture");
+        fs::create_dir_all(&dir).unwrap();
+        for index in 0..SHARDS {
+            fs::write(
+                dir.join(format!("2026-08-{index:02}.jsonl")),
+                format!("{{\"n\":{index}}}\n"),
+            )
+            .unwrap();
+        }
+        commands_tier_git(repo, &["add", "series"]).unwrap();
+        commands_tier_git(
+            repo,
+            &[
+                "-c",
+                "user.name=scorecard fixture",
+                "-c",
+                "user.email=scorecard@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "shards",
+            ],
+        )
+        .unwrap();
+        let before = count();
+        let snapshot = snapshot_series_source(&repo.join("series")).unwrap();
+        let started = count() - before;
+        assert_eq!(snapshot.shards.len(), SHARDS);
+        assert!(
+            started <= 8,
+            "reading {SHARDS} shards started {started} git processes"
+        );
+    }
 }
 
 /// The series-snapshot refusals that need a worktree to change under a
