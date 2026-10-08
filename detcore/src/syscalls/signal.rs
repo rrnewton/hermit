@@ -150,6 +150,14 @@ fn without_perf_event_signal(mask: KernelSigset) -> KernelSigset {
 /// value makes `rt_sigprocmask` copy exactly the kernel-sized input and then
 /// return `EINVAL` without changing the mask. Use that as a permission probe,
 /// then read the already-validated word while the guest is stopped.
+/// The x86-64 System V red zone below the stack pointer, which a leaf function
+/// may use and an injected call therefore must not.
+const STACK_RED_ZONE: usize = 128;
+
+/// The two eight-byte scratch cells `handle_rt_sigsuspend` places below the
+/// red zone: the rt_sigpending result and the copy of the call's mask.
+const SCRATCH_CELLS_SIZE: usize = 2 * std::mem::size_of::<u64>();
+
 pub(super) async fn read_kernel_sigset<G, T>(
     guest: &mut G,
     address: Addr<'_, libc::sigset_t>,
@@ -466,12 +474,29 @@ impl<T: RecordOrReplay> Detcore<T> {
         // signals can end the call (`Resources::blocked_signal_mask`), and
         // another process sharing the buffer (MAP_SHARED) may rewrite it before
         // the call runs; Linux copies the mask when the call starts, and from
-        // the guest's view the call has already started. The guard keeps the
-        // copy alive until the call returns.
-        let mut stack = guest.stack().await;
-        let pending_addr = stack.push(0_u64);
-        let mask_copy = stack.push(temporary_mask);
-        let scratch_guard = stack.commit()?;
+        // the guest's view the call has already started.
+        //
+        // The copy and the rt_sigpending result live in two cells just below
+        // the stack's red zone, the scratch area an injected call may use, but
+        // never on the caller's buffer: a guest may keep its mask there while
+        // it blocks every signal, and a copy placed on that very buffer would
+        // be the original again, while the pending cell would overwrite the
+        // guest's mask. If the buffer overlaps the two cells, they move to just
+        // below it. They are written directly rather than through a scratch
+        // stack, whose commit writes one contiguous region down from the red
+        // zone and so would cover a buffer inside it.
+        let caller_mask = mask_addr.as_raw()..mask_addr.as_raw() + KERNEL_SIGSET_SIZE;
+        let below_red_zone = (guest.regs().await.rsp as usize).wrapping_sub(STACK_RED_ZONE);
+        let cells = (below_red_zone - SCRATCH_CELLS_SIZE)..below_red_zone;
+        let cells_start = if cells.start < caller_mask.end && caller_mask.start < cells.end {
+            (caller_mask.start - SCRATCH_CELLS_SIZE) & !(std::mem::align_of::<u64>() - 1)
+        } else {
+            cells.start
+        };
+        let pending_addr = Addr::<u64>::from_raw(cells_start).ok_or(Errno::EFAULT)?;
+        let mask_copy = AddrMut::<u64>::from_raw(cells_start + std::mem::size_of::<u64>())
+            .ok_or(Errno::EFAULT)?;
+        guest.memory().write_value(mask_copy, &temporary_mask)?;
         let pending_out = AddrMut::<libc::sigset_t>::from_raw(pending_addr.as_raw())
             .expect("stack address must be non-null");
         let pending_call = syscalls::RtSigpending::new()
@@ -479,13 +504,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_sigsetsize(KERNEL_SIGSET_SIZE);
         guest.inject_with_retry(pending_call).await?;
         let pending: u64 = guest.memory().read_value(pending_addr)?;
-        let call = call.with_mask(Some(mask_copy.cast()));
+        let call = call.with_mask(Some(Addr::from_raw(mask_copy.as_raw()).expect("non-null")));
 
         // The scheduler records the mask the call sleeps under, read here in
         // this thread's turn, to choose a SIGCHLD target while the thread is
         // outside the runnable set (`Resources::blocked_signal_mask`).
         let installed_mask = kernel_installed_signal_mask(temporary_mask);
-        let result = if pending & !temporary_mask != 0 {
+        if pending & !temporary_mask != 0 {
             // The kernel will consume an already-pending signal as soon as it
             // atomically installs the temporary mask. Keep this immediate case
             // out of the terminal-wait classification; the real syscall still
@@ -495,9 +520,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             self.record_or_replay_rt_sigsuspend(guest, call, installed_mask)
                 .await
-        };
-        drop(scratch_guard);
-        result
+        }
     }
 
     /// rt_sigaction
@@ -1254,57 +1277,54 @@ mod rt_sigsuspend_tests {
     use crate::ThreadState;
     use crate::syscalls::threads::kernel_sigset_bit;
 
-    /// Scratch memory for the guest's stack: room for the call's two cells.
-    const ARENA_WORDS: usize = 4;
+    /// The guest's stack, in this process's memory: `regs` reports a stack
+    /// pointer `STACK_WORD` words in, so the cells below its red zone are words
+    /// `COPY_WORD - 1` (the pending set) and `COPY_WORD` (the copy).
+    const ARENA_WORDS: usize = 64;
+    const STACK_WORD: usize = 48;
+    const COPY_WORD: usize = STACK_WORD - STACK_RED_ZONE / 8 - 1;
 
-    struct SuspendStack {
-        arena: usize,
-        used: usize,
-    }
+    /// rt_sigsuspend writes its cells directly; it takes no scratch stack.
+    struct NoStack;
 
-    struct SuspendStackGuard;
+    struct NoStackGuard;
 
-    impl Drop for SuspendStackGuard {
+    impl Drop for NoStackGuard {
         fn drop(&mut self) {}
     }
 
-    impl reverie::Stack for SuspendStack {
-        type StackGuard = SuspendStackGuard;
+    impl reverie::Stack for NoStack {
+        type StackGuard = NoStackGuard;
 
         fn size(&self) -> usize {
-            self.used
+            panic!("rt_sigsuspend takes no scratch stack")
         }
         fn capacity(&self) -> usize {
-            ARENA_WORDS * std::mem::size_of::<u64>()
+            panic!("rt_sigsuspend takes no scratch stack")
         }
-        fn push<'stack, T>(&mut self, value: T) -> Addr<'stack, T> {
-            assert!(self.used + std::mem::size_of::<T>() <= self.capacity());
-            let address = self.arena + self.used;
-            self.used += std::mem::size_of::<T>().next_multiple_of(8);
-            // SAFETY: the arena is a live, 8-byte aligned buffer owned by the
-            // guest, and the assertion above keeps `T` inside it.
-            unsafe { std::ptr::write(address as *mut T, value) };
-            Addr::from_raw(address).unwrap()
+        fn push<'stack, T>(&mut self, _: T) -> Addr<'stack, T> {
+            panic!("rt_sigsuspend takes no scratch stack")
         }
         fn reserve<'stack, T>(&mut self) -> AddrMut<'stack, T> {
-            panic!("rt_sigsuspend pushes its scratch cells")
+            panic!("rt_sigsuspend takes no scratch stack")
         }
         fn commit(self) -> Result<Self::StackGuard, Errno> {
-            Ok(SuspendStackGuard)
+            panic!("rt_sigsuspend takes no scratch stack")
         }
     }
 
     /// A guest whose `rt_sigsuspend` caller's mask lives at `caller_mask`. The
     /// call's `rt_sigpending` probe, which runs after Detcore read that mask
-    /// and before the real call, rewrites it to `rewritten`, as another
-    /// process sharing the buffer could while the call waits for its turn.
-    /// Every mask a real `rt_sigsuspend` is given is kept in `suspended_under`.
+    /// and before the real call, rewrites it to `rewritten` if one is given,
+    /// as another process sharing the buffer could while the call waits for
+    /// its turn. Every mask a real `rt_sigsuspend` is given is kept in
+    /// `suspended_under`.
     struct SuspendGuest {
         config: Config,
         thread: ThreadState<()>,
         arena: Box<[u64; ARENA_WORDS]>,
         caller_mask: usize,
-        rewritten: KernelSigset,
+        rewritten: Option<KernelSigset>,
         suspended_under: Vec<KernelSigset>,
     }
 
@@ -1327,7 +1347,7 @@ mod rt_sigsuspend_tests {
     #[reverie::tool]
     impl Guest<Detcore> for SuspendGuest {
         type Memory = LocalMemory;
-        type Stack = SuspendStack;
+        type Stack = NoStack;
 
         fn tid(&self) -> Pid {
             Pid::from_raw(1)
@@ -1348,13 +1368,13 @@ mod rt_sigsuspend_tests {
             &self.thread
         }
         async fn regs(&mut self) -> libc::user_regs_struct {
-            panic!("rt_sigsuspend must not read registers")
+            // SAFETY: user_regs_struct is plain integers; all zeroes is valid.
+            let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+            regs.rsp = (self.arena.as_ptr() as usize + STACK_WORD * 8) as u64;
+            regs
         }
         async fn stack(&mut self) -> Self::Stack {
-            SuspendStack {
-                arena: self.arena.as_mut_ptr() as usize,
-                used: 0,
-            }
+            NoStack
         }
         async fn daemonize(&mut self) {
             panic!("rt_sigsuspend must not daemonize")
@@ -1367,10 +1387,12 @@ mod rt_sigsuspend_tests {
                 Syscall::RtSigpending(call) => {
                     let set = call.set().expect("rt_sigpending without a set");
                     LocalMemory::new().write_value(set.cast::<KernelSigset>(), &0)?;
-                    // SAFETY: `caller_mask` is the test's live, aligned buffer.
-                    unsafe {
-                        std::ptr::write(self.caller_mask as *mut KernelSigset, self.rewritten)
-                    };
+                    if let Some(rewritten) = self.rewritten {
+                        // SAFETY: `caller_mask` is the test's live, aligned buffer.
+                        unsafe {
+                            std::ptr::write(self.caller_mask as *mut KernelSigset, rewritten)
+                        };
+                    }
                     Ok(0)
                 }
                 Syscall::RtSigsuspend(call) => {
@@ -1417,7 +1439,7 @@ mod rt_sigsuspend_tests {
             config: config.clone(),
             arena: Box::new([u64::MAX; ARENA_WORDS]),
             caller_mask: caller_address,
-            rewritten: blocks_sigchld,
+            rewritten: Some(blocks_sigchld),
             suspended_under: Vec::new(),
         };
         let call = syscalls::RtSigsuspend::new()
@@ -1431,5 +1453,50 @@ mod rt_sigsuspend_tests {
         );
         assert_eq!(*caller_mask, blocks_sigchld, "the buffer was rewritten");
         assert_eq!(guest.suspended_under, [unblocks_sigchld]);
+    }
+
+    /// A caller's mask that lies on the cells Detcore places below the red
+    /// zone, as a raw syscall may pass one there in a shared stack: the copy
+    /// must not be the caller's buffer, or a rewrite of the shared buffer
+    /// reaches the real call again, and the rt_sigpending cell must not
+    /// overwrite it. The cells move below the buffer, which keeps its own
+    /// contents. Before, the copy slot was the caller's buffer, and the
+    /// pending slot's buffer was overwritten with the pending set.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rt_sigsuspend_scratch_never_lands_on_the_callers_mask() {
+        let config = Config::default();
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
+        let original: KernelSigset = kernel_sigset_bit(libc::SIGUSR2);
+        let rewritten = original | kernel_sigset_bit(libc::SIGCHLD);
+        // The copy's slot, rewritten by a peer; then the pending cell's slot,
+        // which nobody rewrites.
+        for (slot, peer_rewrite) in [(COPY_WORD, Some(rewritten)), (COPY_WORD - 1, None)] {
+            let mut arena = Box::new([u64::MAX; ARENA_WORDS]);
+            arena[slot] = original;
+            let caller_address = &mut arena[slot] as *mut u64 as usize;
+            let mut guest = SuspendGuest {
+                thread: ThreadState::new(DetPid::from_raw(1), &config, ()),
+                config: config.clone(),
+                arena,
+                caller_mask: caller_address,
+                rewritten: peer_rewrite,
+                suspended_under: Vec::new(),
+            };
+            let call = syscalls::RtSigsuspend::new()
+                .with_mask(Addr::from_raw(caller_address))
+                .with_sigsetsize(KERNEL_SIGSET_SIZE);
+
+            let result = tool.handle_rt_sigsuspend(&mut guest, call).await;
+            assert!(
+                matches!(result, Err(Error::Errno(Errno::EINTR))),
+                "slot {slot}: {result:?}"
+            );
+            assert_eq!(guest.suspended_under, [original], "slot {slot}");
+            assert_eq!(
+                guest.arena[slot],
+                peer_rewrite.unwrap_or(original),
+                "slot {slot}: the caller's buffer holds only what the guest wrote"
+            );
+        }
     }
 }

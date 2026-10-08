@@ -119,6 +119,7 @@ static REPLAY_EPOCH_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FORK_CHILD_GETRANDOM_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGSUSPEND_AFTER_WNOHANG_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGSUSPEND_SHARED_MASK_REWRITE_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SIGSUSPEND_SHARED_STACK_MASK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "liteinst")]
 static LITEINST_IN_GUEST_WAIT_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
@@ -776,6 +777,32 @@ fn sigsuspend_shared_mask_rewrite_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "sigsuspend-shared-mask-rewrite guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn sigsuspend_shared_stack_mask_guest() -> &'static Path {
+    SIGSUSPEND_SHARED_STACK_MASK_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("sigsuspend-shared-stack-mask");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the sigsuspend-shared-stack-mask guest directory");
+        let guest = build_root.join("sigsuspend_shared_stack_mask");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/sigsuspend_shared_stack_mask.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the sigsuspend-shared-stack-mask guest");
+        assert!(
+            output.status.success(),
+            "sigsuspend-shared-stack-mask guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -6467,6 +6494,39 @@ fn a_sigchld_sent_at_an_rt_sigsuspend_request_wakes_the_call() {
 fn a_shared_sigsuspend_mask_rewritten_before_the_call_runs_does_not_stall_the_run() {
     let _guard = hermit_run_guard();
     let guest = sigsuspend_shared_mask_rewrite_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let args = [
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--max-timeslice=disabled",
+        "--",
+        guest,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "sigchld=1 sigusr1=1\n");
+    assert!(
+        stderr(&output).contains("Determinism verified"),
+        "missing verification success marker:\n{}",
+        stderr(&output)
+    );
+}
+
+/// tests/c/sigsuspend_shared_stack_mask.c: the shared-mask scenario of
+/// `a_shared_sigsuspend_mask_rewritten_before_the_call_runs_does_not_stall_the_run`
+/// with the parent's mask on a MAP_SHARED stack, 144 bytes below the stack
+/// pointer, where Detcore used to place its private copy of the mask. The copy
+/// must not be the guest's buffer, or the peer's rewrite reaches the real call
+/// again. Before, the copy was that buffer: the call slept under the rewritten
+/// mask, the scheduler held every thread for a SIGCHLD stop that never came,
+/// and after 30 s the run was refused (exit 122).
+#[test]
+fn a_sigsuspend_mask_on_a_shared_stack_below_the_red_zone_is_copied_elsewhere() {
+    let _guard = hermit_run_guard();
+    let guest = sigsuspend_shared_stack_mask_guest()
         .to_str()
         .expect("guest path should be UTF-8");
     let args = [
