@@ -160,6 +160,26 @@ rust_unittest(
     ],
 )
 
+# The directory-listing order tests run on the system allocator: unlike its
+# siblings this target installs no #[global_allocator], because the test
+# allocator never frees and these tests list directories of thousands of
+# entries five times each. Without a global allocator it needs no static_pic
+# link style.
+rust_unittest(
+    name = "tests_readdir_order",
+    srcs = ["tests/readdir_order/mod.rs"],
+    crate_root = "tests/readdir_order/mod.rs",
+    env = test_env,
+    rustc_flags = sanitized_feature,
+    deps = [
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:tempfile",
+        ":detcore",
+        ":detcore-testutils",
+        "//hermetic_infra/reverie:reverie",
+    ],
+)
+
 # FIXME: Disabled because these tests are too brittle to run and maintain.
 # rust_unittest(
 #    name = "tests_stats",

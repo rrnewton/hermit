@@ -82,6 +82,7 @@
         "test.hermit_unit",
         "test.detcore_unit",
         "test.detcore_misc",
+        "test.detcore_readdir_order",
         "test.detcore_time"
       ]
     },

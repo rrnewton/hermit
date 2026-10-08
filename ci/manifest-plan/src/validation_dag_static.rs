@@ -157,6 +157,7 @@ pub(super) const NEXTEST_RESULT_PRODUCERS: &[&str] = &[
     "test.command_strict_verify",
     "test.detcore_misc",
     "test.detcore_parallel",
+    "test.detcore_readdir_order",
     "test.detcore_time",
     "test.detcore_unit",
     "test.hermit_integration",
@@ -173,6 +174,7 @@ pub(super) const NEXTEST_RESULT_PRODUCERS: &[&str] = &[
     "test.command_strict_verify_on_host",
     "test.detcore_misc_on_host",
     "test.detcore_parallel_on_host",
+    "test.detcore_readdir_order_on_host",
     "test.detcore_time_on_host",
     "test.detcore_unit_on_host",
     "test.hermit_integration_on_host",
@@ -1566,6 +1568,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // reviews) retains all 87 (measured 88).
     ("test.detcore_misc", 88),
     ("test.detcore_parallel", 5),
+    // The 39 readdir_order tests leave tests_misc for their own
+    // tests_readdir_order binary, which installs no test allocator: all 39,
+    // listed with cargo nextest list --profile ci -p hermit-detcore --test
+    // tests_readdir_order.
+    ("test.detcore_readdir_order", 39),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
     // identities: 28 + 2 = 30.
@@ -2120,6 +2127,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host node carries the identical 85-test tests_misc selection.
     ("test.detcore_misc_on_host", 88),
     ("test.detcore_parallel_on_host", 5),
+    // The host node carries the identical tests_readdir_order selection: 39,
+    // listed the same way.
+    ("test.detcore_readdir_order_on_host", 39),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
     // io_buffers::event_tests::
@@ -4836,6 +4846,42 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             est_duration_s: 120.0,
             rss_baseline_bytes: Some(2147483648),
             hard_mem_max_bytes: Some(4294967296),
+            classification: StepClass::CpuBound,
+            preferred_inner_jobs: None,
+            measured_effective_cores: None,
+            measured_cpu_utilization: None,
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 720,
+        cpu_timeout: 7200,
+        jobs_flag: None,
+        jobs_env: None,
+    },
+    StaticStepSpec {
+        group: r########"test"########,
+        job: r########"detcore_readdir_order"########,
+        desc: r########"Detcore directory-listing order cases (tests_readdir_order, system allocator, serial execution)"########,
+        description: r########"The 39 directory-listing order tests (detcore/tests/readdir_order/mod.rs) ran in tests_misc until 2026-10-08 and now form their own test binary, which installs no #[global_allocator]: tests_misc's test allocator (common/test-allocator) never frees, so each of these tests, which list directories of up to 3000 entries five times over, kept every byte it had ever allocated. Without a global allocator the binary needs no static_pic link style in detcore/BUCK either. The selection and its serial -j 1 are the ones these tests had in test.detcore_misc, and the hosted twin test.detcore_readdir_order_on_host carries the same selection. MEMORY CALIBRATED 2026-10-08 on the measurement host recorded for test.detcore_readdir_order in docs/TESTING_ENVIRONMENTS.md ("Named measurement hosts"), debug profile: cargo nextest run --profile ci -p hermit-detcore --test tests_readdir_order -j 1, with every test process under /usr/bin/time -v, ran 39 of 39 tests. The largest per-test peak resident set was 28835840 bytes with Detcore's per-filesystem entry lookups and 28811264 bytes with every listed entry looked up by its own lstat (forced by a temporary one-line change; https://github.com/rrnewton/hermit/pull/3255 makes that Detcore's only lookup), and the selection took 36.8 s and 61.2 s of wall time respectively. The 1-GiB scheduling baseline rounds the larger peak up to a whole GiB, the 3-GiB hard cap adds 2 GiB of headroom, and est_duration_s rounds the 61.2-s wall time up to 62 seconds."########,
+        labels: &[
+            r########"full"########,
+            r########"hosted-portable"########,
+            r########"portable"########,
+        ],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-detcore --test tests_readdir_order -j 1"########,
+        cmdtype: CmdType::Unknown,
+        manifest: None,
+        integration_test_binaries: None,
+        deps: &[
+            r########"build.e2e_artifact"########,
+            r########"setup.nextest"########,
+        ],
+        env: &[],
+        hint: HintSpec {
+            resources: &[],
+            est_duration_s: 62.0,
+            rss_baseline_bytes: Some(1073741824),
+            hard_mem_max_bytes: Some(3221225472),
             classification: StepClass::CpuBound,
             preferred_inner_jobs: None,
             measured_effective_cores: None,

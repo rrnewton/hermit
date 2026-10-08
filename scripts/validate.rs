@@ -30461,6 +30461,9 @@ mod committed_selection_preservation_tests {
                     "the fixture must accompany the strict compatibility bucket: {stdout}"
                 );
             } else {
+                // 68 since test.detcore_readdir_order_on_host was enrolled,
+                // assigned to the unit job in ci/portable-shards.json, when
+                // the readdir_order tests left tests_misc for their own binary.
                 // 67 since test.liteinst_strict_on_host was retired with the
                 // LiteInst host hybrid
                 // (https://github.com/rrnewton/hermit/issues/3520); 68 since
@@ -30488,7 +30491,7 @@ mod committed_selection_preservation_tests {
                 // ci/portable-shards.json.
                 assert!(
                     stdout.contains(
-                        "67 committed hosted-portable steps each assigned to exactly one hosted job"
+                        "68 committed hosted-portable steps each assigned to exactly one hosted job"
                     ),
                     "{stdout}"
                 );
@@ -30616,6 +30619,7 @@ mod committed_selection_preservation_tests {
             "test.command_strict_verify",
             "test.detcore_misc",
             "test.detcore_parallel",
+            "test.detcore_readdir_order",
             "test.detcore_time",
             "test.detcore_unit",
             "test.envelope_levels",
@@ -30644,8 +30648,10 @@ mod committed_selection_preservation_tests {
         // https://github.com/rrnewton/hermit/issues/3301). 17 since
         // test.detcore_time_on_host was enrolled. 16 since
         // test.liteinst_strict_on_host was retired
-        // (https://github.com/rrnewton/hermit/issues/3520).
-        assert_eq!(expected.len(), 16);
+        // (https://github.com/rrnewton/hermit/issues/3520). 17 since
+        // test.detcore_readdir_order_on_host was enrolled, when the
+        // readdir_order tests left tests_misc for their own binary.
+        assert_eq!(expected.len(), 17);
         let requested = [public.join(","), "e2e.manifest_compat".into()].join(",");
         for only in [false, true] {
             let mut argv = if only {

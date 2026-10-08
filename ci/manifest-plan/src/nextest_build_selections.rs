@@ -37,6 +37,9 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         | "super.network_syscall_determinism_diagnostic" => {
             Some(&["-p", "hermit-detcore", "--test", "tests_misc"])
         }
+        "test.detcore_readdir_order" => {
+            Some(&["-p", "hermit-detcore", "--test", "tests_readdir_order"])
+        }
         "test.detcore_time" | "privileged-test.pmu_detcore_time_cases" => {
             Some(&["-p", "hermit-detcore", "--test", "tests_time"])
         }

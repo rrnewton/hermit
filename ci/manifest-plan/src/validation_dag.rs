@@ -618,6 +618,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "test.detcore_unit",
     "test.detcore_misc",
     "test.detcore_parallel",
+    "test.detcore_readdir_order",
     "test.detcore_time",
     "test.hermit_integration",
     "test.arbitrary_binaries",
@@ -748,15 +749,21 @@ const PROFILES: [Profile; 12] = [
     // ptrace cases that need the PMU timer left test.hermit_integration and
     // its hosted twin: 89/90 before. portable and hosted-portable are
     // unchanged because the node carries only the full label.
+    // full and portable then each gained test.detcore_readdir_order, and
+    // hosted-portable its twin test.detcore_readdir_order_on_host, when the
+    // 39 readdir_order tests left tests_misc for the tests_readdir_order
+    // binary, which installs no test allocator: 91/92 for full, 76/77 for
+    // portable and 68/68 for hosted-portable since, 90/91, 75/76 and 67/67
+    // before.
     Profile {
         label: "full",
-        direct_steps: 90,
-        selected_steps: 91,
+        direct_steps: 91,
+        selected_steps: 92,
     },
     Profile {
         label: "portable",
-        direct_steps: 75,
-        selected_steps: 76,
+        direct_steps: 76,
+        selected_steps: 77,
     },
     Profile {
         label: "quick",
@@ -777,8 +784,8 @@ const PROFILES: [Profile; 12] = [
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
-        direct_steps: 67,
-        selected_steps: 67,
+        direct_steps: 68,
+        selected_steps: 68,
     },
     Profile {
         label: HOSTED_PRIVILEGED_LABEL,
@@ -1476,10 +1483,13 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
     // tests/backend-parity (also slice S13). 20 since test.detcore_time and its hosted twin were enrolled.
     // 19 since test.liteinst_strict, whose hosted twin was
     // test.liteinst_strict_on_host, was retired with the LiteInst host hybrid
-    // (https://github.com/rrnewton/hermit/issues/3520).
-    if split.len() != 19 {
+    // (https://github.com/rrnewton/hermit/issues/3520). 20 since
+    // test.detcore_readdir_order and its hosted twin were enrolled, when the
+    // readdir_order tests left tests_misc for a binary without the test
+    // allocator.
+    if split.len() != 20 {
         return Err(format!(
-            "hosted test split has {} roots, expected 19",
+            "hosted test split has {} roots, expected 20",
             split.len()
         ));
     }
@@ -1521,9 +1531,11 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
     // tests/backend-parity (also slice S13). 23 since test.detcore_time and its hosted twin were enrolled.
     // 22 since test.liteinst_strict, one of the split's roots, was retired
     // with the LiteInst host hybrid (https://github.com/rrnewton/hermit/issues/3520).
-    if split.len() != 22 {
+    // 23 since test.detcore_readdir_order, a new root of the split, was
+    // enrolled.
+    if split.len() != 23 {
         return Err(format!(
-            "hosted test dependency closure has {} nodes, expected 22",
+            "hosted test dependency closure has {} nodes, expected 23",
             split.len()
         ));
     }
@@ -2702,10 +2714,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // (https://github.com/rrnewton/hermit/issues/3520). 134 since
     // test.record_replay joined the Nextest producers. 135 since
     // test.pmu_integration_cases took the 25 external_signal_interrupt
-    // ptrace cases that need the PMU timer.
-    if expected.len() != 135 {
+    // ptrace cases that need the PMU timer. 137 since
+    // test.detcore_readdir_order and its hosted twin were enrolled.
+    if expected.len() != 137 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 135",
+            "structured result producer registry has {} entries, expected 137",
             expected.len()
         ));
     }
@@ -2719,10 +2732,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // test.liteinst_strict and test.liteinst_strict_on_host were retired with
     // the LiteInst host hybrid (https://github.com/rrnewton/hermit/issues/3520);
     // 42 since test.record_replay joined it; 43 since
-    // test.pmu_integration_cases joined it.
-    if expected_counts.len() != 43 {
+    // test.pmu_integration_cases joined it; 45 since
+    // test.detcore_readdir_order and its hosted twin joined it.
+    if expected_counts.len() != 45 {
         return Err(format!(
-            "Nextest expected-count registry has {} entries, expected 43",
+            "Nextest expected-count registry has {} entries, expected 45",
             expected_counts.len()
         ));
     }
@@ -2858,8 +2872,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // hosted twin, liteinst.strict and super.liteinst_python3_verify_diagnostics
     // were retired with the LiteInst host hybrid
     // (https://github.com/rrnewton/hermit/issues/3520), and 69 with
-    // test.record_replay, and 70 with test.pmu_integration_cases.
-    if actual_group_counts != [70, 56, 7, 2] {
+    // test.record_replay, and 70 with test.pmu_integration_cases, and 72
+    // with test.detcore_readdir_order and its hosted twin.
+    if actual_group_counts != [72, 56, 7, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -3855,9 +3870,11 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // check.script_unit_tests that carries the longer hosted wall (433 + 1).
     // 435 with test.pmu_integration_cases, which runs the 25
     // external_signal_interrupt ptrace cases that need the PMU timer (434 + 1).
-    if cfg.steps.len() != 435 {
+    // 437 when test.detcore_readdir_order and its hosted twin were enrolled
+    // (435 + 2).
+    if cfg.steps.len() != 437 {
         return Err(format!(
-            "superset has {} steps, expected 435",
+            "superset has {} steps, expected 437",
             cfg.steps.len()
         ));
     }
@@ -5682,6 +5699,8 @@ sys.exit(37)
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let selected =
             select_steps_by_labels(&committed, &[HOSTED_PORTABLE_LABEL.to_string()]).unwrap();
+        // 68 since test.detcore_readdir_order_on_host was enrolled, when the
+        // readdir_order tests left tests_misc for their own binary;
         // 67 since test.liteinst_strict_on_host was retired with the LiteInst
         // host hybrid (https://github.com/rrnewton/hermit/issues/3520);
         // 68 since test.detcore_time_on_host was enrolled;
@@ -5701,7 +5720,7 @@ sys.exit(37)
         // 255 since the five selftest.<name> nodes left gate.manifest
         // (https://github.com/rrnewton/hermit/issues/3381); 250 since
         // test.dbt_parity_on_host was retired (slice S13); 251 before.
-        assert_eq!(selected.steps.len(), 67);
+        assert_eq!(selected.steps.len(), 68);
         let legacy_variants = [
             "test.cli_on_host",
             "test.hermit_modes_on_host",
@@ -5727,6 +5746,7 @@ sys.exit(37)
             "command_strict_verify",
             "detcore_misc",
             "detcore_parallel",
+            "detcore_readdir_order",
             "detcore_time",
             "detcore_unit",
             "envelope_levels",
@@ -5758,6 +5778,8 @@ sys.exit(37)
             "lint.clippy_on_host".into(),
             "check.script_unit_tests_on_host".into(),
         ]);
+        // 24 since test.detcore_readdir_order_on_host was enrolled, when the
+        // readdir_order tests left tests_misc for their own binary;
         // 23 since check.script_unit_tests_on_host took the hosted lane's copy
         // of check.script_unit_tests, with its longer hosted wall;
         // 22 since test.liteinst_strict_on_host was retired with the LiteInst
@@ -5775,7 +5797,7 @@ sys.exit(37)
         // change of 2026-09-30 retired build.liteinst_runtime_release_on_host
         // and moved check.dbt_runtime_abi into the pinned root, which gave it
         // the hosted twin check.dbt_runtime_abi_on_host.
-        assert_eq!(new_variants.len(), 23);
+        assert_eq!(new_variants.len(), 24);
         let mut expected = legacy_variants
             .map(str::to_string)
             .into_iter()
@@ -5908,6 +5930,10 @@ sys.exit(37)
             .retain(|label| label != HOSTED_PORTABLE_LABEL);
         let error = assert_invariants(&planted_coverage_loss, &cells).unwrap_err();
         assert!(
+            // 67 = the 68 hosted-portable direct steps since
+            // test.detcore_readdir_order_on_host was enrolled, when the
+            // readdir_order tests left tests_misc for their own binary, minus
+            // the one planted loss;
             // 66 = the 67 hosted-portable direct steps since
             // test.liteinst_strict_on_host was retired with the LiteInst host
             // hybrid (https://github.com/rrnewton/hermit/issues/3520), minus
@@ -5931,7 +5957,7 @@ sys.exit(37)
             // selftest.scorecard_commands split from selftest.scorecard,
             // https://github.com/rrnewton/hermit/issues/3381), minus the one
             // planted loss.
-            error.contains("hosted-portable label has 66 direct steps"),
+            error.contains("hosted-portable label has 67 direct steps"),
             "{error}"
         );
     }
@@ -6281,6 +6307,7 @@ sys.exit(37)
                     "test.command_strict_verify",
                     "test.detcore_misc",
                     "test.detcore_parallel",
+                    "test.detcore_readdir_order",
                     "test.detcore_time",
                     "test.detcore_unit",
                     "test.hermit_integration",
@@ -6328,8 +6355,10 @@ sys.exit(37)
         // privileged-test.pmu_detcore_time_cases did) - 22 replaced + 19
         // full-buck-e2e nodes (18, and 86 in all, before e2e.buck_stage).
         // 88 since test.pmu_integration_cases joined full (91 full
-        // nodes).
-        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 88);
+        // nodes). 89 since test.detcore_readdir_order joined full (92 full
+        // nodes), when the readdir_order tests left tests_misc for their own
+        // binary.
+        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 89);
 
         fn twin(cfg: &mut DagConfig) -> &mut Step {
             cfg.steps
