@@ -3645,9 +3645,15 @@ fn run_liteinst_rejects_an_inert_dso_before_dispatch() {
 /// and SaBRe Detcore runtimes, and a packaged resource is consulted before the
 /// Cargo artifact directory.
 ///
-/// The installation is a directory holding a link to (or copy of) this test's
-/// Hermit and an `rsrcs/` directory, the layout a dereferenced copy of
-/// `target/install_pkg` has. Nothing else can supply the runtime there: no
+/// The installation is a directory holding a copy of this test's Hermit and an
+/// `rsrcs/` directory, the layout a dereferenced copy of `target/install_pkg`
+/// has. It is a copy and never a hard link: a link adds a name to the inode of
+/// the Cargo-built Hermit, which changes its ctime and link count, and the
+/// validation runner refuses a prepared test input whose metadata moves while
+/// it hashes it, so another node starting at that moment failed with "prepared
+/// input changed while hashing ... nlink 2 -> 3". The test checks that the
+/// Cargo-built Hermit's inode is untouched at the end. Nothing else can supply
+/// the runtime there: no
 /// `libdetcore_liteinst.so` sits beside that Hermit, and
 /// `HERMIT_LITEINST_TOOL_RUNTIME` and `HERMIT_INSTALL_DIR` are removed. So the
 /// run fails while `rsrcs/` is empty, which is the control, and succeeds in-guest
@@ -3657,19 +3663,30 @@ fn run_liteinst_rejects_an_inert_dso_before_dispatch() {
 #[test]
 #[cfg(feature = "liteinst")]
 fn run_liteinst_finds_the_runtime_staged_as_an_installed_resource() {
+    use std::os::unix::fs::MetadataExt;
+
     let _guard = hermit_run_guard();
-    let link_or_copy = |source: &Path, destination: &Path| {
-        if fs::hard_link(source, destination).is_err() {
-            fs::copy(source, destination).unwrap_or_else(|error| {
-                panic!(
-                    "failed to copy {} to {}: {error}",
-                    source.display(),
-                    destination.display()
-                )
-            });
-        }
+    let copy = |source: &Path, destination: &Path| {
+        fs::copy(source, destination).unwrap_or_else(|error| {
+            panic!(
+                "failed to copy {} to {}: {error}",
+                source.display(),
+                destination.display()
+            )
+        });
     };
     let built = Path::new(env!("CARGO_BIN_EXE_hermit"));
+    let inode_state = |path: &Path| {
+        let metadata = fs::metadata(path)
+            .unwrap_or_else(|error| panic!("failed to stat {}: {error}", path.display()));
+        (
+            metadata.ino(),
+            metadata.nlink(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        )
+    };
+    let built_before = inode_state(built);
     let runtime = built
         .parent()
         .expect("the Cargo-built Hermit has a profile directory")
@@ -3682,7 +3699,7 @@ fn run_liteinst_finds_the_runtime_staged_as_an_installed_resource() {
     let install = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("failed to create the installation directory");
     let installed_hermit = install.path().join("hermit");
-    link_or_copy(built, &installed_hermit);
+    copy(built, &installed_hermit);
     let resources = install.path().join("rsrcs");
     fs::create_dir(&resources).expect("failed to create the rsrcs directory");
 
@@ -3719,7 +3736,7 @@ fn run_liteinst_finds_the_runtime_staged_as_an_installed_resource() {
         "the guest ran without a runtime: {missing:?}"
     );
 
-    link_or_copy(&runtime, &resources.join("libdetcore_liteinst.so"));
+    copy(&runtime, &resources.join("libdetcore_liteinst.so"));
     let installed = run_installed();
     assert_success(&installed, &args);
     assert_eq!(stdout(&installed), "installed-liteinst-ok\n");
@@ -3749,6 +3766,13 @@ fn run_liteinst_finds_the_runtime_staged_as_an_installed_resource() {
     assert!(
         stderr.contains("does not register detcore_liteinst_initialize as a preload constructor"),
         "the packaged runtime must be consulted before the one beside Hermit: {stderr}"
+    );
+    assert_eq!(
+        inode_state(built),
+        built_before,
+        "staging the installation changed the inode of {} (inode, link count, ctime); \
+         other validation nodes hash that file as a prepared input",
+        built.display()
     );
 }
 
