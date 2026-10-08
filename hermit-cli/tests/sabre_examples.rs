@@ -827,9 +827,15 @@ fn sabre_verify_survives_a_guest_dup_onto_the_forwarding_socket() {
     let Some(loader) = sabre_loader() else {
         return;
     };
+    // -I -B: the guest must not depend on state its first run leaves behind.
+    // A writable bytecode cache (PYTHONPYCACHEPREFIX, which the hosted
+    // validation sets) made run 1 compile and write the standard library's .pyc
+    // files and run 2 read them: different syscalls, a failed comparison, and
+    // a 45 s kill on the hosted runner. Isolated mode ignores PYTHON* variables
+    // and -B writes no bytecode, so both runs see the same files.
     let run = verify_run(
         Some(&loader),
-        &["/usr/bin/python3", "-c", GUEST],
+        &["/usr/bin/python3", "-I", "-B", "-c", GUEST],
         "SaBRe python3 dup2 onto 1024..1039",
     );
     assert_eq!(String::from_utf8_lossy(&run.output.stdout), "alive\n");

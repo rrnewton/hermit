@@ -16368,7 +16368,10 @@ fn liteinst_in_guest_verify_survives_a_guest_stderr_without_a_reader() {
         print('alive', flush=True)\n";
 
     let _lock = hermit_run_guard();
-    let run = liteinst_verify_with_forwarded_records(&["/usr/bin/python3", "-c", GUEST]);
+    // -I -B, as in sabre_examples' python3 guest: a writable bytecode cache
+    // (PYTHONPYCACHEPREFIX) would make the two verify runs differ.
+    let run =
+        liteinst_verify_with_forwarded_records(&["/usr/bin/python3", "-I", "-B", "-c", GUEST]);
     assert_eq!(run.stdout, "alive\n");
     assert!(run.syscall_records > 0);
 }
