@@ -515,7 +515,7 @@ fn context(source: &Path, outcomes: &[StepOutcome], run_id: &str) -> LedgerCtx {
         cache_state: "fixture-owned".into(),
         commit: git_text(source, &["rev-parse", "HEAD"]),
         tree: git_text(source, &["rev-parse", "HEAD^{tree}"]),
-        git_depth: 0,
+        git_depth: Some(0),
         git_ahead: Some(0),
         git_behind: Some(0),
         commit_anchored: false,

@@ -1274,9 +1274,9 @@ fn usage() -> &'static str {
      \x20 --verbosity N    Output level 1..5 (default 1; levels 3/4 currently equal 2;\n\
      \x20                  level 5 prefixes every streamed line with test identity).\n\
      \x20 --skip-inner-dirty-working-tree-and-rebase-freshness-checks\n\
-     \x20                  Skip only scripts/validate.rs's dirty-working-tree and\n\
-     \x20                  rebase-freshness checks; does not bypass ci-hub validate-lock\n\
-     \x20                  admission. AGENTS SHOULD NOT USE THIS.\n\
+     \x20                  Skip only scripts/validate.rs's dirty-working-tree check (base\n\
+     \x20                  freshness is checked by ci-hub validate-lock admission, which\n\
+     \x20                  this does not bypass). AGENTS SHOULD NOT USE THIS.\n\
      \x20 --label-pr       Publish a receipt and label the PR after a full green (default).\n\
      \x20 --no-label-pr    Disable the non-fatal receipt publication and label update.\n\
      \x20 --ignore-cache   Force a real run even on a tree-keyed cache hit.\n\
@@ -4864,7 +4864,6 @@ fn self_test() -> Result<(), String> {
     host_capability_bracket(&root)?;
     coverage_schema_bracket()?;
     cell_results_schema_bracket()?;
-    rebase_freshness_message_bracket()?;
     test_node_coverage_bracket()?;
     typed_libtest_count_bracket()?;
     ledger_gate_origin_bracket()?;
@@ -5551,7 +5550,7 @@ fn inner_freshness_skip_cli_bracket() -> Result<(), String> {
     })?;
     if !parsed.skip_inner_dirty_working_tree_and_rebase_freshness_checks {
         return Err(format!(
-            "inner freshness skip: {} did not select the two inner checks",
+            "inner freshness skip: {} did not select the inner dirty-tree check",
             SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_OPTION
         ));
     }
@@ -5560,9 +5559,9 @@ fn inner_freshness_skip_cli_bracket() -> Result<(), String> {
     for required in [
         SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_OPTION,
         SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_ENV,
-        "Skip only scripts/validate.rs's dirty-working-tree and",
-        "rebase-freshness checks; does not bypass ci-hub validate-lock",
-        "admission. AGENTS SHOULD NOT USE THIS.",
+        "Skip only scripts/validate.rs's dirty-working-tree check (base",
+        "freshness is checked by ci-hub validate-lock admission, which",
+        "this does not bypass). AGENTS SHOULD NOT USE THIS.",
     ] {
         if !help.contains(required) {
             return Err(format!(
@@ -5578,7 +5577,7 @@ fn inner_freshness_skip_cli_bracket() -> Result<(), String> {
         }
     }
     println!(
-        "  inner freshness skip: new option accepted, old option refused, and help names only the two inner checks"
+        "  inner freshness skip: new option accepted, old option refused, and help names only the inner dirty-tree check"
     );
     Ok(())
 }
@@ -6832,7 +6831,6 @@ mod e2e_runner_tests {
         assert_eq!(buck.selection_mode, "full");
         assert!(buck.suite_complete);
         assert!(buck.committed_selection.is_some());
-        assert!(validate_plan::undeclared_nodes(&buck.cfg).is_empty());
     }
 
     /// A Buck runner's cells execute the Cargo identity's own binary:
@@ -6862,15 +6860,6 @@ fn super_plan_bracket() -> Result<(), String> {
         .map_err(|c| format!("super plan: the `super` level was REFUSED with exit {c}"))?;
     let plan = build_plan(&root, &args, &tmp)
         .map_err(|e| format!("super plan: could not build a plan: {e}"))?;
-    // Positive: the audit must ACCEPT a real, fully-declared super plan.
-    let undeclared = validate_plan::undeclared_nodes(&plan.cfg);
-    if !undeclared.is_empty() {
-        return Err(format!(
-            "super plan: {} node(s) lack declared caps: {}",
-            undeclared.len(),
-            undeclared.join(", ")
-        ));
-    }
     let tags: BTreeSet<String> = plan.cfg.steps.iter().map(|s| s.tag()).collect();
     // One representative of each expansion the table names, so a lost synthetic
     // is caught here and not at 2am in the weekly run.
@@ -6918,46 +6907,8 @@ fn super_plan_bracket() -> Result<(), String> {
     if !plan.super_mode {
         return Err("super plan: super_mode must be set so the stress table is printed".into());
     }
-    // Negative: one node with no caps must be REFUSED by the same audit.
-    let mut broken = validate_plan::config_from(
-        vec![dagrun::model::Step {
-            group: "bracket".into(),
-            job: "uncapped".into(),
-            desc: "inert fixture: declares no caps".into(),
-            description: String::new(),
-            cmd: "true".into(),
-            cmdtype: CmdType::Unknown,
-            manifest: None,
-            integration_test_binaries: None,
-            result_manifests: None,
-            labels: Vec::new(),
-            deps: vec![],
-            env: BTreeMap::new(),
-            hint: Default::default(),
-            networkonly: false,
-            engine_only: false,
-            delegated_children: false,
-            timeout: 0,
-            cpu_timeout: 0,
-            jobs_flag: None,
-            jobs_env: None,
-            skip_reason: None,
-            write_domains: None,
-            write_domain_guarantee: None,
-            explains: Vec::new(),
-            fail_fast_family: None,
-        }],
-        "caps-audit negative bracket",
-    );
-    broken.default_step_cpu_timeout = 0;
-    let refused = validate_plan::undeclared_nodes(&broken);
-    if refused != vec!["bracket.uncapped".to_string()] {
-        return Err(format!(
-            "caps audit: an uncapped node MUST be refused; the audit returned {refused:?}"
-        ));
-    }
     println!(
-        "  super plan: {} boxed node(s), all capped; caps audit bracketed 1 accept / 1 refusal",
+        "  super plan: {} boxed node(s); every expansion and stress probe present",
         plan.cfg.steps.len()
     );
     Ok(())
@@ -10587,21 +10538,16 @@ fn product_front_door_applies(
 }
 
 /// A local off-the-record run is an iteration tool, not a cheaper publication
-/// path. It therefore requires both a commit anchor and an explicitly narrowed
-/// profile. Full-cost validation and every publishable result stay in ci-hub.
-fn local_off_the_record_refusal(args: &Args, dirty: bool) -> Option<String> {
+/// path. It therefore requires an explicitly narrowed profile; full-cost
+/// validation and every publishable result stay in ci-hub. It may run on a
+/// dirty tree: it publishes nothing, and reproducing a fix before committing it
+/// is what it is for.
+fn local_off_the_record_refusal(args: &Args) -> Option<String> {
     if !args.allow_local_off_the_record_run {
         return None;
     }
     if args.show_plan {
         return None;
-    }
-    if dirty {
-        return Some(format!(
-            "validate: REFUSED — {ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION} still requires a clean, \
-             commit-anchored tree. Commit the work in progress first so this run records a SHA, \
-             then retry the narrowed command."
-        ));
     }
     if args.focused.is_none() && args.level != Level::Quick && args.selected.is_none() {
         return Some(format!(
@@ -10704,105 +10650,6 @@ fn cache_state(root: &Path) -> &'static str {
 }
 
 // --------------------------------------------------------------------------- rebase freshness
-
-/// Refuse to validate a head that is behind its upstream.
-///
-/// Owner directive: "ALWAYS rebase before validate; admission control should
-/// ERROR if the base is out of date." The reason is not tidiness: validation
-/// records exact-commit evidence, and admission requires that commit to include
-/// every `origin/main` change available when the run starts. Whether that exact
-/// evidence later authorizes a hard-green or soft-green landing is a separate
-/// decision at the landing boundary.
-///
-/// Only ERRORS when the local `origin/main` ref genuinely contains commits this
-/// head lacks. It does NOT fetch (that would make an offline run fail for a
-/// network reason) and it does not fire when the ref is absent — an unknown base
-/// is reported as unknown, never silently treated as fresh.
-fn rebase_freshness(force: bool) -> Result<String, String> {
-    if sh(
-        "git",
-        &[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            "refs/remotes/origin/main",
-        ],
-    )
-    .is_none()
-    {
-        return Ok(
-            "base: origin/main not present locally; freshness UNKNOWN (not asserted)".into(),
-        );
-    }
-    let counts = sh(
-        "git",
-        &["rev-list", "--left-right", "--count", "origin/main...HEAD"],
-    )
-    .unwrap_or_else(|| "0\t0".into());
-    let mut it = counts.split_whitespace();
-    let behind: i64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let ahead: i64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-    rebase_freshness_from_counts(behind, ahead, force)
-}
-
-fn rebase_freshness_from_counts(behind: i64, ahead: i64, force: bool) -> Result<String, String> {
-    if behind == 0 {
-        return Ok(format!(
-            "base: up to date with origin/main (ahead {ahead}, behind 0)"
-        ));
-    }
-    let msg = format!(
-        "HEAD is {behind} commit(s) BEHIND origin/main (ahead {ahead}).\n  \
-         Validation records exact-commit evidence. Admission requires HEAD to include every \
-         origin/main change available when the run starts; hard-green or soft-green landing \
-         authorization is decided separately at the landing boundary.\n  \
-         Rebase first:  git rebase origin/main\n  \
-         To skip only scripts/validate.rs's dirty-working-tree and rebase-freshness checks, pass \
-         --skip-inner-dirty-working-tree-and-rebase-freshness-checks. This does not bypass \
-         ci-hub validate-lock admission."
-    );
-    if force {
-        Ok(format!(
-            "base: STALE, {behind} behind origin/main — forced past the freshness gate"
-        ))
-    } else {
-        Err(msg)
-    }
-}
-
-fn rebase_freshness_message_bracket() -> Result<(), String> {
-    let refusal = rebase_freshness_from_counts(1, 2, false)
-        .expect_err("a stale base must still be refused at admission");
-    for required in [
-        "HEAD is 1 commit(s) BEHIND origin/main (ahead 2)",
-        "Validation records exact-commit evidence",
-        "hard-green or soft-green landing authorization is decided separately",
-        "Rebase first",
-    ] {
-        if !refusal.contains(required) {
-            return Err(format!(
-                "rebase freshness: stale-base refusal omitted {required:?}: {refusal}"
-            ));
-        }
-    }
-    for false_claim in ["cannot authorize a landing", "will have to be rebuilt"] {
-        if refusal.contains(false_claim) {
-            return Err(format!(
-                "rebase freshness: stale-base refusal retained false landing claim {false_claim:?}"
-            ));
-        }
-    }
-    let forced = rebase_freshness_from_counts(1, 2, true)?;
-    if !forced.contains("base: STALE, 1 behind origin/main") {
-        return Err(format!(
-            "rebase freshness: explicit force did not retain its stale-base warning: {forced}"
-        ));
-    }
-    println!(
-        "  rebase freshness: stale admission still refuses; exact-commit evidence is separate from hard-green or soft-green landing authorization"
-    );
-    Ok(())
-}
 
 // --------------------------------------------------------------------------- plan
 
@@ -20498,7 +20345,7 @@ struct LedgerCtx {
     cache_state: String,
     commit: String,
     tree: String,
-    git_depth: u64,
+    git_depth: Option<u64>,
     git_ahead: Option<i64>,
     git_behind: Option<i64>,
     commit_anchored: bool,
@@ -21250,20 +21097,15 @@ fn product_front_door_bracket() -> Result<(), String> {
         "test.cli".into(),
     ])
     .map_err(|code| format!("off-the-record focused form did not parse: exit {code}"))?;
-    if focused.label_pr
-        || local_off_the_record_refusal(&focused, false).is_some()
-        || !local_off_the_record_refusal(&focused, true)
-            .is_some_and(|message| message.contains("Commit the work in progress first"))
-    {
+    if focused.label_pr || local_off_the_record_refusal(&focused).is_some() {
         return Err(
-            "off-the-record focused form did not disable publication or enforce a clean commit"
-                .into(),
+            "off-the-record focused form did not disable publication or was refused".into(),
         );
     }
 
     let full = parse_argv(&[ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into(), "full".into()])
         .map_err(|code| format!("off-the-record full form did not parse: exit {code}"))?;
-    let full_refusal = local_off_the_record_refusal(&full, false)
+    let full_refusal = local_off_the_record_refusal(&full)
         .ok_or_else(|| "off-the-record full run was not refused".to_string())?;
     if !full_refusal.contains("full-cost validate belongs in ci-hub")
         || !full_refusal.contains("--only portable test.cli")
@@ -21275,13 +21117,13 @@ fn product_front_door_bracket() -> Result<(), String> {
 
     let quick = parse_argv(&[ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into(), "quick".into()])
         .map_err(|code| format!("off-the-record quick form did not parse: exit {code}"))?;
-    if local_off_the_record_refusal(&quick, false).is_some() {
+    if local_off_the_record_refusal(&quick).is_some() {
         return Err("off-the-record quick run was incorrectly refused".into());
     }
 
     println!(
-        "  product front door: publishing requires authority; clean quick/focused local iteration \
-         is off the record; dirty/full local forms and diagnostics bracketed"
+        "  product front door: publishing requires authority; quick/focused local iteration \
+         is off the record; full local forms and diagnostics bracketed"
     );
     Ok(())
 }
@@ -26441,7 +26283,7 @@ fn run(
     }
 
     if args.allow_local_off_the_record_run {
-        if let Some(refusal) = local_off_the_record_refusal(&args, tree_dirty()) {
+        if let Some(refusal) = local_off_the_record_refusal(&args) {
             eprintln!("{refusal}");
             return RunSummary::refused(
                 2,
@@ -26659,7 +26501,8 @@ fn run(
         dirty_worktree_requires_refusal(
             nesting.nested,
             dirtiness.worktree,
-            args.skip_inner_dirty_working_tree_and_rebase_freshness_checks,
+            args.skip_inner_dirty_working_tree_and_rebase_freshness_checks
+                || args.allow_local_off_the_record_run,
         )
     }) {
         eprintln!("validate: refusing to run on a dirty working tree.");
@@ -26691,9 +26534,10 @@ fn run(
         );
     }
 
-    // Rebase-freshness gate. Mechanically enforced, not advisory. A nested
-    // payload inherits the outer run's verdict on the very same checkout; it also
-    // must not spend a network round trip inside a budgeted DAG node.
+    // Base freshness is ci-hub validate-lock's admission check: an admitted run
+    // verifies its immutable admitted floor here. An unadmitted run (off the
+    // record, or outside dev-hermit) publishes no evidence, so its base is not
+    // asserted.
     let freshness = match admitted_context.as_ref() {
         Some(proof) => proof.verify_source(&root).map(|()| {
             format!(
@@ -26702,12 +26546,7 @@ fn run(
                 proof.floor().tree
             )
         }),
-        None => rebase_freshness(
-            args.skip_inner_dirty_working_tree_and_rebase_freshness_checks
-                || nesting.nested
-                || args.write_constructed_dag.is_some()
-                || args.write_generated_plan.is_some(),
-        ),
+        None => Ok("base: not admitted, so freshness is not asserted".to_string()),
     };
     match freshness {
         Ok(msg) => eprintln!("validate: {msg}"),
@@ -27015,24 +26854,26 @@ fn run(
         nesting.nested,
         args.allow_local_off_the_record_run,
     ) {
+        // The evidence plan is part of what can make this run a receipt, which
+        // ci-hub's qualifying-receipt predicate decides; failing to capture it
+        // is reported, not a reason to skip the tests.
         match validate_evidence::SelectedEvidence::capture(&root, &plan) {
             Ok(selected) => Some(selected),
             Err(error) => {
-                return RunSummary::refused(
-                    2,
-                    &plan.profile,
-                    "constructed evidence plan",
-                    vec![error],
+                eprintln!(
+                    "validate: WARNING: cannot capture the constructed evidence plan: {error}; \
+                     this run cannot be a schema-10 receipt"
                 );
+                None
             }
         }
     } else {
         None
     };
 
-    // Fail-closed caps audit. A node without declared caps would run UNBOXED
-    // while the driver still printed "boxing ACTIVE" — a green verifying less
-    // than it claims. Refuse rather than run.
+    // Every committed node's declared caps (timeout, cpu_timeout, a memory hint)
+    // are checked where the committed graph is made, by
+    // `generate-validation-dag --check` (validation_dag::assert_declared_caps).
     // FAIL CLOSED on capacity that can never be granted. A step demanding a
     // resource the config does not cap is unschedulable forever, and the
     // scheduler expresses that as an infinite 50 ms sleep, not an error --
@@ -27060,73 +26901,10 @@ fn run(
             .collect(),
         );
     }
-    let mut undeclared = validate_plan::undeclared_nodes(&plan.cfg);
-    if let Some(second) = &plan.second {
-        undeclared.extend(validate_plan::undeclared_nodes(second));
-    }
-    if !undeclared.is_empty() {
-        eprintln!(
-            "validate: ERROR: {} node(s) lack declared resource caps and would run UNBOXED: {}",
-            undeclared.len(),
-            undeclared.join(", ")
-        );
-        eprintln!(
-            "  Declare timeout + cpu_timeout + a memory hint for each; see scripts/lib/validate_plan.rs."
-        );
-        return RunSummary::refused(
-            3,
-            &plan.profile,
-            "the declared-caps audit",
-            vec![
-                format!(
-                    "{} node(s) would run UNBOXED while the driver claimed boxing was active: {}",
-                    undeclared.len(),
-                    undeclared.join(", ")
-                ),
-                "declare timeout + cpu_timeout + a memory hint for each; see \
-                 scripts/lib/validate_plan.rs"
-                    .into(),
-            ],
-        );
-    }
-
-    // The whole-run budget is the first boundary able to stop cumulative cost
-    // while preserving evidence. Per-node caps cannot bound a sequence of legal
-    // nodes, and the hosted job kill discards the diagnostic tail.
-    // Refuse an inverted ladder for every execution. A node with an allowance
-    // at least as large as the run budget can only be cut by the less-specific
-    // outer clock, losing attribution to the node. `--show-plan` has no run
-    // deadline and executes nothing, so an inherited execution budget is not
-    // applicable to its raw, pre-wrapping plan. An explicit `--run-timeout`
-    // still asks to audit that prospective ladder.
+    // A node whose wall budget is at least the whole-run budget is refused by
+    // dagrun's own scheduler pre-flight (`steps_violating_run_timeout`), which
+    // names the node; validate does not check the same inversion first.
     if let Some(secs) = run_timeout {
-        let mut bad = steps_violating_run_timeout(&plan.cfg, secs);
-        if let Some(second) = &plan.second {
-            bad.extend(steps_violating_run_timeout(second, secs));
-        }
-        if !bad.is_empty() {
-            bad.sort();
-            bad.dedup();
-            return RunSummary::refused(
-                3,
-                &plan.profile,
-                "whole-run budget is not larger than every node budget",
-                std::iter::once(format!(
-                    "{} node(s) declare a wall budget >= the {secs}s whole-run budget:",
-                    bad.len()
-                ))
-                .chain(capped_refusal_items(
-                    bad.iter()
-                        .map(|(tag, t)| format!("  {tag} ({t}s)"))
-                        .collect(),
-                ))
-                .chain(std::iter::once(
-                    "lower the named node budgets so each can diagnose itself before the whole-run boundary"
-                        .to_string(),
-                ))
-                .collect(),
-            );
-        }
         // The scheduler is handed only what preparation left. Say how much that
         // was, so a refusal that names a node budget also shows where the time
         // went (https://github.com/rrnewton/hermit/issues/3896).
@@ -27487,19 +27265,13 @@ fn run(
     }
 
     let commit = git_sha();
+    // One ledger field is not a reason to refuse a run: an unmeasurable depth
+    // is recorded as null (unknown), never invented.
     let git_depth = match measure_git_depth(&commit) {
-        Ok(depth) => depth,
+        Ok(depth) => Some(depth),
         Err(error) => {
-            return RunSummary::refused(
-                2,
-                &plan.profile,
-                "git depth measurement",
-                vec![
-                    error,
-                    "the schema requires a real git_depth; refusing instead of omitting it or inventing a value"
-                        .into(),
-                ],
-            )
+            eprintln!("validate: WARNING: git depth is unknown and recorded as null: {error}");
+            None
         }
     };
     if admitted_context.is_some() && verified_state_root.is_none() {
@@ -27571,12 +27343,11 @@ fn run(
             match retained {
                 Ok(evidence) => Some(evidence),
                 Err(error) => {
-                    return RunSummary::refused(
-                        4,
-                        &plan.profile,
-                        "constructed evidence publication",
-                        vec![error],
+                    eprintln!(
+                        "validate: WARNING: cannot publish the constructed evidence plan: {error}; \
+                         this run cannot be a schema-10 receipt"
                     );
+                    None
                 }
             }
         }
@@ -27599,31 +27370,29 @@ fn run(
     // BURNED CPU between two samples. A running peak is kept for the whole run
     // because a point-in-time probe misses a peer that starts and ends in the
     // middle.
+    //
+    // An admitted run's exclusivity is already proved by its validate-lock
+    // ancestry. A registry failure therefore does not refuse the run: it is
+    // reported, and the run's peer count is recorded as unknown (null) rather
+    // than as a measured zero.
     let registry = validate_runtime::registry_dir(parent.as_deref());
+    let mut registered = !nesting.nested;
     let run_record = if nesting.nested {
         None
     } else {
         match validate_runtime::register_run(&registry, &plan.profile, &root) {
             Ok(record) => Some(record),
             Err(error) => {
-                let _ = std::fs::remove_dir_all(&tmp);
-                let mut summary = RunSummary::refused(
-                    COULD_NOT_RUN_EXIT_CODE,
-                    &plan.profile,
-                    "box-wide live-run registration",
-                    vec![
-                        error,
-                        "concurrency accounting is required evidence; refusing rather than \
-                         running unregistered and reporting zero peers"
-                            .into(),
-                    ],
+                eprintln!(
+                    "validate: WARNING: box-wide live-run registration failed: {error}; this \
+                     run's concurrent-validate count is recorded as unknown"
                 );
-                summary.log = Some(log_path.clone());
-                return summary;
+                registered = false;
+                None
             }
         }
     };
-    let monitor = if nesting.nested {
+    let monitor = if !registered {
         None
     } else {
         Some(validate_runtime::ConcurrencyMonitor::start(
@@ -28816,19 +28585,13 @@ fn stop_test_seam(
     ];
 
     let commit = git_sha();
+    // One ledger field is not a reason to refuse a run: an unmeasurable depth
+    // is recorded as null (unknown), never invented.
     let git_depth = match measure_git_depth(&commit) {
-        Ok(depth) => depth,
+        Ok(depth) => Some(depth),
         Err(error) => {
-            return RunSummary::refused(
-                2,
-                profile,
-                "git depth measurement",
-                vec![
-                    error,
-                    "the schema requires a real git_depth; refusing instead of omitting it or inventing a value"
-                        .into(),
-                ],
-            )
+            eprintln!("validate: WARNING: git depth is unknown and recorded as null: {error}");
+            None
         }
     };
 
@@ -32909,7 +32672,7 @@ with (root/'calls.jsonl').open('a') as out:
             cache_state: "cold".into(),
             commit,
             tree,
-            git_depth: 1,
+            git_depth: Some(1),
             git_ahead: Some(0),
             git_behind: Some(0),
             commit_anchored: true,

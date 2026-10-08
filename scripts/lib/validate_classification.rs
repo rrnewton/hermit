@@ -1308,7 +1308,7 @@ mod ledger_tests {
                 cache_state: "warm".into(),
                 commit: "535b48a113390f0084eac204b54de67dacc24f29".into(),
                 tree: "d0fc13f45eb671585d1aa26c7fcf3fdb4ca480c7".into(),
-                git_depth: 1,
+                git_depth: Some(1),
                 git_ahead: Some(0),
                 git_behind: Some(0),
                 commit_anchored: false,

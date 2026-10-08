@@ -418,11 +418,11 @@ to justify accepting something arbitrarily stale is citing half a rule.
 That block is about a Reverie pin, but the property it names is general.
 
 Two things it does not say, and both are separate questions rather than extra
-conditions on landing. Validation ADMISSION has the opposite answer:
-`scripts/validate.rs` refuses to start a run whose head is behind `origin/main`,
-because a run must measure a commit that includes everything available when it
-starts. And a REVIEW attestation binds an exact sha, so a head move leaves an
-approval bound to the older one. Neither makes an earlier commit's validation
+conditions on landing. Validation ADMISSION has the opposite answer: the
+dev-hermit parent's `ci-hub validate-lock` refuses to admit a run whose head is
+behind `origin/main`, because a run must measure a commit that includes
+everything available when it starts. And a REVIEW attestation binds an exact
+sha, so a head move leaves an approval bound to the older one. Neither makes an earlier commit's validation
 evidence unusable at the landing boundary.
 
 ## A gate nobody can pass is a defect, not a high standard

@@ -3526,6 +3526,36 @@ fn critical_path_wall_seconds(cfg: &DagConfig) -> Result<i64, String> {
         .ok_or_else(|| "selected graph is empty".to_string())
 }
 
+/// Every committed node declares a wall timeout, a CPU budget (its own or the
+/// config default) and a memory cap. A node without them would run unboxed
+/// while scripts/validate.rs printed "cgroup boxing ACTIVE": a green that
+/// verified less than it claimed. Checked here, where the committed graph is
+/// made, rather than again at the start of every validation run.
+fn assert_declared_caps(cfg: &DagConfig) -> Result<(), String> {
+    let undeclared: Vec<String> = cfg
+        .steps
+        .iter()
+        .filter(|step| {
+            let memory =
+                step.hint.hard_mem_max_bytes.is_some() || step.hint.rss_baseline_bytes.is_some();
+            let cpu = step.cpu_timeout > 0 || cfg.default_step_cpu_timeout > 0;
+            let wall = step.timeout > 0;
+            !(memory && cpu && wall)
+        })
+        .map(Step::tag)
+        .collect();
+    if undeclared.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} node(s) lack declared resource caps (timeout, cpu_timeout and a memory hint) \
+             and would run unboxed: {}",
+            undeclared.len(),
+            undeclared.join(", ")
+        ))
+    }
+}
+
 fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String> {
     // Backend parity is a scored comparison, not a gate
     // (https://github.com/rrnewton/hermit/issues/3301). No newly constructed
@@ -3543,6 +3573,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
             step.tag()
         ));
     }
+    assert_declared_caps(cfg)?;
     assert_structured_result_producers(cfg)?;
     crate::nextest_build_selections::assert_preparation_dependencies(cfg)?;
     crate::nextest_build_selections::assert_producers_build_the_unified_selection(cfg)?;
@@ -5890,6 +5921,34 @@ sys.exit(37)
     /// preparation on one development host: 65 s and 134 s typically, 734 s at
     /// worst (https://github.com/rrnewton/hermit/issues/3896).
     const PREPARATION_RESERVE_S: i64 = 1200;
+
+    #[test]
+    fn every_committed_node_declares_its_caps_and_an_uncapped_one_is_refused() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        assert_declared_caps(&committed).unwrap();
+        for (what, edit) in [
+            (
+                "wall",
+                &(|step: &mut Step| step.timeout = 0) as &dyn Fn(&mut Step),
+            ),
+            ("memory", &|step: &mut Step| {
+                step.hint.hard_mem_max_bytes = None;
+                step.hint.rss_baseline_bytes = None;
+            }),
+        ] {
+            let mut broken = committed.clone();
+            edit(&mut broken.steps[0]);
+            let error = assert_declared_caps(&broken).unwrap_err();
+            assert!(
+                error.contains(&broken.steps[0].tag()) && error.contains("would run unboxed"),
+                "{what}: {error}"
+            );
+        }
+        let mut no_cpu = committed.clone();
+        no_cpu.default_step_cpu_timeout = 0;
+        no_cpu.steps[0].cpu_timeout = 0;
+        assert!(assert_declared_caps(&no_cpu).is_err());
+    }
 
     #[test]
     fn committed_selections_survive_a_slow_preparation() {

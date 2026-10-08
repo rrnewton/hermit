@@ -36,7 +36,8 @@
 //! and failed the run. Boxing works; it just has to be asked for.
 //!
 //! So every committed node declares `timeout`, `cpu_timeout`, and a memory
-//! hint, and [`undeclared_nodes`] is the fail-closed audit that keeps it true.
+//! hint, and `generate-validation-dag --check` (`validation_dag::assert_declared_caps`)
+//! is the fail-closed audit that keeps it true.
 //! The committed graph deliberately has no global CPU fallback: the generator
 //! records each measured or inherited node budget explicitly, including the
 //! hosted-privileged repair that replaced the retired graph's unusable implicit
@@ -926,26 +927,4 @@ pub fn ungrantable_resources(cfg: &DagConfig) -> Vec<String> {
         }
     }
     bad
-}
-
-/// Fail-closed audit: every node in a plan must declare a wall timeout, a CPU
-/// budget (its own or the config default), and a memory cap.
-///
-/// This is the guard that keeps the module doc's claim true as nodes are added.
-/// Without it, a future node added without hints would run UNBOXED while the
-/// driver still printed "cgroup boxing ACTIVE" — a green that verified less than
-/// it claimed, which is precisely the failure class this port exists to remove.
-///
-/// Returns the tags of any nodes that are not fully declared.
-pub fn undeclared_nodes(cfg: &DagConfig) -> Vec<String> {
-    cfg.steps
-        .iter()
-        .filter(|s| {
-            let mem = s.hint.hard_mem_max_bytes.is_some() || s.hint.rss_baseline_bytes.is_some();
-            let cpu = s.cpu_timeout > 0 || cfg.default_step_cpu_timeout > 0;
-            let wall = s.timeout > 0;
-            !(mem && cpu && wall)
-        })
-        .map(|s| s.tag())
-        .collect()
 }
