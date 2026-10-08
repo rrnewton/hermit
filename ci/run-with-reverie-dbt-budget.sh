@@ -1199,7 +1199,15 @@ fi
 # reverie-dbt, the root Cargo.toml, third-party or rust-toolchain.toml changes,
 # so the four budget inputs are unchanged. Carry, not recalibration: no new
 # timing sample or >=5-sample replacement claim is made.
-expected_pin=87e2b5c47febd685ed3ee746e47255bb6461958e
+# CARRY TO f906ff204c3cd30ef93910123c92fcf456ea0613 (2026-10-08): from
+# 87e2b5c47febd685ed3ee746e47255bb6461958e. The sixteen commits change reverie-inguest,
+# reverie-liteinst, reverie-memory and reverie-ptrace only (in-guest runtime
+# start-up kept out of the guest's C heap and off interposable libc wrappers,
+# with new tests); no file under reverie-dbt, the root Cargo.toml, third-party
+# or rust-toolchain.toml changes, so the four budget inputs are unchanged.
+# Carry, not recalibration: no new timing sample or >=5-sample replacement
+# claim is made.
+expected_pin=f906ff204c3cd30ef93910123c92fcf456ea0613
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
