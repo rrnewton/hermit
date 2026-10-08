@@ -873,9 +873,11 @@ pub struct RunOpts {
     /// kinds are enforced only when the guest runs under the ptrace runtime
     /// (the default, or `--backend=e9patch`): with `--namespace-only` or
     /// another backend, the run is refused before the guest starts (exit 122)
-    /// rather than run with the ordering ignored. A spec that does not load is
-    /// refused the same way. Combine with `--hb-list-events` to preview how the
-    /// spec resolves against the binary.
+    /// rather than run with the ordering ignored. A spec the user must fix
+    /// (missing, unreadable, not valid JSON, not a valid program) is refused the
+    /// same way; any other failure to read it, such as EIO, is a Hermit failure
+    /// (exit 125). Combine with `--hb-list-events` to preview how the spec
+    /// resolves against the binary.
     #[clap(long, value_name = "filepath")]
     happens_before: Option<PathBuf>,
 
@@ -2082,6 +2084,8 @@ fn happens_before_spec_load_errors_are_refusals_except_host_read_failures() {
         not_utf8,
         dir.path().join("missing.json"),
         dir.path().to_path_buf(),
+        // ENOTDIR: a path through a regular file.
+        dir.path().join("bad.json").join("spec.json"),
     ] {
         let error = RunOpts::load_happens_before_spec(&path).expect_err("must not load");
         assert!(
@@ -6267,9 +6271,10 @@ impl RunOpts {
 
     /// Load a `--happens-before` spec for a run or for `--hb-list-events`.
     ///
-    /// A spec that is missing, unreadable for permission, a directory, not UTF-8,
-    /// not valid JSON or not a valid program (`nth: 0`, `fd` on the wrong syscall,
-    /// ...) is the user's to fix: a policy refusal, exit 122
+    /// A spec that is missing (including a path through a non-directory),
+    /// unreadable for permission, a directory, not UTF-8, not valid JSON or not
+    /// a valid program (`nth: 0`, `fd` on the wrong syscall, ...) is the user's
+    /// to fix: a policy refusal, exit 122
     /// (https://github.com/rrnewton/hermit/issues/3943). Any other failure to read
     /// it (`EIO`, ...) is not the user's, and stays a Hermit failure, exit 125.
     fn load_happens_before_spec(path: &Path) -> Result<HappensBeforeProgram, Error> {
@@ -6280,6 +6285,7 @@ impl RunOpts {
                     std::io::ErrorKind::NotFound
                         | std::io::ErrorKind::PermissionDenied
                         | std::io::ErrorKind::IsADirectory
+                        | std::io::ErrorKind::NotADirectory
                         | std::io::ErrorKind::InvalidData
                 )
             });
