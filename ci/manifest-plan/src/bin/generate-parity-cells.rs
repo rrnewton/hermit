@@ -18,9 +18,9 @@ use hermit_manifest_plan::validation_dag::repo_root;
 fn usage() -> &'static str {
     "Usage: generate-parity-cells [--check | --write]\n\
      Derive every cross-backend parity cell (each manifest test's verify mode on\n\
-     kvm, liteinst, sabre and dbt, against ptrace) and the parity population\n\
-     (every test whose ptrace verify cell full validation selects, on every\n\
-     candidate backend) from tests/e2e/manifests, and compare it with, or write\n\
+     kvm, liteinst, in-guest-trap, sabre and dbt, against ptrace) and the parity\n\
+     population (every test whose ptrace verify cell full validation selects,\n\
+     on every candidate backend) from tests/e2e/manifests, and compare it with, or write\n\
      it to, ci/compat-envelope/parity-cells.json.\n\
      --check is the default. It refuses a stale snapshot and prints the counts."
 }

@@ -62,6 +62,7 @@ use super::process_build_root;
 static LITEINST_ADVANCED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static USERFAULTFD_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static CONSTRUCTOR_MUTATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static EXIT_REAPING_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static UNSCHEDULED_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DUP_ALIAS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1588,6 +1589,331 @@ fn liteinst_in_guest_dispatch_record_reports_patched_sites() {
     assert!(candidates > 0, "{record}");
 }
 
+/// The line Hermit prints when it runs the guest under `--backend=in-guest-trap`
+/// (`RunOpts::main` in `hermit-cli/src/bin/hermit/run.rs`).
+const IN_GUEST_TRAP_SELECTED: &str = "hermit: [in-guest-trap] selected: the guest preload is to \
+     host the Detcore Tool, with syscall site patching off (REVERIE_LITEINST_SITE_PATCHING=0)";
+
+/// `--backend=in-guest-trap` is in-guest LiteInst with syscall site patching
+/// off, which Hermit sets itself: its dispatch record, named `in-guest-trap`,
+/// reports no site considered for patching and none patched, and every
+/// dispatch arrives as an in-guest `SIGSYS` trap rather than a patched direct
+/// call. The same guest under `--backend=liteinst`, with no variable
+/// set by the caller in either run, patches sites: that control shows the
+/// count can see patching, so the zero is the backend's doing.
+#[test]
+fn in_guest_trap_dispatch_record_reports_no_patched_sites() {
+    let _guard = hermit_run_guard();
+    let guest = dispatch_stats::build_guest("guest-in-guest-trap", &[]);
+    let record = dispatch_stats::dispatch_record(
+        "in-guest-trap",
+        hermit_binary(),
+        &["--max-timeslice=disabled"],
+        &[],
+        &guest,
+    );
+    assert_eq!(record.sites.patched, Some(0), "{record}");
+    // With patching off the runtime makes no patch decision, so it records no
+    // candidate either.
+    assert_eq!(record.sites.candidates, Some(0), "{record}");
+    assert_eq!(record.counters.patched_direct_calls, Some(0), "{record}");
+    assert!(
+        record
+            .counters
+            .signal_traps
+            .is_some_and(|traps| traps >= dispatch_stats::GUEST_SYSCALLS),
+        "{record}"
+    );
+
+    let control = dispatch_stats::dispatch_record(
+        "liteinst",
+        hermit_binary(),
+        &["--max-timeslice=disabled"],
+        &[],
+        &guest,
+    );
+    assert!(
+        control.sites.patched.is_some_and(|patched| patched > 0),
+        "liteinst patched nothing, so a zero proves nothing about in-guest-trap: {control}"
+    );
+}
+
+/// A real program verifies deterministically under `--backend=in-guest-trap`:
+/// `--verify --verify-strict` matches with canonical bitwise parity over
+/// nonzero INFO messages, and both runs' dispatch records report no syscall
+/// site patched.
+#[test]
+fn in_guest_trap_verifies_a_program_with_no_site_patched() {
+    let _guard = hermit_run_guard();
+    let report_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report_path = report_dir.path().join("verify.json");
+    let listed = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/common");
+    let output = Command::new(hermit_binary())
+        .args(["--log=info", "--backend", "in-guest-trap", "run"])
+        .args([
+            "--max-timeslice=disabled",
+            "--strict",
+            "--base-env=minimal",
+            "--verify",
+            "--verify-strict",
+        ])
+        .arg(format!("--verify-json={}", report_path.display()))
+        .arg("--")
+        .args(["/bin/ls", "-1"])
+        .arg(&listed)
+        .env_remove("RUST_LOG")
+        .env_remove("HERMIT_LOG")
+        .env_remove("HERMIT_LOG_FILE")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run Hermit in-guest-trap");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "status={:?}\nstdout={}\nstderr={stderr}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+    );
+    assert!(
+        stderr.lines().any(|line| line == IN_GUEST_TRAP_SELECTED),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(IN_GUEST_SELECTED), "{stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line == "liteinst_in_guest_programs.rs"),
+        "{stdout}"
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report_path).expect("--verify-json report")).unwrap();
+    assert!(
+        report["verified"] == true
+            && report["bitwise_parity"] == true
+            && report["verdict"] == "matched"
+            && report["comparison"]["strictness"] == "canonical"
+            && report["comparison"]["compare_logs"] == true,
+        "{report}"
+    );
+    let messages = &report["compared_log_messages"];
+    assert!(
+        messages["left"].as_u64().is_some_and(|left| left > 0)
+            && messages["left"] == messages["right"],
+        "{report}"
+    );
+    for run in ["run1", "run2"] {
+        let dispatch = &report["runtime"][run]["dispatch"];
+        assert_eq!(dispatch["backend"], "in-guest-trap", "{run}: {report}");
+        assert_eq!(dispatch["sites"]["patched"], 0, "{run}: {report}");
+        assert_eq!(
+            dispatch["counters"]["patched_direct_calls"], 0,
+            "{run}: {report}"
+        );
+    }
+}
+
+/// Hermit, not the caller, decides site patching under `--backend=in-guest-trap`:
+/// the guest sees `REVERIE_LITEINST_SITE_PATCHING=0` though nobody set it, a
+/// caller value of `0` is accepted, and any other value is refused before the
+/// guest starts (exit 122) with a message that names the value and the two
+/// ways out.
+#[test]
+fn in_guest_trap_sets_site_patching_off_and_refuses_a_caller_who_turns_it_on() {
+    let _guard = hermit_run_guard();
+    let run = |env: Option<&str>| {
+        let mut command = Command::new(hermit_binary());
+        command
+            .args(["--log=info", "--backend", "in-guest-trap", "run"])
+            .args(["--max-timeslice=disabled", "--strict", "--base-env=minimal"]);
+        if let Some(value) = env {
+            command.arg(format!("--env=REVERIE_LITEINST_SITE_PATCHING={value}"));
+        }
+        command
+            // A shell builtin prints the guest's value: no exec, and bash is
+            // one of the pinned root's declared guest programs.
+            .args([
+                "--",
+                "/usr/bin/bash",
+                "-c",
+                "printf '%s\\n' \"${REVERIE_LITEINST_SITE_PATCHING-unset}\"",
+            ])
+            .env_remove("REVERIE_LITEINST_SITE_PATCHING")
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run Hermit in-guest-trap")
+    };
+    for env in [None, Some("0")] {
+        let output = run(env);
+        assert!(
+            output.status.success(),
+            "{env:?}: status={:?}\nstderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "0\n", "{env:?}");
+    }
+    let refused = run(Some("1"));
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(
+        refused.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "stderr={stderr}"
+    );
+    assert!(refused.stdout.is_empty(), "the guest ran: {refused:?}");
+    assert!(
+        stderr.contains(
+            "--backend=in-guest-trap (in-guest LiteInst, site patching off) refuses this run: \
+             the guest environment sets REVERIE_LITEINST_SITE_PATCHING=1,"
+        ),
+        "{stderr}"
+    );
+    assert!(stderr.contains("select --backend=liteinst"), "{stderr}");
+}
+
+/// The program of `hermit-cli/tests/fixtures/in_guest_trap_constructor_main.c`,
+/// linked against the shared library of
+/// `in_guest_trap_constructor_lib.c`, whose constructor changes the in-guest
+/// runtime's site-patching switch before the runtime's constructor runs.
+fn constructor_mutation_guest() -> &'static Path {
+    CONSTRUCTOR_MUTATION_GUEST.get_or_init(|| {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let build_root = process_build_root("in-guest-trap-constructor");
+        fs::create_dir_all(&build_root).expect("failed to create the fixture directory");
+        let library = build_root.join("libin_guest_trap_constructor.so");
+        let compiled = Command::new("cc")
+            .args(["-O2", "-Wall", "-Wextra", "-Werror", "-shared", "-fPIC"])
+            .arg(fixtures.join("in_guest_trap_constructor_lib.c"))
+            .arg("-o")
+            .arg(&library)
+            .output()
+            .expect("failed to compile the constructor library");
+        assert!(compiled.status.success(), "{compiled:?}");
+        let guest = build_root.join("in_guest_trap_constructor");
+        let linked = Command::new("cc")
+            .args(["-O2", "-Wall", "-Wextra", "-Werror"])
+            .arg(fixtures.join("in_guest_trap_constructor_main.c"))
+            .arg(&library)
+            .arg(format!("-Wl,-rpath,{}", build_root.display()))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to link the constructor guest");
+        assert!(linked.status.success(), "{linked:?}");
+        guest
+    })
+}
+
+fn run_constructor_mutation_guest(backend: &str, mode: &str) -> Output {
+    Command::new(hermit_binary())
+        // Quiet, so the guest's refusal message is not interleaved with
+        // Detcore's own records on the same stderr.
+        .args(["--log=error", "--backend", backend, "run"])
+        .args(["--max-timeslice=disabled", "--strict", "--base-env=minimal"])
+        .arg(format!("--env=IN_GUEST_TRAP_FIXTURE_CONSTRUCTOR={mode}"))
+        .arg("--")
+        .arg(constructor_mutation_guest())
+        .env_remove("REVERIE_LITEINST_SITE_PATCHING")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run Hermit")
+}
+
+/// A shared library's constructor runs before the in-guest runtime's and can
+/// change the runtime's settings, which the runtime reads from the
+/// environment while it installs. Under `--backend=in-guest-trap` each Tool
+/// image compares the settings the runtime actually captured
+/// (`reverie_liteinst::site_patching_enabled` and `guest_stats_enabled`) with
+/// the host's request, which arrives over the coordinator connection, and
+/// refuses to run the program when they differ. Refused before `main`, each
+/// with its message: a constructor that sets REVERIE_LITEINST_SITE_PATCHING=1;
+/// one that removes it (which turns patching on); one that sets it to 1 while
+/// the library's interposed `mprotect` sets it back to 0 during the runtime's
+/// installation, after the runtime read 1 (a check of the environment at the
+/// Tool's construction would see 0 and accept); and one that removes the
+/// statistics variable. The coordinator then refuses each run too (exit 122):
+/// for the sites the image's runtime patched, or because no process reported
+/// statistics. Controls: the constructor leaving everything alone runs under
+/// in-guest-trap; under liteinst, which patches by design, the restoring
+/// constructor reaches `main` and shows its `mprotect` put the variable back
+/// to 0 during startup.
+#[test]
+fn in_guest_trap_refuses_a_guest_library_that_turns_site_patching_back_on() {
+    let _guard = hermit_run_guard();
+    const PATCHING: &str = "detcore-liteinst: initialization failed: --backend=in-guest-trap runs \
+         with syscall site patching off, but the in-guest runtime installed this process with \
+         site patching on";
+    const NO_STATS: &str = "detcore-liteinst: initialization failed: --backend=in-guest-trap \
+         needs every process's syscall site statistics, but the in-guest runtime installed this \
+         process without collecting them";
+    for (mode, image_refusal, run_refusal) in [
+        ("set", PATCHING, "its guests' LiteInst statistics report "),
+        ("unset", PATCHING, "its guests' LiteInst statistics report "),
+        (
+            "set-then-restore",
+            PATCHING,
+            "its guests' LiteInst statistics report ",
+        ),
+        (
+            "no-stats",
+            NO_STATS,
+            "no guest process reported LiteInst statistics",
+        ),
+    ] {
+        let output = run_constructor_mutation_guest("in-guest-trap", mode);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // The image refuses from its constructor (exit 127, as every in-guest
+        // initialization refusal does), and the coordinator's postcondition
+        // refuses the run as well: the typed in-guest refusal, exit 122.
+        assert_eq!(
+            output.status.code(),
+            Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+            "{mode}: {output:?}"
+        );
+        assert!(
+            !stdout.contains("main ran"),
+            "{mode}: the program ran: {stdout}"
+        );
+        assert!(stderr.contains(image_refusal), "{mode}: {stderr}");
+        assert!(
+            stderr.contains("run this program with --backend=liteinst"),
+            "{mode}: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!(
+                "--backend=in-guest-trap (in-guest LiteInst, site patching off) refuses this \
+                 run: {run_refusal}"
+            )),
+            "{mode}: {stderr}"
+        );
+        assert!(
+            stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+            "{mode}: {stderr}"
+        );
+    }
+
+    let control = run_constructor_mutation_guest("in-guest-trap", "none");
+    assert!(control.status.success(), "{control:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&control.stdout),
+        "main ran; constructor none; restored 0; REVERIE_LITEINST_SITE_PATCHING=0\n"
+    );
+    let restored = run_constructor_mutation_guest("liteinst", "set-then-restore");
+    assert!(restored.status.success(), "{restored:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&restored.stdout),
+        "main ran; constructor set-then-restore; restored 1; REVERIE_LITEINST_SITE_PATCHING=0\n"
+    );
+    let liteinst = run_constructor_mutation_guest("liteinst", "set");
+    assert!(liteinst.status.success(), "{liteinst:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&liteinst.stdout),
+        "main ran; constructor set; restored 0; REVERIE_LITEINST_SITE_PATCHING=1\n"
+    );
+}
+
 fn userfaultfd_guest() -> &'static Path {
     USERFAULTFD_GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1701,8 +2027,8 @@ fn liteinst_in_guest_refuses_a_guest_that_opens_dev_fuse() {
     );
     assert!(
         stderr.contains(
-            "--backend=liteinst (in-guest LiteInst) cannot run this program; run it with \
-             --backend=ptrace."
+            "in-guest LiteInst (--backend=liteinst or --backend=in-guest-trap) cannot run \
+             this program; run it with --backend=ptrace."
         ),
         "{stderr}"
     );

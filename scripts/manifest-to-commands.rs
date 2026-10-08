@@ -64,7 +64,7 @@ use timeouts::MAX_TIMEOUT_SECONDS;
 use timeouts::MIN_TIMEOUT_SECONDS;
 use timeouts::resolve_timeout_seconds;
 
-const HERMIT_BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
+const HERMIT_BACKENDS: [&str; 6] = ["ptrace", "dbt", "kvm", "sabre", "liteinst", "in-guest-trap"];
 const NAKED_BACKENDS: [&str; 1] = ["native"];
 const RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=\"$cell/tmp\" E2E_FIXTURE_DIR=\"$cell/fixtures\"";
 const HERMIT_RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=/tmp/hermit-e2e E2E_FIXTURE_DIR=\"$cell/fixtures\"";
@@ -1124,7 +1124,7 @@ test:
         let error = guest_args_json_lines(&tests).expect_err("unknown backend must be rejected");
         assert_eq!(
             error,
-            "c-programs/unknown-backend: modes.verify.guest_args.ptrcae names unknown backend for this mode; expected one of [\"ptrace\", \"dbt\", \"kvm\", \"sabre\", \"liteinst\"]"
+            "c-programs/unknown-backend: modes.verify.guest_args.ptrcae names unknown backend for this mode; expected one of [\"ptrace\", \"dbt\", \"kvm\", \"sabre\", \"liteinst\", \"in-guest-trap\"]"
         );
     }
 
@@ -1165,7 +1165,7 @@ test:
         );
         assert_eq!(
             guest_args_json_lines(&normal).expect_err("native must be rejected outside naked mode"),
-            "c-programs/native-args: modes.verify.guest_args.native names unknown backend for this mode; expected one of [\"ptrace\", \"dbt\", \"kvm\", \"sabre\", \"liteinst\"]"
+            "c-programs/native-args: modes.verify.guest_args.native names unknown backend for this mode; expected one of [\"ptrace\", \"dbt\", \"kvm\", \"sabre\", \"liteinst\", \"in-guest-trap\"]"
         );
     }
 

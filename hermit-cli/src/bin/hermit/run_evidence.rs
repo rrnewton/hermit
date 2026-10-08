@@ -198,7 +198,7 @@ impl RunEvidenceSession {
             .and_then(|status| guest_disposition(self.backend, *status));
         let unsupported = !matches!(
             self.backend,
-            Backend::Ptrace | Backend::Liteinst | Backend::Kvm
+            Backend::Ptrace | Backend::Liteinst | Backend::InGuestTrap | Backend::Kvm
         );
 
         let (outcome, canonical_info) = if unsupported {
@@ -644,6 +644,7 @@ fn report_backend(backend: Backend) -> RunEvidenceBackend {
         Backend::Ptrace => RunEvidenceBackend::Ptrace,
         Backend::Dbt => RunEvidenceBackend::Dbt,
         Backend::Liteinst => RunEvidenceBackend::Liteinst,
+        Backend::InGuestTrap => RunEvidenceBackend::InGuestTrap,
         Backend::Sabre => RunEvidenceBackend::Sabre,
         Backend::Kvm => RunEvidenceBackend::Kvm,
         Backend::E9patch => RunEvidenceBackend::E9patch,
@@ -1224,7 +1225,12 @@ mod tests {
             assert_eq!(status.code(), Some(observed));
             let status = ExitStatus::from_raw(status.into_raw());
             assert_eq!(status, ExitStatus::Exited(observed));
-            for backend in [Backend::Ptrace, Backend::Liteinst, Backend::Kvm] {
+            for backend in [
+                Backend::Ptrace,
+                Backend::Liteinst,
+                Backend::InGuestTrap,
+                Backend::Kvm,
+            ] {
                 let destination = parent.path().join(format!("{backend:?}-{argument}"));
                 let session = RunEvidenceSession::create(&destination, backend).unwrap();
                 write_valid_log(&session);
@@ -1242,7 +1248,12 @@ mod tests {
             }
         }
         for code in [i32::MIN, -1, 256, i32::MAX] {
-            for backend in [Backend::Ptrace, Backend::Liteinst, Backend::Kvm] {
+            for backend in [
+                Backend::Ptrace,
+                Backend::Liteinst,
+                Backend::InGuestTrap,
+                Backend::Kvm,
+            ] {
                 assert_eq!(guest_disposition(backend, ExitStatus::Exited(code)), None);
                 let destination = parent.path().join(format!("invalid-{backend:?}-{code}"));
                 let session = RunEvidenceSession::create(&destination, backend).unwrap();

@@ -49,7 +49,7 @@ inventory does not silently imply support.
 Compatibility coverage enters through these shared schema-v3 manifests, not
 through a backend-owned guest list. Every test declares all five modes, and
 every non-naked mode partitions the complete `ptrace`, `dbt`, `kvm`, `sabre`,
-and `liteinst` axis into enabled cells and explicit gaps. Any active mode must
+`liteinst` and `in-guest-trap` axis into enabled cells and explicit gaps. Any active mode must
 include ptrace so the reference behavior is established before another backend
 ratchets it.
 
@@ -106,8 +106,9 @@ command. Program extensions select the runner:
 tables: `verify`, `chaos`, `replay`, `naked`, and `custom`. Each table has a
 `backends_enabled` list and a `backends_disabled` table. The two must form a
 complete, disjoint partition and every disabled backend needs a nonempty WHY.
-For non-naked modes the axis is `ptrace`, `dbt`, `kvm`, `sabre`, and
-`liteinst`; naked partitions only `native`.
+For non-naked modes the axis is `ptrace`, `dbt`, `kvm`, `sabre`, `liteinst`,
+and `in-guest-trap` (in-guest LiteInst with syscall site patching off, a
+column of its own); naked partitions only `native`.
 
 ```yaml
 test:
@@ -121,6 +122,7 @@ test:
           kvm: KVM requires the privileged runner
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its compatibility partition
+          in-guest-trap: in-guest-trap coverage is tracked apart from liteinst
 ```
 
 
@@ -186,8 +188,8 @@ strings, which the parity post-pass requires before it reports a
 comparison's `credit` rather than its `unequalized_credit`
 (<https://github.com/rrnewton/hermit/issues/3301>). The parity population is
 the verify matrix itself, with no selection file: every test whose ptrace
-`verify` cell full validation selects, on every candidate backend (dbt, kvm,
-liteinst and sabre). A candidate whose `verify` cell is disabled, not selected,
+`verify` cell full validation selects, on every candidate backend (dbt,
+in-guest-trap, kvm, liteinst and sabre). A candidate whose `verify` cell is disabled, not selected,
 red or missing scores 0 and is counted; only a test whose ptrace run left no
 golden is left out, and counted apart. `ci/compat-envelope/parity-cells.json`
 snapshots it. A guest in any other mode
@@ -263,7 +265,7 @@ exporter look up the requested backend's arguments exactly, without inheriting
 another backend's arguments; an omitted backend receives no guest arguments.
 The exporter uses JSON Lines so empty strings, tabs, newlines, and explicitly
 empty vectors retain their exact argument boundaries.
-The only valid backend for `naked` is `native`; other modes accept only the five
+The only valid backend for `naked` is `native`; other modes accept only the six
 Hermit backends.
 
 A verify cell whose guest ends unsuccessfully on purpose declares exactly how it

@@ -150,10 +150,10 @@
       "e2e_backends": ["sabre"]
     },
     {
-      "_why": "The in-guest LiteInst runtime (the detcore-liteinst cdylib) is preloaded at run time by the cli binary's in-guest LiteInst tests, a dependency Cargo's graph does not show.",
+      "_why": "The in-guest LiteInst runtime (the detcore-liteinst cdylib) is preloaded at run time by the cli binary's in-guest LiteInst tests and by every liteinst and in-guest-trap guest, a dependency Cargo's graph does not show.",
       "packages": ["detcore-liteinst"],
       "nodes": ["test.cli_on_host"],
-      "e2e_backends": ["liteinst"]
+      "e2e_backends": ["liteinst", "in-guest-trap"]
     },
     {
       "_why": "Flaky guest binaries feed the chaos and determinism-stress manifest buckets.",

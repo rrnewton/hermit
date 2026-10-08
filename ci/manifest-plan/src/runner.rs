@@ -104,7 +104,7 @@ use crate::timeouts::resolve_timeout_seconds;
 use crate::timeouts::timeout_multipliers_from_env;
 use crate::timeouts::validate_timeout_seconds;
 
-const BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
+const BACKENDS: [&str; 6] = ["ptrace", "dbt", "kvm", "sabre", "liteinst", "in-guest-trap"];
 const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
 const CELL_CPU_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CELL_CPU_ACCOUNTING_GRACE: Duration = Duration::from_secs(1);
@@ -4811,7 +4811,7 @@ fn current_verification_report(bytes: &[u8]) -> Result<VerificationReport, Strin
 }
 
 /// Backends whose every completed run must carry a dispatch record.
-const DISPATCH_RECORD_BACKENDS: [&str; 3] = ["ptrace", "liteinst", "sabre"];
+const DISPATCH_RECORD_BACKENDS: [&str; 4] = ["ptrace", "liteinst", "in-guest-trap", "sabre"];
 
 /// Why a passing verify report's runtime does not carry each run's dispatch
 /// record for `backend`, or `None` when it does.
@@ -4819,18 +4819,43 @@ const DISPATCH_RECORD_BACKENDS: [&str; 3] = ["ptrace", "liteinst", "sabre"];
 /// Only a run whose summary was read is checked: a report without runtime has
 /// nothing to carry the record in. KVM and DBT have no record, and native runs
 /// no backend, so they are not checked.
+///
+/// `in-guest-trap` is held to more. Its pass claims that both executions ran
+/// with syscall site patching off, and only the dispatch records show that, so
+/// the report must carry the runtime, both runs' summaries and both records,
+/// and each record must report no syscall site patched and none considered
+/// for patching, and must have measured something: every syscall of a run
+/// with patching off reaches the Tool as an in-guest `SIGSYS`, so a record
+/// with no signal trap is the empty record of a run whose guests collected no
+/// statistics, whose zeros are not measurements. And otherwise: a patched site (a guest that turned patching back on, or a
+/// Hermit that stopped forcing it off) makes the cell's result a liteinst
+/// result under the wrong name, and missing evidence cannot rule that out.
 fn dispatch_record_error(backend: &str, runtime: Option<&VerificationRuntime>) -> Option<String> {
     if !DISPATCH_RECORD_BACKENDS.contains(&backend) {
         return None;
     }
-    let runtime = runtime?;
+    let requires_every_run = backend == "in-guest-trap";
+    let Some(runtime) = runtime else {
+        return requires_every_run.then(|| {
+            "verification report carries no runtime, so it cannot show that both in-guest-trap \
+             runs patched no syscall site"
+                .to_owned()
+        });
+    };
     [
         ("run1", runtime.run1.as_ref()),
         ("run2", runtime.run2.as_ref()),
     ]
     .into_iter()
-    .filter_map(|(run, stats)| Some((run, stats?)))
     .find_map(|(run, stats)| {
+        let Some(stats) = stats else {
+            return requires_every_run.then(|| {
+                format!(
+                    "verification runtime.{run} is missing, so it cannot show that this \
+                     in-guest-trap run patched no syscall site"
+                )
+            });
+        };
         let Some(record) = &stats.dispatch else {
             return Some(format!(
                 "verification runtime.{run} carries no {backend} dispatch record"
@@ -4843,10 +4868,31 @@ fn dispatch_record_error(backend: &str, runtime: Option<&VerificationRuntime>) -
             ));
         }
         let inconsistencies = record.inconsistencies();
-        (!inconsistencies.is_empty()).then(|| {
-            format!(
+        if !inconsistencies.is_empty() {
+            return Some(format!(
                 "verification runtime.{run} dispatch record is inconsistent: {}",
                 inconsistencies.join("; ")
+            ));
+        }
+        let shown = |count: Option<u64>| {
+            count.map_or_else(|| "unmeasured".to_owned(), |count| count.to_string())
+        };
+        if requires_every_run && record.counters.signal_traps.is_none_or(|traps| traps == 0) {
+            return Some(format!(
+                "verification runtime.{run} in-guest-trap dispatch record counts {} signal \
+                 traps, so its guests measured nothing and its zero patched sites are not a \
+                 measurement",
+                shown(record.counters.signal_traps)
+            ));
+        }
+        (requires_every_run
+            && (record.sites.patched != Some(0) || record.sites.candidates != Some(0)))
+        .then(|| {
+            format!(
+                "verification runtime.{run} in-guest-trap dispatch record reports {} patched \
+                 and {} candidate syscall sites, expected 0 and 0",
+                shown(record.sites.patched),
+                shown(record.sites.candidates)
             )
         })
     })
@@ -8975,6 +9021,7 @@ mod tests {
             ("kvm".into(), "not qualified".into()),
             ("sabre".into(), "not qualified".into()),
             ("liteinst".into(), "not qualified".into()),
+            ("in-guest-trap".into(), "not qualified".into()),
         ]);
         let mode = ModeRecipe {
             ci: CiSelectionSpec::Uniform(ci),
@@ -9237,7 +9284,7 @@ mod tests {
                 let backends: &[&str] = if mode == "naked" {
                     &["native"]
                 } else {
-                    &["ptrace", "dbt", "kvm", "sabre", "liteinst"]
+                    &["ptrace", "dbt", "kvm", "sabre", "liteinst", "in-guest-trap"]
                 };
                 test.modes.insert(
                     mode.into(),
@@ -9874,6 +9921,136 @@ mod tests {
         );
         assert_eq!(dispatch_record_error("ptrace", None), None);
         assert!(dispatch_record_error("sabre", historical.runtime.as_ref()).is_some());
+    }
+
+    /// An in-guest-trap run must patch no syscall site: a passing report whose
+    /// dispatch record names in-guest-trap and reports a patched site is
+    /// refused, and the same record under liteinst, which patches by design,
+    /// is not.
+    #[test]
+    fn an_in_guest_trap_dispatch_record_must_report_no_patched_site() {
+        let record = |backend: &str, patched: u64| {
+            let mut record = ptrace_dispatch_record();
+            record.backend = backend.into();
+            record.counters.ptrace_seccomp_stops = Some(0);
+            record.counters.signal_traps = Some(40);
+            record.sites.candidates = Some(patched);
+            record.sites.patched = Some(patched);
+            record
+        };
+        let report = |backend: &str, run2_patched: u64| {
+            let mut report: VerificationReport =
+                serde_json::from_str(PRODUCER_STRIPPED_REPORT).unwrap();
+            let runtime = report.runtime.as_mut().unwrap();
+            runtime.run1.as_mut().unwrap().dispatch = Some(record(backend, 0));
+            runtime.run2.as_mut().unwrap().dispatch = Some(record(backend, run2_patched));
+            report
+        };
+        assert_eq!(
+            dispatch_record_error("in-guest-trap", report("in-guest-trap", 0).runtime.as_ref()),
+            None
+        );
+        let error =
+            dispatch_record_error("in-guest-trap", report("in-guest-trap", 3).runtime.as_ref())
+                .expect("a patched site under in-guest-trap is refused");
+        assert!(
+            error.contains("runtime.run2 in-guest-trap dispatch record reports 3 patched"),
+            "{error}"
+        );
+        // Missing or partial evidence cannot show zero patched sites.
+        assert!(
+            dispatch_record_error("in-guest-trap", None)
+                .is_some_and(|error| error.contains("carries no runtime"))
+        );
+        for missing in ["run1", "run2"] {
+            let mut partial = report("in-guest-trap", 0);
+            let runtime = partial.runtime.as_mut().unwrap();
+            if missing == "run1" {
+                runtime.run1 = None;
+            } else {
+                runtime.run2 = None;
+            }
+            let error = dispatch_record_error("in-guest-trap", partial.runtime.as_ref())
+                .unwrap_or_else(|| panic!("a report without {missing} was accepted"));
+            assert!(
+                error.contains(&format!("runtime.{missing} is missing")),
+                "{error}"
+            );
+            let mut no_record = report("in-guest-trap", 0);
+            let runtime = no_record.runtime.as_mut().unwrap();
+            let stats = if missing == "run1" {
+                runtime.run1.as_mut()
+            } else {
+                runtime.run2.as_mut()
+            };
+            stats.unwrap().dispatch = None;
+            let error = dispatch_record_error("in-guest-trap", no_record.runtime.as_ref())
+                .unwrap_or_else(|| panic!("a {missing} without a dispatch record was accepted"));
+            assert!(
+                error.contains(&format!(
+                    "runtime.{missing} carries no in-guest-trap dispatch record"
+                )),
+                "{error}"
+            );
+        }
+        // A candidate without a patch is evidence of patching too.
+        let mut candidate = report("in-guest-trap", 0);
+        let record = candidate
+            .runtime
+            .as_mut()
+            .unwrap()
+            .run1
+            .as_mut()
+            .unwrap()
+            .dispatch
+            .as_mut()
+            .unwrap();
+        record.sites.candidates = Some(1);
+        record.sites.fell_back = Some(1);
+        assert!(
+            dispatch_record_error("in-guest-trap", candidate.runtime.as_ref())
+                .is_some_and(|error| error.contains("0 patched and 1 candidate"))
+        );
+        // An empty record, as from guests whose statistics were suppressed,
+        // measured nothing.
+        let mut empty = report("in-guest-trap", 0);
+        empty
+            .runtime
+            .as_mut()
+            .unwrap()
+            .run2
+            .as_mut()
+            .unwrap()
+            .dispatch
+            .as_mut()
+            .unwrap()
+            .counters
+            .signal_traps = Some(0);
+        assert!(
+            dispatch_record_error("in-guest-trap", empty.runtime.as_ref()).is_some_and(|error| {
+                error.contains(
+                    "runtime.run2 in-guest-trap dispatch record \
+                     counts 0 signal traps",
+                )
+            })
+        );
+        // The other backends keep their leniency for absent evidence.
+        assert_eq!(dispatch_record_error("liteinst", None), None);
+        let mut liteinst_partial = report("liteinst", 0);
+        liteinst_partial.runtime.as_mut().unwrap().run2 = None;
+        assert_eq!(
+            dispatch_record_error("liteinst", liteinst_partial.runtime.as_ref()),
+            None
+        );
+        // A liteinst record under the in-guest-trap name is refused by name.
+        assert!(
+            dispatch_record_error("in-guest-trap", report("liteinst", 0).runtime.as_ref())
+                .is_some_and(|error| error.contains("names backend liteinst"))
+        );
+        assert_eq!(
+            dispatch_record_error("liteinst", report("liteinst", 3).runtime.as_ref()),
+            None
+        );
     }
 
     #[test]
@@ -14608,6 +14785,7 @@ backends_disabled:
   dbt: unsupported
   kvm: unsupported
   sabre: unsupported
+  in-guest-trap: unsupported
 "#,
         )
         .unwrap();

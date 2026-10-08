@@ -431,11 +431,14 @@ impl Subcommand {
                  `analyze` and `bisect`, do not preprocess their guest"
             );
         }
-        if backend == Some(hermit::Backend::Liteinst) && !matches!(self, Subcommand::Run(_)) {
+        if let Some(backend) = backend.filter(|backend| backend.is_in_guest_liteinst())
+            && !matches!(self, Subcommand::Run(_))
+        {
             anyhow::bail!(
                 "the LiteInst preload backend is available only through `hermit --backend \
-                 liteinst run`; other subcommands, including `analyze` and `bisect`, do not \
-                 use the preload runtime"
+                 {backend} run`; other subcommands, including `analyze` and `bisect`, do not \
+                 use the preload runtime",
+                backend = backend.as_str()
             );
         }
         if backend == Some(hermit::Backend::Kvm)
@@ -1953,6 +1956,31 @@ mod tests {
             .validate_backend_scope(Some(Backend::Liteinst))
             .unwrap_err();
         assert!(error.to_string().contains("only through"));
+    }
+
+    #[test]
+    fn in_guest_trap_is_rejected_outside_run() {
+        use hermit::Backend;
+
+        let args = Args::try_parse_from([
+            "hermit",
+            "--backend",
+            "in-guest-trap",
+            "record",
+            "list",
+            "--json",
+        ])
+        .unwrap();
+        let error = args
+            .command
+            .validate_backend_scope(Some(Backend::InGuestTrap))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("only through `hermit --backend in-guest-trap run`"),
+            "{error}"
+        );
     }
 
     #[test]

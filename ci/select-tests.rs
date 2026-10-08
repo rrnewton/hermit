@@ -630,7 +630,8 @@ fn derive_run_plan(sel: &Selection, shards: &Shards, plan: &Plan, dag: &Dag) -> 
     for c in &cells {
         match c.backend.as_str() {
             "dbt" | "sabre" => build_dbt = true,
-            "liteinst" => build_aux = true,
+            // in-guest-trap runs the same in-guest LiteInst runtime.
+            "liteinst" | "in-guest-trap" => build_aux = true,
             _ => {}
         }
     }

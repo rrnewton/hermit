@@ -237,13 +237,19 @@ pub const HOSTED_PORTABLE_EXCLUDED_BACKENDS: &[&str] = &["kvm"];
 /// `/dev/fuse` refusal) failed with the same error. The FUSE plain-file case
 /// starts the same runtime; that run reported it passed only because the
 /// runner has no FUSE mount, so it returned before launching anything, and on
-/// a runner with one it would fail the same way. Only `test.cli_on_host`
+/// a runner with one it would fail the same way. The four `in_guest_trap_`
+/// cases run guests under the same runtime with site patching off
+/// (`--backend=in-guest-trap`). Only `test.cli_on_host`
 /// excludes them, with one exact-name filterset (`-E 'not (test(=NAME) |
 /// ...)'`) rather than substring `--skip`s; the local `test.cli` keeps running
 /// every one in the pinned root, and a test below holds both sides to this
 /// list.
 pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_backend_stats_report_the_guests_own_dispatch_paths",
+    "liteinst_in_guest_programs::in_guest_trap_dispatch_record_reports_no_patched_sites",
+    "liteinst_in_guest_programs::in_guest_trap_refuses_a_guest_library_that_turns_site_patching_back_on",
+    "liteinst_in_guest_programs::in_guest_trap_sets_site_patching_off_and_refuses_a_caller_who_turns_it_on",
+    "liteinst_in_guest_programs::in_guest_trap_verifies_a_program_with_no_site_patched",
     "liteinst_in_guest_programs::liteinst_in_guest_abnormal_exit_after_registration_does_not_hang",
     "liteinst_in_guest_programs::liteinst_in_guest_an_undeliverable_sigalrm_is_a_loss_and_stops_the_guest",
     "liteinst_in_guest_programs::liteinst_in_guest_close_range_releases_ports_like_ptrace",

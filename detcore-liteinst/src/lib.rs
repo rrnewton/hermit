@@ -152,8 +152,8 @@ pub unsafe extern "C" fn detcore_liteinst_initialize() {
     // Detcore's exit-dependency refusals name only the capability; this
     // backend adds its name and the alternative.
     detcore::exit_dependencies::set_backend_advice(
-        "--backend=liteinst (in-guest LiteInst) cannot run this program; run it with \
-         --backend=ptrace.",
+        "in-guest LiteInst (--backend=liteinst or --backend=in-guest-trap) cannot run this \
+         program; run it with --backend=ptrace.",
     );
     // Coord rulings A and D.1: Detcore checks every descriptor that arrives
     // later; this checks the ones the process image starts with. A forked
@@ -176,6 +176,19 @@ pub unsafe extern "C" fn detcore_liteinst_initialize() {
     // the window `install_tool` requires.
     if let Err(error) = unsafe { reverie_liteinst::install_tool::<detcore::Detcore>(socket) } {
         fail(&error.to_string());
+    }
+    // `--backend=in-guest-trap`: the Tool's constructor recorded the host's
+    // request from the coordinator's configuration; compare it with the
+    // settings the runtime actually captured while installing, which guest
+    // code cannot change afterwards, and refuse to run the program when guest
+    // code that ran before this point changed the environment they were read
+    // from. The program's own code has not run.
+    if let Some(violation) = detcore::in_guest_site_patching::violation(
+        detcore::in_guest_site_patching::site_patching_off_required(),
+        reverie_liteinst::site_patching_enabled(),
+        reverie_liteinst::guest_stats_enabled(),
+    ) {
+        fail(&violation);
     }
     // A description a fork shares is reached through the coordinator, over
     // this process's one existing connection. The first installation in a

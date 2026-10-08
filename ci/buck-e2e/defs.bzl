@@ -52,7 +52,7 @@ PINNED_ROOT_ONLY = {
     "c-programs/environment-and-workdir/verify": "asserts a fresh tmpfs workdir at /test, which cell.sh gives only pinned-root cells (elsewhere the workdir is the bound /tmp/test)",
 }
 
-# ptrace/liteinst cells that run with --max-timeslice=disabled and so never arm the PMU.
+# ptrace/liteinst/in-guest-trap cells that run with --max-timeslice=disabled and so never arm the PMU.
 PMU_FREE_CELLS = [
     "c-programs/io-uring-fallback/custom@ptrace",
     "system-utils/clock-determinism/custom@liteinst",
@@ -67,7 +67,7 @@ def cell_slug(cell):
     return "{}-{}-{}".format(cell["test"].replace("/", "-"), cell["mode"], cell["backend"])
 
 def pmu_armed(cell):
-    return cell["backend"] in ["ptrace", "liteinst"] and cell["category"] != "compat" and cell_id(cell) not in PMU_FREE_CELLS
+    return cell["backend"] in ["ptrace", "liteinst", "in-guest-trap"] and cell["category"] != "compat" and cell_id(cell) not in PMU_FREE_CELLS
 
 def _route(cell, pmu_on_re, re_exclusions, kvm_verify_tests):
     """Returns (where, reason): where is "local" or "re"."""

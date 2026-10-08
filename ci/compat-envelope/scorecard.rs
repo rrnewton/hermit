@@ -219,9 +219,10 @@ Commands:
       Check the tracked files, then require a fresh PASS row at HEAD for every
       selected regression cell in the named lanes. The default is both lanes.
       --exclude-backend omits one Hermit backend's cells (ptrace, dbt, kvm,
-      sabre, or liteinst) from the required population and reports how many
-      were omitted; it must match at least one selected cell. The hosted
-      portable profile uses it for kvm because GitHub-hosted runners have no PMU.
+      sabre, liteinst, or in-guest-trap) from the required population and
+      reports how many were omitted; it must match at least one selected
+      cell. The hosted portable profile uses it for kvm because GitHub-hosted
+      runners have no PMU.
   self-test
       Run the regression tier: exercise accepting and refusing result sets
       in process. It runs no guest, none of this tool's commands, no ledger
@@ -4110,10 +4111,11 @@ fn run() -> Result<(), String> {
                             .ok_or("--exclude-backend requires a Hermit backend")?;
                         if !matches!(
                             backend.as_str(),
-                            "ptrace" | "dbt" | "kvm" | "sabre" | "liteinst"
+                            "ptrace" | "dbt" | "kvm" | "sabre" | "liteinst" | "in-guest-trap"
                         ) {
                             return Err(format!(
-                                "--exclude-backend accepts ptrace, dbt, kvm, sabre, or liteinst; got `{backend}`"
+                                "--exclude-backend accepts ptrace, dbt, kvm, sabre, liteinst, or \
+                                 in-guest-trap; got `{backend}`"
                             ));
                         }
                         if !excluded_backends.insert(backend.clone()) {
@@ -5396,7 +5398,15 @@ fn render_scorecard(derived: &Derived) -> String {
         .iter()
         .map(|id| id.backend.as_str())
         .collect();
-    let preferred = ["ptrace", "dbt", "kvm", "sabre", "liteinst", "native"];
+    let preferred = [
+        "ptrace",
+        "dbt",
+        "kvm",
+        "sabre",
+        "liteinst",
+        "in-guest-trap",
+        "native",
+    ];
     let mut ordered = Vec::new();
     for backend in preferred {
         if backends.remove(backend) {
@@ -5588,7 +5598,10 @@ applicability facts as the table above.\n\n| Mode",
         ));
     }
     out.push_str(&format!(
-        "| **Total** | | | | | | | **{selected_total}** | **{}** | **{na_total}** | **{total}** |\n\n",
+        "| **Total** |{} **{selected_total}** | **{}** | **{na_total}** | **{total}** |\n\n",
+        // One empty cell per backend column, so the totals stay under
+        // their own headers whatever the number of backends.
+        " |".repeat(ordered.len()),
         total - selected_total - na_total
     ));
     out.push_str(
@@ -46510,6 +46523,10 @@ mod parity_summary_tests {
             [
                 "dbt: parity: not compared: 0 measured of 14 selected (inputs cannot be \
                  equalized); selected 14 of 14 committed",
+                // The run predates in-guest-trap, so its column is empty.
+                "in-guest-trap: parity: 0/0 matched; selected 0 of 0 committed; population 0: \
+                 mean n/a over 0 (0 full, 0 partial, 0 zero); excluded: 0 reference without \
+                 golden; 0 not compared; measured mean n/a over 0",
                 "kvm: parity: 0/77 matched; selected 77 of 77 committed; population 77: mean \
                  0.100 over 77 (0 full, 76 partial, 1 zero: no-result-row 1); excluded: 0 \
                  reference without golden; 0 not compared; measured mean 0.101 over 76 [inputs \

@@ -763,7 +763,7 @@ test:
       verify:
         ci: true
         backends_enabled: [ptrace]
-        backends_disabled: {dbt: Not applicable in this fixture, kvm: Not applicable in this fixture, sabre: Not applicable in this fixture, liteinst: Not applicable in this fixture}
+        backends_disabled: {dbt: Not applicable in this fixture, kvm: Not applicable in this fixture, sabre: Not applicable in this fixture, liteinst: Not applicable in this fixture, in-guest-trap: Not applicable in this fixture}
       naked:
         ci: false
         backends_enabled: []
@@ -771,15 +771,15 @@ test:
       replay:
         ci: false
         backends_enabled: []
-        backends_disabled: {ptrace: Not applicable in this fixture, dbt: Not applicable in this fixture, kvm: Not applicable in this fixture, sabre: Not applicable in this fixture, liteinst: Not applicable in this fixture}
+        backends_disabled: {ptrace: Not applicable in this fixture, dbt: Not applicable in this fixture, kvm: Not applicable in this fixture, sabre: Not applicable in this fixture, liteinst: Not applicable in this fixture, in-guest-trap: Not applicable in this fixture}
       chaos:
         ci: false
         backends_enabled: []
-        backends_disabled: {ptrace: Not applicable in this fixture, dbt: Not applicable in this fixture, kvm: Not applicable in this fixture, sabre: Not applicable in this fixture, liteinst: Not applicable in this fixture}
+        backends_disabled: {ptrace: Not applicable in this fixture, dbt: Not applicable in this fixture, kvm: Not applicable in this fixture, sabre: Not applicable in this fixture, liteinst: Not applicable in this fixture, in-guest-trap: Not applicable in this fixture}
       custom:
         ci: true
         backends_enabled: [ptrace]
-        backends_disabled: {dbt: Not applicable in this fixture, kvm: Not applicable in this fixture, sabre: Not applicable in this fixture, liteinst: Not applicable in this fixture}
+        backends_disabled: {dbt: Not applicable in this fixture, kvm: Not applicable in this fixture, sabre: Not applicable in this fixture, liteinst: Not applicable in this fixture, in-guest-trap: Not applicable in this fixture}
 "#;
 
     #[test]
@@ -835,9 +835,9 @@ test:
         // Schema 3 exports a custom cell whether or not full validation
         // selects it (schema 2 exported only selected ones, so this list was
         // empty): the enabled ptrace cell with the occasional reason and the
-        // four disabled backends with their not-applicable reasons.
+        // five disabled backends with their not-applicable reasons.
         let custom = &export.selected_by_full_custom_commands;
-        assert_eq!(custom.len(), 5);
+        assert_eq!(custom.len(), 6);
         assert!(custom.iter().all(|cell| {
             cell.test == "occasional/full-selection"
                 && cell.mode == "custom"
@@ -1006,8 +1006,8 @@ test:
                 "backends_enabled: [ptrace, sabre]\n        timeout_seconds: {ptrace: 21}\n        cpu_timeout_seconds: {ptrace: 9}\n        slow_reason: {ptrace: Explicit fixture override}",
             )
             .replace(
-                "backends_disabled: {dbt: Not applicable in this fixture, kvm: Not applicable in this fixture, sabre: Not applicable in this fixture, liteinst: Not applicable in this fixture}",
-                "backends_disabled: {dbt: Not applicable in this fixture, kvm: Not applicable in this fixture, liteinst: Not applicable in this fixture}",
+                "backends_disabled: {dbt: Not applicable in this fixture, kvm: Not applicable in this fixture, sabre: Not applicable in this fixture, liteinst: Not applicable in this fixture, in-guest-trap: Not applicable in this fixture}",
+                "backends_disabled: {dbt: Not applicable in this fixture, kvm: Not applicable in this fixture, liteinst: Not applicable in this fixture, in-guest-trap: Not applicable in this fixture}",
             );
         for inherited_wall in [15, 19] {
             let source = if inherited_wall == 15 {
@@ -1036,6 +1036,7 @@ test:
                 limits,
                 BTreeMap::from([
                     ("dbt", (inherited_wall, 7)),
+                    ("in-guest-trap", (inherited_wall, 7)),
                     ("kvm", (inherited_wall, 7)),
                     ("liteinst", (inherited_wall, 7)),
                     ("ptrace", (21, 9)),
@@ -1174,7 +1175,7 @@ test:
         for (test, modes) in per_test_modes {
             assert_eq!(
                 modes,
-                BTreeMap::from([("chaos", 5), ("naked", 1), ("replay", 5), ("verify", 5),]),
+                BTreeMap::from([("chaos", 6), ("naked", 1), ("replay", 6), ("verify", 6),]),
                 "wrong comparable matrix for {test}"
             );
         }

@@ -44,7 +44,7 @@ use serde_json::json;
 mod manifest_value;
 use manifest_value::Value;
 
-const KNOWN_BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
+const KNOWN_BACKENDS: [&str; 6] = ["ptrace", "dbt", "kvm", "sabre", "liteinst", "in-guest-trap"];
 const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
 const MATRIX_SYMMETRY_BASELINE: &str = "ci/matrix-symmetry-baseline.json";
 const CI_REASON_BASELINE: &str = "ci/ci-reason-baseline.json";
@@ -2072,6 +2072,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#;
 
     #[test]
@@ -2118,6 +2119,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#;
 
     #[test]
@@ -2202,6 +2204,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         validate_mode(
@@ -2230,6 +2233,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         validate_mode(
@@ -2257,6 +2261,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         validate_mode(
@@ -2287,6 +2292,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         validate_mode(
@@ -2318,6 +2324,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         validate_mode(
@@ -2357,6 +2364,7 @@ backends_enabled = ["ptrace"]
 dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         validate_mode(
@@ -2410,6 +2418,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         let mut rows = Vec::new();
@@ -2422,7 +2431,7 @@ liteinst = "unsupported"
             &spec,
             &mut rows,
         );
-        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.len(), KNOWN_BACKENDS.len());
         let applicable: Vec<_> = rows.iter().filter(|row| row.applicable).collect();
         assert_eq!(applicable.len(), 1);
         assert_eq!(applicable[0].backend, "ptrace");
@@ -2433,7 +2442,7 @@ liteinst = "unsupported"
             rows.iter()
                 .all(|row| row.timeout_seconds == 90 && row.attempts == Some(1))
         );
-        assert_eq!(rows.iter().filter(|row| !row.applicable).count(), 4);
+        assert_eq!(rows.iter().filter(|row| !row.applicable).count(), 5);
     }
 
     #[test]
@@ -2451,6 +2460,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         let mut rows = Vec::new();
@@ -2488,6 +2498,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         validate_mode(
@@ -2515,6 +2526,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         validate_mode(
@@ -2540,6 +2552,7 @@ workdir = "/tmp"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         validate_mode(
@@ -2569,6 +2582,7 @@ reason = "canonical comparison diverged at scheduler turn 10"
 dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         let mut rows = Vec::new();
@@ -2614,6 +2628,7 @@ reason = "x"
 dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         validate_mode(
@@ -2783,6 +2798,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         validate_mode(
@@ -2809,6 +2825,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#
         ))
     }
@@ -2883,6 +2900,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#
         ))
     }
@@ -2961,6 +2979,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         validate_mode(
@@ -2987,6 +3006,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         validate_mode(
@@ -3014,6 +3034,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 "#,
         );
         validate_mode(
@@ -3060,6 +3081,7 @@ dbt = "unsupported"
 kvm = "unsupported"
 sabre = "unsupported"
 liteinst = "unsupported"
+in-guest-trap = "unsupported"
 
 [assert]
 {assert_body}
@@ -3082,7 +3104,7 @@ liteinst = "unsupported"
         );
         let mut rows = Vec::new();
         validate_chaos(&spec, &mut rows);
-        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.len(), KNOWN_BACKENDS.len());
         assert_eq!(rows.iter().filter(|row| row.applicable).count(), 1);
         assert!(rows.iter().all(|row| row.mode == "chaos"));
     }
@@ -3095,7 +3117,7 @@ liteinst = "unsupported"
         );
         let mut rows = Vec::new();
         validate_chaos(&spec, &mut rows);
-        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.len(), KNOWN_BACKENDS.len());
         assert_eq!(rows.iter().filter(|row| row.applicable).count(), 1);
     }
 

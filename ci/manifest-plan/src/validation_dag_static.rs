@@ -890,7 +890,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1011: 1014.
     // Removed with the test-free declarations it checked (the zero-test run
     // refusal they existed to lift is gone): back to the same 1004.
-    ("test.regular_crates", 1014),
+    // runner::tests::an_in_guest_trap_dispatch_record_must_report_no_patched_site
+    // and config::tests::in_guest_site_patching_off_never_enters_the_legacy_form
+    // (`--backend=in-guest-trap`, step C4 of
+    // https://github.com/rrnewton/hermit/issues/3520) retain all 1011: 1013,
+    // listed with this node's arguments.
+    ("test.regular_crates", 1016),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1205,7 +1210,21 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/3908) retains all 998: 999,
     // listed with this node's arguments less the five skipped real_random_
     // tests.
-    ("test.hermit_unit", 999),
+    // `--backend=in-guest-trap` (step C4 of
+    // https://github.com/rrnewton/hermit/issues/3520) adds seven:
+    // tests::{in_guest_trap_is_in_guest_liteinst_and_forces_site_patching_off,
+    // in_guest_trap_refuses_a_guest_environment_that_turns_site_patching_on},
+    // backend_stats::tests::{in_guest_trap_reports_the_liteinst_source_under_its_own_name,
+    // in_guest_trap_rejects_a_source_of_another_runtime},
+    // error::tests::in_guest_trap_refusal_is_serialized_as_a_policy_refusal,
+    // tests::in_guest_trap_is_rejected_outside_run (bin hermit) and
+    // run::in_guest_trap_refuses_the_options_liteinst_refuses (bin hermit),
+    // retaining all 997: 1004, listed with this node's arguments.
+    // tests::{an_in_guest_trap_run_that_patched_a_site_is_refused_after_it_ends,
+    // detcore_checks_the_variable_the_in_guest_runtime_reads} (the
+    // in-guest-trap coordinator postcondition) retain all 1004: 1006, listed
+    // with this node's arguments.
+    ("test.hermit_unit", 1008),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1553,7 +1572,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // syscalls::accept_in_turn tests
     // (https://github.com/rrnewton/hermit/pull/3908) retain all 1188: 1202,
     // listed with this node's arguments.
-    ("test.detcore_unit", 1202),
+    // in_guest_site_patching::tests::only_zero_satisfies_a_request_for_site_patching_off
+    // (the in-guest-trap Tool image check) retains all 1186: 1187, listed
+    // with this node's arguments.
+    ("test.detcore_unit", 1203),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1989,7 +2011,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // happens_before_fd_anchor_is_refused_without_interception and
     // happens_before_unsupported_fd_anchor_is_refused_before_reading_stdin
     // retain all 234: 241.
-    ("test.cli", 241),
+    // liteinst_in_guest_programs::{in_guest_trap_dispatch_record_reports_no_patched_sites,
+    // in_guest_trap_verifies_a_program_with_no_site_patched,
+    // in_guest_trap_sets_site_patching_off_and_refuses_a_caller_who_turns_it_on,
+    // in_guest_trap_refuses_a_guest_library_that_turns_site_patching_back_on}
+    // (`--backend=in-guest-trap`, step C4 of
+    // https://github.com/rrnewton/hermit/issues/3520) retain all 234: 238,
+    // listed with this node's arguments. Each starts an in-guest LiteInst
+    // guest, so they join the hosted CPUID-faulting exact-name filterset and
+    // test.cli_on_host does not change.
+    ("test.cli", 245),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2171,6 +2202,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_child_exit_is_notified_once_with_linuxs_siginfo: 185.
     // And the two run_config_ tests: 187.
     // The seven happens-before fd-anchor tests start no LiteInst guest: 194.
+    // The four in-guest-trap cli tests start in-guest LiteInst guests, so they
+    // join the exact-name filterset: 187 + 4 - 4 = 187.
     ("test.cli_on_host", 194),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
@@ -2268,7 +2301,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two refused-turn-charge tests: 1186.
     // And the two happens-before syscall-occurrence scheduler tests: 1188.
     // And the same fourteen rejoin and accept-in-turn tests: 1202.
-    ("test.detcore_unit_on_host", 1202),
+    // And the in-guest-trap site-patching check test: 1187.
+    ("test.detcore_unit_on_host", 1203),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -2366,7 +2400,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same sixteen run config tests: 997.
     // The same launch refusal test: 998.
     // And the same backgrounded-accept record-version test: 999.
-    ("test.hermit_unit_on_host", 999),
+    // And the nine in-guest-trap tests: 1006.
+    ("test.hermit_unit_on_host", 1008),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -2463,7 +2498,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same six scheduler-turn-cost tests: 1011.
     // The same three detcore-model happens-before tests: 1014.
     // And the same test-free declaration test: 1005; removed with it: 1004.
-    ("test.regular_crates_on_host", 1014),
+    // And the same two in-guest-trap tests: 1013.
+    ("test.regular_crates_on_host", 1016),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
@@ -5170,7 +5206,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Portable CLI cases (skips KVM/DBT-backend-only cases)"########,
         description: r########"Five exact DBT product failures are excluded from the portable baseline under #2791 and retain source TODOs naming their individual defects; the LiteInst tests remain active. They include real programs (coreutils, sqlite3, Python, jq, perl and the tests/c guests) run under in-guest LiteInst with --max-timeslice=disabled and without --verify (liteinst_in_guest_programs::, formerly the liteinst_advanced binary); those load the libdetcore_liteinst.so that the workspace build writes beside target/validate/hermit, so a missing runtime fails them with Hermit's refusal naming `cargo build -p detcore-liteinst`. The 40 of them that start the in-guest LiteInst runtime (33 liteinst_in_guest_programs:: cases, the five liteinst_in_guest_verify_ cases, liteinst_backend_stats_report_the_guests_own_dispatch_paths and run_liteinst_finds_the_runtime_staged_as_an_installed_resource) need CPUID faulting, a host capability like the PMU: the GitHub-hosted runner has none, and in portable run 37383177918 each of the first 25 refused there with detcore-liteinst: initialization failed: CPUID faulting is unavailable: No such device (the 26th failed earlier, on the runtime the prebuilt tree did not yet ship). In portable run https://github.com/rrnewton/hermit/actions/runs/37543769782 four later cases (liteinst_in_guest_exit_reaping_matches_ptrace, liteinst_in_guest_unscheduled_deaths_complete_and_refuse_verification, liteinst_in_guest_serves_its_own_userfaultfd_and_exits_registered and liteinst_in_guest_refuses_a_guest_that_opens_dev_fuse) failed with the same error; liteinst_in_guest_reads_a_plain_file_on_a_fuse_filesystem starts the same runtime and was reported passed there only because the runner has no FUSE mount, so it returned before launching anything. This hosted twin excludes them with an exact-name filterset (-E 'not (test(=...) | ...)'), never a substring --skip, and test.cli keeps running all of them in the pinned root; the LiteInst refusal, fixture-staging and command-construction cases, which launch no real runtime, stay here. MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 339279872 bytes; the larger 4068401152-byte historical completed peak governs. The 4-GiB baseline rounds above that floor and the 6-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md."########,
         labels: &[r########"hosted-portable"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'not (test(=liteinst_backend_stats_report_the_guests_own_dispatch_paths) | test(=liteinst_in_guest_programs::liteinst_in_guest_abnormal_exit_after_registration_does_not_hang) | test(=liteinst_in_guest_programs::liteinst_in_guest_an_undeliverable_sigalrm_is_a_loss_and_stops_the_guest) | test(=liteinst_in_guest_programs::liteinst_in_guest_close_range_releases_ports_like_ptrace) | test(=liteinst_in_guest_programs::liteinst_in_guest_cpuid_in_a_late_loaded_library_runs) | test(=liteinst_in_guest_programs::liteinst_in_guest_detcore_micro_suite) | test(=liteinst_in_guest_programs::liteinst_in_guest_dispatch_record_reports_patched_sites) | test(=liteinst_in_guest_programs::liteinst_in_guest_dup_aliases_share_one_cursor_after_fork) | test(=liteinst_in_guest_programs::liteinst_in_guest_encoding_and_digest_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_exit_reaping_matches_ptrace) | test(=liteinst_in_guest_programs::liteinst_in_guest_file_and_text_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_fork_runs_without_hanging) | test(=liteinst_in_guest_programs::liteinst_in_guest_formatting_and_sequence_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_heap_growth_avoids_trampoline_mappings) | test(=liteinst_in_guest_programs::liteinst_in_guest_identity_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe) | test(=liteinst_in_guest_programs::liteinst_in_guest_path_and_language_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_python_entropy) | test(=liteinst_in_guest_programs::liteinst_in_guest_python_random_example) | test(=liteinst_in_guest_programs::liteinst_in_guest_reads_a_plain_file_on_a_fuse_filesystem) | test(=liteinst_in_guest_programs::liteinst_in_guest_refuses_a_guest_that_opens_dev_fuse) | test(=liteinst_in_guest_programs::liteinst_in_guest_round2_arithmetic_and_predicate_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round2_encoding_and_comparison_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round2_representation_and_path_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round3_encoding_and_compression_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round3_portable_system_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round3_stdin_filter_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_runtime_bootstrap_is_not_charged_to_host_identity_uptime) | test(=liteinst_in_guest_programs::liteinst_in_guest_semantic_file_and_sqlite_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_semantic_text_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_serves_its_own_userfaultfd_and_exits_registered) | test(=liteinst_in_guest_programs::liteinst_in_guest_shell_and_entropy_consumer) | test(=liteinst_in_guest_programs::liteinst_in_guest_sigalrm_committed_at_an_instruction_trap_runs_before_exit) | test(=liteinst_in_guest_programs::liteinst_in_guest_sigalrm_handler_is_virtual_and_published) | test(=liteinst_in_guest_programs::liteinst_in_guest_sigalrm_handler_runs_at_syscall_completion) | test(=liteinst_in_guest_programs::liteinst_in_guest_sigalrm_pending_at_handler_return_runs_before_the_next_syscall) | test(=liteinst_in_guest_programs::liteinst_in_guest_tool_directory_reads_stay_out_of_the_guest_heap) | test(=liteinst_in_guest_programs::liteinst_in_guest_unscheduled_deaths_complete_and_refuse_verification) | test(=liteinst_in_guest_programs::liteinst_in_guest_user_address_limit_queries_keep_the_guest_errno) | test(=liteinst_in_guest_programs::liteinst_in_guest_virtual_identity_and_time) | test(=liteinst_in_guest_refuses_a_guest_socket_at_the_forwarding_number) | test(=liteinst_in_guest_verify_compares_the_records_the_guest_forwards) | test(=liteinst_in_guest_verify_forwards_records_by_the_cli_filters_per_target_answer) | test(=liteinst_in_guest_verify_log_keeps_records_in_ptraces_order) | test(=liteinst_in_guest_verify_survives_a_guest_stderr_without_a_reader) | test(=liteinst_in_guest_verify_with_records_past_the_log_bound_is_no_result) | test(=run_liteinst_finds_the_runtime_staged_as_an_installed_resource))' -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbt_strict_returns_with_blocked_stdin_source --skip run_dbt_verifies_pipe_backpressure --skip run_dbt_keeps_diagnostics_out_of_guest_stderr --skip run_dbt_recovers_after_failed_exec --skip run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls --skip run_dbt_verifies_queued_self_signals --skip run_dbt_verifies_self_prlimit --skip run_dbt_verifies_shell_process_lifecycle --skip run_dbt_verifies_simple_env_shebang --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --skip skid_overshoot_and_guest_failure_have_different_exit_codes --skip run_ptrace_nonleader_exec_preserves_identity_and_time --skip run_ptrace_nonleader_exec_preserves_preemption --skip run_ptrace_nonleader_exec_displaces_runnable_leader --skip run_ptrace_nonleader_exec_refuses_preemption_artifacts --skip run_chaos_preemption_replay_reuses_the_recorded_epoch --skip max_log_bytes_preemption_stacktrace_exits_promptly_when_stderr_is_a_full_pipe"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'not (test(=liteinst_backend_stats_report_the_guests_own_dispatch_paths) | test(=liteinst_in_guest_programs::in_guest_trap_dispatch_record_reports_no_patched_sites) | test(=liteinst_in_guest_programs::in_guest_trap_refuses_a_guest_library_that_turns_site_patching_back_on) | test(=liteinst_in_guest_programs::in_guest_trap_sets_site_patching_off_and_refuses_a_caller_who_turns_it_on) | test(=liteinst_in_guest_programs::in_guest_trap_verifies_a_program_with_no_site_patched) | test(=liteinst_in_guest_programs::liteinst_in_guest_abnormal_exit_after_registration_does_not_hang) | test(=liteinst_in_guest_programs::liteinst_in_guest_an_undeliverable_sigalrm_is_a_loss_and_stops_the_guest) | test(=liteinst_in_guest_programs::liteinst_in_guest_close_range_releases_ports_like_ptrace) | test(=liteinst_in_guest_programs::liteinst_in_guest_cpuid_in_a_late_loaded_library_runs) | test(=liteinst_in_guest_programs::liteinst_in_guest_detcore_micro_suite) | test(=liteinst_in_guest_programs::liteinst_in_guest_dispatch_record_reports_patched_sites) | test(=liteinst_in_guest_programs::liteinst_in_guest_dup_aliases_share_one_cursor_after_fork) | test(=liteinst_in_guest_programs::liteinst_in_guest_encoding_and_digest_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_exit_reaping_matches_ptrace) | test(=liteinst_in_guest_programs::liteinst_in_guest_file_and_text_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_fork_runs_without_hanging) | test(=liteinst_in_guest_programs::liteinst_in_guest_formatting_and_sequence_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_heap_growth_avoids_trampoline_mappings) | test(=liteinst_in_guest_programs::liteinst_in_guest_identity_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe) | test(=liteinst_in_guest_programs::liteinst_in_guest_path_and_language_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_python_entropy) | test(=liteinst_in_guest_programs::liteinst_in_guest_python_random_example) | test(=liteinst_in_guest_programs::liteinst_in_guest_reads_a_plain_file_on_a_fuse_filesystem) | test(=liteinst_in_guest_programs::liteinst_in_guest_refuses_a_guest_that_opens_dev_fuse) | test(=liteinst_in_guest_programs::liteinst_in_guest_round2_arithmetic_and_predicate_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round2_encoding_and_comparison_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round2_representation_and_path_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round3_encoding_and_compression_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round3_portable_system_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round3_stdin_filter_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_runtime_bootstrap_is_not_charged_to_host_identity_uptime) | test(=liteinst_in_guest_programs::liteinst_in_guest_semantic_file_and_sqlite_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_semantic_text_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_serves_its_own_userfaultfd_and_exits_registered) | test(=liteinst_in_guest_programs::liteinst_in_guest_shell_and_entropy_consumer) | test(=liteinst_in_guest_programs::liteinst_in_guest_sigalrm_committed_at_an_instruction_trap_runs_before_exit) | test(=liteinst_in_guest_programs::liteinst_in_guest_sigalrm_handler_is_virtual_and_published) | test(=liteinst_in_guest_programs::liteinst_in_guest_sigalrm_handler_runs_at_syscall_completion) | test(=liteinst_in_guest_programs::liteinst_in_guest_sigalrm_pending_at_handler_return_runs_before_the_next_syscall) | test(=liteinst_in_guest_programs::liteinst_in_guest_tool_directory_reads_stay_out_of_the_guest_heap) | test(=liteinst_in_guest_programs::liteinst_in_guest_unscheduled_deaths_complete_and_refuse_verification) | test(=liteinst_in_guest_programs::liteinst_in_guest_user_address_limit_queries_keep_the_guest_errno) | test(=liteinst_in_guest_programs::liteinst_in_guest_virtual_identity_and_time) | test(=liteinst_in_guest_refuses_a_guest_socket_at_the_forwarding_number) | test(=liteinst_in_guest_verify_compares_the_records_the_guest_forwards) | test(=liteinst_in_guest_verify_forwards_records_by_the_cli_filters_per_target_answer) | test(=liteinst_in_guest_verify_log_keeps_records_in_ptraces_order) | test(=liteinst_in_guest_verify_survives_a_guest_stderr_without_a_reader) | test(=liteinst_in_guest_verify_with_records_past_the_log_bound_is_no_result) | test(=run_liteinst_finds_the_runtime_staged_as_an_installed_resource))' -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbt_strict_returns_with_blocked_stdin_source --skip run_dbt_verifies_pipe_backpressure --skip run_dbt_keeps_diagnostics_out_of_guest_stderr --skip run_dbt_recovers_after_failed_exec --skip run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls --skip run_dbt_verifies_queued_self_signals --skip run_dbt_verifies_self_prlimit --skip run_dbt_verifies_shell_process_lifecycle --skip run_dbt_verifies_simple_env_shebang --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --skip skid_overshoot_and_guest_failure_have_different_exit_codes --skip run_ptrace_nonleader_exec_preserves_identity_and_time --skip run_ptrace_nonleader_exec_preserves_preemption --skip run_ptrace_nonleader_exec_displaces_runnable_leader --skip run_ptrace_nonleader_exec_refuses_preemption_artifacts --skip run_chaos_preemption_replay_reuses_the_recorded_epoch --skip max_log_bytes_preemption_stacktrace_exits_promptly_when_stderr_is_a_full_pipe"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"cli"########]),

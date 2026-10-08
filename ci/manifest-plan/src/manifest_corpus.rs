@@ -16,7 +16,7 @@ use serde_yaml::Mapping;
 use serde_yaml::Value;
 
 /// The backends a manifest mode partitions into enabled and disabled.
-const BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
+const BACKENDS: [&str; 6] = ["ptrace", "dbt", "kvm", "sabre", "liteinst", "in-guest-trap"];
 
 /// The modes every test recipe declares, in the order an expanded test lists
 /// them.

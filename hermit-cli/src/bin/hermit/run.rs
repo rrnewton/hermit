@@ -443,7 +443,7 @@ fn unobserved_guest_execution(backend: Backend, passthru_opt: bool) -> Option<&'
             "SaBRe's loader runs an exec'd program's .preinit_array before Detcore starts \
              and forwards those syscalls unobserved",
         ),
-        Backend::Liteinst => {
+        Backend::Liteinst | Backend::InGuestTrap => {
             Some("in-guest LiteInst's preload starts after an exec'd program's .preinit_array runs")
         }
         Backend::Dbt => Some("DBT's launcher does not collect host inputs"),
@@ -466,7 +466,9 @@ const REVERIE_PTRACE_PRIVATE_PAGE: (u64, u64) = (0x7100_0000, 0x7100_1000);
 fn untraced_code_range(backend: Backend) -> Option<(u64, u64)> {
     match backend {
         Backend::Ptrace | Backend::E9patch => Some(REVERIE_PTRACE_PRIVATE_PAGE),
-        Backend::Kvm | Backend::Sabre | Backend::Liteinst | Backend::Dbt => None,
+        Backend::Kvm | Backend::Sabre | Backend::Liteinst | Backend::InGuestTrap | Backend::Dbt => {
+            None
+        }
     }
 }
 
@@ -2114,6 +2116,7 @@ fn backend_values_parse_and_round_trip() {
         ("ptrace", Backend::Ptrace),
         ("dbt", Backend::Dbt),
         ("liteinst", Backend::Liteinst),
+        ("in-guest-trap", Backend::InGuestTrap),
         ("sabre", Backend::Sabre),
         ("kvm", Backend::Kvm),
         ("e9patch", Backend::E9patch),
@@ -2156,6 +2159,7 @@ fn comparator_choice_does_not_depend_on_the_backend() {
         ("ptrace", Backend::Ptrace),
         ("dbt", Backend::Dbt),
         ("liteinst", Backend::Liteinst),
+        ("in-guest-trap", Backend::InGuestTrap),
         ("sabre", Backend::Sabre),
         ("kvm", Backend::Kvm),
         ("e9patch", Backend::E9patch),
@@ -2191,7 +2195,15 @@ fn comparator_choice_does_not_depend_on_the_backend() {
 
 #[test]
 fn verification_always_compares_retained_logs() {
-    for backend in ["ptrace", "dbt", "liteinst", "sabre", "kvm", "e9patch"] {
+    for backend in [
+        "ptrace",
+        "dbt",
+        "liteinst",
+        "in-guest-trap",
+        "sabre",
+        "kvm",
+        "e9patch",
+    ] {
         let run = run_opts_for(&[
             "hermit",
             "--backend",
@@ -2209,7 +2221,15 @@ fn verification_always_compares_retained_logs() {
 
 #[test]
 fn every_backend_keeps_io_buffer_checking_on_by_default() {
-    for backend in ["ptrace", "dbt", "liteinst", "sabre", "kvm", "e9patch"] {
+    for backend in [
+        "ptrace",
+        "dbt",
+        "liteinst",
+        "in-guest-trap",
+        "sabre",
+        "kvm",
+        "e9patch",
+    ] {
         let run = run_opts_for(&[
             "hermit",
             "--backend",
@@ -2753,6 +2773,7 @@ fn passthru_opt_leaves_guest_syscalls_unobserved_on_every_backend() {
         Backend::Kvm,
         Backend::Sabre,
         Backend::Liteinst,
+        Backend::InGuestTrap,
         Backend::Dbt,
     ] {
         let reason = unobserved_guest_execution(backend, true)
@@ -2766,7 +2787,12 @@ fn passthru_opt_leaves_guest_syscalls_unobserved_on_every_backend() {
             "{backend:?}"
         );
     }
-    for backend in [Backend::Sabre, Backend::Liteinst, Backend::Dbt] {
+    for backend in [
+        Backend::Sabre,
+        Backend::Liteinst,
+        Backend::InGuestTrap,
+        Backend::Dbt,
+    ] {
         assert!(
             unobserved_guest_execution(backend, false).is_some(),
             "{backend:?}"
@@ -2790,6 +2816,7 @@ fn the_ptrace_runtime_guards_reverie_private_page() {
         Backend::Kvm,
         Backend::Sabre,
         Backend::Liteinst,
+        Backend::InGuestTrap,
         Backend::Dbt,
     ] {
         assert_eq!(untraced_code_range(backend), None, "{backend:?}");
@@ -3245,10 +3272,70 @@ fn scheduler_turn_cost_parses_round_trips_and_is_refused_for_dbt() {
 
 #[cfg(test)]
 fn liteinst_in_guest_refusal(options: &[&str]) -> Result<(), anyhow::Error> {
-    let mut argv = vec!["hermit", "--backend=liteinst", "run"];
+    in_guest_refusal("--backend=liteinst", options)
+}
+
+#[cfg(test)]
+fn in_guest_refusal(backend_flag: &str, options: &[&str]) -> Result<(), anyhow::Error> {
+    let mut argv = vec!["hermit", backend_flag, "run"];
     argv.extend_from_slice(options);
     argv.push("fakeprog");
     run_opts_for(&argv).refuse_unqualified_liteinst_in_guest_options()
+}
+
+/// in-guest-trap runs the in-guest LiteInst runtime, so it refuses exactly
+/// the options liteinst refuses, and each refusal names the backend the
+/// caller selected.
+#[test]
+fn in_guest_trap_refuses_the_options_liteinst_refuses() {
+    #[cfg(feature = "liteinst")]
+    {
+        let error = in_guest_refusal("--backend=in-guest-trap", &[]).unwrap_err();
+        assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+        assert!(
+            error.to_string().contains("pass --max-timeslice=disabled"),
+            "{error:#}"
+        );
+    }
+    for option in [
+        "--run-evidence-dir=/unused/new-path",
+        "--timeout=3",
+        "--skid-margin=500",
+        "--gdbserver",
+    ] {
+        let options = ["--max-timeslice=disabled", option];
+        let trap = in_guest_refusal("--backend=in-guest-trap", &options).unwrap_err();
+        let liteinst = liteinst_in_guest_refusal(&options).unwrap_err();
+        assert!(
+            trap.downcast_ref::<PolicyRefusal>().is_some(),
+            "{option}: {trap:#}"
+        );
+        assert_eq!(
+            trap.to_string()
+                .replace("--backend=in-guest-trap", "--backend=liteinst"),
+            liteinst.to_string(),
+            "{option}"
+        );
+        assert!(
+            trap.to_string().starts_with("--backend=in-guest-trap "),
+            "{option}: {trap:#}"
+        );
+    }
+    in_guest_refusal(
+        "--backend=in-guest-trap",
+        &["--max-timeslice=disabled", "--verify"],
+    )
+    .unwrap();
+    let run = run_opts_for(&[
+        "hermit",
+        "--backend=in-guest-trap",
+        "run",
+        "--max-timeslice=disabled",
+        "fakeprog",
+    ]);
+    assert!(run.uses_in_guest_liteinst());
+    assert!(run.forwards_in_guest_detlogs());
+    assert!(!run.arms_reverie_ptrace_pmu_timer());
 }
 
 #[test]
@@ -3472,6 +3559,7 @@ fn log_cap_refusal_table_covers_every_backend() {
         Backend::Ptrace,
         Backend::Dbt,
         Backend::Liteinst,
+        Backend::InGuestTrap,
         Backend::Sabre,
         Backend::Kvm,
         Backend::E9patch,
@@ -3491,6 +3579,7 @@ fn log_cap_refusal_table_covers_every_backend() {
             (Backend::Dbt, false),
             (Backend::Dbt, true),
             (Backend::Liteinst, true),
+            (Backend::InGuestTrap, true),
             (Backend::Sabre, true),
             (Backend::Kvm, true),
             (Backend::E9patch, true),
@@ -4627,9 +4716,10 @@ impl RunOpts {
 
     /// Whether this run's Tool writes its DETLOG records to the guest's standard
     /// error for `--verify` to move into the run's log: SaBRe's plugin and the
-    /// in-guest LiteInst runtime both do.
+    /// in-guest LiteInst runtime (`liteinst` and `in-guest-trap`) both do.
     fn forwards_in_guest_detlogs(&self) -> bool {
-        matches!(self.selected_backend(), Backend::Sabre | Backend::Liteinst)
+        let backend = self.selected_backend();
+        backend == Backend::Sabre || backend.is_in_guest_liteinst()
     }
 
     /// A Unix `SOCK_SEQPACKET` pair for one verification run's forwarded
@@ -4705,10 +4795,11 @@ impl RunOpts {
         extract_forwarded_detlogs(log, stderr, limit, false).map(Some)
     }
 
-    /// Whether this run hosts Detcore inside the guest through LiteInst.
-    /// `--namespace-only` runs no backend, so it never does.
+    /// Whether this run hosts Detcore inside the guest through LiteInst
+    /// (`liteinst` or `in-guest-trap`). `--namespace-only` runs no backend, so
+    /// it never does.
     fn uses_in_guest_liteinst(&self) -> bool {
-        !self.namespace_only && self.selected_backend() == Backend::Liteinst
+        !self.namespace_only && self.selected_backend().is_in_guest_liteinst()
     }
 
     /// Whether this run hosts Detcore inside the guest through SaBRe.
@@ -4754,7 +4845,8 @@ impl RunOpts {
             return Ok(());
         };
         Err(Error::new(PolicyRefusal).context(format!(
-            "--backend=liteinst (in-guest LiteInst) refuses this run: {reason}"
+            "--backend={} (in-guest LiteInst) refuses this run: {reason}",
+            self.selected_backend().as_str()
         )))
     }
 
@@ -4775,7 +4867,7 @@ impl RunOpts {
         if cfg!(feature = "liteinst") || !self.uses_in_guest_liteinst() {
             return Ok(());
         }
-        Backend::Liteinst.ensure_available()
+        self.selected_backend().ensure_available()
     }
 
     /// Why `--max-log-bytes` cannot end a run of this backend in this namespace
@@ -4861,6 +4953,11 @@ impl RunOpts {
                  a ptrace tracee nor inside a PID namespace hermit owns, so exiting 123 at the \
                  cap would leave the guest running; drop --no-namespace",
             ),
+            Backend::InGuestTrap if no_namespace => Some(
+                "--backend=in-guest-trap and --no-namespace: the in-guest LiteInst guest is \
+                 neither a ptrace tracee nor inside a PID namespace hermit owns, so exiting 123 \
+                 at the cap would leave the guest running; drop --no-namespace",
+            ),
             Backend::Sabre if no_namespace => Some(
                 "--backend=sabre and --no-namespace: the guest is handed to the SaBRe worker \
                  stopped and untraced, before PTRACE_O_EXITKILL binds it, and no PID namespace \
@@ -4880,6 +4977,7 @@ impl RunOpts {
             ),
             Backend::Ptrace
             | Backend::Liteinst
+            | Backend::InGuestTrap
             | Backend::Sabre
             | Backend::Kvm
             | Backend::E9patch => None,
@@ -5210,6 +5308,7 @@ impl RunOpts {
         match backend {
             Backend::Ptrace
             | Backend::Liteinst
+            | Backend::InGuestTrap
             | Backend::Sabre
             | Backend::Kvm
             | Backend::E9patch => {}
@@ -5247,6 +5346,12 @@ impl RunOpts {
             // configuration, not an outcome.
             crate::tracing::diagnostic_eprintln!(
                 "hermit: [liteinst in-guest] selected: the guest preload is to host the Detcore Tool"
+            );
+        }
+        if backend == Backend::InGuestTrap && self.uses_in_guest_liteinst() {
+            crate::tracing::diagnostic_eprintln!(
+                "hermit: [in-guest-trap] selected: the guest preload is to host the Detcore Tool, \
+                 with syscall site patching off (REVERIE_LITEINST_SITE_PATCHING=0)"
             );
         }
 
@@ -5324,7 +5429,11 @@ impl RunOpts {
     fn backend_arms_reverie_ptrace_pmu_timer(&self) -> bool {
         match self.selected_backend() {
             Backend::Ptrace | Backend::E9patch => true,
-            Backend::Liteinst | Backend::Dbt | Backend::Sabre | Backend::Kvm => false,
+            Backend::Liteinst
+            | Backend::InGuestTrap
+            | Backend::Dbt
+            | Backend::Sabre
+            | Backend::Kvm => false,
         }
     }
 
@@ -5346,7 +5455,7 @@ impl RunOpts {
         let backend = self.selected_backend();
         if self.run_evidence_dir.is_some() {
             let limitation = match backend {
-                Backend::Ptrace | Backend::Liteinst | Backend::Kvm => None,
+                Backend::Ptrace | Backend::Liteinst | Backend::InGuestTrap | Backend::Kvm => None,
                 Backend::Dbt => Some(
                     "authenticated DBT evidence currently implies an isolated process group, \
                      which can change guest setsid/setpgid results",
@@ -5373,7 +5482,7 @@ impl RunOpts {
             && (self.namespace_only
                 || !matches!(
                     backend,
-                    Backend::Ptrace | Backend::Liteinst | Backend::E9patch
+                    Backend::Ptrace | Backend::Liteinst | Backend::InGuestTrap | Backend::E9patch
                 ))
         {
             anyhow::bail!(
@@ -6497,7 +6606,7 @@ impl RunOpts {
                 Error::msg("e9patch backend engagement was not recorded during preparation")
             })?,
             Backend::Dbt => unreachable!("the DBT adapter writes its own engagement record"),
-            Backend::Liteinst | Backend::Sabre | Backend::Kvm => {
+            Backend::Liteinst | Backend::InGuestTrap | Backend::Sabre | Backend::Kvm => {
                 return Err(Error::msg(format!(
                     "backend `{}` does not expose an engagement value",
                     self.selected_backend().as_str()
@@ -7164,6 +7273,7 @@ impl RunOpts {
         let backend_banner = match self.selected_backend() {
             Backend::Kvm => Some("KVM (reverie-kvm KvmGuest<Detcore>)"),
             Backend::Liteinst
+            | Backend::InGuestTrap
             | Backend::Ptrace
             | Backend::Dbt
             | Backend::Sabre
@@ -7747,7 +7857,13 @@ impl RunOpts {
             return Ok(());
         }
         let backend = self.runtime_backend();
-        if matches!(backend, Backend::Ptrace | Backend::Liteinst) {
+        // in-guest-trap runs the in-guest LiteInst runtime, so it takes
+        // liteinst's answer here; both are refused `--timeout` earlier by
+        // `refuse_unqualified_liteinst_in_guest_options`.
+        if matches!(
+            backend,
+            Backend::Ptrace | Backend::Liteinst | Backend::InGuestTrap
+        ) {
             return Ok(());
         }
         Err(Error::new(PolicyRefusal).context(format!(
@@ -8438,7 +8554,12 @@ mod tests {
 
     #[test]
     fn run_evidence_backend_scope_matches_authoritative_private_sinks() {
-        for backend in [Backend::Ptrace, Backend::Liteinst, Backend::Kvm] {
+        for backend in [
+            Backend::Ptrace,
+            Backend::Liteinst,
+            Backend::InGuestTrap,
+            Backend::Kvm,
+        ] {
             let mut options = run_opts_for(&[
                 "hermit",
                 &format!("--backend={}", backend.as_str()),
@@ -8519,6 +8640,7 @@ mod tests {
         for backend in [
             Backend::Ptrace,
             Backend::Liteinst,
+            Backend::InGuestTrap,
             Backend::Kvm,
             Backend::Dbt,
             Backend::Sabre,
@@ -8534,7 +8656,10 @@ mod tests {
             assert_eq!(paths.stdout, PathBuf::from("/unused/stdout"));
             assert_eq!(paths.stderr, PathBuf::from("/unused/stderr"));
             let result = options.validate_args_with_perf_support(true);
-            if matches!(backend, Backend::Ptrace | Backend::Liteinst | Backend::Kvm) {
+            if matches!(
+                backend,
+                Backend::Ptrace | Backend::Liteinst | Backend::InGuestTrap | Backend::Kvm
+            ) {
                 result.unwrap();
             } else {
                 assert!(
