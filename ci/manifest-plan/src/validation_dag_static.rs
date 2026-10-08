@@ -859,7 +859,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // config::tests::target_timeslice_syscalls_only_never_enters_the_legacy_form
     // (lane qemu-rcb, https://github.com/rrnewton/hermit/pull/3859) retains
     // all 996: 997.
-    ("test.regular_crates", 997),
+    // runner::tests::a_child_still_in_the_root_cgroup_while_forked_is_read_again
+    // retains all 997: 998, listed with this node's arguments.
+    ("test.regular_crates", 998),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2196,7 +2198,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the two review-fix tests listed there make 994.
     // The compare_io_buffers refusal test listed there retains all 995: 996.
     // The host twin selects the same detcore-model legacy-form test: 997.
-    ("test.regular_crates_on_host", 997),
+    // And the same fork-window cgroup test: 998.
+    ("test.regular_crates_on_host", 998),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

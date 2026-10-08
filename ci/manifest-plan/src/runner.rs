@@ -6088,6 +6088,22 @@ fn stat_process_group(stat: &[u8]) -> Option<u32> {
         .ok()
 }
 
+/// How many times [`check_cgroup_membership`] reads again, [`FORK_WINDOW_PAUSE`]
+/// apart, a process whose cgroup reads as the root cgroup `/`.
+///
+/// A child that `fork` is still creating is in the root cgroup for a moment:
+/// `cgroup_fork` points it at `init_css_set`, `copy_process` makes it visible
+/// in `/proc` and in its parent's process group, and only then does
+/// `cgroup_post_fork` move it into its parent's cgroup (Linux v6.19
+/// kernel/fork.c and kernel/cgroup/cgroup.c). A forking guest's child read
+/// in that window is not outside: c-programs/wait-on-child (verify/sabre) was
+/// refused that way in a box validation of hermit 6b31e9ae, and a probe that
+/// reads each child of a forking loop as soon as it appears saw 2 of 108171
+/// children in `/`. Nothing this user runs can move a process into the root
+/// cgroup, so one that stays there through the re-reads is refused.
+const FORK_WINDOW_REREADS: u32 = 50;
+const FORK_WINDOW_PAUSE: Duration = Duration::from_millis(2);
+
 /// Check that every process the process-group scan could see for this
 /// invocation is in its cgroup `invocation` or a cgroup below it: the leader
 /// `pid` while it is unreaped (`leader_unreaped`), wherever its process group
@@ -6121,7 +6137,17 @@ fn check_cgroup_membership(
         .into_iter()
         .chain(members.into_iter().filter(|member| Some(*member) != leader))
     {
-        match cgroup_of(member).map_err(unchecked)? {
+        let mut cgroup = cgroup_of(member).map_err(unchecked)?;
+        let mut rereads = 0;
+        while cgroup.as_deref() == Some("/")
+            && !within_cgroup("/", invocation)
+            && rereads < FORK_WINDOW_REREADS
+        {
+            std::thread::sleep(FORK_WINDOW_PAUSE);
+            cgroup = cgroup_of(member).map_err(unchecked)?;
+            rereads += 1;
+        }
+        match cgroup {
             Some(cgroup) if !within_cgroup(&cgroup, invocation) => {
                 let role = if Some(member) == leader {
                     "the leader"
@@ -13011,6 +13037,58 @@ mod tests {
             }
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_child_still_in_the_root_cgroup_while_forked_is_read_again() {
+        let invocation = "/runner/hermit-e2e-invocation-1";
+        // Process 8's cgroup reads as each entry of `reads` in turn, then as
+        // the last one; 7, the leader, is inside.
+        let check = |reads: &[Option<&str>]| {
+            let reads: Vec<Option<String>> =
+                reads.iter().map(|read| read.map(str::to_owned)).collect();
+            let seen = std::cell::Cell::new(0);
+            let result = check_cgroup_membership(
+                7,
+                true,
+                invocation,
+                |_| Ok(vec![7, 8]),
+                |pid| match pid {
+                    7 => Ok(Some(invocation.to_owned())),
+                    8 => {
+                        let read = reads[seen.get().min(reads.len() - 1)].clone();
+                        seen.set(seen.get() + 1);
+                        Ok(read)
+                    }
+                    other => panic!("process {other} was not expected to be checked"),
+                },
+            );
+            (result, seen.get())
+        };
+        // In the root cgroup while fork creates it, then in the invocation.
+        assert_eq!(check(&[Some("/"), Some(invocation)]), (Ok(()), 2));
+        assert_eq!(
+            check(&[
+                Some("/"),
+                Some("/"),
+                Some("/runner/hermit-e2e-invocation-1/x")
+            ]),
+            (Ok(()), 3)
+        );
+        // Gone before a re-read: not outside.
+        assert_eq!(check(&[Some("/"), None]), (Ok(()), 2));
+        // Read again only for the root cgroup: a parent cgroup is refused at once.
+        let (parent, reads) = check(&[Some("/runner"), Some(invocation)]);
+        assert!(parent.unwrap_err().contains("process 8 (a member"));
+        assert_eq!(reads, 1);
+        // Still in the root cgroup after every re-read: refused.
+        let (stays, reads) = check(&[Some("/")]);
+        let refusal = stays.unwrap_err();
+        assert!(
+            refusal.contains("process 8 (a member of the leader's process group) is in cgroup /,"),
+            "{refusal}"
+        );
+        assert_eq!(reads, 1 + FORK_WINDOW_REREADS as usize);
     }
 
     #[test]
