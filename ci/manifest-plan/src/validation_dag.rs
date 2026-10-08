@@ -285,8 +285,9 @@ pub const HOSTED_PORTABLE_EXCLUDED_BACKENDS: &[&str] = &["kvm", "liteinst", "in-
 /// runner has no FUSE mount, so it returned before launching anything, and on
 /// a runner with one it would fail the same way. The four `in_guest_trap_`
 /// cases run guests under the same runtime with site patching off
-/// (`--backend=in-guest-trap`). Only `test.cli_on_host`
-/// excludes them, with one exact-name filterset (`-E 'not (test(=NAME) |
+/// (`--backend=in-guest-trap`). The two guest-heap cases (the heap at `main`,
+/// and a fork child's heap) run guests under both in-guest backends. Only
+/// `test.cli_on_host` excludes them, with one exact-name filterset (`-E 'not (test(=NAME) |
 /// ...)'`) rather than substring `--skip`s; the local `test.cli` keeps running
 /// every one in the pinned root, and a test below holds both sides to this
 /// list.
@@ -306,6 +307,7 @@ pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_in_guest_programs::liteinst_in_guest_encoding_and_digest_utilities",
     "liteinst_in_guest_programs::liteinst_in_guest_exit_reaping_matches_ptrace",
     "liteinst_in_guest_programs::liteinst_in_guest_file_and_text_utilities",
+    "liteinst_in_guest_programs::liteinst_in_guest_fork_child_heap_is_the_parents",
     "liteinst_in_guest_programs::liteinst_in_guest_fork_runs_without_hanging",
     "liteinst_in_guest_programs::liteinst_in_guest_formatting_and_sequence_utilities",
     "liteinst_in_guest_programs::liteinst_in_guest_heap_growth_avoids_trampoline_mappings",
@@ -323,6 +325,7 @@ pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_in_guest_programs::liteinst_in_guest_round3_portable_system_utilities",
     "liteinst_in_guest_programs::liteinst_in_guest_round3_stdin_filter_utilities",
     "liteinst_in_guest_programs::liteinst_in_guest_runtime_bootstrap_is_not_charged_to_host_identity_uptime",
+    "liteinst_in_guest_programs::liteinst_in_guest_runtime_leaves_the_guest_heap_as_the_program_made_it",
     "liteinst_in_guest_programs::liteinst_in_guest_semantic_file_and_sqlite_utilities",
     "liteinst_in_guest_programs::liteinst_in_guest_semantic_text_utilities",
     "liteinst_in_guest_programs::liteinst_in_guest_serves_its_own_userfaultfd_and_exits_registered",
