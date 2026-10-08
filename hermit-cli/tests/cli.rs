@@ -7550,6 +7550,178 @@ fn max_log_bytes_exits_promptly_with_an_unresolved_happens_before_anchor_and_std
     .assert_exits_promptly_with_full_unread_stderr(|_| {});
 }
 
+/// Scheduler turns of one `run --strict` of a syscall-heavy shell loop,
+/// optionally carrying a `--happens-before` spec, read from `--summary-json`.
+fn strict_shell_loop_turns(directory: &Path, spec: Option<&str>) -> (u64, u64) {
+    let summary = directory.join(if spec.is_some() {
+        "with-spec.json"
+    } else {
+        "no-spec.json"
+    });
+    let summary_arg = format!("--summary-json={}", summary.display());
+    let mut args = vec!["run", "--strict", summary_arg.as_str()];
+    if let Some(spec) = spec {
+        args.extend(["--happens-before", spec]);
+    }
+    // Each `read` opens, reads and closes a file: about three syscalls per
+    // iteration, on the root thread only.
+    args.extend([
+        "--",
+        "/bin/sh",
+        "-c",
+        "i=0; while [ $i -lt 300 ]; do read x < /proc/self/stat; i=$((i+1)); done",
+    ]);
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&summary).expect("the summary was not written"))
+            .expect("the summary is not JSON");
+    (
+        report["sched_turns"]
+            .as_u64()
+            .expect("summary has no sched_turns"),
+        report["syscalls"]
+            .as_u64()
+            .expect("summary has no syscalls"),
+    )
+}
+
+/// A `--happens-before` spec costs one scheduler checkpoint per thread that
+/// reaches an anchored syscall count, not one per syscall
+/// (https://github.com/rrnewton/hermit/issues/3877). The spec here can never
+/// gate anything (its AFTER anchor is a syscall count the guest never reaches),
+/// so it must leave the schedule almost untouched: before the fix, every
+/// intercepted syscall issued a checkpoint and the turn count grew by about
+/// one per syscall, which stalled QEMU (about 1.15 million syscalls a run).
+#[test]
+fn happens_before_inert_spec_adds_no_per_syscall_scheduler_turns() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let spec = directory.path().join("inert.json");
+    fs::write(
+        &spec,
+        r#"{"version": 1,
+            "events": {"early": {"thread": "3", "syscalls": 2},
+                       "never": {"thread": "3", "syscalls": 1000000000}},
+            "edges": [{"before": "early", "after": "never", "strength": "hard"}]}"#,
+    )
+    .unwrap();
+    let (base_turns, base_syscalls) = strict_shell_loop_turns(directory.path(), None);
+    let (spec_turns, spec_syscalls) =
+        strict_shell_loop_turns(directory.path(), Some(spec.to_str().unwrap()));
+    assert!(
+        base_syscalls >= 500,
+        "the guest made only {base_syscalls} syscalls; the comparison needs a syscall-heavy guest"
+    );
+    assert_eq!(
+        base_syscalls, spec_syscalls,
+        "the inert spec changed what the guest did"
+    );
+    // Two anchored counts on one thread: at most two checkpoint turns.
+    assert!(
+        spec_turns <= base_turns + 2,
+        "an inert --happens-before spec added {} scheduler turns over {base_turns} \
+         for {base_syscalls} syscalls: the checkpoint is issued per syscall again",
+        spec_turns.saturating_sub(base_turns)
+    );
+}
+
+/// The two-process guest of the ordering test: a backgrounded subshell and its
+/// parent each write one line to stdout.
+const HB_ORDER_GUEST: [&str; 3] = ["/bin/sh", "-c", "(echo child) & echo parent; wait"];
+
+/// One `write(1, ..)` the guest made, as Hermit logged it at INFO: the thread
+/// and that thread's syscall count, which is the count a `syscalls` anchor uses
+/// (both are `new_count` in `detcore/src/lib.rs`).
+struct LoggedWrite {
+    dettid: u64,
+    count: u64,
+    len: u64,
+}
+
+/// Every `finish syscall #N: write(1, PTR, LEN)` line in a Hermit INFO log.
+fn logged_stdout_writes(log: &str) -> Vec<LoggedWrite> {
+    log.lines()
+        .filter_map(|line| {
+            let after_dtid = line.split_once("[syscall][detcore, dtid ")?.1;
+            let (dettid, rest) = after_dtid.split_once(']')?;
+            let rest = rest.split_once("finish syscall #")?.1;
+            let (count, rest) = rest.split_once(": write(1, ")?;
+            let len = rest.split_once(", ")?.1.split_once(')')?.0;
+            Some(LoggedWrite {
+                dettid: dettid.trim().parse().ok()?,
+                count: count.parse().ok()?,
+                len: len.trim().parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+/// A hard `--happens-before` edge reverses the order of two processes' writes.
+///
+/// Calibration and the edge come from the same environment: an INFO run
+/// finds each process's `write(1, ..)` and its syscall count (the parent writes
+/// 7 bytes, "parent\n", the child 6). The run's default order names a first and
+/// a second writer; the edge "second writer's next syscall after its write"
+/// before "first writer's write" must then put the second writer's line first.
+/// Without enforcement (for example, a checkpoint filter that never fires) the
+/// default order comes back and the test fails.
+#[test]
+fn happens_before_edge_reverses_two_processes_writes() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut args = vec!["--log", "info", "run", "--strict", "--"];
+    args.extend(HB_ORDER_GUEST);
+    let calibration = hermit(&args);
+    assert_success(&calibration, &args);
+    let default_stdout = String::from_utf8_lossy(&calibration.stdout).into_owned();
+    let writes = logged_stdout_writes(&stderr(&calibration));
+    let parent = writes.iter().find(|w| w.len == 7);
+    let child = writes.iter().find(|w| w.len == 6);
+    let (Some(parent), Some(child)) = (parent, child) else {
+        panic!(
+            "no parent and child write(1, ..) in the INFO log; found {} writes",
+            writes.len()
+        );
+    };
+    assert_ne!(
+        parent.dettid, child.dettid,
+        "the two writes came from one thread"
+    );
+    let (first, second, reversed) = match default_stdout.as_str() {
+        "parent\nchild\n" => (parent, child, "child\nparent\n"),
+        "child\nparent\n" => (child, parent, "parent\nchild\n"),
+        other => panic!("unexpected default output {other:?}"),
+    };
+    let spec = directory.path().join("reverse.json");
+    fs::write(
+        &spec,
+        format!(
+            r#"{{"version": 1,
+                "events": {{"second_wrote": {{"thread": "{}", "syscalls": {}}},
+                            "first_writes": {{"thread": "{}", "syscalls": {}}}}},
+                "edges": [{{"before": "second_wrote", "after": "first_writes", "strength": "hard"}}]}}"#,
+            second.dettid,
+            second.count + 1,
+            first.dettid,
+            first.count
+        ),
+    )
+    .unwrap();
+    let spec = spec.to_str().unwrap().to_owned();
+    let mut args = vec!["run", "--strict", "--happens-before", spec.as_str(), "--"];
+    args.extend(HB_ORDER_GUEST);
+    let ordered = hermit(&args);
+    assert_success(&ordered, &args);
+    assert_eq!(
+        String::from_utf8_lossy(&ordered.stdout),
+        reversed,
+        "the edge {}:{} < {}:{} did not reverse the default order {default_stdout:?}",
+        second.dettid,
+        second.count + 1,
+        first.dettid,
+        first.count
+    );
+}
+
 /// `--hb-list-events` prints the resolved spec and exits 0 without running
 /// the guest; the anchors it cannot resolve are named on stderr.
 #[test]
