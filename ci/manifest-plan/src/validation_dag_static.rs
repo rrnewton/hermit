@@ -1227,7 +1227,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // detcore_checks_the_variable_the_in_guest_runtime_reads} (the
     // in-guest-trap coordinator postcondition) retain all 1004: 1006, listed
     // with this node's arguments.
-    ("test.hermit_unit", 1008),
+    // sabre_bootstrap::tests::frame_descriptor_v2_decodes_r10 retains all
+    // 997: 998.
+    ("test.hermit_unit", 1009),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2050,7 +2052,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // sabre_virtualizes_an_rdtsc_in_a_guest_signal_handler and
     // sabre_refuses_a_guest_rdtsc_before_its_plugin_starts retain all 21: 23.
     // sabre_refuses_an_rdtsc_that_reenters_a_tool_call retains all 23: 24.
-    ("test.sabre_examples", 24),
+    // sabre_guest_startup_reads_detcores_stack_limit and
+    // sabre_refuses_a_guest_limit_change_before_its_plugin_starts retain all
+    // 24: 26.
+    // sabre_guest_startup_limit_reads_through_the_sigill_marker retains all
+    // 26: 27.
+    ("test.sabre_examples", 27),
     ("test.hermit_modes", 21),
     ("test.app_strict_verify", 8),
     ("test.command_strict_verify", 9),
@@ -2404,7 +2411,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same launch refusal test: 998.
     // And the same backgrounded-accept record-version test: 999.
     // And the nine in-guest-trap tests: 1006.
-    ("test.hermit_unit_on_host", 1008),
+    // And the same version 2 frame-descriptor test: 998.
+    ("test.hermit_unit_on_host", 1009),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -2513,8 +2521,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // guest-stderr-file test (18), and the same guest-socket test (19).
     // And the same exec-image forwarding test: 20.
     // And the same guest-RDTSC test: 21, and the same signal-handler and
-    // early RDTSC tests: 23, and the same re-entrant RDTSC test: 24.
-    ("test.sabre_examples_on_host", 24),
+    // early RDTSC tests: 23, and the same re-entrant RDTSC test: 24, and the
+    // same stack-limit and early limit-change tests: 26, and the same marker
+    // limit-read test: 27.
+    ("test.sabre_examples_on_host", 27),
 ];
 
 pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {

@@ -1267,8 +1267,17 @@ fi
 # re-entrant RDTSC refused); no file under reverie-dbt, the root Cargo.toml, third-party or rust-toolchain.toml
 # changes, so the four budget inputs are unchanged. Carry, not recalibration:
 # no new timing sample or >=5-sample replacement claim is made.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 23ca5355678059c7acd598d3a989af7143885947 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 23ca5355678059c7acd598d3a989af7143885947 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 87e2b5c47febd685ed3ee746e47255bb6461958e (2026-10-08): from
+# 23ca5355678059c7acd598d3a989af7143885947. The three commits change reverie-ptrace (core-limit
+# handling for the fatal-signal tests and their plain-guest fixture) and
+# experimental/reverie-sabre's vendored SaBRe loader (a pre-plugin
+# resource-limit read forwarded through the bootstrap channel, a pre-plugin
+# change refused, and a version 2 frame descriptor); no file under
+# reverie-dbt, the root Cargo.toml, third-party or rust-toolchain.toml changes,
+# so the four budget inputs are unchanged. Carry, not recalibration: no new
+# timing sample or >=5-sample replacement claim is made.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 87e2b5c47febd685ed3ee746e47255bb6461958e ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 87e2b5c47febd685ed3ee746e47255bb6461958e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

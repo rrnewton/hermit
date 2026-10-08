@@ -321,6 +321,20 @@ impl Default for ResourceLimits {
     }
 }
 
+/// The limit every guest process starts with for `resource`, as
+/// `(current, maximum)` in the `prlimit64` ABI's units, or `None` for an
+/// invalid resource number.
+///
+/// A backend whose guest reads a limit before Detcore runs answers it with
+/// this. SaBRe is one: its guest's dynamic loader and libc startup run before
+/// the plugin is initialized, and libc sizes default thread stacks from
+/// `RLIMIT_STACK` there.
+pub fn initial_resource_limit(resource: u32) -> Option<(u64, u64)> {
+    ResourceLimits::default()
+        .get(resource)
+        .map(|limit| (limit.current, limit.maximum))
+}
+
 impl ResourceLimits {
     /// Return a limit when `resource` is a valid Linux resource number.
     pub(crate) fn get(&self, resource: u32) -> Option<ResourceLimit> {
@@ -2044,7 +2058,7 @@ pub struct ThreadState<T> {
     pub(crate) initialized_random_auxv: Option<(
         crate::random::InitialImage,
         [u8; 16],
-        Vec<crate::random::RandomFill>,
+        Vec<crate::random::EarlyRequest>,
     )>,
 
     /// RNG to drive chaos scheduling decisions, separate from other (guest) RNG.
@@ -2614,15 +2628,15 @@ impl<T> ThreadState<T> {
         {
             return Err(Errno::EPROTO);
         }
-        let (prng, at_random_value, early_getrandom) =
+        let (prng, at_random_value, early_requests) =
             crate::random::decode_initial_state(bytes, config, image)?;
         self.prng = prng;
-        self.initialized_random_auxv = Some((image, at_random_value, early_getrandom));
+        self.initialized_random_auxv = Some((image, at_random_value, early_requests));
         Ok(())
     }
 
     /// Consume the early auxv write's fact, returning the bytes it wrote and
-    /// the getrandom fills served before post-exec, in order, or `None` when no
+    /// the requests served before post-exec, in order, or `None` when no
     /// backend wrote AT_RANDOM before post-exec.
     pub(crate) fn complete_initial_random_auxv(
         &mut self,
@@ -2634,9 +2648,9 @@ impl<T> ThreadState<T> {
         if pointer != Some(image.at_random) || self.dettid.as_raw() != image.pid {
             return Err(Errno::EPROTO);
         }
-        let (_, at_random_value, early_getrandom) =
+        let (_, at_random_value, early_requests) =
             self.initialized_random_auxv.take().expect("checked above");
-        Ok(Some((at_random_value, early_getrandom)))
+        Ok(Some((at_random_value, early_requests)))
     }
 
     pub(crate) fn record_robust_list_head(&mut self, head: Option<usize>) {

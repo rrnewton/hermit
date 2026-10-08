@@ -29,7 +29,7 @@ mod signal;
 /// The guest's virtual SIGALRM blocked bit (signal phase 1).
 pub(crate) use signal::virtual_sigalrm_blocked;
 pub(crate) mod socket_timestamp_ioctl;
-mod sysinfo;
+pub(crate) mod sysinfo;
 mod threads;
 /// Where a futex wait takes its deadline from; a `restart_syscall` resumes an
 /// interrupted wait with the deadline it kept.

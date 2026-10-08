@@ -144,6 +144,7 @@ use tool_global::report_unsupported_syscall;
 use tool_global::robust_list_wakes_after_exit;
 pub use tool_global::shared_open_file_reply;
 pub use tool_global::shared_open_file_request;
+pub use tool_local::initial_resource_limit;
 
 fn select_thread_exit_detpid(
     thread_detpid: Option<DetPid>,
@@ -2297,14 +2298,27 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // handoff) emitted no record: emit it here from the bytes it wrote, with
         // no second draw or write, so the record sits where every backend puts
         // it, after the root thread's seeding records. The loader's getrandom
-        // fills (glibc's early initialization makes one) emitted none either:
-        // their records follow, in order, as when this thread's own getrandom
-        // handler serves them after this callback.
-        if let Some((bytes, early_getrandom)) = initialized {
+        // fills (glibc's early initialization makes one) and resource-limit
+        // reads (glibc's startup reads RLIMIT_STACK) emitted none either: their
+        // records follow, in order, as when this thread's own handlers serve
+        // them after this callback.
+        if let Some((bytes, early_requests)) = initialized {
             let dettid = guest.thread_state().dettid;
             random::record_initial_auxv(dettid, &bytes);
-            for fill in early_getrandom {
-                random::record_early_getrandom(dettid, fill);
+            for request in early_requests {
+                match request {
+                    random::EarlyRequest::Getrandom(fill) => {
+                        random::record_early_getrandom(dettid, fill)
+                    }
+                    random::EarlyRequest::LimitRead {
+                        call,
+                        resource,
+                        current,
+                        maximum,
+                    } => {
+                        syscalls::sysinfo::record_early_limit_read(call, resource, current, maximum)
+                    }
+                }
             }
         } else if let Some(ptr) = auxv.at_random() {
             // It is safe to mutate this address since libc has not yet had a
