@@ -548,6 +548,20 @@ pub struct Config {
     #[clap(skip = false)]
     pub recordreplay_modes: bool,
 
+    /// **Internal:** Set only by `hermit replay`, alongside `recordreplay_modes`. Replay serves
+    /// socket reads, writes, accepts and connects, and `poll`, `ppoll`, `select` and
+    /// `pselect6`, from the recording, so they cannot block. They still run as backgrounded
+    /// blocking I/O, as during recording, but Detcore's scheduler commits no other turn until
+    /// they finish. Otherwise the descriptor-table changes of different threads could
+    /// interleave differently from one replay to the next.
+    ///
+    /// It never enters the legacy form ([`to_legacy_backend_json`]), so the DBT runtime's
+    /// `HERMIT_DBT_DETCONFIG` in the guest's environment is unchanged by its introduction
+    /// and reads it as false. Record and replay run only on the ptrace backend.
+    #[serde(default)]
+    #[clap(skip = false)]
+    pub replaying: bool,
+
     /// **Internal:** debugging option to stop execution after a specific scheduler commit, aka turn number
     /// (non-negative integer). This only makes sense if `--sequentialize-threads` is specified, as the scheduler is otherwise not engaged.
     #[clap(long, value_name = "turn_N")]
@@ -1519,7 +1533,8 @@ impl Default for Config {
 /// that capability reads, and [`Config::in_guest_detlog_forward_policy`],
 /// which is unset for DBT. So is [`Config::target_timeslice_syscalls_only`],
 /// added after this form froze; DBT runs without a PMU maximum, where the
-/// option has no effect. Every other field is serialized exactly as
+/// option has no effect. So is [`Config::replaying`], set only by `hermit
+/// replay`, which runs only on the ptrace backend. Every other field is serialized exactly as
 /// `serde_json::to_string(config)` serializes it.
 ///
 /// Use this wherever the JSON is visible to the guest. `hermit run
@@ -1849,13 +1864,16 @@ mod legacy_backend_json {
     /// the behaviour every legacy reader already has.
     /// `in_guest_detlog_forward_policy` is unset for DBT (its runtime forwards
     /// no records on a socket), so it is never written and reads as unset.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 6] = [
+    /// `replaying` is never written either: only `hermit replay` sets it, and
+    /// replay runs only on the ptrace backend.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 7] = [
         "backend",
         "record_host_inputs",
         "backend_supports_blocked_wait_signal_interruption",
         "guest_may_inherit_a_terminal",
         "in_guest_detlog_forward_policy",
         "target_timeslice_syscalls_only",
+        "replaying",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -1947,8 +1965,9 @@ mod legacy_backend_json {
     /// there nor [`Config::record_host_inputs`],
     /// [`Config::backend_supports_blocked_wait_signal_interruption`],
     /// [`Config::guest_may_inherit_a_terminal`],
-    /// [`Config::in_guest_detlog_forward_policy`] or
-    /// [`Config::target_timeslice_syscalls_only`] takes an element. Each gets a
+    /// [`Config::in_guest_detlog_forward_policy`],
+    /// [`Config::target_timeslice_syscalls_only`] or [`Config::replaying`]
+    /// takes an element. Each gets a
     /// placeholder; [`super::from_legacy_backend_json`] replaces the first.
     struct LegacyPositions<'f, 'l, A> {
         inner: A,
@@ -1982,7 +2001,8 @@ mod legacy_backend_json {
                     "record_host_inputs"
                     | "backend_supports_blocked_wait_signal_interruption"
                     | "guest_may_inherit_a_terminal"
-                    | "target_timeslice_syscalls_only",
+                    | "target_timeslice_syscalls_only"
+                    | "replaying",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Unset, as its serde default is.
                 Some("in_guest_detlog_forward_policy") => seed
@@ -2232,7 +2252,8 @@ mod legacy_backend_json {
                 | "backend_supports_blocked_wait_signal_interruption"
                 | "guest_may_inherit_a_terminal"
                 | "in_guest_detlog_forward_policy"
-                | "target_timeslice_syscalls_only" => Ok(()),
+                | "target_timeslice_syscalls_only"
+                | "replaying" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -2693,9 +2714,9 @@ mod tests {
     /// The legacy form's positions are `Config`'s fields in declaration order
     /// with the fifteen legacy keys where `backend` stands and no
     /// `record_host_inputs`, `backend_supports_blocked_wait_signal_interruption`,
-    /// `guest_may_inherit_a_terminal`, `in_guest_detlog_forward_policy` or
-    /// `target_timeslice_syscalls_only`, which is the key order the encoder
-    /// writes.
+    /// `guest_may_inherit_a_terminal`, `in_guest_detlog_forward_policy`,
+    /// `target_timeslice_syscalls_only` or `replaying`, which is the key order
+    /// the encoder writes.
     #[test]
     fn legacy_positions_are_the_encoded_key_order() {
         let names = legacy_backend_keys(&Config::default()).map(|(name, _)| name);
@@ -2714,7 +2735,8 @@ mod tests {
                 | "backend_supports_blocked_wait_signal_interruption"
                 | "guest_may_inherit_a_terminal"
                 | "in_guest_detlog_forward_policy"
-                | "target_timeslice_syscalls_only" => {}
+                | "target_timeslice_syscalls_only"
+                | "replaying" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -2726,10 +2748,10 @@ mod tests {
         assert_eq!(keys, expected);
         // `backend` becomes fifteen keys; `record_host_inputs`,
         // `backend_supports_blocked_wait_signal_interruption`,
-        // `guest_may_inherit_a_terminal`, `in_guest_detlog_forward_policy` and
-        // `target_timeslice_syscalls_only` none.
+        // `guest_may_inherit_a_terminal`, `in_guest_detlog_forward_policy`,
+        // `target_timeslice_syscalls_only` and `replaying` none.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len() + 9, keys.len());
+        assert_eq!(fields.len() + 8, keys.len());
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -2917,6 +2939,53 @@ mod tests {
                 .unwrap()
                 .target_timeslice_syscalls_only
         );
+    }
+
+    /// `replaying` never enters the legacy form, whatever its value: the
+    /// guest-visible string stays the legacy bytes, and it reads back as false
+    /// from both the object and the array form.
+    #[test]
+    fn replaying_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            replaying: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("replaying"), "{json}");
+        assert!(!from_legacy_backend_json(&json).unwrap().replaying);
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(!from_legacy_backend_json(&array).unwrap().replaying);
+    }
+
+    /// `Config` crosses Reverie RPC as legacy bincode, which is positional, so
+    /// `replaying` must be encoded whatever its value: a field left out when
+    /// false would shift every later field for the decoder.
+    #[test]
+    fn replaying_round_trips_through_reverie_bincode() {
+        for replaying in [false, true] {
+            let config = Config {
+                replaying,
+                ..Config::default()
+            };
+            let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
+            let (decoded, read): (Config, usize) =
+                bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
+            assert_eq!(read, wire.len());
+            assert_eq!(decoded.replaying, replaying);
+            assert_eq!(
+                bincode::serde::encode_to_vec(&decoded, bincode::config::legacy()).unwrap(),
+                wire
+            );
+        }
     }
 
     /// Serde reads a derived struct from a JSON array by position, so the

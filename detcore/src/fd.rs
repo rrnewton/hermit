@@ -349,6 +349,11 @@ struct OpenFileDescription {
     /// `syscall_targets_internal_fd`.
     #[serde(default)]
     socketpair_endpoint: bool,
+    /// True when `accept(2)` or `accept4(2)` returned this socket. Record and
+    /// replay keep such a connection only in the log, and replay stands in an
+    /// eventfd for it. See `is_accepted_connection`.
+    #[serde(default)]
+    accepted_connection: bool,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#2373)
     /// The `flock(2)` mode this open file description currently holds, as the
@@ -435,6 +440,7 @@ impl DetFd {
                 network_lowat: None,
                 network_socket: NetworkSocketKind::NotInet,
                 socketpair_endpoint: false,
+                accepted_connection: false,
                 flock_mode: None,
                 flock_mode_known: true,
                 flock_mode_ever_known: true,
@@ -1042,6 +1048,18 @@ impl DetFd {
     /// container-internal.
     pub(crate) fn is_socketpair_endpoint(&self) -> bool {
         self.with_description(|d| d.socketpair_endpoint)
+    }
+
+    /// Mark this open file as a connection returned by `accept(2)` or
+    /// `accept4(2)`. It applies to the open file description, so dup and fork
+    /// aliases are covered too.
+    pub(crate) fn set_accepted_connection(&self) {
+        self.with_description(|d| d.accepted_connection = true);
+    }
+
+    /// Whether `accept(2)` or `accept4(2)` returned this open file.
+    pub(crate) fn is_accepted_connection(&self) -> bool {
+        self.with_description(|d| d.accepted_connection)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED

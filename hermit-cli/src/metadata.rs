@@ -192,7 +192,11 @@ impl RecordVersion {
 // inode columns over the recorded raw bytes, during recording and again during
 // replay. An older recording replayed under the new numbering could show the
 // guest different bytes, although no event shape changed.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x123);
+// 0x123 -> 0x124: accept and accept4 record an `Accept` event, and bind, listen
+// and shutdown record a `Return` event, instead of running live during replay
+// (https://github.com/rrnewton/hermit/issues/3864). An older recording has no
+// events for these calls, so this replayer would consume another call's event.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x124);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -217,7 +221,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x123);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x123;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x124;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -467,6 +471,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         sched_seed: default_config.sched_seed,
         network_trace: Default::default(),
         recordreplay_modes: true,
+        replaying: false,
         record_preemptions: false,
         record_preemptions_to: None,
         replay_preemptions_from: None,
@@ -743,6 +748,14 @@ mod tests {
     #[test]
     fn record_version_rejects_pre_request_ordinal_inode_streams() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x122)));
+    }
+
+    /// A 0x123 recording has no events for accept, accept4, bind, listen or
+    /// shutdown, which this replayer serves from the log, so replaying it would
+    /// consume other calls' events; the version gate must refuse it.
+    #[test]
+    fn record_version_rejects_pre_accept_streams() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x123)));
     }
 
     #[test]

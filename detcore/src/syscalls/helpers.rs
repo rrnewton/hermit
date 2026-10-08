@@ -172,6 +172,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             _ => unreachable!("blocking syscall helper requires a blocking resource"),
         };
+        // Replay serves some of these calls from the recording, so they cannot block.
+        // They still run in the background, as they did during recording, so that the
+        // schedule matches the recording's. The flag makes the scheduler commit no
+        // other turn until they finish. Otherwise a stand-in descriptor that replay
+        // creates for an accepted connection could take its slot before or after
+        // another thread's open or close, and which of these calls had finished, and
+        // so the order in which they rejoin, would depend on host timing
+        // (https://github.com/rrnewton/hermit/pull/3871).
+        let replay_served_from_log = self.cfg.replaying
+            && (replay_serves_blocking_call_from_log(call)
+                || replay_serves_socket_call_from_log(guest, call));
         // Internal-vs-external fd classification happens at the call sites that hold the
         // typed, nonblockize-able syscall (see execute_nonblockable_fd_syscall):
         // container-internal pipes are routed to the InternalIOPolling nonblockize-retry
@@ -198,6 +209,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             rsrcs.insert(blocking_resource, Permission::RW);
             rsrcs.fyi(call.name());
             rsrcs.blocked_signal_mask = blocked_signal_mask;
+            rsrcs.replay_served_from_log = replay_served_from_log;
             resource_request(guest, rsrcs).await;
         }
         tracing::trace!(
@@ -849,6 +861,79 @@ pub fn syscall_targets_internal_fd<G: Guest<Detcore<T>>, T: RecordOrReplay>(
             .unwrap_or(false),
         None => false,
     }
+}
+
+/// Does replay answer this call from the recording rather than by running it?
+///
+/// This follows the replayer's dispatch. It serves `accept`, `accept4`, `connect`,
+/// `sendto`, `sendmsg`, `recvfrom` and `recvmsg` from its log whatever the descriptor
+/// is, so they count even on a descriptor Detcore does not track, such as a listener
+/// received over `SCM_RIGHTS`; an untagged accept there would let its stand-in take a
+/// slot at a host-timed point. `read`, `readv`, `write` and `writev` count only on a
+/// socket Detcore created with `socket(2)` or `accept(2)`: on other descriptors,
+/// replay may run them for real as eventfd operations, which can block, so an unknown
+/// descriptor is not assumed to be served from the log. `recvmmsg` and `sendmmsg` are
+/// recorded by neither recorder nor replayer (on an accepted connection record/replay
+/// refuses them, see `refuse_log_served_mmsg`).
+fn replay_serves_socket_call_from_log<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &mut G,
+    call: Syscall,
+) -> bool {
+    let fd = match call {
+        Syscall::Accept(_)
+        | Syscall::Accept4(_)
+        | Syscall::Connect(_)
+        | Syscall::Sendto(_)
+        | Syscall::Sendmsg(_)
+        | Syscall::Recvfrom(_)
+        | Syscall::Recvmsg(_) => return true,
+        Syscall::Read(s) => s.fd(),
+        Syscall::Readv(s) => s.fd(),
+        Syscall::Write(s) => s.fd(),
+        Syscall::Writev(s) => s.fd(),
+        _ => return false,
+    };
+    is_log_served_socket(guest, fd)
+}
+
+/// Does replay answer this otherwise blocking call from the recording alone?
+///
+/// The replayer serves `poll`, `ppoll`, `select` and `pselect6` from the log
+/// without running them. `epoll_wait` is excluded because replay reapplies its
+/// side effects on live descriptors, which may block.
+fn replay_serves_blocking_call_from_log(call: Syscall) -> bool {
+    matches!(
+        call,
+        Syscall::Poll(_) | Syscall::Ppoll(_) | Syscall::Select(_) | Syscall::Pselect6(_)
+    )
+}
+
+/// Is `fd` a socket whose connection record and replay keep only in the log?
+///
+/// That is a socket Detcore created with `socket(2)` or `accept(2)`, but not a
+/// socketpair endpoint: replay recreates a socketpair, and its operations run
+/// live.
+fn is_log_served_socket<G: Guest<Detcore<T>>, T: RecordOrReplay>(guest: &mut G, fd: i32) -> bool {
+    guest
+        .thread_state()
+        .with_detfd(fd, |detfd| {
+            matches!(detfd.ty(), FdType::Socket) && !detfd.is_socketpair_endpoint()
+        })
+        .unwrap_or(false)
+}
+
+/// Is `fd` a connection that `accept(2)` or `accept4(2)` returned? Record and
+/// replay keep such a connection only in the log, and replay stands in an
+/// eventfd for it, so an operation that runs live during replay meets that
+/// eventfd rather than a connected socket.
+pub(crate) fn is_accepted_connection<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &mut G,
+    fd: i32,
+) -> bool {
+    guest
+        .thread_state()
+        .with_detfd(fd, |detfd| detfd.is_accepted_connection())
+        .unwrap_or(false)
 }
 
 /// A large subset of system calls have a single, unique file descriptor argument.  This

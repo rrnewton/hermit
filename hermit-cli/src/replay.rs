@@ -87,6 +87,7 @@ impl Replay {
         }
 
         let mut config = record_or_replay_config(dir);
+        config.replaying = true;
         // Recorder events contain the raw bytes from the recording namespace.
         // Reapply Detcore's sanitizer with the recording-time mount IDs, not
         // the unrelated IDs of this fresh replay namespace.

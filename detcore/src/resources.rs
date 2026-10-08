@@ -402,6 +402,15 @@ pub struct Resources {
     /// (<https://github.com/rrnewton/hermit/issues/3146>).
     #[serde(default)]
     pub(crate) blocked_signal_mask: Option<u64>,
+    /// Set on a `BlockingExternalIO` request whose call `hermit replay` serves
+    /// from the recording. Such a call runs in the background as it did during
+    /// recording, so the schedule matches the recording's, but it cannot
+    /// block. The scheduler therefore commits no other turn until it has
+    /// finished, and readmits such calls before any other background call, so
+    /// that neither its effects nor when it rejoins depend on host timing.
+    /// `false` outside replay.
+    #[serde(default)]
+    pub(crate) replay_served_from_log: bool,
 }
 
 impl fmt::Debug for Resources {
@@ -421,6 +430,9 @@ impl fmt::Debug for Resources {
         if let Some(mask) = self.blocked_signal_mask {
             debug.field("blocked_signal_mask", &mask);
         }
+        if self.replay_served_from_log {
+            debug.field("replay_served_from_log", &true);
+        }
         debug.finish()
     }
 }
@@ -436,6 +448,7 @@ impl Resources {
             signal_interrupt_errno: None,
             backend_runtime_bootstrap: false,
             blocked_signal_mask: None,
+            replay_served_from_log: false,
         }
     }
 
@@ -466,6 +479,7 @@ impl Resources {
             (Some(left), Some(right)) => assert_eq!(left, right),
             (Some(_), None) => {}
         }
+        self.replay_served_from_log |= other.replay_served_from_log;
     }
 
     pub fn set_signal_interrupt_errno(&mut self, errno: Errno) {

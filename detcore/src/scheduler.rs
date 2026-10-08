@@ -475,6 +475,14 @@ pub struct BlockedPool {
     /// sleeper the scheduler counts as unwakeable, and the next pass reports a
     /// deadlock before the thread's signal stop is posted.
     pub signaled_sigsuspend_requests: BTreeMap<DetTid, Signal>,
+
+    /// Threads in `external_io_blockers` whose call `hermit replay` serves
+    /// from the recording (`Resources::replay_served_from_log`). Such a call
+    /// cannot block, so `step2c_process_io_blockers` commits no turn until all
+    /// of them have finished, then readmits them, in thread order, before any
+    /// other background call. An entry lives exactly
+    /// as long as the thread's `external_io_blockers` entry.
+    pub replay_log_served: BTreeSet<DetTid>,
 }
 
 impl BlockedPool {
@@ -3403,6 +3411,7 @@ impl Scheduler {
     fn remove_blocking_entries(&mut self, dtid: &DetTid) {
         self.blocked.timed_waiters.remove(*dtid);
         let _ = self.blocked.external_io_blockers.remove(dtid);
+        self.blocked.replay_log_served.remove(dtid);
         let _ = self.blocked.rt_sigsuspend_blockers.remove(dtid);
         let _ = self.blocked.out_of_scheduler_masks.remove(dtid);
         self.blocked.timed_out_futex_waiters.remove(dtid);
@@ -3788,6 +3797,7 @@ impl Scheduler {
                 dtid
             );
             let external = self.blocked.external_io_blockers.remove(&dtid);
+            self.blocked.replay_log_served.remove(&dtid);
             let sigsuspend = self.blocked.rt_sigsuspend_blockers.remove(&dtid);
             let _ = self.blocked.out_of_scheduler_masks.remove(&dtid);
             assert!(
@@ -4935,6 +4945,7 @@ impl Scheduler {
                         ready_dtid
                     );
                     let external = scheduler.blocked.external_io_blockers.remove(ready_dtid);
+                    scheduler.blocked.replay_log_served.remove(ready_dtid);
                     let sigsuspend = scheduler.blocked.rt_sigsuspend_blockers.remove(ready_dtid);
                     let _ = scheduler.blocked.out_of_scheduler_masks.remove(ready_dtid);
                     assert!(
@@ -4949,6 +4960,25 @@ impl Scheduler {
             // "Nondeterminstic algorithm" below, but record & replay those scheduler events. In
             // the meantime, use a deterministic eager policy once there is no other runnable work.
             if self.recordreplay_modes {
+                // A call that replay serves from the recording cannot block, but it
+                // changes guest state while it runs: the stand-in for an accepted
+                // connection takes a descriptor slot. Commit no other turn until every
+                // such call has finished, so that each takes effect right after its own
+                // turn rather than among other threads' turns at a host-timed point.
+                // Waiting changes only how long the scheduler spins, not what it commits
+                // next. It also makes the readiness of these calls below independent of
+                // host timing.
+                let log_served: Vec<DetTid> =
+                    self.blocked.replay_log_served.iter().copied().collect();
+                if log_served.iter().any(|dtid| !ready.contains(dtid)) {
+                    trace!(
+                        "[step2] waiting for background calls replay serves from the log, dtids {:?}",
+                        log_served
+                    );
+                    std::thread::yield_now();
+                    return Err(SkipTurn);
+                }
+
                 // Only *real* deterministic work should defer external-IO harvesting.
                 // Internal pollers sit at LAST_PRIORITY and are frequently spinning on
                 // the very result an external-IO blocker will produce (e.g. the reader
@@ -4967,6 +4997,13 @@ impl Scheduler {
                 // cannot complete clone while an existing worker blocks indefinitely in
                 // epoll_wait.
                 if !self.run_queue.is_empty() && !only_pollers {
+                    return Ok(());
+                }
+
+                // Readmit those calls first, in thread order; every one has finished.
+                // Other background calls are readmitted below once none of them remain.
+                if !log_served.is_empty() {
+                    requeue_ready(self, &log_served);
                     return Ok(());
                 }
 
@@ -5701,14 +5738,21 @@ impl Scheduler {
                 0 => Ok(()),
                 1 => {
                     let (rid, perm) = rs.resources.iter().next().unwrap();
-                    self.block_for_one_resource(
+                    let blocked = self.block_for_one_resource(
                         dettid,
                         rid,
                         perm,
                         rs.signal_interrupt_errno(),
                         rs.blocked_signal_mask,
                         resp,
-                    )
+                    );
+                    if rs.replay_served_from_log
+                        && matches!(rid, ResourceID::BlockingExternalIO(_))
+                        && self.blocked.external_io_blockers.contains_key(&dettid)
+                    {
+                        self.blocked.replay_log_served.insert(dettid);
+                    }
+                    blocked
                 }
                 _ => {
                     panic!(

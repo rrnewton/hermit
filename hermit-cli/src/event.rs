@@ -129,6 +129,9 @@ pub enum SyscallEvent {
     /// The result of a guest-semantic `madvise` and the file-backed contents
     /// replay must restore over its anonymous replacement mappings.
     Madvise(MadviseEvent),
+    /// The outcome and peer-address copy-out of an `accept4` that the kernel
+    /// completed.
+    Accept(AcceptEvent),
 }
 
 /// Recorded output and signal side effects of a read syscall.
@@ -356,6 +359,28 @@ pub struct MadviseRefill {
     pub bytes: Vec<u8>,
     /// `PROT_*` bits of the mapping, restored after replay writes the bytes.
     pub prot: i32,
+}
+
+/// The guest-visible outputs of an `accept` or `accept4` that the kernel
+/// completed.
+///
+/// Linux takes the connection off the queue before it copies the peer address
+/// out, so the copy-out can still fail with `EFAULT` or `EINVAL` after memory
+/// has changed. Such a call is recorded here with its error and the writes that
+/// preceded it; a call that failed before the kernel accepted anything is
+/// recorded as a plain error event.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AcceptEvent {
+    /// The descriptor number of the accepted connection, or the error the
+    /// address copy-out returned, in which case no descriptor was installed.
+    pub result: Result<i32, Errno>,
+    /// The prefix of the peer address written to the guest's buffer. It is
+    /// shorter than the truncated address when the copy-out faulted, and empty
+    /// when the guest passed no address buffer.
+    pub addr: Vec<u8>,
+    /// The full address length written back through `addrlen`, or `None` when
+    /// nothing was written there.
+    pub addr_len: Option<libc::socklen_t>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -2615,7 +2615,6 @@ fn record_pipe_read_after_clearing_nonblocking_waits_for_its_writer() {
 /// comparison matches when the recording itself captured the wrong result.
 /// Returns a description of each phase that failed.
 fn blocking_read_failures(kind: &str, clear: Option<&str>) -> Vec<String> {
-    let program = &workload("c_record_replay_socketpair_blocking_read").path;
     let label = match clear {
         Some(clear) => format!("{kind} {clear}"),
         None => kind.to_owned(),
@@ -2625,11 +2624,29 @@ fn blocking_read_failures(kind: &str, clear: Option<&str>) -> Vec<String> {
     } else {
         ("recv", "recvmsg")
     };
-    let expected = format!(
-        "{kind} original: read=5 errno=0 data=hello\n\
-         {kind} dup: {dup_receive}=5 errno=0 data=hello\n\
-         {kind} fork: {fork_receive}=5 errno=0 data=hello\n"
-    );
+    let args: Vec<&str> = std::iter::once(kind).chain(clear).collect();
+    record_replay_output_failures(
+        &label,
+        &workload("c_record_replay_socketpair_blocking_read").path,
+        &args,
+        &format!(
+            "{kind} original: read=5 errno=0 data=hello\n\
+             {kind} dup: {dup_receive}=5 errno=0 data=hello\n\
+             {kind} fork: {fork_receive}=5 errno=0 data=hello\n"
+        ),
+    )
+}
+
+/// Records `program` with `args` under `hermit record start` and then replays
+/// it with `hermit replay --autopilot`. Each phase runs under a timeout, must
+/// exit 0 and must print exactly `expected`. Returns a description, starting
+/// with `label`, of each phase that failed.
+fn record_replay_output_failures(
+    label: &str,
+    program: &Path,
+    args: &[&str],
+    expected: &str,
+) -> Vec<String> {
     let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
     let mut record = Command::new("timeout");
     record
@@ -2639,8 +2656,7 @@ fn blocking_read_failures(kind: &str, clear: Option<&str>) -> Vec<String> {
         .arg(format!("--data-dir={}", data_dir.path().display()))
         .arg("--")
         .arg(program)
-        .arg(kind)
-        .args(clear);
+        .args(args);
     let mut replay = Command::new("timeout");
     replay
         .args(["--kill-after=5s", "45s"])
@@ -2710,6 +2726,321 @@ fn record_socketpair_read_after_clearing_nonblocking_waits_for_its_writer() {
         })
         .collect();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A guest that accepts its own loopback TCP connections (see
+/// `tests/c/record_replay_tcp_accept.c`). Record used to let `accept(2)` and
+/// `accept4(2)` run live and logged nothing, so replay issued them against a
+/// listener with no client and waited forever. Every round must print what
+/// Linux gives the guest: the echoed bytes; the peer's address family, length
+/// and host, in full and truncated to a 4-byte buffer that Linux must not
+/// write past; the close-on-exec flag, both as `fcntl` reports it and as the
+/// next descriptor of an exec'd child sees it; `SOCK_NONBLOCK`, through
+/// `F_GETFL` and an `EAGAIN` read; and the `EAGAIN` and `EINVAL` failures.
+#[test]
+fn record_tcp_accept_replays_from_the_log() {
+    let _guard = hermit_record_lock();
+    let failures = record_replay_output_failures(
+        "tcp-accept",
+        &workload("c_record_replay_tcp_accept").path,
+        &[],
+        "client: go=2 sent=4 echo=ping\n\
+         server accept: echoed=4 family=2 len=16 host=127.0.0.1\n\
+         exec child: open fresh\n\
+         client: go=2 sent=4 echo=ping\n\
+         server accept4: echoed=4 cloexec=1\n\
+         exec child: open reuse\n\
+         client: go=2 sent=4 echo=ping\n\
+         server truncated: echoed=4 family=2 len=16 untouched=1\n\
+         client: go=2 sent=4 echo=ping\n\
+         server nonblock: early=-1 errno=EAGAIN nonblock=1 echoed=4\n\
+         server errors: empty=-1 errno=EAGAIN badflags=-1 errno=EINVAL\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// What `accept4(2)` writes back at the edges (see
+/// `tests/c/record_replay_accept_copyout.c`): address buffers and `*addrlen`
+/// that end at, or straddle, an unmapped or read-only page. Record used to
+/// read `*addrlen` and copy the address with plain memory accesses after the
+/// call, so a legal short buffer next to an unmapped page turned a successful
+/// accept into a recorded error, and an error Linux returned after writing
+/// part of the guest's memory replayed without those bytes. An `*addrlen` on
+/// a write-only page is legal, because on x86 Linux can read any writable user
+/// page, while one on a `PROT_NONE` page faults. The last two cases call accept4
+/// on a stack of the guest's own, one only 192 bytes above an unmapped page and
+/// one whose zero `*addrlen` sits past the red zone: record used to borrow
+/// guest stack below the red zone for the address, which faulted on the first
+/// and overwrote the second's capacity. Recent Linux (7.1
+/// and later) writes the length first and then the address, stopping at a
+/// fault; record follows that order on every host, and each case's result,
+/// length, copied prefix and untouched tail must match it in both phases. Linux
+/// 7.0 and earlier copy the address first, so a native run there differs in the
+/// two fault cases.
+#[test]
+fn record_accept_copies_the_peer_address_out_as_linux_does() {
+    let _guard = hermit_record_lock();
+    let failures = record_replay_output_failures(
+        "accept-copyout",
+        &workload("c_record_replay_accept_copyout").path,
+        &[],
+        "full: result=fd len=16 prefix=1 tail=1 nofd=1\n\
+         zero: result=fd len=16 prefix=1 tail=1 nofd=1\n\
+         truncated: result=fd len=16 prefix=1 tail=1 nofd=1\n\
+         address-ends-at-page-4: result=fd len=16 prefix=1 tail=1 nofd=1\n\
+         address-ends-at-page-1: result=fd len=16 prefix=1 tail=1 nofd=1\n\
+         addrlen-ends-at-page: result=fd len=16 prefix=1 tail=1 nofd=1\n\
+         addrlen-straddles-pages: result=fd len=16 prefix=1 tail=1 nofd=1\n\
+         address-faults-after-4: result=EFAULT len=16 prefix=1 tail=1 nofd=1\n\
+         addrlen-read-only: result=EFAULT len=16 prefix=1 tail=1 nofd=1\n\
+         addrlen-unmapped: result=EFAULT len=-1 prefix=1 tail=1 nofd=1\n\
+         addrlen-write-only: result=fd len=16 prefix=1 tail=1 nofd=1\n\
+         addrlen-inaccessible: result=EFAULT len=-1 prefix=1 tail=1 nofd=1\n\
+         addrlen-null: result=EFAULT len=-1 prefix=1 tail=1 nofd=1\n\
+         negative: result=EINVAL len=-1 prefix=1 tail=1 nofd=1\n\
+         tight-stack: result=fd len=16 prefix=1 tail=1 nofd=1\n\
+         zero-addrlen-below-red-zone: result=fd len=16 prefix=1 tail=1 nofd=1\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Linux reads `*addrlen` after `accept(2)` has waited for a connection, not
+/// before. In `tests/c/record_replay_accept_copyout.c wait` one thread blocks
+/// in accept with `*addrlen` 0 while another sets it to 16 and only then
+/// connects. Record used to save the capacity before the wait, so the guest
+/// got no address at all.
+#[test]
+fn record_accept_reads_the_address_capacity_after_the_wait() {
+    let _guard = hermit_record_lock();
+    let failures = record_replay_output_failures(
+        "accept-wait",
+        &workload("c_record_replay_accept_copyout").path,
+        &["wait"],
+        "wait: result=fd len=16 prefix=1 tail=1 connector=0\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A thread cloned with `CLONE_THREAD` but without `CLONE_FILES` has a
+/// descriptor table of its own (see `tests/c/record_replay_accept_copyout.c
+/// private-table`). Record used to look up the socket such a thread accepted
+/// in the leader's table, where the same number holds a decoy connection, and
+/// so wrote the decoy's peer address into the guest's buffer. The accept must
+/// get the connecting client's address, with and without an address buffer.
+#[test]
+fn record_accept_on_a_thread_with_its_own_fd_table_names_its_peer() {
+    let _guard = hermit_record_lock();
+    let program = &workload("c_record_replay_accept_copyout").path;
+    let mut failures = record_replay_output_failures(
+        "accept-private-table",
+        program,
+        &["private-table"],
+        "private-table: result=fd fd=1 len=16 peer=1 decoy=1\n",
+    );
+    failures.extend(record_replay_output_failures(
+        "accept-private-table-noaddr",
+        program,
+        &["private-table-noaddr"],
+        "private-table-noaddr: result=fd fd=1 len=0 peer=1 decoy=1\n",
+    ));
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Replay decides whether to reapply a recorded `setsockopt(2)` or
+/// `shutdown(2)` by what the descriptor names: an accepted connection's
+/// stand-in, a Unix socket, or another socket. For a thread with its own
+/// descriptor table (see `tests/c/record_replay_accept_copyout.c
+/// private-table-sockets`) that is the thread's table, where the number can
+/// name something else than in the leader's. Replay used to look in the
+/// leader's table, so it reapplied both calls to an accepted connection's
+/// stand-in and failed, skipped a socketpair shutdown that a live `recvmmsg(2)`
+/// then missed, and took a connected client socket for a Unix socket.
+#[test]
+fn replay_reapplies_socket_calls_against_the_calling_threads_own_fd_table() {
+    let _guard = hermit_record_lock();
+    let failures = record_replay_output_failures(
+        "accept-private-table-sockets",
+        &workload("c_record_replay_accept_copyout").path,
+        &["private-table-sockets"],
+        "private-table-sockets: accept_fd=1 setsockopt=0 shutdown=0 pair_fd=1 \
+         pair_shutdown=0 pair_eof=1 client_fd=1 client_shutdown=0\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// `shutdown(2)` on a socketpair endpoint must take effect on the live socket
+/// in replay, because the receive that follows it runs live: Linux reports the
+/// shutdown to `recvmmsg(2)` on the other end as one message of length 0
+/// (see `tests/c/record_replay_socket_mmsg.c`). Replay used to return only the
+/// recorded result of the shutdown, so the receive found the socket open and
+/// failed with `EAGAIN`.
+#[test]
+fn replay_applies_a_socketpair_shutdown_before_a_live_recvmmsg() {
+    let _guard = hermit_record_lock();
+    let failures = record_replay_output_failures(
+        "socketpair-mmsg",
+        &workload("c_record_replay_socket_mmsg").path,
+        &[],
+        "socketpair: shutdown=0 recv=1 length=0 err=0\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Record/replay serves an accepted connection's data from its log and stands
+/// the connection in with a descriptor that carries none, so batched I/O that
+/// would run live against it cannot be faithful. Record must stop and name the
+/// call rather than let it reach that stand-in (see
+/// `tests/c/record_replay_socket_mmsg.c`), and the guest must not print its
+/// result line.
+fn assert_recording_refuses_mmsg_on_an_accepted_connection(mode: &str, sysno: &str) {
+    let _guard = hermit_record_lock();
+    let data_dir = tempfile::tempdir().expect("failed to create recording directory");
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["record", "start", "--record-timeout=30", "--data-dir"])
+        .arg(data_dir.path())
+        .arg("--")
+        .arg(&workload("c_record_replay_socket_mmsg").path)
+        .arg(mode);
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start the {sysno} recording: {error}"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_ne!(
+        output.status.code(),
+        Some(124),
+        "{sysno} recording hung: {rendered}"
+    );
+    assert!(
+        !output.status.success(),
+        "{sysno} recording reported success: {rendered}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("unsupported syscall: {sysno}")),
+        "{sysno} recording did not name {sysno}:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("accepted:"),
+        "the guest ran past the refused {sysno}: {stdout}"
+    );
+}
+
+#[test]
+fn recording_refuses_sendmmsg_on_an_accepted_connection() {
+    assert_recording_refuses_mmsg_on_an_accepted_connection("accepted", "sendmmsg");
+}
+
+#[test]
+fn recording_refuses_recvmmsg_on_an_accepted_connection() {
+    assert_recording_refuses_mmsg_on_an_accepted_connection("accepted-recv", "recvmmsg");
+}
+
+/// Replay's refusal of a recording in which an accepted connection holds a
+/// different descriptor slot than it did during recording, as
+/// `hermit-cli/src/replayer.rs` prints it.
+const ACCEPT_SLOT_REFUSAL: &str = "replay refused: an accepted connection's \
+    descriptor slot differs from the recording, because record does not log where a \
+    backgrounded accept took its slot (https://github.com/rrnewton/hermit/issues/3880)";
+
+/// One thread accepts loopback TCP connections while another opens and closes
+/// descriptors (see `tests/c/record_replay_tcp_accept_threads.c`). Replay
+/// serves each accept from the log and refuses to continue if the recorded
+/// descriptor number is not the one free at that point. Replay runs the
+/// accept in the background, as record did, and the scheduler used to commit
+/// the other thread's turns while it ran, so where its stand-in landed among
+/// that thread's calls depended on host timing and replays of one recording
+/// disagreed: some finished and some refused. Every replay of the recording
+/// must now end with the same exit status and output.
+///
+/// Record does not yet capture where among the other thread's calls the
+/// recorded accept ran, so these replays may all refuse rather than all
+/// succeed; https://github.com/rrnewton/hermit/issues/3880 tracks that. Replay
+/// catches it at one of two points: at the accept, when its recorded slot is
+/// taken, or at the other thread's open, when the accept's stand-in holds the
+/// slot that open recorded. Both refuse with the same named message. The test
+/// requires the recording to succeed, the replays to agree, and their common
+/// outcome to be either the recorded output or that refusal. Any other
+/// descriptor-slot divergence panics with a different message and fails it.
+#[test]
+fn replays_of_a_threaded_tcp_accept_recording_agree() {
+    assert_threaded_accept_replays_agree(&[]);
+}
+
+/// As `replays_of_a_threaded_tcp_accept_recording_agree`, but the guest
+/// accepts through a listener it received over `SCM_RIGHTS`. Detcore does not
+/// track a received descriptor, so replay must hold the scheduler for the
+/// accept because of the call itself, not because it knows the listener.
+#[test]
+fn replays_of_a_threaded_tcp_accept_recording_agree_for_a_received_listener() {
+    assert_threaded_accept_replays_agree(&["scm-rights"]);
+}
+
+fn assert_threaded_accept_replays_agree(guest_args: &[&str]) {
+    const REPLAYS: usize = 10;
+    let _guard = hermit_record_lock();
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let mut record = Command::new("timeout");
+    record
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "record", "start", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg("--")
+        .arg(&workload("c_record_replay_tcp_accept_threads").path)
+        .args(guest_args);
+    let recorded = command_output(record, "recording of the threaded accept workload");
+    let recorded_stdout = String::from_utf8_lossy(&recorded.stdout).into_owned();
+    assert_eq!(recorded_stdout, "threads: echoed=20 clients_ok=1\n");
+    let outcomes: Vec<(Option<i32>, String, String)> = (0..REPLAYS)
+        .map(|_| {
+            let mut replay = Command::new("timeout");
+            replay
+                .args(["--kill-after=5s", "45s"])
+                .arg(env!("CARGO_BIN_EXE_hermit"))
+                .args(["--log=off", "replay", "--autopilot"])
+                .arg(format!("--data-dir={}", data_dir.path().display()));
+            let output = replay.output().expect("failed to start replay");
+            (
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            )
+        })
+        .collect();
+    let (first_status, first_stdout, _) = &outcomes[0];
+    let disagreeing: Vec<String> = outcomes
+        .iter()
+        .enumerate()
+        .filter(|(_, (status, stdout, _))| status != first_status || stdout != first_stdout)
+        .map(|(index, (status, stdout, stderr))| {
+            format!("replay {index}: status {status:?}\nstdout:\n{stdout}stderr:\n{stderr}")
+        })
+        .collect();
+    assert!(
+        disagreeing.is_empty(),
+        "replay 0 exited {first_status:?} with stdout:\n{first_stdout}stderr:\n{}\n\
+         {} of {REPLAYS} replays disagreed with it:\n{}",
+        outcomes[0].2,
+        disagreeing.len(),
+        disagreeing.join("\n"),
+    );
+    let finished = *first_status == Some(0) && *first_stdout == recorded_stdout;
+    let refused = *first_status == Some(HERMIT_INTERNAL_FAILURE_EXIT)
+        && outcomes[0].2.contains(ACCEPT_SLOT_REFUSAL);
+    assert!(
+        finished || refused,
+        "every replay exited {first_status:?}, which is neither the recorded output nor the \
+         descriptor-order refusal:\nstdout:\n{first_stdout}stderr:\n{}",
+        outcomes[0].2,
+    );
+    eprintln!(
+        "all {REPLAYS} replays {}",
+        if finished { "finished" } else { "refused" }
+    );
 }
 
 /// The scheduler records that place a guest's SIGCHLD in a ptrace log: every

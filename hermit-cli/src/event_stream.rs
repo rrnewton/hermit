@@ -262,12 +262,12 @@ fn kernel_arg_count(sysno: Sysno) -> Option<u8> {
         close | chdir | fchdir | dup | time | unlink | rmdir => 1,
         access | getcwd | set_robust_list | stat | fstat | lstat | dup2 | clock_gettime
         | clock_getres | gettimeofday | settimeofday | mkdir | statfs | fstatfs | ftruncate
-        | kill | listen | rt_sigpending | rename | link | symlink | chmod => 2,
+        | kill | listen | shutdown | rt_sigpending | rename | link | symlink | chmod => 2,
         mprotect | read | readv | write | writev | lseek | getdents | getdents64 | dup3 | ioctl
         | socket | fcntl | connect | sendmsg | poll | getpeername | getsockname | getrandom
         | readlink | unlinkat | open | execve | close_range | tgkill | faccessat | chown
-        | lchown | mknod => 3,
-        pread64 | pwrite64 | newfstatat | fadvise64 | openat | faccessat2 => 4,
+        | lchown | mknod | accept | bind => 3,
+        pread64 | pwrite64 | newfstatat | fadvise64 | openat | faccessat2 | accept4 => 4,
         statx | pwritev | preadv | ppoll | setsockopt | getsockopt | execveat | prctl => 5,
         recvfrom | sendto | pwritev2 | preadv2 | mmap => 6,
         _ => return None,
@@ -508,6 +508,10 @@ mod tests {
         assert_eq!(kernel_arg_count(Sysno::kill), Some(2));
         assert_eq!(kernel_arg_count(Sysno::ftruncate), Some(2));
         assert_eq!(kernel_arg_count(Sysno::listen), Some(2));
+        assert_eq!(kernel_arg_count(Sysno::shutdown), Some(2));
+        assert_eq!(kernel_arg_count(Sysno::accept), Some(3));
+        assert_eq!(kernel_arg_count(Sysno::bind), Some(3));
+        assert_eq!(kernel_arg_count(Sysno::accept4), Some(4));
         assert_eq!(kernel_arg_count(Sysno::rt_sigpending), Some(2));
         assert_eq!(kernel_arg_count(Sysno::tgkill), Some(3));
         assert_eq!(kernel_arg_count(Sysno::prctl), Some(5));

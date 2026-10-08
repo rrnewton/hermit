@@ -200,6 +200,100 @@ fn unexpected_pidfd_getfd_fd(
     }
 }
 
+/// How replay refuses a recording in which an accepted connection holds a
+/// different descriptor slot than it did during recording. Record runs
+/// `accept` in the background and does not log where it took its slot among
+/// other threads' descriptor calls, so replay can find the recorded slot taken
+/// when it reaches the accept, or find that the accept's stand-in has taken a
+/// slot that a later call recorded for another descriptor.
+pub(super) const ACCEPT_SLOT_REFUSAL: &str = "replay refused: an accepted connection's \
+    descriptor slot differs from the recording, because record does not log where a \
+    backgrounded accept took its slot (https://github.com/rrnewton/hermit/issues/3880)";
+
+/// The initial count of the eventfd that stands in for an accepted
+/// connection. Every other replay placeholder starts at 0, and replay serves
+/// every operation on a stand-in from the log, so this count never changes and
+/// marks exactly the live stand-ins and their duplicates, across `fork` and
+/// `dup`. An eventfd id would not do: Linux reuses a freed id at once, so a
+/// later placeholder would carry a closed stand-in's id. `eventfd2` takes a
+/// 32-bit initial value; a guest eventfd created with this value, or counted
+/// up to it, in a diverged slot would read as a stand-in.
+const ACCEPT_STAND_IN_COUNT: u32 = 0x3880_acc7;
+
+/// The `eventfd-count` line of an fdinfo file, present for eventfds. Linux
+/// prints the count in hexadecimal.
+fn parse_eventfd_count(fdinfo: &str) -> Option<u64> {
+    let count = fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("eventfd-count:"))?;
+    u64::from_str_radix(count.trim(), 16).ok()
+}
+
+/// Whether `fd` in the table of thread `tid` holds a placeholder installed
+/// for an accepted connection. `/proc/<tid>` shows that thread's own table,
+/// which is not the leader's for a thread cloned without `CLONE_FILES`.
+fn holds_accept_stand_in(tid: Pid, fd: libc::c_int) -> bool {
+    std::fs::read_to_string(format!("/proc/{}/fdinfo/{fd}", tid.as_raw()))
+        .ok()
+        .and_then(|fdinfo| parse_eventfd_count(&fdinfo))
+        == Some(u64::from(ACCEPT_STAND_IN_COUNT))
+}
+
+/// Why a placeholder for slot `fd` landed in `placeholder` instead: the
+/// named #3880 refusal when an accepted connection's stand-in holds the slot,
+/// and the generic divergence otherwise.
+fn slot_divergence_message(tid: Pid, fd: libc::c_int, placeholder: i64) -> String {
+    if holds_accept_stand_in(tid, fd) {
+        format!(
+            "{ACCEPT_SLOT_REFUSAL}: slot {fd}, recorded for another descriptor, holds an \
+             accepted connection's stand-in; lowest free {placeholder}"
+        )
+    } else {
+        format!(
+            "replay FD namespace diverged: expected slot {fd}, placeholder returned {placeholder}"
+        )
+    }
+}
+
+/// Whether descriptor `fd` of thread `tid` names an eventfd, which is what
+/// `reserve_replay_fd` installs as a placeholder.
+fn fd_is_eventfd(tid: Pid, fd: libc::c_int) -> bool {
+    std::fs::read_link(format!("/proc/{}/fd/{fd}", tid.as_raw()))
+        .is_ok_and(|target| target == std::path::Path::new("anon_inode:[eventfd]"))
+}
+
+/// Whether descriptor `fd` of thread `tid` is an `AF_UNIX` socket: its socket
+/// inode is listed in the `/proc/<tid>/net/unix` table of the thread's network
+/// namespace.
+fn fd_is_unix_socket(tid: Pid, fd: libc::c_int) -> io::Result<bool> {
+    let target = std::fs::read_link(format!("/proc/{}/fd/{fd}", tid.as_raw()))?;
+    let Some(inode) = socket_inode(&target) else {
+        return Ok(false);
+    };
+    let table = std::fs::read_to_string(format!("/proc/{}/net/unix", tid.as_raw()))?;
+    Ok(unix_table_lists_inode(&table, inode))
+}
+
+/// The inode of a `socket:[<inode>]` descriptor link.
+fn socket_inode(target: &std::path::Path) -> Option<u64> {
+    target
+        .to_str()?
+        .strip_prefix("socket:[")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()
+}
+
+/// Whether a `/proc/net/unix` table has a row for `inode`, its seventh column.
+fn unix_table_lists_inode(table: &str, inode: u64) -> bool {
+    table.lines().skip(1).any(|row| {
+        row.split_whitespace()
+            .nth(6)
+            .and_then(|column| column.parse::<u64>().ok())
+            == Some(inode)
+    })
+}
+
 fn remember_materialized_file(pid: Pid, fd: libc::c_int) {
     let Ok(metadata) = std::fs::metadata(format!("/proc/{}/fd/{fd}", pid.as_raw())) else {
         return;
@@ -526,10 +620,7 @@ impl Tool for Replayer {
             Syscall::Gettimeofday(syscall) => self.handle_gettimeofday(guest, syscall).await,
             Syscall::Settimeofday(_) => self.handle_simple(guest, syscall).await,
             Syscall::Time(syscall) => self.handle_time(guest, syscall).await,
-            Syscall::Setsockopt(_) => {
-                self.handle_replayed_side_effect(guest, syscall, "setsockopt")
-                    .await
-            }
+            Syscall::Setsockopt(_) => self.handle_setsockopt(guest, syscall).await,
             Syscall::Fcntl(call)
                 if matches!(
                     call.cmd(),
@@ -545,6 +636,14 @@ impl Tool for Replayer {
             }
             Syscall::Fcntl(_) => self.handle_simple(guest, syscall).await,
             Syscall::Connect(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-3871): Replay does not recreate a connection's
+            // peer, so the calls that set up and tear down a connection are
+            // served from the log like `connect`.
+            Syscall::Bind(_) | Syscall::Listen(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Shutdown(_) => self.handle_shutdown(guest, syscall).await,
+            Syscall::Accept(call) => self.handle_accept4(guest, call.into()).await,
+            Syscall::Accept4(call) => self.handle_accept4(guest, call).await,
             Syscall::Sendto(_) => self.handle_simple(guest, syscall).await,
             Syscall::Sendmsg(_) => self.handle_simple(guest, syscall).await,
             Syscall::Poll(syscall) => self.handle_poll(guest, syscall).await,
@@ -1296,23 +1395,54 @@ impl Replayer {
         fd: i32,
         cloexec: bool,
     ) {
+        if let Err(placeholder) = self.try_reserve_replay_fd(guest, fd, cloexec, 0).await {
+            panic!("{}", slot_divergence_message(guest.tid(), fd, placeholder));
+        }
+    }
+
+    /// Installs the placeholder for an accepted connection in slot `fd`,
+    /// refusing by name if that slot is not the lowest free descriptor.
+    pub(super) async fn reserve_accept_stand_in<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: i32,
+        cloexec: bool,
+    ) {
+        if let Err(placeholder) = self
+            .try_reserve_replay_fd(guest, fd, cloexec, ACCEPT_STAND_IN_COUNT)
+            .await
+        {
+            panic!("{ACCEPT_SLOT_REFUSAL}: accept recorded {fd}, lowest free {placeholder}");
+        }
+    }
+
+    /// Installs an eventfd placeholder with initial `count` in slot `fd`,
+    /// which must be the lowest free descriptor. If Linux places it elsewhere,
+    /// closes it and returns the slot it landed in, so the caller can name the
+    /// cause.
+    async fn try_reserve_replay_fd<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: i32,
+        cloexec: bool,
+        count: u32,
+    ) -> Result<(), i64> {
         let flags = if cloexec {
             EfdFlags::EFD_CLOEXEC
         } else {
             EfdFlags::empty()
         };
         let placeholder = guest
-            .inject_with_retry(Eventfd2::new().with_count(0).with_flags(flags))
+            .inject_with_retry(Eventfd2::new().with_count(count).with_flags(flags))
             .await
             .unwrap_or_else(|error| {
                 panic!("could not reserve replay FD {fd} with an eventfd: {error}")
             });
         if placeholder != i64::from(fd) {
             let _ = guest.inject(Close::new().with_fd(placeholder as i32)).await;
-            panic!(
-                "replay FD namespace diverged: expected slot {fd}, placeholder returned {placeholder}"
-            );
+            return Err(placeholder);
         }
+        Ok(())
     }
     pub(super) fn fd_is_in_replay_root(&self, pid: Pid, fd: libc::c_int) -> bool {
         let path = format!("/proc/{}/fd/{fd}", pid.as_raw());
@@ -2314,6 +2444,73 @@ impl Replayer {
         recorded
     }
 
+    /// `setsockopt` changes kernel socket state that later live calls can
+    /// observe, so a recorded success is reapplied and must succeed again.
+    ///
+    /// The exception is a replay placeholder. An accepted connection or a
+    /// descriptor received over `SCM_RIGHTS` is an eventfd during replay, and
+    /// every recorded operation on it is served from the log. A recorded success
+    /// means the recorded descriptor was a socket, since `setsockopt` on an
+    /// eventfd fails with `ENOTSOCK`, so an eventfd in its slot can only be such
+    /// a placeholder and the option is not reapplied.
+    async fn handle_setsockopt<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let Syscall::Setsockopt(call) = syscall else {
+            unreachable!("handle_setsockopt called for {syscall:?}");
+        };
+        if fd_is_eventfd(guest.tid(), call.fd()) {
+            return next_event!(guest, Return);
+        }
+        self.handle_replayed_side_effect(guest, syscall, "setsockopt")
+            .await
+    }
+
+    /// `shutdown` changes kernel socket state that later live calls observe on
+    /// a socket replay recreated, such as a `socketpair` endpoint whose reads
+    /// run live, so a recorded success is reapplied.
+    ///
+    /// Two kinds of socket hold their connection only in the log. A replay
+    /// placeholder (an eventfd standing in for an accepted connection or a
+    /// descriptor received over `SCM_RIGHTS`) serves the recorded result, as in
+    /// [`Self::handle_setsockopt`]. A live socket whose `connect`, `bind` and
+    /// `listen` were served from the log is unconnected during replay, so
+    /// Linux reports `ENOTCONN` while still marking it shut down; every
+    /// recorded operation on such a socket is served from the log as well.
+    /// Linux's `AF_UNIX` shutdown never reports `ENOTCONN`, so on a Unix
+    /// socket, such as a recreated socketpair endpoint, it is a divergence.
+    // TODO-HUMAN-REVIEW(PR-3871): Reapply shutdown on live sockets during replay.
+    async fn handle_shutdown<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Syscall,
+    ) -> Result<i64, Errno> {
+        let Syscall::Shutdown(call) = syscall else {
+            unreachable!("handle_shutdown called for {syscall:?}");
+        };
+        if fd_is_eventfd(guest.tid(), call.fd()) {
+            return next_event!(guest, Return);
+        }
+        let recorded = next_event!(guest, Return);
+        if recorded.is_ok() {
+            let actual = guest.inject_with_retry(syscall).await;
+            let unconnected = actual == Err(Errno::ENOTCONN)
+                && !fd_is_unix_socket(guest.tid(), call.fd()).unwrap_or_else(|error| {
+                    panic!(
+                        "cannot tell whether shutdown's fd {} is a Unix socket: {error}",
+                        call.fd()
+                    )
+                });
+            assert!(
+                actual == recorded || unconnected,
+                "shutdown side effects diverged: replay observed {actual:?}, recording observed {recorded:?}"
+            );
+        }
+        recorded
+    }
+
     async fn handle_pidfd_getfd<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2469,5 +2666,127 @@ mod pidfd_getfd_replay_tests {
         );
         assert_eq!(unexpected_pidfd_getfd_fd(&Ok(7), &Ok(9)), Some(9));
         assert_eq!(unexpected_pidfd_getfd_fd(&Ok(7), &Err(Errno::EPERM)), None);
+    }
+}
+
+#[cfg(test)]
+mod accept_stand_in_tests {
+    use std::os::fd::AsRawFd;
+
+    use super::*;
+
+    fn eventfd(count: u32) -> OwnedFd {
+        // SAFETY: eventfd(2) returns a new descriptor that only this test owns.
+        unsafe {
+            let fd = libc::eventfd(count, libc::EFD_CLOEXEC);
+            assert!(fd >= 0, "eventfd: {}", io::Error::last_os_error());
+            OwnedFd::from_raw_fd(fd)
+        }
+    }
+
+    fn pid() -> Pid {
+        Pid::from_raw(std::process::id() as i32)
+    }
+
+    fn is_generic(message: &str) -> bool {
+        message.starts_with("replay FD namespace diverged:") && !message.contains("3880")
+    }
+
+    #[test]
+    fn eventfd_count_is_read_from_its_own_fdinfo_line() {
+        let fdinfo = "pos:\t0\nflags:\t02000002\nmnt_id:\t18\nino:\t5138\n\
+                      eventfd-count:         3880acc7\neventfd-id: 8606\neventfd-semaphore: 0\n";
+        assert_eq!(parse_eventfd_count(fdinfo), Some(0x3880_acc7));
+        let fdinfo = fdinfo.replace("3880acc7", "       0");
+        assert_eq!(parse_eventfd_count(&fdinfo), Some(0));
+        assert_eq!(parse_eventfd_count("pos:\t0\nflags:\t02\nino:\t1\n"), None);
+    }
+
+    #[test]
+    fn a_stand_in_and_its_duplicates_name_the_accept_refusal() {
+        let stand_in = eventfd(ACCEPT_STAND_IN_COUNT);
+        let duplicate = stand_in.try_clone().unwrap();
+        for fd in [stand_in.as_raw_fd(), duplicate.as_raw_fd()] {
+            assert!(holds_accept_stand_in(pid(), fd));
+            assert!(slot_divergence_message(pid(), fd, 9).starts_with(ACCEPT_SLOT_REFUSAL));
+        }
+    }
+
+    #[test]
+    fn an_ordinary_placeholder_gives_the_generic_divergence() {
+        let placeholder = eventfd(0);
+        let (reader, _writer) = nix::unistd::pipe().unwrap();
+        for fd in [placeholder.as_raw_fd(), reader.as_raw_fd(), -1] {
+            assert!(!holds_accept_stand_in(pid(), fd));
+            assert!(is_generic(&slot_divergence_message(pid(), fd, 9)));
+        }
+    }
+
+    #[test]
+    fn a_placeholder_reusing_a_closed_stand_ins_id_gives_the_generic_divergence() {
+        let stand_in = eventfd(ACCEPT_STAND_IN_COUNT);
+        let stand_in_id = eventfd_id(stand_in.as_raw_fd());
+        drop(stand_in);
+        let placeholder = eventfd(0);
+        // Linux usually hands the freed id straight back out. Whether or not
+        // it did here, the new placeholder must not read as a stand-in.
+        let _reused = eventfd_id(placeholder.as_raw_fd()) == stand_in_id;
+        assert!(!holds_accept_stand_in(pid(), placeholder.as_raw_fd()));
+        assert!(is_generic(&slot_divergence_message(
+            pid(),
+            placeholder.as_raw_fd(),
+            9
+        )));
+    }
+
+    fn eventfd_id(fd: libc::c_int) -> Option<String> {
+        std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
+            .ok()?
+            .lines()
+            .find_map(|line| Some(line.strip_prefix("eventfd-id:")?.trim().to_owned()))
+    }
+}
+
+#[cfg(test)]
+mod shutdown_replay_tests {
+    use std::os::fd::AsRawFd;
+    use std::os::fd::FromRawFd;
+    use std::os::fd::OwnedFd;
+
+    use super::*;
+
+    #[test]
+    fn unix_socket_lookup_tells_a_socketpair_from_tcp_and_a_pipe() {
+        let pid = Pid::from_raw(std::process::id() as i32);
+        let (left, right) = std::os::unix::net::UnixStream::pair().unwrap();
+        // SAFETY: socket(2) returns a new descriptor that only this test owns.
+        let tcp = unsafe {
+            let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+            assert!(fd >= 0, "socket: {}", io::Error::last_os_error());
+            OwnedFd::from_raw_fd(fd)
+        };
+        let (reader, _writer) = nix::unistd::pipe().unwrap();
+
+        assert!(fd_is_unix_socket(pid, left.as_raw_fd()).unwrap());
+        assert!(fd_is_unix_socket(pid, right.as_raw_fd()).unwrap());
+        assert!(!fd_is_unix_socket(pid, tcp.as_raw_fd()).unwrap());
+        assert!(!fd_is_unix_socket(pid, reader.as_raw_fd()).unwrap());
+        assert!(fd_is_unix_socket(pid, -1).is_err());
+    }
+
+    #[test]
+    fn unix_table_rows_match_only_their_inode_column() {
+        let table = "Num       RefCount Protocol Flags    Type St Inode Path\n\
+                     0000000000000000: 00000002 00000000 00010000 0001 01 23456 /run/a\n\
+                     0000000000000000: 00000003 00000000 00000000 0001 03 34567\n";
+        assert!(unix_table_lists_inode(table, 23456));
+        assert!(unix_table_lists_inode(table, 34567));
+        assert!(!unix_table_lists_inode(table, 2));
+        assert!(!unix_table_lists_inode(table, 10000));
+        assert_eq!(
+            socket_inode(std::path::Path::new("socket:[34567]")),
+            Some(34567)
+        );
+        assert_eq!(socket_inode(std::path::Path::new("pipe:[34567]")), None);
     }
 }

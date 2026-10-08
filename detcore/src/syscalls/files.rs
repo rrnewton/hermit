@@ -6011,6 +6011,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             FdType::Socket,
         )
         .await?;
+        guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.set_accepted_connection())?;
 
         self.maybe_set_nonblocking_fd(guest, fd);
 

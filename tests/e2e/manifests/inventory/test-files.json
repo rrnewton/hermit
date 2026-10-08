@@ -1340,6 +1340,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_accept_copyout.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_accept_copyout.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration suite compiles this workload and checks that accept4 copies the peer address and its length out as Linux does, under record and under replay, for sixteen buffer placements next to unmapped, read-only, write-only and inaccessible pages or on a guest stack with little room below it, and for an address capacity another thread sets while the accept waits; each expected line is what the guest prints natively."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/record_replay_deep_fork_chain.c",
       "runner": "hermit-cli/tests/record_replay.rs",
       "why": "tests/c/record_replay_deep_fork_chain.c is owned by hermit-cli/tests/record_replay.rs: The dedicated integration suite compiles this process-tree workload and asserts recording-stream behavior across a deep fork chain, including lifecycle setup not represented by a generic manifest row."
@@ -1436,9 +1442,27 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_socket_mmsg.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_socket_mmsg.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration suite compiles this workload and checks that replay applies a recorded shutdown to a socketpair endpoint before a live recvmmsg reads from it, and that a recording refuses sendmmsg on an accepted connection, whose replay stand-in is not a socket."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/record_replay_socketpair_blocking_read.c",
       "runner": "hermit-cli/tests/record_replay.rs",
       "why": "tests/c/record_replay_socketpair_blocking_read.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration suite compiles this workload and checks, for a pipe and for stream, seqpacket and datagram socketpairs, that a blocking read waits for the other process's write under record and replay instead of returning EAGAIN, on a fresh channel each through the original descriptor, through a dup with the original closed (recv on a socketpair), and in a forked child through its inherited descriptor (recvmsg on a socketpair), with and without the reader first clearing O_NONBLOCK with FIONBIO or F_SETFL."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_tcp_accept.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_tcp_accept.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration suite compiles this workload and checks that a guest accepting its own loopback TCP connections prints, under record and under replay, what Linux gives it: the echoed bytes, the peer address (in full and truncated to a 4-byte buffer), the close-on-exec flag as an exec'd child's next descriptor sees it, SOCK_NONBLOCK, and the EAGAIN and EINVAL failures."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_tcp_accept_threads.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_tcp_accept_threads.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration suite compiles this workload, records it once and replays the recording several times, and checks that every replay ends with the same exit status and output while one thread accepts loopback TCP connections, on its own listener or on one received over SCM_RIGHTS, and another opens and closes descriptors."
     },
     {
       "disposition": "guest-fixture",

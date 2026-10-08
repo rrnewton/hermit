@@ -8,11 +8,18 @@
 
 //! Handles poll, ppoll, epoll, and select system calls.
 
+use std::os::fd::AsFd;
+use std::os::fd::AsRawFd;
+use std::os::fd::BorrowedFd;
+use std::os::unix::fs::FileExt;
+
 use reverie::Errno;
 use reverie::Guest;
 use reverie::Pid;
+use reverie::syscalls::Accept4;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
+use reverie::syscalls::Close;
 use reverie::syscalls::EpollWait;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Poll;
@@ -27,6 +34,7 @@ use reverie::syscalls::Timespec;
 use reverie::syscalls::family::SockOptFamily;
 
 use super::Recorder;
+use crate::event::AcceptEvent;
 use crate::event::EpollWaitEvent;
 use crate::event::PollEvent;
 use crate::event::PpollEvent;
@@ -48,6 +56,246 @@ fn read_bytes<M: MemoryAccess>(
     let mut bytes = vec![0; length];
     memory.read_exact(address.cast(), &mut bytes)?;
     Ok(bytes)
+}
+
+const SOCKADDR_STORAGE_LEN: usize = std::mem::size_of::<libc::sockaddr_storage>();
+const USER_PAGE_SIZE: usize = 4096;
+
+fn accepted_fd(fd: i64) -> i32 {
+    i32::try_from(fd).expect("accept4 returned a descriptor beyond i32")
+}
+
+/// What an emulated `move_addr_to_user` wrote, and the error it returned.
+#[derive(Debug, PartialEq, Eq)]
+struct PeerAddressCopyOut {
+    error: Option<Errno>,
+    addr: Vec<u8>,
+    addr_len: Option<libc::socklen_t>,
+}
+
+/// Copies an accepted peer address out to the guest the way Linux 7.1's
+/// `move_addr_to_user` does once the connection has been taken: read the
+/// capacity with `read_user` and clamp it to the address length; unless the
+/// result is negative, write the full length back first; reject a negative
+/// result with `EINVAL`; then copy the address prefix. Every guest access obeys
+/// the guest's page permissions. A length that cannot be written fails with
+/// `EFAULT` before any address byte is copied, and an address that faults part
+/// way fails with `EFAULT` after the length and whatever prefix was already
+/// written. Linux 7.0 and earlier copy the address before writing the length,
+/// so on those kernels the two faults leave different bytes behind; record
+/// deliberately follows the 7.1 order on every host.
+fn copy_peer_address_out<M: MemoryAccess>(
+    memory: &mut M,
+    read_user: impl FnOnce(&M, AddrMut<u8>, &mut [u8]) -> bool,
+    sockaddr: AddrMut<u8>,
+    addrlen: Option<AddrMut<u8>>,
+    address: &[u8],
+    kernel_len: libc::socklen_t,
+) -> PeerAddressCopyOut {
+    let failed = |error, addr, addr_len| PeerAddressCopyOut {
+        error: Some(error),
+        addr,
+        addr_len,
+    };
+    let Some(addrlen) = addrlen else {
+        return failed(Errno::EFAULT, Vec::new(), None);
+    };
+    let mut capacity = [0; std::mem::size_of::<libc::c_int>()];
+    if !read_user(memory, addrlen, &mut capacity) {
+        return failed(Errno::EFAULT, Vec::new(), None);
+    }
+    let len = libc::c_int::from_ne_bytes(capacity).min(kernel_len as libc::c_int);
+    let Ok(len) = usize::try_from(len) else {
+        return failed(Errno::EINVAL, Vec::new(), None);
+    };
+    if !write_user_word(memory, addrlen, &capacity, &kernel_len.to_ne_bytes()) {
+        return failed(Errno::EFAULT, Vec::new(), None);
+    }
+    let wanted = &address[..len.min(address.len())];
+    let written = write_user_prefix(memory, sockaddr, wanted);
+    if written < wanted.len() {
+        return failed(Errno::EFAULT, wanted[..written].to_vec(), Some(kernel_len));
+    }
+    PeerAddressCopyOut {
+        error: None,
+        addr: wanted.to_vec(),
+        addr_len: Some(kernel_len),
+    }
+}
+
+/// Reads guest memory with the access the kernel's `get_user` has on x86, where
+/// every writable user page is also readable. `process_vm_readv` needs a
+/// readable mapping, so a range it refuses is read through `/proc/<pid>/mem`,
+/// exactly, if every page of it lies in a readable or writable mapping.
+/// Execute-only mappings count as unreadable, as they are on hardware with
+/// protection keys, and protection keys the guest assigns itself are not
+/// consulted. Like the kernel's read, this races with another thread changing
+/// the mappings, and either order is a result Linux can give.
+fn read_user_bytes<M: MemoryAccess>(
+    memory: &M,
+    pid: Pid,
+    address: AddrMut<u8>,
+    buf: &mut [u8],
+) -> bool {
+    if memory.read_exact_with_user_access(address, buf).is_ok() {
+        return true;
+    }
+    let start = address.as_raw();
+    if start.checked_add(buf.len()).is_none() {
+        return false;
+    }
+    let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else {
+        return false;
+    };
+    user_page_chunks(start, buf.len())
+        .iter()
+        .all(|&(offset, _)| mapping_is_user_readable(&maps, start + offset))
+        && std::fs::File::open(format!("/proc/{pid}/mem"))
+            .and_then(|mem| mem.read_exact_at(buf, start as u64))
+            .is_ok()
+}
+
+/// Whether `address` lies in a mapping of a `/proc/<pid>/maps` listing that
+/// the kernel can read from user space on x86: one that is readable or
+/// writable.
+fn mapping_is_user_readable(maps: &str, address: usize) -> bool {
+    maps.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        let (Some(range), Some(perms)) = (fields.next(), fields.next()) else {
+            return false;
+        };
+        let Some((start, end)) = range.split_once('-') else {
+            return false;
+        };
+        let (Ok(start), Ok(end)) = (
+            usize::from_str_radix(start, 16),
+            usize::from_str_radix(end, 16),
+        ) else {
+            return false;
+        };
+        (start..end).contains(&address) && matches!(perms.as_bytes(), [b'r', ..] | [_, b'w', ..])
+    })
+}
+
+/// The peer address Linux's `accept` copies out for the new socket `socket`,
+/// and its full length, or `None` if Linux could not name the peer, which
+/// makes `accept` fail with `ECONNABORTED`. Linux asks the socket with
+/// `getname(.., 2)`. `getpeername` asks with 1, which on IPv4 and IPv6 also
+/// refuses a socket the peer has already reset, so for those `SO_PEERNAME`,
+/// which asks with 2, answers instead. It wants exactly the family's address
+/// size.
+fn accepted_peer_address(
+    socket: BorrowedFd,
+) -> std::io::Result<Option<(Vec<u8>, libc::socklen_t)>> {
+    let mut address = [0u8; SOCKADDR_STORAGE_LEN];
+    let mut len = SOCKADDR_STORAGE_LEN as libc::socklen_t;
+    // SAFETY: `address` holds `len` bytes.
+    if unsafe { libc::getpeername(socket.as_raw_fd(), address.as_mut_ptr().cast(), &mut len) } == 0
+    {
+        return Ok(Some((
+            address[..(len as usize).min(SOCKADDR_STORAGE_LEN)].to_vec(),
+            len,
+        )));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::ENOTCONN) {
+        return Err(error);
+    }
+    let mut domain = [0; std::mem::size_of::<libc::c_int>()];
+    socket_option(socket, libc::SO_DOMAIN, &mut domain)?;
+    let len = match libc::c_int::from_ne_bytes(domain) {
+        libc::AF_INET => std::mem::size_of::<libc::sockaddr_in>(),
+        libc::AF_INET6 => std::mem::size_of::<libc::sockaddr_in6>(),
+        _ => return Ok(None),
+    };
+    let mut peer = vec![0; len];
+    match socket_option(socket, libc::SO_PEERNAME, &mut peer) {
+        Ok(()) => Ok(Some((peer, len as libc::socklen_t))),
+        Err(error) if error.raw_os_error() == Some(libc::ENOTCONN) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Reads the `SOL_SOCKET` option `name` into all of `value`.
+fn socket_option(socket: BorrowedFd, name: libc::c_int, value: &mut [u8]) -> std::io::Result<()> {
+    let mut len = value.len() as libc::socklen_t;
+    // SAFETY: `value` holds `len` bytes.
+    let result = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            name,
+            value.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// The page-sized pieces of `[address, address + len)`, in address order.
+fn user_page_chunks(address: usize, len: usize) -> Vec<(usize, usize)> {
+    let mut chunks = Vec::new();
+    let mut offset = 0;
+    while offset < len {
+        let at = address.wrapping_add(offset);
+        let size = (USER_PAGE_SIZE - at % USER_PAGE_SIZE).min(len - offset);
+        chunks.push((offset, size));
+        offset += size;
+    }
+    chunks
+}
+
+fn write_user_chunk<M: MemoryAccess>(memory: &mut M, address: usize, bytes: &[u8]) -> usize {
+    let Some(address) = AddrMut::from_raw(address) else {
+        return 0;
+    };
+    match memory.write_with_user_access(address, bytes) {
+        Ok(written) => written,
+        Err(Errno::EFAULT) => 0,
+        Err(error) => panic!("backend cannot write guest memory with user access: {error}"),
+    }
+}
+
+/// Writes the longest prefix of `bytes` that the guest's page permissions
+/// allow, as `copy_to_user` does, and returns its length.
+fn write_user_prefix<M: MemoryAccess>(memory: &mut M, address: AddrMut<u8>, bytes: &[u8]) -> usize {
+    let mut written = 0;
+    for (offset, size) in user_page_chunks(address.as_raw(), bytes.len()) {
+        let chunk = &bytes[offset..offset + size];
+        let copied = write_user_chunk(memory, address.as_raw() + offset, chunk);
+        written += copied;
+        if copied < size {
+            break;
+        }
+    }
+    written
+}
+
+/// Stores a 4-byte word all or nothing, as `put_user` does: a word that
+/// straddles a page boundary is written high page first, and restored to
+/// `original` if the low page then refuses the write.
+fn write_user_word<M: MemoryAccess>(
+    memory: &mut M,
+    address: AddrMut<u8>,
+    original: &[u8; 4],
+    value: &[u8; 4],
+) -> bool {
+    let chunks = user_page_chunks(address.as_raw(), value.len());
+    for (index, &(offset, size)) in chunks.iter().enumerate().rev() {
+        let at = address.as_raw() + offset;
+        if write_user_chunk(memory, at, &value[offset..offset + size]) < size {
+            for &(offset, size) in &chunks[index + 1..] {
+                let at = address.as_raw() + offset;
+                write_user_chunk(memory, at, &original[offset..offset + size]);
+            }
+            return false;
+        }
+    }
+    true
 }
 
 fn pollfd_address<'a>(address: AddrMut<'a, PollFd>, index: usize) -> Option<AddrMut<'a, PollFd>> {
@@ -384,6 +632,105 @@ impl Recorder {
         result
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3871): Record accepted connections for replay.
+    pub(super) async fn handle_accept4<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Accept4,
+    ) -> Result<i64, Errno> {
+        // Without an address buffer Linux writes nothing but the descriptor,
+        // and ignores `addrlen`.
+        let Some(sockaddr) = syscall.sockaddr() else {
+            let result = guest.inject(syscall).await;
+            let event = result.map(|fd| {
+                SyscallEvent::Accept(AcceptEvent {
+                    result: Ok(accepted_fd(fd)),
+                    addr: Vec::new(),
+                    addr_len: None,
+                })
+            });
+            self.record_event(guest, event);
+            return result;
+        };
+
+        // Only after Linux has taken the connection off the queue does it read
+        // the capacity in `*addrlen`, write the full length back and copy the
+        // address out. Another thread can change or unmap both buffers while
+        // accept4 waits, and a fault in the copy-out leaves the earlier writes
+        // in place while the call fails. So accept without an address, ask the
+        // new socket for its peer, and perform that copy-out here, recording
+        // exactly the memory the guest saw change. No guest memory is borrowed
+        // for this, so the guest's stack and buffers are never touched beyond
+        // what Linux writes.
+        let fd = match guest
+            .inject(syscall.with_sockaddr(None).with_addrlen(None))
+            .await
+        {
+            Ok(fd) => fd,
+            Err(error) => {
+                self.record_event(guest, Err(error));
+                return Err(error);
+            }
+        };
+
+        // Only a guest thread closing or replacing a descriptor number it was
+        // never given could take the new socket away before this, so failing
+        // to inspect it is treated as a Hermit failure, not a guest error.
+        // The socket is in the accepting thread's table, which is not the
+        // leader's when the thread was cloned without CLONE_FILES.
+        let pid = guest.pid();
+        let peer = crate::fd::duplicate_guest_thread_fd(pid, guest.tid(), accepted_fd(fd))
+            .and_then(|socket| accepted_peer_address(socket.as_fd()))
+            .unwrap_or_else(|error| {
+                panic!("accept4 returned fd {fd}, but its peer address could not be read: {error}")
+            });
+        let copy_out = match peer {
+            Some((address, kernel_len)) => copy_peer_address_out(
+                &mut guest.memory(),
+                |memory, address, buf| read_user_bytes(memory, pid, address, buf),
+                sockaddr.cast(),
+                syscall.addrlen().map(|address| address.cast()),
+                &address,
+                kernel_len,
+            ),
+            None => PeerAddressCopyOut {
+                error: Some(Errno::ECONNABORTED),
+                addr: Vec::new(),
+                addr_len: None,
+            },
+        };
+        let result = match copy_out.error {
+            None => Ok(accepted_fd(fd)),
+            Some(error) => {
+                // Linux releases the new file when naming the peer or the
+                // copy-out fails, so the descriptor is never installed for the
+                // guest. Detcore has not seen it either, because the call
+                // returns an error. A pending signal, such as the client's
+                // SIGCHLD, can interrupt this extra syscall before it runs, so
+                // retry it: Linux's close(2) itself never reports ERESTARTSYS.
+                let close = Close::new().with_fd(accepted_fd(fd));
+                if let Err(close_error) = guest.inject_with_retry(close).await {
+                    panic!(
+                        "could not close fd {fd} after its accept4 copy-out failed: {close_error}"
+                    );
+                }
+                Err(error)
+            }
+        };
+
+        self.record_event(
+            guest,
+            Ok(SyscallEvent::Accept(AcceptEvent {
+                result,
+                addr: copy_out.addr,
+                addr_len: copy_out.addr_len,
+            })),
+        );
+
+        result.map(i64::from)
+    }
+
     pub(super) async fn handle_sockopt_family<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -504,6 +851,369 @@ mod tests {
     use reverie::syscalls::PollFlags;
 
     use super::*;
+
+    /// Guest memory made of whole pages, each readable and writable or not, so
+    /// that a test can place a buffer across a permission boundary.
+    struct PagedMemory {
+        base: usize,
+        bytes: Vec<u8>,
+        readable: Vec<bool>,
+        writable: Vec<bool>,
+    }
+
+    impl PagedMemory {
+        const BASE: usize = 0x10_0000;
+
+        fn new(pages: usize) -> Self {
+            Self {
+                base: Self::BASE,
+                bytes: vec![0xa5; pages * USER_PAGE_SIZE],
+                readable: vec![true; pages],
+                writable: vec![true; pages],
+            }
+        }
+
+        fn page_of(&self, address: usize) -> Option<usize> {
+            let offset = address.checked_sub(self.base)?;
+            (offset < self.bytes.len()).then_some(offset / USER_PAGE_SIZE)
+        }
+
+        fn at(address: usize) -> AddrMut<'static, u8> {
+            AddrMut::from_raw(address).unwrap()
+        }
+
+        fn slice(&self, address: usize, len: usize) -> &[u8] {
+            &self.bytes[address - self.base..][..len]
+        }
+
+        fn put(&mut self, address: usize, bytes: &[u8]) {
+            let offset = address - self.base;
+            self.bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
+        }
+
+        /// Copies byte by byte up to the first byte `allowed` refuses.
+        fn transfer(&self, address: usize, len: usize, allowed: &[bool]) -> usize {
+            (0..len)
+                .take_while(|&index| {
+                    self.page_of(address + index)
+                        .is_some_and(|page| allowed[page])
+                })
+                .count()
+        }
+    }
+
+    impl MemoryAccess for PagedMemory {
+        fn read_vectored(
+            &self,
+            read_from: &[std::io::IoSlice],
+            write_to: &mut [std::io::IoSliceMut],
+        ) -> Result<usize, Errno> {
+            let (remote, local) = (&read_from[0], &mut write_to[0]);
+            let address = remote.as_ptr() as usize;
+            let count = self.transfer(address, remote.len().min(local.len()), &self.readable);
+            if count == 0 && !local.is_empty() {
+                return Err(Errno::EFAULT);
+            }
+            local[..count].copy_from_slice(self.slice(address, count));
+            Ok(count)
+        }
+
+        fn write_vectored(
+            &mut self,
+            _read_from: &[std::io::IoSlice],
+            _write_to: &mut [std::io::IoSliceMut],
+        ) -> Result<usize, Errno> {
+            panic!("the accept4 copy-out must use user-access writes only")
+        }
+
+        fn write_with_user_access(
+            &mut self,
+            address: AddrMut<u8>,
+            bytes: &[u8],
+        ) -> Result<usize, Errno> {
+            let address = address.as_raw();
+            let count = self.transfer(address, bytes.len(), &self.writable);
+            if count == 0 && !bytes.is_empty() {
+                return Err(Errno::EFAULT);
+            }
+            self.put(address, &bytes[..count]);
+            Ok(count)
+        }
+    }
+
+    const PEER: [u8; 16] = [2, 0, 0x1f, 0x90, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+    const PEER_LEN: libc::socklen_t = PEER.len() as libc::socklen_t;
+
+    fn copy_out(
+        memory: &mut PagedMemory,
+        sockaddr: usize,
+        addrlen: Option<usize>,
+        capacity: libc::c_int,
+    ) -> PeerAddressCopyOut {
+        if let Some(addrlen) = addrlen {
+            memory.put(addrlen, &capacity.to_ne_bytes());
+        }
+        copy_peer_address_out(
+            memory,
+            |memory, address, buf| memory.read_exact_with_user_access(address, buf).is_ok(),
+            PagedMemory::at(sockaddr),
+            addrlen.map(PagedMemory::at),
+            &PEER,
+            PEER_LEN,
+        )
+    }
+
+    #[test]
+    fn accept_copy_out_truncates_to_the_capacity_and_reports_the_full_length() {
+        let base = PagedMemory::BASE;
+        for (capacity, copied) in [(16, 16), (128, 16), (4, 4), (0, 0)] {
+            let mut memory = PagedMemory::new(1);
+            let result = copy_out(&mut memory, base, Some(base + 256), capacity);
+            assert_eq!(
+                result,
+                PeerAddressCopyOut {
+                    error: None,
+                    addr: PEER[..copied].to_vec(),
+                    addr_len: Some(PEER_LEN),
+                }
+            );
+            assert_eq!(memory.slice(base, copied), &PEER[..copied]);
+            assert_eq!(
+                memory.slice(base + copied, 1),
+                &[0xa5],
+                "capacity {capacity}"
+            );
+            assert_eq!(memory.slice(base + 256, 4), &PEER_LEN.to_ne_bytes());
+        }
+    }
+
+    #[test]
+    fn accept_copy_out_rejects_a_negative_capacity_without_writing() {
+        let base = PagedMemory::BASE;
+        let mut memory = PagedMemory::new(1);
+        let result = copy_out(&mut memory, base, Some(base + 256), -1);
+        assert_eq!(result.error, Some(Errno::EINVAL));
+        assert_eq!((result.addr.len(), result.addr_len), (0, None));
+        assert_eq!(memory.slice(base, 1), &[0xa5]);
+        assert_eq!(memory.slice(base + 256, 4), &(-1i32).to_ne_bytes());
+    }
+
+    #[test]
+    fn accept_copy_out_faults_on_a_missing_or_unreadable_addrlen() {
+        let base = PagedMemory::BASE;
+        let mut memory = PagedMemory::new(2);
+        let missing = copy_out(&mut memory, base, None, 0);
+        assert_eq!(missing.error, Some(Errno::EFAULT));
+
+        memory.readable[1] = false;
+        let unreadable = copy_out(&mut memory, base, Some(base + USER_PAGE_SIZE + 8), 16);
+        assert_eq!(unreadable.error, Some(Errno::EFAULT));
+        for result in [missing, unreadable] {
+            assert_eq!((result.addr.len(), result.addr_len), (0, None));
+        }
+        assert_eq!(memory.slice(base, 1), &[0xa5]);
+    }
+
+    #[test]
+    fn accept_copy_out_writes_the_length_and_keeps_the_prefix_before_a_fault() {
+        let base = PagedMemory::BASE;
+        let mut memory = PagedMemory::new(2);
+        memory.writable[1] = false;
+        let sockaddr = base + USER_PAGE_SIZE - 6;
+        let result = copy_out(&mut memory, sockaddr, Some(base + 64), 128);
+        assert_eq!(
+            result,
+            PeerAddressCopyOut {
+                error: Some(Errno::EFAULT),
+                addr: PEER[..6].to_vec(),
+                addr_len: Some(PEER_LEN),
+            }
+        );
+        assert_eq!(memory.slice(sockaddr, 6), &PEER[..6]);
+        assert_eq!(memory.slice(sockaddr + 6, 1), &[0xa5]);
+        assert_eq!(memory.slice(base + 64, 4), &PEER_LEN.to_ne_bytes());
+    }
+
+    #[test]
+    fn accept_copy_out_writes_a_straddling_addrlen_all_or_nothing_before_the_address() {
+        let base = PagedMemory::BASE;
+        let addrlen = base + USER_PAGE_SIZE - 2;
+        for read_only_page in [0, 1] {
+            let mut memory = PagedMemory::new(2);
+            memory.put(addrlen, &16i32.to_ne_bytes());
+            memory.writable[read_only_page] = false;
+            let sockaddr = if read_only_page == 0 {
+                base + USER_PAGE_SIZE + 64
+            } else {
+                base
+            };
+            let result = copy_out(&mut memory, sockaddr, Some(addrlen), 16);
+            assert_eq!(
+                result,
+                PeerAddressCopyOut {
+                    error: Some(Errno::EFAULT),
+                    addr: Vec::new(),
+                    addr_len: None,
+                },
+                "read-only page {read_only_page}"
+            );
+            assert_eq!(memory.slice(sockaddr, 1), &[0xa5]);
+            assert_eq!(memory.slice(addrlen, 4), &16i32.to_ne_bytes());
+        }
+
+        let mut memory = PagedMemory::new(2);
+        let result = copy_out(&mut memory, base, Some(addrlen), 16);
+        assert_eq!(result.error, None);
+        assert_eq!(memory.slice(addrlen, 4), &PEER_LEN.to_ne_bytes());
+    }
+
+    /// Maps `pages` private anonymous pages, each with its own protection.
+    fn map_pages(protections: &[libc::c_int]) -> *mut u8 {
+        let len = protections.len() * USER_PAGE_SIZE;
+        // SAFETY: a fresh anonymous mapping that nothing else refers to.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED);
+        let base = base.cast::<u8>();
+        for (page, &protection) in protections.iter().enumerate() {
+            // SAFETY: inside the mapping made above.
+            unsafe {
+                let at = base.add(page * USER_PAGE_SIZE);
+                std::ptr::write_bytes(at, page as u8 + 1, USER_PAGE_SIZE);
+                assert_eq!(libc::mprotect(at.cast(), USER_PAGE_SIZE, protection), 0);
+            }
+        }
+        base
+    }
+
+    #[test]
+    fn a_user_read_reaches_readable_and_write_only_pages_but_not_inaccessible_ones() {
+        let page = USER_PAGE_SIZE;
+        let base = map_pages(&[libc::PROT_READ, libc::PROT_WRITE, libc::PROT_NONE]) as usize;
+        let pid = Pid::this();
+        let read = |address: usize| {
+            let mut word = [0; 4];
+            read_user_bytes(
+                &LocalMemory::new(),
+                pid,
+                PagedMemory::at(address),
+                &mut word,
+            )
+            .then_some(word)
+        };
+        assert_eq!(read(base + 8), Some([1; 4]), "readable");
+        assert_eq!(read(base + page + 8), Some([2; 4]), "write-only");
+        assert_eq!(
+            read(base + 2 * page - 4),
+            Some([2; 4]),
+            "write-only page end"
+        );
+        assert_eq!(
+            read(base + page - 2),
+            Some([1, 1, 2, 2]),
+            "readable into write-only"
+        );
+        assert_eq!(read(base + 2 * page + 8), None, "inaccessible");
+        assert_eq!(
+            read(base + 2 * page - 2),
+            None,
+            "write-only into inaccessible"
+        );
+        // SAFETY: the mapping made above, no longer referenced.
+        assert_eq!(unsafe { libc::munmap(base as *mut _, 3 * page) }, 0);
+    }
+
+    #[test]
+    fn a_mapping_is_user_readable_if_it_is_readable_or_writable() {
+        let maps = "\
+            1000-2000 r--p 00000000 00:00 0\n\
+            2000-3000 -w-p 00000000 00:00 0\n\
+            3000-4000 ---p 00000000 00:00 0\n\
+            4000-5000 --xp 00000000 00:00 0\n\
+            6000-7000 rw-p 00000000 00:00 0 [stack]\n";
+        for (address, readable) in [
+            (0x1000, true),
+            (0x1fff, true),
+            (0x2000, true),
+            (0x2fff, true),
+            (0x3000, false),
+            (0x4000, false),
+            (0x5000, false),
+            (0x6ffc, true),
+            (0x7000, false),
+            (0x0fff, false),
+        ] {
+            assert_eq!(
+                mapping_is_user_readable(maps, address),
+                readable,
+                "{address:#x}"
+            );
+        }
+    }
+
+    fn loopback_listener() -> std::net::TcpListener {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap()
+    }
+
+    #[test]
+    fn an_accepted_tcp_socket_names_its_peer() {
+        let listener = loopback_listener();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let (address, len) = accepted_peer_address(server.as_fd()).unwrap().unwrap();
+        let port = client.local_addr().unwrap().port().to_be_bytes();
+        assert_eq!(len, 16);
+        assert_eq!(address[..8], [2, 0, port[0], port[1], 127, 0, 0, 1]);
+    }
+
+    #[test]
+    fn an_accepted_tcp_socket_the_peer_reset_still_names_it_as_accept_does() {
+        let listener = loopback_listener();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let port = client.local_addr().unwrap().port().to_be_bytes();
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        // SAFETY: `linger` is a valid option value of its own size.
+        let set = unsafe {
+            libc::setsockopt(
+                client.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                std::ptr::from_ref(&linger).cast(),
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(set, 0);
+        drop(client);
+        let (server, from) = listener.accept().unwrap();
+        assert_eq!(
+            server.peer_addr().unwrap_err().raw_os_error(),
+            Some(libc::ENOTCONN),
+            "getpeername refuses a reset socket, so this exercises SO_PEERNAME"
+        );
+        let (address, len) = accepted_peer_address(server.as_fd()).unwrap().unwrap();
+        assert_eq!(from.port().to_be_bytes(), port);
+        assert_eq!(len, 16);
+        assert_eq!(address[..8], [2, 0, port[0], port[1], 127, 0, 0, 1]);
+    }
+
+    #[test]
+    fn a_connected_unix_socket_names_its_unbound_peer() {
+        let (server, _client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (address, len) = accepted_peer_address(server.as_fd()).unwrap().unwrap();
+        let family = (libc::AF_UNIX as libc::sa_family_t).to_ne_bytes();
+        assert_eq!((len, address), (2, family.to_vec()));
+    }
 
     #[test]
     fn capture_poll_keeps_outputs_on_efault() {

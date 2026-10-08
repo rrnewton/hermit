@@ -43,6 +43,7 @@ use crate::scheduler::runqueue::FIRST_PRIORITY;
 use crate::syscalls::helpers::KernelSignalWait;
 use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::RestartCall;
+use crate::syscalls::helpers::is_accepted_connection;
 use crate::syscalls::helpers::keep_restart_block;
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
 use crate::syscalls::helpers::record_retry_event;
@@ -1662,11 +1663,31 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Sendmmsg,
     ) -> Result<i64, Error> {
+        if self.cfg.recordreplay_modes && is_accepted_connection(guest, call.sockfd()) {
+            return self.refuse_log_served_mmsg(guest, Sysno::sendmmsg).await;
+        }
         let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
         if result > 0 {
             guest.thread_state().forget_flock_modes();
         }
         Ok(result)
+    }
+
+    /// Record and replay keep an accepted connection only in the log, and
+    /// replay stands in an eventfd for it. Neither recorder nor replayer
+    /// records the batched `sendmmsg` and `recvmmsg`, so replay would run them
+    /// live against that eventfd and return something other than what the
+    /// recording saw. Refuse them in both modes instead. On other sockets
+    /// they still run live
+    /// (https://github.com/rrnewton/hermit/issues/3883).
+    // TODO-HUMAN-REVIEW(PR-3871): Refuse unrecorded batched I/O on accepted connections.
+    async fn refuse_log_served_mmsg<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+    ) -> Result<i64, Error> {
+        self.refuse_unserviceable_operation(guest, sysno, Errno::EOPNOTSUPP)
+            .await
     }
 
     // TODO-HUMAN-REVIEW(PR-912): Review receive-time capture across socket aliases.
@@ -2027,6 +2048,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Recvmmsg,
     ) -> Result<i64, Error> {
+        if self.cfg.recordreplay_modes && is_accepted_connection(guest, call.fd()) {
+            return self.refuse_log_served_mmsg(guest, Sysno::recvmmsg).await;
+        }
         if !self.cfg.virtualize_time || call.vlen() > libc::UIO_MAXIOV as u32 {
             return self.execute_nonblockable_fd_syscall(guest, call).await;
         }

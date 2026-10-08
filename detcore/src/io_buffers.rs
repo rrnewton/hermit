@@ -1308,6 +1308,7 @@ mod event_tests {
             rng_seed: Some(0),
             sequentialize_threads: true,
             recordreplay_modes: false,
+            replaying: false,
             record_preemptions: false,
             max_timeslice: None,
             detlog_io_buffers: true,

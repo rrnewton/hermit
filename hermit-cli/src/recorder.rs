@@ -476,6 +476,11 @@ impl Tool for Recorder {
             Sysno::setsockopt,
             Sysno::fcntl,
             Sysno::connect,
+            Sysno::bind,
+            Sysno::listen,
+            Sysno::shutdown,
+            Sysno::accept,
+            Sysno::accept4,
             Sysno::sendto,
             Sysno::sendmsg,
             Sysno::poll,
@@ -663,6 +668,15 @@ impl Tool for Recorder {
             // FIXME: Not all fcntl cases are simple.
             Syscall::Fcntl(_) => self.handle_simple(guest, syscall).await,
             Syscall::Connect(_) => self.handle_simple(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-3871): Replay does not recreate a connection's
+            // peer, so the calls that set up and tear down a connection are
+            // served from the log like `connect`.
+            Syscall::Bind(_) | Syscall::Listen(_) | Syscall::Shutdown(_) => {
+                self.handle_simple(guest, syscall).await
+            }
+            Syscall::Accept(call) => self.handle_accept4(guest, call.into()).await,
+            Syscall::Accept4(call) => self.handle_accept4(guest, call).await,
             Syscall::Sendto(_) => self.handle_simple(guest, syscall).await,
             Syscall::Sendmsg(_) => self.handle_simple(guest, syscall).await,
             Syscall::Poll(syscall) => self.handle_poll(guest, syscall).await,

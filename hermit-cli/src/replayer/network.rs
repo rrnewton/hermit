@@ -8,6 +8,7 @@
 
 use reverie::Errno;
 use reverie::Guest;
+use reverie::syscalls::Accept4;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::EpollWait;
 use reverie::syscalls::MemoryAccess;
@@ -18,6 +19,7 @@ use reverie::syscalls::Pselect6;
 use reverie::syscalls::Recvfrom;
 use reverie::syscalls::Recvmsg;
 use reverie::syscalls::Select;
+use reverie::syscalls::SockFlag;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::family::SockOptFamily;
 
@@ -330,6 +332,58 @@ impl Replayer {
             syscall.timeout().map(AddrMut::cast),
             event,
         )
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3871): Replay accepted connections from the log.
+    pub(super) async fn handle_accept4<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Accept4,
+    ) -> Result<i64, Errno> {
+        let event = next_event!(guest, Accept)?;
+
+        // Reproduce the recorded copy-out before any descriptor exists, in
+        // the order record used (Linux 7.1's): the length first, then the
+        // address prefix. These writes succeeded during recording into the
+        // same address space, so a failure here means replay has diverged.
+        if let Some(addr_len) = event.addr_len {
+            let len_address = syscall
+                .addrlen()
+                .expect("replay diverged: recorded accept4 wrote addrlen, replay passed none");
+            guest
+                .memory()
+                .write_value(len_address.cast::<libc::socklen_t>(), &addr_len)
+                .unwrap_or_else(|error| {
+                    panic!("replay diverged: cannot write the recorded accept4 addrlen: {error}")
+                });
+        }
+        if !event.addr.is_empty() {
+            let sockaddr = syscall.sockaddr().expect(
+                "replay diverged: recorded accept4 wrote a peer address, replay passed none",
+            );
+            guest
+                .memory()
+                .write_exact(sockaddr.cast::<u8>(), &event.addr)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "replay diverged: cannot write the recorded accept4 peer address: {error}"
+                    )
+                });
+        }
+
+        // A copy-out that failed during recording released the connection
+        // without installing a descriptor.
+        let fd = event.result?;
+
+        // Replay does not recreate the connection's peer, so a placeholder
+        // holds the recorded descriptor number and every recorded operation on
+        // it is served from the log, as for descriptors received over
+        // `SCM_RIGHTS`.
+        let cloexec = syscall.flags().contains(SockFlag::SOCK_CLOEXEC);
+        self.reserve_accept_stand_in(guest, fd, cloexec).await;
+
+        Ok(i64::from(fd))
     }
 
     pub(super) async fn handle_sockopt_family<G: Guest<Self>>(

@@ -2775,6 +2775,7 @@ impl<T> ThreadState<T> {
             signal_interrupt_errno: None,
             backend_runtime_bootstrap: false,
             blocked_signal_mask: None,
+            replay_served_from_log: false,
         }
     }
 
