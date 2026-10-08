@@ -27946,9 +27946,25 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                                 command,
                                 (command == "import-results").then_some(current_summary.as_path()),
                             )?;
+                            // A failed command leaves the fixture ledger unwritten, where this
+                            // cell still has its retired id; report the command's own output
+                            // rather than a lookup that cannot succeed.
+                            if !output.status.success() {
+                                return Err(format!(
+                                    "{command} failed for pre-reference {classification} {initial} ({}): stdout: {}; stderr: {}",
+                                    output.status,
+                                    String::from_utf8_lossy(&output.stdout),
+                                    String::from_utf8_lossy(&output.stderr)
+                                ));
+                            }
                             let cells: TrackedCells =
                                 read_json(&fixture_ledger.join(LEDGER_CELLS))?;
-                            let cell = cells.cells.iter().find(|cell| &cell.id == id).unwrap();
+                            let cell =
+                                cells.cells.iter().find(|cell| &cell.id == id).ok_or_else(|| {
+                                    format!(
+                                        "{command} wrote a fixture ledger without {id:?} for pre-reference {classification} {initial}: {output:?}"
+                                    )
+                                })?;
                             let ordinary = cell
                                 .observations
                                 .iter()
