@@ -8,6 +8,7 @@
 
 //! Deterministic scheduling algorithm.
 
+pub(crate) mod child_exit_sigchld;
 #[cfg(test)]
 pub(crate) mod exec_teardown_tests;
 pub(crate) mod parked;
@@ -928,6 +929,11 @@ pub struct Scheduler {
     /// entry leaves when it is consumed by that grant or when the leader is
     /// logically retired.
     child_exit_publications_completed: BTreeSet<DetPid>,
+
+    /// The owned children's exit notifications, on a backend that reports
+    /// child-exit publication, where the scheduler and the kernel both send a
+    /// `SIGCHLD` (`child_exit_sigchld`).
+    child_exit_sigchld: child_exit_sigchld::ChildExitSigchldLedger,
 
     /// The guest's own signal mask for each thread Detcore currently holds
     /// under a private blocking mask (`block_signals_for_disposition`). The
@@ -2223,6 +2229,7 @@ impl Scheduler {
             completed_physical_process_exits: Default::default(),
             child_exit_publications_pending: Default::default(),
             child_exit_publications_completed: Default::default(),
+            child_exit_sigchld: Default::default(),
             saved_guest_sigmasks: Default::default(),
             #[cfg(test)]
             test_signal_masks: Default::default(),
@@ -6073,6 +6080,13 @@ impl Scheduler {
                             } else {
                                 parent
                             };
+                            // Where the kernel also sends its own, the first of the
+                            // two delivered stands for the exit, the other is
+                            // dropped, and the scheduler's gets Linux's siginfo
+                            // (`child_exit_sigchld`).
+                            if self.backend.reports_child_exit_publication && ends_named_process {
+                                self.child_exit_sigchld.own(parent, *process);
+                            }
                             self.blocked.timed_waiters.insert_child_exit(
                                 deadline,
                                 *process,
@@ -6081,6 +6095,9 @@ impl Scheduler {
                             );
                         }
                     }
+                }
+                if *group {
+                    self.child_exit_sigchld.forget_exit_status(*process);
                 }
                 Ok(())
             }
@@ -10934,6 +10951,57 @@ mod test {
                 ),
             )]
         );
+    }
+
+    /// The first `SIGCHLD` delivered for an owned child's exit stands for it
+    /// (`child_exit_sigchld`): once the kernel's copy was delivered, the
+    /// child's `ChildExit` timer sends none, which before was a second
+    /// `SIGCHLD` for that exit. Without that delivery the timer sends its own.
+    #[test]
+    fn a_child_exit_timer_sends_nothing_after_the_kernels_copy() {
+        use child_exit_sigchld::ChildExitSigchldAnswer;
+        use child_exit_sigchld::ChildExitSigchldControl;
+        for kernel_copy_first in [false, true] {
+            let mut scheduler = Scheduler::new(&Config::default());
+            let parent = DetPid::from_raw(100);
+            let child = DetPid::from_raw(200);
+            register_known_thread(&mut scheduler, parent);
+            assert_eq!(
+                scheduler.child_exit_sigchld_control(
+                    child,
+                    ChildExitSigchldControl::ExitStatus {
+                        code: libc::CLD_EXITED,
+                        status: 7,
+                        uid: 0,
+                    },
+                ),
+                ChildExitSigchldAnswer::Recorded
+            );
+            assert!(scheduler.child_exit_sigchld.own(parent, child));
+            if kernel_copy_first {
+                assert_eq!(
+                    scheduler.child_exit_sigchld_control(
+                        parent,
+                        ChildExitSigchldControl::ClaimKernelCopy { child },
+                    ),
+                    ChildExitSigchldAnswer::Claimed(false),
+                    "the kernel's copy is the first, and is delivered"
+                );
+            }
+            let attempts = scheduler.host_signal_attempts;
+            scheduler.dispatch_timed_signal(
+                scheduler.committed_time,
+                timed_waiters::SignalTimerId::ChildExit { child, parent },
+                parent,
+                Signal::SIGCHLD,
+                true,
+            );
+            assert_eq!(
+                scheduler.host_signal_attempts - attempts,
+                u64::from(!kernel_copy_first),
+                "kernel copy first: {kernel_copy_first}"
+            );
+        }
     }
 
     #[test]
