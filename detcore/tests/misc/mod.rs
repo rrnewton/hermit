@@ -1763,6 +1763,83 @@ fn netlink_autobind_port_ids_are_deterministic() {
     });
 }
 
+/// A `FUTEX_WAKE` of one reaches the longest waiter even when another
+/// waiter waits again after every wake it receives. Thread A waits once;
+/// thread B waits again each time it is woken; the main thread wakes one
+/// waiter at a time. Linux wakes waiters of equal priority in arrival order,
+/// so the first wake reaches A. When Detcore woke the most recent waiter, B
+/// took every wake and A never ran
+/// (https://github.com/rrnewton/hermit/issues/3917).
+#[test]
+fn a_futex_wake_reaches_the_longest_waiter_while_another_waits_again() {
+    det_test_fn_sequential_without_pmu(|| {
+        use std::sync::atomic::AtomicU32;
+        static WORD: AtomicU32 = AtomicU32::new(0);
+        static A_READY: AtomicU32 = AtomicU32::new(0);
+        static A_WOKEN: AtomicU32 = AtomicU32::new(0);
+        static B_READY: AtomicU32 = AtomicU32::new(0);
+        static B_WAKES: AtomicU32 = AtomicU32::new(0);
+        static DONE: AtomicU32 = AtomicU32::new(0);
+        fn futex(op: libc::c_int, val: u32) -> libc::c_long {
+            unsafe {
+                libc::syscall(
+                    libc::SYS_futex,
+                    WORD.as_ptr(),
+                    op | libc::FUTEX_PRIVATE_FLAG,
+                    val,
+                    std::ptr::null::<libc::timespec>(),
+                )
+            }
+        }
+        fn yield_turns(count: usize) {
+            for _ in 0..count {
+                assert_eq!(unsafe { libc::sched_yield() }, 0);
+            }
+        }
+        // The word stays 0, so every wait blocks until a wake.
+        let a = std::thread::spawn(|| {
+            A_READY.store(1, Ordering::SeqCst);
+            assert_eq!(futex(libc::FUTEX_WAIT, 0), 0);
+            A_WOKEN.store(1, Ordering::SeqCst);
+        });
+        while A_READY.load(Ordering::SeqCst) == 0 {
+            yield_turns(1);
+        }
+        yield_turns(3);
+        let b = std::thread::spawn(|| {
+            loop {
+                B_READY.store(1, Ordering::SeqCst);
+                assert_eq!(futex(libc::FUTEX_WAIT, 0), 0);
+                if DONE.load(Ordering::SeqCst) == 1 {
+                    break;
+                }
+                B_WAKES.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        while B_READY.load(Ordering::SeqCst) == 0 {
+            yield_turns(1);
+        }
+        yield_turns(3);
+        let mut wakes = 0;
+        while A_WOKEN.load(Ordering::SeqCst) == 0 && wakes < 20 {
+            assert_eq!(futex(libc::FUTEX_WAKE, 1), 1);
+            wakes += 1;
+            yield_turns(3);
+        }
+        let a_woken = A_WOKEN.load(Ordering::SeqCst);
+        println!(
+            "wakes {wakes}, A woken {a_woken}, B woken {}",
+            B_WAKES.load(Ordering::SeqCst)
+        );
+        DONE.store(1, Ordering::SeqCst);
+        assert_eq!(futex(libc::FUTEX_WAKE, u32::MAX >> 1), 1);
+        a.join().unwrap();
+        b.join().unwrap();
+        assert_eq!(a_woken, 1, "the longest waiter was never woken");
+        assert_eq!(wakes, 1, "the first wake did not reach the longest waiter");
+    });
+}
+
 #[test]
 fn shared_futex_modes_are_supported_and_validate_bitsets() {
     det_test_fn_sequential_without_pmu(|| {

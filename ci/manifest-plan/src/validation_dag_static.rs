@@ -1254,7 +1254,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Three host_seccomp::tests and run_config's global-option-after-the-
     // subcommand test (the inherited seccomp filter refusal,
     // https://github.com/rrnewton/hermit/issues/3942) retain all 1009: 1013.
-    ("test.hermit_unit", 1015),
+    // metadata::tests::record_version_rejects_newest_first_futex_wake_streams
+    // (lane qemu-rcb, https://github.com/rrnewton/hermit/issues/3917) retains
+    // all 1015: 1016.
+    ("test.hermit_unit", 1016),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1623,7 +1626,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // syscalls::namespace::tests::a_failed_device_probe_is_kept_without_the_c_library_message
     // (in-guest LiteInst start-up out of the guest's heap) retains all 1213:
     // 1214, listed with this node's arguments.
-    ("test.detcore_unit", 1214),
+    // scheduler::test::a_futex_wake_takes_the_longest_waiter_first (lane
+    // qemu-rcb, https://github.com/rrnewton/hermit/issues/3917) retains all
+    // 1214: 1215.
+    // scheduler::test::{a_futex_wake_of_several_takes_the_longest_waiters_in_order,
+    // a_partial_bitset_wake_keeps_the_other_waiters_in_arrival_order,
+    // exit_wakes_take_the_longest_waiter_first} (the same change) retain all
+    // 1215: 1218.
+    ("test.detcore_unit", 1218),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1669,7 +1679,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 87).
     // inode_reuse::nothing_is_retired_without_sequentialized_threads (the same
     // reviews) retains all 87 (measured 88).
-    ("test.detcore_misc", 88),
+    // a_futex_wake_reaches_the_longest_waiter_while_another_waits_again (lane
+    // qemu-rcb, https://github.com/rrnewton/hermit/issues/3917) retains all 88:
+    // 89.
+    ("test.detcore_misc", 89),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -2293,7 +2306,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
     // The host node carries the identical 85-test tests_misc selection.
-    ("test.detcore_misc_on_host", 88),
+    // And the same futex wake-order guest test: 89.
+    ("test.detcore_misc_on_host", 89),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -2385,7 +2399,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/pull/3224: 1213, listed with the
     // host twin's arguments.
     // And the device-probe error description test: 1214.
-    ("test.detcore_unit_on_host", 1214),
+    // And the same four futex wake-order tests: 1218.
+    ("test.detcore_unit_on_host", 1218),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -2487,7 +2502,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same version 2 frame-descriptor test: 998.
     // And the same two happens-before refusal tests: 1011.
     // And the same four inherited-seccomp tests: 1013.
-    ("test.hermit_unit_on_host", 1015),
+    // And the same futex record-version test: 1016.
+    ("test.hermit_unit_on_host", 1016),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

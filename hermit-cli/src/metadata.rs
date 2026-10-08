@@ -205,7 +205,16 @@ impl RecordVersion {
 // the wrong number of events. A recording also carries a `rejoins` file, the
 // turns at which backgrounded calls rejoined the run queue, which replay
 // requires.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x125);
+// 0x125 -> 0x126: in the precise futex mode a FUTEX_WAKE that wakes fewer
+// waiters than are waiting takes the longest waiters first, as Linux does,
+// instead of the most recent ones, and a FUTEX_WAKE_BITSET leaves the waiters
+// it skips in arrival order (https://github.com/rrnewton/hermit/issues/3917).
+// Futex waits and wakes are not recorded events; replay recomputes which thread
+// each wake takes, so an older recording replayed under the new order could run
+// a different schedule, although no event shape changed. Schedule and
+// preemption files written by `--record-preemptions-to` carry no version and
+// are likewise tied to the old order.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x126);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -230,7 +239,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x125);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x125;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x126;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -775,6 +784,14 @@ mod tests {
     #[test]
     fn record_version_rejects_backgrounded_accept_streams() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x124)));
+    }
+
+    /// A 0x125 recording was made while a futex wake took the most recent
+    /// waiters; replay recomputes every wake, so under the oldest-first order
+    /// it could run another schedule. The version gate must refuse it.
+    #[test]
+    fn record_version_rejects_newest_first_futex_wake_streams() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x125)));
     }
 
     #[test]
