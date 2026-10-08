@@ -237,6 +237,46 @@ fn an_entry_detcore_cannot_name_records_a_determinism_loss() {
     );
 }
 
+/// By the time Detcore could read a stat's path again, a result written
+/// over it may name another entry. Here it does: x86_64's `struct stat`
+/// holds `st_mode` at offset 24, so a path placed there reads "mA" once the
+/// result for a directory with mode 0o40555 is written, and "mA" in the
+/// guest's directory leads to `/proc/self/fd`. The stat reports
+/// `/proc/self/task`, which Linux looked up before it wrote the result.
+/// Detcore must not give it `/proc/self/fd`'s number; it records a loss.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn an_overwritten_path_does_not_name_the_entry_it_now_leads_to() {
+    let links = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink("/proc/self/task", links.path().join("orig")).unwrap();
+    std::os::unix::fs::symlink("/proc/self/fd", links.path().join("mA")).unwrap();
+    under_detcore(|| {
+        let fds = std::fs::metadata("/proc/self/fd").unwrap().ino();
+        let directory = File::open(links.path()).unwrap();
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        let buffer = stat.as_mut_ptr().cast::<u8>();
+        let path = b"orig\0";
+        let at = unsafe { buffer.add(24) };
+        unsafe { std::ptr::copy_nonoverlapping(path.as_ptr(), at, path.len()) };
+        let result =
+            unsafe { libc::syscall(libc::SYS_newfstatat, directory.as_raw_fd(), at, buffer, 0) };
+        assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+        let stat = unsafe { stat.assume_init() };
+        assert_eq!(
+            stat.st_mode,
+            libc::S_IFDIR | 0o555,
+            "the result wrote no \"mA\""
+        );
+        assert_ne!(stat.st_ino, fds, "the entry took /proc/self/fd's number");
+        let task = std::fs::metadata("/proc/self/task").unwrap().ino();
+        assert_eq!(task, stat.st_ino, "named, the entry was renumbered");
+    });
+    assert_eq!(
+        detcore::detlog::determinism_loss().as_deref(),
+        Some("procfs inode numbers: the call's result overwrote the guest's path")
+    );
+}
+
 /// `tcp` listed in `/proc/<pid>/net` and reached as
 /// `/proc/<pid>/task/<pid>/net/tcp` is one host inode.
 fn net_tcp_numbers() -> (u64, u64) {
@@ -290,14 +330,21 @@ fn cwd_link_count(path: Option<&CStr>) -> std::io::Result<u32> {
 /// a NULL one, reports `/proc`'s link count as `stat` of `/proc` does.
 #[test]
 fn the_proc_root_link_count_through_the_cwd_does_not_count_host_processes() {
+    // Linux before 6.11 refuses a NULL path, and the guest must see what the
+    // host's kernel does.
+    let native = cwd_link_count(None)
+        .map(drop)
+        .map_err(|error| error.raw_os_error());
     under_detcore(|| {
         std::env::set_current_dir("/proc").unwrap();
         let empty = CString::new("").unwrap();
         assert_eq!(cwd_link_count(Some(&empty)).unwrap(), 1, "an empty path");
-        match cwd_link_count(None) {
-            // Linux before 6.11 refuses a NULL path.
-            Err(error) if error.raw_os_error() == Some(libc::EFAULT) => {}
-            count => assert_eq!(count.unwrap(), 1, "a NULL path"),
+        match native {
+            Ok(()) => assert_eq!(cwd_link_count(None).unwrap(), 1, "a NULL path"),
+            Err(errno) => {
+                let error = cwd_link_count(None).unwrap_err();
+                assert_eq!(error.raw_os_error(), errno, "a NULL path");
+            }
         }
     });
 }
