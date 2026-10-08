@@ -1084,6 +1084,11 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 ///
 /// Unset `..._SITE` keeps the previous behaviour exactly: fault at whichever site
 /// is reached first. Existing callers and tests are unaffected.
+///
+/// `block` is not a fault of its own: the child announces the site on stderr
+/// and waits there until something outside kills it. That gives a test a
+/// fixed point at which to kill a container child from outside, instead of
+/// racing a stage that may already have finished.
 fn inject_test_fault(site: &str) {
     if std::env::var("HERMIT_TEST_CONTAINER_CHILD_FAULT_SITE").is_ok_and(|want| want != site) {
         return;
@@ -1098,6 +1103,12 @@ fn inject_test_fault(site: &str) {
         Some("segv") => {
             // A genuine memory fault, NOT a panic. catch_unwind must not touch this.
             unsafe { std::ptr::null_mut::<u8>().write_volatile(1) };
+        }
+        Some("block") => {
+            eprintln!("hermit: test fault: container child blocked at site {site}");
+            loop {
+                std::thread::park();
+            }
         }
         _ => {}
     }

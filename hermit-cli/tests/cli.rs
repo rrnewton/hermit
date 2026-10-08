@@ -13728,18 +13728,19 @@ if outer is not None:
     );
 }
 
-/// The REPLAY-stage classification site of `record --verify`, which the fault
-/// injector cannot reach and which was therefore left unpinned.
+/// The REPLAY-stage classification site of `record --verify`, with the
+/// container child killed from outside by a signal it did not choose.
 ///
-/// ⚠️ THIS EXISTS BECAUSE "UNREACHABLE" WAS WRONG. The sibling test below covers
-/// four of `record`'s six `run_guarded` sites, and its doc comment used to
-/// assert that the remaining two -- the replay stages of `--verify` and
-/// `--verify-with-gdbex` -- could not be reached without teaching
-/// `inject_test_fault` to name a stage. `agent(codex-rev-2628)` disproved that
-/// in review, and the idea is the one this file was missing: THE FAULT DOES NOT
-/// HAVE TO COME FROM INSIDE THE CHILD. Waiting for `:: Replaying...` on stderr
-/// and killing the container child from outside reaches the site, with no
-/// change to production code and no new injector.
+/// THE FAULT DOES NOT HAVE TO COME FROM INSIDE THE CHILD (`agent(codex-rev-2628)`
+/// in review): killing the replay container child from outside reaches the site.
+/// It must be killed at a FIXED POINT, though. The first version waited for
+/// `:: Replaying...` on stderr and then killed whatever child it found, which
+/// raced the replay itself: a `/bin/sleep` replay takes about 0.2 s, and on
+/// GitHub's hosted runner the replay finished first ("kill: No such process"),
+/// matched, and the test failed. The injector's `block` mode now parks the
+/// replay child at the `record_verify.replay` site and announces it on stderr;
+/// the test kills it only then, so the kill always lands on a live child at the
+/// site.
 ///
 /// ⚠️ AND `SIGKILL` IS WHAT MAKES IT A CONTAINER-CHILD EXIT rather than a
 /// reported error: it is a status the child did not choose and no handler can
@@ -13819,14 +13820,13 @@ fn record_classifies_a_replay_stage_container_child_failure() {
         found
     }
 
-    let mut child = hermit_command(&["record", "--verify", "--", "/bin/sleep", "5"])
+    let mut child = hermit_command(&["record", "--verify", "--", "/bin/true"])
         .env("HERMIT_DATA_DIR", data_dir.path())
-        // ⚠️ THE GUEST ARGUMENT BUYS NO HEADROOM AND AN EARLIER COMMENT HERE
-        // CLAIMED IT DID. Guest time is virtualized, so `sleep 1`, `sleep 5` and
-        // `sleep 60` all give the same ~0.4s window and `/bin/true` gives 0.2s --
-        // measured by `agent(hermit-dbgrev7)`. What makes the kill land is the
-        // poll loop below, which waits for the replay container to appear rather
-        // than assuming it is already there; the guest is incidental.
+        .env("HERMIT_TEST_CONTAINER_CHILD_FAULT", "block")
+        .env(
+            "HERMIT_TEST_CONTAINER_CHILD_FAULT_SITE",
+            "record_verify.replay",
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -13851,19 +13851,14 @@ fn record_classifies_a_replay_stage_container_child_failure() {
                 buffer.push_str(&line);
                 buffer.push('\n');
             }
-            if !killed && line.contains("Replaying...") {
-                // The replay container is forked after the announcement, so poll
-                // rather than assume it is already there.
-                let until = Instant::now() + Duration::from_secs(10);
-                while Instant::now() < until {
-                    if let Some(target) = children_of(pid).first().copied() {
-                        let _ = Command::new("kill")
-                            .args(["-9", &target.to_string()])
-                            .status();
+            if !killed && line.contains("container child blocked at site record_verify.replay") {
+                // The replay child waits at the site until it is killed, so it
+                // is alive here; only a successful kill counts.
+                for target in children_of(pid) {
+                    // SAFETY: kill(2) on a pid read from /proc; no memory is shared.
+                    if unsafe { libc::kill(target as libc::pid_t, libc::SIGKILL) } == 0 {
                         killed = true;
-                        break;
                     }
-                    thread::sleep(Duration::from_millis(20));
                 }
             }
         }
@@ -13895,8 +13890,8 @@ fn record_classifies_a_replay_stage_container_child_failure() {
     // landed, this test proves nothing and must say so instead of going green.
     assert!(
         killed,
-        "no container child was signalled after `Replaying...`, so this test never \
-         exercised the replay stage it exists for\nstderr:\n{stderr}"
+        "no replay container child was killed at the record_verify.replay site, so \
+         this test never exercised the replay stage it exists for\nstderr:\n{stderr}"
     );
     assert!(
         stderr.contains("HERMIT_INTERNAL_FAILURE class=container-child-exit"),
