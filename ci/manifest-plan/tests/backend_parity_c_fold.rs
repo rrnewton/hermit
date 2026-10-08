@@ -515,8 +515,15 @@ fn every_manifest_node_with_a_dbt_cell_orders_after_the_dbt_runtime_abi_check() 
     assert_eq!(
         needs,
         BTreeSet::from([
+            "e2e.manifest_applications".to_string(),
+            "e2e.manifest_bin_c".to_string(),
             "e2e.manifest_c_programs".to_string(),
+            "e2e.manifest_debugger_c".to_string(),
+            "e2e.manifest_determinism_stress_c".to_string(),
+            "e2e.manifest_language_runtimes".to_string(),
+            "e2e.manifest_shared_futex_c".to_string(),
             "e2e.manifest_system_utils".to_string(),
+            "e2e.manifest_util_c".to_string(),
             "privileged-e2e.manifest_c_programs".to_string(),
         ])
     );

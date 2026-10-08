@@ -909,12 +909,13 @@ test:
           ptrace: true
           kvm: true
           sabre: true
+          dbt: true
         backends_enabled:
           - ptrace
           - kvm
           - sabre
+          - dbt
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       replay:
         ci: true
@@ -1350,8 +1351,8 @@ test:
         backends_enabled:
           - ptrace
           - kvm
+          - dbt
         backends_disabled:
-          dbt: Qualify recursive du independently against the new ptrace golden baseline
           sabre: Qualify recursive du independently against the new ptrace golden baseline
           liteinst: Qualify recursive du independently against the new ptrace golden baseline
       replay:
@@ -1419,8 +1420,8 @@ test:
           - ptrace
           - sabre
           - kvm
+          - dbt
         backends_disabled:
-          dbt: Qualify recursive find independently against the new ptrace golden baseline
           liteinst: Qualify recursive find independently against the new ptrace golden baseline
       replay:
         ci: false
@@ -1476,8 +1477,8 @@ test:
           - ptrace
           - sabre
           - kvm
+          - dbt
         backends_disabled:
-          dbt: Enable once measured on this backend; ptrace is the proven baseline
           liteinst: Enable once measured on this backend; ptrace is the proven baseline
       naked:
         ci: false
@@ -1598,14 +1599,15 @@ test:
           ptrace: true
           kvm: true
           sabre: false
+          dbt: true
         ci_disabled_reason:
           sabre: {"result": "determinism-failure", "evidence": "Generated scorecard ci/compat-envelope/cells.json at Hermit 5b811757980b9cab599206c047560a7962176a6b retains historical results determinism-failure at Hermit 90e46cba9ad83550205f3c9cd232ae222c6b6173; retained first divergent record positions: 117, 117, 117.", "reason": "Historical canonical verification diverged at recorded positions. The later clean observations do not erase that retained failure, so this backend remains excluded pending separate qualification."}
         backends_enabled:
           - ptrace
           - kvm
           - sabre
+          - dbt
         backends_disabled:
-          dbt: Qualify the DBT startup TLS path independently after the ptrace and SaBRe ownership boundary is fixed
           liteinst: Qualify the LiteInst startup TLS path independently after the ptrace and SaBRe ownership boundary is fixed
       naked:
         ci: false
@@ -1669,12 +1671,13 @@ test:
           ptrace: true
           sabre: true
           kvm: true
+          dbt: true
         backends_enabled:
           - ptrace
           - sabre
           - kvm
+          - dbt
         backends_disabled:
-          dbt: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away
           liteinst: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in WHICH partial state a reader catches is a FINDING, not something to stabilise away
       naked:
         ci: false
@@ -1798,8 +1801,8 @@ test:
           - ptrace
           - sabre
           - kvm
+          - dbt
         backends_disabled:
-          dbt: Enable once measured on this backend; ptrace is the proven baseline
           liteinst: Enable once measured on this backend; ptrace is the proven baseline
       naked:
         ci: false
