@@ -150,6 +150,8 @@ deterministic execution.
 
 | Message | Class | Trigger | Fix |
 | --- | --- | --- | --- |
+| `HERMIT_HB_ANCHOR_NEVER_FIRED`, exit 122 | Configuration | A `--happens-before` anchor named a point the guest never reached. Either a BEFORE anchor never fired, so the thread it holds can never proceed (the deadlock report follows), or a syscall-occurrence anchor had not fired when the guest finished. The refusal names each anchor, its position and the edges or held thread involved. | Correct the anchor's thread, syscall, `fd` or `nth`. A syscall-occurrence anchor counts the thread's calls that match by descriptor number at call time, and counts syscall entries (a restarted call counts again). |
+| `HERMIT_HB_HOLD_IN_VFORK_CHILD`, exit 122 | Configuration | A `--happens-before` gate would hold a vfork child (for example the child of `posix_spawn`) before it execs. While that child runs, no other thread can, so the gate could never open. | Anchor the edge on a point before the vfork or after the child's exec. |
 | `Fatal: Exiting hermit container immediately upon SIGINT` | Configuration | SIGINT arrived while `--sigint-instakill` was enabled. | This is the requested behavior. Rerun without the option if the guest should handle SIGINT. |
 | `Could not read backtrace!` | Configuration | A requested stacktrace could not be unwound. | Install matching debug information/unwind support and preserve the executable; omit stacktrace diagnostics if unnecessary. |
 | `Failed to open preemption stacktrace log file` | Configuration | `--preemption-stacktrace-log-file` is unwritable. | Correct the path/permissions or remove the file option to log to stderr. |

@@ -113,6 +113,7 @@ static EXEC_CLOCK_CONTINUITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_TWO_THREADS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_SOURCE_THEN_FUTEX_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_SIGNAL_WHILE_HELD_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static HB_SPAWN_DUP2_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_LSEEK_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_INODE_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REPLAY_EPOCH_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -587,6 +588,31 @@ fn hb_source_then_futex_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "hb-source-then-futex guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn hb_spawn_dup2_guest() -> &'static Path {
+    HB_SPAWN_DUP2_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("hb-spawn-dup2");
+        fs::create_dir_all(&build_root).expect("failed to create hb-spawn-dup2 guest directory");
+        let guest = build_root.join("hb_spawn_dup2");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/hb_spawn_dup2.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile hb-spawn-dup2 guest");
+        assert!(
+            output.status.success(),
+            "hb-spawn-dup2 guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -8419,14 +8445,16 @@ fn happens_before_gate_that_cannot_open_reports_a_deadlock() {
     ];
     let output = hermit(&args);
     let log = stderr(&output);
-    assert!(
-        !output.status.success(),
-        "a gate that cannot open let the run succeed: {log}"
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "a gate that cannot open must end with the policy-refusal status: {log}"
     );
     assert!(
-        log.contains("held at a happens-before gate whose BEFORE anchor cannot fire")
+        log.contains("anchor 'never' on thread 3: after 1000000000 syscalls never fired; it holds dtid 3 at anchor 'gate'")
+            && log.contains("held at a happens-before gate whose BEFORE anchor cannot fire")
             && log.contains("HappensBeforeCheckpoint(50)"),
-        "no deadlock report naming the gate:\n{log}"
+        "no refusal naming the gate's BEFORE anchor, with the deadlock report:\n{log}"
     );
     assert!(String::from_utf8_lossy(&output.stdout).is_empty());
 }
@@ -8836,6 +8864,91 @@ fn happens_before_fd_anchor_counts_past_the_first_occurrence() {
             );
         }
     }
+}
+
+/// A BEFORE anchor that never fires, while its AFTER thread is held, is the
+/// likeliest spec mistake (a wrong `fd` or `nth`). The held main thread can
+/// never proceed and nothing else can run: the run must end with the named
+/// refusal, naming the BEFORE anchor and the thread it holds, and the
+/// policy-refusal status, not as a Hermit internal failure.
+#[test]
+fn happens_before_before_anchor_that_never_fires_is_refused_by_name() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = hb_two_threads_guest().to_str().unwrap().to_owned();
+    let spec = directory.path().join("phantom-before.json");
+    fs::write(
+        &spec,
+        r#"{"version": 1,
+            "events": {"phantom_before": {"thread": "5", "syscall": "write", "fd": 77, "nth": 1},
+                       "main_writes": {"thread": "3", "syscall": "write", "fd": 1, "nth": 1}},
+            "edges": [{"before": "phantom_before", "after": "main_writes", "strength": "hard"}]}"#,
+    )
+    .unwrap();
+    let spec = spec.to_str().unwrap().to_owned();
+    let args = [
+        "run",
+        "--strict",
+        "--happens-before",
+        spec.as_str(),
+        "--",
+        guest.as_str(),
+    ];
+    let output = hermit(&args);
+    let log = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "a BEFORE anchor that never fired must end the run with the policy-refusal status:\n{log}"
+    );
+    assert!(
+        log.contains("HERMIT_HB_ANCHOR_NEVER_FIRED: happens-before BEFORE anchor(s) never fired")
+            && log.contains(
+                "anchor 'phantom_before' on thread 5: write(fd=77)#1 never fired; it holds dtid 3 \
+                 at anchor 'main_writes'"
+            ),
+        "no refusal naming the BEFORE anchor that never fired:\n{log}"
+    );
+}
+
+/// A gate on a vfork child before its exec can never open: while the child
+/// runs, no other thread can (https://github.com/rrnewton/hermit/issues/3930).
+/// The child of `posix_spawn` calls dup2 before execve; a spec holding it there
+/// must be refused by name with the policy-refusal status, not spin until an
+/// outside timeout.
+#[test]
+fn happens_before_hold_in_a_vfork_child_is_refused_by_name() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = hb_spawn_dup2_guest().to_str().unwrap().to_owned();
+    let spec = directory.path().join("vfork-hold.json");
+    fs::write(
+        &spec,
+        r#"{"version": 1,
+            "threads": {"child": {"spawn_ordinal": 1}},
+            "events": {"parent_writes": {"thread": "3", "syscall": "write", "fd": 1, "nth": 1},
+                       "child_dup2": {"thread": "child", "syscall": "dup2", "fd": 5, "nth": 1}},
+            "edges": [{"before": "parent_writes", "after": "child_dup2", "strength": "hard"}]}"#,
+    )
+    .unwrap();
+    let spec = spec.to_str().unwrap().to_owned();
+    let args = [
+        "run",
+        "--strict",
+        "--happens-before",
+        spec.as_str(),
+        "--",
+        guest.as_str(),
+    ];
+    let output = hermit(&args);
+    let log = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "a hold inside a vfork child must be refused with the policy-refusal status:\n{log}"
+    );
+    assert!(
+        log.contains("HERMIT_HB_HOLD_IN_VFORK_CHILD: happens-before anchor(s) [\"child_dup2\"]"),
+        "no refusal naming the anchor that would hold the vfork child:\n{log}"
+    );
 }
 
 /// `--hb-list-events` prints the resolved spec and exits 0 without running

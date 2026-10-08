@@ -550,9 +550,13 @@ fn blocking_request_is_ready(
 /// `writev` to fd 9"), which the guest counts per thread and names in its
 /// checkpoint ([`HbRuntime::occurrence_anchors_on`]). Other position kinds are retained
 /// for diagnostics but never fire; [`HbRuntime::new`] warns about them so a run
-/// never silently ignores an ordering constraint. A syscall-occurrence anchor
-/// that never fires is refused by name when the scheduler finishes
-/// ([`HbRuntime::unfired_occurrence_report`]).
+/// never silently ignores an ordering constraint. An anchor that never fires
+/// is refused by name (`HERMIT_HB_ANCHOR_NEVER_FIRED`, exit 122): a BEFORE
+/// anchor whose held thread can never proceed, at the terminal deadlock
+/// ([`HbRuntime::held_gate_refusal`]), and any syscall-occurrence anchor still
+/// unfired when the scheduler finishes ([`HbRuntime::unfired_occurrence_report`]).
+/// A gate that would hold a vfork child before its exec is refused when it
+/// closes (`HERMIT_HB_HOLD_IN_VFORK_CHILD`).
 #[derive(Debug)]
 struct HbRuntime {
     /// The validated, normalized program (anchors indexed by name, plus edges).
@@ -576,6 +580,10 @@ struct HbRuntime {
     /// selection is in progress (as it is inside `block_for_one_resource`,
     /// where anchors fire).
     wake_pending: bool,
+    /// For each parked thread, the anchors it is held at (those whose gate was
+    /// closed when it reached them), so a gate that can never open is refused
+    /// by naming the BEFORE anchors it waits on. Kept in step with `parked`.
+    held_at: BTreeMap<DetTid, Vec<String>>,
 }
 
 impl HbRuntime {
@@ -597,6 +605,7 @@ impl HbRuntime {
             parked: BTreeSet::new(),
             spawn_order: Vec::new(),
             wake_pending: false,
+            held_at: BTreeMap::new(),
         }
     }
 
@@ -648,6 +657,39 @@ impl HbRuntime {
             })
             .cloned()
             .collect()
+    }
+
+    /// The refusal for a terminal state in which threads are held at gates that
+    /// can never open, or `None` when no thread is held. Names, for each held
+    /// thread, the unfired BEFORE anchors of the hard edges into the anchors it
+    /// is held at: those are the points the guest never reached, the likeliest
+    /// cause being a wrong count, `fd` or `nth` in the spec. Byte-stable.
+    fn held_gate_refusal(&self) -> Option<String> {
+        if self.parked.is_empty() {
+            return None;
+        }
+        let mut lines = Vec::new();
+        for dettid in &self.parked {
+            let held_at = self.held_at.get(dettid).cloned().unwrap_or_default();
+            for after in &held_at {
+                for edge in self.program.edges.iter().filter(|e| {
+                    &e.after == after
+                        && e.strength == Strength::Hard
+                        && !self.fired.contains(&e.before)
+                }) {
+                    let before = &self.program.anchors[&edge.before];
+                    lines.push(format!(
+                        "  anchor '{}' on thread {}: {} never fired; it holds dtid {} at anchor '{}'",
+                        before.name, before.thread.label, before.position, dettid, after
+                    ));
+                }
+            }
+        }
+        Some(format!(
+            "HERMIT_HB_ANCHOR_NEVER_FIRED: happens-before BEFORE anchor(s) never fired, and the \
+             thread(s) they hold cannot proceed because nothing else can run:\n{}",
+            lines.join("\n")
+        ))
     }
 
     /// The refusal for syscall-occurrence anchors that never fired, or `None`
@@ -909,6 +951,12 @@ pub struct Scheduler {
     /// return as soon as it is set, before any maintenance, selection, grant
     /// or signal observation, so nothing new waits on a guest.
     terminal_clock_exhaustion: Option<String>,
+
+    /// Set when `terminal_deadlock` is a policy refusal of the happens-before
+    /// spec (a gate that can never open, or a hold inside a vfork child) rather
+    /// than a scheduler failure: the run then exits with
+    /// `HERMIT_POLICY_REFUSAL_EXIT` instead of the fatal status.
+    terminal_is_refusal: bool,
 
     /// The scheduler turn at which `step2d_handle_empty_queue` last logged
     /// "zero threads left anywhere, fizzling.", while that empty state lasts.
@@ -1704,8 +1752,20 @@ async fn sched_loop_inner(
         // Printed with `eprintln!` rather than `tracing::error!` on purpose: the
         // tracing writer prefixes a real wall-clock timestamp, and this report
         // is required to be byte-identical across runs of the same program.
-        if let Some(report) = sched.lock().unwrap().take_terminal_deadlock() {
+        let terminal = {
+            let mut sched = sched.lock().unwrap();
+            let is_refusal = sched.terminal_is_refusal;
+            sched
+                .take_terminal_deadlock()
+                .map(|report| (report, is_refusal))
+        };
+        if let Some((report, is_refusal)) = terminal {
             eprintln!("{}", report);
+            if is_refusal {
+                // A happens-before spec the guest cannot satisfy: a policy
+                // refusal, distinct from the guest's status and from a failure.
+                std::process::exit(detcore_model::HERMIT_POLICY_REFUSAL_EXIT);
+            }
             immediate_fatal_exit(); // We don't want a backtrace of this thread.
         }
         // Virtual time ran out under a configured --scheduler-turn-cost: end
@@ -2311,6 +2371,7 @@ impl Scheduler {
             cleared_child_tids: Default::default(),
             terminal_deadlock: None,
             terminal_clock_exhaustion: None,
+            terminal_is_refusal: false,
             empty_queue_kick_turn: None,
             backend_failure: None,
             backend_failure_sender: Some(backend_failure_sender),
@@ -2483,7 +2544,29 @@ impl Scheduler {
                  anchor(s) {:?} (syscall count {}) awaiting a BEFORE anchor",
                 self.turn, dettid, reached, count
             );
-            self.happens_before.as_mut().unwrap().parked.insert(dettid);
+            if self
+                .vfork_barriers
+                .values()
+                .any(|child| *child == Some(dettid))
+            {
+                // While a vfork child runs, no other thread can be selected
+                // (`step3_peek`), so a BEFORE anchor could never fire and the run
+                // would spin with no report
+                // (https://github.com/rrnewton/hermit/issues/3930). Refuse instead.
+                self.terminal_deadlock.get_or_insert_with(|| {
+                    format!(
+                        "HERMIT_HB_HOLD_IN_VFORK_CHILD: happens-before anchor(s) {:?} would hold \
+                         dtid {}, a vfork child that has not exec'd yet; while it runs no other \
+                         thread can, so its gate could never open. Anchor the edge on a point \
+                         before the vfork or after the child's exec.",
+                        reached, dettid
+                    )
+                });
+                self.terminal_is_refusal = true;
+            }
+            let hb = self.happens_before.as_mut().unwrap();
+            hb.parked.insert(dettid);
+            hb.held_at.insert(dettid, reached.clone());
             return self.skip_turn_blocked(dettid);
         }
 
@@ -2535,7 +2618,9 @@ impl Scheduler {
             .map(|hb| hb.parked.iter().copied().collect())
             .unwrap_or_default();
         for dettid in parked {
-            self.happens_before.as_mut().unwrap().parked.remove(&dettid);
+            let hb = self.happens_before.as_mut().unwrap();
+            hb.parked.remove(&dettid);
+            hb.held_at.remove(&dettid);
             if !self.run_queue.contains_tid(dettid) {
                 let pos = self.runqueue_push_back(dettid);
                 trace!(
@@ -3551,6 +3636,7 @@ impl Scheduler {
         // for a parked thread: it leaves a held thread held.)
         if let Some(hb) = self.happens_before.as_mut() {
             hb.parked.remove(dtid);
+            hb.held_at.remove(dtid);
         }
     }
 
@@ -5479,8 +5565,23 @@ impl Scheduler {
     /// `do_a_turn_blocking` would also poison the scheduler mutex.
     fn report_terminal_deadlock(&mut self) -> SkipTurn {
         let report = self.format_terminal_deadlock();
+        // A terminal state with threads held at happens-before gates that can
+        // never open is a fault of the spec, not of Hermit: refuse it by naming
+        // the BEFORE anchors that never fired, with the deadlock report below
+        // for diagnosis.
+        let refusal = self
+            .happens_before
+            .as_ref()
+            .and_then(HbRuntime::held_gate_refusal);
         // Keep the first verdict: it names the state that actually wedged.
-        self.terminal_deadlock.get_or_insert(report);
+        if self.terminal_deadlock.is_none() {
+            if let Some(refusal) = refusal {
+                self.terminal_deadlock = Some(format!("{}\n{}", refusal, report));
+                self.terminal_is_refusal = true;
+            } else {
+                self.terminal_deadlock = Some(report);
+            }
+        }
         SkipTurn
     }
 

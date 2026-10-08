@@ -301,9 +301,18 @@ pub fn load_program(path: &Path) -> anyhow::Result<HappensBeforeProgram> {
     let program = spec
         .normalize()
         .with_context(|| format!("normalizing happens-before spec: {}", path.display()))?;
-    // A syscall anchor is enforced at the prehook of the thread's nth matching
-    // call. One authored for the polling or posthook phase cannot be enforced,
-    // and ignoring it would let a run pass with its ordering unexercised.
+    Ok(program)
+}
+
+/// Refuse a program the run cannot enforce as written: a syscall anchor for
+/// the polling or posthook phase. Syscall anchors are enforced at the prehook
+/// of the thread's nth matching call; ignoring one authored for another phase
+/// would let a run pass with its ordering unexercised. Applied on the run path
+/// only, so `--hb-list-events` can still preview such a spec.
+pub fn refuse_unenforceable_anchors(
+    program: &HappensBeforeProgram,
+    path: &Path,
+) -> anyhow::Result<()> {
     if let Some(anchor) = program
         .anchors
         .values()
@@ -317,7 +326,7 @@ pub fn load_program(path: &Path) -> anyhow::Result<HappensBeforeProgram> {
             anchor.position
         );
     }
-    Ok(program)
+    Ok(())
 }
 
 /// Render one anchor for `--list-events`-style introspection, showing the
@@ -479,11 +488,11 @@ mod tests {
     }
 
     /// A syscall anchor authored for the posthook (or polling) phase cannot be
-    /// enforced, so loading the spec refuses it by name instead of running with
-    /// the ordering ignored. The same anchor at the prehook (or with no phase)
-    /// loads.
+    /// enforced, so the run path refuses it by name instead of running with the
+    /// ordering ignored; `load_program` itself (shared with `--hb-list-events`)
+    /// still loads it for preview. The same anchor at the prehook passes.
     #[test]
-    fn load_program_refuses_a_syscall_anchor_it_cannot_enforce() {
+    fn run_path_refuses_a_syscall_anchor_it_cannot_enforce() {
         let dir = tempfile::tempdir().unwrap();
         let spec = dir.path().join("post.json");
         std::fs::write(
@@ -492,7 +501,10 @@ mod tests {
                 "events": {"closed": {"thread": "3", "syscall": "close", "fd": 4, "phase": "post"}}}"#,
         )
         .unwrap();
-        let err = load_program(&spec).unwrap_err().to_string();
+        let program = load_program(&spec).expect("a posthook anchor still loads for preview");
+        let err = refuse_unenforceable_anchors(&program, &spec)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("anchor 'closed'") && err.contains("enforced only at the prehook"),
             "{err}"
@@ -503,6 +515,7 @@ mod tests {
                 "events": {"closed": {"thread": "3", "syscall": "close", "fd": 4, "phase": "pre"}}}"#,
         )
         .unwrap();
-        assert!(load_program(&spec).is_ok());
+        let program = load_program(&spec).unwrap();
+        assert!(refuse_unenforceable_anchors(&program, &spec).is_ok());
     }
 }

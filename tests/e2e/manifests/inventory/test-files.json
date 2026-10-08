@@ -596,6 +596,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/hb_spawn_dup2.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/hb_spawn_dup2.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test happens_before_hold_in_a_vfork_child_is_refused_by_name compiles this posix_spawn guest, whose vfork child calls dup2 before execve, and requires a --happens-before spec that would hold the child at that dup2 to be refused by name (exit 122) instead of spinning; it remains a guest fixture because a generic manifest cannot express a happens-before spec and a refusal-text assertion."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/hb_two_threads.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/hb_two_threads.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test happens_before_edge_reverses_two_threads_writes compiles this two-thread pthread guest, calibrates each thread's write(1, ..) syscall count from an INFO run, and requires a --happens-before edge between the two threads of one process (the worker's dettid is not its process's detpid) to reverse their output order; it remains a guest fixture because a generic manifest cannot express a calibration run followed by a spec authored from its log."

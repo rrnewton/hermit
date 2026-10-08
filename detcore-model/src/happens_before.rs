@@ -144,7 +144,10 @@ pub struct EventSpec {
 
     /// Restrict the named `syscall` to calls whose first argument is this file
     /// descriptor, for example `{"syscall": "writev", "fd": 9, "nth": 3}`: the
-    /// thread's third `writev` to fd 9. Only valid with `syscall`, and only for
+    /// thread's third `writev` to fd 9. The descriptor is matched by number at
+    /// the time of the call: a write to a `dup` of fd 9 under another number
+    /// does not count, and after fd 9 is closed and the number reused, calls
+    /// on the new fd 9 do. Only valid with `syscall`, and only for
     /// a syscall whose first argument is a file descriptor
     /// ([`syscall_takes_fd_first`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -283,6 +286,9 @@ pub enum Position {
     /// - What is counted is syscall *entries*, the same unit as
     ///   [`Position::SyscallCount`]. A matching call that a signal interrupts
     ///   and the kernel restarts is entered, and counted, again.
+    /// - The counters belong to the thread, like its syscall count: a new
+    ///   thread starts at zero, an exec keeps them, and after a non-leader exec
+    ///   the calling thread's counters continue under the leader's thread id.
     /// - Like every anchor, it fires at the prehook: an edge orders the BEFORE
     ///   thread *reaching* its syscall, not that syscall's effect. Under the
     ///   default scheduler the BEFORE syscall completes before the held thread
@@ -605,6 +611,12 @@ pub enum HappensBeforeError {
         /// The unparseable name.
         name: String,
     },
+    /// An occurrence-counted event (`syscall`, `rip`, `mark` or a code
+    /// location) set `nth` to 0; occurrences are 1-based.
+    NthZero {
+        /// The offending event name.
+        event: String,
+    },
     /// An event set `fd` without `syscall`.
     FdWithoutSyscall {
         /// The offending event name.
@@ -679,6 +691,11 @@ impl fmt::Display for HappensBeforeError {
             HappensBeforeError::UnknownSyscall { event, name } => {
                 write!(f, "event '{}' names unknown syscall '{}'", event, name)
             }
+            HappensBeforeError::NthZero { event } => write!(
+                f,
+                "event '{}' sets 'nth' to 0; occurrences are counted from 1",
+                event
+            ),
             HappensBeforeError::FdWithoutSyscall { event } => write!(
                 f,
                 "event '{}' sets 'fd' without 'syscall'; 'fd' restricts a named syscall",
@@ -826,6 +843,12 @@ impl HappensBeforeSpec {
 
         if ev.fd.is_some() && ev.syscall.is_none() {
             return Err(HappensBeforeError::FdWithoutSyscall {
+                event: name.to_string(),
+            });
+        }
+
+        if ev.nth == Some(0) && ev.syscalls.is_none() && ev.rcbs.is_none() {
+            return Err(HappensBeforeError::NthZero {
                 event: name.to_string(),
             });
         }
@@ -1306,6 +1329,18 @@ mod tests {
             }
         );
         assert!(err.to_string().contains("'y'"), "{err}");
+        let err = HappensBeforeSpec::from_json(
+            r#"{"version": 1, "events": {"z": {"thread": "7", "syscall": "write", "fd": 1, "nth": 0}}}"#,
+        )
+        .unwrap()
+        .normalize()
+        .unwrap_err();
+        assert_eq!(
+            err,
+            HappensBeforeError::NthZero {
+                event: "z".to_string()
+            }
+        );
     }
 
     /// Occurrences are counted per thread over the calls that match: the

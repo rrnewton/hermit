@@ -48,6 +48,7 @@ use hermit::canonical_verdict::Verdict;
 use hermit::happens_before::DebugInfoResolver;
 use hermit::happens_before::describe_anchor;
 use hermit::happens_before::load_program;
+use hermit::happens_before::refuse_unenforceable_anchors;
 use hermit::happens_before::resolve_program;
 use hermit::host_input_change::HostInputs;
 use hermit::host_input_change::PatternDifference;
@@ -5162,6 +5163,12 @@ impl RunOpts {
             // it so every subsequent `effective_det_config()` (including both
             // `--verify` runs) hands the scheduler the identical resolved program.
             let program = self.load_and_resolve_happens_before()?;
+            refuse_unenforceable_anchors(
+                &program,
+                self.happens_before
+                    .as_deref()
+                    .expect("checked by is_some above"),
+            )?;
             // Syscall-occurrence anchors are counted and enforced by the Detcore
             // that traces the guest from outside, on the ptrace backend. Backends
             // that run Detcore inside the guest never receive the program, so every
@@ -5176,6 +5183,19 @@ impl RunOpts {
                     anchor.name,
                     anchor.position,
                     backend
+                );
+            }
+            // `--passthru-opt` intercepts only an allow-list of syscalls, so a
+            // syscall-occurrence anchor on any other call could never be
+            // counted, and the run would blame the guest for never reaching it.
+            if self.det_opts.det_config.passthru_opt
+                && let Some(anchor) = program.anchors.values().find(|a| a.is_syscall_occurrence())
+            {
+                anyhow::bail!(
+                    "--happens-before anchor '{}' ({}) is a syscall-occurrence anchor, which \
+                     needs every syscall intercepted; --passthru-opt leaves some unintercepted",
+                    anchor.name,
+                    anchor.position
                 );
             }
             self.resolved_happens_before = Some(program);
