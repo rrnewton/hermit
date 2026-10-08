@@ -69,6 +69,13 @@ static TOOL_OUTPUT_IDENTITY: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLo
 /// is still single-threaded and before any seccomp filter is active.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn detcore_liteinst_initialize() {
+    // Until Detcore is installed, this library's Rust allocations would come
+    // from the guest's own malloc (outside a Tool callback the runtime's
+    // allocator forwards there), so what this setup reads (environment values,
+    // the /proc/self/fd listing and its links) would stay in the guest's heap
+    // after it is freed, where the guest's own allocations find it. Allocate
+    // from the runtime's private Tool heap instead, as a Tool callback does.
+    let private_allocations = reverie_inguest::guest::alloc::enter_dispatch();
     let Some(socket) = std::env::var_os(reverie_liteinst::COORDINATOR_ENV) else {
         fail("the coordinator socket environment variable is missing");
     };
@@ -163,6 +170,7 @@ pub unsafe extern "C" fn detcore_liteinst_initialize() {
             "cannot list the descriptors this process started with: {error}"
         )),
     }
+    drop(private_allocations);
     // SAFETY: the loader runs constructors before any application thread
     // exists and before the application can install a seccomp filter, which is
     // the window `install_tool` requires.

@@ -581,3 +581,120 @@ mod shared_stderr_origin_tests {
         );
     }
 }
+
+/// Calls `visit` with each name in directory `path`, without `.` and `..`,
+/// in the kernel's order, until it returns `Some`, and returns that value
+/// (`None` when every name was visited).
+///
+/// Read with raw `getdents64` into one fixed buffer from Rust's allocator,
+/// never with `std::fs::read_dir`: that calls glibc's `opendir`, whose
+/// directory buffer comes from the C library's `malloc`. Under in-guest
+/// LiteInst, Detcore runs inside the guest and that heap is the guest's: the
+/// freed buffer would keep the kernel's bytes (raw `/proc` inode numbers, say)
+/// where the guest's next allocation finds them, so the guest could observe
+/// host-chosen data, for example in the padding of its own `getdents64`
+/// records. Rust's allocator is private to the runtime there (inside a Tool
+/// callback or an allocation scope). The names are streamed, not collected,
+/// so a directory of any size costs the one buffer.
+pub fn find_in_directory<T>(
+    path: &std::path::Path,
+    mut visit: impl FnMut(&std::ffi::OsStr) -> Option<T>,
+) -> std::io::Result<Option<T>> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: a NUL-terminated path; the descriptor is closed below.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a descriptor this function just opened and owns; dropping it
+    // closes it on every path, a panicking visitor included.
+    let directory = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+    let mut buffer = vec![0_u8; 32 * 1024];
+    let result = 'listing: loop {
+        // SAFETY: the buffer is writable for its length.
+        let read =
+            unsafe { libc::syscall(libc::SYS_getdents64, fd, buffer.as_mut_ptr(), buffer.len()) };
+        if read < 0 {
+            break Err(std::io::Error::last_os_error());
+        }
+        if read == 0 {
+            break Ok(None);
+        }
+        let mut offset = 0_usize;
+        let read = read as usize;
+        // A record: d_ino (8), d_off (8), d_reclen (2), d_type (1), d_name.
+        while offset + 19 <= read {
+            let reclen = u16::from_ne_bytes([buffer[offset + 16], buffer[offset + 17]]) as usize;
+            if reclen < 19 || offset + reclen > read {
+                break;
+            }
+            let name = &buffer[offset + 19..offset + reclen];
+            let name = &name[..name
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(name.len())];
+            if name != b"."
+                && name != b".."
+                && let Some(found) = visit(std::ffi::OsStr::from_bytes(name))
+            {
+                break 'listing Ok(Some(found));
+            }
+            offset += reclen;
+        }
+    };
+    drop(directory);
+    result
+}
+
+#[cfg(test)]
+mod find_in_directory_tests {
+    use super::*;
+
+    /// Every name `std::fs::read_dir` finds is visited once, the visit stops
+    /// at the first `Some`, and a path that is not a directory is an error.
+    #[test]
+    fn find_in_directory_visits_every_name_and_stops_at_the_first_find() {
+        let directory = tempfile::tempdir().unwrap();
+        for index in 0..300 {
+            std::fs::write(
+                directory
+                    .path()
+                    .join(format!("entry-with-a-long-name-{index}")),
+                b"",
+            )
+            .unwrap();
+        }
+        let mut visited = Vec::new();
+        let none: Option<()> = find_in_directory(directory.path(), |name| {
+            visited.push(name.to_owned());
+            None
+        })
+        .unwrap();
+        assert!(none.is_none());
+        visited.sort();
+        let mut expected: Vec<_> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        expected.sort();
+        assert_eq!(visited.len(), 300);
+        assert_eq!(visited, expected);
+        let mut calls = 0;
+        let found = find_in_directory(directory.path(), |name| {
+            calls += 1;
+            (calls == 7).then(|| name.to_owned())
+        })
+        .unwrap();
+        assert!(found.is_some());
+        assert_eq!(calls, 7);
+        let file = directory.path().join("entry-with-a-long-name-0");
+        assert!(find_in_directory(&file, |_| Some(())).is_err());
+    }
+}

@@ -534,6 +534,47 @@ fn liteinst_in_guest_sigalrm_handler_is_virtual_and_published() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), not_admitted);
 }
 
+/// In-guest LiteInst runs the Detcore Tool inside the guest, so the Tool must
+/// keep out of the guest's C library heap. Installing a SIGALRM handler makes
+/// Detcore list the kernel's descriptor table; listed with glibc's opendir,
+/// the freed buffer kept raw /proc inode numbers that the guest's next
+/// opendir got back, so the padding of its getdents64 records (which Linux
+/// never writes) differed between runs (how `iostat` failed --verify). The
+/// fixture prints that padding; the run must verify and match native Linux.
+#[test]
+fn liteinst_in_guest_tool_directory_reads_stay_out_of_the_guest_heap() {
+    let _guard = hermit_run_guard();
+    let build_root = process_build_root("liteinst-guest-heap");
+    fs::create_dir_all(&build_root).expect("failed to create the guest directory");
+    let guest = build_root.join("tool_keeps_out_of_guest_heap");
+    let compiled = Command::new("cc")
+        .args(["-O2", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/liteinst_tool_keeps_out_of_guest_heap.c"),
+        )
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the guest");
+    assert!(compiled.status.success(), "{compiled:?}");
+    let output = liteinst_command("info")
+        .arg("--verify")
+        .arg("--env=REVERIE_LITEINST_SITE_PATCHING=0")
+        .arg("--env=REVERIE_LITEINST_SIGALRM_HANDLERS=1")
+        .arg("--")
+        .arg(&guest)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run Hermit LiteInst");
+    let output = assert_liteinst_in_guest_output(output);
+    let mut expected = String::from("install=0\nrecord 0 pad: 00 00 00\nrecord 1 pad: 00 00\n");
+    for record in 2..10 {
+        expected.push_str(&format!("record {record} pad: 00 00 00 00 00 00\n"));
+    }
+    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+}
+
 #[test]
 fn liteinst_in_guest_detcore_micro_suite() {
     let _guard = hermit_run_guard();
