@@ -10638,9 +10638,16 @@ mod tests {
             .filter(|cell| cell.id.test == "c-programs/record-replay-file-state-regular-sink")
             .map(|cell| (cell.id.mode.as_str(), cell.id.backend.as_deref()))
             .collect::<BTreeSet<_>>();
+        // Its KVM verify cell joins on 2026-10-08 (the KVM zero-class
+        // qualification: three non-vacuous canonical passes on the validation
+        // host), also with the default timeouts and no calibration change.
         assert_eq!(
             regular_sink,
-            BTreeSet::from([("verify", Some("ptrace")), ("verify", Some("sabre"))])
+            BTreeSet::from([
+                ("verify", Some("kvm")),
+                ("verify", Some("ptrace")),
+                ("verify", Some("sabre"))
+            ])
         );
         // https://github.com/rrnewton/hermit/pull/3231 qualifies three new
         // cells without revising the frozen calibration or any timeout override.
