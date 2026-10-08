@@ -93,6 +93,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     backend_supports_blocked_wait_signal_interruption: false,
     guest_may_inherit_a_terminal: false,
     in_guest_detlog_forward_policy: None,
+    inherited_seccomp: detcore::InheritedSeccomp::measure(),
     virtualize_time: false,
     virtualize_metadata: false,
     mountinfo_root_rewrites: Vec::new(),
@@ -176,6 +177,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     backend_supports_blocked_wait_signal_interruption: false,
     guest_may_inherit_a_terminal: false,
     in_guest_detlog_forward_policy: None,
+    inherited_seccomp: detcore::InheritedSeccomp::measure(),
     virtualize_time: true, // stat* could depends on this
     virtualize_metadata: true,
     mountinfo_root_rewrites: Vec::new(),
@@ -259,6 +261,7 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     backend_supports_blocked_wait_signal_interruption: false,
     guest_may_inherit_a_terminal: false,
     in_guest_detlog_forward_policy: None,
+    inherited_seccomp: detcore::InheritedSeccomp::measure(),
     virtualize_time: true,
     virtualize_metadata: true,
     mountinfo_root_rewrites: Vec::new(),
