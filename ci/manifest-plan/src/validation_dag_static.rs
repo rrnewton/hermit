@@ -1463,7 +1463,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1150, listed with this node's arguments.
     // scheduler::test::a_signal_sent_at_an_rt_sigsuspend_request_arms_the_call_it_wakes
     // retains all 1150: 1151, listed with this node's arguments.
-    ("test.detcore_unit", 1151),
+    // Four fatal_core::tests (orphaned temp files, the helper-thread wait, a
+    // panicking helper, an abandoned capture): 1151 + 4 = 1155.
+    ("test.detcore_unit", 1155),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2055,7 +2057,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same seven signal phase 1 table tests, re-listed: 1134.
     // And the schedstats sanitizer test: 1150.
     // And the rt_sigsuspend request signal test: 1151.
-    ("test.detcore_unit_on_host", 1151),
+    // And the same four fatal_core::tests: 1155.
+    ("test.detcore_unit_on_host", 1155),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

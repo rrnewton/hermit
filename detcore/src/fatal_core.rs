@@ -43,7 +43,10 @@
 //! only the notes (registers, signal, process identity, auxiliary vector and
 //! mapped files) and the mapping layout. A core that cannot fit even then is
 //! not written. Once a Full core runs out of time, later captures in the same
-//! hermit process start at the Stack tier. Every failure is returned for the
+//! hermit process start at the Stack tier. The tracer waits for a capture only
+//! until its end, even when a read or write blocks in the kernel (see
+//! [`capture`]), and a capture deletes temporary files that dead writers left
+//! before it sizes the remaining total. Every failure is returned for the
 //! caller to log.
 
 use std::fs;
@@ -54,10 +57,13 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
 
 use ::procfs::process::CoredumpFlags;
 use ::procfs::process::MMPermissions;
@@ -130,13 +136,62 @@ pub(crate) fn capture_and_log(cfg: &FatalCoreCapture, exit: &FatalSignalExit) {
 
 /// Writes a core for the thread `exit` names, held at its exit stop, if it is
 /// the thread that ran the kernel's core dump step.
+///
+/// The work runs on a helper thread that the tracer waits for only until the
+/// capture's end, plus [`HELPER_SLACK`]. The capture checks its end between
+/// frames, but one read of a file mapping on a hung network filesystem, or a
+/// write into a core directory on one, can block in the kernel past any
+/// check. The tracer then gives up, so the guest waits no longer, and the
+/// helper deletes what it was writing if it ever returns.
 pub(crate) fn capture(cfg: &FatalCoreCapture, exit: &FatalSignalExit) -> anyhow::Result<Outcome> {
     if !exit.dumping {
         return Ok(Outcome::NotDumping);
     }
-    // A memory that is already gone still leaves the notes worth keeping.
-    let mem = File::open(format!("/proc/{}/mem", exit.tid.as_raw())).ok();
-    capture_from(cfg, exit, mem.as_ref(), &FULL_TIER_TIMED_OUT)
+    let end = capture_end(Instant::now(), cfg.time_limit, exit.deadline) + HELPER_SLACK;
+    let (cfg, exit) = (cfg.clone(), *exit);
+    run_within(end, move |abandoned| {
+        // A memory that is already gone still leaves the notes worth keeping.
+        let mem = File::open(format!("/proc/{}/mem", exit.tid.as_raw())).ok();
+        capture_abandonable(&cfg, &exit, mem.as_ref(), &FULL_TIER_TIMED_OUT, abandoned)
+    })
+}
+
+/// How long past a capture's own end the tracer still waits for it. A healthy
+/// capture overruns its end by at most one frame: one read of up to 1 MiB and
+/// its compression.
+const HELPER_SLACK: Duration = Duration::from_millis(500);
+
+/// Runs `work` on a helper thread and returns its result if it arrives by
+/// `end`. Otherwise sets the flag `work` was given and returns an error: the
+/// helper is left to finish on its own and must not keep anything once the
+/// flag is set. A panic in `work` is an error too, not a tracer panic.
+///
+/// A helper that finishes in the instant between the timeout and the flag
+/// can still keep its core while the report says it was not kept.
+fn run_within(
+    end: Instant,
+    work: impl FnOnce(&AtomicBool) -> anyhow::Result<Outcome> + Send + 'static,
+) -> anyhow::Result<Outcome> {
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    let flag = Arc::clone(&abandoned);
+    std::thread::Builder::new()
+        .name("fatal-core".to_string())
+        .spawn(move || {
+            let _ = send.send(work(&flag));
+        })
+        .map_err(|error| anyhow::anyhow!("cannot start the capture thread: {error}"))?;
+    match receive.recv_timeout(end.saturating_duration_since(Instant::now())) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout) => {
+            abandoned.store(true, Ordering::SeqCst);
+            match receive.try_recv() {
+                Ok(result) => result,
+                Err(_) => anyhow::bail!("gave up: a read or write blocked past the time limit"),
+            }
+        }
+        Err(RecvTimeoutError::Disconnected) => anyhow::bail!("the capture thread panicked"),
+    }
 }
 
 /// Set once a Full core has run out of time in this hermit process. Every
@@ -146,12 +201,26 @@ static FULL_TIER_TIMED_OUT: AtomicBool = AtomicBool::new(false);
 
 /// [`capture`] with the thread's memory, or `None` when it cannot be read at
 /// all, in which case only the notes and the mapping layout are kept.
-/// `full_timed_out` is [`FULL_TIER_TIMED_OUT`] outside tests.
+/// `full_timed_out` is [`FULL_TIER_TIMED_OUT`] outside tests. Tests call it
+/// directly; [`capture`] goes through [`capture_abandonable`].
+#[cfg(test)]
 fn capture_from(
     cfg: &FatalCoreCapture,
     exit: &FatalSignalExit,
     mem: Option<&File>,
     full_timed_out: &AtomicBool,
+) -> anyhow::Result<Outcome> {
+    capture_abandonable(cfg, exit, mem, full_timed_out, &AtomicBool::new(false))
+}
+
+/// [`capture_from`] for a helper the tracer may give up on: once `abandoned`
+/// is set, a finished core is deleted instead of kept.
+fn capture_abandonable(
+    cfg: &FatalCoreCapture,
+    exit: &FatalSignalExit,
+    mem: Option<&File>,
+    full_timed_out: &AtomicBool,
+    abandoned: &AtomicBool,
 ) -> anyhow::Result<Outcome> {
     let start = Instant::now();
     let end = capture_end(start, cfg.time_limit, exit.deadline);
@@ -160,6 +229,7 @@ fn capture_from(
     let snapshot = Snapshot::read(&process, exit)?;
     fs::create_dir_all(&cfg.dir)?;
     let _lock = DirLock::acquire(&cfg.dir, end)?;
+    remove_orphaned_temps(&cfg.dir, cfg.time_limit * 2)?;
     let used = regular_file_bytes(&cfg.dir)?;
     let budget = cfg
         .max_core_bytes
@@ -186,6 +256,10 @@ fn capture_from(
         let segments = snapshot.segments(tier);
         match write_core(&temp, budget, deadline, &snapshot, &segments, mem) {
             Ok(_) => {
+                if abandoned.load(Ordering::SeqCst) {
+                    let _ = fs::remove_file(&temp);
+                    anyhow::bail!("the tracer gave up on this capture");
+                }
                 fs::rename(&temp, &path)?;
                 return Ok(Outcome::Written { path });
             }
@@ -250,6 +324,41 @@ fn free_name(dir: &Path, stem: &str) -> std::io::Result<String> {
         name = format!("{stem}.{n}.zst");
     }
     Ok(name)
+}
+
+/// Removes the temporary files of writers that died mid-core, so they stop
+/// counting against `max_total_bytes`. Every writer creates its temp only while
+/// it holds [`DirLock`], so one found while the caller holds the lock has no
+/// live writer on this host. Only hermit's own core temp names
+/// (`.hermit-*core.*.zst.tmp`) are touched, and only ones last written at
+/// least `min_age` ago, which also covers a writer on another host whose lock
+/// this host cannot see on some network filesystems. A temp that cannot be
+/// removed, such as another user's in a sticky directory, is skipped: it keeps
+/// counting, but it never stops this capture.
+fn remove_orphaned_temps(dir: &Path, min_age: Duration) -> std::io::Result<()> {
+    let now = SystemTime::now();
+    for entry in fs::read_dir(dir)? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with(".hermit-") && name.contains("core.") && name.ends_with(".zst.tmp")) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let old = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= min_age);
+        if metadata.is_file() && old {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    Ok(())
 }
 
 /// Bytes held by the regular files directly in `dir`.
@@ -1138,6 +1247,104 @@ mod tests {
         let outcome = capture_from(&config(dir.path()), &late, Some(&mem), &flag).unwrap();
         assert!(matches!(outcome, Outcome::NoRoom { .. }), "{outcome:?}");
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_dead_writers_temp_file_stops_counting_against_the_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let orphan = dir
+            .path()
+            .join(".hermit-1-0000000000000000-core.3.3.SIGSEGV.zst.tmp");
+        let unrelated = dir.path().join(".someone-else.tmp");
+        let not_a_core = dir.path().join(".hermit-notes.tmp");
+        let young = dir
+            .path()
+            .join(".hermit-2-0000000000000000-core.4.4.SIGSEGV.zst.tmp");
+        fs::write(&orphan, vec![0u8; 1 << 20]).unwrap();
+        for path in [&unrelated, &not_a_core, &young] {
+            fs::write(path, b"x").unwrap();
+        }
+        // Written longer ago than twice the time limit, so certainly dead.
+        let hour_ago = SystemTime::now() - Duration::from_secs(3600);
+        for path in [&orphan, &unrelated, &not_a_core] {
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(hour_ago)
+                .unwrap();
+        }
+        let cfg = FatalCoreCapture {
+            max_total_bytes: 1 << 20,
+            ..config(dir.path())
+        };
+        let outcome = capture_from(&cfg, &own_exit(true, None), None, &AtomicBool::new(false));
+        assert!(
+            matches!(outcome, Ok(Outcome::Written { .. })),
+            "the orphan still took the whole total: {outcome:?}"
+        );
+        assert!(!orphan.exists(), "the orphaned temp file was kept");
+        assert!(
+            unrelated.exists(),
+            "a file that is not hermit's was removed"
+        );
+        assert!(
+            not_a_core.exists(),
+            "a hermit file that is not a core temp was removed"
+        );
+        assert!(young.exists(), "a temp written just now was removed");
+    }
+
+    #[test]
+    fn the_tracer_stops_waiting_at_the_end_and_the_helper_then_keeps_nothing() {
+        let (tell, told) = std::sync::mpsc::channel();
+        let start = Instant::now();
+        let outcome = run_within(start + Duration::from_millis(100), move |abandoned| {
+            // Stands in for a read blocked in the kernel.
+            std::thread::sleep(Duration::from_millis(600));
+            tell.send(abandoned.load(Ordering::SeqCst)).unwrap();
+            Ok(Outcome::NotDumping)
+        });
+        let waited = start.elapsed();
+        let error = outcome.expect_err("a blocked capture was reported as done");
+        assert!(error.to_string().contains("gave up"), "{error:#}");
+        assert!(
+            waited < Duration::from_millis(500),
+            "the tracer waited {waited:?}"
+        );
+        assert!(
+            told.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "the helper was not told it was abandoned"
+        );
+    }
+
+    #[test]
+    fn a_capture_that_finishes_in_time_is_returned_and_a_panic_is_an_error() {
+        let done = run_within(Instant::now() + Duration::from_secs(5), |_| {
+            Ok(Outcome::NotDumping)
+        });
+        assert_eq!(done.unwrap(), Outcome::NotDumping);
+        let panicked = run_within(Instant::now() + Duration::from_secs(5), |_| panic!("boom"));
+        assert!(panicked.unwrap_err().to_string().contains("panicked"));
+    }
+
+    #[test]
+    fn an_abandoned_capture_deletes_its_core_instead_of_keeping_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let abandoned = AtomicBool::new(true);
+        let outcome = capture_abandonable(
+            &config(dir.path()),
+            &own_exit(true, None),
+            None,
+            &AtomicBool::new(false),
+            &abandoned,
+        );
+        assert!(outcome.is_err(), "{outcome:?}");
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "an abandoned capture left a file"
+        );
     }
 
     #[test]

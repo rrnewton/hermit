@@ -226,17 +226,31 @@ fn files_from_other_invocations_neither_block_a_core_nor_get_removed() {
     let others = [
         "hermit-1-core.3.3.SIGSEGV.zst",
         "hermit-1-0000000000000000-core.3.3.SIGSEGV.zst",
-        ".hermit-1-0000000000000000-core.3.3.SIGSEGV.zst.tmp",
     ];
     for name in others {
         fs::write(cores.join(name), b"not ours").unwrap();
     }
+    // A temporary file exists only while its writer holds the directory lock,
+    // so one found by a capture holding the lock belongs to a dead writer.
+    let orphan = ".hermit-1-0000000000000000-core.3.3.SIGSEGV.zst.tmp";
+    fs::write(cores.join(orphan), b"a dead writer's").unwrap();
+    // Last written long before the capture's time limit, as a dead writer's is.
+    fs::File::options()
+        .write(true)
+        .open(cores.join(orphan))
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+        .unwrap();
     let dir = cores.to_str().unwrap();
     let crashed = hermit(&["--fatal-core-dir", dir], &guest, &["segv"]);
     assert!(
         stderr(&crashed).contains(": kept as hermit-"),
         "an existing file stopped the core:\n{}",
         stderr(&crashed)
+    );
+    assert!(
+        !cores.join(orphan).exists(),
+        "the capture kept a dead writer's temporary file"
     );
     let green = hermit(&["--fatal-core-dir", dir], &guest, &["child-segv-ok"]);
     assert!(green.status.success(), "{}", stderr(&green));
