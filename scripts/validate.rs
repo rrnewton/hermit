@@ -32120,6 +32120,26 @@ mod shared_consumer_tests {
 mod submodule_service_tests {
     use super::*;
 
+    /// A temporary directory outside every Cargo workspace. The default one
+    /// can be inside the Hermit checkout (hosted CI sets TMPDIR under
+    /// target/), where Cargo refuses a rust-script cache, so fall back to /tmp
+    /// when any ancestor holds a Cargo.toml.
+    fn tempdir_outside_cargo_workspaces() -> tempfile::TempDir {
+        let default = std::env::temp_dir();
+        let base = if default
+            .ancestors()
+            .any(|dir| dir.join("Cargo.toml").is_file())
+        {
+            PathBuf::from("/tmp")
+        } else {
+            default
+        };
+        tempfile::Builder::new()
+            .prefix("submodule-service-")
+            .tempdir_in(base)
+            .unwrap()
+    }
+
     #[test]
     fn only_the_no_submodules_child_builds_in_a_private_rust_script_cache() {
         fn env(command: &Command, key: &str) -> Option<Option<PathBuf>> {
@@ -32130,7 +32150,7 @@ mod submodule_service_tests {
         }
         // A top-level run with no TMPDIR puts TMPDIR, and so the fixture,
         // inside the Hermit Cargo workspace.
-        let outer = tempfile::tempdir().unwrap();
+        let outer = tempdir_outside_cargo_workspaces();
         let workspace = outer.path().join("hermit-checkout");
         std::fs::create_dir(&workspace).unwrap();
         std::fs::write(
@@ -32226,7 +32246,7 @@ mod submodule_service_tests {
 
     #[test]
     fn the_compiling_child_runs_with_a_fresh_private_cache_that_ends_with_it() {
-        let outer = tempfile::tempdir().unwrap();
+        let outer = tempdir_outside_cargo_workspaces();
         let base = outer.path().join("cache-base");
         let ledger = outer.path().join("ledger");
         std::fs::write(&ledger, b"").unwrap();
