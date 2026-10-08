@@ -1,12 +1,30 @@
 # Inherited seccomp filters as an explicit run input
 
-Status: design, revision 3. The direction was approved on 2026-10-08. Revision 1
-was reviewed and changes were requested; revision 2 answered the review with
-per-call checking on every filtered host. The owner rejected that cost on
-2026-10-08 ("I definitely don't want 3x ptrace stops"), so this revision makes
-normal transport the design and keeps per-call checking as an opt-in paranoid
-mode. It lands together with its implementation; nothing here is built yet.
-Tracking issue: https://github.com/rrnewton/hermit/issues/3942.
+Status: the record of a design that is **not being built**. Tracking issue:
+https://github.com/rrnewton/hermit/issues/3942.
+
+## Current decision (owner, 2026-10-08)
+
+What is built (phase 1):
+
+- Hermit refuses to start a guest when it inherited a seccomp filter. The refusal is a policy refusal (exit 122) naming the filter's mode and count and the remedies.
+- `--unsafe-ignore-host-seccomp` (a global option, saved in the run config) runs anyway. It warns, and records the filter's mode and count in the INFO log and the run evidence.
+
+What is not built: the middle option, in which a run config declares a filter at
+least as restrictive as the host's and Hermit then runs under the host filter.
+The owner's bar for it: "contingent on us actually coming up with a design that
+catches any violation of this filter strictness ordering, and does so
+efficiently without significant slowdown. If that is not possible we shouldn't
+implement."
+
+Neither revision of the design below meets that bar:
+
+- Revision 2's per-call check catches every violation, but costs about 2.9× per traced call. The owner rejected that cost.
+- Revision 3 (normal transport, startup probe) costs nothing per call, but has known blind spots: limits 1 to 3 below.
+
+The section "Could a Docker-only feature meet the bar?" answers the owner's
+follow-up question. The rest of this document is kept as the record: the
+prototype measurements, both revisions and their reviews.
 
 ## Background
 
@@ -351,6 +369,94 @@ as a normal run.
 The kernel passthrough list is detected per kernel and architecture: such a
 number gets no TRACE stop even on a mode-0 host. It is recorded in the evidence
 and counted visibly, never reported as host interference.
+
+## Could a Docker-only feature meet the bar?
+
+**The bar.** Catch every violation of "the declared policy is at least as
+restrictive as the host filter", with no significant slowdown.
+
+**What any cheap design must do.** In normal transport Hermit never sees a call
+the host blocks (see Background). So a design without per-call cost has to
+establish the ordering before the run starts, which means knowing the host
+filter exactly. Given the host filter H as an exact rule set, checking the
+declared policy D against it is exact and costs nothing at run time. Both are
+finite rule sets over (system-call number, architecture, argument registers
+compared with constants), so the argument space can be partitioned at every
+constant either side compares against and the actions compared region by
+region. Normal transport also requires D to equal H wherever H acts, because the
+host's own result is what reaches the guest for those calls. So the whole
+question is whether Hermit can know H exactly inside a Docker container.
+
+**What Docker's default profile is.** This is the published profile
+(moby/profiles, `seccomp/default.json`, as fetched on 2026-10-08):
+- default action ERRNO(EPERM), with 60 rules over 469 system-call names;
+- argument-conditional rules on `socket` (30 rules by address family), `personality` (5 allowed values) and `clone` (namespace flags);
+- rules gated by capabilities: `unshare`, `setns`, `mount`, `bpf` and others need CAP_SYS_ADMIN; `perf_event_open` needs CAP_SYS_ADMIN or CAP_PERFMON; `clone3` returns ENOSYS without CAP_SYS_ADMIN;
+- rules gated by kernel version (`ptrace` from 4.8) and by architecture.
+
+The effective filter in a container is therefore a function of the profile
+revision, the container's capabilities, the kernel version and the architecture.
+The last three can be read inside the container (`CapEff` in
+`/proc/self/status`, `uname`); the profile revision cannot.
+
+One practical consequence stands apart from the bar. Without CAP_SYS_ADMIN the
+default profile denies `unshare`, which Hermit needs for its user and PID
+namespaces, and `perf_event_open`, which its PMU-based preemption needs. A
+default Docker container already fails Hermit's namespace capability check.
+Running Hermit in Docker needs either `--cap-add SYS_ADMIN`, which changes the
+effective profile because the capability-gated rules then allow, or
+`--security-opt seccomp=unconfined`, or Hermit's `--no-namespace`. A
+Docker-only mode would have to model at least "default profile plus
+CAP_SYS_ADMIN".
+
+**Option 1: recognise the default profile by probing (cheap, not exact).** The
+startup probe (section 4) can test every system-call number and also every
+argument branch in the candidate profile: each socket family, each personality
+value, each clone namespace bit. That is about 550 probes, roughly 7 ms
+extrapolating from the measured 6 ms for 512 numbers. It must also find
+`Seccomp_filters: 1`. Together these catch:
+- any deviation that changes one of the profile's own decisions;
+- any extra filter stacked on top (the count);
+
+and they identify which known profile revision matches. They **cannot** catch a
+single customised filter that agrees with Docker's default at every probed
+point and differs elsewhere, for example an added rule on one `ioctl` request.
+No black-box observation from inside can exclude that filter, so this option
+does not meet "every violation".
+
+**Option 2: the operator states the profile (cheap, exact only relative to the
+statement).** The operator passes the JSON they gave `docker run --security-opt
+seccomp=FILE`, or names the default profile's revision. Hermit checks D against
+it exactly and runs option 1's probe for conformance. Every violation relative
+to the stated profile is caught. A host whose real filter differs from the
+statement away from the probed points is not caught. That is option 1 with the
+operator's word as an input.
+
+**Option 3: read the filter from outside the container (exact, zero per-call
+cost, but needs privilege and a particular kernel).**
+1. An unfiltered helper on the Docker host, with CAP_SYS_ADMIN, seizes Hermit's own process with ptrace before Hermit starts tracing (Docker supplies the container's process ID).
+2. It reads Hermit's whole filter stack with `PTRACE_SECCOMP_GET_FILTER` and detaches.
+3. It evaluates the classic BPF exactly. Seccomp BPF compares `seccomp_data` fields with constants only, so its decision regions are finite and enumerable, and the result is the exact rule set H.
+
+The kernel never removes or loosens a filter, so H stays valid for the life of
+that process. A filter added later changes `Seccomp_filters`, which Hermit
+checks. The static check is then exact, with no run-time cost. This meets the
+bar, at three costs:
+- a privileged step outside the container for every run (or a weaker per-container binding);
+- a kernel built with `CONFIG_CHECKPOINT_RESTORE` (the measured test host's kernel is not);
+- the orchestration around both.
+
+Nothing in it is specific to Docker: Docker only supplies the process ID.
+
+**Answer.** Only option 3 meets the owner's bar, and it is neither narrow nor
+inside-the-container: it needs a privileged host-side reader on a
+checkpoint/restore kernel. Options 1 and 2 are cheap and Docker-specific, but
+each keeps a blind spot (a customised filter that matches the default at every
+probed point), so by the stated rule they should not be built. Recommendation:
+build none of the three now, and keep the refusal and the unsafe override. For
+containers, document "create the container with `--security-opt
+seccomp=unconfined`" (plus CAP_SYS_ADMIN, or `--no-namespace`, for Hermit's
+namespaces). Revisit option 3 if a host-side step becomes acceptable.
 
 ## Acceptance matrix
 
