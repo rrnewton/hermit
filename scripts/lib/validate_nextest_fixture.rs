@@ -52,33 +52,56 @@ const FIXTURE_WALL_SECONDS: u64 = 1200;
 /// Stable name of every fixture tree inside the harness log directory.
 const FIXTURE_ROOT_PREFIX: &str = "real-nextest-results-";
 
+/// Stable name of every fixture's Cargo build directory under `$TMPDIR`.
+const FIXTURE_BUILD_PREFIX: &str = "real-nextest-build-";
+
 /// One run's fixture tree, `<DAGRUN_LOG_DIR>/real-nextest-results-XXXXXX`.
 ///
 /// The harness retains its log directory on purpose, so the small evidence
 /// files stay. The generated crate and its Cargo target directory are only
 /// inputs to the five cases, and the target directory is a complete Cargo
-/// build: until 2026-10-03 the tree was kept whole, and one host held 70 of
-/// them using 43.5e9 bytes (https://github.com/rrnewton/hermit/issues/3622).
+/// build of about 1.7 GiB. Kept in the retained directory, it leaked: one host
+/// held 70 of them using 43.5e9 bytes
+/// (https://github.com/rrnewton/hermit/issues/3622), and after the first fix
+/// every failing run still kept one
+/// (https://github.com/rrnewton/hermit/issues/3867).
 ///
-/// [`FixtureTree::finish`] removes both when every case has passed. A failing
-/// case unwinds past `finish`; the whole tree is then kept for diagnosis and
-/// its path printed. A killed test runs neither, and no validation cleanup
-/// sweeps the harness log directory, so the leftover is found by this name:
-/// `<DAGRUN_LOG_DIR>/real-nextest-results-*/target`.
+/// So the target directory is not in this tree at all. It lives under
+/// `$TMPDIR` (`real-nextest-build-XXXXXX/target`) and is removed whether the
+/// cases pass or fail. A local validation run's `$TMPDIR` is its per-run
+/// runtime root, which validation's cleanup removes after the run's checkout
+/// and Cargo home (or its sweep does later), so even a killed test leaves no
+/// build in retained evidence. Elsewhere `$TMPDIR` is usually `/tmp` (a tmpfs
+/// on hosted runners), where a killed test's build is left to that
+/// filesystem's own cleanup.
+///
+/// [`FixtureTree::finish`] also removes the generated crate when every case
+/// has passed. A failing case unwinds past `finish`; the crate and the
+/// evidence are then kept for diagnosis and the path printed.
 struct FixtureTree {
     root: PathBuf,
+    build: Option<tempfile::TempDir>,
     finished: bool,
 }
 
 impl FixtureTree {
     fn create(parent: &Path) -> Self {
+        Self::create_with_build_parent(parent, &std::env::temp_dir())
+    }
+
+    fn create_with_build_parent(parent: &Path, build_parent: &Path) -> Self {
         let root = tempfile::Builder::new()
             .prefix(FIXTURE_ROOT_PREFIX)
             .tempdir_in(parent)
             .unwrap()
             .keep();
+        let build = tempfile::Builder::new()
+            .prefix(FIXTURE_BUILD_PREFIX)
+            .tempdir_in(build_parent)
+            .unwrap();
         Self {
             root,
+            build: Some(build),
             finished: false,
         }
     }
@@ -92,19 +115,32 @@ impl FixtureTree {
     }
 
     fn target_dir(&self) -> PathBuf {
-        self.root.join("target")
+        self.build
+            .as_ref()
+            .expect("the build directory lives until the tree is dropped")
+            .path()
+            .join("target")
     }
 
     /// Called after the last assertion. A removal failure fails the test: a
     /// silent one is exactly the leak this type exists to prevent.
     fn finish(mut self) {
         self.finished = true;
-        for directory in [self.target_dir(), self.crate_dir()] {
-            match fs::remove_dir_all(&directory) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => panic!("cannot remove fixture {}: {error}", directory.display()),
-            }
+        let build = self.build.take().unwrap();
+        let build_path = build.path().to_path_buf();
+        if let Err(error) = build.close() {
+            panic!(
+                "cannot remove fixture build {}: {error}",
+                build_path.display()
+            );
+        }
+        let crate_dir = self.crate_dir();
+        match fs::remove_dir_all(&crate_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("cannot remove fixture {}: {error}", crate_dir.display()),
+        }
+        for directory in [&build_path, &crate_dir] {
             assert!(
                 !directory.exists(),
                 "{} survived removal",
@@ -116,58 +152,134 @@ impl FixtureTree {
 
 impl Drop for FixtureTree {
     fn drop(&mut self) {
+        if let Some(build) = self.build.take() {
+            let build_path = build.path().to_path_buf();
+            if let Err(error) = build.close() {
+                eprintln!(
+                    "cannot remove the fixture's Cargo build {}: {error}",
+                    build_path.display()
+                );
+            }
+        }
         if !self.finished {
             eprintln!(
-                "authentic Nextest fixture failed; its whole tree is kept for diagnosis: {}. \
-                 Delete its target/ (a full Cargo build) when done.",
-                self.root.display()
+                "authentic Nextest fixture failed; its crate and evidence are kept for \
+                 diagnosis: {root}. Its Cargo build was removed; rebuild it with \
+                 `cargo build --manifest-path {root}/crate/Cargo.toml --target-dir <dir>`.",
+                root = self.root.display()
             );
         }
     }
 }
 
 #[test]
-fn fixture_tree_drops_its_build_on_success_and_keeps_it_on_failure() {
-    fn populate(tree: &FixtureTree) -> PathBuf {
+fn fixture_tree_never_keeps_its_build_and_keeps_its_crate_only_on_failure() {
+    /// Fills the tree as the fixture does and returns its root and target.
+    fn populate(tree: &FixtureTree) -> (PathBuf, PathBuf) {
         let root = tree.root().to_path_buf();
-        fs::create_dir_all(tree.target_dir().join("debug/deps")).unwrap();
-        fs::write(tree.target_dir().join("debug/deps/fixture-binary"), b"x").unwrap();
+        let target = tree.target_dir();
+        fs::create_dir_all(target.join("debug/deps")).unwrap();
+        fs::write(target.join("debug/deps/fixture-binary"), b"x").unwrap();
         fs::create_dir_all(tree.crate_dir().join("src")).unwrap();
         fs::write(tree.crate_dir().join("Cargo.toml"), b"[package]\n").unwrap();
         fs::write(root.join("bounds.json"), b"{}").unwrap();
         fs::create_dir_all(root.join("writable-pass")).unwrap();
         fs::write(root.join("writable-pass/producer.stderr"), b"log").unwrap();
-        root
+        (root, target)
+    }
+    /// No directory below `root` holds the build, at any depth.
+    fn holds_no_build(root: &Path) -> bool {
+        walkdir_names(root)
+            .iter()
+            .all(|name| name != "target" && name != "fixture-binary")
+    }
+    fn walkdir_names(root: &Path) -> Vec<String> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(root).unwrap() {
+            let entry = entry.unwrap();
+            names.push(entry.file_name().into_string().unwrap());
+            if entry.file_type().unwrap().is_dir() {
+                names.extend(walkdir_names(&entry.path()));
+            }
+        }
+        names
     }
     let parent = tempfile::tempdir().unwrap();
+    let build_parent = tempfile::tempdir().unwrap();
 
-    let passed = FixtureTree::create(parent.path());
-    let root = populate(&passed);
+    let passed = FixtureTree::create_with_build_parent(parent.path(), build_parent.path());
+    let (root, target) = populate(&passed);
     assert_eq!(root.parent(), Some(parent.path()));
     let name = root.file_name().unwrap().to_str().unwrap();
     assert!(name.starts_with(FIXTURE_ROOT_PREFIX), "{name}");
+    assert!(
+        target.starts_with(build_parent.path()) && !target.starts_with(parent.path()),
+        "the Cargo build {} must live outside the retained directory",
+        target.display()
+    );
+    assert!(holds_no_build(&root), "the retained tree holds a build");
     passed.finish();
     assert!(
-        !root.join("target").exists(),
+        !target.exists(),
         "a passing run must not keep its Cargo build"
     );
     assert!(!root.join("crate").exists());
     assert!(root.join("bounds.json").is_file(), "evidence is retained");
     assert!(root.join("writable-pass/producer.stderr").is_file());
 
-    let failed = FixtureTree::create(parent.path());
-    let root = populate(&failed);
+    let failed = FixtureTree::create_with_build_parent(parent.path(), build_parent.path());
+    let (root, target) = populate(&failed);
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let _failed = failed;
         panic!("simulated fixture assertion failure");
     }));
     assert!(unwound.is_err());
     assert!(
-        root.join("target/debug/deps/fixture-binary").is_file(),
-        "a failing run keeps its whole tree for diagnosis"
+        !target.exists(),
+        "a failing run must not keep its Cargo build either"
     );
-    assert!(root.join("crate/Cargo.toml").is_file());
+    assert!(holds_no_build(&root), "the retained tree holds a build");
+    assert!(
+        root.join("crate/Cargo.toml").is_file(),
+        "the crate is kept for diagnosis"
+    );
     assert!(root.join("bounds.json").is_file());
+    assert_eq!(
+        fs::read_dir(build_parent.path()).unwrap().count(),
+        0,
+        "a fixture build directory was left under the build parent"
+    );
+}
+
+#[test]
+fn the_fixture_builds_under_tmpdir_which_validation_deletes() {
+    // Stands in for DAGRUN_LOG_DIR. It is itself under $TMPDIR here, so the
+    // check that matters is that the build is not under it: neither beside
+    // the evidence nor inside the retained root.
+    let parent = tempfile::tempdir().unwrap();
+    let tree = FixtureTree::create(parent.path());
+    let target = tree.target_dir();
+    assert!(
+        !target.starts_with(parent.path()),
+        "{} is under the retained log directory {}",
+        target.display(),
+        parent.path().display()
+    );
+    assert_eq!(
+        target.parent().unwrap().parent(),
+        Some(std::env::temp_dir().as_path()),
+        "{} is not directly in $TMPDIR",
+        target.display()
+    );
+    let build = target
+        .parent()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(build.starts_with(FIXTURE_BUILD_PREFIX), "{build}");
+    tree.finish();
 }
 
 /// This fixture owns a local clock, not a replacement scheduler epoch. A real
