@@ -27078,7 +27078,7 @@ fn run(
     // whose preparation took 734 s of a 4200 s budget refused every node over
     // e2e.buck_cells' then 3600 s (https://github.com/rrnewton/hermit/issues/3896).
     // For committed selections the room is kept in the committed budgets
-    // instead, and committed_full_selections_survive_a_slow_preparation (in
+    // instead, and committed_selections_survive_a_slow_preparation (in
     // ci/manifest-plan/src/validation_dag.rs) holds them to a preparation
     // reserve.
     if plan.committed_selection.is_none() {

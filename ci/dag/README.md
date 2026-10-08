@@ -130,7 +130,10 @@ The quick path was 9300 seconds after setup.manifest_plan's wall cap went from
 180 to 300 seconds (https://github.com/rrnewton/hermit/issues/3381), and is
 9600 seconds since the Rust-script producer's wall cap went from 900 to 1200
 seconds, 1.5 times its largest observed wall of 644.5 seconds rounded up to
-the next 300-second bucket.
+the next 300-second bucket. It is 7200 seconds since quick.build's wall cap
+went from 3600 to 1200 seconds, so a 4200-second ci-hub run keeps a
+preparation reserve under the quick label
+(https://github.com/rrnewton/hermit/issues/3906).
 These sums are scheduling bounds, not measured preparation or execution times.
 The pressure runner's batch preparation similarly retains the Nextest setup
 prerequisite: ten nodes including LiteInst, or nine without it. This adds 600

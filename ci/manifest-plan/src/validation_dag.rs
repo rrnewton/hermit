@@ -1729,7 +1729,7 @@ fn materialize_buck_e2e(cfg: &mut DagConfig) -> Result<(), String> {
     // after preparation, so a 3600 s node made every buck-runner full
     // validation refuse once its preparation passed the 600 s that a 4200 s
     // run budget left (https://github.com/rrnewton/hermit/issues/3896; see
-    // committed_full_selections_survive_a_slow_preparation).
+    // committed_selections_survive_a_slow_preparation).
     cells.timeout = 2400;
     // dagrun gives a step the time it started (DAGRUN_STEP_STARTED_MONOTONIC_NS)
     // but not its wall bound; validate-node keeps the Buck invocation records
@@ -4033,10 +4033,12 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
         // plus the 120 seconds setup.manifest_plan's wall cap grew (180 to 300)
         // in https://github.com/rrnewton/hermit/issues/3381, plus the 300
         // seconds the rust-script producer's wall bound grew (900 to 1200) to
-        // keep 1.5 times its largest observed wall.
-        if profile.label == "quick" && critical_path_wall_seconds(&selected)? != 9600 {
+        // keep 1.5 times its largest observed wall. 7200 = 9600 minus the 2400
+        // seconds quick.build's wall bound fell (3600 to 1200) to leave a
+        // preparation reserve (https://github.com/rrnewton/hermit/issues/3906).
+        if profile.label == "quick" && critical_path_wall_seconds(&selected)? != 7200 {
             return Err(format!(
-                "quick selected critical path differs from 9600 seconds with image-owned Nextest, the measured rust-script wall bound and the 300-second setup.manifest_plan wall: {}",
+                "quick selected critical path differs from 7200 seconds with image-owned Nextest, the measured rust-script wall bound, the 300-second setup.manifest_plan wall and the 1200-second quick.build wall: {}",
                 critical_path_wall_seconds(&selected)?
             ));
         }
@@ -5869,30 +5871,53 @@ sys.exit(37)
         assert!(error.contains("Buck E2E"), "{error}");
     }
 
-    /// ci-hub's whole-run budget for a full validation
+    /// ci-hub's whole-run budget for a validation
     /// (`hermit_run_timeout_seconds` in dev-hermit
     /// ci-hub/validate/start_unit.py, for its 4800 s lock child deadline).
-    const CI_HUB_FULL_RUN_BUDGET_S: i64 = 4200;
-    /// Preparation a full validation must survive: scripts/validate.rs anchors
-    /// the run epoch before locks, freshness checks, plan construction and the
-    /// cgroup re-exec, and hands dagrun only what is left, while a committed
-    /// selection's node budgets are never clamped to it. Measured preparation
-    /// on one development host: 65 s and 134 s typically, 734 s at worst
-    /// (https://github.com/rrnewton/hermit/issues/3896).
+    /// It does not depend on the selection: a quick, envelope-only or
+    /// qemu-l2-only run gets the same 4200 s as a full one.
+    const CI_HUB_RUN_BUDGET_S: i64 = 4200;
+    /// Preparation every committed selection must survive: scripts/validate.rs
+    /// anchors the run epoch before locks, freshness checks, plan construction
+    /// and the cgroup re-exec, and hands dagrun only what is left, while a
+    /// committed selection's node budgets are never clamped to it. Measured
+    /// preparation on one development host: 65 s and 134 s typically, 734 s at
+    /// worst (https://github.com/rrnewton/hermit/issues/3896).
     const PREPARATION_RESERVE_S: i64 = 1200;
 
     #[test]
-    fn committed_full_selections_survive_a_slow_preparation() {
+    fn committed_selections_survive_a_slow_preparation() {
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
-        let full = select_steps_by_labels(&committed, &["full".to_string()]).unwrap();
-        let buck = buck_e2e_selection(&committed).unwrap();
-        for (name, selection) in [("full", &full), ("full with the Buck runner", &buck)] {
+        let labels: BTreeSet<&str> = committed
+            .steps
+            .iter()
+            .flat_map(|step| step.labels.iter().map(String::as_str))
+            .collect();
+        let mut selections = vec![(
+            "full with the Buck runner".to_string(),
+            buck_e2e_selection(&committed).unwrap(),
+        )];
+        for label in &labels {
+            selections.push((
+                format!("label {label}"),
+                select_steps_by_labels(&committed, &[label.to_string()]).unwrap(),
+            ));
+        }
+        // The three focused profiles that carried a 3600 s build node
+        // (https://github.com/rrnewton/hermit/issues/3906) must stay covered.
+        for label in ["full", "quick", "envelope-only", "qemu-l2-only"] {
+            assert!(
+                labels.contains(label),
+                "the committed DAG lost label {label}"
+            );
+        }
+        for (name, selection) in &selections {
             // The refusal of https://github.com/rrnewton/hermit/issues/3896:
             // 734 s of preparation left 3466 s, and dagrun refused every node
             // because e2e.buck_cells declared 3600 s.
             let after_734 = dagrun::scheduler::steps_violating_run_timeout(
                 selection,
-                CI_HUB_FULL_RUN_BUDGET_S - 734,
+                CI_HUB_RUN_BUDGET_S - 734,
             );
             assert!(
                 after_734.is_empty(),
@@ -5900,12 +5925,12 @@ sys.exit(37)
             );
             let after_reserve = dagrun::scheduler::steps_violating_run_timeout(
                 selection,
-                CI_HUB_FULL_RUN_BUDGET_S - PREPARATION_RESERVE_S,
+                CI_HUB_RUN_BUDGET_S - PREPARATION_RESERVE_S,
             );
             assert!(
                 after_reserve.is_empty(),
                 "{name}: these committed nodes leave less than {PREPARATION_RESERVE_S} s of the \
-                 {CI_HUB_FULL_RUN_BUDGET_S} s run budget for preparation, so a slow preparation \
+                 {CI_HUB_RUN_BUDGET_S} s run budget for preparation, so a slow preparation \
                  makes dagrun refuse the whole run: {after_reserve:?}"
             );
         }
