@@ -984,10 +984,15 @@ fn generated_plan_populations_preserve_command_policy() {
         .count();
     let hosted_cells = expected_cells
         .iter()
-        .filter(|cell| cell.lane == "portable" && cell.backend != "kvm")
+        .filter(|cell| {
+            cell.lane == "portable"
+                && !crate::validation_dag::HOSTED_PORTABLE_EXCLUDED_BACKENDS
+                    .contains(&cell.backend.as_str())
+        })
         .cloned()
         .collect::<Vec<_>>();
-    // The exclusion is exercised only while the plan has portable KVM cells.
+    // The exclusion is exercised only while the plan has portable cells of an
+    // excluded backend.
     assert!(hosted_cells.len() < portable);
     assert_eq!(current_hosted.planned_cells().unwrap(), hosted_cells);
     assert_eq!(
@@ -1000,7 +1005,7 @@ fn generated_plan_populations_preserve_command_policy() {
         let mut changed = hosted_now.clone();
         if strip_flag {
             for step in &mut changed.steps {
-                step.cmd = step.cmd.replace(" --exclude-backend kvm", "");
+                step.cmd = step.cmd.replace(&hosted_exclusion_flags(), "");
             }
         } else {
             restore_pre_exclusion_ownership(&mut changed, &generated);
@@ -1048,7 +1053,7 @@ fn generated_plan_populations_preserve_command_policy() {
             // rebuilt from that shape.
             restore_pre_exclusion_ownership(&mut live, &generated);
             for step in &mut live.steps {
-                step.cmd = step.cmd.replace(" --exclude-backend kvm", "");
+                step.cmd = step.cmd.replace(&hosted_exclusion_flags(), "");
             }
         }
         let live_selected = expected_cells
@@ -2766,4 +2771,13 @@ fn the_weak_tier_is_refused_unless_it_is_exactly_a_stripped_verify_comparison() 
         };
         refused(&other, &weak(&comparison, false));
     }
+}
+
+/// The hosted-portable exclusion flags exactly as the generator writes them,
+/// one ` --exclude-backend NAME` per excluded backend.
+fn hosted_exclusion_flags() -> String {
+    crate::validation_dag::HOSTED_PORTABLE_EXCLUDED_BACKENDS
+        .iter()
+        .map(|backend| format!(" --exclude-backend {backend}"))
+        .collect()
 }
