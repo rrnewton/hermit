@@ -1476,7 +1476,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // scheduler::parked_tests::the_runtimes_sigalrm_publications_and_questions
     // and sigalrm_phase1::tests::a_signalfd_in_the_kernels_table_is_found
     // (signal phase 1 step I3) retain all 1150: 1152, re-listed.
-    ("test.detcore_unit", 1164),
+    // scheduler::test::empty_queue_step_readmits_a_parked_thread_whose_gate_opened,
+    // empty_queue_step_reports_a_parked_thread_whose_gate_cannot_open and
+    // signal_to_a_thread_held_at_a_gate_leaves_it_held
+    // (https://github.com/rrnewton/hermit/issues/3149) retain all 1164: 1167.
+    ("test.detcore_unit", 1167),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1843,7 +1847,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retains all 211: 212, re-listed. It starts an in-guest LiteInst guest, so
     // it joins the hosted CPUID-faulting exact-name filterset and
     // test.cli_on_host stays 171.
-    ("test.cli", 217),
+    // The thread-aware happens-before checkpoint and its parked-thread fixes
+    // (https://github.com/rrnewton/hermit/issues/3149) add seven tests:
+    // happens_before_spec_adds_checkpoint_turns_only_on_named_threads,
+    // happens_before_edge_reverses_two_threads_writes,
+    // happens_before_source_then_blocking_wait_lets_the_target_pass,
+    // happens_before_gate_that_cannot_open_reports_a_deadlock,
+    // happens_before_sigchld_to_a_held_thread_waits_for_its_gate,
+    // happens_before_alarm_at_a_held_thread_ends_in_a_deadlock_report and
+    // happens_before_process_exit_with_a_held_worker_exits_zero retain all 217: 224.
+    ("test.cli", 224),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2006,7 +2019,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // So does the shared-mask rewrite test: 175, listed.
     // liteinst_in_guest_refuses_a_guest_socket_at_the_forwarding_number is not
     // in the exclusion filterset, so the host twin selects it too: 175.
-    ("test.cli_on_host", 176),
+    // The seven happens-before tests start no LiteInst guest: 183.
+    ("test.cli_on_host", 183),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 55),
@@ -2093,7 +2107,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the rt_sigsuspend mask-copy test: 1152.
     // And the same six detlog forwarding tests: 1161.
     // And the two signal phase 1 step I3 tests: 1152.
-    ("test.detcore_unit_on_host", 1164),
+    // And the three happens-before parked-thread scheduler tests: 1167.
+    ("test.detcore_unit_on_host", 1167),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
