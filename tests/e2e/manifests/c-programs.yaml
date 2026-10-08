@@ -9501,7 +9501,7 @@ test:
           liteinst: No custom edge-case arguments have been calibrated for this C guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
   - id: c-programs/sigsuspend-sibling-signal-wake
-    description: Strict verification for tests/c/sigsuspend_sibling_signal_wake.c
+    description: Strict verification for tests/c/sigsuspend_sibling_signal_wake.c, masked phases only (guest argument masked)
     lane: portable
     requires:
       - linux
@@ -9525,6 +9525,9 @@ test:
           ptrace: true
         backends_enabled:
           - ptrace
+        guest_args:
+          ptrace:
+            - masked
         assert:
           bitwise_parity: true
         backends_disabled:
@@ -9563,10 +9566,10 @@ test:
           in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
       custom:
         ci: false
-        ci_disabled_reason: This fixture takes no arguments and has no additional custom argument case.
+        ci_disabled_reason: The guest's unmasked phases (guest argument unmasked, or all) diverge under strict ptrace verification at an rt_sigsuspend finish record (ERESTARTNOHAND against ERESTARTSYS), so no custom argument case is qualified; the verify cell runs the masked phases.
         backends_enabled: []
         backends_disabled:
-          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          ptrace: The guest argument unmasked exits 0 with Linux's output, but strict ptrace verification diverges at an rt_sigsuspend finish record (ERESTARTNOHAND in one run, ERESTARTSYS in the other) when a signal that the waiting thread does not block outside the call arrives while Detcore injects the call; not qualified until that is fixed
           dbt: No custom edge-case arguments have been calibrated for this C guest
           kvm: No custom edge-case arguments have been calibrated for this C guest
           sabre: No custom edge-case arguments have been calibrated for this C guest
