@@ -86,12 +86,19 @@ Measured against a test inherited filter (`uname` → EACCES, `getppid` → EPER
    - **Mode 1 (strict):** refuse, since Hermit cannot run.
    - **Mode 2:** continue to step 2.
 2. Probe the action map (about 6 ms) and hash it with SHA-256. Compare the hash with `seccomp.inherited.map_sha256` in the run config:
-   - **No `seccomp` section:** refuse (owner point 1). The remedy names the command: rerun with `--save-config FILE` to capture the section, then run with `--config FILE`.
+   - **No `seccomp` section:** apply the unacknowledged-filter policy below; by default, refuse (owner point 1). The remedy names the command: rerun with `--save-config FILE` to capture the section, then run with `--config FILE`.
    - **A different hash:** refuse with a "re-capture" remedy, listing each system call whose action changed, old and new.
 3. **Strictness check:** every number the map shows as blocked must get an equal or stronger action from the declared rules at the probed arguments (KILL > TRAP > ERRNO > ALLOW). Otherwise refuse, naming the declared rule that is looser than the host.
 4. A run config that records an inherited map but runs where nothing is inherited (mode 0) is accepted. Hermit enforces the declared rules itself, so the run reproduces outside the container, which is the purpose of declaring them.
 
 The probe needs a ptrace child. On a host where ptrace itself is blocked, Hermit refuses before probing.
+
+**The unacknowledged-filter policy is a single switch.** The answer to "an inherited filter is present and the run config does not acknowledge it" is one enumeration with two values, decided in exactly one function that every caller consults:
+
+- `Error` (the default): refuse before the guest starts, as a policy refusal (exit 122), with the capture remedy above.
+- `Warning`: print the same text as a warning, write it to the run's evidence, and continue. The run is then not reproducible from its config, and its `--verify` and `--run-evidence-dir` records say so.
+
+The default is `Error` until the owner decides otherwise, and changing the default is a one-line change to that function. Only this case has a policy switch. A changed fingerprint and a declared rule looser than the host always refuse: the run config makes a claim about the host there, and the claim is false.
 
 ### 2. The `seccomp:` section of the run config
 
