@@ -4849,6 +4849,7 @@ fn self_test() -> Result<(), String> {
     test_node_coverage_bracket()?;
     typed_libtest_count_bracket()?;
     test_free_selection_verdict_bracket()?;
+    test_free_plan_wiring_bracket()?;
     ledger_gate_origin_bracket()?;
     ledger_gate_compaction_bracket()?;
     requalification_plan_bracket(&root)?;
@@ -16423,6 +16424,11 @@ fn test_free_selection_verdict_bracket() -> Result<(), String> {
             "a hosted-portable profile outside --selected",
         ),
         (
+            "quick",
+            "label",
+            "a label selection of a profile that is not test-free",
+        ),
+        (
             "envelope-only",
             "only",
             "an envelope-only profile outside label selection",
@@ -16508,6 +16514,75 @@ fn test_free_selection_verdict_bracket() -> Result<(), String> {
                 .into(),
         );
     }
+    Ok(())
+}
+
+/// The profile, selection mode and planned tags that run() hands to the count
+/// come from real plans (review R2 of https://github.com/rrnewton/hermit/pull/3919).
+/// Each plan below is built from real arguments; every planned node is given a
+/// passing, count-free outcome; derive_plan_run_counts, which run() calls,
+/// must accept exactly the declared test-free shapes: label selections of
+/// envelope-only and qemu-l2-only, and GitHub CI's hosted preflight
+/// (`--hosted-portable-only --selected` of the five preflight nodes). quick,
+/// full and `--only full` are refused by their profile;
+/// `--qemu-l2-only --selected` is refused by its selection mode alone.
+fn test_free_plan_wiring_bracket() -> Result<(), String> {
+    let root = repo_root();
+    let tmp = std::env::temp_dir().join(format!("validate-test-free-plan-{}", std::process::id()));
+    for (argv_words, accepted) in [
+        (&["--envelope-only"][..], true),
+        (&["--qemu-l2-only"][..], true),
+        (
+            &[
+                // ci/run-node.sh portable <preflight_nodes>, as GitHub CI runs it.
+                "--hosted-portable-only",
+                "--allow-local-off-the-record-run",
+                "--selected",
+                "pre.submodules,pre.reverie_pin,build.rust_scripts,setup.manifest_plan,gate.manifest",
+                "--ignore-selected-deps",
+                "--no-label-pr",
+            ][..],
+            true,
+        ),
+        (&["quick"][..], false),
+        (&["full"][..], false),
+        (
+            &["--only", "full", "gate.manifest", "--no-label-pr"][..],
+            false,
+        ),
+        (
+            &[
+                "--qemu-l2-only",
+                "--selected",
+                "qemu.strict_l2_boot",
+                "--allow-local-off-the-record-run",
+            ][..],
+            false,
+        ),
+    ] {
+        let words: Vec<String> = argv_words.iter().map(|word| word.to_string()).collect();
+        let args = parse_argv(&words)
+            .map_err(|code| format!("test-free plan wiring: {words:?} refused with exit {code}"))?;
+        let plan = build_plan(&root, &args, &tmp)
+            .map_err(|error| format!("test-free plan wiring: {words:?}: {error}"))?;
+        let outcomes: Vec<StepOutcome> = plan_planned_tags(&plan)
+            .into_iter()
+            .map(|tag| StepOutcome::passed(tag, 1.0, String::new(), Some(0), None, None))
+            .collect();
+        let counts = derive_plan_run_counts(&plan, &outcomes, &[]);
+        let exit = exit_code_with_verdict_refusals(0, &run_verdict_refusals(None, 0, &counts));
+        let passed = exit == 0;
+        if counts.test_free_selection != accepted || passed != accepted {
+            return Err(format!(
+                "test-free plan wiring: {words:?} (profile {}, selection {}) should {} the zero-test refusal, got test_free={} exit {exit}",
+                plan.profile,
+                plan.selection_mode,
+                if accepted { "lift" } else { "keep" },
+                counts.test_free_selection
+            ));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
     Ok(())
 }
 
@@ -22055,6 +22130,35 @@ fn derive_run_counts(
         test_free_declaration_error,
         test_free_selection,
     }
+}
+
+/// Every node a plan schedules, including those withheld as host-inapplicable.
+fn plan_planned_tags(plan: &Plan) -> BTreeSet<String> {
+    std::iter::once(&plan.cfg)
+        .chain(plan.second.iter())
+        .flat_map(|cfg| cfg.steps.iter().map(|s| s.tag()))
+        .chain(plan.host_inapplicable.iter().map(|n| n.tag.clone()))
+        .collect()
+}
+
+/// derive_run_counts with exactly what run() knows about the plan: its
+/// compatibility mode, profile, selection mode, planned tags and the committed
+/// test-free declarations. run() calls this, and so does
+/// test_free_plan_wiring_bracket, on plans built from real arguments.
+fn derive_plan_run_counts(
+    plan: &Plan,
+    outcomes: &[StepOutcome],
+    attempts: &[NodeAttempt],
+) -> RunCounts {
+    derive_run_counts(
+        outcomes,
+        attempts,
+        plan.compat,
+        plan.compat_prefix,
+        (plan.profile.as_str(), plan.selection_mode),
+        &plan_planned_tags(plan),
+        hermit_manifest_plan::validation_dag::declared_test_free,
+    )
 }
 
 /// The verdict's completeness refusals for a run's counts. run() and the
@@ -28287,11 +28391,7 @@ fn run(
     // host-inapplicable. The ledger's `unaccounted_nodes` is computed against
     // this set, so a node that neither ran nor carries a recorded reason is
     // named rather than lost.
-    let planned_tags: BTreeSet<String> = std::iter::once(&plan.cfg)
-        .chain(plan.second.iter())
-        .flat_map(|cfg| cfg.steps.iter().map(|s| s.tag()))
-        .chain(plan.host_inapplicable.iter().map(|n| n.tag.clone()))
-        .collect();
+    let planned_tags = plan_planned_tags(&plan);
 
     println!(
         "Validation profile: {} (selection: {})",
@@ -28458,15 +28558,7 @@ fn run(
     // Whole-run CPU, taken once in THIS process (a worker thread would see only
     // its own accounting, exactly as a bash subshell's `times` would).
     let (cpu_user, cpu_sys) = validate_runtime::process_cpu_seconds();
-    let run_counts = derive_run_counts(
-        &outcomes,
-        &attempts,
-        plan.compat,
-        plan.compat_prefix,
-        (plan.profile.as_str(), plan.selection_mode),
-        &planned_tags,
-        hermit_manifest_plan::validation_dag::declared_test_free,
-    );
+    let run_counts = derive_plan_run_counts(&plan, &outcomes, &attempts);
     let executed_tests = run_counts.executed_tests;
     let passed_tests = run_counts.passed_tests;
     let filtered_tests = run_counts.filtered_tests;
