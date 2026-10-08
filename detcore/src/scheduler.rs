@@ -11671,6 +11671,149 @@ mod test {
         }
     }
 
+    /// A signal another guest sends in its own turn (`notify_signal_pending`)
+    /// while a thread is still stopped at its posted `rt_sigsuspend` request
+    /// reaches the call, as a timer's send at that point does
+    /// (`a_signal_sent_at_an_rt_sigsuspend_request_arms_the_call_it_wakes`):
+    /// the send is queued, the step2 drain notes it without arming anything,
+    /// and committing the call arms the thread for the release barrier. A
+    /// signal the temporary mask blocks is not noted, and nothing arms. Coverage
+    /// of main: its drain notes the send
+    /// (`BlockedPool::signaled_sigsuspend_requests`) and its grant arms the
+    /// note.
+    #[test]
+    fn a_sibling_signal_sent_at_an_rt_sigsuspend_request_arms_the_call_it_wakes() {
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        for (case, signal, temporary_mask, armed) in [
+            ("admitted", Signal::SIGUSR1, 0, true),
+            // Gap: main's drain drops a realtime signal sent at an rt_sigsuspend request.
+            ("blocked", Signal::SIGUSR1, usr1, false),
+            // Gap: main notes SIGKILL sent at an rt_sigsuspend request (open policy question).
+        ] {
+            let (mut scheduler, _parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+            let op = ExternalOpId::new(creator, 7);
+            let mut request = Resources::new(creator);
+            request.insert(ResourceID::BlockingRtSigsuspend(op), Permission::RW);
+            request.blocked_signal_mask = Some(temporary_mask);
+            scheduler.next_turns.get_mut(&creator).unwrap().req = Ivar::full(Ok(request));
+            // Its request is posted, so it waits in the run queue for its turn.
+            scheduler.runqueue_push_back(creator);
+
+            scheduler.notify_signal_pending(creator, SigWrapper::from(signal));
+            assert_eq!(
+                scheduler.pending_cross_task_signals.get(&creator),
+                Some(&vec![SigWrapper::from(signal)]),
+                "{case}"
+            );
+            assert!(
+                scheduler.blocked.signaled_sigsuspend_requests.is_empty(),
+                "{case}"
+            );
+            scheduler.drain_pending_cross_task_signals();
+            assert!(scheduler.pending_cross_task_signals.is_empty(), "{case}");
+            assert!(scheduler.blocked.signaled_background.is_empty(), "{case}");
+            assert_eq!(
+                scheduler
+                    .blocked
+                    .signaled_sigsuspend_requests
+                    .get(&creator)
+                    .copied(),
+                armed.then_some(signal),
+                "{case}"
+            );
+            assert!(scheduler.run_queue.remove_tid(creator), "{case}");
+            commit_out_of_scheduler_call(
+                &mut scheduler,
+                creator,
+                ResourceID::BlockingRtSigsuspend(op),
+                Some(temporary_mask),
+            );
+            assert_eq!(
+                scheduler.blocked.rt_sigsuspend_blockers.get(&creator),
+                Some(&op),
+                "{case}"
+            );
+            assert_eq!(
+                scheduler.blocked.signaled_background.contains(&creator),
+                armed,
+                "{case}"
+            );
+            assert!(
+                scheduler.blocked.signaled_sigsuspend_requests.is_empty(),
+                "{case}"
+            );
+        }
+    }
+
+    /// A signal a sibling sends while the waiter's `rt_sigsuspend` request is
+    /// posted but not yet granted is delivered by the kernel as soon as the
+    /// granted call installs its temporary mask, and the waiter's delivery stop
+    /// is its report. The step2 drain notes the send and granting the request
+    /// arms the waiter, so every pass is empty until that stop is posted, and
+    /// the release barrier then requeues the waiter ahead of the runnable
+    /// sibling: no sibling runs between the grant and the waiter's return.
+    /// Coverage of main: its drain notes the send
+    /// (`BlockedPool::signaled_sigsuspend_requests`) and its grant arms the
+    /// note. Adapted from https://github.com/rrnewton/hermit/pull/3224, where a
+    /// hold on every other thread gave this order.
+    #[tokio::test]
+    async fn a_sibling_signal_sent_before_the_rt_sigsuspend_grant_requeues_the_waiter_first() {
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        let (mut scheduler, parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+        let op = ExternalOpId::new(creator, 1);
+        let rid = ResourceID::BlockingRtSigsuspend(op);
+        let mut request = Resources::new(creator);
+        request.insert(rid.clone(), Permission::RW);
+        request.blocked_signal_mask = Some(0);
+        let req = scheduler.next_turns[&creator].req.clone();
+        scheduler.request_put(&req, request, &global_time);
+        // Its request is posted, so it waits in the run queue for its turn.
+        scheduler.runqueue_push_back(creator);
+
+        scheduler.notify_signal_pending(creator, SigWrapper(libc::SIGUSR1));
+        scheduler.drain_pending_cross_task_signals();
+        assert!(scheduler.pending_cross_task_signals.is_empty());
+        assert!(scheduler.blocked.signaled_background.is_empty());
+        assert_eq!(
+            scheduler.blocked.signaled_sigsuspend_requests.get(&creator),
+            Some(&Signal::SIGUSR1)
+        );
+
+        assert!(scheduler.run_queue.remove_tid(creator));
+        commit_out_of_scheduler_call(&mut scheduler, creator, rid, Some(0));
+        let req = scheduler.next_turns[&parent].req.clone();
+        scheduler.request_put(&req, Resources::new(parent), &global_time);
+        scheduler.runqueue_push_back(parent);
+        let sched = Arc::new(Mutex::new(scheduler));
+        let last: Result<Resources, SkipTurn> = Err(SkipTurn);
+
+        for _ in 0..3 {
+            let pass = do_a_turn_blocking(sched.clone(), global_time.clone(), &last).await;
+            assert!(pass.is_err(), "the sibling ran before the waiter reported");
+            let s = sched.lock().unwrap();
+            assert!(s.next_turns[&parent].resp.try_read().is_none());
+            assert!(s.run_queue.contains_tid(parent));
+        }
+        post_inbound_signal(
+            &mut sched.lock().unwrap(),
+            creator,
+            libc::SIGUSR1,
+            &global_time,
+        );
+        let turn = do_a_turn_blocking(sched.clone(), global_time.clone(), &last)
+            .await
+            .expect("the waiter's delivery turn");
+        assert_eq!(turn.tid, creator);
+        assert!(
+            turn.resources
+                .contains_key(&ResourceID::InboundSignal(SigWrapper(libc::SIGUSR1)))
+        );
+        let s = sched.lock().unwrap();
+        assert!(s.next_turns[&parent].resp.try_read().is_none());
+        assert!(s.blocked.rt_sigsuspend_blockers.is_empty());
+        assert!(s.blocked.signaled_background.is_empty());
+    }
+
     /// The invariant that guards the counterfeit request still holds for every
     /// thread outside the background pools: a signaled thread there must be
     /// parked at a posted request.
