@@ -4310,6 +4310,70 @@ fn run_dbt_virtualizes_process_identities() {
     );
 }
 
+/// DBT numbers a guest's syscalls as ptrace does, counting the execve that
+/// entered the guest's first image.
+///
+/// Ptrace intercepts that execve and counts it as syscall #1. DynamoRIO starts
+/// the guest already executing its image, so Detcore never saw the execve, and
+/// DBT's syscall numbers and syscall-derived virtual time ran one behind
+/// ptrace's from the first record: this guest's first write was #1 under DBT
+/// and #2 under ptrace. A static guest with no libc makes the same syscalls
+/// under both backends, so the whole numbered sequence must match.
+#[test]
+fn run_dbt_numbers_syscalls_like_ptrace_from_the_initial_execve() {
+    if dbt_unavailable("run_dbt_numbers_syscalls_like_ptrace_from_the_initial_execve") {
+        return;
+    }
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = process_build_root("dbt-syscall-numbering");
+    fs::create_dir_all(&build_root).expect("failed to create the guest directory");
+    let guest = build_root.join("static_nolibc_syscall_sites");
+    let output = Command::new("cc")
+        .args(["-O1", "-static", "-nostdlib"])
+        .arg(repository.join("tests/c/static_nolibc_syscall_sites.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the static guest");
+    assert!(
+        output.status.success(),
+        "static guest compilation failed:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let guest = guest.to_str().expect("guest path should be UTF-8");
+    let numbered = |backend: &str| {
+        let args = [
+            "--log",
+            "info",
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--",
+            guest,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        stderr(&output)
+            .lines()
+            .filter_map(|line| {
+                let finish = line.split("finish syscall #").nth(1)?;
+                Some(finish.split('(').next()?.to_owned())
+            })
+            .collect::<Vec<_>>()
+    };
+    let ptrace = numbered("ptrace");
+    assert_eq!(
+        ptrace.first().map(String::as_str),
+        Some("2: write"),
+        "{ptrace:#?}"
+    );
+    assert_eq!(numbered("dbt"), ptrace);
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1065): Review DBT self-prlimit L2 coverage.
 // TODO(#2791): Remove the portable test.cli skip when DBT self-prlimit defect #2806 is fixed.

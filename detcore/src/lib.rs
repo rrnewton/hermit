@@ -2266,6 +2266,22 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             }
             result => result?,
         }
+        // The guest's first image is entered by an execve. A backend that traces
+        // the guest from before it (ptrace) intercepts that execve and counts it
+        // as the guest's first syscall. A backend that starts the guest already
+        // executing its image (DBT under DynamoRIO, SaBRe) reaches this callback
+        // with nothing counted, so under DBT, which then sees every later
+        // syscall, numbers and virtual time ran exactly one syscall behind
+        // ptrace's. Count that execve here, at its own cost. (SaBRe also misses
+        // the dynamic loader's syscalls before its plugin starts; this closes
+        // only the execve's share of that gap.)
+        let thread = guest.thread_state_mut();
+        if !thread.past_global_first_execve && thread.stats.syscall_count == 0 {
+            thread.stats.count_syscall();
+            thread
+                .thread_logical_time
+                .add_syscall_with_cost(syscall_time::cost_ns(Sysno::execve));
+        }
         guest.thread_state_mut().past_global_first_execve = true;
         // exec resets a handled signal to its default action.
         guest.thread_state_mut().sigalrm_handled = false;
