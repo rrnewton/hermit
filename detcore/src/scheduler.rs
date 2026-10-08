@@ -2314,7 +2314,8 @@ impl Scheduler {
             );
             // Defer the actual re-admission: we are inside `block_for_one_resource`
             // with a `tentative_pop` selection live, and pushing to the run queue
-            // now would trip the queue's transaction assertion. `step3` flushes.
+            // now would trip the queue's transaction assertion. The next
+            // `step2_drain_prefix` flushes (`step3_peek` as a backstop).
             self.happens_before.as_mut().unwrap().wake_pending = true;
         }
         Ok(())
@@ -2326,8 +2327,8 @@ impl Scheduler {
     /// untouched, so no request needs re-filling. Deterministic: parked threads
     /// are iterated in `DetTid` order.
     ///
-    /// Called from `step2d_decide_empty_queue` (so the empty-queue
-    /// classification sees threads whose gate just opened) and from
+    /// Called from `step2_drain_prefix`, with the other deferred run-queue
+    /// admissions and before step2c and step2d look at the queue, and from
     /// `step3_peek` *before* the turn's `tentative_pop`. Both are points with no
     /// live selection transaction: anchors fire deep inside
     /// `block_for_one_resource` while a selection is live, so the actual
@@ -3348,8 +3349,8 @@ impl Scheduler {
         self.pending_run_queue_admissions.remove(dtid);
         let _ = self.remove_futex_waiter(dtid);
         // A killed thread must not keep the scheduler loop alive as a parked
-        // happens-before thread; a force-unblocked one is re-queued and
-        // re-evaluates its gate (re-parking if it is still closed).
+        // happens-before thread. (`force_unblock_thread_at` never reaches here
+        // for a parked thread: it leaves a held thread held.)
         if let Some(hb) = self.happens_before.as_mut() {
             hb.parked.remove(dtid);
         }
@@ -3574,6 +3575,14 @@ impl Scheduler {
         self.drain_pending_run_queue_removals();
         self.drain_pending_cross_task_signals();
         self.drain_pending_run_queue_admissions();
+        // Re-admit happens-before threads whose gate a source opened in the
+        // last committed turn, with the other deferred admissions: before
+        // step2c harvests host-timed I/O continuations (so a ready one cannot
+        // overtake a thread that is already runnable as far as the guest can
+        // tell) and before step2d classifies an empty queue (so a source thread
+        // that blocked right after firing is not reported as a futex deadlock,
+        // https://github.com/rrnewton/hermit/issues/3149).
+        self.hb_flush_wakes();
         if self.backend.process_exits_complete_asynchronously
             && !self.pending_physical_process_exits.is_empty()
         {
@@ -4731,7 +4740,27 @@ impl Scheduler {
     /// sibling queued ahead of it and not blocking the signal would otherwise
     /// resume first and take it, leaving the waiter a wake with nothing to be
     /// interrupted by (https://github.com/rrnewton/hermit/issues/3146).
+    ///
+    /// A thread held at a happens-before gate is left held. Its pending
+    /// request is the gate's checkpoint, and the guest does not re-check the
+    /// gate after a substituted resume, so replacing that request would let
+    /// the thread past a hard edge before its BEFORE anchor fired. A held
+    /// thread is runnable as far as Linux is concerned, only not scheduled:
+    /// the signal stays pending in the kernel and is delivered when the gate
+    /// opens and the thread resumes, as for any runnable thread that is not
+    /// running.
     fn force_unblock_thread_at(&mut self, dettid: DetTid, rsrcs: Resources, front: bool) {
+        if self
+            .happens_before
+            .as_ref()
+            .is_some_and(|hb| hb.parked.contains(&dettid))
+        {
+            info!(
+                "[dtid {}] held at a happens-before gate; leaving it held, its signal pending",
+                dettid
+            );
+            return;
+        }
         info!(
             "[dtid {}] removing blocking entries and requeuing thread",
             dettid
@@ -5238,21 +5267,14 @@ impl Scheduler {
         &mut self,
         global_time: &Arc<Mutex<GlobalTime>>,
     ) -> Result<(), SkipTurn> {
-        // Re-admit happens-before threads whose gate a source opened since the
-        // last turn BEFORE classifying the queue. The anchor fired inside a
-        // committed turn, so membership here is a function of guest execution;
-        // without this, a source thread that blocks right after firing (say, in
-        // a FUTEX_WAIT the parked target would later wake) left an empty queue
-        // that was classified as a futex deadlock before `step3_peek` could
-        // flush the wake (https://github.com/rrnewton/hermit/issues/3149). No
-        // selection transaction is live here; this step already pushes timed
-        // wakes to the queue.
-        self.hb_flush_wakes();
-        // Threads still parked after the flush wait on a source that has not
-        // fired. They are blocked, not gone: an empty queue with only them (and
-        // no timer or external input that could let a source run) is a deadlock
-        // to report, not an exit to fizzle into
-        // (https://github.com/rrnewton/hermit/issues/3149).
+        // Threads whose gate opened were re-admitted by `step2_drain_prefix`;
+        // threads still parked wait on a source that has not fired. They are
+        // blocked, not gone: an empty queue with only them (and no timer or
+        // external input that could let a source run) is a deadlock to report,
+        // not an exit to fizzle into
+        // (https://github.com/rrnewton/hermit/issues/3149). A child wait counts
+        // as external input here, so a cycle through a parked child is not yet
+        // reported.
         let hb_parked_empty = self
             .happens_before
             .as_ref()
@@ -6924,6 +6946,16 @@ impl Scheduler {
             }
             if self.pending_run_queue_admissions.contains_key(&dtid) {
                 return ThreadStatus::Running;
+            }
+            // Held at a happens-before gate: alive, out of the run queue until
+            // a source fires. Reporting it as gone made a signal sent to it
+            // (a child's SIGCHLD, an alarm) panic `wake_signaled_guest`.
+            if self
+                .happens_before
+                .as_ref()
+                .is_some_and(|hb| hb.parked.contains(&dtid))
+            {
+                return ThreadStatus::NotRunning;
             }
             ThreadStatus::Gone
         }
@@ -11779,6 +11811,29 @@ mod test {
             .blocked
             .timed_waiters
             .insert(LogicalTime::INDEFINITE, DetTid::from_raw(11));
+        // A thread held at a happens-before gate, which adds a headline class
+        // and renders its checkpoint request in the per-thread list.
+        let held = DetTid::from_raw(13);
+        let mut gate = Resources::new(held);
+        gate.insert(ResourceID::HappensBeforeCheckpoint(50), Permission::R);
+        scheduler.next_turns.insert(
+            held,
+            ThreadNextTurn {
+                dettid: held,
+                child_tid_addr: 0,
+                req: Ivar::full(Ok(gate)),
+                resp: Ivar::new(),
+                protocol: Default::default(),
+            },
+        );
+        let mut hb = hb_runtime(
+            r#"{"version": 1,
+                "events": {"never": {"thread": "3", "syscalls": 1000000000},
+                           "gate": {"thread": "13", "syscalls": 50}},
+                "edges": [{"before": "never", "after": "gate", "strength": "hard"}]}"#,
+        );
+        hb.parked.insert(held);
+        scheduler.happens_before = Some(hb);
         scheduler
     }
 
@@ -11823,11 +11878,14 @@ mod test {
         // The report is still substantive: it names every blocked thread, the
         // futex keys, and the indefinite deadline.
         for expected in [
-            // This fixture holds BOTH pools, so the state-derived headline must
-            // name both rather than whichever branch happened to fire.
+            // This fixture holds BOTH pools and a held thread, so the
+            // state-derived headline must name all three rather than whichever
+            // branch happened to fire.
             "Deadlock detected: thread(s) waiting on futex, and thread(s) waiting \
-             indefinitely (pause, or a timer beyond the end of logical time), but no \
-             runnable threads left.",
+             indefinitely (pause, or a timer beyond the end of logical time), and \
+             thread(s) held at a happens-before gate whose BEFORE anchor cannot fire, \
+             but no runnable threads left.",
+            "dtid 13: HappensBeforeCheckpoint(50): R",
             "dtid 3",
             "dtid 9",
             "0x404100",
@@ -12984,9 +13042,10 @@ mod test {
         "edges": [{"before": "src", "after": "dst", "strength": "hard"}]}"#;
 
     /// A source fired and opened a parked thread's gate (`wake_pending`), and
-    /// the source thread then left the run queue: the empty-queue step must
-    /// re-admit the parked thread before it classifies the state, not report a
-    /// deadlock (https://github.com/rrnewton/hermit/issues/3149).
+    /// the source thread then left the run queue: the maintenance prefix must
+    /// re-admit the parked thread before the empty-queue step classifies the
+    /// state, not leave it to be reported as a deadlock
+    /// (https://github.com/rrnewton/hermit/issues/3149).
     #[test]
     fn empty_queue_step_readmits_a_parked_thread_whose_gate_opened() {
         let config = Config::default();
@@ -13000,6 +13059,7 @@ mod test {
         scheduler.happens_before = Some(hb);
         scheduler.priorities.insert(target, DEFAULT_PRIORITY);
 
+        assert!(scheduler.step2_drain_prefix().is_ok());
         assert!(scheduler.step2d_handle_empty_queue(&global_time).is_ok());
         assert!(scheduler.run_queue.contains_tid(target));
         let hb = scheduler.happens_before.as_ref().unwrap();
@@ -13029,6 +13089,64 @@ mod test {
         assert!(
             report.contains("held at a happens-before gate whose BEFORE anchor cannot fire"),
             "{report}"
+        );
+    }
+
+    /// A signal the scheduler sends to a thread held at a happens-before gate
+    /// (a child's SIGCHLD, an alarm) must leave the thread held, with its
+    /// gate's checkpoint request intact. The held thread used to be reported as
+    /// gone, which panicked `wake_signaled_guest` and hung the run; and had it
+    /// been force-unblocked, the substituted request would have let it past
+    /// its gate before the source fired.
+    #[test]
+    fn signal_to_a_thread_held_at_a_gate_leaves_it_held() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let target = DetTid::from_raw(5);
+        let mut hb = hb_runtime(HB_GATE_SPEC);
+        hb.parked.insert(target);
+        scheduler.happens_before = Some(hb);
+        scheduler.priorities.insert(target, DEFAULT_PRIORITY);
+        let mut gate = Resources::new(target);
+        gate.insert(ResourceID::HappensBeforeCheckpoint(43), Permission::R);
+        scheduler.next_turns.insert(
+            target,
+            ThreadNextTurn {
+                dettid: target,
+                child_tid_addr: 0,
+                req: Ivar::full(Ok(gate)),
+                resp: Ivar::new(),
+                protocol: Default::default(),
+            },
+        );
+
+        assert!(matches!(
+            scheduler.thread_status(target),
+            ThreadStatus::NotRunning
+        ));
+        scheduler.wake_signaled_guest(target, Signal::SIGCHLD);
+
+        assert!(!scheduler.run_queue.contains_tid(target));
+        assert!(
+            scheduler
+                .happens_before
+                .as_ref()
+                .unwrap()
+                .parked
+                .contains(&target)
+        );
+        let request = scheduler.next_turns[&target]
+            .req
+            .try_read()
+            .expect("the held thread's request is still filled")
+            .expect("the held thread's request is not an error");
+        assert!(
+            request
+                .resources
+                .contains_key(&ResourceID::HappensBeforeCheckpoint(43))
+                && request.resources.len() == 1,
+            "the gate's checkpoint request was replaced: {:?}",
+            request.resources.keys().collect::<Vec<_>>()
         );
     }
 

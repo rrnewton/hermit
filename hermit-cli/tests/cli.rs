@@ -112,6 +112,7 @@ static LITEINST_INERT_RUNTIME: OnceLock<PathBuf> = OnceLock::new();
 static EXEC_CLOCK_CONTINUITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_TWO_THREADS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_SOURCE_THEN_FUTEX_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static HB_SIGNAL_WHILE_HELD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_LSEEK_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_INODE_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REPLAY_EPOCH_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -583,6 +584,32 @@ fn hb_source_then_futex_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "hb-source-then-futex guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn hb_signal_while_held_guest() -> &'static Path {
+    HB_SIGNAL_WHILE_HELD_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("hb-signal-while-held");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create hb-signal-while-held guest directory");
+        let guest = build_root.join("hb_signal_while_held");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/hb_signal_while_held.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile hb-signal-while-held guest");
+        assert!(
+            output.status.success(),
+            "hb-signal-while-held guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -8192,6 +8219,218 @@ fn happens_before_gate_that_cannot_open_reports_a_deadlock() {
         "no deadlock report naming the gate:\n{log}"
     );
     assert!(String::from_utf8_lossy(&output.stdout).is_empty());
+}
+
+/// The shell guest of the held-signal test: a short backgrounded child, a long
+/// one, and the parent each write one line (6, 5 and 7 bytes).
+const HB_HELD_SIGCHLD_GUEST: [&str; 3] = [
+    "/bin/sh",
+    "-c",
+    "(echo early) & \
+     (i=0; while [ $i -lt 300 ]; do read x < /proc/self/stat; i=$((i+1)); done; echo late) & \
+     echo parent; wait",
+];
+
+/// A signal the scheduler sends to a thread held at a happens-before gate
+/// leaves it held until the gate opens. The parent is held at its write until
+/// the long child's write; meanwhile the short child exits and the scheduler
+/// sends the parent its SIGCHLD. A held thread used to be reported as gone, so
+/// `wake_signaled_guest` panicked and the run hung (the reproduction from the
+/// review of https://github.com/rrnewton/hermit/pull/3897). The run must
+/// complete in the edge's order, and the log must show the signal reaching the
+/// held parent, or the test exercised nothing.
+#[test]
+fn happens_before_sigchld_to_a_held_thread_waits_for_its_gate() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut args = vec!["--log", "info", "run", "--strict", "--"];
+    args.extend(HB_HELD_SIGCHLD_GUEST);
+    let calibration = hermit(&args);
+    assert_success(&calibration, &args);
+    let writes = logged_stdout_writes(&stderr(&calibration));
+    let parent = writes.iter().find(|w| w.len == 7);
+    let late = writes.iter().find(|w| w.len == 5);
+    let (Some(parent), Some(late)) = (parent, late) else {
+        panic!(
+            "no parent and late-child write(1, ..) in the INFO log; found {} writes",
+            writes.len()
+        );
+    };
+    let spec = directory.path().join("held-sigchld.json");
+    fs::write(
+        &spec,
+        format!(
+            r#"{{"version": 1,
+                "events": {{"late_writes": {{"thread": "{}", "syscalls": {}}},
+                            "parent_writes": {{"thread": "{}", "syscalls": {}}}}},
+                "edges": [{{"before": "late_writes", "after": "parent_writes", "strength": "hard"}}]}}"#,
+            late.dettid, late.count, parent.dettid, parent.count
+        ),
+    )
+    .unwrap();
+    let spec = spec.to_str().unwrap().to_owned();
+    let mut args = vec![
+        "--log",
+        "info",
+        "run",
+        "--strict",
+        "--happens-before",
+        spec.as_str(),
+        "--",
+    ];
+    args.extend(HB_HELD_SIGCHLD_GUEST);
+    let ordered = hermit(&args);
+    let log = stderr(&ordered);
+    assert_success(&ordered, &args);
+    let stdout = String::from_utf8_lossy(&ordered.stdout).into_owned();
+    assert!(
+        stdout.ends_with("late\nparent\n") && stdout.contains("early\n"),
+        "the edge did not put the late child's line before the parent's: {stdout:?}"
+    );
+    let parent = parent.dettid;
+    assert!(
+        log.contains(&format!("SKIP dettid {parent} held at happens-before")),
+        "the parent (dettid {parent}) was never held at its gate, so the test exercised nothing"
+    );
+    assert!(
+        log.contains(&format!(
+            "[dtid {parent}] held at a happens-before gate; leaving it held, its signal pending"
+        )),
+        "no signal reached the held parent (dettid {parent}), so the test exercised nothing"
+    );
+}
+
+/// An alarm that fires at a thread held at a gate that can never open must
+/// end the run in a deadlock report. The gate is the syscall after `alarm(1)`
+/// (its count comes from an INFO run, since the loader's syscalls vary with
+/// the environment). The alarm then fires through the empty-queue time skip
+/// with only the held thread left; it used to panic the scheduler (the held
+/// thread was reported as gone) and hang the run.
+#[test]
+fn happens_before_alarm_at_a_held_thread_ends_in_a_deadlock_report() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = hb_signal_while_held_guest().to_str().unwrap().to_owned();
+    let args = [
+        "--log",
+        "info",
+        "run",
+        "--strict",
+        "--",
+        guest.as_str(),
+        "alarm",
+    ];
+    let calibration = hermit(&args);
+    assert_success(&calibration, &args);
+    let calibration_log = stderr(&calibration);
+    let Some(alarm) = calibration_log.lines().find_map(|line| {
+        let rest = line
+            .split_once("[syscall][detcore, dtid 3] finish syscall #")?
+            .1;
+        let (count, rest) = rest.split_once(": ")?;
+        rest.starts_with("alarm(1)")
+            .then(|| count.parse::<u64>().ok())
+            .flatten()
+    }) else {
+        panic!("no alarm(1) by dettid 3 in the calibration log");
+    };
+    let gate = alarm + 1;
+    let spec = directory.path().join("never-open.json");
+    fs::write(
+        &spec,
+        format!(
+            r#"{{"version": 1,
+                "events": {{"never": {{"thread": "3", "syscalls": 1000000000}},
+                            "gate": {{"thread": "3", "syscalls": {gate}}}}},
+                "edges": [{{"before": "never", "after": "gate", "strength": "hard"}}]}}"#
+        ),
+    )
+    .unwrap();
+    let spec = spec.to_str().unwrap().to_owned();
+    let args = [
+        "--log",
+        "info",
+        "run",
+        "--strict",
+        "--happens-before",
+        spec.as_str(),
+        "--",
+        guest.as_str(),
+        "alarm",
+    ];
+    let output = hermit(&args);
+    let log = stderr(&output);
+    assert!(
+        !output.status.success(),
+        "a gate that cannot open let the run succeed: {log}"
+    );
+    assert!(
+        log.contains("[dtid 3] held at a happens-before gate; leaving it held, its signal pending"),
+        "the alarm never reached the held thread, so the test exercised nothing:\n{log}"
+    );
+    assert!(
+        log.contains("held at a happens-before gate whose BEFORE anchor cannot fire")
+            && log.contains(&format!("HappensBeforeCheckpoint({gate})")),
+        "no deadlock report naming the gate:\n{log}"
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).is_empty());
+}
+
+/// A process may exit while one of its threads is held at a gate that can
+/// never open. The held worker is killed with its process and must not keep
+/// the scheduler loop alive or be reported as a deadlock: the run exits 0.
+#[test]
+fn happens_before_process_exit_with_a_held_worker_exits_zero() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = hb_signal_while_held_guest().to_str().unwrap().to_owned();
+    let args = [
+        "--log",
+        "info",
+        "run",
+        "--strict",
+        "--",
+        guest.as_str(),
+        "exit",
+    ];
+    let calibration = hermit(&args);
+    assert_success(&calibration, &args);
+    let writes = logged_stdout_writes(&stderr(&calibration));
+    let Some(worker) = writes.iter().find(|w| w.len == 7) else {
+        panic!(
+            "no worker write(1, ..) in the INFO log; found {} writes",
+            writes.len()
+        );
+    };
+    let worker = worker.dettid;
+    let spec = directory.path().join("held-worker.json");
+    fs::write(
+        &spec,
+        format!(
+            r#"{{"version": 1,
+                "events": {{"never": {{"thread": "3", "syscalls": 1000000000}},
+                            "gate": {{"thread": "{worker}", "syscalls": 3}}}},
+                "edges": [{{"before": "never", "after": "gate", "strength": "hard"}}]}}"#
+        ),
+    )
+    .unwrap();
+    let spec = spec.to_str().unwrap().to_owned();
+    let args = [
+        "--log",
+        "info",
+        "run",
+        "--strict",
+        "--happens-before",
+        spec.as_str(),
+        "--",
+        guest.as_str(),
+        "exit",
+    ];
+    let output = hermit(&args);
+    let log = stderr(&output);
+    assert_success(&output, &args);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "main-exits\n");
+    assert!(
+        log.contains(&format!("SKIP dettid {worker} held at happens-before")),
+        "the worker (dettid {worker}) was never held at its gate, so the test exercised nothing"
+    );
 }
 
 /// `--hb-list-events` prints the resolved spec and exits 0 without running

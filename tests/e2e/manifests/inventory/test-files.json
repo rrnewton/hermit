@@ -578,6 +578,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/hb_signal_while_held.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/hb_signal_while_held.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests happens_before_alarm_at_a_held_thread_ends_in_a_deadlock_report and happens_before_process_exit_with_a_held_worker_exits_zero compile this guest and run one mode each (alarm, exit) with a --happens-before spec that holds a thread at a gate that can never open while an alarm is sent to it or while its process exits; it remains a guest fixture because a generic manifest cannot express a calibration run followed by a spec authored from its log and a check of the held thread in the second run's log."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/hb_source_then_futex.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/hb_source_then_futex.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test happens_before_source_then_blocking_wait_lets_the_target_pass compiles this fork-and-futex guest, calibrates the parent's FUTEX_WAIT and the child's FUTEX_WAKE syscall counts from an INFO run, and requires a --happens-before edge whose source thread blocks right after firing to let the parked target pass and the run complete; it remains a guest fixture because a generic manifest cannot express a calibration run followed by a spec authored from its log and an ordering check on the second run's log."
