@@ -91,6 +91,7 @@ pub use config::BlockingMode;
 pub use config::CONFIG_FINGERPRINT_ENV;
 pub use config::Config;
 pub use config::FatalCoreCapture;
+pub use config::InheritedSeccomp;
 pub use config::RunsPostFork;
 pub use config::SchedHeuristic;
 pub use config::config_wire_fingerprint;
