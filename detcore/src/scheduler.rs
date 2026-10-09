@@ -872,7 +872,7 @@ pub struct Scheduler {
     /// to the scheduler. Their barrier is kept until the child's next release
     /// edge, which happens at a deterministic point: its `Exit` grant, its
     /// successful exec, or its logical kill
-    /// ([`Scheduler::release_dead_parent_vfork_barrier`]). Dropping it at the
+    /// ([`Scheduler::release_vfork_child`]). Dropping it at the
     /// parent's own retirement would let other threads be selected at a
     /// moment the host chooses: on ptrace a SIGKILL from another process
     /// retires its target only at the target's deregistration
