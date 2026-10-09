@@ -867,10 +867,25 @@ fn path_overlaps_buffer<M: MemoryAccess>(
     path: Option<syscalls::PathPtr<'_>>,
     buffer: StatPtr,
 ) -> bool {
+    path_overlaps_bytes(
+        memory,
+        path,
+        buffer.0.as_raw(),
+        std::mem::size_of::<libc::stat>(),
+    )
+}
+
+/// Whether the `len` bytes at `start` overlap `path` through its NUL. A path
+/// that cannot be read counts as overlapping.
+fn path_overlaps_bytes<M: MemoryAccess>(
+    memory: &M,
+    path: Option<syscalls::PathPtr<'_>>,
+    start: usize,
+    len: usize,
+) -> bool {
     use reverie::syscalls::FromToRaw;
 
-    let start = buffer.0.as_raw();
-    let end = start + std::mem::size_of::<libc::stat>();
+    let end = start.saturating_add(len);
     path.is_some_and(|ptr| match ptr.read(memory) {
         Ok(read) => {
             let addr = Some(ptr).into_raw();
@@ -950,6 +965,9 @@ enum StatTarget<'a> {
         path: Option<PathPtr<'a>>,
         follow: bool,
     },
+    /// A file named by a path that the call's result overwrote, which Detcore
+    /// cannot look up again.
+    Overwritten,
 }
 
 impl<'a> StatTarget<'a> {
@@ -975,11 +993,24 @@ impl<'a> StatTarget<'a> {
         }
     }
 
+    /// This target, or [`StatTarget::Overwritten`] if it is a path that the
+    /// `len` bytes of the call's result at `result` overlap. Linux reads the
+    /// path before it writes the result, so the call succeeds, but the path
+    /// the guest named is gone once it returns. Found before the call.
+    fn unless_overwritten<M: MemoryAccess>(self, memory: &M, result: usize, len: usize) -> Self {
+        match self {
+            StatTarget::Path { path, .. } if path_overlaps_bytes(memory, path, result, len) => {
+                StatTarget::Overwritten
+            }
+            target => target,
+        }
+    }
+
     /// The descriptor the call describes itself, if it names no path.
     fn descriptor(&self) -> Option<RawFd> {
         match self {
             StatTarget::Descriptor(fd) => Some(*fd),
-            StatTarget::Cwd | StatTarget::Path { .. } => None,
+            StatTarget::Cwd | StatTarget::Path { .. } | StatTarget::Overwritten => None,
         }
     }
 }
@@ -4212,17 +4243,19 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///
     /// Never under record and replay, which reproduces the recorded host
     /// numbers instead: Replayer's descriptor is a placeholder, and its guest
-    /// has no `/proc`. Nor under a backend whose guest threads are not host
-    /// tasks (KVM, the backend that owns process signal control), which has
-    /// no `/proc/<tid>` to read.
+    /// has no `/proc`. Nor when the guest's thread IDs do not name host tasks
+    /// (see [`procfs_inode::guest_tids_name_host_tasks`]), as there is then no
+    /// `/proc/<tid>` to read.
     async fn procfs_entry<G: Guest<Self>>(
         guest: &mut G,
         stat: &DetStat,
         target: StatTarget<'_>,
     ) -> ProcfsEntry {
-        let config = guest.config();
-        if config.recordreplay_modes
-            || config.backend.provides_process_signal_control
+        if guest.config().recordreplay_modes
+            || !procfs_inode::guest_tids_name_host_tasks(
+                &guest.config().backend,
+                guest.thread_state().physical_tid,
+            )
             || !procfs_inode::may_be_procfs(stat.dev, stat.blksize)
         {
             return ProcfsEntry::NotProcfs;
@@ -4250,23 +4283,25 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// The canonical path of the procfs file `stat` describes, which the
     /// guest named as `target`, from the magic link of the descriptor or
-    /// working directory in the guest thread's `/proc/<tid>`. For a path,
-    /// Detcore opens an `O_PATH` descriptor in the guest with the guest's own
-    /// path, directory and flags, which resolves `self` and `thread-self` to
-    /// the guest, and closes it again; the entry may have been rebuilt since
-    /// the guest's stat, so only its device is checked.
+    /// working directory in the guest thread's `/proc/<tid>`, if that is
+    /// still the file `stat` describes. For a path, Detcore opens an `O_PATH`
+    /// descriptor in the guest with the guest's own path, directory and
+    /// flags, which resolves `self` and `thread-self` to the guest, and
+    /// closes it again. An entry the host rebuilt between the guest's stat
+    /// and that open, a window of one injected call, is not the file `stat`
+    /// describes, and goes unnamed.
     async fn procfs_canonical_path<G: Guest<Self>>(
         guest: &mut G,
         stat: &DetStat,
         target: StatTarget<'_>,
     ) -> Result<PathBuf, String> {
         let tid = guest.tid().as_raw();
-        let inspect = |link: String, inode: Option<u64>| {
-            procfs_inode::inspect_link(Path::new(&link), stat.dev, inode)
-        };
+        let inspect =
+            |link: String| procfs_inode::inspect_link(Path::new(&link), stat.dev, stat.inode);
         match target {
-            StatTarget::Descriptor(fd) => inspect(format!("/proc/{tid}/fd/{fd}"), Some(stat.inode)),
-            StatTarget::Cwd => inspect(format!("/proc/{tid}/cwd"), Some(stat.inode)),
+            StatTarget::Descriptor(fd) => inspect(format!("/proc/{tid}/fd/{fd}")),
+            StatTarget::Cwd => inspect(format!("/proc/{tid}/cwd")),
+            StatTarget::Overwritten => Err("the call's result overwrote the guest's path".into()),
             StatTarget::Path {
                 dirfd,
                 path,
@@ -4284,17 +4319,30 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .inject_with_retry(open)
                     .await
                     .map_err(|errno| format!("cannot open the guest's path again: {errno}"))?;
-                let found = inspect(format!("/proc/{tid}/fd/{fd}"), None);
-                // Not retried on EINTR: Linux releases the descriptor even then.
-                if let Err(errno) = guest
-                    .inject(syscalls::Close::new().with_fd(fd as i32))
-                    .await
-                {
-                    return Err(format!(
-                        "cannot close the guest's O_PATH descriptor: {errno}"
-                    ));
+                let found = inspect(format!("/proc/{tid}/fd/{fd}"));
+                let close = syscalls::Close::new().with_fd(fd as i32);
+                loop {
+                    match guest.inject(close).await {
+                        // A close that never ran: Reverie reports an injection
+                        // that a signal stopped before it executed as a
+                        // restart, which Linux's close never returns.
+                        Err(
+                            Errno::ERESTARTSYS
+                            | Errno::ERESTARTNOINTR
+                            | Errno::ERESTARTNOHAND
+                            | Errno::ERESTART_RESTARTBLOCK,
+                        ) => continue,
+                        Err(Errno::EBADF) => {
+                            return Err(
+                                "the guest's O_PATH descriptor was not open to close".into()
+                            );
+                        }
+                        // Linux releases the descriptor whatever else close
+                        // returns, and turns an interrupted close into EINTR,
+                        // which must not be retried.
+                        _ => return found,
+                    }
                 }
-                found
             }
         }
     }
@@ -4420,8 +4468,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // kernel because there're many corner cases. i.e.: even access
             // filepath from tracer may cause tracer to hang under certain fuse
             // filesystem (squashfs_ll).
-            guest.inject(Syscall::from(call)).await?;
-            let statptr = call.stat().ok_or(Errno::EFAULT)?;
+            // The target is found before the call, which can overwrite its path.
             let target = match &call {
                 StatFamily::Fstat(call) => StatTarget::Descriptor(call.fd()),
                 StatFamily::Fstatat(call) => {
@@ -4440,6 +4487,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                     follow: false,
                 },
             };
+            let target = match call.stat() {
+                Some(result) => target.unless_overwritten(
+                    &guest.memory(),
+                    result.0.as_raw(),
+                    std::mem::size_of::<libc::stat>(),
+                ),
+                None => target,
+            };
+            guest.inject(Syscall::from(call)).await?;
+            let statptr = call.stat().ok_or(Errno::EFAULT)?;
             let inode_override = target
                 .descriptor()
                 .and_then(|fd| stdio_inode_override(guest, fd));
@@ -4469,9 +4526,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             // NB: let kernel handle error codes, it's not easy to do so without kernel
             // because there're many corner cases. i.e.: even access filepath from tracer
             // may cause tracer to hang under certain fuse filesystem (squashfs_ll).
+            // The target is found before the call, which can overwrite its path.
+            let target = StatTarget::at(&guest.memory(), call.dirfd(), call.path(), call.flags());
+            let target = match call.statx() {
+                Some(result) => target.unless_overwritten(
+                    &guest.memory(),
+                    result.0.as_raw(),
+                    std::mem::size_of::<libc::statx>(),
+                ),
+                None => target,
+            };
             guest.inject(call).await?;
             let statptr = call.statx().ok_or(Errno::EFAULT)?;
-            let target = StatTarget::at(&guest.memory(), call.dirfd(), call.path(), call.flags());
             let inode_override = target
                 .descriptor()
                 .and_then(|fd| stdio_inode_override(guest, fd));
@@ -6483,13 +6549,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !needs_snapshot {
             return self.serve_next_batch(guest, call).await;
         }
-        let retirements = retirement_count(guest).await;
+        let mark = directory_snapshot_mark(guest).await;
         match self.snapshot_directory_privately(guest, call).await {
             Ok(Some(entries)) => {
                 let mut entries = Some(entries);
                 guest.thread_state().with_detfd(call.fd, |detfd| {
-                    detfd
-                        .install_directory_snapshot(entries.take().unwrap_or_default(), retirements)
+                    detfd.install_directory_snapshot(entries.take().unwrap_or_default(), mark)
                 })?;
                 self.serve_next_batch(guest, call).await
             }
@@ -6548,14 +6613,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         match stream {
             None | Some((0, true)) => return Ok(kernel.map(|_| 0)?),
             Some((_, true)) => {
-                let retirements = retirement_count(guest).await;
+                let mark = directory_snapshot_mark(guest).await;
                 match self.snapshot_directory_privately(guest, call).await {
                     Ok(Some(entries)) => {
                         let mut entries = Some(entries);
                         let target = guest.thread_state().with_detfd(call.fd, |detfd| {
                             detfd.install_directory_snapshot(
                                 entries.take().unwrap_or_default(),
-                                retirements,
+                                mark,
                             );
                             detfd.with_directory_stream(|stream| stream.kernel_target())
                         })??;
@@ -6586,12 +6651,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: GetdentsCall<'_>,
     ) -> Result<i64, Error> {
-        let (start, batch, retirements) = guest.thread_state().with_detfd(call.fd, |detfd| {
+        let (start, batch, mark) = guest.thread_state().with_detfd(call.fd, |detfd| {
             detfd.with_directory_stream(|stream| {
                 (
                     stream.position(),
                     stream.next_batch(call.format, call.capacity),
-                    stream.snapshot_retirements(),
+                    stream.snapshot_mark(),
                 )
             })
         })??;
@@ -6602,7 +6667,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let mut names = Vec::with_capacity(batch.len());
                 for (index, entry) in batch.iter().enumerate() {
                     let (host, path) = inodes.entry_inode(&entry.name, entry.ino);
-                    let (d_ino, _) = determinize_listed_inode(guest, host, path, retirements).await;
+                    let (d_ino, _) = determinize_listed_inode(guest, host, path, mark).await;
                     let d_off = i64::try_from(start + index as u64 + 1).unwrap_or(i64::MAX);
                     call.format
                         .encode(entry, d_ino.as_raw(), d_off, &mut records);
