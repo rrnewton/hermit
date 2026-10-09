@@ -1627,13 +1627,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // mountinfo_names_procfs_mounts_by_type,
     // only_anonymous_devices_with_1024_byte_blocks_may_be_procfs,
     // other_directories_keep_host_keys, path_keys_cannot_equal_procfs_inodes,
+    // procfs_entries_are_named_only_where_thread_ids_are_host_ids,
     // this_process_reads_its_own_procfs_entries} and tool_global::tests::{
     // a_numbered_host_inode_keeps_its_number_when_its_path_is_named,
+    // a_snapshot_entry_names_the_task_that_held_its_id,
     // a_rebuilt_procfs_entry_keeps_its_number,
     // a_reused_task_id_names_new_procfs_entries, procfs_aliases_share_one_number,
     // a_write_to_a_rebuilt_procfs_entry_sets_the_mtime_of_its_number}
-    // (rebuilt procfs entries keep their numbers) retain all 1213: 1227.
-    ("test.detcore_unit", 1227),
+    // (rebuilt procfs entries keep their numbers) retain all 1213: 1229.
+    ("test.detcore_unit", 1229),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1683,10 +1685,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_rebuilt_entry_reached_through_self_keeps_its_number,
     // a_procfs_entry_reached_by_two_paths_keeps_one_number,
     // an_entry_detcore_cannot_name_records_a_determinism_loss,
+    // an_overwritten_path_does_not_name_the_entry_it_now_leads_to,
     // the_proc_root_link_count_does_not_count_host_processes,
     // the_proc_root_link_count_through_the_cwd_does_not_count_host_processes,
-    // a_write_to_a_procfs_file_moves_its_mtime} retain all 88 (measured 95).
-    ("test.detcore_misc", 95),
+    // a_write_to_a_procfs_file_moves_its_mtime} retain all 88 (measured 96).
+    ("test.detcore_misc", 96),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -2299,7 +2302,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
     // The host node carries the identical tests_misc selection.
-    ("test.detcore_misc_on_host", 95),
+    ("test.detcore_misc_on_host", 96),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -2392,7 +2395,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // host twin's arguments.
     // And the eleven procfs inode tests: 1224.
     // And the three tests of naming procfs entries through the guest: 1227.
-    ("test.detcore_unit_on_host", 1227),
+    // And the two tests of where procfs entries are named: 1229.
+    ("test.detcore_unit_on_host", 1229),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
