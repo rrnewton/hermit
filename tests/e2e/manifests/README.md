@@ -367,7 +367,9 @@ specific configuration:
   `--no-virtualize-cpuid` and `--max-timeslice=VALUE` are accepted. Each
   relaxes determinism, so a non-empty `hermit_args_reason` is required and
   every flag is recorded, with that reason, in the result row's
-  `relaxations`.
+  `relaxations`. `hermit_args_reason` is one string for every backend's
+  flags, or a mapping that names exactly the backends of `hermit_args`, each
+  with its own reason, so each cell records only its own.
 - `env` adds guest variables as `--env NAME=VALUE` after the runner's fixed
   guest environment; a name the runner sets (`HOME`, `TZ`, `LC_ALL`, ...) is
   refused. Only a verify or a replay mode accepts it. A replay cell that does
@@ -417,7 +419,17 @@ why that row's cell is a diagnostic, with its own shortened budget, and
 on one more backend to every row except those its `except` names (each with
 the reason that backend is disabled there), labelled with a run type (below),
 so the default run type does not run it; it shares the section's verify
-settings except `hermit_args`, which stay on the section's backend.
+settings except `hermit_args`, which stay on the section's backend. Each
+`additional` entry adds a verify cell on one more backend to the rows its
+`rows` names, which the default (full) run type does run: it carries none of
+the row's run-type labels, has the global default budget, shares the
+section's environment, comparator and `no_retry_reason`, is never a
+diagnostic, and takes the entry's own `hermit_args` and `hermit_args_reason`,
+which join the mode's per-backend `hermit_args` (and, when the flagged cells'
+reasons differ, a per-backend `hermit_args_reason`). Every other row disables
+that backend with the entry's `disabled_reason`, or with its own reason in the
+entry's `disabled`. An additional backend may not be the section's backend or
+a focused one.
 `replay` gives every row except those its `except` groups name (each group
 with its reason) a replay cell on ptrace in the row's own test (`hermit record
 start` then replay, compared by the harness), labelled with the section's run

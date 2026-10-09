@@ -433,6 +433,38 @@ pub struct Observation {
     pub artifacts: Vec<String>,
 }
 
+/// Why a verify mode's `hermit_args` relax determinism: one reason for every
+/// backend's flags, or a mapping with one reason for each backend that has
+/// flags, so each cell's relaxation records only its own.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum HermitArgsReason {
+    Shared(String),
+    PerBackend(BTreeMap<String, String>),
+}
+
+impl HermitArgsReason {
+    /// The reason for `backend`'s flags.
+    pub fn for_backend(&self, backend: &str) -> Option<&str> {
+        match self {
+            Self::Shared(reason) => Some(reason),
+            Self::PerBackend(reasons) => reasons.get(backend).map(String::as_str),
+        }
+    }
+}
+
+impl From<&str> for HermitArgsReason {
+    fn from(reason: &str) -> Self {
+        Self::Shared(reason.to_string())
+    }
+}
+
+impl From<String> for HermitArgsReason {
+    fn from(reason: String) -> Self {
+        Self::Shared(reason)
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModeRecipe {
@@ -486,7 +518,7 @@ pub struct ModeRecipe {
     /// required and both are recorded as relaxations.
     #[serde(default)]
     pub hermit_args: BTreeMap<String, Vec<String>>,
-    pub hermit_args_reason: Option<String>,
+    pub hermit_args_reason: Option<HermitArgsReason>,
     /// Guest environment variables a verify cell adds, as `--env NAME=VALUE`,
     /// after the runner's fixed guest environment. A name the runner sets is
     /// refused rather than silently overridden. A replay cell inherits its
@@ -2112,14 +2144,15 @@ pub fn cell_relaxations(cell: &SelectedCell) -> Vec<String> {
     }
     let reason =
         |reason: &Option<String>| reason.as_deref().unwrap_or("reason missing").to_string();
-    for arg in cell
-        .id
-        .backend
-        .as_deref()
-        .map(|backend| cell_hermit_args(recipe, backend))
-        .unwrap_or_default()
-    {
-        relaxations.push(format!("{arg}: {}", reason(&recipe.hermit_args_reason)));
+    if let Some(backend) = cell.id.backend.as_deref() {
+        let args_reason = recipe
+            .hermit_args_reason
+            .as_ref()
+            .and_then(|reason| reason.for_backend(backend))
+            .unwrap_or("reason missing");
+        for arg in cell_hermit_args(recipe, backend) {
+            relaxations.push(format!("{arg}: {args_reason}"));
+        }
     }
     if recipe.comparator == Some(Comparator::Stripped) {
         relaxations.push(format!(
@@ -8196,12 +8229,22 @@ fn validate_mode_extensions(id: &str, mode: &str, recipe: &ModeRecipe) -> Result
             ));
         }
     }
-    match (
-        recipe.hermit_args.is_empty(),
-        recipe.hermit_args_reason.as_deref().map(str::trim),
-    ) {
+    match (recipe.hermit_args.is_empty(), &recipe.hermit_args_reason) {
         (true, None) => {}
-        (false, Some(reason)) if !reason.is_empty() => {}
+        (false, Some(HermitArgsReason::Shared(reason))) if !reason.trim().is_empty() => {}
+        // One reason per backend with flags, and none for a backend without.
+        (false, Some(HermitArgsReason::PerBackend(reasons))) => {
+            if !reasons.keys().eq(recipe.hermit_args.keys()) {
+                return Err(format!(
+                    "{id}: a per-backend hermit_args_reason must name exactly the backends of hermit_args"
+                ));
+            }
+            if reasons.values().any(|reason| reason.trim().is_empty()) {
+                return Err(format!(
+                    "{id}: hermit_args relax determinism and require a substantive hermit_args_reason"
+                ));
+            }
+        }
         (false, _) => {
             return Err(format!(
                 "{id}: hermit_args relax determinism and require a substantive hermit_args_reason"
@@ -9058,6 +9101,175 @@ mod tests {
             preprocessors: Vec::new(),
             labels: Vec::new(),
         }
+    }
+
+    /// A corpus's additional-backend flags reach the expanded verify mode's
+    /// per-backend `hermit_args`, so the manifest validator holds them to the
+    /// same allowlist and once-per-flag rule as any hand-written cell's, and
+    /// the relaxation each cell records names its own flags.
+    #[test]
+    fn corpus_additional_backend_flags_meet_the_manifest_validator() {
+        let corpus = r#"schema: 3
+bucket: fixture
+corpus:
+  description: Fixture program
+  lane: portable
+  requires: [linux]
+  backend: ptrace
+  verify:
+    hermit_args: [--no-virtualize-cpuid]
+    hermit_args_reason: fixture configuration
+    timeout_seconds: 60
+    cpu_timeout_seconds: 59
+    slow_reason: fixture budget
+  additional:
+    - backend: liteinst
+      hermit_args: [--max-timeslice=disabled]
+      hermit_args_reason: fixture in-guest reason
+      rows: [echo]
+      disabled_reason: not measured on liteinst
+  rows:
+    - {label: "echo", argv: ["/bin/echo", "x"]}
+    - {label: "true", argv: ["/bin/true"]}
+"#;
+        let load = |text: &str| -> Result<ManifestDocument, String> {
+            let value = crate::manifest_corpus::expand_corpus(
+                serde_yaml::from_str(text).map_err(|error| error.to_string())?,
+            )?;
+            let document: ManifestDocument =
+                serde_yaml::from_value(value).map_err(|error| error.to_string())?;
+            validate_document(&document, "fixture", Path::new("/"), 15)?;
+            Ok(document)
+        };
+        let document = load(corpus).unwrap();
+        let verify = &document.test[0].modes["verify"];
+        assert_eq!(verify.backends_enabled, ["ptrace", "liteinst"]);
+        assert_eq!(
+            cell_hermit_args(verify, "liteinst"),
+            ["--max-timeslice=disabled"]
+        );
+        assert_eq!(
+            cell_hermit_args(verify, "ptrace"),
+            ["--no-virtualize-cpuid"]
+        );
+        // Each cell's relaxation names its own flags with its own reason.
+        let relaxations = |backend: &str| {
+            cell_relaxations(&SelectedCell {
+                category: "fixture".into(),
+                test: document.test[0].clone(),
+                id: CellId {
+                    test: "fixture/echo".into(),
+                    mode: "verify".into(),
+                    backend: Some(backend.into()),
+                },
+                enabled: true,
+                timeout_seconds: 15,
+                cpu_timeout_seconds: 15,
+            })
+        };
+        assert_eq!(
+            relaxations("ptrace"),
+            ["--no-virtualize-cpuid: fixture configuration"]
+        );
+        assert_eq!(
+            relaxations("liteinst"),
+            ["--max-timeslice=disabled: fixture in-guest reason"]
+        );
+        // A row without the additional cell keeps the lane's one reason.
+        assert_eq!(
+            document.test[1].modes["verify"].hermit_args_reason,
+            Some(HermitArgsReason::from("fixture configuration"))
+        );
+        for refused_flag in ["--no-strict", "--chaos", "--max-timeslice=", "--epoch=1"] {
+            let error = load(&corpus.replace(
+                "hermit_args: [--max-timeslice=disabled]",
+                &format!("hermit_args: [\"{refused_flag}\"]"),
+            ))
+            .unwrap_err();
+            assert!(error.contains("is not one of"), "{refused_flag}: {error}");
+        }
+        let error = load(&corpus.replace(
+            "hermit_args: [--max-timeslice=disabled]",
+            "hermit_args: [--max-timeslice=1, --max-timeslice=disabled]",
+        ))
+        .unwrap_err();
+        assert!(error.contains("repeats `--max-timeslice`"), "{error}");
+        let error =
+            load(&corpus.replace("      hermit_args_reason: fixture in-guest reason\n", ""))
+                .unwrap_err();
+        assert!(error.contains("require a hermit_args_reason"), "{error}");
+    }
+
+    /// A per-backend `hermit_args_reason` names exactly the backends with
+    /// flags, each with a substantive reason, and each cell records its own.
+    #[test]
+    fn a_per_backend_hermit_args_reason_covers_exactly_the_flagged_backends() {
+        let accepted = ModeRecipe {
+            backends_enabled: vec!["ptrace".into(), "liteinst".into(), "sabre".into()],
+            hermit_args: BTreeMap::from([
+                ("ptrace".into(), vec!["--no-virtualize-cpuid".into()]),
+                ("liteinst".into(), vec!["--max-timeslice=disabled".into()]),
+            ]),
+            hermit_args_reason: Some(HermitArgsReason::PerBackend(BTreeMap::from([
+                (
+                    "ptrace".into(),
+                    "the corpus records this configuration".into(),
+                ),
+                (
+                    "liteinst".into(),
+                    "in-guest LiteInst refuses a preemption timer".into(),
+                ),
+            ]))),
+            ..ModeRecipe::default()
+        };
+        validate_mode_extensions("fixture/test", "verify", &accepted).unwrap();
+        let reason = accepted.hermit_args_reason.as_ref().unwrap();
+        assert_eq!(
+            reason.for_backend("liteinst"),
+            Some("in-guest LiteInst refuses a preemption timer")
+        );
+        assert_eq!(reason.for_backend("sabre"), None);
+        let refused = |reasons: &[(&str, &str)], needle: &str| {
+            let mut recipe = accepted.clone();
+            recipe.hermit_args_reason = Some(HermitArgsReason::PerBackend(
+                reasons
+                    .iter()
+                    .map(|(backend, reason)| (backend.to_string(), reason.to_string()))
+                    .collect(),
+            ));
+            let error = validate_mode_extensions("fixture/test", "verify", &recipe).unwrap_err();
+            assert!(error.contains(needle), "{reasons:?}: {error}");
+        };
+        let exactly = "must name exactly the backends of hermit_args";
+        refused(&[("ptrace", "configuration")], exactly);
+        refused(
+            &[
+                ("ptrace", "configuration"),
+                ("liteinst", "timer"),
+                ("sabre", "no flags"),
+            ],
+            exactly,
+        );
+        refused(&[], exactly);
+        refused(
+            &[("ptrace", "configuration"), ("liteinst", " ")],
+            "require a substantive hermit_args_reason",
+        );
+        // A per-backend reason without flags is a reason without flags.
+        let mut bare = accepted.clone();
+        bare.hermit_args.clear();
+        assert!(
+            validate_mode_extensions("fixture/test", "verify", &bare)
+                .unwrap_err()
+                .contains("hermit_args_reason without hermit_args")
+        );
+        // Both spellings read from YAML.
+        let shared: HermitArgsReason = serde_yaml::from_str("one reason").unwrap();
+        assert_eq!(shared, HermitArgsReason::from("one reason"));
+        let per_backend: HermitArgsReason =
+            serde_yaml::from_str("{ptrace: a, liteinst: b}").unwrap();
+        assert_eq!(per_backend.for_backend("ptrace"), Some("a"));
+        assert!(serde_yaml::from_str::<HermitArgsReason>("[a, b]").is_err());
     }
 
     #[test]
