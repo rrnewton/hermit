@@ -34,9 +34,11 @@ use crate::syscalls::threads::KERNEL_SIGSET_SIZE;
 use crate::syscalls::threads::KernelSigaction;
 use crate::syscalls::threads::KernelSigset;
 use crate::syscalls::threads::kernel_sigset_bit;
+use crate::syscalls::threads::read_thread_wait_signal_state;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::SigalrmControl;
 use crate::tool_global::alarm_remaining;
+use crate::tool_global::host_timed_signals;
 use crate::tool_global::notify_signal_pending;
 use crate::tool_global::refuse_sigalrm;
 use crate::tool_global::register_alarm;
@@ -449,21 +451,41 @@ impl<T: RecordOrReplay> Detcore<T> {
             // `LogicalTime::INDEFINITE` records that, and the scheduler refuses to
             // fast-forward virtual time onto it (see `step2d_handle_empty_queue`),
             // so the `Normal` arm below stays unreachable.
-            let mut req = Self::sleep_request_abs(guest, LogicalTime::INDEFINITE).await;
-            req.fyi(crate::resources::PAUSE_FYI);
-            match crate::tool_global::parked_wait_request(
-                guest,
-                req,
-                crate::scheduler::parked::ParkedWaitPolicy::PauseNoHandlerRestart,
-            )
-            .await
-            {
-                ResumeStatus::Normal => {
-                    panic!(
-                        "Internal violation: pause should never return from the scheduler except by interruption!"
-                    )
+            loop {
+                // A signal that already ended the call before it parked: one sent
+                // while this thread was stopped short of filing the request, as
+                // when its timeslice ended in the syscall's prehook.
+                if sleep_signal(guest, SleepCheck::BeforePark, true).await? == SleepSignal::Pending
+                {
+                    return Err(Errno::ERESTARTNOHAND.into());
                 }
-                ResumeStatus::Signaled(_) => Err(reverie::Error::Errno(Errno::EINTR)),
+                let mut req = Self::sleep_request_abs(guest, LogicalTime::INDEFINITE).await;
+                req.fyi(crate::resources::PAUSE_FYI);
+                match crate::tool_global::parked_wait_request(
+                    guest,
+                    req,
+                    crate::scheduler::parked::ParkedWaitPolicy::PauseNoHandlerRestart,
+                )
+                .await
+                {
+                    ResumeStatus::Normal => {
+                        panic!(
+                            "Internal violation: pause should never return from the scheduler except by interruption!"
+                        )
+                    }
+                    ResumeStatus::Signaled(signals) => {
+                        match sleep_signal(guest, SleepCheck::AfterWake(signals), true).await? {
+                            SleepSignal::Pending => return Err(Errno::ERESTARTNOHAND.into()),
+                            SleepSignal::Held => return Err(Errno::EINTR.into()),
+                            SleepSignal::None => {
+                                info!(
+                                    "[dtid {}] pause woken for a signal no longer pending for it; waiting again",
+                                    guest.thread_state().dettid
+                                );
+                            }
+                        }
+                    }
+                }
             }
         } else {
             info!(
@@ -1069,6 +1091,114 @@ impl<T: RecordOrReplay> Detcore<T> {
 
 fn should_notify_cross_task_signal(sender: DetTid, target: DetTid, raw_signal: i32) -> bool {
     raw_signal != 0 && target != sender
+}
+
+/// Which check [`sleep_signal`] makes for an emulated `pause` or `nanosleep`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SleepCheck {
+    /// Before the sleep parks: whether a signal already pending for the thread
+    /// ends it at once.
+    BeforePark,
+    /// After the scheduler woke the sleep for these signals.
+    AfterWake(Option<Vec<SigWrapper>>),
+}
+
+/// What ends an emulated `pause` or `nanosleep`, per [`sleep_signal`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SleepSignal {
+    /// A signal pending for this thread, unblocked and caught or acted on by
+    /// default: the kernel delivers it as the call returns. `pause` returns
+    /// `ERESTARTNOHAND` for it and `nanosleep` `EINTR`.
+    Pending,
+    /// The scheduler ended the sleep for a signal whose pending bit cannot
+    /// decide (below), or this backend does not report the guest's signal
+    /// state: the call returns `EINTR`, as every wake did before.
+    Held,
+    /// Nothing ends the sleep, and it waits (again) with its original deadline.
+    None,
+}
+
+/// Decides, in this thread's own turn, whether a signal ends an emulated
+/// `pause` or `nanosleep` (<https://github.com/rrnewton/hermit/issues/3982>).
+///
+/// Only on a backend whose kernel reports the guest's signal state; on any
+/// other, a sleep never checks before it parks, and a wake always ends it
+/// (`Held`). A signal ends the sleep when it is pending for this thread,
+/// unblocked, and caught or acted on by default
+/// (`KernelSignalState::pending_interrupting`). Before the sleep parks, a stop
+/// signal does so only when `stops_end_it`, which `nanosleep` leaves unset
+/// because Detcore does not keep its deadline for the kernel's restart after a
+/// stop, so the stop takes effect when the sleep ends, as before. After a wake,
+/// which only the scheduler's own sends (a timer, a child-exit `SIGCHLD`) can
+/// commit for a stop on a `nanosleep`, a pending stop ends it, as every wake
+/// did before, so that the stop takes effect promptly.
+///
+/// `SIGCHLD` and the signals a host-timed source armed by a guest can post
+/// (`host_timed_signals`) are held: the kernel can post them at a moment set by
+/// host timing, and `/proc` cannot tell that copy from one a guest sent, so
+/// their pending bits are never read. They never end a sleep before it parks,
+/// nor does the scheduler record a guest's cross-task send of one for a sleep;
+/// a wake the scheduler committed for one of its own, a child-exit `SIGCHLD`,
+/// ends it with `Held`, as before. Like the precise futex
+/// wait's check, this reads the pending set before the sleep parks as well as
+/// after a wake: a signal sent while the thread was stopped short of filing
+/// its request, as when its timeslice ended in the syscall's prehook, is
+/// pending and was never recorded for its sleep. After a wake whose
+/// non-held signals are no longer pending, a `SIGCONT` having cancelled a stop
+/// or `sigaction(SIG_IGN)` having flushed it, a Linux sleep would still be
+/// asleep, so this returns `None`.
+///
+/// A state that cannot be read is handled as a wait's first read is
+/// (`read_wait_signal_state`, here `read_thread_wait_signal_state`, since
+/// Reverie can report the creator's pid for a process a raw `clone` made): a
+/// thread that no longer exists ends the call
+/// with `ERESTARTNOINTR`, which nothing observes, and otherwise the run ends
+/// with a diagnostic.
+pub(crate) async fn sleep_signal<G, T>(
+    guest: &mut G,
+    check: SleepCheck,
+    stops_end_it: bool,
+) -> Result<SleepSignal, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if !guest
+        .config()
+        .backend_supports_blocked_wait_signal_interruption
+    {
+        return Ok(match check {
+            SleepCheck::BeforePark => SleepSignal::None,
+            SleepCheck::AfterWake(_) => SleepSignal::Held,
+        });
+    }
+    let held = kernel_sigset_bit(libc::SIGCHLD) | host_timed_signals(guest).await;
+    let before_park = check == SleepCheck::BeforePark;
+    let (deciding, held_wake) = match check {
+        SleepCheck::BeforePark => (!held, false),
+        SleepCheck::AfterWake(None) => (0, true),
+        SleepCheck::AfterWake(Some(woken)) => {
+            let woken = woken
+                .iter()
+                .fold(0, |set, signal| set | kernel_sigset_bit(signal.raw()));
+            (woken & !held, woken & held != 0)
+        }
+    };
+    if deciding != 0 {
+        let state = read_thread_wait_signal_state(guest.pid(), guest.tid())?;
+        let mut ending = state.pending_interrupting(state.blocked, false) & deciding;
+        if !stops_end_it && before_park {
+            ending &= !(state.default_job_control_stops() | kernel_sigset_bit(libc::SIGSTOP));
+        }
+        if ending != 0 {
+            return Ok(SleepSignal::Pending);
+        }
+    }
+    Ok(if held_wake {
+        SleepSignal::Held
+    } else {
+        SleepSignal::None
+    })
 }
 
 #[cfg(test)]

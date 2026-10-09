@@ -20,6 +20,7 @@ mod replayer;
 pub mod runqueue;
 mod sigalrm;
 pub(crate) mod signal_control;
+mod sleep_signal;
 pub mod timed_waiters;
 
 use std::collections::BTreeMap;
@@ -935,6 +936,11 @@ pub struct Scheduler {
     /// place of reading `/proc`.
     #[cfg(test)]
     test_kernel_signal_states: BTreeMap<DetTid, KernelSignalState>,
+
+    /// Read failures that tests install for emulated sleepers, in place of
+    /// reading `/proc` (`sleep_signal`).
+    #[cfg(test)]
+    test_sleeper_read_failures: BTreeMap<DetTid, sleep_signal::SleeperStateUnreadable>,
 
     /// How many times `read_thread_blocked_mask` was asked for a thread's mask,
     /// so a test can show that a path which must not read `/proc` does not.
@@ -2418,6 +2424,8 @@ impl Scheduler {
             host_timed_signals_everywhere: startup_host_timed_signals(cfg),
             #[cfg(test)]
             test_kernel_signal_states: Default::default(),
+            #[cfg(test)]
+            test_sleeper_read_failures: Default::default(),
             #[cfg(test)]
             test_kernel_mask_reads: Default::default(),
             cleared_child_tids: Default::default(),
@@ -5204,10 +5212,12 @@ impl Scheduler {
     /// Record an unambiguous cross-task signal that was physically queued while
     /// its target was parked in waitid, restartable internal IO polling, or a
     /// precise-mode futex wait, or slept in a real `rt_sigsuspend` or waited
-    /// for its grant (`in_rt_sigsuspend`). The
+    /// for its grant (`in_rt_sigsuspend`), or in an emulated `pause` or
+    /// `nanosleep` (`sleep_signal`). The
     /// request rewrite is deferred to step2 so an asynchronous backend cannot
     /// mutate beneath a tentative selection. A futex waiter is admitted on its mask
-    /// alone; the drain, the commit point, decides on the dispositions.
+    /// alone, and a sleep on its request alone; the drain, the commit point,
+    /// decides on the rest.
     pub(crate) fn notify_signal_pending(&mut self, dettid: DetTid, signal: SigWrapper) {
         if self.waitid_signal_request(dettid).is_some()
             || self.restartable_internal_io_signals(dettid).is_some()
@@ -5215,6 +5225,7 @@ impl Scheduler {
                 .parked_futex_unblocked_signals(dettid)
                 .is_some_and(|signals| signals & kernel_signal_bit(signal.raw()) != 0)
             || self.in_rt_sigsuspend(dettid)
+            || self.admits_sleep_signal(dettid, signal)
         {
             let signals = self.pending_cross_task_signals.entry(dettid).or_default();
             if !signals.contains(&signal) {
@@ -7609,6 +7620,12 @@ impl Scheduler {
                     resources.insert(ResourceID::WaitidSignals(signals), Permission::W);
                     self.force_unblock_thread_at(dettid, resources, true);
                 }
+                None if let Some(sleep) = self.signal_sleep(dettid) => {
+                    // An emulated `pause` or `nanosleep`, parked in the timed
+                    // waiters or still queued with its request
+                    // (https://github.com/rrnewton/hermit/issues/3982).
+                    self.drain_sleep_signals(dettid, sleep, signals);
+                }
                 None => {
                     let Some(existing) = self.restartable_internal_io_signals(dettid) else {
                         continue;
@@ -8148,8 +8165,11 @@ impl Scheduler {
 mod test {
     use reverie::syscalls::Sysno;
 
+    use super::sleep_signal::SignalSleep;
     use super::*;
     use crate::DetTime;
+    use crate::resources::NANOSLEEP_FYI;
+    use crate::resources::PAUSE_FYI;
     use crate::tool_local::RobustListExit;
     use crate::tool_local::RobustListWake;
     use crate::tool_local::ThreadState;
@@ -15204,6 +15224,391 @@ mod test {
         // note_spawn is idempotent, so a re-registration does not shift indices.
         hb.note_spawn(root);
         assert_eq!(hb.anchors_at_syscall(child, 4), vec!["b".to_string()]);
+    }
+
+    /// A thread with an emulated sleep filed as its request, the way
+    /// `handle_pause` and `nanosleep` file one, parked in the timed waiters at
+    /// its deadline unless `queued`, which leaves it on the run queue with the
+    /// request not yet admitted.
+    fn filed_sleep(
+        scheduler: &mut Scheduler,
+        deadline: LogicalTime,
+        fyi: &str,
+        queued: bool,
+    ) -> DetTid {
+        let target = DetTid::from_raw(100);
+        register_known_thread(scheduler, target);
+        let mut request = Resources::new(target);
+        request.insert(ResourceID::SleepUntil(deadline), Permission::W);
+        request.fyi(fyi);
+        scheduler.next_turns.get_mut(&target).unwrap().req = Ivar::full(Ok(request));
+        if queued {
+            scheduler.runqueue_push_back(target);
+        } else {
+            scheduler.blocked.timed_waiters.insert(deadline, target);
+        }
+        target
+    }
+
+    /// A sleeper's kernel signal state: `caught` handled, `ignored` set to
+    /// `SIG_IGN`, the rest at their default action; `blocked` its mask and
+    /// `pending` its pending set.
+    fn sleeper_state(caught: u64, ignored: u64, blocked: u64, pending: u64) -> KernelSignalState {
+        KernelSignalState {
+            caught,
+            ignored,
+            blocked,
+            pending,
+            thread_pending: pending,
+            ..Default::default()
+        }
+    }
+
+    fn set_sleeper_state(scheduler: &mut Scheduler, target: DetTid, state: KernelSignalState) {
+        scheduler.test_kernel_signal_states.insert(target, state);
+    }
+
+    /// Records `signals` as sent to `target` in one sender turn, each made
+    /// pending as the kernel queues it, then installs `at_drain` (if any) as the
+    /// state the drain reads and drains.
+    fn send_cross_task(
+        scheduler: &mut Scheduler,
+        target: DetTid,
+        signals: &[i32],
+        at_drain: Option<KernelSignalState>,
+    ) {
+        for signal in signals {
+            if let Some(state) = scheduler.test_kernel_signal_states.get_mut(&target) {
+                state.pending |= kernel_signal_bit(*signal);
+                state.thread_pending |= kernel_signal_bit(*signal);
+            }
+            scheduler.notify_signal_pending(target, SigWrapper(*signal));
+        }
+        if let Some(state) = at_drain {
+            set_sleeper_state(scheduler, target, state);
+        }
+        scheduler.drain_pending_cross_task_signals();
+        assert!(scheduler.pending_cross_task_signals.is_empty());
+    }
+
+    fn assert_sleep_parked(
+        scheduler: &Scheduler,
+        target: DetTid,
+        deadline: LogicalTime,
+        case: &str,
+    ) {
+        assert_eq!(
+            scheduler.blocked.timed_waiters.iter().collect::<Vec<_>>(),
+            vec![(deadline, TimedEvent::ThreadEvt(target))],
+            "{case}"
+        );
+        assert!(!scheduler.run_queue.contains_tid(target), "{case}");
+        assert!(scheduler.signal_sleep(target).is_some(), "{case}");
+    }
+
+    fn assert_sleep_woken(scheduler: &Scheduler, target: DetTid, signals: &[i32], case: &str) {
+        assert!(scheduler.blocked.timed_waiters.is_empty(), "{case}");
+        assert_eq!(
+            scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
+            vec![target],
+            "{case}"
+        );
+        assert_eq!(
+            scheduler.inbound_signals(target),
+            signals
+                .iter()
+                .map(|signal| SigWrapper(*signal))
+                .collect::<Vec<_>>(),
+            "{case}"
+        );
+        assert_eq!(scheduler.signal_sleep(target), None, "{case}");
+    }
+
+    /// A cross-task signal that is caught, or whose default action terminates
+    /// the process, ends a `pause` parked in the timed waiters at
+    /// `INDEFINITE`: the request becomes the signal set and the thread is
+    /// queued, so its turn answers `Signaled`. Before the fix the signal was
+    /// never recorded and the pause slept forever
+    /// (https://github.com/rrnewton/hermit/issues/3982).
+    #[test]
+    fn a_caught_or_fatal_cross_task_signal_ends_a_parked_pause() {
+        for (signal, caught) in [(libc::SIGUSR1, true), (libc::SIGTERM, false)] {
+            let mut scheduler = gated_scheduler();
+            let target = filed_sleep(&mut scheduler, LogicalTime::INDEFINITE, PAUSE_FYI, false);
+            let case = format!("signal {signal}, caught={caught}");
+            assert_eq!(
+                scheduler.signal_sleep(target),
+                Some(SignalSleep::Pause),
+                "{case}"
+            );
+            let caught_set = if caught { kernel_signal_bit(signal) } else { 0 };
+            set_sleeper_state(&mut scheduler, target, sleeper_state(caught_set, 0, 0, 0));
+            send_cross_task(&mut scheduler, target, &[signal], None);
+            assert_sleep_woken(&scheduler, target, &[signal], &case);
+        }
+    }
+
+    /// A pause whose request is filed but still queued, not yet admitted to
+    /// the timed waiters, is ended in place: it stays queued exactly once with
+    /// the signal set as its request.
+    #[test]
+    fn a_cross_task_signal_ends_a_pause_still_on_the_run_queue() {
+        let mut scheduler = gated_scheduler();
+        let target = filed_sleep(&mut scheduler, LogicalTime::INDEFINITE, PAUSE_FYI, true);
+        set_sleeper_state(&mut scheduler, target, sleeper_state(0, 0, 0, 0));
+        send_cross_task(&mut scheduler, target, &[libc::SIGTERM], None);
+        assert_sleep_woken(&scheduler, target, &[libc::SIGTERM], "queued pause");
+    }
+
+    /// Signals a pause does not return for leave it parked: one its mask
+    /// blocks, one set to `SIG_IGN`, and `SIGWINCH` and `SIGCONT` with their
+    /// default action, which ignores them. In a batch with one that does end
+    /// it, only that one is delivered as the wake's signal set.
+    #[test]
+    fn a_blocked_or_ignored_cross_task_signal_leaves_a_pause_parked() {
+        let mut scheduler = gated_scheduler();
+        let target = filed_sleep(&mut scheduler, LogicalTime::INDEFINITE, PAUSE_FYI, false);
+        let state = sleeper_state(
+            kernel_signal_bit(libc::SIGUSR1),
+            kernel_signal_bit(libc::SIGUSR2),
+            kernel_signal_bit(libc::SIGHUP),
+            0,
+        );
+        set_sleeper_state(&mut scheduler, target, state);
+        let quiet = [libc::SIGHUP, libc::SIGUSR2, libc::SIGWINCH, libc::SIGCONT];
+        send_cross_task(&mut scheduler, target, &quiet, None);
+        assert_sleep_parked(&scheduler, target, LogicalTime::INDEFINITE, "quiet signals");
+
+        let mut batch = quiet.to_vec();
+        batch.push(libc::SIGUSR1);
+        send_cross_task(&mut scheduler, target, &batch, None);
+        assert_sleep_woken(&scheduler, target, &[libc::SIGUSR1], "batch with SIGUSR1");
+    }
+
+    /// A signal recorded in the sender's turn but no longer pending at the
+    /// drain does not end the sleep: a caught `SIGTSTP` that the same turn's
+    /// `SIGCONT` cancelled, or a `SIGUSR1` flushed when its disposition became
+    /// `SIG_IGN` and then a handler again. Linux would leave the sleep asleep.
+    #[test]
+    fn a_cross_task_signal_withdrawn_before_the_drain_leaves_the_sleep_parked() {
+        let deadline = LogicalTime::from_nanos(5_000_000_000);
+        for (fyi, deadline) in [
+            (PAUSE_FYI, LogicalTime::INDEFINITE),
+            (NANOSLEEP_FYI, deadline),
+        ] {
+            let caught = kernel_signal_bit(libc::SIGTSTP) | kernel_signal_bit(libc::SIGUSR1);
+            let mut scheduler = gated_scheduler();
+            let target = filed_sleep(&mut scheduler, deadline, fyi, false);
+            set_sleeper_state(&mut scheduler, target, sleeper_state(caught, 0, 0, 0));
+            send_cross_task(
+                &mut scheduler,
+                target,
+                &[libc::SIGTSTP, libc::SIGUSR1, libc::SIGCONT],
+                Some(sleeper_state(caught, 0, 0, 0)),
+            );
+            assert_sleep_parked(&scheduler, target, deadline, fyi);
+        }
+    }
+
+    /// A signal that is unblocked and ignored when it is sent is discarded by
+    /// Linux at generation, so a handler installed later in the sender's turn
+    /// does not make it end the sleep, although ptrace left it pending.
+    #[test]
+    fn a_signal_ignored_when_sent_never_ends_the_sleep() {
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        let mut scheduler = gated_scheduler();
+        let target = filed_sleep(&mut scheduler, LogicalTime::INDEFINITE, PAUSE_FYI, false);
+        set_sleeper_state(&mut scheduler, target, sleeper_state(0, usr1, 0, 0));
+        send_cross_task(
+            &mut scheduler,
+            target,
+            &[libc::SIGUSR1],
+            Some(sleeper_state(usr1, 0, 0, usr1)),
+        );
+        assert_sleep_parked(
+            &scheduler,
+            target,
+            LogicalTime::INDEFINITE,
+            "ignored when sent",
+        );
+
+        // Blocked when sent, it is kept pending and does end the sleep once it
+        // is caught and unblocked, as Linux delivers it.
+        let mut scheduler = gated_scheduler();
+        let target = filed_sleep(&mut scheduler, LogicalTime::INDEFINITE, PAUSE_FYI, false);
+        set_sleeper_state(&mut scheduler, target, sleeper_state(0, usr1, usr1, 0));
+        send_cross_task(
+            &mut scheduler,
+            target,
+            &[libc::SIGUSR1],
+            Some(sleeper_state(usr1, 0, 0, usr1)),
+        );
+        assert_sleep_woken(&scheduler, target, &[libc::SIGUSR1], "blocked when sent");
+    }
+
+    /// The signals a gated wait holds are never recorded for a sleep, although
+    /// caught and pending: `SIGCHLD`, and a signal a host-timed source armed by
+    /// the guest can post to its process, as for a parked futex waiter. The
+    /// kernel can post either at a host-chosen moment, so neither the pending
+    /// bit nor the recorded send could tell whether a later guest call, a
+    /// `sigaction(SIG_IGN)` or a `SIGCONT`, took the guest's copy back.
+    #[test]
+    fn a_held_signal_never_ends_the_sleep() {
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        let usr2 = kernel_signal_bit(libc::SIGUSR2);
+        let mut scheduler = gated_scheduler();
+        let target = filed_sleep(&mut scheduler, LogicalTime::INDEFINITE, PAUSE_FYI, false);
+        scheduler.record_host_timed_signals(target, HostTimedSignalScope::Caller, usr2);
+        set_sleeper_state(&mut scheduler, target, sleeper_state(chld | usr2, 0, 0, 0));
+        for signal in [libc::SIGCHLD, libc::SIGUSR2] {
+            scheduler.notify_signal_pending(target, SigWrapper(signal));
+            assert!(scheduler.pending_cross_task_signals.is_empty(), "{signal}");
+        }
+        send_cross_task(
+            &mut scheduler,
+            target,
+            &[libc::SIGCHLD, libc::SIGUSR2],
+            None,
+        );
+        assert_sleep_parked(&scheduler, target, LogicalTime::INDEFINITE, "held signals");
+    }
+
+    /// A state the drain cannot read never invents an interruption: a thread
+    /// that is gone is left to its retirement, and a live one ends the run with
+    /// a diagnostic.
+    #[test]
+    fn an_unreadable_sleeper_state_never_wakes_the_sleep() {
+        for failure in [
+            sleep_signal::SleeperStateUnreadable::Gone,
+            sleep_signal::SleeperStateUnreadable::Unreadable(reverie::Errno::EMFILE),
+        ] {
+            let mut scheduler = gated_scheduler();
+            let target = filed_sleep(&mut scheduler, LogicalTime::INDEFINITE, PAUSE_FYI, false);
+            scheduler.test_sleeper_read_failures.insert(target, failure);
+            send_cross_task(&mut scheduler, target, &[libc::SIGTERM], None);
+            let case = format!("{failure:?}");
+            assert_sleep_parked(&scheduler, target, LogicalTime::INDEFINITE, &case);
+            assert_eq!(
+                scheduler.terminal_deadlock.is_some(),
+                failure != sleep_signal::SleeperStateUnreadable::Gone,
+                "{case}"
+            );
+        }
+    }
+
+    /// A default stop ends a pause, which Linux then restarts once the process
+    /// continues (`Detcore::handle_pause` returns `ERESTARTNOHAND`), but never a
+    /// `nanosleep`, whose restart would have to keep its deadline: the stop
+    /// takes effect when the sleep ends. A caught or fatal signal ends both.
+    #[test]
+    fn a_default_stop_ends_a_pause_but_not_a_nanosleep() {
+        let deadline = LogicalTime::from_nanos(5_000_000_000);
+        for signal in [libc::SIGTSTP, libc::SIGSTOP] {
+            let mut scheduler = gated_scheduler();
+            let target = filed_sleep(&mut scheduler, LogicalTime::INDEFINITE, PAUSE_FYI, false);
+            set_sleeper_state(&mut scheduler, target, sleeper_state(0, 0, 0, 0));
+            send_cross_task(&mut scheduler, target, &[signal], None);
+            assert_sleep_woken(
+                &scheduler,
+                target,
+                &[signal],
+                &format!("pause, signal {signal}"),
+            );
+
+            let mut scheduler = gated_scheduler();
+            let target = filed_sleep(&mut scheduler, deadline, NANOSLEEP_FYI, false);
+            assert_eq!(
+                scheduler.signal_sleep(target),
+                Some(SignalSleep::Nanosleep { deadline })
+            );
+            set_sleeper_state(&mut scheduler, target, sleeper_state(0, 0, 0, 0));
+            send_cross_task(&mut scheduler, target, &[signal], None);
+            assert_sleep_parked(
+                &scheduler,
+                target,
+                deadline,
+                &format!("nanosleep, signal {signal}"),
+            );
+        }
+        for (signal, caught) in [(libc::SIGUSR1, true), (libc::SIGTERM, false)] {
+            let mut scheduler = gated_scheduler();
+            let target = filed_sleep(&mut scheduler, deadline, NANOSLEEP_FYI, false);
+            let caught_set = if caught { kernel_signal_bit(signal) } else { 0 };
+            set_sleeper_state(&mut scheduler, target, sleeper_state(caught_set, 0, 0, 0));
+            send_cross_task(&mut scheduler, target, &[signal], None);
+            assert_sleep_woken(
+                &scheduler,
+                target,
+                &[signal],
+                &format!("nanosleep, signal {signal}"),
+            );
+        }
+    }
+
+    /// A signal drained once a `nanosleep`'s deadline has passed leaves the
+    /// sleep to complete normally at its timed pop, as Linux completes a sleep
+    /// whose timer has fired; the signal is delivered as the call returns.
+    #[test]
+    fn a_cross_task_signal_after_a_nanosleep_deadline_leaves_it_to_complete() {
+        let deadline = LogicalTime::from_nanos(5_000_000_000);
+        for committed in [deadline, deadline + LogicalTime::from_nanos(1)] {
+            let mut scheduler = gated_scheduler();
+            let target = filed_sleep(&mut scheduler, deadline, NANOSLEEP_FYI, false);
+            scheduler.committed_time = committed;
+            let usr1 = kernel_signal_bit(libc::SIGUSR1);
+            set_sleeper_state(&mut scheduler, target, sleeper_state(usr1, 0, 0, 0));
+            send_cross_task(&mut scheduler, target, &[libc::SIGUSR1], None);
+            assert_sleep_parked(
+                &scheduler,
+                target,
+                deadline,
+                &format!("committed {committed}"),
+            );
+        }
+    }
+
+    /// What is not recorded at all: a `SIGKILL`, which the kernel acts on for
+    /// a traced thread without the thread running, as before; a sleep request
+    /// that is neither a tagged `pause` nor a tagged `nanosleep`; and any sleep
+    /// on a backend that does not report the guest's signal state, which keeps
+    /// its previous behavior.
+    #[test]
+    fn sleeps_that_cross_task_signals_do_not_reach() {
+        let mut scheduler = gated_scheduler();
+        let target = filed_sleep(&mut scheduler, LogicalTime::INDEFINITE, PAUSE_FYI, false);
+        scheduler.notify_signal_pending(target, SigWrapper(libc::SIGKILL));
+        assert!(scheduler.pending_cross_task_signals.is_empty(), "SIGKILL");
+
+        let deadline = LogicalTime::from_nanos(5_000_000_000);
+        for (deadline, fyi) in [
+            (deadline, ""),
+            (deadline, PAUSE_FYI),
+            (LogicalTime::INDEFINITE, ""),
+        ] {
+            let mut scheduler = gated_scheduler();
+            let target = filed_sleep(&mut scheduler, deadline, fyi, false);
+            assert_eq!(scheduler.signal_sleep(target), None, "{deadline} {fyi:?}");
+            scheduler.notify_signal_pending(target, SigWrapper(libc::SIGTERM));
+            assert!(
+                scheduler.pending_cross_task_signals.is_empty(),
+                "{deadline} {fyi:?}"
+            );
+        }
+
+        for (deadline, fyi) in [
+            (LogicalTime::INDEFINITE, PAUSE_FYI),
+            (deadline, NANOSLEEP_FYI),
+        ] {
+            let mut scheduler = Scheduler::new(&Config {
+                sequentialize_threads: true,
+                ..Config::default()
+            });
+            assert!(!scheduler.models_signal_targets);
+            let target = filed_sleep(&mut scheduler, deadline, fyi, false);
+            assert_eq!(scheduler.signal_sleep(target), None, "{fyi}");
+            scheduler.notify_signal_pending(target, SigWrapper(libc::SIGTERM));
+            assert!(scheduler.pending_cross_task_signals.is_empty(), "{fyi}");
+        }
     }
 
     #[test]

@@ -1034,6 +1034,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/pause_cross_task_signal.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
+      "why": "tests/c/pause_cross_task_signal.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and runs in blocking GitHub CI; it asserts that a signal one guest process sends another parked in pause(2) or nanosleep(2) is delivered as on Linux: a default-fatal signal kills it, a caught one ends the call with EINTR, blocked and ignored signals leave it asleep, and a stop and continue restart pause"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/perf_event_hardware_enosys.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/perf_event_hardware_enosys.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"

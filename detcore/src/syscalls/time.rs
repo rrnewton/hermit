@@ -26,6 +26,8 @@ use tracing::error;
 use tracing::info;
 use tracing::trace;
 
+use super::signal::SleepCheck;
+use super::signal::SleepSignal;
 use crate::detlog;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
@@ -700,46 +702,69 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Return 0 or EINTR respectively.
     async fn wait_and_return<R: Guest<Self>>(
         guest: &mut R,
-        request: Resources,
+        mut request: Resources,
         call: NanosleepFamily,
     ) -> Result<i64, Error> {
         let target_time = time_from_resources(&request).expect("a sleepuntil resource request");
-        match crate::tool_global::parked_wait_request(
-            guest,
-            request,
-            crate::scheduler::parked::ParkedWaitPolicy::NanosleepNoHandlerRestart {
-                absolute_deadline: target_time,
-            },
-        )
-        .await
-        {
-            ResumeStatus::Normal => Ok(0),
-            ResumeStatus::Signaled(_) => {
-                let now = thread_observe_time(guest).await;
-                let delta = remaining_sleep_duration(target_time, now);
-                // Linux never touches remain for TIMER_ABSTIME, even when
-                // a caught signal interrupts the absolute sleep.
-                let addr2 = if call.flags() & libc::TIMER_ABSTIME == 0 {
-                    call.rem()
-                } else {
-                    None
-                };
-                if let Some(addr2) = addr2 {
-                    info!(
-                        "[interrupted] sleep till (until {}), woke up {:?} early, writing into nanosleep rem argument.",
-                        target_time, delta
-                    );
-                    let t = Timespec {
-                        tv_sec: delta.as_secs() as i64,
-                        tv_nsec: delta.subsec_nanos() as i64,
-                    };
-                    guest.memory().write_value(addr2, &t)?;
-                } else {
-                    info!("[interrupted] nanosleep rem argument is null, not writing it.")
+        // Lets the scheduler end the sleep for a cross-task signal that
+        // interrupts it (`scheduler::sleep_signal`).
+        request.fyi(crate::resources::NANOSLEEP_FYI);
+        loop {
+            // A signal already pending ends the sleep before it parks, and one
+            // still pending after a wake ends it; a wake whose signal was taken
+            // back parks it again with its original absolute deadline
+            // (`super::signal::sleep_signal`).
+            if super::signal::sleep_signal(guest, SleepCheck::BeforePark, false).await?
+                == SleepSignal::Pending
+            {
+                break;
+            }
+            match crate::tool_global::parked_wait_request(
+                guest,
+                request.clone(),
+                crate::scheduler::parked::ParkedWaitPolicy::NanosleepNoHandlerRestart {
+                    absolute_deadline: target_time,
+                },
+            )
+            .await
+            {
+                ResumeStatus::Normal => return Ok(0),
+                ResumeStatus::Signaled(signals) => {
+                    match super::signal::sleep_signal(guest, SleepCheck::AfterWake(signals), false)
+                        .await?
+                    {
+                        SleepSignal::Pending | SleepSignal::Held => break,
+                        SleepSignal::None => trace!(
+                            "nanosleep woken for a signal no longer pending for it; sleeping again until {}",
+                            target_time
+                        ),
+                    }
                 }
-                Err(reverie::Error::Errno(Errno::EINTR))
             }
         }
+        let now = thread_observe_time(guest).await;
+        let delta = remaining_sleep_duration(target_time, now);
+        // Linux never touches remain for TIMER_ABSTIME, even when
+        // a caught signal interrupts the absolute sleep.
+        let addr2 = if call.flags() & libc::TIMER_ABSTIME == 0 {
+            call.rem()
+        } else {
+            None
+        };
+        if let Some(addr2) = addr2 {
+            info!(
+                "[interrupted] sleep till (until {}), woke up {:?} early, writing into nanosleep rem argument.",
+                target_time, delta
+            );
+            let t = Timespec {
+                tv_sec: delta.as_secs() as i64,
+                tv_nsec: delta.subsec_nanos() as i64,
+            };
+            guest.memory().write_value(addr2, &t)?;
+        } else {
+            info!("[interrupted] nanosleep rem argument is null, not writing it.")
+        }
+        Err(reverie::Error::Errno(Errno::EINTR))
     }
 
     /// clock_nanosleep and nanosleep

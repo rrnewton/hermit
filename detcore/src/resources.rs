@@ -44,9 +44,15 @@ pub(crate) const HOST_TIMED_INTERNAL_PIPE_IO_FYI: &str = "sabre-internal-pipe-io
 pub(crate) const LOOPBACK_POLL_YIELD_FYI: &str = "sabre-loopback-poll-zero-timeout";
 
 /// Identifies an emulated `pause` request (`SleepUntil(INDEFINITE)`), which a SIGALRM
-/// ledger entry ends (`scheduler::sigalrm`). A `nanosleep` whose deadline saturates files
-/// the same resource, and is not a pause.
+/// ledger entry ends (`scheduler::sigalrm`), as does a cross-task signal that interrupts it
+/// (`scheduler::sleep_signal`). A `nanosleep` whose deadline saturates files the same
+/// resource, and is not a pause.
 pub(crate) const PAUSE_FYI: &str = "pause";
+
+/// Identifies an emulated `nanosleep` or `clock_nanosleep` request (`SleepUntil(deadline)`),
+/// which a cross-task signal that interrupts it ends before its deadline
+/// (`scheduler::sleep_signal`).
+pub(crate) const NANOSLEEP_FYI: &str = "nanosleep";
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1151)

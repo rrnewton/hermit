@@ -35,10 +35,11 @@ mod threads;
 /// interrupted wait with the deadline it kept.
 pub(crate) use threads::FutexDeadline;
 /// The kernel's view of a guest thread's signals, which the scheduler reads when
-/// it commits a wake for a parked precise-mode futex waiter.
-#[cfg(test)]
+/// it commits a wake for a parked precise-mode futex waiter or an emulated sleep.
 pub(crate) use threads::KernelSignalState;
 pub(crate) use threads::read_kernel_signal_state;
+pub(crate) use threads::read_thread_signal_state;
+pub(crate) use threads::thread_is_gone;
 pub(crate) mod time;
 
 use crate::consts::DET_SPECIAL_INODE_OFFSET;

@@ -8,59 +8,59 @@
   "population_rule": "Every manifest test whose ptrace verify cell full validation selects (Population::Required), crossed with every candidate backend (dbt, in-guest-trap, kvm, liteinst, sabre). A candidate whose verify cell is disabled, enabled but not selected, red, refused or missing is in the population and scores 0. A cell whose ptrace reference left no usable golden log is outside it and is counted apart.",
   "counts": {
     "all": {
-      "cells": 3940,
+      "cells": 3945,
       "applicable": 1705,
       "selectable": 1401,
-      "population": 2765,
+      "population": 2770,
       "population_candidate_selected": 1401,
       "population_candidate_not_selected": 260,
-      "population_candidate_disabled": 1104
+      "population_candidate_disabled": 1109
     },
     "by_backend": {
       "dbt": {
-        "cells": 788,
+        "cells": 789,
         "applicable": 252,
         "selectable": 205,
-        "population": 553,
+        "population": 554,
         "population_candidate_selected": 205,
         "population_candidate_not_selected": 46,
-        "population_candidate_disabled": 302
+        "population_candidate_disabled": 303
       },
       "in-guest-trap": {
-        "cells": 788,
+        "cells": 789,
         "applicable": 320,
         "selectable": 314,
-        "population": 553,
+        "population": 554,
         "population_candidate_selected": 314,
-        "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 239
-      },
-      "kvm": {
-        "cells": 788,
-        "applicable": 335,
-        "selectable": 329,
-        "population": 553,
-        "population_candidate_selected": 329,
-        "population_candidate_not_selected": 5,
-        "population_candidate_disabled": 219
-      },
-      "liteinst": {
-        "cells": 788,
-        "applicable": 319,
-        "selectable": 313,
-        "population": 553,
-        "population_candidate_selected": 313,
         "population_candidate_not_selected": 0,
         "population_candidate_disabled": 240
       },
+      "kvm": {
+        "cells": 789,
+        "applicable": 335,
+        "selectable": 329,
+        "population": 554,
+        "population_candidate_selected": 329,
+        "population_candidate_not_selected": 5,
+        "population_candidate_disabled": 220
+      },
+      "liteinst": {
+        "cells": 789,
+        "applicable": 319,
+        "selectable": 313,
+        "population": 554,
+        "population_candidate_selected": 313,
+        "population_candidate_not_selected": 0,
+        "population_candidate_disabled": 241
+      },
       "sabre": {
-        "cells": 788,
+        "cells": 789,
         "applicable": 479,
         "selectable": 240,
-        "population": 553,
+        "population": 554,
         "population_candidate_selected": 240,
         "population_candidate_not_selected": 209,
-        "population_candidate_disabled": 104
+        "population_candidate_disabled": 105
       }
     }
   },
@@ -750,6 +750,11 @@
     {"test_id":"c-programs/pause-alarm-interrupt","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/pause-alarm-interrupt","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)"},
     {"test_id":"c-programs/pause-alarm-interrupt","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/pause-cross-task-signal","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Config::backend_supports_blocked_wait_signal_interruption is false on DBT, so the scheduler does not model signal targets and a cross-task signal to a thread parked in an emulated pause or nanosleep is not recorded for the step2 drain (https://github.com/rrnewton/hermit/issues/3982); qualify DBT separately"},
+    {"test_id":"c-programs/pause-cross-task-signal","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
+    {"test_id":"c-programs/pause-cross-task-signal","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: Config::backend_supports_blocked_wait_signal_interruption is false on KVM, so the scheduler does not model signal targets and a cross-task signal to a thread parked in an emulated pause or nanosleep is not recorded for the step2 drain (https://github.com/rrnewton/hermit/issues/3982); qualify KVM separately"},
+    {"test_id":"c-programs/pause-cross-task-signal","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)"},
+    {"test_id":"c-programs/pause-cross-task-signal","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Config::backend_supports_blocked_wait_signal_interruption is false on SaBRe, so the scheduler does not model signal targets and a cross-task signal to a thread parked in an emulated pause or nanosleep is not recorded for the step2 drain (https://github.com/rrnewton/hermit/issues/3982); qualify SaBRe separately"},
     {"test_id":"c-programs/perf-event-hardware-enosys","backend":"dbt","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: dbt verify is not selected by full validation: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence."},
     {"test_id":"c-programs/perf-event-hardware-enosys","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/perf-event-hardware-enosys","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

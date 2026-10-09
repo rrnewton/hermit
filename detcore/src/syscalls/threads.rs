@@ -816,13 +816,20 @@ impl KernelSignalState {
     /// `SIGCHLD`, `SIGCONT`, `SIGURG`, and `SIGWINCH` do not, and neither does the
     /// backend's own preemption signal.
     pub(crate) fn interrupting(&self, mask: KernelSigset) -> KernelSigset {
-        let default_ignored = [libc::SIGCHLD, libc::SIGCONT, libc::SIGURG, libc::SIGWINCH]
-            .into_iter()
-            .fold(0, |set, signal| set | kernel_sigset_bit(signal));
         let default_action = !(self.ignored | self.caught);
-        (self.caught | (default_action & !default_ignored))
+        (self.caught | (default_action & !default_ignored_signals()))
             & !mask
             & !kernel_sigset_bit(reverie::PERF_EVENT_SIGNAL as i32)
+    }
+
+    /// Signals Linux discards when they are generated while unblocked: those
+    /// set to `SIG_IGN`, and the default-ignored `SIGCHLD`, `SIGCONT`, `SIGURG`
+    /// and `SIGWINCH` while they have no handler (`sig_task_ignored`). A blocked
+    /// signal is never discarded, since its disposition may change before it is
+    /// unblocked. Under ptrace the kernel queues even these for the tracer, so
+    /// the pending set alone does not show the discard.
+    pub(crate) fn discarded_at_generation(&self) -> KernelSigset {
+        (self.ignored | (default_ignored_signals() & !self.caught)) & !self.blocked
     }
 
     /// The job-control stop signals `SIGTSTP`, `SIGTTIN`, and `SIGTTOU` whose
@@ -914,6 +921,13 @@ impl KernelSignalState {
     }
 }
 
+/// The signals whose default action ignores them.
+fn default_ignored_signals() -> KernelSigset {
+    [libc::SIGCHLD, libc::SIGCONT, libc::SIGURG, libc::SIGWINCH]
+        .into_iter()
+        .fold(0, |set, signal| set | kernel_sigset_bit(signal))
+}
+
 /// The signals an instruction raises, which the kernel dequeues before any other
 /// signal on the same queue (`SYNCHRONOUS_MASK` in `kernel/signal.c`).
 const SYNCHRONOUS_SIGNALS: [i32; 6] = [
@@ -996,10 +1010,54 @@ impl std::fmt::Display for BlockedWaitSignalError {
 impl std::error::Error for BlockedWaitSignalError {}
 
 /// Whether thread `tid` of process `pid` no longer exists.
-fn guest_thread_is_gone(pid: Pid, tid: Pid) -> bool {
+pub(crate) fn guest_thread_is_gone(pid: Pid, tid: Pid) -> bool {
     // SAFETY: signal 0 only checks that the thread exists and may be signalled.
     let result = unsafe { libc::syscall(libc::SYS_tgkill, pid.as_raw(), tid.as_raw(), 0) };
     result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Read `tid`'s signal state when `pid` may not be its thread group.
+///
+/// Reverie can report the creating process's pid for a process that a raw
+/// `clone` without `CLONE_THREAD` created, so `/proc/<pid>/task/<tid>` does not
+/// exist although the thread does. `/proc/<tid>/task/<tid>` names any live
+/// thread, its own thread group's leader or not, so it is read before the
+/// thread is taken to be gone (https://github.com/rrnewton/hermit/issues/3982).
+pub(crate) fn read_thread_signal_state(pid: Pid, tid: Pid) -> Result<KernelSignalState, Errno> {
+    read_kernel_signal_state(pid, tid).or_else(|error| {
+        if pid == tid {
+            Err(error)
+        } else {
+            read_kernel_signal_state(tid, tid)
+        }
+    })
+}
+
+/// Whether thread `tid` no longer exists, when `pid` may not be its thread
+/// group ([`read_thread_signal_state`]). `tkill` names the thread without a
+/// thread group, so a live thread under a wrong `pid` is not taken to be gone.
+pub(crate) fn thread_is_gone(pid: Pid, tid: Pid) -> bool {
+    if !guest_thread_is_gone(pid, tid) {
+        return false;
+    }
+    // SAFETY: signal 0 only checks that the thread exists and may be signalled.
+    let result = unsafe { libc::syscall(libc::SYS_tkill, tid.as_raw(), 0) };
+    result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// [`read_wait_signal_state`] for a thread whose reported `pid` may not be its
+/// thread group ([`read_thread_signal_state`]).
+pub(crate) fn read_thread_wait_signal_state(
+    pid: Pid,
+    tid: Pid,
+) -> Result<KernelSignalState, Error> {
+    match read_thread_signal_state(pid, tid) {
+        Ok(state) => Ok(state),
+        Err(_) if thread_is_gone(pid, tid) => Err(Errno::ERESTARTNOINTR.into()),
+        Err(errno) => Err(Error::Tool(anyhow::Error::new(
+            BlockedWaitSignalError::StateUnreadable { pid, tid, errno },
+        ))),
+    }
 }
 
 /// Read the signal state of `tid`, which is stopped inside a blocked wait.
@@ -3281,6 +3339,22 @@ mod tests {
     use reverie::Tool;
 
     use super::*;
+
+    /// A thread whose reported pid is not its thread group, as Reverie
+    /// reports for a process that a raw `clone` without `CLONE_THREAD` made,
+    /// still has a readable signal state and is not taken to be gone
+    /// (https://github.com/rrnewton/hermit/issues/3982). The test's own thread
+    /// stands in for it, with this process's parent as the wrong pid.
+    #[test]
+    fn a_thread_reported_under_another_pid_is_read_and_alive() {
+        let tid = Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) } as i32);
+        let wrong = Pid::from_raw(unsafe { libc::getppid() });
+        assert_ne!(wrong, tid);
+        assert!(read_kernel_signal_state(wrong, tid).is_err());
+        assert!(read_thread_signal_state(wrong, tid).is_ok());
+        assert!(!thread_is_gone(wrong, tid));
+        assert!(read_thread_wait_signal_state(wrong, tid).is_ok());
+    }
     use crate::config::Config;
     use crate::tool_global::GlobalRequest;
     use crate::tool_global::GlobalState;
