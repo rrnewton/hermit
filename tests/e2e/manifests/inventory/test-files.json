@@ -1406,6 +1406,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_forked_stdout_pipe.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_forked_stdout_pipe.c is owned by hermit-cli/tests/record_replay.rs: The dedicated integration suite compiles this workload and checks that a child forked after its parent redirected stdout into a pipe records its writes as pipe traffic, not as captured container output, so replay does not refill a pipe whose reader it serves from the recording."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/record_replay_forked_streams.c",
       "runner": "hermit-cli/tests/record_replay.rs",
       "why": "tests/c/record_replay_forked_streams.c is owned by hermit-cli/tests/record_replay.rs: The dedicated integration suite compiles this process-tree workload and checks stable recording streams across forked children using caller-owned setup and assertions."

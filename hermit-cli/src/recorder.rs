@@ -78,6 +78,37 @@ pub struct RecorderThreadState {
     child_stream_ids: ChildEventStreamIds,
     pending_exec: Option<PreparedExec>,
     bootstrapped: bool,
+    /// The physical output endpoints the root guest inherited, which every
+    /// thread inherits from the thread that created it (`ContainerOutputs`).
+    outputs: ContainerOutputs,
+}
+
+/// The identities of the stdout and stderr the root guest inherited: the only
+/// endpoints whose writes are captured as output, which replay emits again
+/// because a reader outside the container consumes them. Every process's
+/// `Recorder::new` sees only that process's descriptors 1 and 2 at its
+/// creation, which in a child forked after its parent redirected its own
+/// stdout are a pipe inside the container (flex forks each filter so). A write
+/// into such a pipe was captured as output, and replay wrote it into the live
+/// pipe, whose reader replay serves from the recording: once the pipe was full,
+/// the writer waited forever (https://github.com/rrnewton/hermit/issues/3964).
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+struct ContainerOutputs {
+    stdout: Option<OutputIdentity>,
+    stderr: Option<OutputIdentity>,
+}
+
+impl ContainerOutputs {
+    /// Whether `metadata` names the root guest's stdout, and whether it names
+    /// its stderr.
+    fn matching(&self, metadata: &std::fs::Metadata) -> (bool, bool) {
+        (
+            self.stdout
+                .is_some_and(|identity| identity.matches(metadata)),
+            self.stderr
+                .is_some_and(|identity| identity.matches(metadata)),
+        )
+    }
 }
 
 impl RecorderThreadState {
@@ -318,7 +349,9 @@ pub struct Recorder {
     // Keep track of the data directory. Each thread uses this path to open its
     // event stream.
     data: PathBuf,
-    /// Physical output endpoints inherited by the root guest.
+    /// This process's descriptors 1 and 2 when it was created. Only the root
+    /// guest's are the container's output endpoints, so only the root thread
+    /// takes them (`RecorderThreadState::outputs`).
     stdout: Option<OutputIdentity>,
     stderr: Option<OutputIdentity>,
     /// Stable regular-file OFDs used for offset aliasing checks.
@@ -376,6 +409,13 @@ impl Tool for Recorder {
             child_stream_ids: ChildEventStreamIds::default(),
             pending_exec: None,
             bootstrapped: parent.is_some_and(|(_, state)| state.bootstrapped),
+            outputs: match parent {
+                None => ContainerOutputs {
+                    stdout: self.stdout,
+                    stderr: self.stderr,
+                },
+                Some((_, state)) => state.outputs,
+            },
         }
     }
 

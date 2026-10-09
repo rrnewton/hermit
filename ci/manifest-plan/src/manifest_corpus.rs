@@ -1384,7 +1384,7 @@ mod tests {
     /// three-run survey on 2026-10-09, 76 of the 77 rows the rr lane never
     /// listed as passing. Each is the replay cell of its row's own test,
     /// carrying the rr run type alone and none of the verify cell's settings.
-    /// 212 are selected, and the 3 the survey saw fail stay enabled with
+    /// 213 are selected, and the 2 the survey saw fail stay enabled with
     /// `ci: false` and the issue of their failure (`UNSELECTED_REPLAY`).
     /// A row moved into or out of the run type, a second test for a program,
     /// the rr run type reaching a verify cell, or a cell quietly unselected or
@@ -1432,18 +1432,16 @@ mod tests {
                 }
             }
         }
-        assert_eq!((gated, refused), (212, UNSELECTED_REPLAY.len()));
+        assert_eq!((gated, refused), (213, UNSELECTED_REPLAY.len()));
     }
 
     /// The replay cells the 2026-10-09 survey saw fail, each with its issue.
-    const UNSELECTED_REPLAY: [(&str, &str); 3] = [
+    /// compat/flex, a third, is selected since its replay stall was fixed
+    /// (https://github.com/rrnewton/hermit/issues/3964).
+    const UNSELECTED_REPLAY: [(&str, &str); 2] = [
         (
             "compat/timeout",
             "https://github.com/rrnewton/hermit/issues/3963",
-        ),
-        (
-            "compat/flex",
-            "https://github.com/rrnewton/hermit/issues/3964",
         ),
         (
             "compat/lsof",

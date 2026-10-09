@@ -555,13 +555,9 @@ impl Recorder {
             syscall.fd()
         ))
         .ok();
+        let outputs = guest.thread_state().outputs;
         let (output_fd, shares_output_ofd) = metadata.as_ref().map_or((None, false), |metadata| {
-            let stdout_matches = self
-                .stdout
-                .is_some_and(|identity| identity.matches(metadata));
-            let stderr_matches = self
-                .stderr
-                .is_some_and(|identity| identity.matches(metadata));
+            let (stdout_matches, stderr_matches) = outputs.matching(metadata);
             let candidate = (metadata.file_type().is_file() && (stdout_matches || stderr_matches))
                 .then(|| crate::fd::duplicate_guest_fd(guest.pid(), syscall.fd()).ok())
                 .flatten();
@@ -639,22 +635,15 @@ impl Recorder {
             syscall.fd()
         ))
         .ok();
+        let outputs = guest.thread_state().outputs;
         let output_fd = if result.is_ok() {
-            metadata.as_ref().and_then(|metadata| {
-                if self
-                    .stdout
-                    .is_some_and(|identity| identity.matches(metadata))
-                {
-                    Some(libc::STDOUT_FILENO)
-                } else if self
-                    .stderr
-                    .is_some_and(|identity| identity.matches(metadata))
-                {
-                    Some(libc::STDERR_FILENO)
-                } else {
-                    None
-                }
-            })
+            metadata
+                .as_ref()
+                .and_then(|metadata| match outputs.matching(metadata) {
+                    (true, _) => Some(libc::STDOUT_FILENO),
+                    (false, true) => Some(libc::STDERR_FILENO),
+                    (false, false) => None,
+                })
         } else {
             None
         };

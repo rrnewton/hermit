@@ -2555,6 +2555,22 @@ fn record_poll_and_ppoll_ready_pipe() {
     record_select_mode("poll");
 }
 
+/// A child forked after its parent redirected its own stdout into a pipe, as
+/// flex does for each stage of its filter chain, writes 128 KiB into that pipe.
+/// The recorder took each process's descriptor 1 at its creation as captured
+/// output, so replay wrote the child's bytes into the live pipe while serving
+/// the parent's reads from the recording, and the child waited forever once the
+/// pipe was full (https://github.com/rrnewton/hermit/issues/3964).
+#[test]
+fn record_forked_child_writes_into_a_redirected_stdout_pipe() {
+    let _guard = hermit_record_lock();
+    canonical_record_replay_command(
+        "forked stdout pipe",
+        &workload("c_record_replay_forked_stdout_pipe").path,
+        &[],
+    );
+}
+
 #[test]
 fn record_select_null_timeout_woken_by_thread() {
     record_select_mode("thread-wake");
