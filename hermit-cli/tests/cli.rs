@@ -116,6 +116,7 @@ static HB_SOURCE_THEN_FUTEX_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_SIGNAL_WHILE_HELD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_SPAWN_DUP2_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_TIMEOUT_VS_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static VFORK_PARENT_KILLED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_LSEEK_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_INODE_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REPLAY_EPOCH_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -680,6 +681,32 @@ fn poll_timeout_vs_spinner_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "poll-timeout-vs-spinner guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn vfork_parent_killed_guest() -> &'static Path {
+    VFORK_PARENT_KILLED_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("vfork-parent-killed");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create vfork-parent-killed guest directory");
+        let guest = build_root.join("vfork_parent_killed");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/vfork_parent_killed.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile vfork-parent-killed guest");
+        assert!(
+            output.status.success(),
+            "vfork-parent-killed guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -19095,4 +19122,31 @@ fn poll_timeout_returns_on_time_while_another_thread_spins() {
             "a 50 ms ppoll returned after {elapsed_ns} ns of virtual time:\n{stdout}"
         );
     }
+}
+
+/// A vfork parent killed while its vfork child runs no longer stops the
+/// schedule (https://github.com/rrnewton/hermit/issues/3984). The child kills
+/// its parent and exits; main waits for the parent and must report
+/// `A killed by signal 9`, as natively. Before the fix the killed parent left
+/// its vfork barrier behind and the run hung until Hermit's `--timeout`.
+/// Run mode only: `--verify-strict` on this guest also meets the separate,
+/// pre-existing host timing of a cross-process SIGKILL on ptrace.
+#[test]
+fn a_killed_vfork_parent_does_not_stop_the_schedule() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = vfork_parent_killed_guest().to_str().unwrap().to_owned();
+    let (status, log) = run_with_deadline(
+        hermit_command(&["run", "--strict", "--timeout", "30", "--", guest.as_str()]),
+        directory.path(),
+        Duration::from_secs(60),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "the run must finish and exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(stdout, "A killed by signal 9\n", "stderr:\n{log}");
 }

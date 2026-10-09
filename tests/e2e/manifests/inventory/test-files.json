@@ -2227,6 +2227,12 @@
       "why": "tests/c/vforkExec.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Symlinked Reverie C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI pending standalone calibration"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/vfork_parent_killed.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/vfork_parent_killed.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_killed_vfork_parent_does_not_stop_the_schedule compiles this guest, in which a vfork child sends SIGKILL to its parent and exits while the grandparent waits, and requires the run to finish with exit 0 and print 'A killed by signal 9' (https://github.com/rrnewton/hermit/issues/3984); it remains a guest fixture because a generic manifest cannot bound the run with a deadline and assert this exact output for a scheduler-liveness regression."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/vmsplice_enosys.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
