@@ -1199,7 +1199,45 @@ fi
 # reverie-dbt, the root Cargo.toml, third-party or rust-toolchain.toml changes,
 # so the four budget inputs are unchanged. Carry, not recalibration: no new
 # timing sample or >=5-sample replacement claim is made.
-expected_pin=87e2b5c47febd685ed3ee746e47255bb6461958e
+# BOUND TO d9f0affc97430885ca79d02dffa7611419a07129 (2026-10-08): from
+# 87e2b5c47febd685ed3ee746e47255bb6461958e. reverie-dbt/build.rs and the root
+# Cargo.toml CHANGED, so the DynamoRIO SDK recipe key changes; the other five
+# recorded inputs are byte-identical:
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: e05db6238bf07c96d8a850c5635a8c48590f20b7 -> ff1eeb32b140ae477894126af21296723c1ba582
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 395eddb164895c7c59ff7db11d0a6105d0c69d30 -> 7177e96f4575158230e2473b4cbfdb1ad902710d
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# The build.rs change (Reverie d712c0ec "build DynamoRIO reproducibly by
+# mapping its build and source paths", and 7e3dda49, which tests the build
+# commands' environment and refuses '$' paths) appends -ffile-prefix-map and
+# -fdebug-prefix-map for the staging and source directories to CFLAGS and
+# CXXFLAGS; the DynamoRIO source, cmake options and job-count rule are
+# unchanged. The root Cargo.toml change only adds the workspace member
+# reverie-elf-loader (d9f0affc), which nothing in the DBT build depends on.
+# The other 18 commits in the range (safeptrace e9d00dc3 and a7a5028f, and
+# the 16-commit in-guest heap series ending at 24d9649a) touch no recorded
+# input.
+# BOUNDED COLD SDK OBSERVATION AT d9f0affc: a cold `cargo build -p reverie-dbt
+# -j 16` of a fresh Reverie checkout with CI=true under `taskset -c 0-3`,
+# default cmake 3.31.8 and CMAKE/CMAKE_GENERATOR unset, on a 316-CPU host at
+# load average ~230, reported MISS, then "completed in 37.95s (jobs=4, 151.80
+# job-seconds; NUM_JOBS=16, available CPUs=4)", and PUBLISHED for
+#     key=sha256:c941bff007f8dd7737312cc1c59824ca796cad1d4688a27f872a558c07fe7cae
+# 151.80 effective-job-seconds is below 1050; at 4 effective jobs the elapsed
+# bound is ceil(1050/4)=263s. A second cold sample through this wrapper, in a
+# fresh Hermit checkout with no target directory
+# (`CARGO_BUILD_JOBS=16 ci/run-with-reverie-dbt-budget.sh cargo check --locked
+# -p detcore-dbt`, child nproc=316, so min(16,316,16)=16 and a 66s bound),
+# reported the same key and "completed in 12.65s (jobs=16, 202.33
+# job-seconds; NUM_JOBS=16, available CPUs=316)".
+# Retain the conservative 1050 effective-job-second threshold and the 16-job
+# clamp. These two local samples do not replace the original n=3 hosted
+# calibration or satisfy the >=5-sample replacement rule, and they are not a
+# Hermit guest or replay result; fresh validation is required.
+expected_pin=d9f0affc97430885ca79d02dffa7611419a07129
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
@@ -1264,6 +1302,6 @@ export REVERIE_DBT_BUDGET_BOUND_PIN
 # shellcheck source=ci/configure-build-jobs.sh
 source "$ROOT_DIR/ci/configure-build-jobs.sh" reverie-dbt-budget-child
 
-echo "run-with-reverie-dbt-budget.sh: reverie-dbt-budget={pin:$REVERIE_DBT_BUDGET_BOUND_PIN,source:$REVERIE_DBT_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBT_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBT_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBT_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBT_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBT_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBT_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4,carried-to-pin-on-dynamorio-recipe-key:f85df40daa25eff544e316659d674515091948a66bb7a3861f5e613dc3465b21}" >&2
+echo "run-with-reverie-dbt-budget.sh: reverie-dbt-budget={pin:$REVERIE_DBT_BUDGET_BOUND_PIN,source:$REVERIE_DBT_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBT_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBT_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBT_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBT_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBT_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBT_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4,carried-to-pin-on-dynamorio-recipe-key:c941bff007f8dd7737312cc1c59824ca796cad1d4688a27f872a558c07fe7cae}" >&2
 
 exec "$@"
