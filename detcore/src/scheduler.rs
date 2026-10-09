@@ -3285,6 +3285,14 @@ impl Scheduler {
     /// tombstone its child never settled, are dropped here, inside this
     /// committed turn.
     fn begin_vfork_barrier(&mut self, parent: DetTid) {
+        // The only barrier `parent` can still hold is one kept for a dead
+        // thread with the same TID: a live parent's own barrier ends at its
+        // continuation (step2a) before it can be granted another vfork.
+        assert!(
+            !self.vfork_barriers.contains_key(&parent)
+                || self.dead_parent_vfork_barriers.contains(&parent),
+            "dettid {parent} began a vfork while its own live barrier stands"
+        );
         self.drop_vfork_barrier(parent);
         self.dead_vfork_parents.remove(&parent);
         self.vfork_barriers.insert(parent, None);
