@@ -133,6 +133,27 @@ impl<T: RecordOrReplay> Detcore<T> {
             call,
             ResourceID::BlockingExternalIO(op_id),
             blocked_signal_mask,
+            false,
+        )
+        .await
+    }
+
+    /// `record_or_replay_blocking` for a call that sleeps under a temporary
+    /// mask its turn cannot vouch for (`Resources::blocked_signal_mask_unknown`):
+    /// the scheduler records no sleeping mask for it.
+    pub async fn record_or_replay_blocking_with_unknown_mask<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, Error> {
+        let dettid = guest.thread_state().dettid;
+        let op_id = ExternalOpId::new(dettid, guest.thread_state().stats.syscall_count);
+        self.record_or_replay_blocking_resource(
+            guest,
+            call,
+            ResourceID::BlockingExternalIO(op_id),
+            None,
+            true,
         )
         .await
     }
@@ -154,6 +175,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             call.into(),
             ResourceID::BlockingRtSigsuspend(op_id),
             Some(temporary_mask),
+            false,
         )
         .await
     }
@@ -164,6 +186,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: Syscall,
         blocking_resource: ResourceID,
         blocked_signal_mask: Option<u64>,
+        blocked_signal_mask_unknown: bool,
     ) -> Result<i64, Error> {
         let dettid = guest.thread_state().dettid;
         let op_id = match &blocking_resource {
@@ -209,6 +232,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             rsrcs.insert(blocking_resource, Permission::RW);
             rsrcs.fyi(call.name());
             rsrcs.blocked_signal_mask = blocked_signal_mask;
+            rsrcs.blocked_signal_mask_unknown = blocked_signal_mask_unknown;
             rsrcs.replay_served_from_log = replay_served_from_log;
             resource_request(guest, rsrcs).await;
         }
@@ -1920,6 +1944,17 @@ where
 /// dispositions, and an interrupting signal ends the wait with the call's restart
 /// errno (see `KernelSignalWait::interrupted_with_state`). The guest's mask is
 /// restored before returning, so the signal is delivered as the call returns.
+/// The signals a scheduler resume names (`ResumeStatus::Signaled`): signals the
+/// scheduler committed to the thread at that point.
+fn committed_signals(resumed: &ResumeStatus) -> KernelSigset {
+    match resumed {
+        ResumeStatus::Signaled(Some(signals)) => signals.iter().fold(0, |set, signal| {
+            set | kernel_sigset_bit(signal.0 as libc::c_int)
+        }),
+        _ => 0,
+    }
+}
+
 async fn retry_blocking_wait_with_kernel_signal_state<T, G, C>(
     guest: &mut G,
     call0: C,
@@ -1946,10 +1981,20 @@ where
     let result = loop {
         // A scheduler `Signaled` answer only says a signal may be pending. The kernel's
         // state below decides whether it ends the wait.
-        let _ = resource_request(guest, rsrc.clone()).await;
+        let resumed = resource_request(guest, rsrc.clone()).await;
         // Read in this turn, before the probe: another thread may have armed a
         // host-timed source since the last turn, and none can until this turn ends.
         signals.hold_until_return(host_timed_signals(guest).await);
+        // In record and replay, a `SIGCHLD` the scheduler committed to this thread
+        // in this turn (a child's exit, through its child-exit timer) ends the wait
+        // as it did before they modelled signal targets
+        // (`KernelSignalWait::admit_committed`; review of
+        // https://github.com/rrnewton/hermit/pull/3989).
+        signals.admit_committed(if guest.config().recordreplay_modes {
+            committed_signals(&resumed) & kernel_sigset_bit(libc::SIGCHLD)
+        } else {
+            0
+        });
         let first = std::mem::take(&mut first_turn);
         // Never `inject_with_retry`: see `KernelSignalWait`.
         let injected = if first {
@@ -2228,6 +2273,13 @@ pub(crate) struct KernelSignalWait {
     /// identify, which may be one whose loss matters, so no later stop may
     /// replace it (`would_replace_precious`).
     held_unidentified: bool,
+    /// The signals `hold_until_return` added because a host-timed source armed
+    /// by a guest can post them; a committed signal never lifts these
+    /// (`admit_committed`).
+    host_timed: KernelSigset,
+    /// Signals the scheduler committed to this thread in the current turn,
+    /// which end the wait even though it holds them (`admit_committed`).
+    committed: KernelSigset,
 }
 
 /// A signal that stopped one of a wait's injections and that the backend holds
@@ -2405,6 +2457,8 @@ impl KernelSignalWait {
             unblockable: false,
             held: None,
             held_unidentified: false,
+            host_timed: 0,
+            committed: 0,
         }
     }
 
@@ -2450,6 +2504,20 @@ impl KernelSignalWait {
     /// `select` wait (`for_select`), which holds nothing.
     pub(crate) fn hold_until_return(&mut self, signals: KernelSigset) {
         self.held_until_return |= signals;
+        self.host_timed |= signals;
+    }
+
+    /// Sets the signals the scheduler committed to this thread in this turn
+    /// (`committed`): its resume named them (`ResumeStatus::Signaled`). Such a
+    /// signal was sent at a fixed point of the schedule, so a wait may end for
+    /// it although the wait holds it, unless a host-timed source can post it
+    /// too (`host_timed`). Only record and replay pass `SIGCHLD` here: their
+    /// polling waits returned EINTR for the `SIGCHLD` of a child's exit, which
+    /// the scheduler commits through its child-exit timer, before they took
+    /// this machinery; `hermit run` holds it until the call returns, a tested
+    /// decision of https://github.com/rrnewton/hermit/pull/3361.
+    pub(crate) fn admit_committed(&mut self, signals: KernelSigset) {
+        self.committed = signals & !self.host_timed;
     }
 
     /// Whether the caller should still call `block`: it has neither blocked the
@@ -2492,7 +2560,8 @@ impl KernelSignalWait {
         let state = read_wait_signal_state(self.pid, self.tid)?;
         let could_interrupt = self.could_interrupt(&state);
         let held = self.held.map_or(0, |held| kernel_sigset_bit(held.signal));
-        let interrupting = (state.pending | held) & could_interrupt & !self.held_until_return;
+        let held_until_return = self.held_until_return & !self.committed;
+        let interrupting = (state.pending | held) & could_interrupt & !held_until_return;
         if interrupting != 0 {
             tracing::trace!(
                 "[tid {}] pending signals {:#x} interrupt a blocking wait",

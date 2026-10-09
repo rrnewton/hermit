@@ -3252,6 +3252,7 @@ impl GlobalState {
                     signal_interrupt_errno: None,
                     backend_runtime_bootstrap: false,
                     blocked_signal_mask: None,
+                    blocked_signal_mask_unknown: false,
                     replay_served_from_log: false,
                     poll_deadline: None,
                     in_guest_sleep_sigalrm: None,

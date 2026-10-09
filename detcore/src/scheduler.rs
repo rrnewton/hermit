@@ -7247,6 +7247,14 @@ impl Scheduler {
                     {
                         self.blocked.replay_log_served.insert(dettid);
                     }
+                    if rs.blocked_signal_mask_unknown
+                        && matches!(rid, ResourceID::BlockingExternalIO(_))
+                        && let Some(recorded) = self.blocked.out_of_scheduler_masks.get_mut(&dettid)
+                    {
+                        // The call sleeps under a mask this turn could not
+                        // read faithfully (`Resources::blocked_signal_mask_unknown`).
+                        *recorded = None;
+                    }
                     blocked
                 }
                 _ => {
@@ -13277,6 +13285,56 @@ mod test {
     /// host thread or none. The gated scheduler, for contrast, records the
     /// call's own mask, or else reads the thread's
     /// (https://github.com/rrnewton/hermit/issues/3146).
+    /// A background call whose temporary mask its turn cannot vouch for
+    /// (`Resources::blocked_signal_mask_unknown`: a pselect6 in record and
+    /// replay) has no recorded sleeping mask, so a committed signal never arms
+    /// it, whatever the thread's ordinary mask, and it is not a `SIGCHLD`
+    /// target. Taking the ordinary mask for such a call armed it for a SIGALRM
+    /// the call's own mask blocks, and the release barrier waited for a wake
+    /// Linux never delivers (Codex review of
+    /// https://github.com/rrnewton/hermit/pull/3989). The same call without the
+    /// flag is armed, from the ordinary mask read while it was stopped.
+    #[test]
+    fn a_background_call_with_an_unknown_sleeping_mask_is_never_armed() {
+        for unknown in [false, true] {
+            let (mut scheduler, _parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+            // A send that this test reaches must not reach a real host thread.
+            scheduler.backend.requires_thread_directed_process_signals = true;
+            scheduler
+                .test_kernel_signal_states
+                .insert(creator, signal_state(0, 0));
+            let op = ExternalOpId::new(creator, 1);
+            let mut request = Resources::new(creator);
+            request.insert(ResourceID::BlockingExternalIO(op), Permission::RW);
+            request.blocked_signal_mask_unknown = unknown;
+            scheduler.runqueue_push_back(creator);
+            assert_eq!(
+                scheduler.run_queue.tentative_pop_tid(creator),
+                Some(creator)
+            );
+            assert!(
+                scheduler
+                    .step4_resource_block(creator, &request, &Ivar::new())
+                    .is_err()
+            );
+            assert_eq!(
+                scheduler.blocked.external_io_blockers.get(&creator),
+                Some(&op)
+            );
+            scheduler.wake_signaled_guest(creator, Signal::SIGALRM);
+            let recorded = scheduler.blocked.out_of_scheduler_masks.get(&creator);
+            let armed = scheduler.blocked.signaled_background.contains(&creator);
+            if unknown {
+                assert_eq!(recorded, Some(&None));
+                assert!(!armed);
+                assert_eq!(scheduler.thread_signal_mask(creator), None);
+            } else {
+                assert_eq!(recorded, Some(&Some(0)));
+                assert!(armed);
+            }
+        }
+    }
+
     #[test]
     fn a_scheduler_that_does_not_model_signal_targets_reads_and_records_no_sleeping_mask() {
         use std::sync::atomic::Ordering;

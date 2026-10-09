@@ -1490,6 +1490,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_sigtimedwait_child_exit.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_sigtimedwait_child_exit.c is owned by hermit-cli/tests/record_replay.rs: The dedicated integration suite compiles this workload and checks that rt_sigtimedwait ends with EINTR for a caught SIGCHLD from a child's exit, and times out for a blocked or default-ignored one, under record and replay."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/record_replay_socket_mmsg.c",
       "runner": "hermit-cli/tests/record_replay.rs",
       "why": "tests/c/record_replay_socket_mmsg.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration suite compiles this workload and checks that replay applies a recorded shutdown to a socketpair endpoint before a live recvmmsg reads from it, and that a recording refuses sendmmsg on an accepted connection, whose replay stand-in is not a socket."

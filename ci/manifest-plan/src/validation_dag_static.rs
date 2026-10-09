@@ -1309,7 +1309,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (relative happens-before anchors) retains all 1018: 1019.
     // metadata::tests::record_version_rejects_pre_child_subreaper_streams
     // (https://github.com/rrnewton/hermit/issues/3997) retains all 1019: 1020.
-    ("test.hermit_unit", 1020),
+    // And the two signal-target metadata tests (https://github.com/rrnewton/hermit/issues/3963): 1022.
+    ("test.hermit_unit", 1022),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1797,7 +1798,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // scheduler::parked_tests::{an_expired_vfork_barrier_ends_the_run_through_the_daemon_loop,
     // the_vfork_barrier_valve_is_thirty_seconds} (the valve's consumer and
     // bound) retain all 1321: 1323.
-    ("test.detcore_unit", 1323),
+    // And a_background_call_with_an_unknown_sleeping_mask_is_never_armed (review of https://github.com/rrnewton/hermit/pull/3989): 1324.
+    ("test.detcore_unit", 1324),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2037,7 +2039,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // record_forked_child_writes_into_a_redirected_stdout_pipe
     // (https://github.com/rrnewton/hermit/issues/3964) adds one and retains all
     // 140 (`cargo nextest list` lists 141).
-    ("test.record_replay", 141),
+    // record_pselect_whose_mask_blocks_the_scheduler_timer_signal,
+    // record_pselect_whose_mask_blocks_a_signal_a_sibling_takes,
+    // record_pselect_with_a_write_only_mask_wrapper,
+    // record_pselect_whose_mask_a_sibling_rewrites_before_the_call_runs and
+    // record_sigtimedwait_ends_for_a_caught_sigchld_from_a_child_exit
+    // (https://github.com/rrnewton/hermit/issues/3963 and its review) add five
+    // and retain all 141 (`cargo nextest list` lists 146).
+    ("test.record_replay", 146),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -2684,7 +2693,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two FUTEX_WAKE count tests: 1306.
     // And the fifteen child-subreaper tests: 1321.
     // And the valve's consumer and bound tests: 1323.
-    ("test.detcore_unit_on_host", 1323),
+    // And the same unknown-sleeping-mask test: 1324.
+    ("test.detcore_unit_on_host", 1324),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -2791,7 +2801,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the vfork release-edge record-version test: 1018.
     // And the version-2 preemption refusal test: 1019.
     // And the child-subreaper record-version test: 1020.
-    ("test.hermit_unit_on_host", 1020),
+    // And the same two signal-target metadata tests: 1022.
+    ("test.hermit_unit_on_host", 1022),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -4550,7 +4561,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"rrcompat"########,
         job: r########"manifest_compat"########,
         desc: r########"The compatibility corpus recorded and replayed under strict Hermit"########,
-        description: r########"The rr-compat-only run type: `test-harness run --label rr-compat-only` over tests/e2e/manifests/compat.yaml, so it runs exactly the cells labelled with that run type and nothing the full validation runs. Those are the replay cells of the rows' own tests compat/<row>, from the corpus's `replay` section: one ptrace replay cell for each row but the lua, perl and df -direct twins and netlink-sock-diag, 215 in all: the 139 programs the retired rr lane listed as passing (ci/compat/corpus-rr.json and RR_PASSING_LABELS until 2026-10-02) and, since 2026-10-09, 76 of the 77 rows it never listed, each running `hermit record start --strict --verify` under the stricter --verify-strict comparison, which records the program, replays the recording and compares the two, with the old lane's 60-second wall bound per program. It runs the validation's one Hermit build, the e2e artifact build.host_hermit_link links on the host, against the fixtures rrcompatprep.fixtures writes. The old lane ran `record start --verify --verify-strict`; the harness adds what every manifest replay cell has: --strict, --log info, --base-env=minimal, and a tmpfs /test working directory. On 2026-10-02 only 51 passed, on the old lane's own command too, because the other 88 stopped recording with exit status 122 at their first clock read (https://github.com/rrnewton/hermit/issues/3519); record mode now records clock reads, and on 2026-10-08 at 27eab6dc only make and node of those 88 still failed, because their replay readmitted a different backgrounded thread than the recording (https://github.com/rrnewton/hermit/issues/3934); the rejoin log of https://github.com/rrnewton/hermit/pull/3908 fixed that, and the node gated all 139. A three-run survey on 2026-10-09 gave the other 77 rows replay cells: 73 recorded and replayed at canonical bitwise parity in 3 of 3 runs and joined, and timeout, flex and lsof stayed `unselected` under their issues; flex joined once its replay stall, a pipe write captured as container output, was fixed (https://github.com/rrnewton/hermit/issues/3964), and timeout and lsof stay. netlink-sock-diag is excepted: its own check asserts Detcore's run-mode sock_diag sanitizer, which record/replay disables by design, and its replay matched the recording bitwise (https://github.com/rrnewton/hermit/issues/3965). The node now gates 213 cells: any of them that diverges, crashes or exceeds its budget turns it red. Until 2026-10-02 these rows were 139 separate rrcompat.<program> nodes running a separately built release Hermit, and until 2026-10-04 139 separate compat/rr-<row> tests duplicating the rows' own tests. Like the old lane's command, each replay cell runs without the corpus's verify settings: no added Hermit flags or comparator, no TMPDIR=/tmp, and one attempt. The node's 600-second wall bound is the 200 seconds `scripts/validate.rs --self-test` requires of it as outer headroom (two modelled attempts of the largest cell, 60 seconds scaled by the representative 1.5x multiplier, each with 10 seconds of termination grace: 2 x (90 + 10)), plus 400 seconds for the rest of the bucket; the 139 cells took 34 seconds of wall time at up to 8 workers on 2026-10-08 (149 seconds of summed cell time and 72 CPU seconds for the 137 that passed then; the slowest, java, 26.8 seconds; with all 139 passing at 7be21e8f on 2026-10-09, 139.2 seconds of summed cell time and 77.8 CPU seconds, the slowest, java, 33.4 seconds), against 56.7 seconds on 2026-10-02 for the 51 programs that passed then, run one after another through the old command. The two attempts are that conservative model only; the harness never retries a replay cell, so a recording that fails to replay fails its one attempt, as it did on the old lane."########,
+        description: r########"The rr-compat-only run type: `test-harness run --label rr-compat-only` over tests/e2e/manifests/compat.yaml, so it runs exactly the cells labelled with that run type and nothing the full validation runs. Those are the replay cells of the rows' own tests compat/<row>, from the corpus's `replay` section: one ptrace replay cell for each row but the lua, perl and df -direct twins and netlink-sock-diag, 215 in all: the 139 programs the retired rr lane listed as passing (ci/compat/corpus-rr.json and RR_PASSING_LABELS until 2026-10-02) and, since 2026-10-09, 76 of the 77 rows it never listed, each running `hermit record start --strict --verify` under the stricter --verify-strict comparison, which records the program, replays the recording and compares the two, with the old lane's 60-second wall bound per program. It runs the validation's one Hermit build, the e2e artifact build.host_hermit_link links on the host, against the fixtures rrcompatprep.fixtures writes. The old lane ran `record start --verify --verify-strict`; the harness adds what every manifest replay cell has: --strict, --log info, --base-env=minimal, and a tmpfs /test working directory. On 2026-10-02 only 51 passed, on the old lane's own command too, because the other 88 stopped recording with exit status 122 at their first clock read (https://github.com/rrnewton/hermit/issues/3519); record mode now records clock reads, and on 2026-10-08 at 27eab6dc only make and node of those 88 still failed, because their replay readmitted a different backgrounded thread than the recording (https://github.com/rrnewton/hermit/issues/3934); the rejoin log of https://github.com/rrnewton/hermit/pull/3908 fixed that, and the node gated all 139. A three-run survey on 2026-10-09 gave the other 77 rows replay cells: 73 recorded and replayed at canonical bitwise parity in 3 of 3 runs and joined, and timeout, flex and lsof stayed `unselected` under their issues; flex joined once its replay stall, a pipe write captured as container output, was fixed (https://github.com/rrnewton/hermit/issues/3964), timeout once its false rt_sigsuspend deadlock in record was fixed (https://github.com/rrnewton/hermit/issues/3963), and lsof stays. netlink-sock-diag is excepted: its own check asserts Detcore's run-mode sock_diag sanitizer, which record/replay disables by design, and its replay matched the recording bitwise (https://github.com/rrnewton/hermit/issues/3965). The node now gates 214 cells: any of them that diverges, crashes or exceeds its budget turns it red. Until 2026-10-02 these rows were 139 separate rrcompat.<program> nodes running a separately built release Hermit, and until 2026-10-04 139 separate compat/rr-<row> tests duplicating the rows' own tests. Like the old lane's command, each replay cell runs without the corpus's verify settings: no added Hermit flags or comparator, no TMPDIR=/tmp, and one attempt. The node's 600-second wall bound is the 200 seconds `scripts/validate.rs --self-test` requires of it as outer headroom (two modelled attempts of the largest cell, 60 seconds scaled by the representative 1.5x multiplier, each with 10 seconds of termination grace: 2 x (90 + 10)), plus 400 seconds for the rest of the bucket; the 139 cells took 34 seconds of wall time at up to 8 workers on 2026-10-08 (149 seconds of summed cell time and 72 CPU seconds for the 137 that passed then; the slowest, java, 26.8 seconds; with all 139 passing at 7be21e8f on 2026-10-09, 139.2 seconds of summed cell time and 77.8 CPU seconds, the slowest, java, 33.4 seconds), against 56.7 seconds on 2026-10-02 for the 51 programs that passed then, run one after another through the old command. The two attempts are that conservative model only; the harness never retries a replay cell, so a recording that fails to replay fails its one attempt, as it did on the old lane."########,
         labels: &[r########"rr-compat-only"########],
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category compat --label rr-compat-only --ci-only --prebuilt --diagnostic-results --results "$E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_compat/junit.xml""########,
         cmdtype: CmdType::Unknown,

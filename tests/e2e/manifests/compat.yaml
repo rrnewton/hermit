@@ -1570,15 +1570,10 @@ corpus:
     # commit that gave the 77 rows excluded above replay cells: 73 recorded and
     # replayed at canonical bitwise parity in 3 of 3 runs and joined the run
     # type; these did not. (netlink-sock-diag, the fourth, is excepted above:
-    # its check asserts a run-mode property. flex, the fifth, joined once
-    # https://github.com/rrnewton/hermit/issues/3964 was fixed.)
+    # its check asserts a run-mode property. flex and timeout, the fifth and
+    # sixth, joined once https://github.com/rrnewton/hermit/issues/3964 and
+    # https://github.com/rrnewton/hermit/issues/3963 were fixed.)
     unselected:
-      - result: crash-error
-        evidence: https://github.com/rrnewton/hermit/issues/3963
-        reason: >-
-          Record stops on a false rt_sigsuspend deadlock report while the
-          thread's SIGCHLD is ready, in 2 of 3 runs
-        rows: [timeout]
       - result: replay-failure
         evidence: https://github.com/rrnewton/hermit/issues/3966
         reason: >-

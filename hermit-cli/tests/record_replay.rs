@@ -2576,6 +2576,67 @@ fn record_select_null_timeout_woken_by_thread() {
     record_select_mode("thread-wake");
 }
 
+/// A pselect6 recorded as a blocking call outside the schedule sleeps under its
+/// own temporary mask, and the scheduler must arm its release barrier from that
+/// mask. Taking the thread's ordinary mask instead, it armed the call for the
+/// SIGALRM its timer sent although the call's mask blocks it, waited for a wake
+/// Linux never delivers, and refused the recording with
+/// `SignaledBackgroundRefusal` after 30 seconds
+/// (https://github.com/rrnewton/hermit/issues/3963).
+#[test]
+fn record_pselect_whose_mask_blocks_the_scheduler_timer_signal() {
+    record_select_mode("pselect-mask-blocks-alarm");
+}
+
+/// The same wait, eight times in one recording, with a writer that leaves
+/// SIGALRM unblocked, so the kernel gives the timer's process-directed SIGALRM
+/// to the writer while the waiter's pselect6 blocks it. Reading pselect6's mask
+/// through an injected syscall before the call let recording give the signal to
+/// the waiter in some runs, and replay refused 8 of 8 such recordings; a direct
+/// read of guest memory replayed 8 of 8 (review of
+/// https://github.com/rrnewton/hermit/pull/3989).
+/// pselect6's `{ sigmask, sigsetsize }` wrapper on a PROT_WRITE page, which
+/// Linux copies from but a tracer read of more than eight bytes cannot reach.
+/// Reading the mask there failed, the scheduler took the ordinary mask, and
+/// recording refused after 30 seconds at the release barrier (Codex review of
+/// https://github.com/rrnewton/hermit/pull/3989).
+#[test]
+fn record_pselect_with_a_write_only_mask_wrapper() {
+    record_select_mode("pselect-mask-writeonly-wrapper");
+}
+
+/// A sibling sets pselect6's mask to block SIGALRM after the waiter announces
+/// the call and before the scheduler runs it. A mask read in the waiter's turn
+/// was the old one, and recording refused after 30 seconds at the release
+/// barrier (Codex review of https://github.com/rrnewton/hermit/pull/3989).
+#[test]
+fn record_pselect_whose_mask_a_sibling_rewrites_before_the_call_runs() {
+    record_select_mode("pselect-mask-sibling-rewrite");
+}
+
+/// rt_sigtimedwait ends with EINTR for a caught, unblocked SIGCHLD from a
+/// child's exit, and times out with EAGAIN when SIGCHLD is blocked or keeps its
+/// default action; the guest checks each against Linux's result. Record and
+/// replay returned EAGAIN for the caught case once their waits held SIGCHLD as
+/// `hermit run` does (Codex review of
+/// https://github.com/rrnewton/hermit/pull/3989).
+#[test]
+fn record_sigtimedwait_ends_for_a_caught_sigchld_from_a_child_exit() {
+    for mode in ["caught", "blocked", "default"] {
+        let _guard = hermit_record_lock();
+        canonical_record_replay_command(
+            &format!("sigtimedwait child exit {mode}"),
+            &workload("c_record_replay_sigtimedwait_child_exit").path,
+            &[OsStr::new(mode)],
+        );
+    }
+}
+
+#[test]
+fn record_pselect_whose_mask_blocks_a_signal_a_sibling_takes() {
+    record_select_mode("pselect-mask-shared-alarm");
+}
+
 /// Replayer substitutes an eventfd for this proc descriptor. The Detcore
 /// procfs layer must bind the live task incarnation named by an absolute or
 /// AT_FDCWD-relative path rather than the placeholder inode. Zero-length

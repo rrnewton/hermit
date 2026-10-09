@@ -448,6 +448,18 @@ pub struct Resources {
     /// (<https://github.com/rrnewton/hermit/issues/3146>).
     #[serde(default)]
     pub(crate) blocked_signal_mask: Option<u64>,
+    /// Set on a `BlockingExternalIO` request whose call installs a temporary
+    /// signal mask that the thread's turn cannot vouch for: a pselect6 in
+    /// record and replay. Its `{ sigmask, sigsetsize }` wrapper may sit in
+    /// memory a tracer read cannot reach though the kernel can, and a sibling
+    /// may rewrite the mask between this turn and the kernel's copy of it. The
+    /// scheduler then records no sleeping mask for the thread
+    /// (`BlockedPool::out_of_scheduler_masks` holds `None`), so it neither arms
+    /// the thread for a committed signal nor chooses it as a `SIGCHLD` target,
+    /// as for every call outside the schedule before the scheduler modelled
+    /// signal targets (review of <https://github.com/rrnewton/hermit/pull/3989>).
+    #[serde(default)]
+    pub(crate) blocked_signal_mask_unknown: bool,
     /// Set on a `BlockingExternalIO` request whose call `hermit replay` serves
     /// from the recording. Such a call runs in the background as it did during
     /// recording, so the schedule matches the recording's, but it cannot
@@ -491,6 +503,9 @@ impl fmt::Debug for Resources {
         if let Some(mask) = self.blocked_signal_mask {
             debug.field("blocked_signal_mask", &mask);
         }
+        if self.blocked_signal_mask_unknown {
+            debug.field("blocked_signal_mask_unknown", &true);
+        }
         if self.replay_served_from_log {
             debug.field("replay_served_from_log", &true);
         }
@@ -515,6 +530,7 @@ impl Resources {
             signal_interrupt_errno: None,
             backend_runtime_bootstrap: false,
             blocked_signal_mask: None,
+            blocked_signal_mask_unknown: false,
             replay_served_from_log: false,
             poll_deadline: None,
             in_guest_sleep_sigalrm: None,
@@ -551,6 +567,7 @@ impl Resources {
             (Some(left), Some(right)) => assert_eq!(left, right),
             (Some(_), None) => {}
         }
+        self.blocked_signal_mask_unknown |= other.blocked_signal_mask_unknown;
         self.replay_served_from_log |= other.replay_served_from_log;
         // A merged request waits for the earlier of two deadlines.
         self.poll_deadline = match (self.poll_deadline, other.poll_deadline) {

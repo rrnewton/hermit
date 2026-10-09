@@ -29,6 +29,30 @@
  *                empty pipe that the main thread then fills: the call records
  *                as blocking external I/O, and replay must not wait on the
  *                live pipe
+ *   pselect-mask-blocks-alarm
+ *                the main thread blocks in glibc pselect() with a NULL timeout
+ *                and a temporary mask that blocks SIGALRM, which its ordinary
+ *                mask leaves unblocked and caught; a 100 ms ITIMER_REAL fires
+ *                during the wait, and a second thread, which blocks SIGALRM,
+ *                fills the pipe at 300 ms. Linux does not wake the call for
+ *                the blocked SIGALRM, so it returns 1 and the handler runs
+ *                only after it returns
+ *                (https://github.com/rrnewton/hermit/issues/3963)
+ *   pselect-mask-writeonly-wrapper
+ *                the blocks-alarm wait, with pselect6's { sigmask, sigsetsize }
+ *                wrapper on a page mapped PROT_WRITE only, which Linux/x86_64
+ *                still copies from; a tracer read of more than eight bytes
+ *                cannot reach it
+ *   pselect-mask-sibling-rewrite
+ *                the blocks-alarm wait, with a mask that is zero when the
+ *                waiter announces its pselect6 and that the writer, which
+ *                blocks SIGALRM, sets to block SIGALRM; the call returns 1, or
+ *                EINTR if the kernel copied the mask before the rewrite
+ *   pselect-mask-shared-alarm
+ *                eight rounds of the same wait with a writer thread that leaves
+ *                SIGALRM unblocked, so the kernel gives the process-directed
+ *                SIGALRM to the writer while the main thread's pselect6 blocks
+ *                it; replay must deliver it to the same thread
  *
  * The first three modes each run four shapes: a ready pipe with a 5 s timeout,
  * the same with a zero timeout, the same with nfds == FD_SETSIZE (larger than
@@ -42,6 +66,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -447,11 +472,344 @@ static int thread_wake(void) {
   return 0;
 }
 
+static volatile sig_atomic_t masked_alarms = 0;
+
+static void count_masked_alarm(int signal) {
+  (void)signal;
+  masked_alarms++;
+}
+
+static int alarm_pipe_fds[2];
+
+/*
+ * The writer inherits a mask that blocks SIGALRM, so the kernel can give the
+ * process-directed SIGALRM of ITIMER_REAL only to the waiting thread. Its
+ * yields keep the scheduler busy before the timer is due, which gives the
+ * waiter time to enter the kernel and install its temporary mask: a SIGALRM
+ * sent before that would be taken under the ordinary mask, at a point that
+ * host speed decides.
+ */
+static void* fill_alarm_pipe_later(void* arg) {
+  (void)arg;
+  for (int i = 0; i < 1000; i++) {
+    sched_yield();
+  }
+  usleep(300000);
+  if (write(alarm_pipe_fds[1], "x", 1) != 1) {
+    perror("fill pipe");
+  }
+  return NULL;
+}
+
+/*
+ * Hermit records pselect6 as a blocking call outside the schedule. The
+ * scheduler must know the call sleeps under its own temporary mask: if it
+ * takes the thread's ordinary mask instead, it expects the SIGALRM its timer
+ * sends to wake the call, waits for a wake Linux never delivers, and refuses
+ * the recording after 30 seconds.
+ */
+static int pselect_mask_blocks_alarm(void) {
+  struct sigaction action;
+  memset(&action, 0, sizeof action);
+  action.sa_handler = count_masked_alarm;
+  if (sigaction(SIGALRM, &action, NULL) != 0) {
+    perror("sigaction");
+    return 1;
+  }
+  if (pipe(alarm_pipe_fds) != 0) {
+    perror("pipe");
+    return 1;
+  }
+  sigset_t during;
+  sigemptyset(&during);
+  sigaddset(&during, SIGALRM);
+  if (pthread_sigmask(SIG_BLOCK, &during, NULL) != 0) {
+    perror("pthread_sigmask block");
+    return 1;
+  }
+  pthread_t writer;
+  if (pthread_create(&writer, NULL, fill_alarm_pipe_later, NULL) != 0) {
+    perror("pthread_create");
+    return 1;
+  }
+  if (pthread_sigmask(SIG_UNBLOCK, &during, NULL) != 0) {
+    perror("pthread_sigmask unblock");
+    return 1;
+  }
+  struct itimerval alarm_in = {{0, 0}, {0, 100000}};
+  if (setitimer(ITIMER_REAL, &alarm_in, NULL) != 0) {
+    perror("setitimer");
+    return 1;
+  }
+  fd_set read_set;
+  FD_ZERO(&read_set);
+  FD_SET(alarm_pipe_fds[0], &read_set);
+  errno = 0;
+  int result =
+      pselect(alarm_pipe_fds[0] + 1, &read_set, NULL, NULL, NULL, &during);
+  int result_errno = errno;
+  int read_ready = result > 0 && FD_ISSET(alarm_pipe_fds[0], &read_set);
+  if (pthread_join(writer, NULL) != 0) {
+    perror("pthread_join");
+    return 1;
+  }
+  close(alarm_pipe_fds[0]);
+  close(alarm_pipe_fds[1]);
+
+  printf(
+      "%-24s result=%011d errno=%011d read_ready=%01d alarms=%01d\n",
+      "pselect-mask-alarm",
+      result,
+      result < 0 ? result_errno : 0,
+      read_ready,
+      (int)masked_alarms);
+
+  if (result != 1 || read_ready != 1 || masked_alarms != 1) {
+    fprintf(stderr, "pselect-mask-blocks-alarm mismatch\n");
+    return 1;
+  }
+  return 0;
+}
+
+static void* fill_shared_alarm_pipe_later(void* arg) {
+  (void)arg;
+  usleep(300000);
+  if (write(alarm_pipe_fds[1], "x", 1) != 1) {
+    perror("fill pipe");
+  }
+  return NULL;
+}
+
+/*
+ * Recording must not delay the waiting thread's entry into pselect6 by
+ * injecting a probe syscall after the scheduler has committed the call: a
+ * SIGALRM due in that window was taken by the waiter under its ordinary mask in
+ * some recordings and by the writer in others, and replay refused the
+ * recording (review of https://github.com/rrnewton/hermit/pull/3989). Each
+ * round repeats the chance.
+ */
+static int pselect_mask_shared_alarm(void) {
+  struct sigaction action;
+  memset(&action, 0, sizeof action);
+  action.sa_handler = count_masked_alarm;
+  if (sigaction(SIGALRM, &action, NULL) != 0) {
+    perror("sigaction");
+    return 1;
+  }
+  sigset_t during;
+  sigemptyset(&during);
+  sigaddset(&during, SIGALRM);
+  for (int round = 0; round < 8; round++) {
+    masked_alarms = 0;
+    if (pipe(alarm_pipe_fds) != 0) {
+      perror("pipe");
+      return 1;
+    }
+    struct itimerval alarm_in = {{0, 0}, {0, 100000}};
+    if (setitimer(ITIMER_REAL, &alarm_in, NULL) != 0) {
+      perror("setitimer");
+      return 1;
+    }
+    pthread_t writer;
+    if (pthread_create(&writer, NULL, fill_shared_alarm_pipe_later, NULL) != 0) {
+      perror("pthread_create");
+      return 1;
+    }
+    fd_set read_set;
+    FD_ZERO(&read_set);
+    FD_SET(alarm_pipe_fds[0], &read_set);
+    errno = 0;
+    int result =
+        pselect(alarm_pipe_fds[0] + 1, &read_set, NULL, NULL, NULL, &during);
+    int result_errno = errno;
+    int read_ready = result > 0 && FD_ISSET(alarm_pipe_fds[0], &read_set);
+    if (pthread_join(writer, NULL) != 0) {
+      perror("pthread_join");
+      return 1;
+    }
+    close(alarm_pipe_fds[0]);
+    close(alarm_pipe_fds[1]);
+    printf(
+        "%-24s round=%01d result=%011d errno=%011d read_ready=%01d alarms=%01d\n",
+        "pselect-mask-shared",
+        round,
+        result,
+        result < 0 ? result_errno : 0,
+        read_ready,
+        (int)masked_alarms);
+    if (result != 1 || read_ready != 1 || masked_alarms != 1) {
+      fprintf(stderr, "pselect-mask-shared-alarm mismatch\n");
+      return 1;
+    }
+  }
+  return 0;
+}
+
+struct pselect_mask_wrapper {
+  const void* mask;
+  size_t size;
+};
+
+static void* fill_alarm_pipe_after_yields(void* arg) {
+  (void)arg;
+  for (int i = 0; i < 1000; i++) {
+    sched_yield();
+  }
+  usleep(300000);
+  if (write(alarm_pipe_fds[1], "x", 1) != 1) {
+    perror("fill pipe");
+  }
+  return NULL;
+}
+
+/*
+ * Starts the timer and the writer for the raw pselect6 modes below: the writer
+ * inherits a mask that blocks SIGALRM, so only the waiter can take the timer's
+ * SIGALRM, as in pselect-mask-blocks-alarm.
+ */
+static int start_alarm_and_writer(pthread_t* writer, void* (*body)(void*)) {
+  struct sigaction action;
+  memset(&action, 0, sizeof action);
+  action.sa_handler = count_masked_alarm;
+  if (sigaction(SIGALRM, &action, NULL) != 0 || pipe(alarm_pipe_fds) != 0) {
+    perror("setup");
+    return 1;
+  }
+  sigset_t alarm_set;
+  sigemptyset(&alarm_set);
+  sigaddset(&alarm_set, SIGALRM);
+  if (pthread_sigmask(SIG_BLOCK, &alarm_set, NULL) != 0 ||
+      pthread_create(writer, NULL, body, NULL) != 0 ||
+      pthread_sigmask(SIG_UNBLOCK, &alarm_set, NULL) != 0) {
+    perror("writer");
+    return 1;
+  }
+  struct itimerval alarm_in = {{0, 0}, {0, 100000}};
+  if (setitimer(ITIMER_REAL, &alarm_in, NULL) != 0) {
+    perror("setitimer");
+    return 1;
+  }
+  return 0;
+}
+
+static int finish_raw_pselect(
+    const char* name,
+    pthread_t writer,
+    int result,
+    int result_errno,
+    fd_set* read_set,
+    int eintr_allowed) {
+  int read_ready = result > 0 && FD_ISSET(alarm_pipe_fds[0], read_set);
+  if (pthread_join(writer, NULL) != 0) {
+    perror("pthread_join");
+    return 1;
+  }
+  close(alarm_pipe_fds[0]);
+  close(alarm_pipe_fds[1]);
+  printf(
+      "%-24s result=%011d errno=%011d read_ready=%01d alarms=%01d\n",
+      name,
+      result,
+      result < 0 ? result_errno : 0,
+      read_ready,
+      (int)masked_alarms);
+  int ready_result = result == 1 && read_ready == 1;
+  int eintr_result = eintr_allowed && result == -1 && result_errno == EINTR;
+  if (!(ready_result || eintr_result) || masked_alarms != 1) {
+    fprintf(stderr, "%s mismatch\n", name);
+    return 1;
+  }
+  return 0;
+}
+
+/*
+ * The wrapper sits on a PROT_WRITE page. Recording must not lose the call's
+ * temporary mask to a tracer read that the page refuses, which made the
+ * scheduler take the ordinary mask and wait for a SIGALRM wake Linux never
+ * delivers (Codex review of https://github.com/rrnewton/hermit/pull/3989).
+ */
+static int pselect_mask_writeonly_wrapper(void) {
+  size_t page = (size_t)sysconf(_SC_PAGESIZE);
+  void* mapping = mmap(
+      NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (mapping == MAP_FAILED) {
+    perror("mmap");
+    return 1;
+  }
+  static uint64_t blocks_alarm;
+  blocks_alarm = UINT64_C(1) << (SIGALRM - 1);
+  struct pselect_mask_wrapper* wrapper =
+      (struct pselect_mask_wrapper*)((char*)mapping + 32);
+  wrapper->mask = &blocks_alarm;
+  wrapper->size = sizeof blocks_alarm;
+  if (mprotect(mapping, page, PROT_WRITE) != 0) {
+    perror("mprotect");
+    return 1;
+  }
+  pthread_t writer;
+  if (start_alarm_and_writer(&writer, fill_alarm_pipe_after_yields) != 0) {
+    return 1;
+  }
+  fd_set read_set;
+  FD_ZERO(&read_set);
+  FD_SET(alarm_pipe_fds[0], &read_set);
+  errno = 0;
+  int result = (int)syscall(
+      SYS_pselect6, alarm_pipe_fds[0] + 1, &read_set, NULL, NULL, NULL, wrapper);
+  int result_errno = errno;
+  int status = finish_raw_pselect(
+      "pselect-writeonly", writer, result, result_errno, &read_set, 0);
+  munmap(mapping, page);
+  return status;
+}
+
+static _Atomic uint64_t rewritten_mask;
+static _Atomic int about_to_pselect;
+
+static void* rewrite_mask_then_fill_pipe(void* arg) {
+  (void)arg;
+  while (!atomic_load_explicit(&about_to_pselect, memory_order_acquire)) {
+    sched_yield();
+  }
+  atomic_store_explicit(
+      &rewritten_mask, UINT64_C(1) << (SIGALRM - 1), memory_order_release);
+  return fill_alarm_pipe_after_yields(NULL);
+}
+
+/*
+ * The writer sets the mask to block SIGALRM after the waiter announces its
+ * pselect6 and before the scheduler runs the call. The scheduler must not
+ * record a mask the kernel does not install (Codex review of
+ * https://github.com/rrnewton/hermit/pull/3989). Natively the waiter usually
+ * enters the call first, under the zero mask, and the SIGALRM ends it with
+ * EINTR; both outcomes are Linux's, and either must finish.
+ */
+static int pselect_mask_sibling_rewrite(void) {
+  pthread_t writer;
+  if (start_alarm_and_writer(&writer, rewrite_mask_then_fill_pipe) != 0) {
+    return 1;
+  }
+  fd_set read_set;
+  FD_ZERO(&read_set);
+  FD_SET(alarm_pipe_fds[0], &read_set);
+  struct pselect_mask_wrapper wrapper = {
+      (const void*)&rewritten_mask, sizeof(uint64_t)};
+  errno = 0;
+  atomic_store_explicit(&about_to_pselect, 1, memory_order_release);
+  int result = (int)syscall(
+      SYS_pselect6, alarm_pipe_fds[0] + 1, &read_set, NULL, NULL, NULL, &wrapper);
+  int result_errno = errno;
+  return finish_raw_pselect(
+      "pselect-sibling", writer, result, result_errno, &read_set, 1);
+}
+
 int main(int argc, char** argv) {
   if (argc != 2) {
     fprintf(
         stderr,
-        "usage: %s [raw|glibc|pselect-mask|efault|einval|poll|thread-wake]\n",
+        "usage: %s [raw|glibc|pselect-mask|efault|einval|poll|thread-wake|"
+        "pselect-mask-blocks-alarm|pselect-mask-shared-alarm|"
+        "pselect-mask-writeonly-wrapper|pselect-mask-sibling-rewrite]\n",
         argv[0]);
     return 2;
   }
@@ -463,6 +821,18 @@ int main(int argc, char** argv) {
   }
   if (strcmp(argv[1], "pselect-mask") == 0) {
     return run_shapes("pselect-mask", GLIBC_PSELECT_MASKED);
+  }
+  if (strcmp(argv[1], "pselect-mask-blocks-alarm") == 0) {
+    return pselect_mask_blocks_alarm();
+  }
+  if (strcmp(argv[1], "pselect-mask-writeonly-wrapper") == 0) {
+    return pselect_mask_writeonly_wrapper();
+  }
+  if (strcmp(argv[1], "pselect-mask-sibling-rewrite") == 0) {
+    return pselect_mask_sibling_rewrite();
+  }
+  if (strcmp(argv[1], "pselect-mask-shared-alarm") == 0) {
+    return pselect_mask_shared_alarm();
   }
   if (strcmp(argv[1], "efault") == 0) {
     return efault();

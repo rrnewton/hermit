@@ -477,9 +477,24 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .read_value(timeout)
                     .is_ok_and(|timeout: Timespec| timeout.tv_sec == 0 && timeout.tv_nsec == 0)
             });
-            return self
-                .record_or_replay_select_family(guest, Syscall::Pselect6(call), zero_timeout)
-                .await;
+            // A call with a `{ sigmask, sigsetsize }` wrapper may sleep under a
+            // temporary mask, and the scheduler must not take the thread's
+            // ordinary mask for it: it would arm the release barrier for a
+            // signal the call blocks and wait for a wake Linux never delivers
+            // (https://github.com/rrnewton/hermit/issues/3963). Nor can this turn
+            // read the mask the kernel will install: the wrapper may sit in
+            // memory a tracer read cannot reach though the kernel can, and a
+            // sibling may rewrite the mask before the kernel copies it. So the
+            // scheduler records no mask for such a call
+            // (`Resources::blocked_signal_mask_unknown`). Without a wrapper the
+            // call sleeps under the thread's own mask, which the scheduler reads.
+            return if call.sigmask().is_some() && !zero_timeout {
+                self.record_or_replay_blocking_with_unknown_mask(guest, Syscall::Pselect6(call))
+                    .await
+            } else {
+                self.record_or_replay_select_family(guest, Syscall::Pselect6(call), zero_timeout)
+                    .await
+            };
         }
         if !self.cfg.sequentialize_threads {
             return Ok(guest.inject(call).await?);

@@ -229,7 +229,18 @@ impl RecordVersion {
 // recording saw ENOSYS for both calls; this replayer would run them and could
 // take another branch and a different schedule, although no event shape
 // changed.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x128);
+// 0x128 -> 0x129: record and replay set
+// `backend_supports_blocked_wait_signal_interruption`, so the scheduler models
+// signal targets as `hermit run` does on ptrace
+// (https://github.com/rrnewton/hermit/issues/3963). A thread that a committed
+// signal wakes out of a backgrounded call rejoins at the release barrier, a
+// precise FUTEX_WAIT or an rt_sigtimedwait ends only for a signal that would end
+// it on Linux, and an emulated pause or nanosleep ends for another thread's
+// signal. (poll, epoll_wait, select and pselect6 are logged background calls
+// here, which the kernel itself ends.) Replay recomputes all of these, so an
+// older recording replayed here could run a different schedule, although no
+// event shape changed.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x129);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -254,7 +265,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x128);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x128;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x129;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -480,7 +491,20 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         virtualize_cpuid: true,
         // Record and replay run under the ptrace backend.
         backend: <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities(),
-        backend_supports_blocked_wait_signal_interruption: false,
+        // As `hermit run` sets it for ptrace (`prepare_backend_config` in
+        // lib.rs). With it off, the scheduler did not model signal targets, so
+        // a thread asleep in a backgrounded rt_sigsuspend that a child-exit
+        // SIGCHLD woke was not held at the release barrier: the scheduler could
+        // pop the next timer, or report a terminal deadlock, before the thread's
+        // continuation posted (https://github.com/rrnewton/hermit/issues/3963).
+        backend_supports_blocked_wait_signal_interruption: true,
+        // A constant, unlike `hermit run`: replay rebuilds this configuration
+        // and must decide which signals end a wait exactly as the recording did,
+        // whatever terminal replay itself runs under. `false` keeps Linux's rule
+        // for the terminal signals a guest sends itself, so a caught SIGINT
+        // still ends a FUTEX_WAIT or rt_sigtimedwait in every recording; a
+        // terminal's own signal during an interactive recording comes from
+        // outside the container, and replay cannot reproduce where it lands.
         guest_may_inherit_a_terminal: false,
         in_guest_detlog_forward_policy: None,
         in_guest_site_patching_off: false,
@@ -827,6 +851,37 @@ mod tests {
     #[test]
     fn record_version_rejects_pre_child_subreaper_streams() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x127)));
+    }
+
+    /// A 0x128 recording was made by a scheduler that did not model signal
+    /// targets in record and replay; replay recomputes where a signalled background thread rejoins
+    /// and which signals end a wait, so it could run another schedule. The
+    /// version gate must refuse it.
+    #[test]
+    fn record_version_rejects_streams_without_signal_target_modelling() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x128)));
+    }
+
+    /// Record and replay run under ptrace with serialized threads, so their
+    /// scheduler models signal targets (`models_signal_targets` in
+    /// detcore/src/scheduler.rs), as `hermit run` does on ptrace. Without it,
+    /// a child-exit SIGCHLD that wakes a thread asleep in a backgrounded
+    /// rt_sigsuspend does not hold the next pass at the release barrier, and
+    /// recording `timeout 1 true` reported a false deadlock in 5 to 7 of 12
+    /// concurrent runs (https://github.com/rrnewton/hermit/issues/3963).
+    #[test]
+    fn record_and_replay_model_signal_targets_as_ptrace_run_does() {
+        let data = tempfile::tempdir().unwrap();
+        let record = record_or_replay_config(data.path());
+        let run =
+            crate::prepare_backend_config(crate::DetConfig::default(), crate::Backend::Ptrace);
+        assert!(record.sequentialize_threads);
+        assert!(record.backend_supports_blocked_wait_signal_interruption);
+        assert_eq!(
+            record.backend_supports_blocked_wait_signal_interruption,
+            run.backend_supports_blocked_wait_signal_interruption
+        );
+        assert!(!record.guest_may_inherit_a_terminal);
     }
 
     #[test]
