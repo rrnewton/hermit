@@ -30,6 +30,7 @@ use crate::procfs::ProcfsSnapshotContext;
 use crate::procfs::TimerSlackReadPreview;
 use crate::resources::ResourceID;
 use crate::stat::*;
+use crate::tool_global::SnapshotMark;
 use crate::types::RawFd;
 use crate::types::*;
 
@@ -944,13 +945,13 @@ impl DetFd {
     /// Install a snapshot freshly read in host order, creating the stream at
     /// position 0 if this is the open file's first `getdents`.
     ///
-    /// `retirements` is the inode retirement count read just before the host
-    /// directory was (see `InodeSighting::Listed`).
-    pub(crate) fn install_directory_snapshot(&self, entries: Vec<DirEntry>, retirements: u64) {
+    /// `mark` is the inode pool's state read just before the host directory
+    /// was (see `SnapshotMark`).
+    pub(crate) fn install_directory_snapshot(&self, entries: Vec<DirEntry>, mark: SnapshotMark) {
         self.with_description(|d| {
             let stream = d.directory.get_or_insert_with(DirectoryStream::default);
             stream.install(entries);
-            stream.note_snapshot_retirements(retirements);
+            stream.note_snapshot_mark(mark);
         });
     }
 
