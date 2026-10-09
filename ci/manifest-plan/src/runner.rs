@@ -9869,12 +9869,15 @@ corpus:
             .unwrap()
             .select(&Selection {
                 test: Some("compat/cat".into()),
+                // The lane's cell; the row's in-guest cells (the corpus's
+                // `additional` backends) carry their own flags.
+                backend: Some("ptrace".into()),
                 population: Some(Population::Required),
                 ..Selection::default()
             })
             .unwrap();
         let [cell] = cells.as_slice() else {
-            panic!("compat/cat must have exactly one CI cell: {cells:?}");
+            panic!("compat/cat must have exactly one ptrace CI cell: {cells:?}");
         };
         assert_eq!(
             (cell.id.mode.as_str(), cell.id.backend.as_deref()),
