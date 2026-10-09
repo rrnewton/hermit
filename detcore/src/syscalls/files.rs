@@ -1015,6 +1015,11 @@ impl<'a> StatTarget<'a> {
     }
 }
 
+/// How many times Detcore injects the `openat` or the `close` of the
+/// `O_PATH` descriptor it opens in the guest to name a procfs entry when the
+/// call did not run, before it records a determinism loss instead.
+const OBJECT_DESCRIPTOR_ATTEMPTS: usize = 8;
+
 /// What Detcore learned of a stat result that may describe a procfs file
 /// (see [`procfs_inode`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1028,7 +1033,8 @@ enum ProcfsEntry {
     /// loss.
     Unnamed,
     /// A file Detcore could not tell from a procfs file, as it could not read
-    /// the guest's mount table. It recorded a determinism loss.
+    /// the guest's mount table or the file's filesystem type. It recorded a
+    /// determinism loss.
     Unknown,
 }
 
@@ -4262,7 +4268,32 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let mounts = match procfs_inode::procfs_mounts(guest.tid().as_raw(), stat.dev) {
             Ok(Some(mounts)) => mounts,
-            Ok(None) => return ProcfsEntry::NotProcfs,
+            // No procfs mount in the guest's mount table is on the device, but
+            // a procfs file can be, opened outside the guest's mounts: one
+            // inherited from Hermit's own `/proc`, or received through
+            // SCM_RIGHTS. It has no path within the guest's procfs, so it goes
+            // unnamed. Its filesystem type tells.
+            Ok(None) => {
+                let on_procfs = Self::with_object_link(guest, target, |link| {
+                    procfs_inode::is_on_procfs(link, stat.dev, stat.inode)
+                })
+                .await;
+                return match on_procfs {
+                    Ok(false) => ProcfsEntry::NotProcfs,
+                    Ok(true) => {
+                        Self::record_procfs_loss(
+                            guest,
+                            "a procfs file outside the guest's procfs mounts".into(),
+                        )
+                        .await;
+                        ProcfsEntry::Unnamed
+                    }
+                    Err(reason) => {
+                        Self::record_procfs_loss(guest, reason).await;
+                        ProcfsEntry::Unknown
+                    }
+                };
+            }
             Err(error) => {
                 Self::record_procfs_loss(
                     guest,
@@ -4282,25 +4313,39 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// The canonical path of the procfs file `stat` describes, which the
-    /// guest named as `target`, from the magic link of the descriptor or
-    /// working directory in the guest thread's `/proc/<tid>`, if that is
-    /// still the file `stat` describes. For a path, Detcore opens an `O_PATH`
-    /// descriptor in the guest with the guest's own path, directory and
-    /// flags, which resolves `self` and `thread-self` to the guest, and
-    /// closes it again. An entry the host rebuilt between the guest's stat
-    /// and that open, a window of one injected call, is not the file `stat`
-    /// describes, and goes unnamed.
+    /// guest named as `target`, from a magic link to it (see
+    /// [`Self::with_object_link`]), if that is still the file `stat`
+    /// describes. An entry the host rebuilt between the guest's stat and an
+    /// `O_PATH` open, a window of one injected call, is not, and goes
+    /// unnamed.
     async fn procfs_canonical_path<G: Guest<Self>>(
         guest: &mut G,
         stat: &DetStat,
         target: StatTarget<'_>,
     ) -> Result<PathBuf, String> {
+        Self::with_object_link(guest, target, |link| {
+            procfs_inode::inspect_link(link, stat.dev, stat.inode)
+        })
+        .await
+    }
+
+    /// Run `inspect` on a magic link to the file the guest named as
+    /// `target`: that of the descriptor or working directory in the guest
+    /// thread's `/proc/<tid>`. For a path, Detcore opens an `O_PATH`
+    /// descriptor in the guest with the guest's own path, directory and
+    /// flags, which resolves `self` and `thread-self` to the guest, and
+    /// closes it again (see [`Self::open_object_descriptor`] and
+    /// [`Self::close_object_descriptor`]). An error is the reason Detcore
+    /// learned nothing, or that the guest's descriptors may have changed.
+    async fn with_object_link<G: Guest<Self>, R>(
+        guest: &mut G,
+        target: StatTarget<'_>,
+        inspect: impl FnOnce(&Path) -> Result<R, String>,
+    ) -> Result<R, String> {
         let tid = guest.tid().as_raw();
-        let inspect =
-            |link: String| procfs_inode::inspect_link(Path::new(&link), stat.dev, stat.inode);
         match target {
-            StatTarget::Descriptor(fd) => inspect(format!("/proc/{tid}/fd/{fd}")),
-            StatTarget::Cwd => inspect(format!("/proc/{tid}/cwd")),
+            StatTarget::Descriptor(fd) => inspect(Path::new(&format!("/proc/{tid}/fd/{fd}"))),
+            StatTarget::Cwd => inspect(Path::new(&format!("/proc/{tid}/cwd"))),
             StatTarget::Overwritten => Err("the call's result overwrote the guest's path".into()),
             StatTarget::Path {
                 dirfd,
@@ -4315,36 +4360,93 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .with_dirfd(dirfd)
                     .with_path(path)
                     .with_flags(flags);
-                let fd = guest
-                    .inject_with_retry(open)
-                    .await
-                    .map_err(|errno| format!("cannot open the guest's path again: {errno}"))?;
-                let found = inspect(format!("/proc/{tid}/fd/{fd}"));
-                let close = syscalls::Close::new().with_fd(fd as i32);
-                loop {
-                    match guest.inject(close).await {
-                        // A close that never ran: Reverie reports an injection
-                        // that a signal stopped before it executed as a
-                        // restart, which Linux's close never returns.
-                        Err(
-                            Errno::ERESTARTSYS
-                            | Errno::ERESTARTNOINTR
-                            | Errno::ERESTARTNOHAND
-                            | Errno::ERESTART_RESTARTBLOCK,
-                        ) => continue,
-                        Err(Errno::EBADF) => {
-                            return Err(
-                                "the guest's O_PATH descriptor was not open to close".into()
-                            );
-                        }
-                        // Linux releases the descriptor whatever else close
-                        // returns, and turns an interrupted close into EINTR,
-                        // which must not be retried.
-                        _ => return found,
-                    }
-                }
+                let fd = Self::open_object_descriptor(guest, open).await?;
+                let found = inspect(Path::new(&format!("/proc/{tid}/fd/{fd}")));
+                Self::close_object_descriptor(guest, fd).await?;
+                found
             }
         }
+    }
+
+    /// Open the `O_PATH` descriptor `open` describes in the guest. Reverie
+    /// reports an injection that a signal stopped before it ran as a restart,
+    /// and an `O_PATH` open does not sleep, so `EINTR` too means that it did
+    /// not run. Either is tried again, but only `OBJECT_DESCRIPTOR_ATTEMPTS`
+    /// times, as a seccomp filter the guest inherited can return it every
+    /// time without running the call.
+    async fn open_object_descriptor<G: Guest<Self>>(
+        guest: &mut G,
+        open: syscalls::Openat,
+    ) -> Result<RawFd, String> {
+        let mut last = Errno::EINTR;
+        for _ in 0..OBJECT_DESCRIPTOR_ATTEMPTS {
+            match guest.inject(open).await {
+                Ok(fd) => {
+                    return RawFd::try_from(fd)
+                        .map_err(|_| format!("openat returned {fd}, which is no descriptor"));
+                }
+                Err(
+                    errno @ (Errno::EINTR
+                    | Errno::ERESTARTSYS
+                    | Errno::ERESTARTNOINTR
+                    | Errno::ERESTARTNOHAND
+                    | Errno::ERESTART_RESTARTBLOCK),
+                ) => last = errno,
+                Err(errno) => return Err(format!("cannot open the guest's path again: {errno}")),
+            }
+        }
+        Err(format!(
+            "cannot open the guest's path again: {last} in each of {OBJECT_DESCRIPTOR_ATTEMPTS} attempts"
+        ))
+    }
+
+    /// Close the `O_PATH` descriptor `fd` that Detcore opened in the guest,
+    /// and confirm through the guest thread's `/proc/<tid>/fd` that it is
+    /// gone, as a seccomp filter the guest inherited can refuse the close,
+    /// with `EPERM`, say, without running it. A descriptor left open would
+    /// change the numbers the guest's later descriptors take, so it is an
+    /// error. A restart means that the close did not run (Linux's
+    /// close releases the descriptor first, and so turns its own restarts
+    /// into `EINTR`), so it is tried again, but only
+    /// `OBJECT_DESCRIPTOR_ATTEMPTS` times. Without thread sequentialization,
+    /// another guest thread can take the number as soon as it is free, which
+    /// reads as a descriptor left open.
+    async fn close_object_descriptor<G: Guest<Self>>(
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<(), String> {
+        let link = format!("/proc/{}/fd/{fd}", guest.tid().as_raw());
+        let close = syscalls::Close::new().with_fd(fd);
+        for _ in 0..OBJECT_DESCRIPTOR_ATTEMPTS {
+            let result = guest.inject(close).await;
+            if result == Err(Errno::EBADF) {
+                return Err("close of the guest's O_PATH descriptor returned EBADF".into());
+            }
+            match std::fs::symlink_metadata(&link) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => {
+                    return Err(format!(
+                        "cannot tell whether close released the guest's O_PATH descriptor: {error}"
+                    ));
+                }
+                Ok(_) => match result {
+                    Err(
+                        Errno::ERESTARTSYS
+                        | Errno::ERESTARTNOINTR
+                        | Errno::ERESTARTNOHAND
+                        | Errno::ERESTART_RESTARTBLOCK,
+                    ) => {}
+                    result => {
+                        return Err(format!(
+                            "close left the guest's O_PATH descriptor open, returning {result:?}"
+                        ));
+                    }
+                },
+            }
+        }
+        Err(format!(
+            "close of the guest's O_PATH descriptor did not run in {OBJECT_DESCRIPTOR_ATTEMPTS} attempts"
+        ))
     }
 
     /// Records the determinism loss of a procfs entry Detcore could not name,
@@ -6550,11 +6652,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             return self.serve_next_batch(guest, call).await;
         }
         let mark = directory_snapshot_mark(guest).await;
+        // How to key the entries' numbers is decided with the snapshot, as a
+        // procfs directory loses its name once its task exits (see
+        // `DirectoryStream`).
+        let inodes = self.directory_inodes(guest, call.fd).await?;
         match self.snapshot_directory_privately(guest, call).await {
             Ok(Some(entries)) => {
                 let mut entries = Some(entries);
                 guest.thread_state().with_detfd(call.fd, |detfd| {
-                    detfd.install_directory_snapshot(entries.take().unwrap_or_default(), mark)
+                    detfd.install_directory_snapshot(
+                        entries.take().unwrap_or_default(),
+                        mark,
+                        inodes.clone(),
+                    )
                 })?;
                 self.serve_next_batch(guest, call).await
             }
@@ -6614,6 +6724,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             None | Some((0, true)) => return Ok(kernel.map(|_| 0)?),
             Some((_, true)) => {
                 let mark = directory_snapshot_mark(guest).await;
+                let inodes = self.directory_inodes(guest, call.fd).await?;
                 match self.snapshot_directory_privately(guest, call).await {
                     Ok(Some(entries)) => {
                         let mut entries = Some(entries);
@@ -6621,6 +6732,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                             detfd.install_directory_snapshot(
                                 entries.take().unwrap_or_default(),
                                 mark,
+                                inodes.clone(),
                             );
                             detfd.with_directory_stream(|stream| stream.kernel_target())
                         })??;
@@ -6641,8 +6753,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Return the entries at the stream's position that fit in the guest's
-    /// buffer, with determinized inodes and each `d_off` naming the position
-    /// after its entry, counting from 1.
+    /// buffer, with determinized inodes, keyed as decided when the snapshot
+    /// was taken, and each `d_off` naming the position after its entry,
+    /// counting from 1.
     ///
     /// Whatever the outcome, the kernel position then follows the stream (see
     /// [`DirectoryStream::kernel_target`]).
@@ -6651,18 +6764,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: GetdentsCall<'_>,
     ) -> Result<i64, Error> {
-        let (start, batch, mark) = guest.thread_state().with_detfd(call.fd, |detfd| {
-            detfd.with_directory_stream(|stream| {
-                (
-                    stream.position(),
-                    stream.next_batch(call.format, call.capacity),
-                    stream.snapshot_mark(),
-                )
-            })
-        })??;
+        let (start, batch, mark, inodes) =
+            guest.thread_state().with_detfd(call.fd, |detfd| {
+                detfd.with_directory_stream(|stream| {
+                    (
+                        stream.position(),
+                        stream.next_batch(call.format, call.capacity),
+                        stream.snapshot_mark(),
+                        stream.snapshot_inodes(),
+                    )
+                })
+            })??;
         let (passed, copied) = match batch {
             Ok(batch) => {
-                let inodes = self.directory_inodes(guest, call.fd).await?;
+                // Every snapshot is installed with its keys; a stream without
+                // them is keyed now.
+                let inodes = match inodes {
+                    Some(inodes) => inodes,
+                    None => self.directory_inodes(guest, call.fd).await?,
+                };
                 let mut records = Vec::new();
                 let mut names = Vec::with_capacity(batch.len());
                 for (index, entry) in batch.iter().enumerate() {
