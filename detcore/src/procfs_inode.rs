@@ -39,19 +39,18 @@
 //! link of the descriptor or working directory the call described, or, for a
 //! call that named a path, the link of an `O_PATH` descriptor that Detcore
 //! opens with the guest's own path, directory and root, and closes again.
-//! When it cannot name a procfs entry (the mount table cannot be read, the
-//! guest has no descriptor left or no longer holds the path it named, the
-//! object found is not the one the guest saw) it numbers the entry by its
-//! host inode and records a determinism loss, so the run is not compared.
+//! The mount the object was reached through, which `statx` names, gives the
+//! mount point to take off that path and the directory of procfs it shows
+//! ([`path_within`]). When it cannot name a procfs entry (the mount table
+//! cannot be read, the guest has no descriptor left or no longer holds the
+//! path it named, the object found is not the one the guest saw, or was
+//! reached through a mount the table does not list) it numbers the entry by
+//! its host inode and records a determinism loss, so the run is not compared.
 //!
 //! Each of these numbers the entry as Detcore did before:
 //!
 //! - An entry rebuilt before Detcore first saw its path gets a new number,
 //!   which that path then leads to.
-//! - A procfs subtree bind-mounted elsewhere is named by the canonical path the
-//!   tracer reads, as is any path under no mount point the guest's mount table
-//!   lists (for a guest whose root differs from the tracer's), so the same
-//!   entry reached another way can get another name.
 //! - A path lookup crosses every mount on the guest's path again, so a mount
 //!   on a FUSE file system whose server is a guest Detcore holds could stall
 //!   it.
@@ -211,10 +210,12 @@ fn tasks_named(within: &Path) -> Vec<i32> {
     tasks
 }
 
-/// A procfs mount in a guest's mount table: the directory of procfs it shows
-/// (`/` unless a subtree is bind-mounted) and where it is mounted.
+/// A procfs mount in a guest's mount table: its ID, the directory of procfs it
+/// shows (`/` unless a subtree is bind-mounted) and where it is mounted, as a
+/// path in the frame magic links read in (see [`procfs_mounts`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProcfsMount {
+    id: u64,
     root: PathBuf,
     mount_point: PathBuf,
 }
@@ -223,22 +224,45 @@ pub(crate) struct ProcfsMount {
 /// `tid`, by its `/proc/<tid>/mountinfo`, which Linux writes without touching
 /// any mounted file system: `Ok(None)` when `device` is not procfs there, and
 /// an error when the tracer cannot tell, or when the descriptor that read the
-/// table did not close (see [`read_checking_close`]). Detcore refuses
-/// `mount`, `unshare` and `setns` once it starts, so a guest's procfs mount
-/// stays one: the mounts of a device found to be procfs are remembered with
-/// its mount namespace, while any other device is looked up again, as it may
-/// yet become one.
+/// table did not close (see [`read_checking_close`]).
+///
+/// The table gives each mount point relative to the guest thread's root,
+/// while a magic link reads as a path relative to the root of the thread
+/// that reads it: the tracer's, or, under SaBRe, the guest's own. So each
+/// mount point is put below the path the guest thread's root reads as, from
+/// its `/proc/<tid>/root`, which the same thread reads.
+///
+/// Detcore refuses `mount`, `unshare` and `setns` once it starts, so a guest's
+/// procfs mount stays one: the mounts of a device found to be procfs are
+/// remembered with its mount namespace and the guest thread's root, which a
+/// `chroot` changes, by its mount, device and inode, and the path it reads
+/// as. Any other device is looked up again, as it may yet become one. A guest
+/// thread that changes the root while Detcore reads for another thread that
+/// shares it, which thread sequentialization rules out, can leave the two
+/// paths in different frames.
 pub(crate) fn procfs_mounts(tid: i32, device: u64) -> io::Result<Option<Arc<[ProcfsMount]>>> {
-    type Known = HashMap<(u64, u64), Arc<[ProcfsMount]>>;
-    static PROCFS_DEVICES: OnceLock<Mutex<Known>> = OnceLock::new();
+    // The mount namespace, the root's mount, device, inode and path, and
+    // the device.
+    type Key = (u64, Option<u64>, u64, u64, PathBuf, u64);
+    static PROCFS_DEVICES: OnceLock<Mutex<HashMap<Key, Arc<[ProcfsMount]>>>> = OnceLock::new();
     let namespace = std::fs::metadata(format!("/proc/{tid}/ns/mnt"))?;
-    let key = (namespace.ino(), device);
+    let root_link = PathBuf::from(format!("/proc/{tid}/root"));
+    let root = identify(&root_link)?;
+    let root_path = std::fs::read_link(&root_link)?;
+    let key = (
+        namespace.ino(),
+        root.mount_id,
+        root.device,
+        root.inode,
+        root_path.clone(),
+        device,
+    );
     let known = PROCFS_DEVICES.get_or_init(Default::default);
     if let Some(mounts) = known.lock().unwrap().get(&key) {
         return Ok(Some(mounts.clone()));
     }
     let mountinfo = read_checking_close(&format!("/proc/{tid}/mountinfo"))?;
-    let mounts = procfs_mounts_in(&mountinfo, device);
+    let mounts = procfs_mounts_in(&mountinfo, device, &root_path);
     if mounts.is_empty() {
         return Ok(None);
     }
@@ -271,8 +295,10 @@ fn read_checking_close(path: &str) -> io::Result<Vec<u8>> {
 
 /// The procfs mounts of `device` a `mountinfo` table lists: lines whose third
 /// field is the device's `major:minor` and whose file system type, the field
-/// after the `-` separator that ends the optional fields, is `proc`.
-fn procfs_mounts_in(mountinfo: &[u8], device: u64) -> Vec<ProcfsMount> {
+/// after the `-` separator that ends the optional fields, is `proc`. Each
+/// mount point, which the table gives relative to the root of the thread it
+/// describes, is put below `guest_root`, the path that root reads as.
+fn procfs_mounts_in(mountinfo: &[u8], device: u64, guest_root: &Path) -> Vec<ProcfsMount> {
     let wanted = format!("{}:{}", libc::major(device), libc::minor(device));
     mountinfo
         .split(|byte| *byte == b'\n')
@@ -285,9 +311,11 @@ fn procfs_mounts_in(mountinfo: &[u8], device: u64) -> Vec<ProcfsMount> {
             if fields.get(separator + 1).copied() != Some(b"proc".as_slice()) {
                 return None;
             }
+            let mount_point = unescape(fields[4]);
             Some(ProcfsMount {
+                id: std::str::from_utf8(fields[0]).ok()?.parse().ok()?,
                 root: unescape(fields[3]),
-                mount_point: unescape(fields[4]),
+                mount_point: guest_root.join(mount_point.strip_prefix("/").unwrap_or(&mount_point)),
             })
         })
         .collect()
@@ -318,38 +346,41 @@ fn unescape(field: &[u8]) -> PathBuf {
     PathBuf::from(OsString::from_vec(path))
 }
 
-/// The path within procfs of the object at the canonical path `canonical`:
-/// its path below the deepest mount point of `mounts` that contains it,
-/// joined to that mount's root. A path under no mount point is kept whole.
-pub(crate) fn path_within(mounts: &[ProcfsMount], canonical: &Path) -> PathBuf {
-    let deepest = mounts
-        .iter()
-        .filter_map(|mount| {
-            let rest = canonical.strip_prefix(&mount.mount_point).ok()?;
-            Some((mount, rest))
-        })
-        .max_by_key(|(mount, _)| mount.mount_point.components().count());
-    match deepest {
-        Some((mount, rest)) if rest.as_os_str().is_empty() => mount.root.clone(),
-        Some((mount, rest)) => mount.root.join(rest),
-        None => canonical.to_path_buf(),
+/// The path within procfs of the object at the canonical path `canonical`,
+/// reached through the mount `mount_id`: its path below that mount's mount
+/// point, joined to the mount's root. `None` when `mounts` does not list the
+/// mount, or lists it at a mount point that does not hold `canonical`, so a
+/// path read in another frame than the table names nothing.
+pub(crate) fn path_within(
+    mounts: &[ProcfsMount],
+    mount_id: u64,
+    canonical: &Path,
+) -> Option<PathBuf> {
+    let mount = mounts.iter().find(|mount| mount.id == mount_id)?;
+    let rest = canonical.strip_prefix(&mount.mount_point).ok()?;
+    if rest.as_os_str().is_empty() {
+        Some(mount.root.clone())
+    } else {
+        Some(mount.root.join(rest))
     }
 }
 
 /// The canonical path of the procfs object behind the magic link `link` (a
 /// `/proc/<tid>/fd/<n>` or `/proc/<tid>/cwd`), which must be inode `inode` on
-/// `device`. Following such a link touches only procfs and the object, which
-/// is on procfs.
+/// `device`, and the ID of the mount it was reached through, which places the
+/// path in the guest's mount table (see [`path_within`]). Following such a
+/// link touches only procfs and the object, which is on procfs.
 ///
 /// Once a task is reaped, a stat through a link to one of its entries fails,
 /// and the link reads as the entry's path with ` (deleted)` appended, as for
 /// a removed file. The task can be reaped between the two, so such a path is
 /// refused too (see [`refuse_deleted`]).
-pub(crate) fn inspect_link(link: &Path, device: u64, inode: u64) -> Result<PathBuf, String> {
-    check_link_object(link, device, inode)?;
+pub(crate) fn inspect_link(link: &Path, device: u64, inode: u64) -> Result<(PathBuf, u64), String> {
+    let mount_id = check_link_object(link, device, inode)?
+        .ok_or_else(|| format!("the kernel does not report the mount of {}", link.display()))?;
     let canonical = std::fs::read_link(link)
         .map_err(|error| format!("cannot read the link {}: {error}", link.display()))?;
-    refuse_deleted(link, canonical)
+    Ok((refuse_deleted(link, canonical)?, mount_id))
 }
 
 /// `canonical`, read from the magic link `link`, unless it ends in
@@ -386,17 +417,56 @@ pub(crate) fn is_on_procfs(link: &Path, device: u64, inode: u64) -> Result<bool,
     Ok(unsafe { buf.assume_init() }.f_type == libc::PROC_SUPER_MAGIC)
 }
 
-/// Requires that the magic link `link` lead to inode `inode` on `device`.
-fn check_link_object(link: &Path, device: u64, inode: u64) -> Result<(), String> {
-    let metadata = std::fs::metadata(link)
-        .map_err(|error| format!("cannot stat {}: {error}", link.display()))?;
-    if metadata.dev() != device || metadata.ino() != inode {
+/// Requires that the magic link `link` lead to inode `inode` on `device`, and
+/// returns the ID of the mount the object was reached through, when the
+/// kernel reports one.
+fn check_link_object(link: &Path, device: u64, inode: u64) -> Result<Option<u64>, String> {
+    let found =
+        identify(link).map_err(|error| format!("cannot stat {}: {error}", link.display()))?;
+    if found.device != device || found.inode != inode {
         return Err(format!(
             "{} is not the object the guest saw",
             link.display()
         ));
     }
-    Ok(())
+    Ok(found.mount_id)
+}
+
+/// The device, inode and mount of a file, by `statx`.
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+    /// The ID of the mount the file was reached through, the first field of
+    /// its line in `mountinfo`, when the kernel reports it (`STATX_MNT_ID`,
+    /// from Linux 5.8).
+    mount_id: Option<u64>,
+}
+
+/// The identity of the file at `path`, following a final link, as a magic
+/// link is followed: to the object it leads to, through the mount it was
+/// reached through.
+fn identify(path: &Path) -> io::Result<FileIdentity> {
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::other(format!("{} contains a NUL byte", path.display())))?;
+    let mut buf = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    let mask = libc::STATX_INO | libc::STATX_MNT_ID;
+    // `AT_NO_AUTOMOUNT`, which `stat` implies, so that looking never mounts
+    // anything.
+    let flags = libc::AT_NO_AUTOMOUNT;
+    // SAFETY: `path` is NUL-terminated and `buf` is large enough for statx.
+    if unsafe { libc::statx(libc::AT_FDCWD, path.as_ptr(), flags, mask, buf.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: statx succeeded, so it filled `buf`.
+    let found = unsafe { buf.assume_init() };
+    if found.stx_mask & libc::STATX_INO == 0 {
+        return Err(io::Error::other("statx reported no inode number"));
+    }
+    Ok(FileIdentity {
+        device: libc::makedev(found.stx_dev_major, found.stx_dev_minor),
+        inode: found.stx_ino,
+        mount_id: (found.stx_mask & libc::STATX_MNT_ID != 0).then_some(found.stx_mnt_id),
+    })
 }
 
 /// A procfs directory being listed, by its path within procfs.
@@ -724,7 +794,7 @@ mod tests {
         let fds = File::open(format!("/proc/self/task/{tid}/fd")).unwrap();
         let metadata = fds.metadata().unwrap();
         let link = PathBuf::from(format!("/proc/self/fd/{}", fds.as_raw_fd()));
-        let inspect = || inspect_link(&link, metadata.dev(), metadata.ino());
+        let inspect = || inspect_link(&link, metadata.dev(), metadata.ino()).map(|(path, _)| path);
         let expected = format!("/proc/{}/task/{tid}/fd", std::process::id());
         assert_eq!(inspect(), Ok(PathBuf::from(expected)));
         finish.send(()).unwrap();
@@ -797,36 +867,95 @@ mod tests {
 
     #[test]
     fn mountinfo_names_procfs_mounts_by_type() {
-        let mounts = |minor| procfs_mounts_in(MOUNTINFO, libc::makedev(0, minor));
-        let mount = |root: &str, mount_point: &str| ProcfsMount {
+        let mounts = |minor| procfs_mounts_in(MOUNTINFO, libc::makedev(0, minor), Path::new("/"));
+        let mount = |id: u64, root: &str, mount_point: &str| ProcfsMount {
+            id,
             root: PathBuf::from(root),
             mount_point: PathBuf::from(mount_point),
         };
         assert_eq!(
             mounts(21),
-            vec![mount("/", "/proc"), mount("/sys", "/srv/my sys")]
+            vec![mount(22, "/", "/proc"), mount(27, "/sys", "/srv/my sys")]
         );
         assert_eq!(
             mounts(25),
-            vec![mount("/", "/srv/proc")],
+            vec![mount(26, "/", "/srv/proc")],
             "a mount with no optional fields"
         );
         for minor in [22, 23, 24, 26] {
             assert!(mounts(minor).is_empty(), "0:{minor}");
         }
-        assert!(procfs_mounts_in(MOUNTINFO, libc::makedev(8, 21)).is_empty());
+        assert!(procfs_mounts_in(MOUNTINFO, libc::makedev(8, 21), Path::new("/")).is_empty());
+    }
+
+    /// The table gives mount points relative to the guest's root, so they
+    /// are put below the path that root reads as.
+    #[test]
+    fn mount_points_are_read_in_the_frame_of_the_guests_root() {
+        let mounts = procfs_mounts_in(MOUNTINFO, libc::makedev(0, 21), Path::new("/box"));
+        let points: Vec<&Path> = mounts
+            .iter()
+            .map(|mount| mount.mount_point.as_path())
+            .collect();
+        assert_eq!(
+            points,
+            [Path::new("/box/proc"), Path::new("/box/srv/my sys")]
+        );
     }
 
     #[test]
     fn a_path_within_procfs_does_not_depend_on_the_mount() {
-        let mounts = procfs_mounts_in(MOUNTINFO, libc::makedev(0, 21));
-        let within = |path: &str| path_within(&mounts, Path::new(path));
-        assert_eq!(within("/proc"), PathBuf::from("/"));
-        assert_eq!(within("/proc/3/fd/0"), PathBuf::from("/3/fd/0"));
-        assert_eq!(within("/srv/my sys/kernel"), PathBuf::from("/sys/kernel"));
-        assert_eq!(within("/proc/sys/kernel"), PathBuf::from("/sys/kernel"));
-        assert_eq!(within("/procfs/3"), PathBuf::from("/procfs/3"));
-        assert_eq!(within("/elsewhere/3"), PathBuf::from("/elsewhere/3"));
+        let mounts = procfs_mounts_in(MOUNTINFO, libc::makedev(0, 21), Path::new("/"));
+        let within = |id: u64, path: &str| path_within(&mounts, id, Path::new(path));
+        let named = |path: &str| Some(PathBuf::from(path));
+        assert_eq!(within(22, "/proc"), named("/"));
+        assert_eq!(within(22, "/proc/3/fd/0"), named("/3/fd/0"));
+        assert_eq!(within(27, "/srv/my sys/kernel"), named("/sys/kernel"));
+        assert_eq!(within(22, "/proc/sys/kernel"), named("/sys/kernel"));
+        // A path that the mount it was reached through does not hold, or a
+        // mount the table does not list for the device, names nothing.
+        assert_eq!(within(22, "/procfs/3"), None);
+        assert_eq!(within(22, "/elsewhere/3"), None);
+        assert_eq!(within(27, "/proc/3"), None);
+        assert_eq!(within(26, "/srv/proc/3"), None);
+    }
+
+    /// A table read before the guest changed its root lists mount points in
+    /// the old frame. The path a link reads as in the new frame can lie under
+    /// another mount there, here one that shows all of procfs where the guest
+    /// reached a bind mount of `/proc/sys`. Matching the mount the guest
+    /// reached the file through names nothing then, rather than another
+    /// entry; the table read in the new frame names the entry again.
+    #[test]
+    fn a_stale_table_names_nothing_rather_than_another_entry() {
+        let device = libc::makedev(0, 21);
+        let before = procfs_mounts_in(
+            b"\
+22 1 0:21 / /proc rw - proc proc rw
+30 1 0:21 /sys /box/proc rw - proc proc rw
+",
+            device,
+            Path::new("/"),
+        );
+        let sysctl = Some(PathBuf::from("/sys/kernel"));
+        assert_eq!(
+            path_within(&before, 30, Path::new("/box/proc/kernel")),
+            sysctl
+        );
+        // After chroot("/box"), a guest that reads its own links, as under
+        // SaBRe, reads this one as /proc/kernel.
+        assert_eq!(path_within(&before, 30, Path::new("/proc/kernel")), None);
+        let after = b"\
+30 1 0:21 /sys /proc rw - proc proc rw
+";
+        let own = procfs_mounts_in(after, device, Path::new("/"));
+        assert_eq!(path_within(&own, 30, Path::new("/proc/kernel")), sysctl);
+        // The tracer, whose root is still /, reads the guest's root as /box.
+        let traced = procfs_mounts_in(after, device, Path::new("/box"));
+        assert_eq!(
+            path_within(&traced, 30, Path::new("/box/proc/kernel")),
+            sysctl
+        );
     }
 
     #[test]
@@ -848,17 +977,17 @@ mod tests {
         let stat = std::fs::metadata(format!("/proc/{pid}/stat")).unwrap();
         let file = File::open("/proc/self/stat").unwrap();
         let link = PathBuf::from(format!("/proc/{pid}/fd/{}", file.as_raw_fd()));
-        let canonical = inspect_link(&link, stat.dev(), stat.ino()).unwrap();
+        let (canonical, mount_id) = inspect_link(&link, stat.dev(), stat.ino()).unwrap();
         assert_eq!(
-            path_within(&mounts, &canonical),
-            PathBuf::from(format!("/{pid}/stat"))
+            path_within(&mounts, mount_id, &canonical),
+            Some(PathBuf::from(format!("/{pid}/stat")))
         );
         assert!(inspect_link(&link, stat.dev(), stat.ino() + 1).is_err());
         assert!(inspect_link(&link, stat.dev() + 1, stat.ino()).is_err());
         let cwd = PathBuf::from(format!("/proc/{pid}/cwd"));
         let here = std::fs::metadata(".").unwrap();
         assert_eq!(
-            inspect_link(&cwd, here.dev(), here.ino()).unwrap(),
+            inspect_link(&cwd, here.dev(), here.ino()).unwrap().0,
             std::env::current_dir().unwrap()
         );
     }
