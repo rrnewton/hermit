@@ -2115,7 +2115,7 @@ pub async fn do_a_turn_blocking(
                             timed_event_processed = state.step2b_process_timed();
                         }
                         // Idempotent and spends no event budget, so it runs on
-                        // every refresh, even one before stage 0's drain.
+                        // every refresh.
                         state.step2b_restore_due_pollers();
                         if let Err(error) = state.select_parked_alarm() {
                             state.fail_parked_selection(error);
@@ -4268,16 +4268,21 @@ impl Scheduler {
     /// 3. it is queued but no longer backed off (`do_poll_upgrade`, or a
     ///    replayed priority change, restored it already): drop;
     /// 4. its request still carries the deadline but it is out of the run
-    ///    queue, which happens while a parked alarm observation holds its
-    ///    suspended entry (`take_validated_membership`): keep, so a later pass
-    ///    restores it once the original entry is back.
+    ///    queue: keep, so a later pass restores it once it is back. This is
+    ///    defensive: the only suspension of a queued entry,
+    ///    `take_validated_membership` for a parked alarm observation, accepts
+    ///    no request that carries a poll deadline today.
     ///
     /// Deterministic: it reads only the deadlines threads computed in their own
     /// turns, `committed_time`, the run queue and the pending requests. It is
     /// idempotent for a given `committed_time` and monotone in it, so how many
     /// passes run between commits does not change its result; it is the same
-    /// exposure `step2b_process_timed` already has to `committed_time`. It
-    /// re-keys entries in place and never pushes.
+    /// exposure `step2b_process_timed` already has to `committed_time`. A
+    /// restore moves the entry to the back of its normal priority level: it
+    /// takes a new back turn and counts toward the poll-upgrade interval
+    /// (`RunQueue::restore_poller_priority`), so a poll upgrade can fire in the
+    /// middle of this loop. Both are deterministic. It never admits or removes
+    /// a thread.
     fn step2b_restore_due_pollers(&mut self) {
         let due: Vec<(LogicalTime, DetTid)> = self
             .poll_deadlines

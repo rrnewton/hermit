@@ -4318,9 +4318,20 @@ fn a_refused_turn_charge_returns_before_a_controlled_observation() {
 /// Queue `tid` as a backed-off poller through `step4_resource_block`'s real
 /// polling branch, retrying a timed wait whose deadline is `deadline`.
 fn backed_off_poller(s: &mut Scheduler, tid: DetTid, deadline: Option<LogicalTime>) -> Resources {
+    backed_off_poller_after(s, tid, deadline, 1)
+}
+
+/// As `backed_off_poller`, after `attempt` retries. From attempt 4 on, the
+/// backed-off priority is capped at `LAST_PRIORITY`.
+fn backed_off_poller_after(
+    s: &mut Scheduler,
+    tid: DetTid,
+    deadline: Option<LogicalTime>,
+    attempt: u32,
+) -> Resources {
     let mut request = Resources::new(tid);
     request.insert(ResourceID::InternalIOPolling, Permission::W);
-    request.poll_attempt = 1;
+    request.poll_attempt = attempt;
     request.poll_deadline = deadline;
     s.next_turns[&tid].req.put(Ok(request.clone()));
     s.run_queue.push_front(tid, DEFAULT_PRIORITY);
@@ -4597,23 +4608,67 @@ fn the_controlled_loop_restores_a_poller_whose_deadline_a_refresh_crosses() {
     assert_eq!(s.run_queue.queued_priority(poller), Some(DEFAULT_PRIORITY));
 }
 
-/// A poller restored by its deadline does not block the deterministic-work-first
-/// gate of a deferred SIGCHLD: the signal's thread is re-admitted ahead of it,
-/// as it would be while the poller was still backed off. Without this, a
-/// thread whose timed wait ended first had its held SIGCHLD handler delayed
-/// until the restored poller had run.
+/// A deferred SIGCHLD and a restored poller: the gate decides as it did while
+/// the poller was backed off. A poller backed off to `LAST_PRIORITY` counted
+/// as a poller, so the signal's thread is re-admitted ahead of it; one backed
+/// off to 2000 (one retry) counted as ordinary work, so the signal stays
+/// deferred until the poller has run, as on main.
 #[test]
-fn a_deadline_restored_poller_does_not_defer_a_held_sigchld() {
-    let mut s = uncontrolled();
-    let (forker, _, _) = add(&mut s, 100, 100);
-    let (poller, _, _) = add(&mut s, 100, 101);
-    backed_off_poller(&mut s, poller, Some(at(100)));
-    s.committed_time = at(100);
-    s.step2b_restore_due_pollers();
-    assert!(s.poll_deadline_of.is_empty(), "restored");
-    s.blocked.sigchld_deferred.insert(forker);
+fn a_deadline_restored_poller_gates_a_held_sigchld_as_while_backed_off() {
+    for (attempt, readmitted) in [(4, true), (1, false)] {
+        let mut s = uncontrolled();
+        let (forker, _, _) = add(&mut s, 100, 100);
+        let (poller, _, _) = add(&mut s, 100, 101);
+        backed_off_poller_after(&mut s, poller, Some(at(100)), attempt);
+        s.committed_time = at(100);
+        s.step2b_restore_due_pollers();
+        assert!(s.poll_deadline_of.is_empty(), "restored");
+        s.blocked.sigchld_deferred.insert(forker);
 
-    s.step2e_process_signal_deferred();
-    assert!(s.blocked.sigchld_deferred.is_empty(), "re-admitted");
-    assert_eq!(next_selection(&mut s), Some(forker));
+        s.step2e_process_signal_deferred();
+        assert_eq!(
+            s.blocked.sigchld_deferred.is_empty(),
+            readmitted,
+            "attempt {attempt}"
+        );
+        let first = if readmitted { forker } else { poller };
+        assert_eq!(next_selection(&mut s), Some(first), "attempt {attempt}");
+    }
+}
+
+/// A finished background call and a restored poller, in both recording
+/// modes: step2c harvests the call ahead of a poller that was at
+/// `LAST_PRIORITY` while backed off, and keeps its gate closed for one that
+/// was at 2000, as on main. Under record/replay a deadline is never recorded,
+/// so the restore is applied directly to cover that branch's gate too.
+#[test]
+fn a_deadline_restored_poller_gates_a_finished_background_call_as_while_backed_off() {
+    for recordreplay in [false, true] {
+        for (attempt, harvested) in [(4, true), (1, false)] {
+            let mut s = uncontrolled();
+            s.recordreplay_modes = recordreplay;
+            let (blocker, _, _) = add(&mut s, 100, 100);
+            let (poller, _, _) = add(&mut s, 100, 101);
+            backed_off_poller_after(&mut s, poller, Some(at(100)), attempt);
+            assert_eq!(
+                s.run_queue.restore_poller_priority(poller),
+                PollerRestore::Restored
+            );
+            let op_id = ExternalOpId::new(blocker, 7);
+            s.blocked.external_io_blockers.insert(blocker, op_id);
+            let mut continuation = Resources::new(blocker);
+            continuation.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
+            s.next_turns[&blocker].req.put(Ok(continuation));
+
+            assert!(s.step2c_process_io_blockers().is_ok());
+            let label = format!("recordreplay {recordreplay}, attempt {attempt}");
+            assert_eq!(
+                !s.blocked.external_io_blockers.contains_key(&blocker),
+                harvested,
+                "{label}"
+            );
+            let first = if harvested { blocker } else { poller };
+            assert_eq!(next_selection(&mut s), Some(first), "{label}");
+        }
+    }
 }

@@ -156,11 +156,13 @@ struct QueueValue {
     /// Upgrade to this priority during polling upgrades
     poll_upgrade: Option<Priority>,
     /// Set when `restore_poller_priority` restored this poller because its
-    /// timeout deadline passed. Until it runs, the deterministic-work-first
-    /// gates (`only_pollers`, `has_runnable_besides`) still count it as a
-    /// poller: on main it would still be backed off at this point, and those
-    /// gates must keep admitting deferred signals and finished background work
-    /// ahead of it (<https://github.com/rrnewton/hermit/issues/3952>).
+    /// timeout deadline passed, and the poller was at `LAST_PRIORITY` while
+    /// backed off. Until it runs, the deterministic-work-first gates
+    /// (`only_pollers`, `has_runnable_besides`) keep counting it as a poller,
+    /// exactly as they did while it was backed off. A poller backed off below
+    /// `LAST_PRIORITY` (after 1 to 3 retries) was already ordinary work for
+    /// the gates, and stays so
+    /// (<https://github.com/rrnewton/hermit/issues/3952>).
     deadline_restored: bool,
 }
 
@@ -705,7 +707,9 @@ impl RunQueue {
         };
         let mut value = self.queue.remove(&key).expect("located queue entry");
         value.poll_upgrade = None;
-        value.deadline_restored = true;
+        // The gates count a backed-off poller as a poller only at
+        // LAST_PRIORITY; keep exactly that classification until it runs.
+        value.deadline_restored = key.priority >= LAST_PRIORITY;
         self.last_back_turn += 1;
         let restored = PrioritizedOrder {
             priority: normal_priority,
@@ -804,9 +808,11 @@ mod tests {
         );
     }
 
-    /// A poller restored by its deadline still counts as a poller for the
-    /// deterministic-work-first gates until it runs; requeued after its turn,
-    /// it is ordinary work.
+    /// A poller backed off to `LAST_PRIORITY` and restored by its deadline
+    /// still counts as a poller for the deterministic-work-first gates until
+    /// it runs; requeued after its turn, it is ordinary work. One backed off
+    /// below `LAST_PRIORITY` was ordinary work for the gates already, and
+    /// stays so after the restore, as on main.
     #[test]
     fn a_deadline_restored_poller_counts_as_a_poller_until_it_runs() {
         let poller = DetTid::from_raw(1);
@@ -825,6 +831,19 @@ mod tests {
         assert_eq!(queue.commit_tentative_pop(), poller);
         queue.push_back(poller, DEFAULT_PRIORITY);
         assert!(!queue.only_pollers(), "after its turn it is ordinary work");
+        assert!(queue.has_runnable_besides(other));
+
+        let mut queue = RunQueue::new(SchedHeuristic::None, 0, 0.0);
+        queue.push_poller(poller, DEFAULT_PRIORITY, 1);
+        assert!(
+            !queue.only_pollers(),
+            "at 2000 it is ordinary work, as on main"
+        );
+        assert_eq!(
+            queue.restore_poller_priority(poller),
+            PollerRestore::Restored
+        );
+        assert!(!queue.only_pollers(), "and stays so after the restore");
         assert!(queue.has_runnable_besides(other));
     }
 
