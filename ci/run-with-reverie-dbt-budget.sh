@@ -1274,7 +1274,20 @@ fi
 # rust-toolchain.toml are byte-identical), so the DynamoRIO SDK recipe key is
 # unchanged. Carry, not recalibration: no new timing sample or >=5-sample
 # replacement claim is made.
-expected_pin=ae8a078ea8f68dab5cc73007fa7d56935d62f11f
+# CARRY TO 9f82eead537ccddf23ed86c3ad7e58d91bfae64e (2026-10-09): from
+# ae8a078ea8f68dab5cc73007fa7d56935d62f11f. The one commit changes reverie-ptrace
+# (an injected syscall that a signal stopped before it ran is reported as a
+# restart, ERESTARTSYS, rather than as what the result register held, and
+# tests of it) and reverie/src/guest.rs (Guest::inject documents that
+# result). No file under reverie-dbt changes (tree
+# 9a3212a9b0f8070c4cce0ae1bf6957d067b5e2d8 at both), and third-party, the root
+# Cargo.toml and rust-toolchain.toml are byte-identical, so none of the seven
+# recorded inputs changes and the DynamoRIO SDK recipe key is unchanged; a
+# reverie-dbt build at this commit's tree computed
+#     key=sha256:75c3067d4692cd8aa168d6791e718f21e6535e672b957291142070a0edc27234
+# Carry, not recalibration: no new timing sample or >=5-sample replacement
+# claim is made.
+expected_pin=9f82eead537ccddf23ed86c3ad7e58d91bfae64e
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
