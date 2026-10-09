@@ -19,6 +19,7 @@ use reverie::syscalls::Errno;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::procfs_inode::DirectoryInodes;
 use crate::tool_global::SnapshotMark;
 
 #[cfg(test)]
@@ -406,6 +407,10 @@ pub(crate) struct DirectoryStream {
     /// an entry can be returned after its file's last name is gone, or after
     /// a task it names exited and a new thread took its ID.
     snapshot: SnapshotMark,
+    /// How to key the inode numbers of the snapshot's entries, decided when
+    /// it was taken: a procfs directory loses its name once its task exits,
+    /// which can be before the stream returns the rest of its entries.
+    inodes: Option<DirectoryInodes>,
 }
 
 impl DirectoryStream {
@@ -418,6 +423,16 @@ impl DirectoryStream {
     /// The inode pool's state when the current snapshot was taken.
     pub(crate) fn snapshot_mark(&self) -> SnapshotMark {
         self.snapshot
+    }
+
+    /// Record how to key the inode numbers of the snapshot just installed.
+    pub(crate) fn note_snapshot_inodes(&mut self, inodes: DirectoryInodes) {
+        self.inodes = Some(inodes);
+    }
+
+    /// How to key the inode numbers of the current snapshot's entries.
+    pub(crate) fn snapshot_inodes(&self) -> Option<DirectoryInodes> {
+        self.inodes.clone()
     }
 
     pub(crate) fn needs_snapshot(&self) -> bool {

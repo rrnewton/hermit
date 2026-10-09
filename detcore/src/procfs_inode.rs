@@ -64,6 +64,7 @@
 //!   those IDs.
 
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::io;
@@ -312,7 +313,54 @@ pub(crate) fn path_within(mounts: &[ProcfsMount], canonical: &Path) -> PathBuf {
 /// `/proc/<tid>/fd/<n>` or `/proc/<tid>/cwd`), which must be inode `inode` on
 /// `device`. Following such a link touches only procfs and the object, which
 /// is on procfs.
+///
+/// Once a task is reaped, a stat through a link to one of its entries fails,
+/// and the link reads as the entry's path with ` (deleted)` appended, as for
+/// a removed file. The task can be reaped between the two, so such a path is
+/// refused too (see [`refuse_deleted`]).
 pub(crate) fn inspect_link(link: &Path, device: u64, inode: u64) -> Result<PathBuf, String> {
+    check_link_object(link, device, inode)?;
+    let canonical = std::fs::read_link(link)
+        .map_err(|error| format!("cannot read the link {}: {error}", link.display()))?;
+    refuse_deleted(link, canonical)
+}
+
+/// `canonical`, read from the magic link `link`, unless it ends in
+/// ` (deleted)`, as the path of an entry of a reaped task does. No procfs
+/// name ends that way, so such a path names nothing.
+fn refuse_deleted(link: &Path, canonical: PathBuf) -> Result<PathBuf, String> {
+    if canonical.as_os_str().as_bytes().ends_with(b" (deleted)") {
+        return Err(format!(
+            "{} leads to {}, an entry of a task that has exited",
+            link.display(),
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
+}
+
+/// Whether the object behind the magic link `link`, which must be inode
+/// `inode` on `device`, is on a procfs filesystem, whatever mount it was
+/// reached through.
+pub(crate) fn is_on_procfs(link: &Path, device: u64, inode: u64) -> Result<bool, String> {
+    check_link_object(link, device, inode)?;
+    let path = CString::new(link.as_os_str().as_bytes())
+        .map_err(|_| format!("{} contains a NUL byte", link.display()))?;
+    let mut buf = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `path` is NUL-terminated and `buf` is large enough for statfs.
+    if unsafe { libc::statfs(path.as_ptr(), buf.as_mut_ptr()) } != 0 {
+        return Err(format!(
+            "cannot statfs {}: {}",
+            link.display(),
+            io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: statfs succeeded, so it filled `buf`.
+    Ok(unsafe { buf.assume_init() }.f_type == libc::PROC_SUPER_MAGIC)
+}
+
+/// Requires that the magic link `link` lead to inode `inode` on `device`.
+fn check_link_object(link: &Path, device: u64, inode: u64) -> Result<(), String> {
     let metadata = std::fs::metadata(link)
         .map_err(|error| format!("cannot stat {}: {error}", link.display()))?;
     if metadata.dev() != device || metadata.ino() != inode {
@@ -321,12 +369,11 @@ pub(crate) fn inspect_link(link: &Path, device: u64, inode: u64) -> Result<PathB
             link.display()
         ));
     }
-    std::fs::read_link(link)
-        .map_err(|error| format!("cannot read the link {}: {error}", link.display()))
+    Ok(())
 }
 
 /// A procfs directory being listed, by its path within procfs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ProcfsDirectory {
     path: PathBuf,
 }
@@ -348,7 +395,7 @@ impl ProcfsDirectory {
 }
 
 /// How to key the inode numbers of the entries of one directory listing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DirectoryInodes {
     /// The host device of the directory, which every entry shares.
     device: u64,
@@ -524,6 +571,92 @@ mod tests {
             &BackendCapabilities::PTRACE,
             Some(4_321)
         ));
+    }
+
+    /// Once its task has exited, an entry is not named: following the link
+    /// fails, and the link's path, read in the moment before, names nothing.
+    /// While the task runs, the same link names the entry.
+    #[test]
+    fn an_entry_of_a_task_that_has_exited_is_not_named() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let (finish, finished) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            sender.send(unsafe { libc::gettid() }).unwrap();
+            finished.recv().unwrap();
+        });
+        let tid = receiver.recv().unwrap();
+        let fds = File::open(format!("/proc/self/task/{tid}/fd")).unwrap();
+        let metadata = fds.metadata().unwrap();
+        let link = PathBuf::from(format!("/proc/self/fd/{}", fds.as_raw_fd()));
+        let inspect = || inspect_link(&link, metadata.dev(), metadata.ino());
+        let expected = format!("/proc/{}/task/{tid}/fd", std::process::id());
+        assert_eq!(inspect(), Ok(PathBuf::from(expected)));
+        finish.send(()).unwrap();
+        thread.join().unwrap();
+        // The join returns when the thread clears its ID, before Linux reaps
+        // it.
+        let start = std::time::Instant::now();
+        let refused = loop {
+            match inspect() {
+                Err(reason) => break reason,
+                Ok(path) => assert!(
+                    start.elapsed() < std::time::Duration::from_secs(10),
+                    "{} still names {} after its task exited",
+                    link.display(),
+                    path.display()
+                ),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        assert!(
+            refused.starts_with("cannot stat ")
+                || refused.ends_with("an entry of a task that has exited"),
+            "{refused}"
+        );
+    }
+
+    /// Linux spells the path of an entry of a reaped task with ` (deleted)`
+    /// appended, which is no procfs name.
+    #[test]
+    fn a_path_linux_marks_deleted_names_nothing() {
+        let link = Path::new("/proc/self/fd/3");
+        let live = PathBuf::from("/proc/12/task/13/fd");
+        assert_eq!(refuse_deleted(link, live.clone()), Ok(live));
+        let deleted = PathBuf::from("/proc/12/task/13/fd (deleted)");
+        assert_eq!(
+            refuse_deleted(link, deleted),
+            Err(
+                "/proc/self/fd/3 leads to /proc/12/task/13/fd (deleted), an entry of a task \
+                 that has exited"
+                    .to_string()
+            )
+        );
+    }
+
+    /// The filesystem type is read from the object itself, so a procfs file
+    /// is told from others wherever it is mounted, and only for the object the
+    /// guest saw.
+    #[test]
+    fn a_procfs_object_is_told_by_its_filesystem_type() {
+        let stat = File::open("/proc/self/stat").unwrap();
+        let null = File::open("/dev/null").unwrap();
+        let link = |file: &File| PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        let (stat_metadata, null_metadata) = (stat.metadata().unwrap(), null.metadata().unwrap());
+        assert_eq!(
+            is_on_procfs(&link(&stat), stat_metadata.dev(), stat_metadata.ino()),
+            Ok(true)
+        );
+        assert_eq!(
+            is_on_procfs(&link(&null), null_metadata.dev(), null_metadata.ino()),
+            Ok(false)
+        );
+        let other = is_on_procfs(&link(&null), stat_metadata.dev(), stat_metadata.ino());
+        assert!(
+            other
+                .as_ref()
+                .is_err_and(|reason| reason.ends_with("is not the object the guest saw")),
+            "{other:?}"
+        );
     }
 
     #[test]
