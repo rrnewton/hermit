@@ -1351,8 +1351,21 @@ fi
 # rust-toolchain.toml are byte-identical), so the DynamoRIO SDK recipe key is
 # unchanged. Carry, not recalibration: no new timing sample or >=5-sample
 # replacement claim is made.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != ae8a078ea8f68dab5cc73007fa7d56935d62f11f ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie ae8a078ea8f68dab5cc73007fa7d56935d62f11f (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 033ba68f2326704047747467ad464018c4642ea5 (2026-10-09): from
+# ae8a078ea8f68dab5cc73007fa7d56935d62f11f. The one commit changes reverie-ptrace
+# (an injected syscall that a signal stopped before it ran is reported as a
+# restart, ERESTARTSYS, rather than as what the result register held, and
+# tests of it) and reverie/src/guest.rs (Guest::inject documents that
+# result). No file under reverie-dbt changes (tree
+# 9a3212a9b0f8070c4cce0ae1bf6957d067b5e2d8 at both), and third-party, the root
+# Cargo.toml and rust-toolchain.toml are byte-identical, so none of the seven
+# recorded inputs changes and the DynamoRIO SDK recipe key is unchanged; a
+# reverie-dbt build at this commit's tree computed
+#     key=sha256:75c3067d4692cd8aa168d6791e718f21e6535e672b957291142070a0edc27234
+# Carry, not recalibration: no new timing sample or >=5-sample replacement
+# claim is made.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 033ba68f2326704047747467ad464018c4642ea5 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 033ba68f2326704047747467ad464018c4642ea5 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
