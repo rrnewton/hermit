@@ -1025,6 +1025,27 @@ pub struct RunOpts {
     #[clap(long)]
     pub(crate) no_sequentialize_threads: bool,
 
+    /// Hand a contended futex to the thread it wakes: after a `FUTEX_WAKE` or `FUTEX_WAKE_BITSET`
+    /// that woke at least one waiter, the waker moves to the back of its priority band and
+    /// yields, so woken threads of its priority run before it continues. On by default wherever
+    /// it applies: the precise futex mode with sequentialized threads, on the ptrace backend
+    /// (including e9patch preprocessing). This flag asks for it explicitly and is refused where it
+    /// cannot apply; without it, a thread that releases a contended lock can re-take it many
+    /// times before the waiter runs, which livelocks QEMU's multi-threaded TCG on its big lock.
+    /// Each extra thread switch is charged scheduler time that the guest can observe (see
+    /// `--scheduler-turn-cost`). The waker keeps its priority, so a woken thread of a lower
+    /// priority still runs after it; under `--chaos` or a random `--sched-heuristic` a woken
+    /// thread is not guaranteed to run first.
+    #[clap(long, conflicts_with = "no_futex_wake_yields")]
+    futex_wake_yields: bool,
+
+    /// Turn off the default futex handoff (see `--futex-wake-yields`): a thread that wakes a
+    /// futex waiter keeps running until its timeslice ends. Selects the schedule Hermit used
+    /// before the handoff became the default, for example to replay a preemption record made
+    /// then.
+    #[clap(long)]
+    no_futex_wake_yields: bool,
+
     /// Disable deterministic I/O behavior.
     #[clap(long)]
     no_deterministic_io: bool,
@@ -1663,6 +1684,12 @@ impl fmt::Display for RunOpts {
         }
         if self.no_sequentialize_threads {
             write!(f, " --no-sequentialize-threads")?;
+        }
+        // The handoff is resolved from these two flags at validation, so render
+        // the choice that was made on the command line, not the resolved value.
+        dop.futex_wake_yields = self.futex_wake_yields;
+        if self.no_futex_wake_yields {
+            write!(f, " --no-futex-wake-yields")?;
         }
         if self.no_deterministic_io {
             write!(f, " --no-deterministic-io")?;
@@ -3388,6 +3415,8 @@ fn skid_margin_override_rejects_non_ptrace_backed_backends() {
 /// command and round-trips. It is refused where it cannot apply: without
 /// sequentialized threads, outside the precise futex mode, and with the DBT
 /// backend, whose runtime reads a configuration form that cannot carry it.
+/// The default resolution is covered by
+/// `futex_wake_yields_is_the_default_where_it_applies`.
 #[test]
 fn futex_wake_yields_parses_round_trips_and_is_refused_where_inert() {
     let mut opts = RunOpts::parse_from(["fakehermit", "--futex-wake-yields", "fakeprog"]);
@@ -3400,11 +3429,6 @@ fn futex_wake_yields_parses_round_trips_and_is_refused_where_inert() {
     let mut reparsed = RunOpts::parse_from(reparsed_args);
     reparsed.validate_args_with_perf_support(true).unwrap();
     assert!(reparsed.det_opts.det_config.futex_wake_yields);
-
-    let mut default = RunOpts::parse_from(["fakehermit", "fakeprog"]);
-    default.validate_args_with_perf_support(true).unwrap();
-    assert!(!default.det_opts.det_config.futex_wake_yields);
-    assert!(!format!("{default}").contains("futex-wake"));
 
     // e9patch is preprocessing on the ptrace backend, where Detcore and the
     // handoff run unchanged, so the gate accepts it.
@@ -3492,6 +3516,69 @@ fn futex_wake_yields_parses_round_trips_and_is_refused_where_inert() {
             .validate_args_with_perf_support(true)
             .unwrap_err();
         assert!(error.to_string().contains(expected), "{argv:?}: {error}");
+    }
+}
+
+/// Without either flag, `hermit run` turns the futex handoff on exactly where
+/// it applies (ptrace, with or without e9patch preprocessing, sequentialized
+/// threads, the precise futex mode) and leaves it off everywhere else without
+/// an error. `--no-futex-wake-yields` turns it off, is rendered and
+/// round-trips; it cannot be combined with `--futex-wake-yields`. A default
+/// is not rendered into the reproduce command, and validating again gives the
+/// same result.
+#[test]
+fn futex_wake_yields_is_the_default_where_it_applies() {
+    let mut default = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    default.validate_args_with_perf_support(true).unwrap();
+    assert!(default.det_opts.det_config.futex_wake_yields);
+    assert!(!format!("{default}").contains("futex-wake"));
+    default.validate_args_with_perf_support(true).unwrap();
+    assert!(default.det_opts.det_config.futex_wake_yields);
+
+    let mut off = RunOpts::parse_from(["fakehermit", "--no-futex-wake-yields", "fakeprog"]);
+    off.validate_args_with_perf_support(true).unwrap();
+    assert!(!off.det_opts.det_config.futex_wake_yields);
+    let rendered = format!("{off}");
+    assert!(rendered.contains(" --no-futex-wake-yields"), "{rendered}");
+    assert!(!rendered.contains(" --futex-wake-yields"), "{rendered}");
+    let mut reparsed_args = vec!["fakehermit".to_owned()];
+    reparsed_args.extend(shell_words::split(&rendered).unwrap());
+    let mut reparsed = RunOpts::parse_from(reparsed_args);
+    reparsed.validate_args_with_perf_support(true).unwrap();
+    assert!(!reparsed.det_opts.det_config.futex_wake_yields);
+
+    assert!(
+        RunOpts::try_parse_from([
+            "fakehermit",
+            "--futex-wake-yields",
+            "--no-futex-wake-yields",
+            "fakeprog",
+        ])
+        .is_err()
+    );
+
+    let e9patch = ["hermit", "--backend=e9patch", "run", "fakeprog"];
+    let mut opts = run_opts_for(&e9patch);
+    if opts.validate_args_with_perf_support(true).is_ok() {
+        assert!(opts.det_opts.det_config.futex_wake_yields, "{e9patch:?}");
+    }
+
+    for argv in [
+        vec!["hermit", "run", "--no-sequentialize-threads", "fakeprog"],
+        vec!["hermit", "run", "--debug-futex-mode=polling", "fakeprog"],
+        vec!["hermit", "run", "--namespace-only", "fakeprog"],
+        vec!["hermit", "run", "--strace-only", "fakeprog"],
+        vec!["hermit", "--backend=dbt", "run", "fakeprog"],
+        vec!["hermit", "--backend=kvm", "run", "fakeprog"],
+    ] {
+        let mut opts = run_opts_for(&argv);
+        match opts.validate_args_with_perf_support(true) {
+            Ok(()) => assert!(!opts.det_opts.det_config.futex_wake_yields, "{argv:?}"),
+            Err(error) => assert!(
+                !error.to_string().contains("futex-wake-yields"),
+                "{argv:?}: {error}"
+            ),
+        }
     }
 }
 
@@ -5865,11 +5952,21 @@ impl RunOpts {
         }
 
         config.sequentialize_threads = self.strict || !self.no_sequentialize_threads;
-        // `--futex-wake-yields` is accepted only where Detcore's precise futex
-        // scheduler runs the guest with sequentialized threads, on the ptrace
-        // backend (with or without e9patch preprocessing). Every other launch
-        // would accept the flag and ignore it, so it is refused before launch.
-        if config.futex_wake_yields {
+        // The futex handoff applies only where Detcore's precise futex scheduler
+        // runs the guest with sequentialized threads, on the ptrace backend
+        // (with or without e9patch preprocessing). There it is on unless
+        // `--no-futex-wake-yields` turns it off; everywhere else it is off. An
+        // explicit `--futex-wake-yields` where it cannot apply would be
+        // accepted and ignored, so it is refused before launch. The setting is
+        // recomputed from the flags on every validation, so a caller that
+        // validates again after changing the options gets a consistent result.
+        let futex_wake_yields_applies = !self.namespace_only
+            && !self.strace_only
+            && config.sequentialize_threads
+            && config.debug_futex_mode == detcore::BlockingMode::Precise
+            && matches!(backend, Backend::Ptrace | Backend::E9patch);
+        config.futex_wake_yields = !self.no_futex_wake_yields && futex_wake_yields_applies;
+        if self.futex_wake_yields {
             if self.namespace_only {
                 anyhow::bail!(
                     "--futex-wake-yields needs Detcore's scheduler; --namespace-only (--lite) \

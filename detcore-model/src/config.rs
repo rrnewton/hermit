@@ -596,21 +596,21 @@ pub struct Config {
 
     /// After a `FUTEX_WAKE` or `FUTEX_WAKE_BITSET` that woke at least one waiter, move the waker to
     /// the back of its priority band and have it yield, so that woken threads of its priority run
-    /// before it continues. Without
-    /// it, a thread that releases a contended lock keeps running until its slice ends and can
-    /// re-take the lock many times before the waiter is scheduled: QEMU's multi-threaded TCG vCPUs
-    /// starve its main loop of the big QEMU lock this way. The yield is a scheduler turn of its
-    /// own: the waker's timeslice keeps its deadlines. Each extra thread switch is charged
-    /// scheduler time that the guest can observe (see `--scheduler-turn-cost`), and costs wall
-    /// time: a two-vCPU QEMU boot took 5% to 48% longer with it. The waker keeps its priority, so a
-    /// woken thread of a lower priority still runs after it; `--chaos` redraws threads' priorities
-    /// from their chaos PRNG, which can put a woken thread in a lower band; and a random
-    /// `--sched-heuristic` does not select first in, first out. In those cases a woken thread is not
-    /// guaranteed to run first. Applies to the precise futex mode while threads are sequentialized,
-    /// on the ptrace backend (including e9patch preprocessing, which runs on it); replay applies it
-    /// as the recorded run did.
+    /// before it continues. Without it, a thread that releases a contended lock keeps running until
+    /// its slice ends and can re-take the lock many times before the waiter is scheduled: QEMU's
+    /// multi-threaded TCG vCPUs starve its main loop of the big QEMU lock this way. The yield is a
+    /// scheduler turn of its own: the waker's timeslice keeps its deadlines. The waker keeps its
+    /// priority, so a woken thread of a lower priority still runs after it; `--chaos` redraws
+    /// threads' priorities from their chaos PRNG, which can put a woken thread in a lower band; and
+    /// a random `--sched-heuristic` does not select first in, first out. In those cases a woken
+    /// thread is not guaranteed to run first. Replay applies it as the recorded run did.
+    ///
+    /// This is the effective setting Detcore reads. `hermit run` turns it on by default wherever
+    /// it applies (the precise futex mode with sequentialized threads, on the ptrace backend,
+    /// including e9patch preprocessing) and takes `--futex-wake-yields` and
+    /// `--no-futex-wake-yields` to override that; the library default is off.
     #[serde(default)]
-    #[clap(long)]
+    #[clap(skip)]
     pub futex_wake_yields: bool,
 
     /// Virtual nanoseconds that each committed scheduler turn adds to the global clock, before
@@ -1757,9 +1757,10 @@ impl Default for Config {
 /// that capability reads, and [`Config::in_guest_detlog_forward_policy`] and
 /// [`Config::in_guest_site_patching_off`], which are unset for DBT. So is [`Config::target_timeslice_syscalls_only`],
 /// added after this form froze; DBT runs without a PMU maximum, where the
-/// option has no effect. So are [`Config::futex_wake_yields`] and
-/// [`Config::scheduler_turn_cost`], also added after this form froze, which
-/// `hermit run` refuses with the DBT backend, and [`Config::replaying`], set
+/// option has no effect. So are [`Config::futex_wake_yields`], which `hermit
+/// run` leaves off with the DBT backend and refuses to turn on there, and
+/// [`Config::scheduler_turn_cost`], which it refuses there; both were added
+/// after this form froze. So is [`Config::replaying`], set
 /// only by `hermit replay`, which runs only on the ptrace backend. So is
 /// [`Config::inherited_seccomp`], added after this form froze, which reads
 /// back as unknown. Every other field is serialized exactly as
@@ -3339,7 +3340,7 @@ mod tests {
         assert!(config.yields_after_futex_wake(3));
         // A wake that found no waiter hands nothing off and keeps the slice.
         assert!(!config.yields_after_futex_wake(0));
-        // Off by default.
+        // Off in the library default; `hermit run` resolves its own default.
         assert!(!Config::default().futex_wake_yields);
         assert!(!Config::default().yields_after_futex_wake(1));
     }
