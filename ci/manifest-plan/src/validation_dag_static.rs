@@ -1655,7 +1655,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and procfs files outside the guest's mounts) retain all 1230: 1233.
     // procfs_inode::tests::a_failed_host_call_leaves_the_callers_errno (the
     // guest's errno under SaBRe) retains all 1233: 1234.
-    ("test.detcore_unit", 1234),
+    // procfs_inode::tests::a_mount_table_read_whose_close_is_refused_is_an_error
+    // (a mount table read under a filter that refuses close) retains all
+    // 1234: 1235.
+    ("test.detcore_unit", 1235),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2437,7 +2440,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two tests of where procfs entries are named: 1230.
     // And the three tests of exited tasks and outside procfs files: 1233.
     // And the errno test: 1234.
-    ("test.detcore_unit_on_host", 1234),
+    // And the mount table close test: 1235.
+    ("test.detcore_unit_on_host", 1235),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
