@@ -1275,7 +1275,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // futex_wake_yields_parses_round_trips_and_is_refused_where_inert (lane
     // qemu-rcb, https://github.com/rrnewton/hermit/issues/3874) retains all
     // 1016: 1017.
-    ("test.hermit_unit", 1017),
+    // metadata::tests::record_version_rejects_pre_vfork_release_edge_streams
+    // (https://github.com/rrnewton/hermit/issues/3984) retains all 1017: 1018.
+    ("test.hermit_unit", 1018),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2692,7 +2694,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same four inherited-seccomp tests: 1013.
     // And the same futex record-version test: 1016.
     // And the futex-wake CLI test: 1017.
-    ("test.hermit_unit_on_host", 1017),
+    // And the vfork release-edge record-version test: 1018.
+    ("test.hermit_unit_on_host", 1018),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

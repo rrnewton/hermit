@@ -214,7 +214,15 @@ impl RecordVersion {
 // a different schedule, although no event shape changed. Schedule and
 // preemption files written by `--record-preemptions-to` carry no version and
 // are likewise tied to the old order.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x126);
+// 0x126 -> 0x127: a vfork barrier ends at the child's release edge (its exec
+// or `Exit` grant) whether or not the parent's death has been seen. With a
+// live parent, the scheduler then commits no turn until the parent's
+// continuation is posted, where the child used to keep running alone for a
+// host-timed number of turns (https://github.com/rrnewton/hermit/issues/3984).
+// Turn selection is not recorded; replay recomputes it, so an older recording
+// containing a vfork replayed under the new rule could run a different
+// schedule, although no event shape changed.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x127);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -239,7 +247,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x126);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x126;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x127;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -795,6 +803,15 @@ mod tests {
     #[test]
     fn record_version_rejects_newest_first_futex_wake_streams() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x125)));
+    }
+
+    /// A 0x126 recording was made while a vfork child kept running alone
+    /// after its exec until the scheduler happened to see its live parent's
+    /// continuation; replay recomputes turn selection, so under the release
+    /// edge it could run another schedule. The version gate must refuse it.
+    #[test]
+    fn record_version_rejects_pre_vfork_release_edge_streams() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x126)));
     }
 
     #[test]
