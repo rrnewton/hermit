@@ -934,7 +934,19 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // runner::tests::a_probed_in_guest_cell_runs_without_a_preemption_timer
     // (hermit-manifest-plan; a probe of a disabled in-guest LiteInst cell runs
     // with --max-timeslice=disabled) retains all 1021: 1022.
-    ("test.regular_crates", 1022),
+    // glibc_compat::tests::{a_panic_unwinds_through_a_frame_in_a_new_dlmopen_namespace,
+    // a_panic_unwinds_through_a_frame_in_the_callers_namespace,
+    // a_constructor_waiting_for_a_workers_first_unwind_does_not_time_out,
+    // the_first_unwind_keeps_a_pending_dlerror,
+    // a_panic_in_an_earlier_constructor_unwinds_through_a_new_dlmopen_namespace,
+    // the_dl_iterate_phdr_fallback_finds_this_code_and_its_unwind_tables,
+    // a_newlm_panic_is_caught_past_an_object_named_libc_with_an_unreadable_dynamic_section,
+    // a_newlm_panic_is_caught_with_libc_loaded_under_another_name,
+    // a_newlm_panic_is_caught_through_a_forwarding_interposer}
+    // (detcore-sabre, the guest preloads' _dl_find_object,
+    // https://github.com/rrnewton/hermit/issues/3980) retain all 1022: 1031,
+    // listed with this node's arguments.
+    ("test.regular_crates", 1031),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2807,7 +2819,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same three futex-wake config tests: 1018.
     // And the three detcore-model inherited_seccomp tests: 1021.
     // And the probed in-guest timeslice test: 1022.
-    ("test.regular_crates_on_host", 1022),
+    // And the same nine glibc_compat unwind tests: 1031.
+    ("test.regular_crates_on_host", 1031),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
