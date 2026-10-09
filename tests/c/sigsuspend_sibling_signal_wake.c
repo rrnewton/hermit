@@ -97,14 +97,23 @@
  * strict verify diverges although the wait status is the same.
  *
  * The phases in which a signal must not end the wait (ignored-alarm,
- * ignored-chld and raw-blocked) also check when it ended, as
- * `external_signal_interrupt.c` checks its polls: no sooner than the waking
- * signal's delay, timed from before the sibling is created, and less than
- * WAKE_OVERSHOOT_MS after it (`woke_in_bounds`). A wait that the discarded or
- * blocked signal ended fails the lower bound, and a waiter that missed the
- * waking signal and slept on until a later event fails the upper one. The
- * phase line prints the result and the handler count, never the time, so the
- * output is the same natively and under Hermit.
+ * ignored-chld and raw-blocked) also check when it ended: no sooner than the
+ * sibling sent the waking signal, which it times from CLOCK_MONOTONIC just
+ * before it sends it (`woke_after_send`). A wait that the discarded or blocked
+ * signal ended fails that check.
+ *
+ * The check has no upper bound. Nothing signals the waiter after the waking
+ * signal, so a waiter that missed it never returns, and the run fails as a
+ * deadlock or a timeout; the handler counts already show which signal ended
+ * the wait. How long after the send the wait ends is not Linux behavior: it
+ * is scheduling latency natively, and under Hermit it is the virtual time
+ * Hermit charges for the sibling's work, which depends on the host. Without
+ * a usable PMU, Hermit counts no instructions and scales every system call's
+ * cost by 500, so the clone that creates the sibling and the sibling's exit
+ * alone add 250 ms, against half a millisecond with a PMU.
+ *
+ * The phase line prints the result and the handler count, never the time, so
+ * the output is the same natively and under Hermit.
  *
  * One optional argument selects the phases by whether the waiting thread
  * blocks their signals outside the call:
@@ -144,49 +153,48 @@
 
 #define SIGNAL_BIT(sig) (UINT64_C(1) << ((sig) - 1))
 
-/* When the waking signal is sent, timed from before the sibling is created:
- * `sibling` sleeps three seconds, and `block_usr1_before_wait` sends its
- * blocked SIGUSR1 after one second and SIGUSR2 after two. */
-#define SIBLING_WAKE_MS 3000L
-#define RAW_BLOCKED_WAKE_MS 2000L
-#define WAKE_OVERSHOOT_MS 50L
-
 static volatile sig_atomic_t usr1_runs = 0;
 static volatile sig_atomic_t usr1_on_waiter = 0;
 static volatile sig_atomic_t usr2_runs = 0;
 static volatile sig_atomic_t usr2_on_waiter = 0;
 static pid_t waiter_tid;
 
+/* When the sibling sent the signal that must end the wait. The waiter reads
+ * it only after joining the sibling, which orders the sibling's store first. */
+static struct timespec wake_sent;
+
 /* The raw phases' temporary mask and their handshakes with the sibling. */
 static _Atomic uint64_t raw_mask;
 static atomic_int sibling_ready;
 static atomic_int waiter_entering;
 
-static long ms_between(const struct timespec* start, const struct timespec* end) {
-  return (end->tv_sec - start->tv_sec) * 1000L +
-      (end->tv_nsec - start->tv_nsec) / 1000000L;
+static long long ns_between(
+    const struct timespec* start,
+    const struct timespec* end) {
+  return (long long)(end->tv_sec - start->tv_sec) * 1000000000LL +
+      (end->tv_nsec - start->tv_nsec);
 }
 
-/* Whether a wait timed from `start` to `end` ended in
- * [wake_ms, wake_ms + WAKE_OVERSHOOT_MS). The time goes to stderr only when it
- * did not, so stdout stays the same natively and under Hermit. */
-static int woke_in_bounds(
-    const char* name,
-    const struct timespec* start,
-    const struct timespec* end,
-    long wake_ms) {
-  long elapsed = ms_between(start, end);
-  int ok = elapsed >= wake_ms && elapsed < wake_ms + WAKE_OVERSHOOT_MS;
-  if (!ok) {
+/* Records when the waking signal is sent, then sends it to the waiter. */
+static void send_wake(int signo) {
+  clock_gettime(CLOCK_MONOTONIC, &wake_sent);
+  syscall(SYS_tgkill, getpid(), waiter_tid, signo);
+}
+
+/* Whether a wait that ended at `end` ended no sooner than the sibling sent the
+ * waking signal. Call it only after joining the sibling. How early it ended
+ * goes to stderr only when it did, so stdout stays the same natively and
+ * under Hermit. */
+static int woke_after_send(const char* name, const struct timespec* end) {
+  long long early_ns = ns_between(end, &wake_sent);
+  if (early_ns > 0) {
     fprintf(
         stderr,
-        "%s wait ended after %ld ms, outside [%ld, %ld)\n",
+        "%s wait ended %lld ns before the waking signal was sent\n",
         name,
-        elapsed,
-        wake_ms,
-        wake_ms + WAKE_OVERSHOOT_MS);
+        early_ns);
   }
-  return ok;
+  return early_ns <= 0;
 }
 
 static void on_usr1(int signo) {
@@ -206,7 +214,7 @@ static void* sibling(void* arg) {
   (void)arg;
   struct timespec three_seconds = {3, 0};
   nanosleep(&three_seconds, NULL);
-  syscall(SYS_tgkill, getpid(), waiter_tid, SIGUSR2);
+  send_wake(SIGUSR2);
   return NULL;
 }
 
@@ -228,8 +236,6 @@ static int phase(const char* name, int fork_child) {
     }
   }
 
-  struct timespec start, end;
-  clock_gettime(CLOCK_MONOTONIC, &start);
   pthread_t thread;
   if (pthread_create(&thread, NULL, sibling, NULL) != 0) {
     puts("SIGSUSPEND_SIBLING_PTHREAD_CREATE_FAILED");
@@ -244,13 +250,14 @@ static int phase(const char* name, int fork_child) {
   errno = 0;
   int rc = sigsuspend(&empty);
   int eintr = rc == -1 && errno == EINTR;
+  struct timespec end;
   clock_gettime(CLOCK_MONOTONIC, &end);
-  int in_bounds = woke_in_bounds(name, &start, &end, SIBLING_WAKE_MS);
 
   if (pthread_join(thread, NULL) != 0) {
     puts("SIGSUSPEND_SIBLING_PTHREAD_JOIN_FAILED");
     return 1;
   }
+  int after_send = woke_after_send(name, &end);
   int child_status = -1;
   if (fork_child) {
     int status = 0;
@@ -265,16 +272,16 @@ static int phase(const char* name, int fork_child) {
    * depend on the ambient locale. */
   printf(
       "%s rc=%d eintr=%d usr2_runs=%d usr2_on_waiter=%d child_status=%d "
-      "woke_in_bounds=%d\n",
+      "woke_after_send=%d\n",
       name,
       rc,
       eintr,
       (int)usr2_runs,
       (int)usr2_on_waiter,
       child_status,
-      in_bounds);
+      after_send);
   return !(rc == -1 && eintr && usr2_runs == 1 && usr2_on_waiter &&
-           child_status == (fork_child ? 7 : -1) && in_bounds);
+           child_status == (fork_child ? 7 : -1) && after_send);
 }
 
 static void sleep_one_second(void) {
@@ -296,7 +303,7 @@ static void* block_usr1_before_wait(void* arg) {
   sleep_one_second();
   syscall(SYS_tgkill, getpid(), waiter_tid, SIGUSR1);
   sleep_one_second();
-  syscall(SYS_tgkill, getpid(), waiter_tid, SIGUSR2);
+  send_wake(SIGUSR2);
   return NULL;
 }
 
@@ -352,8 +359,6 @@ static int raw_phase(const char* name, void* (*sibling_main)(void*)) {
   atomic_store(&sibling_ready, 0);
   atomic_store(&waiter_entering, 0);
 
-  struct timespec start, end;
-  clock_gettime(CLOCK_MONOTONIC, &start);
   pthread_t thread;
   if (pthread_create(&thread, NULL, sibling_main, NULL) != 0) {
     puts("SIGSUSPEND_SIBLING_PTHREAD_CREATE_FAILED");
@@ -368,6 +373,7 @@ static int raw_phase(const char* name, void* (*sibling_main)(void*)) {
   errno = 0;
   long rc = syscall(SYS_rt_sigsuspend, (void*)&raw_mask, sizeof(uint64_t));
   int eintr = rc == -1 && errno == EINTR;
+  struct timespec end;
   clock_gettime(CLOCK_MONOTONIC, &end);
   int usr1_in_wait = usr1_runs;
   int usr2_in_wait = usr2_runs;
@@ -410,10 +416,9 @@ static int raw_phase(const char* name, void* (*sibling_main)(void*)) {
              usr2_runs == 1 && on_waiter);
   }
   /* raw-blocked: the blocked SIGUSR1 must not end the wait, so it ends only
-   * with the SIGUSR2 sent two seconds after the sibling started. */
-  int bounded = sibling_main == block_usr1_before_wait;
-  int in_bounds =
-      bounded && woke_in_bounds(name, &start, &end, RAW_BLOCKED_WAKE_MS);
+   * with the SIGUSR2 that the sibling sends a second after SIGUSR1. */
+  int wake_checked = sibling_main == block_usr1_before_wait;
+  int after_send = wake_checked && woke_after_send(name, &end);
   printf(
       "%s rc=%ld eintr=%d usr1_in_wait=%d usr2_in_wait=%d usr1_pending=%d "
       "usr2_pending=%d usr1_runs=%d usr2_runs=%d on_waiter=%d",
@@ -427,8 +432,8 @@ static int raw_phase(const char* name, void* (*sibling_main)(void*)) {
       (int)usr1_runs,
       (int)usr2_runs,
       on_waiter);
-  if (bounded) {
-    printf(" woke_in_bounds=%d", in_bounds);
+  if (wake_checked) {
+    printf(" woke_after_send=%d", after_send);
   }
   putchar('\n');
   if (sibling_main == send_usr1) {
@@ -438,7 +443,7 @@ static int raw_phase(const char* name, void* (*sibling_main)(void*)) {
   }
   return !(rc == -1 && eintr && usr1_in_wait == 0 && usr2_in_wait == 1 &&
            usr1_pending == 1 && usr2_pending == 0 && usr1_runs == 1 &&
-           usr2_runs == 1 && on_waiter && in_bounds);
+           usr2_runs == 1 && on_waiter && after_send);
 }
 
 /* restart-handled (see the comment at the top). Returns 0 on success. */
