@@ -3023,6 +3023,16 @@ impl Scheduler {
         self.remove_blocking_entries(dtid);
         self.retire_sigalrm_thread(*dtid, *detpid);
         self.remove_physical_thread(dtid, mm);
+        // A killed vfork parent takes its barrier with it. step2a drops a
+        // barrier only when it can read the parent's pending request, which
+        // `next_turns.remove` below discards, and while any barrier exists
+        // `step3_peek` selects only a barrier's child: a barrier left behind
+        // stops the schedule once that child is gone
+        // (https://github.com/rrnewton/hermit/issues/3984). A child that has
+        // not registered yet registers as an orphan (`dead_vfork_parents`).
+        if self.vfork_barriers.remove(dtid) == Some(None) {
+            self.dead_vfork_parents.insert(*dtid);
+        }
         self.vfork_registration_origins.remove(dtid);
         self.saved_guest_sigmasks.remove(dtid);
         if dtid.as_raw() == detpid.as_raw() {
@@ -3644,9 +3654,10 @@ impl Scheduler {
     /// `DeregisterThread`), at a moment the host chose. Returns whether anything
     /// was consumed; the caller then records determinism loss.
     ///
-    /// A dead vfork parent's barrier is cancelled so no other turn stays
-    /// excluded. If its child has not registered yet, a tombstone lets the
-    /// child's outstanding registration settle without the barrier.
+    /// A dead vfork parent's barrier is cancelled (by `logically_kill_thread`)
+    /// so no other turn stays excluded. If its child has not registered yet, a
+    /// tombstone lets the child's outstanding registration settle without the
+    /// barrier.
     pub(crate) fn consume_unreported_exit(&mut self, detpid: DetPid) -> bool {
         // An admitted process can die before its parent's fork turn, or its
         // own startup, registers it. Then it has nothing to consume; the
@@ -3667,9 +3678,6 @@ impl Scheduler {
             // A late DeregisterThread from the same incarnation, if one was
             // still in flight, is then acknowledged as already accounted.
             self.deregistration_accounted.insert(*tid);
-            if self.vfork_barriers.remove(tid) == Some(None) {
-                self.dead_vfork_parents.insert(*tid);
-            }
             let mm = self
                 .physical_thread_pidfds
                 .get(tid)
@@ -9873,6 +9881,63 @@ mod test {
         scheduler.complete_vfork_registration(parent, child);
         assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
         assert_eq!(scheduler.vfork_barriers.get(&parent), Some(&Some(child)));
+    }
+
+    /// A vfork parent killed while its registered child's barrier is up takes
+    /// the barrier with it. Otherwise, once the child is gone, `step3_peek`
+    /// selects nothing while another thread is runnable
+    /// (https://github.com/rrnewton/hermit/issues/3984).
+    #[test]
+    fn a_killed_vfork_parent_takes_its_barrier_with_it() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let parent = DetTid::from_raw(3);
+        let child = DetTid::from_raw(5);
+        let other = DetTid::from_raw(7);
+        for tid in [parent, other] {
+            scheduler.priorities.insert(tid, DEFAULT_PRIORITY);
+            scheduler.next_turns.insert(
+                tid,
+                ThreadNextTurn {
+                    dettid: tid,
+                    child_tid_addr: 0,
+                    req: Ivar::full(Ok(Resources::new(tid))),
+                    resp: Ivar::new(),
+                    protocol: Default::default(),
+                },
+            );
+        }
+        scheduler.vfork_barriers.insert(parent, Some(child));
+        scheduler.run_queue.push_back(other, DEFAULT_PRIORITY);
+        assert!(
+            scheduler.step3_peek().is_none(),
+            "with the child gone, the barrier selects nobody"
+        );
+
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.logically_kill_thread(&parent, &parent, MmId::initial(parent));
+        assert!(scheduler.vfork_barriers.is_empty());
+        assert!(!scheduler.dead_vfork_parents.contains(&parent));
+        let (selected, _, _) = scheduler.step3_peek().expect("the other thread runs");
+        assert_eq!(selected, other);
+        scheduler.run_queue.undo_tentative_pop();
+    }
+
+    /// A vfork parent killed before its child registered leaves a tombstone,
+    /// so the child's late registration settles as an orphan's.
+    #[test]
+    fn a_killed_vfork_parent_with_an_unregistered_child_leaves_a_tombstone() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let parent = DetTid::from_raw(3);
+        let child = DetTid::from_raw(5);
+        scheduler.vfork_barriers.insert(parent, None);
+
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.logically_kill_thread(&parent, &parent, MmId::initial(parent));
+        assert!(scheduler.vfork_barriers.is_empty());
+        assert!(scheduler.dead_vfork_parents.contains(&parent));
+        scheduler.complete_vfork_registration(parent, child);
+        assert!(!scheduler.dead_vfork_parents.contains(&parent));
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
     }
 
     #[test]
