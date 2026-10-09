@@ -901,7 +901,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // record_workloads::tests::standalone_population_is_shared_across_processes_and_pruned
     // (hermit-manifest-plan includes ci/record-replay-workloads.rs,
     // https://github.com/rrnewton/hermit/issues/3946) retains all 1017: 1018.
-    ("test.regular_crates", 1018),
+    // manifest_corpus::tests::{an_additional_backend_adds_full_validation_cells_with_their_own_flags,
+    // a_malformed_additional_backend_is_refused} and
+    // runner::tests::corpus_additional_backend_flags_meet_the_manifest_validator
+    // (hermit-manifest-plan, the compat corpus's additional backends,
+    // https://github.com/rrnewton/hermit/issues/3745) retain all 1018: 1021,
+    // listed with this node's arguments.
+    ("test.regular_crates", 1021),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2522,7 +2528,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two in-guest-trap tests: 1013.
     // And the same in-guest CPUID-faulting test: 1014.
     // And the same shared standalone population test: 1018.
-    ("test.regular_crates_on_host", 1018),
+    // And the same three corpus additional-backend tests: 1021.
+    ("test.regular_crates_on_host", 1021),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
