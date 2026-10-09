@@ -10032,6 +10032,51 @@ mod test {
         scheduler.run_queue.undo_tentative_pop();
     }
 
+    /// The child's `Exit` grant is a release edge: inside that committed turn
+    /// the barrier of its killed parent ends.
+    #[test]
+    fn a_vfork_childs_exit_grant_releases_its_dead_parents_barrier() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let parent = DetTid::from_raw(3);
+        let child = DetTid::from_raw(5);
+        for tid in [parent, child] {
+            scheduler.thread_tree.add_child(tid, tid, true);
+            scheduler.priorities.insert(tid, DEFAULT_PRIORITY);
+            scheduler.next_turns.insert(
+                tid,
+                ThreadNextTurn {
+                    dettid: tid,
+                    child_tid_addr: 0,
+                    req: Ivar::full(Ok(Resources::new(tid))),
+                    resp: Ivar::new(),
+                    protocol: Default::default(),
+                },
+            );
+        }
+        scheduler.vfork_barriers.insert(parent, Some(child));
+        scheduler.logically_kill_thread(&parent, &parent, MmId::initial(parent));
+        assert_eq!(scheduler.vfork_barriers.get(&parent), Some(&Some(child)));
+
+        assert!(
+            scheduler
+                .block_for_one_resource(
+                    child,
+                    &ResourceID::Exit {
+                        group: true,
+                        process: child,
+                        mm: MmId::initial(child),
+                    },
+                    &Permission::RW,
+                    None,
+                    None,
+                    &Ivar::new(),
+                )
+                .is_ok()
+        );
+        assert!(scheduler.vfork_barriers.is_empty());
+        assert!(scheduler.dead_parent_vfork_barriers.is_empty());
+    }
+
     /// A tombstone left by a dead vfork parent is stale once a later thread
     /// with the same TID begins a vfork of its own: that thread's child must
     /// fill the new barrier, not be swallowed by the old record.
