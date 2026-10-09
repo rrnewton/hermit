@@ -38,22 +38,25 @@
 //! magic link in the guest thread's `/proc/<tid>` ([`inspect_link`]): the
 //! link of the descriptor or working directory the call described, or, for a
 //! call that named a path, the link of an `O_PATH` descriptor that Detcore
-//! opens with the guest's own path, directory and root, and closes again.
-//! The mount the object was reached through, which `statx` names, gives the
-//! mount point to take off that path and the directory of procfs it shows
-//! ([`path_within`]). When it cannot name a procfs entry (the mount table
-//! cannot be read, the guest has no descriptor left or no longer holds the
-//! path it named, the object found is not the one the guest saw, or was
-//! reached through a mount the table does not list) it numbers the entry by
-//! its host inode and records a determinism loss, so the run is not compared.
+//! opens with the guest's own path, directory and root, and closes again
+//! ([`read_open`], [`read_close`]). The mount the object was reached through,
+//! which `statx` names, gives the mount point to take off that path and the
+//! directory of procfs it shows, once a `statx` of that mount point finds the
+//! root of the same mount there ([`path_within`]). When it cannot name a
+//! procfs entry (the mount table cannot be read, the guest has no descriptor
+//! left or no longer holds the path it named, an injected call may not have
+//! run, the object found is not the one the guest saw, or was reached through
+//! a mount the table does not list at a mount point that holds it) it numbers
+//! the entry by its host inode and records a determinism loss, so the run is
+//! not compared.
 //!
 //! Each of these numbers the entry as Detcore did before:
 //!
 //! - An entry rebuilt before Detcore first saw its path gets a new number,
 //!   which that path then leads to.
-//! - A path lookup crosses every mount on the guest's path again, so a mount
-//!   on a FUSE file system whose server is a guest Detcore holds could stall
-//!   it.
+//! - A path lookup crosses every mount on the guest's path again, and the
+//!   check of a mount point every mount above it, so a mount on a FUSE file
+//!   system whose server is a guest Detcore holds could stall it.
 //! - `get_next_ino` wraps at 2^32, so a directory other than a procfs root can
 //!   have inode 1, and has its link count reported as 1.
 //! - Under a backend whose guest thread IDs do not name host tasks, there is
@@ -70,6 +73,7 @@ use std::fs::File;
 use std::io;
 use std::io::Read;
 use std::os::fd::IntoRawFd;
+use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
@@ -82,6 +86,7 @@ use std::sync::OnceLock;
 
 use detcore_model::fd::RawInode;
 use reverie::BackendCapabilities;
+use reverie::syscalls::Errno;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -211,8 +216,8 @@ fn tasks_named(within: &Path) -> Vec<i32> {
 }
 
 /// A procfs mount in a guest's mount table: its ID, the directory of procfs it
-/// shows (`/` unless a subtree is bind-mounted) and where it is mounted, as a
-/// path in the frame magic links read in (see [`procfs_mounts`]).
+/// shows (`/` unless a subtree is bind-mounted) and where it is mounted, below
+/// the path the guest's root reads as (see [`procfs_mounts`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProcfsMount {
     id: u64,
@@ -228,26 +233,37 @@ pub(crate) struct ProcfsMount {
 ///
 /// The table gives each mount point relative to the guest thread's root,
 /// while a magic link reads as a path relative to the root of the thread
-/// that reads it: the tracer's, or, under SaBRe, the guest's own. So each
-/// mount point is put below the path the guest thread's root reads as, from
-/// its `/proc/<tid>/root`, which the same thread reads.
+/// that reads it (the tracer's, or, under SaBRe, the guest's own) when it
+/// leads below that root, and from the root of the mount namespace when it
+/// does not. So each mount point is put below the path the guest thread's
+/// root reads as, from its `/proc/<tid>/root`, which the same thread reads.
+/// That puts a mount point and a link in one frame when the guest's root is
+/// below the reader's, but not always when it is not, so [`path_within`]
+/// uses a mount point only where the reader finds the mount.
 ///
 /// Detcore refuses `mount`, `unshare` and `setns` once it starts, so a guest's
 /// procfs mount stays one: the mounts of a device found to be procfs are
 /// remembered with its mount namespace and the guest thread's root, which a
 /// `chroot` changes, by its mount, device and inode, and the path it reads
-/// as. Any other device is looked up again, as it may yet become one. A guest
-/// thread that changes the root while Detcore reads for another thread that
-/// shares it, which thread sequentialization rules out, can leave the two
-/// paths in different frames.
-pub(crate) fn procfs_mounts(tid: i32, device: u64) -> io::Result<Option<Arc<[ProcfsMount]>>> {
+/// as. Any other device is looked up again, as it may yet become one. A
+/// rename of a directory above a mount point moves the mount and changes
+/// none of these, so [`path_within`] asks for the table again (`reread`),
+/// which reads it and remembers what it finds, or forgets the device when it
+/// is no longer procfs there. A guest thread that changes the root while
+/// Detcore reads for another thread that shares it, which thread
+/// sequentialization rules out, can leave the two paths in different frames.
+pub(crate) fn procfs_mounts(
+    tid: i32,
+    device: u64,
+    reread: bool,
+) -> io::Result<Option<Arc<[ProcfsMount]>>> {
     // The mount namespace, the root's mount, device, inode and path, and
     // the device.
     type Key = (u64, Option<u64>, u64, u64, PathBuf, u64);
     static PROCFS_DEVICES: OnceLock<Mutex<HashMap<Key, Arc<[ProcfsMount]>>>> = OnceLock::new();
     let namespace = std::fs::metadata(format!("/proc/{tid}/ns/mnt"))?;
     let root_link = PathBuf::from(format!("/proc/{tid}/root"));
-    let root = identify(&root_link)?;
+    let root = identify(&root_link, true)?;
     let root_path = std::fs::read_link(&root_link)?;
     let key = (
         namespace.ino(),
@@ -258,12 +274,13 @@ pub(crate) fn procfs_mounts(tid: i32, device: u64) -> io::Result<Option<Arc<[Pro
         device,
     );
     let known = PROCFS_DEVICES.get_or_init(Default::default);
-    if let Some(mounts) = known.lock().unwrap().get(&key) {
+    if !reread && let Some(mounts) = known.lock().unwrap().get(&key) {
         return Ok(Some(mounts.clone()));
     }
     let mountinfo = read_checking_close(&format!("/proc/{tid}/mountinfo"))?;
     let mounts = procfs_mounts_in(&mountinfo, device, &root_path);
     if mounts.is_empty() {
+        known.lock().unwrap().remove(&key);
         return Ok(None);
     }
     let mounts: Arc<[ProcfsMount]> = mounts.into();
@@ -348,20 +365,89 @@ fn unescape(field: &[u8]) -> PathBuf {
 
 /// The path within procfs of the object at the canonical path `canonical`,
 /// reached through the mount `mount_id`: its path below that mount's mount
-/// point, joined to the mount's root. `None` when `mounts` does not list the
-/// mount, or lists it at a mount point that does not hold `canonical`, so a
-/// path read in another frame than the table names nothing.
+/// point, joined to the mount's root. The mount point must be where the
+/// reader finds the root of that mount: `mount_root` gives the mount whose
+/// root a path leads to, as the thread that read `canonical` resolves it
+/// (see [`mount_root`]).
+///
+/// That check makes the name the object's, whichever table the mount point
+/// came from. The reader reaches the root of a mount only through its one
+/// mount point, and `canonical` reads, from the same root, through that
+/// mount point and then the object's path within the mount. So a prefix of
+/// `canonical` where the reader finds the mount is that mount point, and the
+/// rest is the path within. Without it, a mount point remembered from before
+/// a rename of a directory above it, or one read in another frame than the
+/// link (see [`procfs_mounts`]), can be another prefix of `canonical`, and
+/// give the entry another name with no loss.
+///
+/// When the check fails with `mounts`, `reread` gives the guest's table read
+/// again, which is tried once more. An error is the reason no name was found.
 pub(crate) fn path_within(
     mounts: &[ProcfsMount],
     mount_id: u64,
     canonical: &Path,
-) -> Option<PathBuf> {
-    let mount = mounts.iter().find(|mount| mount.id == mount_id)?;
-    let rest = canonical.strip_prefix(&mount.mount_point).ok()?;
+    reread: impl FnOnce() -> io::Result<Option<Arc<[ProcfsMount]>>>,
+    mount_root: impl Fn(&Path) -> io::Result<Option<u64>>,
+) -> Result<PathBuf, String> {
+    if let Ok(within) = within_table(mounts, mount_id, canonical, &mount_root) {
+        return Ok(within);
+    }
+    match reread() {
+        Ok(Some(mounts)) => within_table(&mounts, mount_id, canonical, &mount_root),
+        Ok(None) => Err(format!(
+            "{} was reached through mount {mount_id}, and the guest's mount table, read again, lists no procfs mount of its device",
+            canonical.display()
+        )),
+        Err(error) => Err(format!(
+            "{} was reached through mount {mount_id}, and the guest's mount table cannot be read again: {error}",
+            canonical.display()
+        )),
+    }
+}
+
+/// [`path_within`] with the mounts of one table.
+fn within_table(
+    mounts: &[ProcfsMount],
+    mount_id: u64,
+    canonical: &Path,
+    mount_root: &impl Fn(&Path) -> io::Result<Option<u64>>,
+) -> Result<PathBuf, String> {
+    let reached = format!(
+        "{} was reached through mount {mount_id}",
+        canonical.display()
+    );
+    let mount = mounts
+        .iter()
+        .find(|mount| mount.id == mount_id)
+        .ok_or_else(|| {
+            format!("{reached}, which the guest's mount table does not list as a procfs mount")
+        })?;
+    let point = mount.mount_point.display();
+    let rest = canonical.strip_prefix(&mount.mount_point).map_err(|_| {
+        format!("{reached}, which the guest's mount table lists at {point}, not above it")
+    })?;
+    match mount_root(&mount.mount_point) {
+        Ok(Some(found)) if found == mount_id => {}
+        Ok(Some(found)) => {
+            return Err(format!(
+                "{reached}, and {point}, where the guest's mount table lists it, is the root of mount {found}"
+            ));
+        }
+        Ok(None) => {
+            return Err(format!(
+                "{reached}, and {point}, where the guest's mount table lists it, is the root of no mount"
+            ));
+        }
+        Err(error) => {
+            return Err(format!(
+                "{reached}, and cannot tell whether {point}, where the guest's mount table lists it, holds it: {error}"
+            ));
+        }
+    }
     if rest.as_os_str().is_empty() {
-        Some(mount.root.clone())
+        Ok(mount.root.clone())
     } else {
-        Some(mount.root.join(rest))
+        Ok(mount.root.join(rest))
     }
 }
 
@@ -422,7 +508,7 @@ pub(crate) fn is_on_procfs(link: &Path, device: u64, inode: u64) -> Result<bool,
 /// kernel reports one.
 fn check_link_object(link: &Path, device: u64, inode: u64) -> Result<Option<u64>, String> {
     let found =
-        identify(link).map_err(|error| format!("cannot stat {}: {error}", link.display()))?;
+        identify(link, true).map_err(|error| format!("cannot stat {}: {error}", link.display()))?;
     if found.device != device || found.inode != inode {
         return Err(format!(
             "{} is not the object the guest saw",
@@ -440,19 +526,25 @@ struct FileIdentity {
     /// its line in `mountinfo`, when the kernel reports it (`STATX_MNT_ID`,
     /// from Linux 5.8).
     mount_id: Option<u64>,
+    /// Whether the file is the root of that mount, when the kernel reports it
+    /// (`STATX_ATTR_MOUNT_ROOT`, from Linux 5.8).
+    mount_root: Option<bool>,
 }
 
-/// The identity of the file at `path`, following a final link, as a magic
-/// link is followed: to the object it leads to, through the mount it was
-/// reached through.
-fn identify(path: &Path) -> io::Result<FileIdentity> {
+/// The identity of the file at `path`, following a final link when `follow`
+/// is set, as a magic link is followed: to the object it leads to, through
+/// the mount it was reached through.
+fn identify(path: &Path, follow: bool) -> io::Result<FileIdentity> {
     let path = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::other(format!("{} contains a NUL byte", path.display())))?;
     let mut buf = std::mem::MaybeUninit::<libc::statx>::zeroed();
     let mask = libc::STATX_INO | libc::STATX_MNT_ID;
     // `AT_NO_AUTOMOUNT`, which `stat` implies, so that looking never mounts
     // anything.
-    let flags = libc::AT_NO_AUTOMOUNT;
+    let mut flags = libc::AT_NO_AUTOMOUNT;
+    if !follow {
+        flags |= libc::AT_SYMLINK_NOFOLLOW;
+    }
     // SAFETY: `path` is NUL-terminated and `buf` is large enough for statx.
     if unsafe { libc::statx(libc::AT_FDCWD, path.as_ptr(), flags, mask, buf.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
@@ -462,11 +554,139 @@ fn identify(path: &Path) -> io::Result<FileIdentity> {
     if found.stx_mask & libc::STATX_INO == 0 {
         return Err(io::Error::other("statx reported no inode number"));
     }
+    let mount_root = libc::STATX_ATTR_MOUNT_ROOT as u64;
     Ok(FileIdentity {
         device: libc::makedev(found.stx_dev_major, found.stx_dev_minor),
         inode: found.stx_ino,
         mount_id: (found.stx_mask & libc::STATX_MNT_ID != 0).then_some(found.stx_mnt_id),
+        mount_root: (found.stx_attributes_mask & mount_root != 0)
+            .then_some(found.stx_attributes & mount_root != 0),
     })
+}
+
+/// The ID of the mount whose root the path `path` leads to, as the calling
+/// thread resolves it, without following a final link or mounting anything:
+/// `None` when it leads to no mount's root, and an error when the kernel does
+/// not report mount roots.
+pub(crate) fn mount_root(path: &Path) -> io::Result<Option<u64>> {
+    let found = identify(path, false)?;
+    match (found.mount_root, found.mount_id) {
+        (Some(false), _) => Ok(None),
+        (Some(true), Some(id)) => Ok(Some(id)),
+        _ => Err(io::Error::other(
+            "the kernel does not report the root of a mount",
+        )),
+    }
+}
+
+/// What a system call Detcore injected into a guest did, read from its
+/// result: it ran, and returned this; it did not run, as the result reports
+/// (`NotRun`), and may be injected again; or it failed, for this reason.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Injected<T> {
+    Ran(T),
+    NotRun(String),
+    Failed(String),
+}
+
+/// The descriptor whose number is `openat`'s own system call number, which
+/// Reverie can report as the result of an `openat` that did not run (see
+/// [`read_open`]).
+pub(crate) const OPENAT_OWN_NUMBER: RawFd = libc::SYS_openat as RawFd;
+
+/// Whether the process of the guest thread `tid` holds descriptor `fd`: its
+/// `/proc/<tid>/fd/<fd>` is there, a magic link that is not followed.
+pub(crate) fn holds_descriptor(tid: i32, fd: RawFd) -> Result<bool, String> {
+    let link = format!("/proc/{tid}/fd/{fd}");
+    match std::fs::symlink_metadata(&link) {
+        Ok(_) => Ok(true),
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(false),
+        Err(error) => Err(format!("cannot stat {link}: {error}")),
+    }
+}
+
+/// What an `openat` Detcore injected into the guest to open an `O_PATH`
+/// descriptor did, from its result.
+///
+/// Reverie reports an injection that a signal stopped before it ran as a
+/// restart, and an `O_PATH` open does not sleep, so `EINTR` too means that
+/// it did not run. And when the tracer runs under a seccomp filter of its
+/// own, Reverie reports an injection that a SIGTRAP stopped before it ran as
+/// returning its own system call number, which on x86_64 the result register
+/// holds until the call runs. So that number is a descriptor the call opened
+/// only when the guest did not hold that descriptor before the call
+/// (`held_before`), as an open takes the lowest free descriptor, and holds it
+/// now (`holds_now`). Were it taken for one otherwise, Detcore would read the
+/// guest's own descriptor, and then close it. Another guest thread that opens
+/// or closes that descriptor between the two looks, which thread
+/// sequentialization rules out, can mislead them.
+pub(crate) fn read_open(
+    result: Result<i64, Errno>,
+    held_before: &Result<bool, String>,
+    holds_now: impl FnOnce() -> Result<bool, String>,
+) -> Injected<RawFd> {
+    let own_number = i64::from(OPENAT_OWN_NUMBER);
+    match result {
+        Ok(fd) if fd == own_number => {
+            let unchanged = match held_before {
+                Ok(true) => Ok(true),
+                Ok(false) => holds_now().map(|holds| !holds),
+                Err(reason) => Err(reason.clone()),
+            };
+            match unchanged {
+                Ok(false) => Injected::Ran(OPENAT_OWN_NUMBER),
+                Ok(true) => Injected::NotRun(format!(
+                    "{fd}, its own number, with descriptor {fd} unchanged"
+                )),
+                Err(reason) => Injected::Failed(format!(
+                    "cannot open the guest's path again: openat returned {fd}, its own number, and cannot tell whether it ran: {reason}"
+                )),
+            }
+        }
+        Ok(fd) => RawFd::try_from(fd).map_or_else(
+            |_| Injected::Failed(format!("openat returned {fd}, which is no descriptor")),
+            Injected::Ran,
+        ),
+        Err(
+            errno @ (Errno::EINTR
+            | Errno::ERESTARTSYS
+            | Errno::ERESTARTNOINTR
+            | Errno::ERESTARTNOHAND
+            | Errno::ERESTART_RESTARTBLOCK),
+        ) => Injected::NotRun(errno.to_string()),
+        Err(errno) => Injected::Failed(format!("cannot open the guest's path again: {errno}")),
+    }
+}
+
+/// What a `close` Detcore injected into the guest to close the `O_PATH`
+/// descriptor it opened did, from its result.
+///
+/// Linux's close releases the descriptor before anything that can fail, and
+/// an `O_PATH` descriptor has nothing to flush, so a close that runs returns
+/// 0, and the descriptor is gone. A restart means that the close did not run,
+/// and so does its own system call number, as for [`read_open`]: close never
+/// returns a positive number. Any other error, `EINTR` and `EBADF` among
+/// them, is a seccomp filter the guest inherited refusing the close (or a
+/// descriptor that was not open), which leaves the descriptor open.
+pub(crate) fn read_close(result: Result<i64, Errno>) -> Injected<()> {
+    match result {
+        Ok(0) => Injected::Ran(()),
+        Ok(number) if number == libc::SYS_close => {
+            Injected::NotRun(format!("{number}, its own number"))
+        }
+        Ok(other) => Injected::Failed(format!(
+            "close of the guest's O_PATH descriptor returned {other}, which close never returns"
+        )),
+        Err(
+            errno @ (Errno::ERESTARTSYS
+            | Errno::ERESTARTNOINTR
+            | Errno::ERESTARTNOHAND
+            | Errno::ERESTART_RESTARTBLOCK),
+        ) => Injected::NotRun(errno.to_string()),
+        Err(errno) => Injected::Failed(format!(
+            "close of the guest's O_PATH descriptor returned {errno:?}"
+        )),
+    }
 }
 
 /// A procfs directory being listed, by its path within procfs.
@@ -616,7 +836,7 @@ mod tests {
         let error = std::thread::spawn(move || {
             refuse_close_in_this_thread();
             let tid = unsafe { libc::gettid() };
-            procfs_mounts(tid, root).unwrap_err().to_string()
+            procfs_mounts(tid, root, false).unwrap_err().to_string()
         })
         .join()
         .unwrap();
@@ -903,10 +1123,34 @@ mod tests {
         );
     }
 
+    /// A `mount_root` for a tree whose only mount root is that of mount `id`
+    /// at `point`.
+    fn only_root(point: &'static str, id: u64) -> impl Fn(&Path) -> io::Result<Option<u64>> + Copy {
+        move |path| Ok((path == Path::new(point)).then_some(id))
+    }
+
+    /// [`path_within`] in a tree that does not change, whose mount table is
+    /// `mounts`, read again too, and where each mount is found at the mount
+    /// point the table lists.
+    fn named_in(mounts: &Arc<[ProcfsMount]>, mount_id: u64, canonical: &str) -> Option<PathBuf> {
+        path_within(
+            mounts,
+            mount_id,
+            Path::new(canonical),
+            || Ok(Some(mounts.clone())),
+            |path| {
+                let mount = mounts.iter().find(|mount| mount.mount_point == path);
+                Ok(mount.map(|mount| mount.id))
+            },
+        )
+        .ok()
+    }
+
     #[test]
     fn a_path_within_procfs_does_not_depend_on_the_mount() {
-        let mounts = procfs_mounts_in(MOUNTINFO, libc::makedev(0, 21), Path::new("/"));
-        let within = |id: u64, path: &str| path_within(&mounts, id, Path::new(path));
+        let mounts: Arc<[ProcfsMount]> =
+            procfs_mounts_in(MOUNTINFO, libc::makedev(0, 21), Path::new("/")).into();
+        let within = |id: u64, path: &str| named_in(&mounts, id, path);
         let named = |path: &str| Some(PathBuf::from(path));
         assert_eq!(within(22, "/proc"), named("/"));
         assert_eq!(within(22, "/proc/3/fd/0"), named("/3/fd/0"));
@@ -924,63 +1168,315 @@ mod tests {
     /// the old frame. The path a link reads as in the new frame can lie under
     /// another mount there, here one that shows all of procfs where the guest
     /// reached a bind mount of `/proc/sys`. Matching the mount the guest
-    /// reached the file through names nothing then, rather than another
-    /// entry; the table read in the new frame names the entry again.
+    /// reached the file through names nothing with that table, rather than
+    /// another entry, and the table read again in the new frame names the
+    /// entry.
     #[test]
     fn a_stale_table_names_nothing_rather_than_another_entry() {
         let device = libc::makedev(0, 21);
-        let before = procfs_mounts_in(
+        let before: Arc<[ProcfsMount]> = procfs_mounts_in(
             b"\
 22 1 0:21 / /proc rw - proc proc rw
 30 1 0:21 /sys /box/proc rw - proc proc rw
 ",
             device,
             Path::new("/"),
-        );
+        )
+        .into();
         let sysctl = Some(PathBuf::from("/sys/kernel"));
-        assert_eq!(
-            path_within(&before, 30, Path::new("/box/proc/kernel")),
-            sysctl
-        );
+        assert_eq!(named_in(&before, 30, "/box/proc/kernel"), sysctl);
         // After chroot("/box"), a guest that reads its own links, as under
-        // SaBRe, reads this one as /proc/kernel.
-        assert_eq!(path_within(&before, 30, Path::new("/proc/kernel")), None);
+        // SaBRe, reads this one as /proc/kernel, and finds mount 30 at /proc.
         let after = b"\
 30 1 0:21 /sys /proc rw - proc proc rw
 ";
-        let own = procfs_mounts_in(after, device, Path::new("/"));
-        assert_eq!(path_within(&own, 30, Path::new("/proc/kernel")), sysctl);
-        // The tracer, whose root is still /, reads the guest's root as /box.
-        let traced = procfs_mounts_in(after, device, Path::new("/box"));
+        let own: Arc<[ProcfsMount]> = procfs_mounts_in(after, device, Path::new("/")).into();
+        let in_box = only_root("/proc", 30);
+        let kernel = Path::new("/proc/kernel");
         assert_eq!(
-            path_within(&traced, 30, Path::new("/box/proc/kernel")),
+            path_within(&before, 30, kernel, || Ok(Some(before.clone())), in_box),
+            Err("/proc/kernel was reached through mount 30, which the guest's mount table lists at /box/proc, not above it".into())
+        );
+        assert_eq!(
+            path_within(&before, 30, kernel, || Ok(Some(own.clone())), in_box).ok(),
             sysctl
         );
+        // The tracer, whose root is still /, reads the guest's root as /box.
+        let traced: Arc<[ProcfsMount]> = procfs_mounts_in(after, device, Path::new("/box")).into();
+        assert_eq!(named_in(&traced, 30, "/box/proc/kernel"), sysctl);
+    }
+
+    /// A rename of a directory above procfs's mount point moves the mount,
+    /// and changes nothing a table is remembered by. Here the guest renames
+    /// `/a` to `/b`, makes a new `/a/proc`, and renames `/b` to
+    /// `/a/proc/moved`, so that the mount point the table remembered from
+    /// before lists is still a prefix of the path the entry reads as. The
+    /// reader does not find the mount there, so the table is read again,
+    /// which names the entry as before the renames, rather than
+    /// `/moved/proc/1/stat`.
+    #[test]
+    fn a_mount_moved_by_a_rename_is_found_where_it_moved() {
+        let device = libc::makedev(0, 21);
+        let table = |mount_point: &str| -> Arc<[ProcfsMount]> {
+            let line = format!("30 1 0:21 / {mount_point} rw - proc proc rw\n");
+            procfs_mounts_in(line.as_bytes(), device, Path::new("/")).into()
+        };
+        let remembered = table("/a/proc");
+        let moved = table("/a/proc/moved/proc");
+        let found = only_root("/a/proc/moved/proc", 30);
+        let stat = Path::new("/a/proc/moved/proc/1/stat");
+        let named = Ok(PathBuf::from("/1/stat"));
+        assert_eq!(
+            path_within(&remembered, 30, stat, || Ok(Some(moved.clone())), found),
+            named
+        );
+        assert_eq!(
+            path_within(&moved, 30, stat, || panic!("read again"), found),
+            named
+        );
+        // A table that still lists the mount where the reader finds no mount,
+        // or another one, names nothing.
+        let reached = "/a/proc/moved/proc/1/stat was reached through mount 30, and /a/proc";
+        assert_eq!(
+            path_within(
+                &remembered,
+                30,
+                stat,
+                || Ok(Some(remembered.clone())),
+                found
+            ),
+            Err(format!(
+                "{reached}, where the guest's mount table lists it, is the root of no mount"
+            ))
+        );
+        let covered = only_root("/a/proc", 31);
+        assert_eq!(
+            path_within(
+                &remembered,
+                30,
+                stat,
+                || Ok(Some(remembered.clone())),
+                covered
+            ),
+            Err(format!(
+                "{reached}, where the guest's mount table lists it, is the root of mount 31"
+            ))
+        );
+        let unknown = |_: &Path| Err(io::Error::other("no statx"));
+        assert_eq!(
+            path_within(
+                &remembered,
+                30,
+                stat,
+                || Ok(Some(remembered.clone())),
+                unknown
+            ),
+            Err(
+                "/a/proc/moved/proc/1/stat was reached through mount 30, and cannot tell whether /a/proc, where the guest's mount table lists it, holds it: no statx"
+                    .to_string()
+            )
+        );
+        // Nor does a table that cannot be read again, or lists no procfs
+        // mount of the device.
+        assert_eq!(
+            path_within(&remembered, 30, stat, || Ok(None), found),
+            Err("/a/proc/moved/proc/1/stat was reached through mount 30, and the guest's mount table, read again, lists no procfs mount of its device".into())
+        );
+        assert_eq!(
+            path_within(&remembered, 30, stat, || Err(io::Error::other("gone")), found),
+            Err("/a/proc/moved/proc/1/stat was reached through mount 30, and the guest's mount table cannot be read again: gone".into())
+        );
+    }
+
+    /// The table gives mount points relative to the guest's root, which reads
+    /// from the root of the mount namespace when the reader cannot reach it,
+    /// while a link to a file the reader can reach reads from the reader's
+    /// root. Here the tracer's root is `/sys`, the guest's is `/`, and
+    /// procfs is mounted at `/sys/sys`. The tracer reads procfs's
+    /// `/sys/kernel/hostname` as `/sys/sys/kernel/hostname`, and the mount
+    /// point as `/sys`, while the table lists it at `/sys/sys`, a directory
+    /// of procfs there. The entry goes unnamed, rather than named
+    /// `/kernel/hostname`.
+    #[test]
+    fn a_mount_point_read_in_another_frame_names_nothing() {
+        let table: Arc<[ProcfsMount]> = procfs_mounts_in(
+            b"22 1 0:21 / /sys/sys rw - proc proc rw\n",
+            libc::makedev(0, 21),
+            Path::new("/"),
+        )
+        .into();
+        let tracer = only_root("/sys", 22);
+        assert_eq!(
+            path_within(
+                &table,
+                22,
+                Path::new("/sys/sys/kernel/hostname"),
+                || Ok(Some(table.clone())),
+                tracer
+            ),
+            Err("/sys/sys/kernel/hostname was reached through mount 22, and /sys/sys, where the guest's mount table lists it, is the root of no mount".into())
+        );
+    }
+
+    /// Under a tracer that runs under a seccomp filter, Reverie can report an
+    /// `openat` that did not run as returning its own number. That number is
+    /// a descriptor the call opened only when the guest did not hold it
+    /// before the call and holds it after: an open takes the lowest free
+    /// descriptor.
+    #[test]
+    fn an_open_returning_its_own_number_ran_only_if_it_took_that_descriptor() {
+        let own = i64::from(OPENAT_OWN_NUMBER);
+        let free = Ok(false);
+        let held = Ok(true);
+        let unknown = Err("cannot stat".to_string());
+        let unchanged = format!("{own}, its own number, with descriptor {own} unchanged");
+        assert_eq!(
+            read_open(Ok(own), &free, || Ok(true)),
+            Injected::Ran(OPENAT_OWN_NUMBER)
+        );
+        assert_eq!(
+            read_open(Ok(own), &free, || Ok(false)),
+            Injected::NotRun(unchanged.clone())
+        );
+        assert_eq!(
+            read_open(Ok(own), &held, || panic!("looked again")),
+            Injected::NotRun(unchanged)
+        );
+        let uncertain = |reason: &str| {
+            Injected::Failed(format!(
+                "cannot open the guest's path again: openat returned {own}, its own number, and cannot tell whether it ran: {reason}"
+            ))
+        };
+        assert_eq!(
+            read_open(Ok(own), &unknown, || panic!("looked again")),
+            uncertain("cannot stat")
+        );
+        assert_eq!(
+            read_open(Ok(own), &free, || Err("gone".into())),
+            uncertain("gone")
+        );
+        // Any other descriptor is the call's.
+        assert_eq!(read_open(Ok(3), &held, || panic!()), Injected::Ran(3));
+        assert_eq!(
+            read_open(Ok(own + 1), &unknown, || panic!()),
+            Injected::Ran(OPENAT_OWN_NUMBER + 1)
+        );
+        assert_eq!(
+            read_open(Ok(1 << 40), &free, || panic!()),
+            Injected::Failed(format!(
+                "openat returned {}, which is no descriptor",
+                1i64 << 40
+            ))
+        );
+        for errno in [
+            Errno::EINTR,
+            Errno::ERESTARTSYS,
+            Errno::ERESTARTNOINTR,
+            Errno::ERESTARTNOHAND,
+            Errno::ERESTART_RESTARTBLOCK,
+        ] {
+            assert_eq!(
+                read_open(Err(errno), &free, || panic!()),
+                Injected::NotRun(errno.to_string())
+            );
+        }
+        assert_eq!(
+            read_open(Err(Errno::EPERM), &free, || panic!()),
+            Injected::Failed(format!(
+                "cannot open the guest's path again: {}",
+                Errno::EPERM
+            ))
+        );
+    }
+
+    /// A close that runs returns 0. Its own number reports one that did not
+    /// run, as for `openat`, and any other number is one close never returns.
+    #[test]
+    fn only_a_close_returning_0_ran() {
+        assert_eq!(read_close(Ok(0)), Injected::Ran(()));
+        assert_eq!(
+            read_close(Ok(libc::SYS_close)),
+            Injected::NotRun(format!("{}, its own number", libc::SYS_close))
+        );
+        assert_eq!(
+            read_close(Ok(5)),
+            Injected::Failed(
+                "close of the guest's O_PATH descriptor returned 5, which close never returns"
+                    .into()
+            )
+        );
+        assert_eq!(
+            read_close(Err(Errno::ERESTARTSYS)),
+            Injected::NotRun(Errno::ERESTARTSYS.to_string())
+        );
+        for (errno, name) in [(Errno::EPERM, "EPERM"), (Errno::EINTR, "EINTR")] {
+            assert_eq!(
+                read_close(Err(errno)),
+                Injected::Failed(format!(
+                    "close of the guest's O_PATH descriptor returned {name}"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn a_process_holds_the_descriptors_it_has_open() {
+        let pid = std::process::id() as i32;
+        let null = File::open("/dev/null").unwrap();
+        // A number far above those that other tests running in this process
+        // take, so that none takes it once it is closed.
+        let fd = unsafe { libc::fcntl(null.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 777) };
+        assert!(fd >= 777, "{}", io::Error::last_os_error());
+        assert_eq!(holds_descriptor(pid, fd), Ok(true));
+        assert_eq!(unsafe { libc::close(fd) }, 0);
+        assert_eq!(holds_descriptor(pid, fd), Ok(false));
     }
 
     #[test]
     fn this_process_reads_its_own_procfs_entries() {
         let pid = std::process::id() as i32;
         let proc = std::fs::metadata("/proc").unwrap();
-        let mounts = procfs_mounts(pid, proc.dev()).unwrap().unwrap();
+        let mounts = procfs_mounts(pid, proc.dev(), false).unwrap().unwrap();
         assert!(
-            procfs_mounts(pid, proc.dev()).unwrap().is_some(),
+            procfs_mounts(pid, proc.dev(), false).unwrap().is_some(),
             "once remembered"
         );
         assert!(
-            procfs_mounts(pid, std::fs::metadata("/").unwrap().dev())
+            procfs_mounts(pid, proc.dev(), true).unwrap().is_some(),
+            "read again"
+        );
+        assert!(
+            procfs_mounts(pid, std::fs::metadata("/").unwrap().dev(), false)
                 .unwrap()
                 .is_none()
         );
-        assert!(procfs_mounts(-1, proc.dev()).is_err(), "no such thread");
+        assert!(
+            procfs_mounts(-1, proc.dev(), false).is_err(),
+            "no such thread"
+        );
 
         let stat = std::fs::metadata(format!("/proc/{pid}/stat")).unwrap();
         let file = File::open("/proc/self/stat").unwrap();
         let link = PathBuf::from(format!("/proc/{pid}/fd/{}", file.as_raw_fd()));
         let (canonical, mount_id) = inspect_link(&link, stat.dev(), stat.ino()).unwrap();
         assert_eq!(
-            path_within(&mounts, mount_id, &canonical),
-            Some(PathBuf::from(format!("/{pid}/stat")))
+            path_within(
+                &mounts,
+                mount_id,
+                &canonical,
+                || panic!("read again"),
+                mount_root
+            ),
+            Ok(PathBuf::from(format!("/{pid}/stat")))
+        );
+        let mount = mounts.iter().find(|mount| mount.id == mount_id).unwrap();
+        assert_eq!(mount_root(&mount.mount_point).unwrap(), Some(mount_id));
+        let directory = mount.mount_point.join(pid.to_string());
+        assert_eq!(mount_root(&directory).unwrap(), None);
+        assert_eq!(
+            mount_root(&mount.mount_point.join("self")).unwrap(),
+            None,
+            "a link that is not followed"
         );
         assert!(inspect_link(&link, stat.dev(), stat.ino() + 1).is_err());
         assert!(inspect_link(&link, stat.dev() + 1, stat.ino()).is_err());

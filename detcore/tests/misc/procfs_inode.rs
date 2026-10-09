@@ -740,3 +740,49 @@ fn a_refused_close_ends_in_a_determinism_loss_whatever_a_lookup_says() {
         },
     );
 }
+
+/// The descriptor whose number is `openat`'s own system call number.
+#[cfg(target_arch = "x86_64")]
+const OPENAT_OWN_NUMBER: i32 = libc::SYS_openat as i32;
+
+/// Reverie can report an `openat` that did not run as returning its own
+/// number, under a tracer that runs under a seccomp filter, but the `O_PATH`
+/// descriptor Detcore opens to name a procfs path can take that number too.
+/// The guest did not hold that descriptor before the call and holds it
+/// after, so the call ran: Detcore names the entry, records no loss, and
+/// closes the descriptor, rather than opening another and leaving this one
+/// open.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn a_descriptor_numbered_as_openat_is_detcores_when_it_was_free() {
+    in_its_own_process(
+        "a_descriptor_numbered_as_openat_is_detcores_when_it_was_free",
+        || {
+            under_detcore(|| {
+                let open = |fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0;
+                assert!(
+                    !open(OPENAT_OWN_NUMBER),
+                    "{OPENAT_OWN_NUMBER} is open from the start"
+                );
+                let null = File::open("/dev/null").unwrap().into_raw_fd();
+                let mut last = null;
+                while last < OPENAT_OWN_NUMBER - 1 {
+                    last = unsafe { libc::dup(null) };
+                    assert!(last >= 0, "dup: {}", std::io::Error::last_os_error());
+                }
+                assert_eq!(
+                    last,
+                    OPENAT_OWN_NUMBER - 1,
+                    "a descriptor below {OPENAT_OWN_NUMBER} was free"
+                );
+                std::fs::metadata("/proc/self/stat").unwrap();
+                assert!(
+                    !open(OPENAT_OWN_NUMBER),
+                    "Detcore's O_PATH descriptor stayed open"
+                );
+                assert!(!open(OPENAT_OWN_NUMBER + 1), "Detcore opened another");
+            });
+            assert_eq!(detcore::detlog::determinism_loss(), None);
+        },
+    );
+}
