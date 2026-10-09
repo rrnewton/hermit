@@ -739,6 +739,13 @@ impl RunQueue {
             let old = self.queue.insert(new_key, qval);
             assert!(old.is_none()); // round robin turns should ensure uniqueness
         }
+        // An upgrade makes every backed-off poller ordinary work for the
+        // deterministic-work-first gates. A poller its deadline restored
+        // earlier would have been upgraded here too, so it stops counting as
+        // a poller now as well (https://github.com/rrnewton/hermit/issues/3952).
+        for value in self.queue.values_mut() {
+            value.deadline_restored = false;
+        }
     }
 }
 
@@ -845,6 +852,26 @@ mod tests {
         );
         assert!(!queue.only_pollers(), "and stays so after the restore");
         assert!(queue.has_runnable_besides(other));
+    }
+
+    /// A poll upgrade turns every backed-off poller into ordinary work for the
+    /// gates; a deadline-restored poller stops counting as a poller at the
+    /// same point.
+    #[test]
+    fn a_poll_upgrade_ends_a_restored_pollers_poller_status() {
+        let poller = DetTid::from_raw(1);
+        let mut queue = RunQueue::new(SchedHeuristic::None, 0, 0.0);
+        queue.push_poller(poller, DEFAULT_PRIORITY, 30);
+        assert_eq!(
+            queue.restore_poller_priority(poller),
+            PollerRestore::Restored
+        );
+        assert!(queue.only_pollers());
+        queue.do_poll_upgrade();
+        assert!(
+            !queue.only_pollers(),
+            "upgraded like every backed-off poller"
+        );
     }
 
     #[test]
