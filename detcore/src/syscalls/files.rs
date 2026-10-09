@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::os::unix::fs::FileTypeExt;
@@ -53,9 +54,13 @@ use super::deterministic_stdio_inode_for_resource;
 use crate::config::SchedHeuristic;
 use crate::dirents::*;
 use crate::fd::*;
+use crate::procfs::DescriptorTable;
 use crate::procfs::MountInfoSnapshot;
 use crate::procfs::ProcfsFile;
 use crate::procfs::ProcfsSnapshotContext;
+use crate::procfs::descriptor_entry_key;
+use crate::procfs::parse_descriptor_entry;
+use crate::procfs::parse_descriptor_table;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Device;
 use crate::resources::HOST_TIMED_INTERNAL_PIPE_IO_FYI;
@@ -678,6 +683,230 @@ fn reopens_scheduler_managed_pipe(pid: i32, fd: RawFd, managed_pipe_fds: &[RawFd
         .any(|&held| held != fd && link(held).as_ref() == Some(&opened))
 }
 
+/// What a stat call describes, as the kernel resolves it: the object a
+/// descriptor holds (`fstat`, or an empty path with `AT_EMPTY_PATH`), or a
+/// path relative to `dirfd`, its last component followed or not. The path is
+/// read before the call runs, because Linux copies the pathname in before it
+/// copies the result out, so a guest may pass overlapping buffers.
+enum StatTarget {
+    Descriptor(RawFd),
+    Path {
+        dirfd: i32,
+        path: PathBuf,
+        follow: bool,
+    },
+}
+
+impl StatTarget {
+    /// The target of an `*at` stat call with these arguments, read before the
+    /// call runs. `AT_EMPTY_PATH` with an empty or NULL path (Linux 6.11
+    /// accepts NULL) describes `dirfd` itself; a pathname that cannot be read
+    /// counts as nonempty and has no target, as does an empty path relative to
+    /// the working directory.
+    fn of_at_call<M: MemoryAccess>(
+        memory: &M,
+        dirfd: i32,
+        path: Option<PathPtr<'_>>,
+        flags: AtFlags,
+    ) -> Option<Self> {
+        let path = match path {
+            None => PathBuf::new(),
+            Some(path) => path.read(memory).ok()?,
+        };
+        if path.as_os_str().is_empty() {
+            return (dirfd >= 0 && flags.contains(AtFlags::AT_EMPTY_PATH))
+                .then_some(Self::Descriptor(dirfd));
+        }
+        Some(Self::Path {
+            dirfd,
+            path,
+            follow: !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW),
+        })
+    }
+}
+
+/// Whether a stat result can describe a per-descriptor procfs entry: Linux
+/// reports a `/proc/<task>/fd/<n>` link with size 64 and an `fdinfo/<n>`
+/// file as empty and mode 0444, both on procfs, whose device has major 0.
+fn may_be_descriptor_entry(stat: &DetStat) -> bool {
+    if libc::major(stat.dev) != 0 {
+        return false;
+    }
+    match stat.mode & libc::S_IFMT {
+        libc::S_IFLNK => stat.size == 64,
+        libc::S_IFREG => stat.size == 0 && stat.mode & 0o7777 == 0o444,
+        _ => false,
+    }
+}
+
+/// The [`descriptor_entry_key`] of the object that thread `tid`'s descriptor
+/// `fd` holds, when the kernel names it `/proc/<task>/fd/<n>` or
+/// `/proc/<task>/fdinfo/<n>` with a numeric task and it is on procfs.
+fn descriptor_entry_key_of(tid: i32, fd: RawFd) -> Option<u64> {
+    let (name, on_procfs) = descriptor_identity(tid, fd)?;
+    let (task, table, number) = parse_descriptor_entry(name.to_str()?)?;
+    (on_procfs && is_numeric_task(task)).then(|| descriptor_entry_key(task, table, number))
+}
+
+/// The [`descriptor_entry_key`] of what `path`, relative to guest thread
+/// `tid`'s `dirfd`, names: the entry at the name [`guest_path_name`] gives
+/// it, when that is `/proc/<numeric task>/{fd,fdinfo}/<n>` on procfs. `ids`
+/// are the thread's process and thread numbers in its pid namespace.
+fn descriptor_entry_key_of_path(
+    tid: i32,
+    ids: (i32, i32),
+    dirfd: i32,
+    path: &Path,
+    follow: bool,
+) -> Option<u64> {
+    let name = guest_path_name(tid, ids, dirfd, path, follow)?;
+    let (task, table, number) = parse_descriptor_entry(name.to_str()?)?;
+    let directory = name.parent()?;
+    (is_numeric_task(task) && is_procfs_path(&in_guest_root(tid, directory)))
+        .then(|| descriptor_entry_key(task, table, number))
+}
+
+/// The name the kernel gives the object `path` names when guest thread `tid`
+/// resolves it relative to `dirfd`, following its last component when
+/// `follow` is set: a guest-absolute path with every symlink expanded, as a
+/// descriptor's link spells it. `None` if any step fails.
+///
+/// This allocates no descriptor, in this process or in the guest, which on
+/// the in-guest backends is the same process: every step is a pathname
+/// call (`lstat`, `readlink`, `statfs`) through `/proc/<tid>/root`, the
+/// guest's own view of the filesystem. The walk starts at `/` for an
+/// absolute path, or at the name the kernel gives the guest's working
+/// directory or `dirfd` (its `/proc/<tid>/cwd` or `/proc/<tid>/fd/<dirfd>`
+/// link), and takes one component at a time, keeping names as raw bytes:
+/// - an ordinary symlink is replaced by its text, an absolute text
+///   restarting at `/`;
+/// - procfs's `self` and `thread-self` are replaced by the guest's own
+///   numbers (`ids`), since here they would name the caller;
+/// - any other procfs link (`fd/<n>`, `cwd`, ...) is replaced by the name
+///   its link gives, and one that names no path (`pipe:[...]`) ends the walk;
+/// - with every symlink expanded, each component of the name is a directory,
+///   so `..` removes the last one, and stays at `/`.
+///
+/// The thread's process and thread numbers come from the caller (injected
+/// `getpid` and `gettid`) rather than from `/proc/<tid>/status`, which would
+/// need a descriptor to read.
+fn guest_path_name(
+    tid: i32,
+    (process, thread): (i32, i32),
+    dirfd: i32,
+    path: &Path,
+    follow: bool,
+) -> Option<PathBuf> {
+    let mut current = if path.is_absolute() {
+        PathBuf::from("/")
+    } else {
+        let start = if dirfd == libc::AT_FDCWD {
+            format!("/proc/{tid}/cwd")
+        } else {
+            format!("/proc/{tid}/fd/{dirfd}")
+        };
+        // A deleted or anonymous directory has no name to resolve under.
+        Some(std::fs::read_link(start).ok()?).filter(|start| start.is_absolute())?
+    };
+    let mut pending: std::collections::VecDeque<OsString> = path_parts(path).collect();
+    let mut links = 0;
+    while let Some(part) = pending.pop_front() {
+        if part == "." {
+            continue;
+        }
+        if part == ".." {
+            current.pop();
+            continue;
+        }
+        let candidate = current.join(&part);
+        let host = in_guest_root(tid, &candidate);
+        let last = pending.is_empty();
+        if !std::fs::symlink_metadata(&host)
+            .ok()?
+            .file_type()
+            .is_symlink()
+            || (last && !follow)
+        {
+            current = candidate;
+            continue;
+        }
+        links += 1;
+        if links > 40 {
+            return None;
+        }
+        let on_procfs = is_procfs_path(&in_guest_root(tid, &current));
+        if on_procfs && (part == "self" || part == "thread-self") {
+            let task = if part == "self" {
+                process.to_string()
+            } else {
+                format!("{process}/task/{thread}")
+            };
+            for part in task.split('/').rev() {
+                pending.push_front(part.into());
+            }
+            continue;
+        }
+        let text = std::fs::read_link(&host).ok()?;
+        if text.is_absolute() {
+            current = PathBuf::from("/");
+        } else if on_procfs {
+            return None;
+        }
+        for part in path_parts(&text).collect::<Vec<_>>().into_iter().rev() {
+            pending.push_front(part);
+        }
+    }
+    Some(current)
+}
+
+/// `guest_path`, a guest-absolute path, as this process reaches it: under
+/// guest thread `tid`'s root.
+fn in_guest_root(tid: i32, guest_path: &Path) -> PathBuf {
+    let relative = guest_path.strip_prefix("/").unwrap_or(guest_path);
+    Path::new(&format!("/proc/{tid}/root")).join(relative)
+}
+
+/// The components of `path` that a walk takes, as names: `.`, `..` and
+/// ordinary names, without the root.
+fn path_parts(path: &Path) -> impl Iterator<Item = OsString> + '_ {
+    path.components().filter_map(|component| match component {
+        std::path::Component::Normal(name) => Some(name.to_os_string()),
+        std::path::Component::ParentDir => Some("..".into()),
+        std::path::Component::CurDir => Some(".".into()),
+        _ => None,
+    })
+}
+
+/// Whether `path` resolves to an object on procfs, by `statfs` of the path,
+/// which allocates no descriptor.
+fn is_procfs_path(path: &Path) -> bool {
+    nix::sys::statfs::statfs(path)
+        .is_ok_and(|statfs| statfs.filesystem_type() == nix::sys::statfs::PROC_SUPER_MAGIC)
+}
+
+/// Whether a procfs task spelling is numeric: `<pid>` or `<pid>/task/<tid>`,
+/// as the kernel names the directories, never `self` or `thread-self`.
+fn is_numeric_task(task: &str) -> bool {
+    task.split('/').enumerate().all(|(index, part)| {
+        (index == 1 && part == "task")
+            || (!part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    })
+}
+
+/// The raw inode a listing reports for `entry`: its
+/// [`descriptor_entry_key`] when the directory is a per-descriptor procfs
+/// `table` and the entry names a descriptor, otherwise the host's inode.
+fn listed_raw_ino(entry: &DirEntry, table: Option<&(String, DescriptorTable)>) -> u64 {
+    match (table, std::str::from_utf8(&entry.name)) {
+        (Some((task, table)), Ok(name))
+            if !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            descriptor_entry_key(task, *table, name)
+        }
+        _ => entry.ino,
+    }
+}
+
 /// The path the kernel resolved an open descriptor to, read from the guest's
 /// own `/proc/<pid>/fd/<fd>` link. This is the evidence authority for "which
 /// object was opened": it is produced by the kernel from the descriptor itself,
@@ -894,31 +1123,6 @@ fn utimensat_input_overlaps<M: MemoryAccess>(
             .times()
             .is_some_and(|times| overlaps(times.as_raw(), std::mem::size_of::<[Timespec; 2]>()));
     path || times
-}
-
-/// The descriptor a `*at` stat call describes by itself: `dirfd`, when the
-/// call passes `AT_EMPTY_PATH` with an empty or NULL path (Linux 6.11 accepts
-/// NULL). `None` for every call that resolves a path, and for `AT_FDCWD`. A
-/// path that cannot be read counts as nonempty, so the call keeps the
-/// path-based numbering and the kernel reports the fault. The path is read
-/// only after the flag and `dirfd` checks, so an ordinary `stat()` reads no
-/// guest memory here.
-fn empty_path_fd<M: MemoryAccess>(
-    memory: &M,
-    dirfd: i32,
-    path: Option<PathPtr>,
-    flags: AtFlags,
-) -> Option<i32> {
-    if dirfd < 0 || !flags.contains(AtFlags::AT_EMPTY_PATH) {
-        return None;
-    }
-    let empty = match path {
-        None => true,
-        Some(path) => path
-            .read(memory)
-            .is_ok_and(|path| path.as_os_str().is_empty()),
-    };
-    empty.then_some(dirfd)
 }
 
 /// The fixed inode that `fd` reports when it is still the container's
@@ -4197,21 +4401,49 @@ impl<T: RecordOrReplay> Detcore<T> {
             // kernel because there're many corner cases. i.e.: even access
             // filepath from tracer may cause tracer to hang under certain fuse
             // filesystem (squashfs_ll).
+            // Read the pathname before the call runs: Linux copies it in
+            // before it copies the result out, so a guest may pass a pathname
+            // that overlaps the stat buffer.
+            let target = {
+                let memory = guest.memory();
+                let read =
+                    |path: Option<PathPtr<'_>>| path.and_then(|path| path.read(&memory).ok());
+                match call {
+                    StatFamily::Fstat(call) => Some(StatTarget::Descriptor(call.fd())),
+                    StatFamily::Fstatat(call) => {
+                        StatTarget::of_at_call(&memory, call.dirfd(), call.path(), call.flags())
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    StatFamily::Stat(call) => read(call.path()).map(|path| StatTarget::Path {
+                        dirfd: libc::AT_FDCWD,
+                        path,
+                        follow: true,
+                    }),
+                    #[cfg(not(target_arch = "aarch64"))]
+                    StatFamily::Lstat(call) => read(call.path()).map(|path| StatTarget::Path {
+                        dirfd: libc::AT_FDCWD,
+                        path,
+                        follow: false,
+                    }),
+                }
+            };
             guest.inject(Syscall::from(call)).await?;
             let statptr = call.stat().ok_or(Errno::EFAULT)?;
-            let described_fd = match call {
-                StatFamily::Fstat(call) => Some(call.fd()),
-                StatFamily::Fstatat(call) => {
-                    empty_path_fd(&guest.memory(), call.dirfd(), call.path(), call.flags())
-                }
-                #[cfg(not(target_arch = "aarch64"))]
-                StatFamily::Stat(_) | StatFamily::Lstat(_) => None,
+            let described_fd = match target {
+                Some(StatTarget::Descriptor(fd)) => Some(fd),
+                _ => None,
             };
             let inode_override = described_fd.and_then(|fd| stdio_inode_override(guest, fd));
-            let mut memory = guest.memory();
-            let stat = memory.read_value(statptr.0)?;
+            let raw: libc::stat = guest.memory().read_value(statptr.0)?;
+            let mut stat = DetStat::from(raw);
+            if inode_override.is_none()
+                && let Some(target) = target
+                && let Some(key) = self.descriptor_entry_stat_key(guest, target, &stat).await
+            {
+                stat.inode = key;
+            }
             let stat = self.determinize_stat(guest, stat, inode_override).await?;
-            memory.write_value(statptr.0, &stat.into())?;
+            guest.memory().write_value(statptr.0, &stat.into())?;
             Ok(0)
         } else {
             Ok(self.record_or_replay(guest, call).await?)
@@ -4228,15 +4460,25 @@ impl<T: RecordOrReplay> Detcore<T> {
             // NB: let kernel handle error codes, it's not easy to do so without kernel
             // because there're many corner cases. i.e.: even access filepath from tracer
             // may cause tracer to hang under certain fuse filesystem (squashfs_ll).
+            // Read the pathname before the call runs (see `handle_stat_family`).
+            let target =
+                StatTarget::of_at_call(&guest.memory(), call.dirfd(), call.path(), call.flags());
             guest.inject(call).await?;
             let statptr = call.statx().ok_or(Errno::EFAULT)?;
-            let inode_override =
-                empty_path_fd(&guest.memory(), call.dirfd(), call.path(), call.flags())
-                    .and_then(|fd| stdio_inode_override(guest, fd));
-            let mut memory = guest.memory();
-            let stat = memory.read_value(statptr.0)?;
+            let inode_override = match target {
+                Some(StatTarget::Descriptor(fd)) => stdio_inode_override(guest, fd),
+                _ => None,
+            };
+            let raw: libc::statx = guest.memory().read_value(statptr.0)?;
+            let mut stat = DetStat::from(raw);
+            if inode_override.is_none()
+                && let Some(target) = target
+                && let Some(key) = self.descriptor_entry_stat_key(guest, target, &stat).await
+            {
+                stat.inode = key;
+            }
             let stat = self.determinize_stat(guest, stat, inode_override).await?;
-            memory.write_value(statptr.0, &stat.into())?;
+            guest.memory().write_value(statptr.0, &stat.into())?;
             Ok(0)
         } else {
             Ok(self.record_or_replay(guest, call).await?)
@@ -6350,12 +6592,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         let (passed, copied) = match batch {
             Ok(batch) => {
                 let device = self.directory_device(guest, call.fd).await?;
+                let table = self.descriptor_table_of(guest, call.fd, device);
                 let mut records = Vec::new();
                 let mut names = Vec::with_capacity(batch.len());
                 for (index, entry) in batch.iter().enumerate() {
                     let (d_ino, _) = determinize_listed_inode(
                         guest,
-                        RawInode::new(device, entry.ino),
+                        RawInode::new(device, listed_raw_ino(entry, table.as_ref())),
                         retirements,
                     )
                     .await;
@@ -6410,6 +6653,61 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// The numeric task and table of the directory that the calling thread's
+    /// descriptor `fd` holds, when it is a per-descriptor procfs table
+    /// (`/proc/<task>/fd` or `fdinfo`), whose entries take
+    /// [`descriptor_entry_key`]s instead of host inodes. Only a directory on a
+    /// device with major number 0 can be one, so others are not looked up.
+    fn descriptor_table_of<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        device: u64,
+    ) -> Option<(String, DescriptorTable)> {
+        if libc::major(device) != 0 {
+            return None;
+        }
+        let (name, on_procfs) = descriptor_identity(guest.tid().as_raw(), fd)?;
+        let (task, table) = parse_descriptor_table(name.to_str()?)?;
+        (on_procfs && is_numeric_task(task)).then(|| (task.to_owned(), table))
+    }
+
+    /// For a stat result, the [`descriptor_entry_key`] that replaces its host
+    /// inode when the object it describes is a per-descriptor procfs entry
+    /// (`/proc/<task>/fd/<n>` itself, or `/proc/<task>/fdinfo/<n>`).
+    ///
+    /// The object is named the way the kernel names it, entirely in this
+    /// process: a descriptor target by the calling thread's descriptor link,
+    /// a path target by resolving the path as the guest would and reading
+    /// the link of this process's descriptor for the result
+    /// ([`descriptor_entry_key_of_path`]). Nothing is opened or closed in the
+    /// guest. Only a result that looks like such an entry is looked up: a link
+    /// of size 64 or a mode-0444 empty regular file, on a device with major
+    /// number 0.
+    async fn descriptor_entry_stat_key<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        target: StatTarget,
+        stat: &DetStat,
+    ) -> Option<u64> {
+        if !may_be_descriptor_entry(stat) {
+            return None;
+        }
+        let tid = guest.tid().as_raw();
+        match target {
+            StatTarget::Descriptor(fd) => descriptor_entry_key_of(tid, fd),
+            StatTarget::Path {
+                dirfd,
+                path,
+                follow,
+            } => {
+                let process = guest.inject(syscalls::Getpid::new()).await.ok()? as i32;
+                let thread = guest.inject(syscalls::Gettid::new()).await.ok()? as i32;
+                descriptor_entry_key_of_path(tid, (process, thread), dirfd, &path, follow)
+            }
+        }
+    }
+
     /// Move the kernel position of the open file behind `fd` to `target`, a
     /// [`DirectoryStream::kernel_target`], so that a descriptor Detcore does
     /// not track that aliases it reads every entry the stream has not
@@ -6448,9 +6746,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut entries = read_records(&guest.memory(), call.buf, len, call.format)?;
         sort_dir_entries(&mut entries);
         let device = self.directory_device(guest, call.fd).await?;
+        let table = self.descriptor_table_of(guest, call.fd, device);
         let mut records = Vec::with_capacity(len);
         for entry in &entries {
-            let (d_ino, _) = determinize_named_inode(guest, RawInode::new(device, entry.ino)).await;
+            let raw = RawInode::new(device, listed_raw_ino(entry, table.as_ref()));
+            let (d_ino, _) = determinize_named_inode(guest, raw).await;
             call.format
                 .encode(entry, d_ino.as_raw(), entry.off, &mut records);
         }

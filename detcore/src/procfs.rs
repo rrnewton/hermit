@@ -1306,6 +1306,72 @@ fn is_process_schedstat_path(path: &str) -> bool {
     }
 }
 
+/// A per-descriptor procfs directory: `/proc/<task>/fd` or `fdinfo`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DescriptorTable {
+    Fd,
+    Fdinfo,
+}
+
+/// The task spelling and table of a path `/proc/<task>/fd` or
+/// `/proc/<task>/fdinfo`, where `<task>` is `self`, `thread-self`, a number,
+/// or `<process>/task/<thread>`.
+pub(crate) fn parse_descriptor_table(path: &str) -> Option<(&str, DescriptorTable)> {
+    let relative = path.strip_prefix("/proc/")?.trim_end_matches('/');
+    let (task, table) = relative.rsplit_once('/')?;
+    let table = match table {
+        "fd" => DescriptorTable::Fd,
+        "fdinfo" => DescriptorTable::Fdinfo,
+        _ => return None,
+    };
+    let components = task.split('/').collect::<Vec<_>>();
+    let valid = match components.as_slice() {
+        [task] => is_proc_task_name(task),
+        [process, "task", thread] => is_proc_process_name(process) && is_numeric_id(thread),
+        _ => false,
+    };
+    valid.then_some((task, table))
+}
+
+/// The task spelling, table and descriptor of a path
+/// `/proc/<task>/fd/<n>` or `/proc/<task>/fdinfo/<n>`.
+pub(crate) fn parse_descriptor_entry(path: &str) -> Option<(&str, DescriptorTable, &str)> {
+    let (table_path, fd) = path.rsplit_once('/')?;
+    let (task, table) = parse_descriptor_table(table_path)?;
+    is_numeric_id(fd).then_some((task, table, fd))
+}
+
+/// A stable stand-in for the host inode of a per-descriptor procfs entry.
+///
+/// Linux gives `/proc/<pid>/fd/<n>` and `fdinfo/<n>` a fresh inode number
+/// (`get_next_ino`) each time it instantiates the entry's dentry, so the
+/// number changes whenever the host drops the cached dentry under memory
+/// pressure, which no guest controls
+/// (https://github.com/rrnewton/hermit/issues/3873). The entry has no
+/// identity beyond its task, table and descriptor, so this key is built from
+/// those, with `task` already numeric (`<pid>` or `<pid>/task/<tid>`). The
+/// top bit is set: `get_next_ino` numbers are 32-bit, so a key never equals a
+/// real procfs inode. The inode pool then numbers the key like any other.
+pub(crate) fn descriptor_entry_key(task: &str, table: DescriptorTable, fd: &str) -> u64 {
+    // FNV-1a, a hash fixed by its definition rather than by the toolchain.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let tag: &[u8] = match table {
+        DescriptorTable::Fd => b"fd",
+        DescriptorTable::Fdinfo => b"fdinfo",
+    };
+    for byte in task
+        .bytes()
+        .chain([0])
+        .chain(tag.iter().copied())
+        .chain([0])
+        .chain(fd.bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash | 1 << 63
+}
+
 fn is_proc_task_name(name: &str) -> bool {
     matches!(name, "self" | "thread-self") || is_numeric_id(name)
 }

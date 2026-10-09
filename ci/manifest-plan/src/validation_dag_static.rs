@@ -1698,8 +1698,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // reviews) retains all 87 (measured 88).
     // a_futex_wake_reaches_the_longest_waiter_while_another_waits_again (lane
     // qemu-rcb, https://github.com/rrnewton/hermit/issues/3917) retains all 88:
-    // 89.
-    ("test.detcore_misc", 89),
+    // 89. The ten procfs descriptor-entry identity tests
+    // (https://github.com/rrnewton/hermit/issues/3873): 99.
+    ("test.detcore_misc", 99),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -2337,8 +2338,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
     // The host node carries the identical 85-test tests_misc selection.
-    // And the same futex wake-order guest test: 89.
-    ("test.detcore_misc_on_host", 89),
+    // And the same futex wake-order guest test: 89, and the same ten procfs
+    // descriptor-entry tests: 99.
+    ("test.detcore_misc_on_host", 99),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
