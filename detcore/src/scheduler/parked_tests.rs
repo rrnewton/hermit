@@ -4578,3 +4578,24 @@ fn the_controlled_loop_restores_a_poller_whose_deadline_a_refresh_crosses() {
     assert_eq!(result.unwrap().tid, poller);
     assert!(s.poll_deadline_of.is_empty());
 }
+
+/// A poller restored by its deadline does not block the deterministic-work-first
+/// gate of a deferred SIGCHLD: the signal's thread is re-admitted ahead of it,
+/// as it would be while the poller was still backed off. Without this, a
+/// thread whose timed wait ended first had its held SIGCHLD handler delayed
+/// until the restored poller had run.
+#[test]
+fn a_deadline_restored_poller_does_not_defer_a_held_sigchld() {
+    let mut s = uncontrolled();
+    let (forker, _, _) = add(&mut s, 100, 100);
+    let (poller, _, _) = add(&mut s, 100, 101);
+    backed_off_poller(&mut s, poller, Some(at(100)));
+    s.committed_time = at(100);
+    s.step2b_restore_due_pollers();
+    assert!(s.poll_deadline_of.is_empty(), "restored");
+    s.blocked.sigchld_deferred.insert(forker);
+
+    s.step2e_process_signal_deferred();
+    assert!(s.blocked.sigchld_deferred.is_empty(), "re-admitted");
+    assert_eq!(next_selection(&mut s), Some(forker));
+}

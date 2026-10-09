@@ -155,6 +155,21 @@ struct QueueValue {
     tid: DetTid,
     /// Upgrade to this priority during polling upgrades
     poll_upgrade: Option<Priority>,
+    /// Set when `restore_poller_priority` restored this poller because its
+    /// timeout deadline passed. Until it runs, the deterministic-work-first
+    /// gates (`only_pollers`, `has_runnable_besides`) still count it as a
+    /// poller: on main it would still be backed off at this point, and those
+    /// gates must keep admitting deferred signals and finished background work
+    /// ahead of it (<https://github.com/rrnewton/hermit/issues/3952>).
+    deadline_restored: bool,
+}
+
+impl QueueValue {
+    /// Whether this entry counts as a poller for the deterministic-work-first
+    /// gates, given its queue priority.
+    fn counts_as_poller(&self, priority: Priority) -> bool {
+        priority >= LAST_PRIORITY || self.deadline_restored
+    }
 }
 
 /// One suspended queue entry. Global yield/random-selection state stays live.
@@ -253,21 +268,26 @@ impl RunQueue {
         }
     }
 
-    // Return the numerically least Priority value in the run_queue, or None if the queue is empty.
-    pub fn first_priority(&self) -> Option<Priority> {
-        let (k, _) = self.queue.first_key_value()?;
-        Some(k.priority)
-    }
-
     /// True if any thread other than `exclude` is runnable at ordinary
-    /// (non-poller) priority. This is the "deterministic work still runnable"
+    /// (non-poller) priority, where a thread `restore_poller_priority` restored
+    /// still counts as a poller until it runs. This is the "deterministic work still runnable"
     /// test used to decide whether an asynchronous signal delivery must defer to
     /// guest work that was already scheduled. Read-only, so it is safe to call
     /// while a tentative_pop selection is in progress.
     pub fn has_runnable_besides(&self, exclude: DetTid) -> bool {
         self.queue
             .iter()
-            .any(|(k, v)| v.tid != exclude && k.priority < LAST_PRIORITY)
+            .any(|(k, v)| v.tid != exclude && !v.counts_as_poller(k.priority))
+    }
+
+    /// True when every queued thread is a poller (or the queue is empty): the
+    /// "no deterministic work is runnable" test of the deterministic-work-first
+    /// gates. A poller is an entry at `LAST_PRIORITY`, or one that
+    /// `restore_poller_priority` restored and that has not run since. Read-only.
+    pub fn only_pollers(&self) -> bool {
+        self.queue
+            .iter()
+            .all(|(k, v)| v.counts_as_poller(k.priority))
     }
 
     /// True while a `tentative_pop`/commit transaction is underway, i.e. the
@@ -382,7 +402,11 @@ impl RunQueue {
         prio: PrioritizedOrder,
         poll_upgrade: Option<Priority>,
     ) -> PrioritizedOrder {
-        let qval = QueueValue { tid, poll_upgrade };
+        let qval = QueueValue {
+            tid,
+            poll_upgrade,
+            deadline_restored: false,
+        };
         let old = self.queue.insert(prio, qval);
         assert!(old.is_none()); // last_*_turn should be monotonic
         self.check_poll_upgrade();
@@ -668,6 +692,7 @@ impl RunQueue {
         };
         let mut value = self.queue.remove(&key).expect("located queue entry");
         value.poll_upgrade = None;
+        value.deadline_restored = true;
         let restored = PrioritizedOrder {
             priority: normal_priority,
             turn: key.turn,
@@ -753,6 +778,30 @@ mod tests {
             queue.restore_poller_priority(DetTid::from_raw(9)),
             PollerRestore::NotQueued
         );
+    }
+
+    /// A poller restored by its deadline still counts as a poller for the
+    /// deterministic-work-first gates until it runs; requeued after its turn,
+    /// it is ordinary work.
+    #[test]
+    fn a_deadline_restored_poller_counts_as_a_poller_until_it_runs() {
+        let poller = DetTid::from_raw(1);
+        let other = DetTid::from_raw(2);
+        let mut queue = RunQueue::new(SchedHeuristic::None, 0, 0.0);
+        queue.push_poller(poller, DEFAULT_PRIORITY, 30);
+        assert!(queue.only_pollers());
+        assert_eq!(
+            queue.restore_poller_priority(poller),
+            PollerRestore::Restored
+        );
+        assert!(queue.only_pollers(), "restored, but it has not run");
+        assert!(!queue.has_runnable_besides(other));
+
+        assert_eq!(queue.tentative_pop_next(), Some(poller));
+        assert_eq!(queue.commit_tentative_pop(), poller);
+        queue.push_back(poller, DEFAULT_PRIORITY);
+        assert!(!queue.only_pollers(), "after its turn it is ordinary work");
+        assert!(queue.has_runnable_besides(other));
     }
 
     #[test]

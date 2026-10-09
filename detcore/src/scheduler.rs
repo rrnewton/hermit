@@ -59,7 +59,6 @@ use reverie::Errno;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 pub use runqueue::DEFAULT_PRIORITY;
-use runqueue::LAST_PRIORITY;
 use runqueue::PollerRestore;
 use runqueue::PrioritizedOrder;
 pub use runqueue::Priority;
@@ -4153,10 +4152,7 @@ impl Scheduler {
         if self.blocked.sigchld_deferred.is_empty() {
             return;
         }
-        let only_pollers = match self.run_queue.first_priority() {
-            Some(fp) => fp >= LAST_PRIORITY,
-            None => true,
-        };
+        let only_pollers = self.run_queue.only_pollers();
         if !self.run_queue.is_empty() && !only_pollers {
             return;
         }
@@ -5399,11 +5395,7 @@ impl Scheduler {
                 // its peer is backgrounded on BlockingExternalIO). Treat a run queue
                 // that holds only pollers as "no deterministic work" so we still harvest
                 // completed IO below; a queued poller must not starve a ready blocker.
-                let only_pollers = if let Some(fp) = self.run_queue.first_priority() {
-                    fp >= LAST_PRIORITY
-                } else {
-                    true
-                };
+                let only_pollers = self.run_queue.only_pollers();
 
                 // Deterministic work is runnable: let it proceed. Waiting here while such
                 // work exists can deadlock thread creation -- the parent and new child
@@ -5490,11 +5482,7 @@ impl Scheduler {
             // completion timing must not decide whether a ready continuation overtakes
             // guest work that was already runnable. Pollers are excluded because they
             // commonly wait for the completed operation and would otherwise starve it.
-            let only_pollers = if let Some(fp) = self.run_queue.first_priority() {
-                fp >= LAST_PRIORITY
-            } else {
-                true
-            };
+            let only_pollers = self.run_queue.only_pollers();
             if !self.run_queue.is_empty() && !only_pollers {
                 return Ok(());
             }
@@ -10016,12 +10004,7 @@ mod test {
         scheduler
             .run_queue
             .push_poller(server, DEFAULT_PRIORITY, u32::MAX);
-        assert!(
-            scheduler
-                .run_queue
-                .first_priority()
-                .is_some_and(|priority| priority >= LAST_PRIORITY)
-        );
+        assert!(!scheduler.run_queue.is_empty() && scheduler.run_queue.only_pollers());
         scheduler.blocked.external_io_blockers.insert(client, op_id);
         scheduler.next_turns.insert(
             client,
