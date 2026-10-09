@@ -99,14 +99,43 @@ pub unsafe extern "C" fn detcore_liteinst_initialize() {
     };
     let forward_request = std::env::var_os(DETLOG_FORWARD_ENV);
     let forward_policy = std::env::var_os(DETLOG_FORWARD_POLICY_ENV);
+    // An empty value counts as absent: it is what the removal below leaves in
+    // main's initial environment, which a shell the guest runs passes on.
+    let coordinator_fingerprint = std::env::var_os(detcore::LITEINST_CONFIG_FINGERPRINT_ENV)
+        .filter(|value| !value.is_empty());
     // SAFETY: the loader runs constructors while the process is still
     // single-threaded, so nothing reads the environment concurrently.
     unsafe {
+        // Hermit's fingerprint is for this check only, so it is removed as
+        // the DETLOG variables are: the value's bytes are zeroed, and a
+        // program reading main's initial environment (bash does) sees the
+        // name with an empty value. Later process images load this same file
+        // through LD_PRELOAD, so the first image's check covers them.
+        scrub_env(detcore::LITEINST_CONFIG_FINGERPRINT_ENV);
+        std::env::remove_var(detcore::LITEINST_CONFIG_FINGERPRINT_ENV);
         // The value names a host socket identity: zero its bytes in the
         // environment block too, which /proc/self/environ shows.
         scrub_env(DETLOG_FORWARD_ENV);
         std::env::remove_var(DETLOG_FORWARD_ENV);
         std::env::remove_var(DETLOG_FORWARD_POLICY_ENV);
+    }
+    // Checked before anything is decoded: the coordinator sends Detcore's
+    // configuration as positional bincode, which a runtime built from another
+    // tree decodes as garbage and reports only as a decoding error
+    // (https://github.com/rrnewton/hermit/issues/3986). Without the variable
+    // (an image the first one executed, or a Hermit from before this check)
+    // nothing is refused: a check that rejects matched pairs is worse than
+    // none, as for the SaBRe plugin.
+    if let Some(mismatch) = coordinator_fingerprint
+        .as_deref()
+        .and_then(detcore::config_fingerprint_mismatch)
+    {
+        fail(&format!(
+            "the runtime at {} was built from a different tree than the hermit running it: \
+             {mismatch}. Rebuild it from Hermit's tree (`cargo build -p detcore-liteinst`), or \
+             point HERMIT_LITEINST_TOOL_RUNTIME at a matching build",
+            runtime_path()
+        ));
     }
     if let Some(value) = forward_request {
         let Some((fd, identity)) = value
@@ -303,6 +332,29 @@ unsafe fn scrub_env(key: &str) {
             }
             slot = slot.add(1);
         }
+    }
+}
+
+/// The file this runtime was loaded from, as the dynamic loader reports it.
+fn runtime_path() -> String {
+    let mut info = std::mem::MaybeUninit::<libc::Dl_info>::zeroed();
+    // SAFETY: `dladdr` writes `info` and reads nothing else; the address is a
+    // function of this library.
+    let found = unsafe {
+        libc::dladdr(
+            detcore_liteinst_initialize as *const libc::c_void,
+            info.as_mut_ptr(),
+        )
+    };
+    // SAFETY: `dladdr` filled `info` when it returned nonzero.
+    let name = (found != 0).then(|| unsafe { info.assume_init() }.dli_fname);
+    match name.filter(|name| !name.is_null()) {
+        // SAFETY: the loader's file name is a NUL-terminated string it keeps
+        // for as long as the library stays loaded.
+        Some(name) => unsafe { std::ffi::CStr::from_ptr(name) }
+            .to_string_lossy()
+            .into_owned(),
+        None => "an unknown path".to_owned(),
     }
 }
 

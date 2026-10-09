@@ -262,6 +262,7 @@ pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_in_guest_programs::liteinst_in_guest_abnormal_exit_after_registration_does_not_hang",
     "liteinst_in_guest_programs::liteinst_in_guest_admitted_sigalrm_leaves_the_guest_heap_as_the_program_made_it",
     "liteinst_in_guest_programs::liteinst_in_guest_an_undeliverable_sigalrm_is_a_loss_and_stops_the_guest",
+    "liteinst_in_guest_programs::liteinst_in_guest_checks_and_hides_the_config_fingerprint",
     "liteinst_in_guest_programs::liteinst_in_guest_close_range_releases_ports_like_ptrace",
     "liteinst_in_guest_programs::liteinst_in_guest_cpuid_in_a_late_loaded_library_runs",
     "liteinst_in_guest_programs::liteinst_in_guest_alarm_outside_emulated_sleep_keeps_its_loss",

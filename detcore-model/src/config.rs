@@ -1599,6 +1599,16 @@ pub const MAX_SCHEDULER_TURN_COST: u64 = 1_000_000_000;
 /// two travel together and a reader finds them in one place.
 pub const CONFIG_FINGERPRINT_ENV: &str = "REVERIE_SABRE_HERMIT_CONFIG_FINGERPRINT";
 
+/// Environment variable carrying the coordinator's [`config_wire_fingerprint`]
+/// to the in-guest LiteInst runtime (`libdetcore_liteinst.so`), which checks it
+/// before it decodes the configuration the coordinator sends. Without the
+/// check, a runtime built from another tree fails with a bare decoding error
+/// that names neither build (<https://github.com/rrnewton/hermit/issues/3986>).
+/// The runtime removes it once checked, as it removes its DETLOG variables:
+/// the value is zeroed in the environment block and the variable is unset, so
+/// the fingerprint never reaches the guest.
+pub const LITEINST_CONFIG_FINGERPRINT_ENV: &str = "HERMIT_LITEINST_CONFIG_FINGERPRINT";
+
 const CONFIG_DEFINITION_SOURCES: &[&[u8]] = &[
     include_bytes!("config.rs"),
     // `RawInode`, the host identity the inode RPCs (`DeterminizeInode`,
@@ -1681,6 +1691,21 @@ pub fn config_wire_fingerprint() -> String {
     let named_shape = serde_json::to_string(&config)
         .expect("canonical Config wire default must encode as JSON for field-name checking");
     fingerprint_of_config_material(&wire, &named_shape, CONFIG_DEFINITION_SOURCES)
+}
+
+/// What differs when a coordinator announced `expected` as its
+/// [`config_wire_fingerprint`] and this build's is another, or `None` when
+/// they are equal. The in-guest LiteInst runtime reports this before it
+/// decodes the coordinator's configuration
+/// (<https://github.com/rrnewton/hermit/issues/3986>).
+pub fn config_fingerprint_mismatch(expected: &std::ffi::OsStr) -> Option<String> {
+    let ours = config_wire_fingerprint();
+    (expected.to_str() != Some(ours.as_str())).then(|| {
+        format!(
+            "its configuration and clock RPC fingerprint is {ours}, Hermit's is {}",
+            expected.to_string_lossy()
+        )
+    })
 }
 
 /// Domain-separated FNV-1a over wire bytes, named JSON, and defining source.
@@ -4018,6 +4043,21 @@ mod tests {
             current,
             "an inode-identity layout change must invalidate the fingerprint"
         );
+    }
+
+    #[test]
+    fn a_config_fingerprint_mismatch_names_both_fingerprints() {
+        let ours = config_wire_fingerprint();
+        assert_eq!(
+            config_fingerprint_mismatch(std::ffi::OsStr::new(&ours)),
+            None
+        );
+        let other = config_fingerprint_mismatch(std::ffi::OsStr::new("0123456789abcdef"))
+            .expect("another fingerprint is a mismatch");
+        assert!(other.contains(&ours), "{other}");
+        assert!(other.contains("0123456789abcdef"), "{other}");
+        use std::os::unix::ffi::OsStrExt;
+        assert!(config_fingerprint_mismatch(std::ffi::OsStr::from_bytes(b"\xff")).is_some());
     }
 
     #[test]

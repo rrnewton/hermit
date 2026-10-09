@@ -440,6 +440,124 @@ fn assert_liteinst_virtual_time_is_continuous() {
     assert_eq!(progress.stdout, b"clock-progress-ok\n");
 }
 
+/// Hermit passes the runtime its configuration and clock RPC fingerprint, and a
+/// runtime built from the same tree accepts it and then removes it, as it does
+/// the DETLOG variables: the value is zeroed in the environment block, so
+/// `/proc/self/environ` keeps only the name, and a program reading `main`'s
+/// initial environment, as bash does, sees the name with an empty value
+/// (https://github.com/rrnewton/hermit/issues/3986). The fingerprint itself
+/// never reaches the guest. A runtime from another tree would stop before the
+/// guest's `main` instead.
+#[test]
+fn liteinst_in_guest_checks_and_hides_the_config_fingerprint() {
+    let _guard = hermit_run_guard();
+    const NAME: &str = "HERMIT_LITEINST_CONFIG_FINGERPRINT";
+    let fingerprint = detcore::config_wire_fingerprint();
+
+    // The value the guest's shell imported, by parameter expansion alone (no
+    // child process). PYTHONDONTWRITEBYTECODE, which run_liteinst sets, shows
+    // that the shell sees the environment.
+    let shell = run_liteinst_in_guest(
+        Path::new("/usr/bin/bash"),
+        &[
+            "-c",
+            "printf '[%s] %s' \"${HERMIT_LITEINST_CONFIG_FINGERPRINT-unset}\" \"${!PYTHON*}\"",
+        ],
+    );
+    let shell = String::from_utf8_lossy(&shell.stdout);
+    assert!(
+        shell == "[] PYTHONDONTWRITEBYTECODE" || shell == "[unset] PYTHONDONTWRITEBYTECODE",
+        "{shell}"
+    );
+
+    let environ = run_liteinst_in_guest(
+        Path::new("/usr/bin/head"),
+        &["-c", "1048576", "/proc/self/environ"],
+    );
+    let entries = environ
+        .stdout
+        .split(|&byte| byte == 0)
+        .filter(|entry| entry.starts_with(NAME.as_bytes()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        entries,
+        [format!("{NAME}=").as_bytes()],
+        "{:?}",
+        String::from_utf8_lossy(&environ.stdout)
+    );
+    assert!(
+        !String::from_utf8_lossy(&environ.stdout).contains(&fingerprint),
+        "{:?}",
+        String::from_utf8_lossy(&environ.stdout)
+    );
+}
+
+/// The runtime refuses a coordinator whose configuration fingerprint is not its
+/// own, before it connects or decodes anything
+/// (https://github.com/rrnewton/hermit/issues/3986). Run without Hermit, with a
+/// coordinator address nothing listens on, so the refusal must come first: a
+/// check moved after the connection would report the connection instead. This
+/// needs no CPUID faulting, because the runtime refuses before it installs
+/// anything. An empty value, which the removal leaves in `main`'s initial
+/// environment, counts as absent and is not refused.
+/// The status the runtime's constructor exits with when it refuses to install
+/// (`fail` in `detcore-liteinst/src/lib.rs`, `libc::_exit(127)`). It is the
+/// runtime's own code, not Hermit's `GUEST_PROGRAM_NOT_FOUND_EXIT`, which has
+/// the same value; this test runs no Hermit.
+const LITEINST_RUNTIME_REFUSAL_EXIT: i32 = 127;
+
+#[test]
+fn liteinst_runtime_refuses_another_trees_fingerprint_before_connecting() {
+    let runtime = hermit_binary()
+        .parent()
+        .expect("the Cargo-built Hermit has a profile directory")
+        .join("libdetcore_liteinst.so");
+    assert!(
+        runtime.is_file(),
+        "{} is missing; build it with `cargo build -p detcore-liteinst` in this profile",
+        runtime.display()
+    );
+    let run = |fingerprint: &str| {
+        Command::new("/usr/bin/test")
+            .env_clear()
+            .env(
+                "REVERIE_LITEINST_COORDINATOR",
+                "/nonexistent/coordinator.sock",
+            )
+            .env("HERMIT_LITEINST_CONFIG_FINGERPRINT", fingerprint)
+            .env("LD_PRELOAD", &runtime)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to start a program under the LiteInst runtime")
+    };
+
+    let other = run("0000000000000000");
+    let stderr = String::from_utf8_lossy(&other.stderr);
+    assert_eq!(
+        other.status.code(),
+        Some(LITEINST_RUNTIME_REFUSAL_EXIT),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "the runtime at {} was built from a different tree than the hermit running it",
+            runtime.display()
+        )),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "its configuration and clock RPC fingerprint is {}, Hermit's is 0000000000000000",
+            detcore::config_wire_fingerprint()
+        )),
+        "{stderr}"
+    );
+
+    let empty = run("");
+    let stderr = String::from_utf8_lossy(&empty.stderr);
+    assert!(!stderr.contains("built from a different tree"), "{stderr}");
+}
+
 #[test]
 fn liteinst_in_guest_heap_growth_avoids_trampoline_mappings() {
     let _guard = hermit_run_guard();

@@ -952,8 +952,9 @@ pub const LITEINST_TOOL_RUNTIME_ENV: &str = "HERMIT_LITEINST_TOOL_RUNTIME";
 /// the Hermit binary or in its `deps/` directory. Packaged resources come before
 /// the Cargo artifact directory, the order the DBT and SaBRe runtimes use.
 ///
-/// This library records no Reverie revision yet, so a stale build is not
-/// detected (<https://github.com/rrnewton/hermit/issues/3520>).
+/// A runtime built from another tree is refused when it starts: Hermit passes
+/// it [`detcore::config_wire_fingerprint`], which it compares with its own
+/// before decoding anything (<https://github.com/rrnewton/hermit/issues/3986>).
 #[doc(hidden)]
 pub fn liteinst_tool_runtime_library_path() -> io::Result<PathBuf> {
     if let Some(path) = std::env::var_os(LITEINST_TOOL_RUNTIME_ENV) {
@@ -1956,6 +1957,19 @@ const LITEINST_DETLOG_FORWARD_ENV: &str = "HERMIT_LITEINST_FORWARD_DETLOG";
 /// `detcore_liteinst::DETLOG_FORWARD_POLICY_ENV`, for the same reason.
 #[cfg(feature = "liteinst")]
 const LITEINST_DETLOG_FORWARD_POLICY_ENV: &str = "HERMIT_LITEINST_FORWARD_DETLOG_POLICY";
+
+/// Tells the in-guest LiteInst runtime this build's
+/// [`detcore::config_wire_fingerprint`], which it compares with its own before
+/// it decodes the configuration the coordinator sends. A runtime built from
+/// another tree then fails naming both fingerprints and its own path, not with
+/// a bare decoding error (<https://github.com/rrnewton/hermit/issues/3986>).
+#[cfg(feature = "liteinst")]
+fn announce_liteinst_config_fingerprint(command: &mut Command) {
+    command.env(
+        detcore::LITEINST_CONFIG_FINGERPRINT_ENV,
+        detcore::config_wire_fingerprint(),
+    );
+}
 
 /// Where in-guest LiteInst and SaBRe runs in this process forward Detcore's
 /// DETLOG records; see [`forward_in_guest_detlogs_to`].
@@ -3803,6 +3817,7 @@ async fn dispatch_backend(
             let stats_request = in_guest_stats_request(backend, print_summary_to_json_file);
             let mut command = command;
             refuse_in_guest_liteinst_run(&mut command, &config, backend)?;
+            announce_liteinst_config_fingerprint(&mut command);
             let _detlog_descriptor = request_liteinst_detlog_forwarding(
                 &mut command,
                 &in_guest_detlog_forward_policy(),
@@ -4116,6 +4131,7 @@ async fn dispatch_output_backend(
             command.stdin(output_backend_stdin()?);
             let stats_request = in_guest_stats_request(backend, print_summary_to_json_file);
             refuse_in_guest_liteinst_run(&mut command, &config, backend)?;
+            announce_liteinst_config_fingerprint(&mut command);
             let _detlog_descriptor = request_liteinst_detlog_forwarding(
                 &mut command,
                 &in_guest_detlog_forward_policy(),
