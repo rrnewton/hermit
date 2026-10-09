@@ -720,10 +720,20 @@ impl FileMetadata {
     fn setup_stdio(mut self, _pid: Pid, owner: DetTid) -> Self {
         // guest stdio can be a pipe, which make things difficult
         // hence use a dummy stat here.
-        // SAFETY: stating stdin is likely to always be safe
-        let stat: DetStat = stat::fstat(unsafe { BorrowedFd::borrow_raw(0) })
-            .unwrap()
-            .into();
+        // The raw syscall, not libc's interposable fstat: this runs inside the
+        // guest under in-guest LiteInst (see crate::util::raw_syscall).
+        let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fstat writes only into `metadata`.
+        let status = unsafe {
+            crate::util::raw_syscall(libc::SYS_fstat, [0, (&raw mut metadata) as u64, 0, 0, 0, 0])
+        };
+        if let Err(error) = crate::util::raw_zero_result(status) {
+            panic!(
+                "fstat of the guest's stdin failed (errno {})",
+                error.raw_os_error().unwrap_or(0)
+            );
+        }
+        let stat: DetStat = metadata.into();
         let stdin = DetFd::new(
             0,
             OFlag::empty(),

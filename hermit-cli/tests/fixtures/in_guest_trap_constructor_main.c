@@ -8,7 +8,7 @@
 
 /*
  * The program for in_guest_trap_constructor_lib.c: it prints what the
- * library's constructor did, whether its mprotect restored the variable, and
+ * library's constructor did, whether its getenv restored the variable, and
  * the variable as main sees it, so a run that reaches main says so.
  */
 
