@@ -1274,7 +1274,16 @@ fi
 # rust-toolchain.toml are byte-identical), so the DynamoRIO SDK recipe key is
 # unchanged. Carry, not recalibration: no new timing sample or >=5-sample
 # replacement claim is made.
-expected_pin=ae8a078ea8f68dab5cc73007fa7d56935d62f11f
+# CARRY TO 6554a9ddd0801aae691a089f12fbda160efe2a9f (2026-10-09): from
+# ae8a078ea8f68dab5cc73007fa7d56935d62f11f. Its four commits (dd862794, 4376dc3e,
+# 0d113f8b and 6554a9dd: "In-guest runtime: run the exit callbacks of a process
+# that signals itself to death" and three rounds of review fixes) change only
+# reverie-core's Tool docs, reverie-inguest and reverie-liteinst: `git diff
+# ae8a078e 6554a9dd -- reverie-dbt third-party Cargo.toml rust-toolchain.toml`
+# is empty, so the recorded inputs and the DynamoRIO SDK recipe key are those
+# carried to ae8a078e above. Carry, not recalibration: no new timing sample is
+# claimed.
+expected_pin=6554a9ddd0801aae691a089f12fbda160efe2a9f
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
