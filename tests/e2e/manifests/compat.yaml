@@ -1566,10 +1566,19 @@ corpus:
           The rr corpus ran these programs with the argv of the -direct
           row of the same name, which this run type runs instead
         rows: [lua, perl, df]
+      - reason: >-
+          Its own check fails when a receive path delivers NETLINK_SOCK_DIAG
+          socket inodes unzeroed, which is Detcore's run-mode metadata
+          sanitizer. Record and replay disable metadata virtualization by
+          design, so the guest sees the real inodes there, as Linux returns
+          them (https://github.com/rrnewton/hermit/issues/3965); its replay
+          matches its recording bitwise
+        rows: [netlink-sock-diag]
     # Measured on 2026-10-09 by three --rr-compat-only runs of a survey
     # commit that gave the 77 rows excluded above replay cells: 73 recorded and
     # replayed at canonical bitwise parity in 3 of 3 runs and joined the run
-    # type; these 4 did not.
+    # type; these did not. (netlink-sock-diag, the fourth, is excepted above:
+    # its check asserts a run-mode property.)
     unselected:
       - result: crash-error
         evidence: https://github.com/rrnewton/hermit/issues/3963
@@ -1583,12 +1592,6 @@ corpus:
           The recording completes but its replay makes no progress until the
           60-second backstop, in 3 of 3 runs
         rows: [flex]
-      - result: crash-error
-        evidence: https://github.com/rrnewton/hermit/issues/3965
-        reason: >-
-          Record delivers NETLINK_SOCK_DIAG socket inodes unzeroed, so the
-          row's own check fails in record and in its matching replay
-        rows: [netlink-sock-diag]
       - result: replay-failure
         evidence: https://github.com/rrnewton/hermit/issues/3966
         reason: >-

@@ -1341,13 +1341,15 @@ mod tests {
     }
 
     /// compat.yaml's replay cells cover every row but the lua, perl and df
-    /// `-direct` twins: the retired rr lane's 139 programs (the count its
-    /// RR_COMPAT_EXPECTED guard held before ci/compat/corpus-rr.json was
-    /// retired) and, since a three-run survey on 2026-10-09, the 77 rows the rr
-    /// lane never listed as passing. Each is the replay cell of its row's own
-    /// test, carrying the rr run type alone and none of the verify cell's
-    /// settings. 212 are selected, and the 4 the survey saw fail stay enabled
-    /// with `ci: false` and the issue of their failure (`UNSELECTED_REPLAY`).
+    /// `-direct` twins and netlink-sock-diag, whose own check asserts run-mode
+    /// metadata virtualization (https://github.com/rrnewton/hermit/issues/3965):
+    /// the retired rr lane's 139 programs (the count its RR_COMPAT_EXPECTED
+    /// guard held before ci/compat/corpus-rr.json was retired) and, since a
+    /// three-run survey on 2026-10-09, 76 of the 77 rows the rr lane never
+    /// listed as passing. Each is the replay cell of its row's own test,
+    /// carrying the rr run type alone and none of the verify cell's settings.
+    /// 212 are selected, and the 3 the survey saw fail stay enabled with
+    /// `ci: false` and the issue of their failure (`UNSELECTED_REPLAY`).
     /// A row moved into or out of the run type, a second test for a program,
     /// the rr run type reaching a verify cell, or a cell quietly unselected or
     /// reselected, fails here.
@@ -1398,7 +1400,7 @@ mod tests {
     }
 
     /// The replay cells the 2026-10-09 survey saw fail, each with its issue.
-    const UNSELECTED_REPLAY: [(&str, &str); 4] = [
+    const UNSELECTED_REPLAY: [(&str, &str); 3] = [
         (
             "compat/timeout",
             "https://github.com/rrnewton/hermit/issues/3963",
@@ -1406,10 +1408,6 @@ mod tests {
         (
             "compat/flex",
             "https://github.com/rrnewton/hermit/issues/3964",
-        ),
-        (
-            "compat/netlink-sock-diag",
-            "https://github.com/rrnewton/hermit/issues/3965",
         ),
         (
             "compat/lsof",
