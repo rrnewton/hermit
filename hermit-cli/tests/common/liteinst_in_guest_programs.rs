@@ -556,9 +556,9 @@ fn sigalrm_fixture(name: &str) -> std::path::PathBuf {
     guest
 }
 
-/// Runs the scalar fixture with exact outputs and current typed canonical
+/// Runs a SIGALRM fixture with exact outputs and current typed canonical
 /// verification. The official CLI runner owns these Hermit invocations.
-fn sigalrm_scalar_identity_run(
+fn strict_sigalrm_fixture_run(
     guest: &Path,
     backend: &str,
     admission: Option<&str>,
@@ -570,8 +570,8 @@ fn sigalrm_scalar_identity_run(
     use super::kvm_cancellation::bounded_command_with_timeout;
     use super::kvm_cancellation::bounded_read;
 
-    let directory = process_build_root(&format!("sigalrm-scalars-{backend}-{mode}"));
-    fs::create_dir_all(&directory).expect("scalar verification directory");
+    let directory = process_build_root(&format!("sigalrm-fixture-{backend}-{mode}"));
+    fs::create_dir_all(&directory).expect("SIGALRM verification directory");
     let report_path = directory.join("verify.json");
     let mut command = Command::new(hermit_binary());
     command
@@ -607,7 +607,7 @@ fn sigalrm_scalar_identity_run(
     );
     let report =
         VerificationReport::from_current_json_slice(&bounded_read(&report_path, 16 * 1024 * 1024))
-            .expect("complete current scalar verification report");
+            .expect("complete current SIGALRM verification report");
     report
         .require_canonical_match()
         .expect("nonempty canonical INFO comparison must match");
@@ -642,7 +642,7 @@ fn in_guest_trap_sigalrm_scalar_identity_matches_ptrace() {
     }
     let mut outputs = Vec::new();
     for backend in ["ptrace", "in-guest-trap"] {
-        let stdout = sigalrm_scalar_identity_run(&guest, backend, Some("1"), "0", "handled");
+        let stdout = strict_sigalrm_fixture_run(&guest, backend, Some("1"), "0", "handled");
         assert_eq!(stdout, expected.as_bytes(), "{backend} scalar lifecycle");
         outputs.push(stdout);
     }
@@ -667,8 +667,104 @@ fn liteinst_sigalrm_scalar_identity_keeps_handler_admission_controls() {
     for (backend, admission, patching) in
         [("in-guest-trap", None, "0"), ("liteinst", Some("1"), "1")]
     {
-        let stdout = sigalrm_scalar_identity_run(&guest, backend, admission, patching, "refused");
+        let stdout = strict_sigalrm_fixture_run(&guest, backend, admission, patching, "refused");
         assert_eq!(stdout, expected.as_bytes(), "{backend} admission control");
+    }
+}
+
+/// A default-fatal virtual alarm ends the actual child by SIGALRM and reports
+/// its exit callbacks. No guest handler opt-in is needed. Patched LiteInst is
+/// exercised as well as the trap backend; nanosleep's inaccessible remainder
+/// must not be written after the fatal wake.
+#[test]
+fn liteinst_in_guest_default_fatal_alarms_end_emulated_sleeps_and_verify() {
+    let _guard = hermit_run_guard();
+    let guest = sigalrm_fixture("liteinst_sigalrm_sleep");
+    let expected = concat!(
+        "before action=0 blocked=0 pending=0\n",
+        "alarm_previous=0\n",
+        "child_signal=14 child_exit=-1 core=0\n",
+        "parent_alarm=0\n",
+    );
+    for (backend, patching) in [("ptrace", "0"), ("in-guest-trap", "0"), ("liteinst", "1")] {
+        for mode in ["default-pause", "default-nanosleep"] {
+            let stdout = strict_sigalrm_fixture_run(&guest, backend, None, patching, mode);
+            assert_eq!(stdout, expected.as_bytes(), "{backend}/{mode}");
+        }
+    }
+}
+
+/// Ignored and blocked alarms do not interrupt a sleep. A blocked alarm stays
+/// pending after cancellation; canceling an unexpired alarm prevents delivery.
+/// The child inherits disposition and mask, but has its own alarm state.
+#[test]
+fn liteinst_in_guest_noninterrupting_alarms_preserve_sleep_and_pending_state() {
+    let _guard = hermit_run_guard();
+    let guest = sigalrm_fixture("liteinst_sigalrm_sleep");
+    for (mode, disposition, blocked, pending, canceled) in [
+        ("ignored-nanosleep", 1, 0, 0, false),
+        ("blocked-nanosleep", 0, 1, 1, false),
+        ("cancelled-nanosleep", 0, 0, 0, true),
+    ] {
+        let mut expected =
+            format!("before action={disposition} blocked={blocked} pending=0\nalarm_previous=0\n");
+        if canceled {
+            expected.push_str("cancel_before_sleep=1\n");
+        }
+        expected.push_str(&format!(
+            "nanosleep=0 errno=0\nafter_sleep action={disposition} blocked={blocked} pending={pending}\n\
+             cancel_after_sleep=0\nafter_cancel action={disposition} blocked={blocked} pending={pending}\n\
+             child_signal=0 child_exit=0 core=0\nparent_alarm=0\n"
+        ));
+        for (backend, patching) in [("ptrace", "0"), ("in-guest-trap", "0"), ("liteinst", "1")] {
+            let stdout = strict_sigalrm_fixture_run(&guest, backend, None, patching, mode);
+            assert_eq!(stdout, expected.as_bytes(), "{backend}/{mode}");
+        }
+    }
+}
+
+/// This bridge covers emulated sleeps, not a running process's alarm. The
+/// existing missing-exit check must still refuse an alarm outside the bridge.
+#[test]
+fn liteinst_in_guest_alarm_outside_emulated_sleep_keeps_its_loss() {
+    use super::kvm_cancellation::bounded_command_with_timeout;
+    use super::kvm_cancellation::bounded_read;
+
+    let _guard = hermit_run_guard();
+    let guest = sigalrm_fixture("liteinst_sigalrm_sleep");
+    for backend in ["in-guest-trap", "liteinst"] {
+        let directory = process_build_root(&format!("alarm-outside-sleep-{backend}"));
+        fs::create_dir_all(&directory).expect("excluded alarm directory");
+        let mut command = Command::new(hermit_binary());
+        command
+            .args(["--log=info", "--backend", backend, "run"])
+            .arg(format!("--epoch={VIRTUAL_TIME_EPOCH}"))
+            .args([
+                "--strict",
+                "--max-timeslice=disabled",
+                "--base-env=minimal",
+                "--verify",
+                "--verify-strict",
+                "--",
+            ])
+            .arg(&guest)
+            .arg("running-alarm")
+            .env_remove("REVERIE_LITEINST_SIGALRM_HANDLERS")
+            .env_remove("REVERIE_LITEINST_SITE_PATCHING")
+            .stdin(Stdio::null());
+        let status =
+            bounded_command_with_timeout(&mut command, &directory, Duration::from_secs(57));
+        let stderr = bounded_read(&directory.join("stderr"), 16 * 1024 * 1024);
+        let stderr = String::from_utf8_lossy(&stderr);
+        assert!(!status.success(), "{backend}: {stderr}");
+        assert!(
+            stderr.contains("exited without deregistering; its exit was not scheduled"),
+            "{backend}: {status:?}: {stderr}",
+        );
+        assert!(
+            !stderr.contains("Determinism verified"),
+            "{backend}: {stderr}"
+        );
     }
 }
 

@@ -54,6 +54,27 @@ pub(crate) const PAUSE_FYI: &str = "pause";
 /// (`scheduler::sleep_signal`).
 pub(crate) const NANOSLEEP_FYI: &str = "nanosleep";
 
+/// The SIGALRM action read in the owner turn of an emulated in-guest sleep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum SigalrmSleepDisposition {
+    Default,
+    Ignored,
+    Handled,
+}
+
+/// Signal state attached to one exact emulated sleep, never a global cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct InGuestSleepSigalrm {
+    pub disposition: SigalrmSleepDisposition,
+    pub blocked: bool,
+}
+
+impl InGuestSleepSigalrm {
+    pub(crate) fn ends_process(self) -> bool {
+        self.disposition == SigalrmSleepDisposition::Default && !self.blocked
+    }
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1151)
 /// An exact slowdown-factor transition recorded at a scheduler commit boundary.
@@ -350,6 +371,11 @@ pub enum ResourceID {
     /// atomically installs its temporary signal mask. Unlike arbitrary external
     /// IO, this operation cannot complete without a signal.
     BlockingRtSigsuspend(ExternalOpId),
+
+    /// A one-shot SIGALRM consumed while its single-threaded in-guest target
+    /// was parked at a qualified emulated sleep. This authorizes only the
+    /// original sleep's typed fatal response, not a generic physical signal.
+    InGuestFatalAlarm,
 }
 
 /// Permission to a device, which behaves like a predefined "inode".
@@ -442,6 +468,10 @@ pub struct Resources {
     /// request, and always under record/replay.
     #[serde(default)]
     pub(crate) poll_deadline: Option<LogicalTime>,
+    /// The action and guest mask read in this exact emulated sleep's own turn.
+    /// Only its singleton SleepUntil request may use this snapshot.
+    #[serde(default)]
+    pub(crate) in_guest_sleep_sigalrm: Option<InGuestSleepSigalrm>,
 }
 
 impl fmt::Debug for Resources {
@@ -467,6 +497,9 @@ impl fmt::Debug for Resources {
         if let Some(deadline) = self.poll_deadline {
             debug.field("poll_deadline", &deadline);
         }
+        if let Some(snapshot) = self.in_guest_sleep_sigalrm {
+            debug.field("in_guest_sleep_sigalrm", &snapshot);
+        }
         debug.finish()
     }
 }
@@ -484,6 +517,7 @@ impl Resources {
             blocked_signal_mask: None,
             replay_served_from_log: false,
             poll_deadline: None,
+            in_guest_sleep_sigalrm: None,
         }
     }
 
@@ -492,6 +526,9 @@ impl Resources {
     /// (NB: equivalent to Haskell `Data.Map.unionWith perm_union`)
     pub fn union(&mut self, other: &Resources) {
         assert_eq!(self.tid, other.tid);
+        // Union describes a combined operation, not the exact wait whose owner
+        // captured the snapshot. Never promote either operand's authority.
+        self.in_guest_sleep_sigalrm = None;
         for (id, perm2) in other.resources.iter() {
             match self.resources.entry(id.clone()) {
                 Entry::Occupied(mut e) => {
@@ -520,6 +557,28 @@ impl Resources {
             (Some(left), Some(right)) => Some(left.min(right)),
             (left, right) => left.or(right),
         };
+    }
+
+    /// Return the owner snapshot only for an unmodified singleton sleep.
+    pub(crate) fn in_guest_sigalrm_sleep(&self) -> Option<(InGuestSleepSigalrm, LogicalTime)> {
+        if self.resources.len() != 1
+            || self.poll_attempt != 0
+            || self.signal_interrupt_errno.is_some()
+            || self.blocked_signal_mask.is_some()
+            || self.replay_served_from_log
+            || self.backend_runtime_bootstrap
+            || self.poll_deadline.is_some()
+        {
+            return None;
+        }
+        let (ResourceID::SleepUntil(deadline), Permission::W) = self.resources.iter().next()?
+        else {
+            return None;
+        };
+        if !(self.fyi == PAUSE_FYI && deadline.is_indefinite() || self.fyi == NANOSLEEP_FYI) {
+            return None;
+        }
+        Some((self.in_guest_sleep_sigalrm?, *deadline))
     }
 
     pub fn set_signal_interrupt_errno(&mut self, errno: Errno) {
@@ -627,6 +686,79 @@ mod tests {
                 parent: tid2,
                 child: tid1,
             }
+        );
+    }
+
+    fn owner_sleep(deadline: LogicalTime, fyi: &str) -> Resources {
+        let mut request = Resources::new(DetTid::from_raw(1));
+        request.insert(ResourceID::SleepUntil(deadline), Permission::W);
+        request.fyi(fyi);
+        request.in_guest_sleep_sigalrm = Some(InGuestSleepSigalrm {
+            disposition: SigalrmSleepDisposition::Default,
+            blocked: false,
+        });
+        request
+    }
+
+    #[test]
+    fn in_guest_sleep_snapshot_requires_exact_singleton_wait_shape() {
+        let deadline = LogicalTime::from_nanos(10);
+        for (deadline, fyi) in [
+            (LogicalTime::INDEFINITE, PAUSE_FYI),
+            (deadline, NANOSLEEP_FYI),
+        ] {
+            let request = owner_sleep(deadline, fyi);
+            assert_eq!(
+                request.in_guest_sigalrm_sleep(),
+                Some((request.in_guest_sleep_sigalrm.unwrap(), deadline))
+            );
+        }
+        for case in 0..11 {
+            let mut request = owner_sleep(deadline, NANOSLEEP_FYI);
+            match case {
+                0 => request.in_guest_sleep_sigalrm = None,
+                1 => request.fyi = PAUSE_FYI.to_owned(),
+                2 => request.fyi("unrelated"),
+                3 => request.insert(ResourceID::TraceReplay, Permission::W),
+                4 => {
+                    request
+                        .resources
+                        .insert(ResourceID::SleepUntil(deadline), Permission::R);
+                }
+                5 => request.poll_attempt = 1,
+                6 => request.signal_interrupt_errno = Some(libc::EINTR),
+                7 => request.blocked_signal_mask = Some(0),
+                8 => request.backend_runtime_bootstrap = true,
+                9 => request.poll_deadline = Some(deadline),
+                10 => request.replay_served_from_log = true,
+                _ => unreachable!(),
+            }
+            assert_eq!(request.in_guest_sigalrm_sleep(), None, "case {case}");
+        }
+    }
+
+    #[test]
+    fn merging_resources_cannot_spread_sleep_snapshot_authority() {
+        let deadline = LogicalTime::from_nanos(10);
+        for merge_sleep_first in [false, true] {
+            let mut sleep = owner_sleep(deadline, NANOSLEEP_FYI);
+            let mut unrelated = Resources::new(sleep.tid);
+            unrelated.insert(ResourceID::TraceReplay, Permission::W);
+            let merged = if merge_sleep_first {
+                sleep.union(&unrelated);
+                sleep
+            } else {
+                unrelated.union(&sleep);
+                unrelated
+            };
+            assert_eq!(merged.in_guest_sleep_sigalrm, None);
+            assert_eq!(merged.in_guest_sigalrm_sleep(), None);
+        }
+        let mut sleep = owner_sleep(deadline, NANOSLEEP_FYI);
+        sleep.union(&sleep.clone());
+        assert_eq!(
+            sleep.in_guest_sleep_sigalrm, None,
+            "even identical merged operations surrender their original wait identity"
         );
     }
 }

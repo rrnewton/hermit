@@ -2841,6 +2841,19 @@ impl GlobalState {
             );
             return (SchedulerRpcResult::ThreadExited, None);
         }
+        if matches!(answer, SchedResponse::InGuestFatalAlarm) {
+            let mut sched = self.lock_rpc_scheduler(false).await;
+            if !self.cfg.sequentialize_threads
+                || !sched.in_guest_fatal_alarm_response_matches(dettid, detpid, request_mm, &rs)
+            {
+                sched.fail_parked(dettid, ProtocolFailure::UnexpectedControl);
+                return (SchedulerRpcResult::ThreadExited, None);
+            }
+            return (
+                SchedulerRpcResult::Continue(ResourceReply::Grant(ResumeStatus::InGuestFatalAlarm)),
+                None,
+            );
+        }
         // A control spends only this response transport, not the resource
         // operation. It must precede exit-group or normal grant side effects.
         if let SchedResponse::ObserveSignal(control) = answer {
@@ -2878,7 +2891,7 @@ impl GlobalState {
         }
 
         match answer {
-            SchedResponse::ObserveSignal(_) => {
+            SchedResponse::ObserveSignal(_) | SchedResponse::InGuestFatalAlarm => {
                 self.sched
                     .lock()
                     .unwrap()
@@ -3224,6 +3237,7 @@ impl GlobalState {
                     blocked_signal_mask: None,
                     replay_served_from_log: false,
                     poll_deadline: None,
+                    in_guest_sleep_sigalrm: None,
                 }
             };
             let nextturn = match sched.next_turns.entry(dettid) {
@@ -3296,7 +3310,10 @@ impl GlobalState {
             &dettid, &response_ivar
         );
         let answer = response_ivar.get().await;
-        if matches!(answer, SchedResponse::ObserveSignal(_)) {
+        if matches!(
+            answer,
+            SchedResponse::ObserveSignal(_) | SchedResponse::InGuestFatalAlarm
+        ) {
             self.sched
                 .lock()
                 .unwrap()
@@ -3505,7 +3522,7 @@ impl GlobalState {
                 answer
             }
             SchedResponse::Signaled(_) => Some(SchedValue::Signaled),
-            SchedResponse::ObserveSignal(_) => {
+            SchedResponse::ObserveSignal(_) | SchedResponse::InGuestFatalAlarm => {
                 self.sched
                     .lock()
                     .unwrap()
@@ -4644,6 +4661,8 @@ where
 pub enum ResumeStatus {
     Normal,
     Signaled(Option<Vec<SigWrapper>>),
+    /// A validated one-shot SIGALRM wake of this exact in-guest sleep.
+    InGuestFatalAlarm,
 }
 
 /// Internal result of a scheduler operation. Terminal results become

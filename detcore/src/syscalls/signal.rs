@@ -26,9 +26,11 @@ use tracing::info;
 use crate::Detcore;
 use crate::fd::FdType;
 use crate::record_or_replay::RecordOrReplay;
+use crate::resources::InGuestSleepSigalrm;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::resources::SigalrmSleepDisposition;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::syscalls::threads::KERNEL_SIGSET_SIZE;
 use crate::syscalls::threads::KernelSigaction;
@@ -194,6 +196,21 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    let state = read_sigalrm_sleep_state(guest).await?;
+    Ok((
+        state.disposition == SigalrmSleepDisposition::Handled,
+        state.blocked,
+    ))
+}
+
+/// Query through the runtime, which reports the guest's action and mask even
+/// when it owns a physical SIGALRM handler. These queries run in an owned turn;
+/// a scheduler-side read of the callback's physical mask is not a substitute.
+async fn read_sigalrm_sleep_state<G, T>(guest: &mut G) -> Result<InGuestSleepSigalrm, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
     let mut stack = guest.stack().await;
     let action = stack.reserve::<KernelSigaction>();
     let mask = stack.reserve::<KernelSigset>();
@@ -218,8 +235,17 @@ where
         .await?;
     let action: KernelSigaction = guest.memory().read_value(action)?;
     let mask: KernelSigset = guest.memory().read_value(mask)?;
-    let handled = action.handler != libc::SIG_DFL as u64 && action.handler != libc::SIG_IGN as u64;
-    Ok((handled, mask & kernel_sigset_bit(libc::SIGALRM) != 0))
+    let disposition = if action.handler == libc::SIG_DFL as u64 {
+        SigalrmSleepDisposition::Default
+    } else if action.handler == libc::SIG_IGN as u64 {
+        SigalrmSleepDisposition::Ignored
+    } else {
+        SigalrmSleepDisposition::Handled
+    };
+    Ok(InGuestSleepSigalrm {
+        disposition,
+        blocked: mask & kernel_sigset_bit(libc::SIGALRM) != 0,
+    })
 }
 
 /// The guest's virtual SIGALRM blocked bit, read from the runtime (which
@@ -342,6 +368,85 @@ fn self_sigkill_targets_current_task(
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    /// Bind a supported in-guest emulated sleep to its guest disposition/mask.
+    /// Ordinary admitted creation does not share signal dispositions between
+    /// processes, and each supported in-guest process has one guest thread.
+    /// The snapshot therefore stays current until this request resumes.
+    pub(crate) async fn in_guest_sleep_sigalrm_snapshot<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Option<InGuestSleepSigalrm> {
+        if !self.cfg.backend.virtualizes_guest_sigalrm {
+            return None;
+        }
+        match read_sigalrm_sleep_state(guest).await {
+            Ok(state) => Some(state),
+            Err(error) => {
+                self.stop_after_in_guest_sleep_signal_loss(
+                    guest,
+                    format!("could not query its SIGALRM action/mask before sleeping: {error}"),
+                )
+                .await
+            }
+        }
+    }
+
+    /// A typed wake means the scheduler generated a one-shot SIGALRM for this
+    /// exact sleep without sending it physically. Stage it through the frozen
+    /// runtime self-signal path, which runs signal and exit callbacks before
+    /// Linux kills the process. The caller must immediately return its handler:
+    /// it must neither resume guest code nor copy nanosleep's remainder out.
+    pub(crate) async fn stage_in_guest_fatal_alarm<G: Guest<Self>>(&self, guest: &mut G) {
+        if !self.cfg.backend.virtualizes_guest_sigalrm {
+            self.stop_after_in_guest_sleep_signal_loss(
+                guest,
+                "received an in-guest fatal alarm on another backend".into(),
+            )
+            .await;
+        }
+        match read_sigalrm_sleep_state(guest).await {
+            Ok(InGuestSleepSigalrm {
+                disposition: SigalrmSleepDisposition::Default,
+                blocked: false,
+            }) => {}
+            other => {
+                self.stop_after_in_guest_sleep_signal_loss(
+                    guest,
+                    format!("its default/unblocked SIGALRM sleep snapshot changed: {other:?}"),
+                )
+                .await;
+            }
+        }
+        let call = syscalls::Tgkill::new()
+            .with_tgid(guest.pid().as_raw())
+            .with_tid(guest.tid().as_raw())
+            .with_sig(libc::SIGALRM);
+        if guest.inject(call).await != Ok(0) {
+            self.stop_after_in_guest_sleep_signal_loss(
+                guest,
+                "could not stage its default-fatal SIGALRM after a sleep wake".into(),
+            )
+            .await;
+        }
+    }
+
+    async fn stop_after_in_guest_sleep_signal_loss<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        reason: String,
+    ) -> ! {
+        let reason = format!(
+            "thread {} cannot complete its in-guest SIGALRM sleep delivery: {reason}",
+            guest.thread_state().dettid,
+        );
+        crate::tool_global::report_determinism_loss(guest, reason).await;
+        match guest
+            .tail_inject(
+                syscalls::ExitGroup::new().with_status(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+            )
+            .await {}
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     /// We send the alarms to the global scheduler to handle.
@@ -461,6 +566,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
                 let mut req = Self::sleep_request_abs(guest, LogicalTime::INDEFINITE).await;
                 req.fyi(crate::resources::PAUSE_FYI);
+                req.in_guest_sleep_sigalrm = self.in_guest_sleep_sigalrm_snapshot(guest).await;
                 match crate::tool_global::parked_wait_request(
                     guest,
                     req,
@@ -468,6 +574,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 )
                 .await
                 {
+                    ResumeStatus::InGuestFatalAlarm => {
+                        self.stage_in_guest_fatal_alarm(guest).await;
+                        return Err(Errno::EINTR.into());
+                    }
                     ResumeStatus::Normal => {
                         panic!(
                             "Internal violation: pause should never return from the scheduler except by interruption!"

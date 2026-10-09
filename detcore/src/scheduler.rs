@@ -158,6 +158,8 @@ pub enum SchedResponse {
     /// the handler.
     Signaled(Option<Vec<SigWrapper>>),
     ObserveSignal(Box<parked::AlarmControl>),
+    /// The original qualified in-guest sleep must stage its consumed SIGALRM.
+    InGuestFatalAlarm,
     // TODO: Time to exit, or an exit is already under way
     // Exit,
 }
@@ -2136,7 +2138,7 @@ pub async fn do_a_turn_blocking(
                         // actual pop consumes it until this turn returns.
                         state.bump_global_time(&global_time, &Err(SkipTurn));
                         if !timed_event_processed {
-                            timed_event_processed = state.step2b_process_timed();
+                            timed_event_processed = state.step2b_process_timed(&global_time);
                         }
                         // Idempotent and spends no event budget, so it runs on
                         // every refresh.
@@ -2158,7 +2160,7 @@ pub async fn do_a_turn_blocking(
                         }
                         1 => {
                             if !timed_event_processed {
-                                timed_event_processed = state.step2b_process_timed();
+                                timed_event_processed = state.step2b_process_timed(&global_time);
                             }
                             state.step2b_restore_due_pollers();
                             if let Err(error) = state.select_parked_alarm() {
@@ -4153,7 +4155,7 @@ impl Scheduler {
         self.step2_sigalrm_ledger();
         self.step2_release_signaled_background()?;
         self.step2_drain_prefix()?;
-        self.step2b_process_timed();
+        self.step2b_process_timed(global_time);
         self.step2b_restore_due_pollers();
         // A timed signal that just armed a background thread is followed by an
         // empty pass, so the barrier above requeues it at the top of the next
@@ -4442,7 +4444,7 @@ impl Scheduler {
     /// accordingly.
     /// Return whether an event was actually consumed, so a control refresh
     /// can distinguish an empty check from a spent maintenance budget.
-    fn step2b_process_timed(&mut self) -> bool {
+    fn step2b_process_timed(&mut self, global_time: &Arc<Mutex<GlobalTime>>) -> bool {
         if let Some((time_ns, evt)) = self
             .blocked
             .timed_waiters
@@ -4451,7 +4453,8 @@ impl Scheduler {
             match evt {
                 TimedEvent::ThreadEvt(tid) => self.wake_timed_event(time_ns, tid),
                 TimedEvent::SignalEvt(id, tid, sig) => {
-                    self.dispatch_timed_signal(time_ns, id, tid, sig, true)
+                    let observed_now = global_time.lock().unwrap().as_nanos();
+                    self.dispatch_timed_signal(time_ns, id, tid, sig, true, observed_now)
                 }
             }
             true
@@ -4483,6 +4486,106 @@ impl Scheduler {
             target, sig
         );
         self.signal_guest(target, sig);
+    }
+
+    /// Snapshot eligibility is local to the exact outstanding sleep request.
+    fn in_guest_sleep_sigalrm(
+        &self,
+        thread: DetTid,
+    ) -> Option<(crate::resources::InGuestSleepSigalrm, LogicalTime)> {
+        if self.backend != BackendCapabilities::LITEINST_IN_GUEST
+            || self.registered_process(thread) != Some(thread)
+            || self.thread_tree.my_thread_group(&thread) != [thread]
+        {
+            return None;
+        }
+        self.next_turns
+            .get(&thread)?
+            .req
+            .try_read()?
+            .ok()?
+            .in_guest_sigalrm_sleep()
+    }
+
+    fn in_guest_fatal_alarm_pending(&self, thread: DetTid) -> bool {
+        self.next_turns
+            .get(&thread)
+            .and_then(|turn| turn.req.try_read())
+            .is_some_and(|request| {
+                request.is_ok_and(|resources| {
+                    resources.resources.len() == 1
+                        && resources.resources.get(&ResourceID::InGuestFatalAlarm)
+                            == Some(&Permission::W)
+                })
+            })
+    }
+
+    /// Only a consumed one-shot Alarm identity may replace a parked sleep.
+    /// Dispatch supplies the event timestamp and observed GlobalTime, since
+    /// empty-queue skips and control hooks can advance that clock before
+    /// committed_time is refreshed.
+    fn divert_in_guest_fatal_alarm(
+        &mut self,
+        event_ns: LogicalTime,
+        id: timed_waiters::SignalTimerId,
+        thread: DetTid,
+        signal: Signal,
+        observed_now: LogicalTime,
+    ) -> bool {
+        let timed_waiters::SignalTimerId::Alarm(process) = id else {
+            return false;
+        };
+        if signal != Signal::SIGALRM
+            || process != thread
+            || self.sigalrm_handled(process)
+            || self.blocked.timed_waiters.alarm_state(process).is_some()
+            || !matches!(self.thread_status(thread), ThreadStatus::NotRunning)
+            || self
+                .happens_before
+                .as_ref()
+                .is_some_and(|hb| hb.parked.contains(&thread))
+        {
+            return false;
+        }
+        let Some((snapshot, deadline)) = self.in_guest_sleep_sigalrm(thread) else {
+            return false;
+        };
+        if !snapshot.ends_process()
+            || self.blocked.timed_waiters.thread_deadline(thread) != Some(deadline)
+            || deadline <= self.committed_time.max(event_ns).max(observed_now)
+        {
+            return false;
+        }
+        let mut wake = Resources::new(thread);
+        wake.insert(ResourceID::InGuestFatalAlarm, Permission::W);
+        info!(
+            "[dtid {}] one-shot SIGALRM expired during an in-guest sleep; staging fatal delivery in the target's turn.",
+            thread
+        );
+        self.force_unblock_thread(thread, wake);
+        true
+    }
+
+    /// Authenticate the retained caller request after the typed grant cleared
+    /// its scheduler slot. This rejects a fabricated generic fatal resource,
+    /// a stale address space, or a grant belonging to another task.
+    pub(crate) fn in_guest_fatal_alarm_response_matches(
+        &self,
+        thread: DetTid,
+        process: DetPid,
+        mm: Option<MmId>,
+        original: &Resources,
+    ) -> bool {
+        self.backend == BackendCapabilities::LITEINST_IN_GUEST
+            && thread == process
+            && original.tid == thread
+            && original
+                .in_guest_sigalrm_sleep()
+                .is_some_and(|(snapshot, _)| snapshot.ends_process())
+            && self.registered_process(thread) == Some(process)
+            && self.thread_tree.my_thread_group(&thread) == [thread]
+            && mm.is_some_and(|mm| self.rpc_incarnation_matches(thread, mm))
+            && self.holds_serial_grant(thread)
     }
 
     // Follow Linux semantics for delivering a signal to a thread within a process group.
@@ -4832,6 +4935,24 @@ impl Scheduler {
     /// this only prevents an internal polling request from hiding a pending
     /// signal indefinitely.
     fn wake_signaled_guest(&mut self, dettid: DetTid, signal: Signal) {
+        if self.in_guest_fatal_alarm_pending(dettid) {
+            return;
+        }
+        // The physical send has already happened. Preserve its real kernel
+        // pending/ignored semantics, but never invent an interrupted sleep
+        // for an alarm this exact owner snapshot blocks or ignores. This
+        // covers both filed requests and sleeps already outside the queue.
+        if signal == Signal::SIGALRM
+            && self
+                .in_guest_sleep_sigalrm(dettid)
+                .is_some_and(|(snapshot, _)| {
+                    snapshot.blocked
+                        || snapshot.disposition
+                            == crate::resources::SigalrmSleepDisposition::Ignored
+                })
+        {
+            return;
+        }
         debug!(
             "[dtid {}] make pending signal {} visible to the scheduler.",
             dettid, signal
@@ -5389,6 +5510,11 @@ impl Scheduler {
     /// opens and the thread resumes, as for any runnable thread that is not
     /// running.
     fn force_unblock_thread_at(&mut self, dettid: DetTid, rsrcs: Resources, front: bool) {
+        // The consumed alarm already owns this exact response. A later
+        // physical signal must not replace its fatal continuation.
+        if self.in_guest_fatal_alarm_pending(dettid) {
+            return;
+        }
         if self
             .happens_before
             .as_ref()
@@ -6340,7 +6466,7 @@ impl Scheduler {
                     .expect("internal error: no timed events found");
                 debug_assert_eq!(event_ns, next_deadline);
                 self.empty_queue_wakes += 1;
-                {
+                let observed_now = {
                     let mut gt = global_time.lock().unwrap();
                     let gt_now_ns = gt.as_nanos();
                     if event_ns > gt_now_ns {
@@ -6361,12 +6487,13 @@ impl Scheduler {
                             event_ns, gt_now_ns,
                         );
                     }
-                }
+                    gt.as_nanos()
+                };
 
                 match evt {
                     TimedEvent::ThreadEvt(dtid) => self.wake_timed_event(event_ns, dtid),
                     TimedEvent::SignalEvt(id, dtid, sig) => {
-                        self.dispatch_timed_signal(event_ns, id, dtid, sig, false)
+                        self.dispatch_timed_signal(event_ns, id, dtid, sig, false, observed_now)
                     }
                 }
                 return Err(SkipTurn);
@@ -6891,6 +7018,7 @@ impl Scheduler {
             ResourceID::FutexWait => Ok(()),
             ResourceID::TraceReplay => Ok(()),
             ResourceID::SchedYield => Ok(()),
+            ResourceID::InGuestFatalAlarm => Ok(()),
 
             // A guest thread checking in at a happens-before anchor point. Delegate
             // to the enforcement logic, which either grants passage (firing anchors)
@@ -7316,13 +7444,16 @@ impl Scheduler {
             &resp, &dtid
         );
         let signals = self.inbound_signals(dtid); // Peek before we clear the ivars.
+        let fatal_alarm = self.in_guest_fatal_alarm_pending(dtid);
         let futex_timed_out = self.blocked.timed_out_futex_waiters.remove(&dtid);
         if let Err(error) = self.clear_nextturn(dtid) {
             self.fail_parked(dtid, error);
             return Err(SkipTurn);
         }
         self.turn += 1;
-        let answer = if !signals.is_empty() {
+        let answer = if fatal_alarm {
+            SchedResponse::InGuestFatalAlarm
+        } else if !signals.is_empty() {
             SchedResponse::Signaled(Some(signals))
         } else if futex_timed_out {
             SchedResponse::Go(Some(SchedValue::TimeOut))
@@ -12782,6 +12913,7 @@ mod test {
             creator,
             Signal::SIGCHLD,
             true,
+            scheduler.committed_time,
         );
         assert_eq!(scheduler.host_signal_attempts, attempts);
         assert!(scheduler.terminal_deadlock.is_none());
@@ -12964,6 +13096,7 @@ mod test {
                 parent,
                 Signal::SIGCHLD,
                 true,
+                scheduler.committed_time,
             );
             assert_eq!(
                 scheduler.host_signal_attempts - attempts,
@@ -15975,5 +16108,502 @@ mod test {
                 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 10_000, 10_000
             ]
         );
+    }
+    /// File the exact owner-turn snapshot without registering a real host PID.
+    fn in_guest_alarm_sleep(
+        deadline: LogicalTime,
+        fyi: &str,
+        snapshot: crate::resources::InGuestSleepSigalrm,
+        queued: bool,
+    ) -> (Scheduler, DetTid, Resources) {
+        let config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        }
+        .with_backend(|backend| *backend = BackendCapabilities::LITEINST_IN_GUEST);
+        let mut scheduler = Scheduler::new(&config);
+        let target = filed_sleep(&mut scheduler, deadline, fyi, queued);
+        scheduler.thread_tree.add_child(target, target, true);
+        scheduler
+            .exec_incarnations
+            .insert(target, MmId::initial(target));
+        let mut request = scheduler.next_turns[&target]
+            .req
+            .try_read()
+            .unwrap()
+            .unwrap();
+        request.in_guest_sleep_sigalrm = Some(snapshot);
+        scheduler.next_turns.get_mut(&target).unwrap().req = Ivar::full(Ok(request.clone()));
+        (scheduler, target, request)
+    }
+
+    fn default_sleep_alarm_snapshot() -> crate::resources::InGuestSleepSigalrm {
+        crate::resources::InGuestSleepSigalrm {
+            disposition: crate::resources::SigalrmSleepDisposition::Default,
+            blocked: false,
+        }
+    }
+
+    /// Drive the real pop, diversion and typed grant boundaries directly,
+    /// so an unexpected rejection cannot send a physical signal to a fake PID.
+    /// Guest probes exercise the complete dispatcher against real targets.
+    #[test]
+    fn in_guest_one_shot_alarm_grants_fatal_sleep_without_host_send() {
+        let expiry = LogicalTime::from_nanos(10);
+        for (deadline, fyi) in [
+            (LogicalTime::INDEFINITE, PAUSE_FYI),
+            (LogicalTime::from_nanos(20), NANOSLEEP_FYI),
+        ] {
+            for normal_due in [true, false] {
+                let (mut scheduler, target, original) =
+                    in_guest_alarm_sleep(deadline, fyi, default_sleep_alarm_snapshot(), false);
+                scheduler.blocked.timed_waiters.insert_alarm(
+                    expiry,
+                    target,
+                    target,
+                    Signal::SIGALRM,
+                    LogicalTime::ZERO,
+                );
+                let (event_ns, TimedEvent::SignalEvt(id, tid, signal)) =
+                    scheduler.blocked.timed_waiters.pop().unwrap()
+                else {
+                    panic!("the alarm must expire before its sleep");
+                };
+                assert_eq!(event_ns, expiry);
+                assert_eq!(scheduler.blocked.timed_waiters.alarm_state(target), None);
+                // Models empty-queue dispatch with committed_time still behind
+                // the event, as well as the ordinary due-event path.
+                scheduler.committed_time = if normal_due {
+                    expiry
+                } else {
+                    LogicalTime::ZERO
+                };
+                let turn_before = scheduler.turn;
+                let committed_before = scheduler.committed_time;
+                let observed_now = if normal_due {
+                    expiry
+                } else {
+                    expiry + LogicalTime::from_nanos(1)
+                };
+                assert!(scheduler.divert_in_guest_fatal_alarm(
+                    event_ns,
+                    id,
+                    tid,
+                    signal,
+                    observed_now
+                ));
+                assert_eq!(
+                    scheduler.turn, turn_before,
+                    "diversion is not an extra guest grant"
+                );
+                assert_eq!(scheduler.committed_time, committed_before);
+                assert_eq!(scheduler.host_signal_attempts, 0);
+                assert!(scheduler.in_guest_fatal_alarm_pending(target));
+                assert_eq!(
+                    scheduler.blocked.timed_waiters.thread_deadline(target),
+                    None
+                );
+                assert_eq!(
+                    scheduler
+                        .run_queue
+                        .tids()
+                        .filter(|tid| **tid == target)
+                        .count(),
+                    1
+                );
+
+                // A later signal and even a direct generic substitution cannot
+                // steal the typed response from the consumed alarm.
+                scheduler.wake_signaled_guest(target, Signal::SIGCHLD);
+                scheduler.wake_signaled_guest(target, Signal::SIGUSR1);
+                let mut generic = Resources::new(target);
+                generic.insert(
+                    ResourceID::InboundSignal(SigWrapper(libc::SIGCHLD)),
+                    Permission::W,
+                );
+                scheduler.force_unblock_thread(target, generic);
+                assert!(scheduler.in_guest_fatal_alarm_pending(target));
+                assert_eq!(
+                    scheduler
+                        .run_queue
+                        .tids()
+                        .filter(|tid| **tid == target)
+                        .count(),
+                    1
+                );
+
+                let response = scheduler.next_turns[&target].resp.clone();
+                assert!(scheduler.unblock_guest(target, &response).is_ok());
+                assert_eq!(
+                    scheduler.turn,
+                    turn_before + 1,
+                    "the fatal continuation consumes exactly one ordinary grant"
+                );
+                assert!(matches!(
+                    response.try_read(),
+                    Some(SchedResponse::InGuestFatalAlarm)
+                ));
+                assert!(scheduler.in_guest_fatal_alarm_response_matches(
+                    target,
+                    target,
+                    Some(MmId::initial(target)),
+                    &original,
+                ));
+                assert!(!scheduler.in_guest_fatal_alarm_pending(target));
+                assert_eq!(scheduler.host_signal_attempts, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn in_guest_ignored_and_blocked_alarm_preserve_filed_or_parked_sleep() {
+        use crate::resources::InGuestSleepSigalrm;
+        use crate::resources::SigalrmSleepDisposition;
+        for snapshot in [
+            InGuestSleepSigalrm {
+                disposition: SigalrmSleepDisposition::Ignored,
+                blocked: false,
+            },
+            InGuestSleepSigalrm {
+                disposition: SigalrmSleepDisposition::Default,
+                blocked: true,
+            },
+            InGuestSleepSigalrm {
+                disposition: SigalrmSleepDisposition::Handled,
+                blocked: true,
+            },
+        ] {
+            for (deadline, fyi) in [
+                (LogicalTime::INDEFINITE, PAUSE_FYI),
+                (LogicalTime::from_nanos(20), NANOSLEEP_FYI),
+            ] {
+                for queued in [false, true] {
+                    let (mut scheduler, target, _) =
+                        in_guest_alarm_sleep(deadline, fyi, snapshot, queued);
+                    assert!(!scheduler.divert_in_guest_fatal_alarm(
+                        LogicalTime::from_nanos(10),
+                        timed_waiters::SignalTimerId::Alarm(target),
+                        target,
+                        Signal::SIGALRM,
+                        LogicalTime::ZERO
+                    ));
+                    // This method is the wake half after a successful physical
+                    // send. Kernel pending semantics belong to the guest probes.
+                    scheduler.wake_signaled_guest(target, Signal::SIGALRM);
+                    assert_eq!(scheduler.run_queue.contains_tid(target), queued);
+                    assert_eq!(
+                        scheduler.blocked.timed_waiters.thread_deadline(target),
+                        (!queued).then_some(deadline)
+                    );
+                    assert_eq!(
+                        scheduler.next_turns[&target]
+                            .req
+                            .try_read()
+                            .unwrap()
+                            .unwrap()
+                            .in_guest_sigalrm_sleep(),
+                        Some((snapshot, deadline))
+                    );
+                    assert!(!scheduler.in_guest_fatal_alarm_pending(target));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn in_guest_fatal_alarm_excludes_other_identities_and_rearmed_timers() {
+        let (mut scheduler, target, _) = in_guest_alarm_sleep(
+            LogicalTime::INDEFINITE,
+            PAUSE_FYI,
+            default_sleep_alarm_snapshot(),
+            false,
+        );
+        let expiry = LogicalTime::from_nanos(10);
+        for (id, signal) in [
+            (
+                timed_waiters::SignalTimerId::Posix(target, 1),
+                Signal::SIGALRM,
+            ),
+            (
+                timed_waiters::SignalTimerId::ChildExit {
+                    child: DetPid::from_raw(200),
+                    parent: target,
+                },
+                Signal::SIGALRM,
+            ),
+            (
+                timed_waiters::SignalTimerId::Alarm(DetPid::from_raw(200)),
+                Signal::SIGALRM,
+            ),
+            (timed_waiters::SignalTimerId::Alarm(target), Signal::SIGUSR1),
+        ] {
+            assert!(!scheduler.divert_in_guest_fatal_alarm(
+                expiry,
+                id,
+                target,
+                signal,
+                LogicalTime::ZERO
+            ));
+        }
+        for interval in [LogicalTime::ZERO, LogicalTime::from_nanos(5)] {
+            scheduler.blocked.timed_waiters.insert_alarm(
+                expiry,
+                target,
+                target,
+                Signal::SIGALRM,
+                interval,
+            );
+            if interval != LogicalTime::ZERO {
+                assert!(matches!(
+                    scheduler.blocked.timed_waiters.pop(),
+                    Some((_, TimedEvent::SignalEvt(..)))
+                ));
+            }
+            assert!(
+                scheduler
+                    .blocked
+                    .timed_waiters
+                    .alarm_state(target)
+                    .is_some(),
+                "unconsumed one-shot or rearmed recurring identity"
+            );
+            assert!(!scheduler.divert_in_guest_fatal_alarm(
+                expiry,
+                timed_waiters::SignalTimerId::Alarm(target),
+                target,
+                Signal::SIGALRM,
+                LogicalTime::ZERO
+            ));
+        }
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(target),
+            Some(LogicalTime::INDEFINITE)
+        );
+        assert!(!scheduler.run_queue.contains_tid(target));
+    }
+
+    #[test]
+    fn in_guest_fatal_alarm_excludes_unqualified_requests_and_states() {
+        let expiry = LogicalTime::from_nanos(10);
+        for case in 0..10 {
+            let (mut scheduler, target, mut request) = in_guest_alarm_sleep(
+                LogicalTime::from_nanos(20),
+                NANOSLEEP_FYI,
+                default_sleep_alarm_snapshot(),
+                false,
+            );
+            match case {
+                0 => scheduler.backend = Config::default().backend,
+                1 => request.in_guest_sleep_sigalrm = None,
+                2 => request.fyi = String::new(),
+                3 => request.insert(ResourceID::TraceReplay, Permission::W),
+                4 => {
+                    scheduler.runqueue_push_back(target);
+                }
+                5 => scheduler.blocked.timed_waiters.remove(target),
+                6 => {
+                    scheduler
+                        .thread_tree
+                        .add_child(target, DetTid::from_raw(101), false);
+                }
+                7 => {
+                    let mut hb = hb_runtime(HB_GATE_SPEC);
+                    hb.parked.insert(target);
+                    scheduler.happens_before = Some(hb);
+                }
+                8 => {
+                    scheduler.blocked.timed_waiters.remove(target);
+                    scheduler
+                        .blocked
+                        .timed_waiters
+                        .insert(LogicalTime::from_nanos(21), target);
+                }
+                9 => {
+                    request.in_guest_sleep_sigalrm.as_mut().unwrap().disposition =
+                        crate::resources::SigalrmSleepDisposition::Handled;
+                }
+                _ => unreachable!(),
+            }
+            scheduler.next_turns.get_mut(&target).unwrap().req = Ivar::full(Ok(request));
+            assert!(
+                !scheduler.divert_in_guest_fatal_alarm(
+                    expiry,
+                    timed_waiters::SignalTimerId::Alarm(target),
+                    target,
+                    Signal::SIGALRM,
+                    LogicalTime::ZERO
+                ),
+                "case {case}"
+            );
+            assert!(
+                !scheduler.in_guest_fatal_alarm_pending(target),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn in_guest_fatal_alarm_excludes_sleep_deadline_equality_and_already_ahead_time() {
+        let deadline = LogicalTime::from_nanos(20);
+        for (committed, event_ns, observed_now) in [
+            (LogicalTime::ZERO, deadline, LogicalTime::ZERO),
+            (
+                LogicalTime::ZERO,
+                deadline + LogicalTime::from_nanos(1),
+                LogicalTime::ZERO,
+            ),
+            (deadline, LogicalTime::from_nanos(10), LogicalTime::ZERO),
+            (
+                deadline + LogicalTime::from_nanos(1),
+                LogicalTime::from_nanos(10),
+                LogicalTime::ZERO,
+            ),
+            // A control hook crossed the sleep deadline while committed_time
+            // and the popped event still lag. The clock must not rewind into
+            // permission to interrupt a completed sleep.
+            (LogicalTime::ZERO, LogicalTime::from_nanos(10), deadline),
+            (
+                LogicalTime::ZERO,
+                LogicalTime::from_nanos(10),
+                deadline + LogicalTime::from_nanos(1),
+            ),
+        ] {
+            let (mut scheduler, target, _) = in_guest_alarm_sleep(
+                deadline,
+                NANOSLEEP_FYI,
+                default_sleep_alarm_snapshot(),
+                false,
+            );
+            scheduler.committed_time = committed;
+            assert!(!scheduler.divert_in_guest_fatal_alarm(
+                event_ns,
+                timed_waiters::SignalTimerId::Alarm(target),
+                target,
+                Signal::SIGALRM,
+                observed_now
+            ));
+            assert_eq!(
+                scheduler.blocked.timed_waiters.thread_deadline(target),
+                Some(deadline)
+            );
+            assert!(!scheduler.run_queue.contains_tid(target));
+        }
+    }
+
+    #[test]
+    fn in_guest_fatal_response_requires_original_sleep_current_mm_and_owned_grant() {
+        let (mut scheduler, target, original) = in_guest_alarm_sleep(
+            LogicalTime::INDEFINITE,
+            PAUSE_FYI,
+            default_sleep_alarm_snapshot(),
+            false,
+        );
+        let mm = MmId::initial(target);
+        assert!(!scheduler.in_guest_fatal_alarm_response_matches(
+            target,
+            target,
+            Some(mm),
+            &original
+        ));
+        assert!(scheduler.divert_in_guest_fatal_alarm(
+            LogicalTime::from_nanos(10),
+            timed_waiters::SignalTimerId::Alarm(target),
+            target,
+            Signal::SIGALRM,
+            LogicalTime::ZERO
+        ));
+        let response = scheduler.next_turns[&target].resp.clone();
+        assert!(scheduler.unblock_guest(target, &response).is_ok());
+        assert!(scheduler.in_guest_fatal_alarm_response_matches(
+            target,
+            target,
+            Some(mm),
+            &original
+        ));
+        assert!(!scheduler.in_guest_fatal_alarm_response_matches(target, target, None, &original));
+        assert!(!scheduler.in_guest_fatal_alarm_response_matches(
+            target,
+            DetPid::from_raw(200),
+            Some(mm),
+            &original
+        ));
+        let mut unqualified = original.clone();
+        unqualified.in_guest_sleep_sigalrm = None;
+        assert!(!scheduler.in_guest_fatal_alarm_response_matches(
+            target,
+            target,
+            Some(mm),
+            &unqualified
+        ));
+        let mut fabricated = Resources::new(target);
+        fabricated.insert(ResourceID::InGuestFatalAlarm, Permission::W);
+        assert!(!scheduler.in_guest_fatal_alarm_response_matches(
+            target,
+            target,
+            Some(mm),
+            &fabricated
+        ));
+        scheduler
+            .exec_incarnations
+            .insert(target, MmId::initial(DetPid::from_raw(200)));
+        assert!(!scheduler.in_guest_fatal_alarm_response_matches(
+            target,
+            target,
+            Some(mm),
+            &original
+        ));
+        scheduler.exec_incarnations.insert(target, mm);
+        scheduler.parked.running = None;
+        assert!(!scheduler.in_guest_fatal_alarm_response_matches(
+            target,
+            target,
+            Some(mm),
+            &original
+        ));
+    }
+
+    #[test]
+    fn in_guest_fatal_alarm_retirement_leaves_no_pending_typed_request() {
+        let (mut scheduler, target, _) = in_guest_alarm_sleep(
+            LogicalTime::INDEFINITE,
+            PAUSE_FYI,
+            default_sleep_alarm_snapshot(),
+            false,
+        );
+        assert!(scheduler.divert_in_guest_fatal_alarm(
+            LogicalTime::from_nanos(10),
+            timed_waiters::SignalTimerId::Alarm(target),
+            target,
+            Signal::SIGALRM,
+            LogicalTime::ZERO
+        ));
+        let response = scheduler.next_turns[&target].resp.clone();
+        scheduler.logically_kill_thread(&target, &target, MmId::initial(target));
+        assert!(!scheduler.in_guest_fatal_alarm_pending(target));
+        assert!(!scheduler.next_turns.contains_key(&target));
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(target),
+            None
+        );
+        assert!(matches!(
+            response.try_read(),
+            Some(SchedResponse::Signaled(None))
+        ));
+    }
+
+    #[test]
+    fn in_guest_handled_sleep_alarm_still_uses_existing_ledger() {
+        let snapshot = crate::resources::InGuestSleepSigalrm {
+            disposition: crate::resources::SigalrmSleepDisposition::Handled,
+            blocked: false,
+        };
+        let (mut scheduler, target, _) =
+            in_guest_alarm_sleep(LogicalTime::INDEFINITE, PAUSE_FYI, snapshot, false);
+        scheduler.set_sigalrm_handled(target, true);
+        scheduler.set_sigalrm_blocked(target, false);
+        assert!(scheduler.divert_sigalrm(target, Signal::SIGALRM));
+        assert!(scheduler.sigalrm_pending(target));
+        assert!(!scheduler.in_guest_fatal_alarm_pending(target));
+        assert_eq!(scheduler.host_signal_attempts, 0);
     }
 }

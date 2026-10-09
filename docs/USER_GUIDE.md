@@ -283,10 +283,20 @@ receives names the signal exactly, but whether a core was dumped is only
 predicted (from the signal, the process's dumpable mode, `RLIMIT_CORE` and
 `core_pattern`) and differs when the kernel fails to write the core; Detcore
 does not use it, and the guest's parent sees the kernel's own status. A
-death by any other signal records the loss, including a hardware fault, a
-signal another process sends, a signal the scheduler delivers (such as the
-SIGALRM of an `alarm` with no handler, which is also what a program gets
-when in-guest LiteInst refuses its handler), and a SIGPIPE from a write.
+death outside the supported delivery paths records the loss, including a
+hardware fault, a signal another process sends, and a SIGPIPE from a write.
+
+Both in-guest backends also schedule a default-fatal SIGALRM from a one-shot
+virtual `alarm` or `ITIMER_REAL` when the single-thread guest is parked in an
+emulated `pause` or `nanosleep` and does not block SIGALRM. No guest-handler
+opt-in is needed. The runtime reports the signal and exit callbacks before
+the kernel terminates the process; a fatal sleep does not copy a remaining
+time to the guest. Ignored or blocked SIGALRM does not interrupt these sleeps,
+and a blocked alarm remains pending after canceling its timer. This bridge
+does not cover recurring timers, other timer kinds, external signals, a
+guest running outside these sleeps, physical or polling I/O, or a sleep
+already at its deadline. Those deaths retain the loss check. The existing
+no-guest-filter launch and callback contract still applies.
 
 On a run qualified for guest SIGALRM handlers, `in-guest-trap` with the
 per-run opt-in `REVERIE_LITEINST_SIGALRM_HANDLERS=1` permits `getuid`,

@@ -184,6 +184,17 @@ impl ProcessSignalControl for Backend {
 fn at(n: u64) -> LogicalTime {
     LogicalTime::from_nanos(n)
 }
+
+/// Direct maintenance tests set committed_time in a zero-based clock without
+/// a running GlobalTime. Supply that same intended instant to timer dispatch.
+fn committed_clock(s: &Scheduler) -> Arc<Mutex<GlobalTime>> {
+    let mut global = GlobalTime::new(&Config {
+        epoch: chrono::DateTime::UNIX_EPOCH,
+        ..Config::default()
+    });
+    global.add_extra_time(std::time::Duration::from_nanos(s.committed_time.as_nanos()));
+    Arc::new(Mutex::new(global))
+}
 fn task(pid: i32, tid: i32) -> SignalTaskIdentity {
     SignalTaskIdentity {
         process: SignalProcessId {
@@ -390,7 +401,7 @@ fn real_expiry_publishes_without_any_borrowed_callback() {
         .unwrap();
     s.real_timers.retire_task(leader, worker);
     s.committed_time = at(10);
-    s.step2b_process_timed();
+    s.step2b_process_timed(&committed_clock(&s));
     assert!(!s.backend_failed());
     assert_eq!(s.host_signal_attempts, 0);
     let p = b.publications.lock().unwrap();
@@ -482,7 +493,7 @@ fn no_handler_reenrolls_original_sleep_and_late_timeout_wins() {
     s.drain_control_intents();
     assert_eq!(s.blocked.timed_waiters.thread_deadline(tid), Some(at(100)));
     b.recipients.lock().unwrap().clear();
-    s.step2b_process_timed();
+    s.step2b_process_timed(&committed_clock(&s));
     assert_eq!(s.blocked.timed_waiters.thread_deadline(tid), None);
     assert!(resumed.try_read().is_none());
     assert!(s.run_queue.contains_tid(tid));
@@ -508,7 +519,7 @@ fn natural_due_sleep_is_not_rewritten_as_interrupted() {
         task: task(100, 100),
     });
     s.committed_time = at(10);
-    s.step2b_process_timed();
+    s.step2b_process_timed(&committed_clock(&s));
     s.select_parked_alarm().unwrap();
     assert!(response.try_read().is_none());
     assert!(b.permits.lock().unwrap().is_empty());
@@ -571,7 +582,8 @@ fn committed_failure_reenters_only_after_scheduler_terminal_and_unlock() {
     {
         let mut scheduler = s.lock().unwrap();
         scheduler.committed_time = at(10);
-        scheduler.step2b_process_timed();
+        let global = committed_clock(&scheduler);
+        scheduler.step2b_process_timed(&global);
         assert!(scheduler.backend_failed());
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         assert_eq!(scheduler.host_signal_attempts, 0);
@@ -2441,7 +2453,7 @@ fn timed_maintenance_budget_survives_alarm_refresh_and_empty_queue() {
             // A prior maintenance pass committed this pending alarm. The turn
             // under test therefore starts with either one or zero due sleeps.
             s.committed_time = start + at(1);
-            s.step2b_process_timed();
+            s.step2b_process_timed(&global);
         }
         backend.recipients.lock().unwrap().push(SignalRecipient {
             task: task(100, 100),
@@ -3270,7 +3282,7 @@ fn child_wait_cross_signal_drain_retires_capability_before_due_alarm() {
             // The shared alarm is published after the signal prefix and before
             // selection, exactly where the stale ChildWait origin used to fail.
             s.committed_time = at(10);
-            assert!(s.step2b_process_timed());
+            assert!(s.step2b_process_timed(&committed_clock(&s)));
             assert_eq!(b.publications.lock().unwrap().len(), 1);
             if !alarm_masked {
                 b.recipients.lock().unwrap().push(SignalRecipient {
@@ -4538,7 +4550,7 @@ fn the_controlled_loop_restores_a_poller_whose_deadline_a_refresh_crosses() {
         .unwrap()
         .add_extra_time(std::time::Duration::from_nanos(1));
     s.committed_time = start + at(1);
-    s.step2b_process_timed();
+    s.step2b_process_timed(&global);
     backend.recipients.lock().unwrap().push(SignalRecipient {
         task: task(100, 100),
     });

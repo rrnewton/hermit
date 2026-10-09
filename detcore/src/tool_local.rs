@@ -2865,6 +2865,7 @@ impl<T> ThreadState<T> {
             blocked_signal_mask: None,
             replay_served_from_log: false,
             poll_deadline: None,
+            in_guest_sleep_sigalrm: None,
         }
     }
 

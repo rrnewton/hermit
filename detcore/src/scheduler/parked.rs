@@ -647,6 +647,7 @@ impl Scheduler {
         tid: DetTid,
         signal: nix::sys::signal::Signal,
         normal_due: bool,
+        observed_now: LogicalTime,
     ) {
         if self.signal_control_installed() && matches!(id, SignalTimerId::Alarm(_)) {
             if let Err(failure) = self.publish_real_expiry(id.process(), deadline) {
@@ -688,7 +689,7 @@ impl Scheduler {
                     self.fire_alarm(parent, target, signal);
                 }
             }
-        } else {
+        } else if !self.divert_in_guest_fatal_alarm(deadline, id, tid, signal, observed_now) {
             self.fire_alarm(id.process(), tid, signal);
         }
     }

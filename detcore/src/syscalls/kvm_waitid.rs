@@ -277,6 +277,9 @@ where
     T: RecordOrReplay,
 {
     match status {
+        ResumeStatus::InGuestFatalAlarm => {
+            Err(failure("in-guest sleep response reached KVM waitid"))
+        }
         ResumeStatus::Normal => Ok(None),
         // The capable resource protocol has already selected a real caught
         // signal. Its returning gate protects copyout through frame delivery.

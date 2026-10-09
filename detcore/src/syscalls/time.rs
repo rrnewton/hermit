@@ -701,6 +701,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Helper function to wait a given period, which may either succeed or be interrupted by a signal.
     /// Return 0 or EINTR respectively.
     async fn wait_and_return<R: Guest<Self>>(
+        &self,
         guest: &mut R,
         mut request: Resources,
         call: NanosleepFamily,
@@ -719,6 +720,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             {
                 break;
             }
+            request.in_guest_sleep_sigalrm = self.in_guest_sleep_sigalrm_snapshot(guest).await;
             match crate::tool_global::parked_wait_request(
                 guest,
                 request.clone(),
@@ -728,6 +730,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await
             {
+                ResumeStatus::InGuestFatalAlarm => {
+                    // The default action terminates the guest. In particular,
+                    // do not observe time or write `rem` after this fatal wake.
+                    self.stage_in_guest_fatal_alarm(guest).await;
+                    return Err(Errno::EINTR.into());
+                }
                 ResumeStatus::Normal => return Ok(0),
                 ResumeStatus::Signaled(signals) => {
                     match super::signal::sleep_signal(guest, SleepCheck::AfterWake(signals), false)
@@ -810,7 +818,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         "nanosleep adding delta {:?} to yield request {:?}",
                         time, &request
                     );
-                    Self::wait_and_return(guest, request, call).await
+                    self.wait_and_return(guest, request, call).await
                 } else {
                     trace!("Not sequentializing threads, letting nanosleep through...");
                     Ok(guest.inject(Syscall::from(call)).await?)
@@ -826,14 +834,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                             "nanosleep setting absolute time {:?} to yield request {:?}",
                             target_time, &request
                         );
-                        Self::wait_and_return(guest, request, call).await
+                        self.wait_and_return(guest, request, call).await
                     } else {
                         // TODO T124594597: Record-replay case here, need better ideas to enable proper handling of this case.
                         error!(
                             "Sequentializing but not virtualizing, so can't rely on passed abs time, especially when replaying a recording, just yelding"
                         );
                         let request = Self::yield_request(guest);
-                        Self::wait_and_return(guest, request, call).await
+                        self.wait_and_return(guest, request, call).await
                     }
                 } else if self.cfg.virtualize_time {
                     trace!(
