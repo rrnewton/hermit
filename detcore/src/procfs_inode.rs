@@ -72,10 +72,7 @@ use std::ffi::CStr;
 use std::ffi::CString;
 use std::ffi::OsStr;
 use std::ffi::OsString;
-use std::fs::File;
 use std::io;
-use std::io::Read;
-use std::os::fd::IntoRawFd;
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
@@ -92,6 +89,8 @@ use reverie::BackendCapabilities;
 use reverie::syscalls::Errno;
 use serde::Deserialize;
 use serde::Serialize;
+
+use crate::util::describe_io_error;
 
 /// The inode number of every procfs root (`PROC_ROOT_INO` in Linux).
 pub(crate) const PROC_ROOT_INO: u64 = 1;
@@ -291,6 +290,12 @@ pub(crate) fn procfs_mounts(
     Ok(Some(mounts))
 }
 
+/// How many times Detcore makes a call of its own to read the guest's mount
+/// table that was interrupted (`EINTR`) before it gives up. Under SaBRe the
+/// call runs in the guest's process, under the guest's seccomp filters, and
+/// a filter can return `EINTR` every time without running it.
+const INTERRUPTED_ATTEMPTS: usize = 8;
+
 /// The contents of the file at `path`, read through a descriptor that must
 /// close. Under SaBRe, Detcore runs in the guest's process, so its
 /// descriptors are in the guest's descriptor table. A `close` that a seccomp
@@ -298,19 +303,69 @@ pub(crate) fn procfs_mounts(
 /// and its later descriptors get other numbers, and `File` ignores that
 /// error when it drops. So a failed close is an error, as it is for the
 /// descriptors Detcore opens in the guest to name a path.
+///
+/// The open and each read are tried again when interrupted, but only as
+/// [`retrying_interrupted`] allows, where `File::open` and `read_to_end`
+/// would try again without end. The close is not: Linux releases the
+/// descriptor before anything that can interrupt it.
 fn read_checking_close(path: &str) -> io::Result<Vec<u8>> {
-    let mut file = File::open(path)?;
-    let mut contents = Vec::new();
-    let read = file.read_to_end(&mut contents);
-    let fd = file.into_raw_fd();
-    // SAFETY: `fd` is the descriptor `file` owned, and nothing else uses it.
+    let c_path = c_path(Path::new(path))?;
+    let fd = retrying_interrupted("open", path, || {
+        // SAFETY: `c_path` is NUL-terminated.
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(fd)
+        }
+    })?;
+    let read = read_to_end(fd, path);
+    // SAFETY: `fd` is the descriptor open returned, and nothing else uses it.
     if unsafe { libc::close(fd) } != 0 {
         return Err(io::Error::other(format!(
             "cannot close descriptor {fd} of {path}: {}",
-            io::Error::last_os_error()
+            describe_io_error(&io::Error::last_os_error())
         )));
     }
-    read.map(|_| contents)
+    read
+}
+
+/// Everything left to read from the descriptor `fd` of `path`, one `read` at
+/// a time, each tried again when interrupted only as [`retrying_interrupted`]
+/// allows.
+fn read_to_end(fd: RawFd, path: &str) -> io::Result<Vec<u8>> {
+    let mut contents = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let count = retrying_interrupted("read", path, || {
+            // SAFETY: `chunk` is writable for its whole length.
+            let count = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+            usize::try_from(count).map_err(|_| io::Error::last_os_error())
+        })?;
+        if count == 0 {
+            return Ok(contents);
+        }
+        contents.extend_from_slice(&chunk[..count]);
+    }
+}
+
+/// The result of `call`, the `name` call on `path`, which is made again
+/// while it fails with `EINTR`, but at most [`INTERRUPTED_ATTEMPTS`] times.
+/// Running out is an error of another kind, so that no caller tries again.
+fn retrying_interrupted<T>(
+    name: &str,
+    path: &str,
+    mut call: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    for _ in 0..INTERRUPTED_ATTEMPTS {
+        match call() {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            done => return done,
+        }
+    }
+    Err(io::Error::other(format!(
+        "the {name} of {path} was interrupted in each of {INTERRUPTED_ATTEMPTS} attempts"
+    )))
 }
 
 /// The procfs mounts of `device` a `mountinfo` table lists: lines whose third
@@ -403,8 +458,9 @@ pub(crate) fn path_within(
             canonical.display()
         )),
         Err(error) => Err(format!(
-            "{} was reached through mount {mount_id}, and the guest's mount table cannot be read again: {error}",
-            canonical.display()
+            "{} was reached through mount {mount_id}, and the guest's mount table cannot be read again: {}",
+            canonical.display(),
+            describe_io_error(&error)
         )),
     }
 }
@@ -444,7 +500,8 @@ fn within_table(
         }
         Err(error) => {
             return Err(format!(
-                "{reached}, and cannot tell whether {point}, where the guest's mount table lists it, holds it: {error}"
+                "{reached}, and cannot tell whether {point}, where the guest's mount table lists it, holds it: {}",
+                describe_io_error(&error)
             ));
         }
     }
@@ -468,8 +525,13 @@ fn within_table(
 pub(crate) fn inspect_link(link: &Path, device: u64, inode: u64) -> Result<(PathBuf, u64), String> {
     let mount_id = check_link_object(link, device, inode)?
         .ok_or_else(|| format!("the kernel does not report the mount of {}", link.display()))?;
-    let canonical = std::fs::read_link(link)
-        .map_err(|error| format!("cannot read the link {}: {error}", link.display()))?;
+    let canonical = std::fs::read_link(link).map_err(|error| {
+        format!(
+            "cannot read the link {}: {}",
+            link.display(),
+            describe_io_error(&error)
+        )
+    })?;
     Ok((refuse_deleted(link, canonical)?, mount_id))
 }
 
@@ -500,7 +562,7 @@ pub(crate) fn is_on_procfs(link: &Path, device: u64, inode: u64) -> Result<bool,
         return Err(format!(
             "cannot statfs {}: {}",
             link.display(),
-            io::Error::last_os_error()
+            describe_io_error(&io::Error::last_os_error())
         ));
     }
     // SAFETY: statfs succeeded, so it filled `buf`.
@@ -511,8 +573,13 @@ pub(crate) fn is_on_procfs(link: &Path, device: u64, inode: u64) -> Result<bool,
 /// returns the ID of the mount the object was reached through, when the
 /// kernel reports one.
 fn check_link_object(link: &Path, device: u64, inode: u64) -> Result<Option<u64>, String> {
-    let found =
-        identify(link, true).map_err(|error| format!("cannot stat {}: {error}", link.display()))?;
+    let found = identify(link, true).map_err(|error| {
+        format!(
+            "cannot stat {}: {}",
+            link.display(),
+            describe_io_error(&error)
+        )
+    })?;
     if found.device != device || found.inode != inode {
         return Err(format!(
             "{} is not the object the guest saw",
@@ -619,7 +686,7 @@ pub(crate) fn mount_root(path: &Path) -> io::Result<Option<u64>> {
     if unsafe { libc::close(fd) } != 0 {
         return Err(io::Error::other(format!(
             "cannot close descriptor {fd}: {}",
-            io::Error::last_os_error()
+            describe_io_error(&io::Error::last_os_error())
         )));
     }
     let found = found?;
@@ -776,11 +843,11 @@ mod tests {
         assert_eq!(nix::errno::Errno::last_raw(), SENTINEL);
     }
 
-    /// Make every `close` of the calling thread fail with `EPERM` without
-    /// running, as a seccomp filter can. The filter binds this thread and
-    /// what it starts afterwards, and no other thread.
+    /// Make every call of the calling thread to one of `syscalls` fail with
+    /// `errno` without running, as a seccomp filter can. The filter binds this
+    /// thread and what it starts afterwards, and no other thread.
     #[cfg(target_arch = "x86_64")]
-    fn refuse_close_in_this_thread() {
+    fn deny_in_this_thread(syscalls: &[i64], errno: i32) {
         const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
         let load = |offset: u32| libc::sock_filter {
             code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
@@ -800,16 +867,20 @@ mod tests {
             jf: 0,
             k: action,
         };
-        // seccomp_data: nr at 0, arch at 4.
-        let mut program = [
+        // seccomp_data: nr at 0, arch at 4. Each match jumps over the
+        // matches after it and the allow, to the denial.
+        let mut program = vec![
             load(4),
             jump_if(AUDIT_ARCH_X86_64, 1, 0),
             ret(libc::SECCOMP_RET_ALLOW),
             load(0),
-            jump_if(libc::SYS_close as u32, 0, 1),
-            ret(libc::SECCOMP_RET_ERRNO | libc::EPERM as u32),
-            ret(libc::SECCOMP_RET_ALLOW),
         ];
+        for (index, syscall) in syscalls.iter().enumerate() {
+            let over = u8::try_from(syscalls.len() - index).unwrap();
+            program.push(jump_if(u32::try_from(*syscall).unwrap(), over, 0));
+        }
+        program.push(ret(libc::SECCOMP_RET_ALLOW));
+        program.push(ret(libc::SECCOMP_RET_ERRNO | errno as u32));
         let fprog = libc::sock_fprog {
             len: program.len() as u16,
             filter: program.as_mut_ptr(),
@@ -829,34 +900,111 @@ mod tests {
         assert_eq!(installed, 0, "seccomp: {}", io::Error::last_os_error());
     }
 
+    /// The error of a read of this thread's mount table, for the device of
+    /// `/`, with `syscalls` denied as [`deny_in_this_thread`] denies them.
+    #[cfg(target_arch = "x86_64")]
+    fn mount_table_error_with_denied(syscalls: &'static [i64], errno: i32) -> String {
+        let root = std::fs::metadata("/").unwrap().dev();
+        std::thread::spawn(move || {
+            deny_in_this_thread(syscalls, errno);
+            let tid = unsafe { libc::gettid() };
+            let error = procfs_mounts(tid, root, false).unwrap_err();
+            format!("{tid} {}", describe_io_error(&error))
+        })
+        .join()
+        .unwrap()
+    }
+
     /// Under SaBRe, Detcore reads a guest's mount table through a descriptor
     /// in the guest's own descriptor table. It reads the table again for any
     /// device it has not found to be procfs, such as that of `/`, and when a
     /// filter refuses that descriptor's close, the read is an error, which
     /// records a determinism loss. The descriptor is still open, as the
-    /// guest would see it.
+    /// guest would see it. The error names the errno without the C library's
+    /// message, which can allocate on the guest's heap (see
+    /// [`describe_io_error`]).
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_mount_table_read_whose_close_is_refused_is_an_error() {
-        let root = std::fs::metadata("/").unwrap().dev();
-        let error = std::thread::spawn(move || {
-            refuse_close_in_this_thread();
-            let tid = unsafe { libc::gettid() };
-            procfs_mounts(tid, root, false).unwrap_err().to_string()
-        })
-        .join()
-        .unwrap();
+        let error = mount_table_error_with_denied(&[libc::SYS_close], libc::EPERM);
+        let (_, error) = error.split_once(' ').unwrap();
         let fd: i32 = error
             .strip_prefix("cannot close descriptor ")
             .and_then(|rest| rest.split_once(' '))
             .and_then(|(fd, _)| fd.parse().ok())
             .unwrap_or_else(|| panic!("not a refused close: {error}"));
-        assert!(
-            error.ends_with("Operation not permitted (os error 1)"),
-            "{error}"
-        );
+        assert!(error.ends_with(": PermissionDenied (errno 1)"), "{error}");
         assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0, "{error}");
         assert_eq!(unsafe { libc::close(fd) }, 0);
+    }
+
+    /// A filter that interrupts every read of the mount table ends the read
+    /// with an error after a bounded number of attempts, which records a
+    /// determinism loss, where `read_to_end` would try again without end.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_mount_table_read_that_is_always_interrupted_is_an_error() {
+        let error = mount_table_error_with_denied(&[libc::SYS_read], libc::EINTR);
+        let (tid, error) = error.split_once(' ').unwrap();
+        assert_eq!(
+            error,
+            format!(
+                "the read of /proc/{tid}/mountinfo was interrupted in each of {INTERRUPTED_ATTEMPTS} attempts"
+            )
+        );
+    }
+
+    /// The same for a filter that interrupts every open of the mount table,
+    /// where `File::open` would try again without end.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_mount_table_open_that_is_always_interrupted_is_an_error() {
+        let error = mount_table_error_with_denied(&[libc::SYS_open, libc::SYS_openat], libc::EINTR);
+        let (tid, error) = error.split_once(' ').unwrap();
+        assert_eq!(
+            error,
+            format!(
+                "the open of /proc/{tid}/mountinfo was interrupted in each of {INTERRUPTED_ATTEMPTS} attempts"
+            )
+        );
+    }
+
+    /// An interrupted call is made again, up to [`INTERRUPTED_ATTEMPTS`]
+    /// times in all; any other result ends the attempts.
+    #[test]
+    fn an_interrupted_call_is_made_again_a_bounded_number_of_times() {
+        let interrupted = || io::Error::from_raw_os_error(libc::EINTR);
+        let mut calls = 0;
+        let error = retrying_interrupted("read", "/x", || -> io::Result<()> {
+            calls += 1;
+            Err(interrupted())
+        })
+        .unwrap_err();
+        assert_eq!(calls, INTERRUPTED_ATTEMPTS);
+        assert_ne!(error.kind(), io::ErrorKind::Interrupted);
+        let mut calls = 0;
+        let read = retrying_interrupted("read", "/x", || {
+            calls += 1;
+            if calls < 3 { Err(interrupted()) } else { Ok(7) }
+        });
+        assert_eq!((read.unwrap(), calls), (7, 3));
+        let mut calls = 0;
+        let error = retrying_interrupted("open", "/x", || -> io::Result<()> {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(libc::EACCES))
+        })
+        .unwrap_err();
+        assert_eq!((error.raw_os_error(), calls), (Some(libc::EACCES), 1));
+    }
+
+    /// The whole of a file longer than one read is read.
+    #[test]
+    fn a_file_longer_than_one_read_is_read_whole() {
+        let path = std::env::current_exe().unwrap();
+        let path = path.to_str().unwrap();
+        let expected = std::fs::read(path).unwrap();
+        assert!(expected.len() > 2 * 4096, "too short to need several reads");
+        assert!(read_checking_close(path).unwrap() == expected);
     }
 
     const PROC_DEVICE: u64 = libc::makedev(0, 23);
