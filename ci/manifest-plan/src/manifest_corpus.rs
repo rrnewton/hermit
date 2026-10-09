@@ -1340,16 +1340,17 @@ mod tests {
         );
     }
 
-    /// compat.yaml's replay cells keep the retired rr lane's 139 programs (the
-    /// count its RR_COMPAT_EXPECTED guard held before ci/compat/corpus-rr.json
-    /// was retired), each the replay cell of its row's own test, carrying the
-    /// rr run type alone and none of the verify cell's settings, and select
-    /// all 139: make and node, unselected until the rejoin log of
-    /// https://github.com/rrnewton/hermit/pull/3908 fixed their replay
-    /// (https://github.com/rrnewton/hermit/issues/3934), record and replay too.
+    /// compat.yaml's replay cells cover every row but the lua, perl and df
+    /// `-direct` twins: the retired rr lane's 139 programs (the count its
+    /// RR_COMPAT_EXPECTED guard held before ci/compat/corpus-rr.json was
+    /// retired) and, since a three-run survey on 2026-10-09, the 77 rows the rr
+    /// lane never listed as passing. Each is the replay cell of its row's own
+    /// test, carrying the rr run type alone and none of the verify cell's
+    /// settings. 212 are selected, and the 4 the survey saw fail stay enabled
+    /// with `ci: false` and the issue of their failure (`UNSELECTED_REPLAY`).
     /// A row moved into or out of the run type, a second test for a program,
-    /// the rr run type reaching a verify cell, or a cell quietly unselected,
-    /// fails here.
+    /// the rr run type reaching a verify cell, or a cell quietly unselected or
+    /// reselected, fails here.
     #[test]
     fn the_replay_cells_keep_the_rr_lane_programs_and_gate_only_those_that_replay() {
         let expanded = expand_corpus(serde_yaml::from_str(COMPAT_YAML).unwrap()).unwrap();
@@ -1382,11 +1383,39 @@ mod tests {
             }
             match &replay["ci"] {
                 Value::Bool(true) => gated += 1,
-                _ => refused += 1,
+                ci => {
+                    assert_eq!(ci["ptrace"], Value::Bool(false), "{id}");
+                    let evidence = replay["ci_disabled_reason"]["ptrace"]["evidence"].as_str();
+                    assert!(
+                        UNSELECTED_REPLAY.contains(&(id, evidence.unwrap_or_default())),
+                        "{id}: {evidence:?}"
+                    );
+                    refused += 1;
+                }
             }
         }
-        assert_eq!((gated, refused), (139, 0));
+        assert_eq!((gated, refused), (212, UNSELECTED_REPLAY.len()));
     }
+
+    /// The replay cells the 2026-10-09 survey saw fail, each with its issue.
+    const UNSELECTED_REPLAY: [(&str, &str); 4] = [
+        (
+            "compat/timeout",
+            "https://github.com/rrnewton/hermit/issues/3963",
+        ),
+        (
+            "compat/flex",
+            "https://github.com/rrnewton/hermit/issues/3964",
+        ),
+        (
+            "compat/netlink-sock-diag",
+            "https://github.com/rrnewton/hermit/issues/3965",
+        ),
+        (
+            "compat/lsof",
+            "https://github.com/rrnewton/hermit/issues/3966",
+        ),
+    ];
 
     #[test]
     fn a_corpus_row_expands_into_one_verify_cell_with_the_lane_settings() {

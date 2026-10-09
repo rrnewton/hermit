@@ -1579,9 +1579,12 @@ corpus:
   # validation nodes running the argv of ci/compat/corpus-rr.json, whose rows
   # are this corpus's rows of the same labels (the -direct rows for lua, perl
   # and df); that file and the label list went with them. Until 2026-10-04
-  # each was a separate compat/rr-<row> test. Like the rr lane's command, the
-  # replay cell runs without the verify settings above: no Hermit flags,
-  # comparator or TMPDIR, and one attempt.
+  # each was a separate compat/rr-<row> test. Since 2026-10-09 it also covers
+  # every other row except the -direct twins below: of the 77 rows the rr
+  # lane never listed as passing, 73 replayed at canonical bitwise parity in
+  # three survey runs and joined, and 4 stay unselected under their issues.
+  # Like the rr lane's command, the replay cell runs without the verify
+  # settings above: no Hermit flags, comparator or TMPDIR, and one attempt.
   replay:
     label: rr-compat-only
     timeout_seconds: 60
@@ -1595,50 +1598,38 @@ corpus:
       wall seconds together through the retired command
     except:
       - reason: >-
-          Not in the rr lane's corpus (ci/compat/corpus-rr.json until
-          2026-10-02), so the rr lane never ran it
-        rows:
-          [
-            xmllint, shell-build, clang, gzip-roundtrip, bzip2-roundtrip,
-            xz-roundtrip, zstd-roundtrip, tar-roundtrip, cpio-roundtrip,
-            wget-localhost, curl-localhost, ip, ss, netlink-route,
-            netlink-sock-diag, lscpu, lsof, time, javac, timeout, truncate,
-            fallocate, setfattr, setfacl, mountpoint, diff3, basenc,
-            dos2unix, envsubst, col, colrm, crc32, uuidgen, shred, sync,
-            pathchk, namei, getconf, cscope, flex, msgfmt, msgunfmt
-          ]
-      - reason: >-
           The rr corpus ran these programs with the argv of the -direct
           row of the same name, which this run type runs instead
         rows: [lua, perl, df]
-      - reason: >-
-          In the rr lane's corpus but not in its measured passing set
-          (RR_COMPAT_PASSING_LABELS), so the rr lane generated no node for
-          it
-        rows:
-          [
-            jq, cargo, curl, cmake, pkg-config, m4, zip-unzip, mktemp,
-            iostat, vmstat-disk, pidstat-disk, findmnt, sysctl-random-uuid,
-            sar-resource-tables, lsirq, mpstat-softirqs, lsmod, numastat,
-            numactl-hardware, ps, vmstat, top, kill, pgrep, pkill, patch,
-            chown, ln, csplit, rustc
-          ]
-      - reason: >-
-          Measured to fail record/replay (RR_COMPAT_KNOWN_FAILURES in
-          validate.sh): replay of thread 13 diverges near event 132, where
-          the header lookup is a readlink in one run and a newfstatat of
-          the precompiled .gch in the other
-        rows: [g++]
-      - reason: >-
-          Measured to fail record/replay (RR_COMPAT_KNOWN_FAILURES in
-          validate.sh): replay of thread 11 diverges near event 3, in the
-          execveat of the rm -rf teardown
-        rows: [ar]
-      - reason: >-
-          Measured to fail record/replay (RR_COMPAT_KNOWN_FAILURES in
-          validate.sh): replay diverges at replayer/mod.rs:776 after a
-          clean record
-        rows: [strip, gprof, gcov]
+    # Measured on 2026-10-09 by three --rr-compat-only runs of a survey
+    # commit that gave the 77 rows excluded above replay cells: 73 recorded and
+    # replayed at canonical bitwise parity in 3 of 3 runs and joined the run
+    # type; these 4 did not.
+    unselected:
+      - result: crash-error
+        evidence: https://github.com/rrnewton/hermit/issues/3963
+        reason: >-
+          Record stops on a false rt_sigsuspend deadlock report while the
+          thread's SIGCHLD is ready, in 2 of 3 runs
+        rows: [timeout]
+      - result: timeout
+        evidence: https://github.com/rrnewton/hermit/issues/3964
+        reason: >-
+          The recording completes but its replay makes no progress until the
+          60-second backstop, in 3 of 3 runs
+        rows: [flex]
+      - result: crash-error
+        evidence: https://github.com/rrnewton/hermit/issues/3965
+        reason: >-
+          Record delivers NETLINK_SOCK_DIAG socket inodes unzeroed, so the
+          row's own check fails in record and in its matching replay
+        rows: [netlink-sock-diag]
+      - result: replay-failure
+        evidence: https://github.com/rrnewton/hermit/issues/3966
+        reason: >-
+          Replay reads a different 11-byte readlink target than the recording
+          at scheduler turn 112, in 3 of 3 runs
+        rows: [lsof]
   # The strict run type (scripts/validate.rs --strict-compat-only): every row
   # of ci/compat/corpus-strict.json once more on ptrace, under --strict and
   # Hermit's strict --verify with none of the corpus's relaxations, so

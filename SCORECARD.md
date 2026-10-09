@@ -2,20 +2,20 @@
 
 This table is derived from the manifest, not from a separately maintained parent-workspace CSV. `./ci/compat-envelope/scorecard.rs check` verifies it.
 
-The count table includes all **14972** cells in the manifest; no row is omitted. A cell is **Selected by full** exactly when it appears in `ci/expected-e2e-plan.json`. A cell is **Not selected by full** when it is in the manifest but absent from that plan. Selection is not a test result: a cell not selected by full may have passed, failed, produced no verdict, or never run. Of these cells, **1972** are selected by full, **698** are not selected by full, and **12302** are **Not applicable**.
+The count table includes all **14972** cells in the manifest; no row is omitted. A cell is **Selected by full** exactly when it appears in `ci/expected-e2e-plan.json`. A cell is **Not selected by full** when it is in the manifest but absent from that plan. Selection is not a test result: a cell not selected by full may have passed, failed, produced no verdict, or never run. Of these cells, **1972** are selected by full, **775** are not selected by full, and **12225** are **Not applicable**.
 
 Every selected `verify` cell that does not declare the stripped comparator, and every seed in a selected `chaos` cell, runs the same backend twice. The manifest runner adds `--verify-strict` when the selected Hermit binary supports it, and accepts a result only when the typed report says `verified=true`, `verdict=matched`, `bitwise_parity=true`, `strictness=canonical`, `compare_logs=true`, a named canonical `record_envelope`, and both INFO-message counts are nonzero. Bare `--verify` remains a Stripped comparison when invoked directly and does not satisfy this regression plan. None of the **1962** selected `verify` cells declares the stripped comparator. These same-backend results do not establish cross-backend parity.
 
 | Backend | Selected by full | Not selected by full | Not applicable | In the manifest |
 | --- | ---: | ---: | ---: | ---: |
-| `ptrace` | 563 | 372 | 1429 | 2364 |
+| `ptrace` | 563 | 449 | 1352 | 2364 |
 | `dbt` | 205 | 47 | 2112 | 2364 |
 | `kvm` | 330 | 7 | 2027 | 2364 |
 | `sabre` | 240 | 239 | 1885 | 2364 |
 | `liteinst` | 317 | 0 | 2047 | 2364 |
 | `in-guest-trap` | 317 | 0 | 2047 | 2364 |
 | `native` | 0 | 33 | 755 | 788 |
-| **Total** | **1972** | **698** | **12302** | **14972** |
+| **Total** | **1972** | **775** | **12225** | **14972** |
 
 ## Denominator, and why the percentage is not comparable across changes to it
 
@@ -24,7 +24,7 @@ Selected by full is **1972 of 14972**, which is **13.17%** — over THIS populat
 - backends: `ptrace`, `dbt`, `kvm`, `sabre`, `liteinst`, `in-guest-trap`, `native`
 - modes: `chaos`, `naked`, `replay`, `verify`
 
-⚠️ **12302 of those 14972 cells are NOT APPLICABLE** — their backend is not applicable for their mode, so they were never asked to run and cannot pass or fail. Over the 2670 cells that CAN run, selected by full is **73.86%**.
+⚠️ **12225 of those 14972 cells are NOT APPLICABLE** — their backend is not applicable for their mode, so they were never asked to run and cannot pass or fail. Over the 2747 cells that CAN run, selected by full is **71.79%**.
 
 ⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same 1972 cells selected by full measured against a smaller denominator. Nothing was fixed to produce it; it is what the first figure always meant once the cells that cannot run are excluded. Quote both or neither, and never compare one against the other as though something moved.
 
@@ -35,10 +35,10 @@ The mode view makes the current order of work explicit: expand `verify` first, t
 | Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `in-guest-trap` | `native` | Selected by full | Not selected by full | Not applicable | In the manifest |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `verify` | 553 / 788 | 205 / 788 | 330 / 788 | 240 / 788 | 317 / 788 | 317 / 788 | — | 1962 | 525 | 2241 | 4728 |
-| `replay` | 4 / 788 | 0 / 788 | 0 / 788 | 0 / 788 | 0 / 788 | 0 / 788 | — | 4 | 139 | 4585 | 4728 |
+| `replay` | 4 / 788 | 0 / 788 | 0 / 788 | 0 / 788 | 0 / 788 | 0 / 788 | — | 4 | 216 | 4508 | 4728 |
 | `chaos` | 6 / 788 | 0 / 788 | 0 / 788 | 0 / 788 | 0 / 788 | 0 / 788 | — | 6 | 1 | 4721 | 4728 |
 | `naked` | — | — | — | — | — | — | 0 / 788 | 0 | 33 | 755 | 788 |
-| **Total** | | | | | | | | **1972** | **698** | **12302** | **14972** |
+| **Total** | | | | | | | | **1972** | **775** | **12225** | **14972** |
 
 ## Ptrace by manifest category
 
