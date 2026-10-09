@@ -56,6 +56,10 @@ use crate::fd::*;
 use crate::procfs::MountInfoSnapshot;
 use crate::procfs::ProcfsFile;
 use crate::procfs::ProcfsSnapshotContext;
+use crate::procfs_inode;
+use crate::procfs_inode::DirectoryInodes;
+use crate::procfs_inode::ProcfsDirectory;
+use crate::procfs_inode::ProcfsLookup;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Device;
 use crate::resources::HOST_TIMED_INTERNAL_PIPE_IO_FYI;
@@ -936,6 +940,48 @@ fn stdio_inode_override<T: RecordOrReplay, G: Guest<Detcore<T>>>(
         })
         .ok()
         .flatten()
+}
+
+/// The file a stat call describes, as Detcore finds it again to learn the
+/// canonical path of a procfs file (see [`procfs_inode`]).
+#[derive(Clone, Copy)]
+enum StatTarget<'a> {
+    /// The file open as this descriptor.
+    Descriptor(RawFd),
+    /// The file `path` names relative to `dirfd`, or the symbolic link itself
+    /// when `follow` is false.
+    Path {
+        dirfd: i32,
+        path: Option<PathPtr<'a>>,
+        follow: bool,
+    },
+}
+
+impl<'a> StatTarget<'a> {
+    /// The target of an `fstatat` or `statx` call with these operands.
+    fn at<M: MemoryAccess>(
+        memory: &M,
+        dirfd: i32,
+        path: Option<PathPtr<'a>>,
+        flags: AtFlags,
+    ) -> Self {
+        match empty_path_fd(memory, dirfd, path, flags) {
+            Some(fd) => StatTarget::Descriptor(fd),
+            None => StatTarget::Path {
+                dirfd,
+                path,
+                follow: !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW),
+            },
+        }
+    }
+
+    /// The descriptor the call describes itself, if it names no path.
+    fn descriptor(&self) -> Option<RawFd> {
+        match self {
+            StatTarget::Descriptor(fd) => Some(*fd),
+            StatTarget::Path { .. } => None,
+        }
+    }
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
@@ -1845,7 +1891,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                 if let Some(stat) = &host_stat
                     && (stat.st_nlink > 0 || call.flags().contains(OFlag::O_TMPFILE))
                 {
-                    forget_retired_inode(guest, RawInode::new(stat.st_dev, stat.st_ino)).await;
+                    // A procfs entry the host rebuilt keeps its number when it is
+                    // next written or read through this descriptor.
+                    let procfs_path = Self::procfs_path_key(
+                        guest,
+                        &DetStat::from(stat),
+                        StatTarget::Descriptor(fd),
+                    );
+                    forget_retired_inode(
+                        guest,
+                        RawInode::new(stat.st_dev, stat.st_ino),
+                        procfs_path,
+                    )
+                    .await;
                 }
                 // A descriptor that writes process memory can rewrite the
                 // untraced code (see `record_untraced_code_change`). Reported
@@ -2506,16 +2564,26 @@ impl<T: RecordOrReplay> Detcore<T> {
                         deterministic_stdio_inode_for_resource(target_fd, detfd.resource()),
                     )
                 })?;
-            let raw_inode = match cached_stat {
-                Some(stat) => stat.raw_inode(),
-                None => {
-                    let stat = self.inject_fstat(guest, target_fd).await?;
-                    RawInode::new(stat.st_dev, stat.st_ino)
-                }
+            let stat = match cached_stat {
+                Some(stat) => stat,
+                None => DetStat::from(self.inject_fstat(guest, target_fd).await?),
             };
+            // Keyed as `fstat` keys the descriptor, so the two numbers agree.
             let virtual_inode = match inode_override {
                 Some(inode) => inode,
-                None => determinize_inode(guest, raw_inode).await.0,
+                None => {
+                    let procfs_path =
+                        Self::procfs_path_key(guest, &stat, StatTarget::Descriptor(target_fd));
+                    determinize_inode_observing_mtime(
+                        guest,
+                        stat.raw_inode(),
+                        procfs_path,
+                        ObservedMtime::Unobserved,
+                        InodeSighting::Descriptor,
+                    )
+                    .await
+                    .0
+                }
             };
             let raw_mount_id =
                 detcore_model::procfs::parse_fdinfo_mount_id(&contents).ok_or_else(|| {
@@ -4105,6 +4173,53 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(result)
     }
 
+    /// The canonical path of the procfs entry `stat` describes, which the
+    /// guest named as `target`, when its device is a procfs mount in the
+    /// guest's mount table and the tracer finds the entry again (see
+    /// [`procfs_inode`]). Never under record and replay, which reproduces the
+    /// recorded host numbers instead: Replayer's descriptor is a placeholder,
+    /// and its guest has no `/proc`.
+    fn procfs_path<G: Guest<Self>>(
+        guest: &G,
+        stat: &DetStat,
+        target: StatTarget<'_>,
+    ) -> Option<PathBuf> {
+        let tid = guest.tid().as_raw();
+        if guest.config().recordreplay_modes
+            || !procfs_inode::may_be_procfs(stat.dev, stat.blksize)
+            || !procfs_inode::is_procfs_device(tid, stat.dev)
+        {
+            return None;
+        }
+        let path;
+        let lookup = match target {
+            StatTarget::Descriptor(fd) => ProcfsLookup::Descriptor(fd),
+            StatTarget::Path {
+                dirfd,
+                path: guest_path,
+                follow,
+            } => {
+                path = guest_path?.read(&guest.memory()).ok()?;
+                ProcfsLookup::Path {
+                    dirfd,
+                    path: &path,
+                    follow,
+                }
+            }
+        };
+        procfs_inode::find_procfs_path(tid, lookup, stat.dev, stat.inode)
+    }
+
+    /// The path key of the procfs entry `stat` describes (see
+    /// [`Self::procfs_path`]).
+    fn procfs_path_key<G: Guest<Self>>(
+        guest: &G,
+        stat: &DetStat,
+        target: StatTarget<'_>,
+    ) -> Option<RawInode> {
+        Self::procfs_path(guest, stat, target).map(|path| procfs_inode::path_inode(stat.dev, &path))
+    }
+
     // Determinize stat by doing:
     //   - using virtual inode instead of real inodes. The virtual inodes
     //     increase monolitically and won't be re-used (like ext4)
@@ -4120,6 +4235,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         stat: S,
         inode_override: Option<DetInode>,
+        procfs_path: Option<RawInode>,
     ) -> Result<DetStat, Error>
     where
         G: Guest<Self>,
@@ -4158,7 +4274,24 @@ impl<T: RecordOrReplay> Detcore<T> {
                 } else {
                     InodeSighting::Descriptor
                 };
-                determinize_inode_observing_mtime(guest, stat.raw_inode(), observed, sighting).await
+                // A procfs root counts the host's processes as its links.
+                // Report 1, which file systems that do not count a
+                // directory's links report, so that a walker such as `find`
+                // infers nothing from it.
+                if procfs_path.is_some()
+                    && stat.inode == procfs_inode::PROC_ROOT_INO
+                    && stat.mask.contains(StatxMask::STATX_NLINK)
+                {
+                    stat.nlink = 1;
+                }
+                determinize_inode_observing_mtime(
+                    guest,
+                    stat.raw_inode(),
+                    procfs_path,
+                    observed,
+                    sighting,
+                )
+                .await
             }
         };
         stat.inode = d_ino.as_raw(); // Reveal only the deterministic inode.
@@ -4199,18 +4332,36 @@ impl<T: RecordOrReplay> Detcore<T> {
             // filesystem (squashfs_ll).
             guest.inject(Syscall::from(call)).await?;
             let statptr = call.stat().ok_or(Errno::EFAULT)?;
-            let described_fd = match call {
-                StatFamily::Fstat(call) => Some(call.fd()),
+            let target = match &call {
+                StatFamily::Fstat(call) => StatTarget::Descriptor(call.fd()),
                 StatFamily::Fstatat(call) => {
-                    empty_path_fd(&guest.memory(), call.dirfd(), call.path(), call.flags())
+                    StatTarget::at(&guest.memory(), call.dirfd(), call.path(), call.flags())
                 }
                 #[cfg(not(target_arch = "aarch64"))]
-                StatFamily::Stat(_) | StatFamily::Lstat(_) => None,
+                StatFamily::Stat(call) => StatTarget::Path {
+                    dirfd: libc::AT_FDCWD,
+                    path: call.path(),
+                    follow: true,
+                },
+                #[cfg(not(target_arch = "aarch64"))]
+                StatFamily::Lstat(call) => StatTarget::Path {
+                    dirfd: libc::AT_FDCWD,
+                    path: call.path(),
+                    follow: false,
+                },
             };
-            let inode_override = described_fd.and_then(|fd| stdio_inode_override(guest, fd));
+            let inode_override = target
+                .descriptor()
+                .and_then(|fd| stdio_inode_override(guest, fd));
             let mut memory = guest.memory();
-            let stat = memory.read_value(statptr.0)?;
-            let stat = self.determinize_stat(guest, stat, inode_override).await?;
+            let stat: libc::stat = memory.read_value(statptr.0)?;
+            let procfs_path = match inode_override {
+                Some(_) => None,
+                None => Self::procfs_path_key(guest, &DetStat::from(&stat), target),
+            };
+            let stat = self
+                .determinize_stat(guest, stat, inode_override, procfs_path)
+                .await?;
             memory.write_value(statptr.0, &stat.into())?;
             Ok(0)
         } else {
@@ -4230,12 +4381,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             // may cause tracer to hang under certain fuse filesystem (squashfs_ll).
             guest.inject(call).await?;
             let statptr = call.statx().ok_or(Errno::EFAULT)?;
-            let inode_override =
-                empty_path_fd(&guest.memory(), call.dirfd(), call.path(), call.flags())
-                    .and_then(|fd| stdio_inode_override(guest, fd));
+            let target = StatTarget::at(&guest.memory(), call.dirfd(), call.path(), call.flags());
+            let inode_override = target
+                .descriptor()
+                .and_then(|fd| stdio_inode_override(guest, fd));
             let mut memory = guest.memory();
-            let stat = memory.read_value(statptr.0)?;
-            let stat = self.determinize_stat(guest, stat, inode_override).await?;
+            let stat: libc::statx = memory.read_value(statptr.0)?;
+            let procfs_path = match inode_override {
+                Some(_) => None,
+                None => Self::procfs_path_key(guest, &DetStat::from(stat), target),
+            };
+            let stat = self
+                .determinize_stat(guest, stat, inode_override, procfs_path)
+                .await?;
             memory.write_value(statptr.0, &stat.into())?;
             Ok(0)
         } else {
@@ -6349,16 +6507,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         })??;
         let (passed, copied) = match batch {
             Ok(batch) => {
-                let device = self.directory_device(guest, call.fd).await?;
+                let inodes = self.directory_inodes(guest, call.fd).await?;
                 let mut records = Vec::new();
                 let mut names = Vec::with_capacity(batch.len());
                 for (index, entry) in batch.iter().enumerate() {
-                    let (d_ino, _) = determinize_listed_inode(
-                        guest,
-                        RawInode::new(device, entry.ino),
-                        retirements,
-                    )
-                    .await;
+                    let (host, path) = inodes.entry_inode(&entry.name, entry.ino);
+                    let (d_ino, _) = determinize_listed_inode(guest, host, path, retirements).await;
                     let d_off = i64::try_from(start + index as u64 + 1).unwrap_or(i64::MAX);
                     call.format
                         .encode(entry, d_ino.as_raw(), d_off, &mut records);
@@ -6390,24 +6544,29 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(copied.map(|len| len as i64)?)
     }
 
-    /// The host device of the directory open as `fd`, which is the device of
-    /// every inode number its entries carry (a mount point's entry names the
-    /// directory beneath the mount, on the same device). It is the cached
-    /// stat's when Detcore tracks `fd`, and an injected `fstat` otherwise.
-    async fn directory_device<G: Guest<Self>>(
+    /// How to key the inode numbers of the entries of the directory open as
+    /// `fd`. Every entry is on the directory's host device (a mount point's
+    /// entry names the directory beneath the mount, on the same device), and
+    /// a procfs directory's entries also name their paths beneath its
+    /// canonical path (see [`procfs_inode`]). The directory's stat is the
+    /// cached one when Detcore tracks `fd`, and an injected `fstat` otherwise.
+    async fn directory_inodes<G: Guest<Self>>(
         &self,
         guest: &mut G,
         fd: RawFd,
-    ) -> Result<u64, Errno> {
+    ) -> Result<DirectoryInodes, Errno> {
         let cached = guest
             .thread_state()
-            .with_detfd(fd, |detfd| detfd.stat().map(|stat| stat.dev))
+            .with_detfd(fd, |detfd| detfd.stat())
             .ok()
             .flatten();
-        match cached {
-            Some(device) => Ok(device),
-            None => Ok(self.inject_fstat(guest, fd).await?.st_dev),
-        }
+        let stat = match cached {
+            Some(stat) => stat,
+            None => DetStat::from(self.inject_fstat(guest, fd).await?),
+        };
+        let procfs = Self::procfs_path(guest, &stat, StatTarget::Descriptor(fd))
+            .map(|path| ProcfsDirectory::new(path, stat.inode == procfs_inode::PROC_ROOT_INO));
+        Ok(DirectoryInodes::new(stat.dev, procfs))
     }
 
     /// Move the kernel position of the open file behind `fd` to `target`, a
@@ -6447,10 +6606,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let mut entries = read_records(&guest.memory(), call.buf, len, call.format)?;
         sort_dir_entries(&mut entries);
-        let device = self.directory_device(guest, call.fd).await?;
+        let inodes = self.directory_inodes(guest, call.fd).await?;
         let mut records = Vec::with_capacity(len);
         for entry in &entries {
-            let (d_ino, _) = determinize_named_inode(guest, RawInode::new(device, entry.ino)).await;
+            let (host, path) = inodes.entry_inode(&entry.name, entry.ino);
+            let (d_ino, _) = determinize_named_inode(guest, host, path).await;
             call.format
                 .encode(entry, d_ino.as_raw(), entry.off, &mut records);
         }
