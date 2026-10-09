@@ -1731,7 +1731,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // procfs::tests::{cgroups_hides_the_host_cgroup_counts,
     // cgroups_leaves_unknown_formats_untouched} (lane qemu-rcb,
     // https://github.com/rrnewton/hermit/issues/3987) retain all 1273: 1275.
-    ("test.detcore_unit", 1275),
+    // a_killed_vfork_parent_takes_its_barrier_with_it,
+    // a_killed_vfork_parent_with_an_unregistered_child_leaves_a_tombstone,
+    // a_killed_vfork_parents_barrier_lasts_until_its_childs_release_edge,
+    // a_vfork_childs_exit_grant_releases_its_dead_parents_barrier and
+    // a_new_vfork_by_a_reused_tid_clears_a_stale_tombstone
+    // (https://github.com/rrnewton/hermit/issues/3984) retain all 1275: 1280.
+    ("test.detcore_unit", 1280),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2249,7 +2255,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The scalar SIGALRM lifecycle and admission-control regressions retain
     // all 258: 260, measured with this node's Nextest listing. Both require
     // CPUID faulting and join only the hosted exact-name exclusions.
-    ("test.cli", 260),
+    // a_killed_vfork_parent_does_not_stop_the_schedule
+    // (https://github.com/rrnewton/hermit/issues/3984) retains all 260: 261.
+    ("test.cli", 261),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2454,7 +2462,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two DBT guest-environment tests: 198 + 2 = 200 (listed).
     // The three self-signal-death tests start in-guest LiteInst guests, so they
     // join the exact-name filterset: 200 + 3 - 3 = 200.
-    ("test.cli_on_host", 200),
+    // And the killed-vfork-parent CLI test: 201.
+    ("test.cli_on_host", 201),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 55),
@@ -2574,7 +2583,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the eleven poll-deadline tests: 1261.
     // And the same eleven pause/nanosleep cross-task wake tests: 1241.
     // And the two /proc/cgroups tests: 1275.
-    ("test.detcore_unit_on_host", 1275),
+    // And the five vfork-parent barrier tests: 1280.
+    ("test.detcore_unit_on_host", 1280),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
