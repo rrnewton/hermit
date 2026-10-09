@@ -1339,8 +1339,15 @@ fi
 # effective-job-second threshold and the 16-job clamp. This local sample does
 # not replace the original n=3 hosted calibration or satisfy the >=5-sample
 # replacement rule; fresh validation is required.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 54adc5eebf40c8f407399b02dcd9ca1f62b7f157 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 54adc5eebf40c8f407399b02dcd9ca1f62b7f157 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# BOUND TO 634e7e1b8ddeac66968b731522fc155f1c93fedd (2026-10-09): from
+# 54adc5eebf40c8f407399b02dcd9ca1f62b7f157. Its two commits (26a4c2a3 and 634e7e1b,
+# "In-guest runtime: run the exit callbacks of a process that signals itself
+# to death" and its review fixes) change only reverie-inguest and
+# reverie-liteinst: `git diff 54adc5ee 634e7e1b -- reverie-dbt third-party
+# Cargo.toml rust-toolchain.toml` is empty, so the seven recorded inputs, and
+# with them the DynamoRIO SDK recipe key, are those bound at 54adc5ee above.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 634e7e1b8ddeac66968b731522fc155f1c93fedd ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 634e7e1b8ddeac66968b731522fc155f1c93fedd (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
