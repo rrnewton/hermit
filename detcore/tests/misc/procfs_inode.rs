@@ -29,6 +29,7 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::fd::IntoRawFd;
 use std::os::unix::fs::MetadataExt;
+use std::process::Command;
 use std::time::Duration;
 
 use detcore::Config;
@@ -54,6 +55,41 @@ fn under_detcore(guest: impl FnOnce() + Send) {
         "guest failed: {}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Marks a run of this test binary that [`in_its_own_process`] started.
+const OWN_PROCESS_ENV: &str = "HERMIT_PROCFS_INODE_TEST_INNER";
+
+/// Run `test`, the body of the test `name` in this module, in a process of
+/// its own: this binary run again on that test alone, as nextest runs every
+/// test. Detcore keeps the first determinism loss a process records, and
+/// records a procfs loss once per process, so a test that checks the loss
+/// must not share its process with other tests, as `cargo test` runs them.
+/// Nor must a test that closes a descriptor in this process and needs its
+/// number again, which a descriptor another test opens could take.
+fn in_its_own_process(name: &str, test: impl FnOnce()) {
+    let ran = format!("procfs_inode: {name} ran in its own process");
+    if std::env::var_os(OWN_PROCESS_ENV).is_some() {
+        test();
+        println!("{ran}");
+        return;
+    }
+    let output = Command::new(std::env::current_exe().unwrap())
+        .arg(format!("procfs_inode::{name}"))
+        .args(["--exact", "--nocapture", "--test-threads=1"])
+        .env(OWN_PROCESS_ENV, "1")
+        .output()
+        .expect("run this test binary again");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "{name} failed in its own process: {stdout}{stderr}"
+    );
+    assert!(
+        stdout.contains(&ran),
+        "{name} did not run in its own process: {stdout}{stderr}"
     );
 }
 
@@ -178,7 +214,9 @@ fn rebuilt_entries_keep_their_numbers(fds: fn() -> Vec<String>) {
 
 #[test]
 fn a_rebuilt_proc_fd_entry_keeps_its_number() {
-    rebuilt_entries_keep_their_numbers(|| vec![format!("{}/fd", proc_dir())]);
+    in_its_own_process("a_rebuilt_proc_fd_entry_keeps_its_number", || {
+        rebuilt_entries_keep_their_numbers(|| vec![format!("{}/fd", proc_dir())]);
+    });
 }
 
 /// `/proc/self` and `/proc/thread-self` name the guest, not the tracer, when
@@ -186,12 +224,17 @@ fn a_rebuilt_proc_fd_entry_keeps_its_number() {
 /// `fd` directory is a second directory, whose entries are other inodes.
 #[test]
 fn a_rebuilt_entry_reached_through_self_keeps_its_number() {
-    rebuilt_entries_keep_their_numbers(|| {
-        vec![
-            "/proc/self/fd".to_owned(),
-            "/proc/thread-self/fd".to_owned(),
-        ]
-    });
+    in_its_own_process(
+        "a_rebuilt_entry_reached_through_self_keeps_its_number",
+        || {
+            rebuilt_entries_keep_their_numbers(|| {
+                vec![
+                    "/proc/self/fd".to_owned(),
+                    "/proc/thread-self/fd".to_owned(),
+                ]
+            });
+        },
+    );
 }
 
 /// Detcore names an entry the guest reached by path by opening the path
@@ -203,37 +246,43 @@ fn a_rebuilt_entry_reached_through_self_keeps_its_number() {
 /// unnamed, and keeps it when the host rebuilds the entry.
 #[test]
 fn an_entry_detcore_cannot_name_records_a_determinism_loss() {
-    under_detcore(|| {
-        let fd = File::open("/dev/null").unwrap().into_raw_fd();
-        let entry = format!("/proc/self/fd/{fd}");
-        let lstat = || std::fs::symlink_metadata(&entry).map(|metadata| metadata.ino());
-        let path = CString::new(entry.clone()).unwrap();
-        let path = path.as_bytes_with_nul();
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
-        assert!(path.len() <= std::mem::size_of::<libc::stat>());
-        let buffer = stat.as_mut_ptr();
-        unsafe { std::ptr::copy_nonoverlapping(path.as_ptr(), buffer.cast(), path.len()) };
-        let flags = libc::AT_SYMLINK_NOFOLLOW;
-        let result =
-            unsafe { libc::syscall(libc::SYS_newfstatat, libc::AT_FDCWD, buffer, buffer, flags) };
-        assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
-        let unnamed = unsafe { stat.assume_init() }.st_ino;
-        assert_eq!(lstat().unwrap(), unnamed, "named, the entry was renumbered");
-        assert_eq!(unsafe { libc::close(fd) }, 0, "close({fd})");
-        assert!(lstat().is_err(), "{entry} exists after close");
-        let again = File::open("/dev/null").unwrap().into_raw_fd();
-        assert_eq!(again, fd, "the reopened file must take the closed number");
-        assert_eq!(
-            lstat().unwrap(),
-            unnamed,
-            "the rebuilt entry was renumbered"
-        );
-    });
-    let loss = detcore::detlog::determinism_loss();
-    assert!(
-        loss.as_deref()
-            .is_some_and(|loss| loss.starts_with("procfs inode numbers: ")),
-        "no procfs determinism loss was recorded: {loss:?}"
+    in_its_own_process(
+        "an_entry_detcore_cannot_name_records_a_determinism_loss",
+        || {
+            under_detcore(|| {
+                let fd = File::open("/dev/null").unwrap().into_raw_fd();
+                let entry = format!("/proc/self/fd/{fd}");
+                let lstat = || std::fs::symlink_metadata(&entry).map(|metadata| metadata.ino());
+                let path = CString::new(entry.clone()).unwrap();
+                let path = path.as_bytes_with_nul();
+                let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+                assert!(path.len() <= std::mem::size_of::<libc::stat>());
+                let buffer = stat.as_mut_ptr();
+                unsafe { std::ptr::copy_nonoverlapping(path.as_ptr(), buffer.cast(), path.len()) };
+                let flags = libc::AT_SYMLINK_NOFOLLOW;
+                let result = unsafe {
+                    libc::syscall(libc::SYS_newfstatat, libc::AT_FDCWD, buffer, buffer, flags)
+                };
+                assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+                let unnamed = unsafe { stat.assume_init() }.st_ino;
+                assert_eq!(lstat().unwrap(), unnamed, "named, the entry was renumbered");
+                assert_eq!(unsafe { libc::close(fd) }, 0, "close({fd})");
+                assert!(lstat().is_err(), "{entry} exists after close");
+                let again = File::open("/dev/null").unwrap().into_raw_fd();
+                assert_eq!(again, fd, "the reopened file must take the closed number");
+                assert_eq!(
+                    lstat().unwrap(),
+                    unnamed,
+                    "the rebuilt entry was renumbered"
+                );
+            });
+            let loss = detcore::detlog::determinism_loss();
+            assert!(
+                loss.as_deref()
+                    .is_some_and(|loss| loss.starts_with("procfs inode numbers: ")),
+                "no procfs determinism loss was recorded: {loss:?}"
+            );
+        },
     );
 }
 
@@ -247,33 +296,39 @@ fn an_entry_detcore_cannot_name_records_a_determinism_loss() {
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn an_overwritten_path_does_not_name_the_entry_it_now_leads_to() {
-    let links = tempfile::tempdir().unwrap();
-    std::os::unix::fs::symlink("/proc/self/task", links.path().join("orig")).unwrap();
-    std::os::unix::fs::symlink("/proc/self/fd", links.path().join("mA")).unwrap();
-    under_detcore(|| {
-        let fds = std::fs::metadata("/proc/self/fd").unwrap().ino();
-        let directory = File::open(links.path()).unwrap();
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
-        let buffer = stat.as_mut_ptr().cast::<u8>();
-        let path = b"orig\0";
-        let at = unsafe { buffer.add(24) };
-        unsafe { std::ptr::copy_nonoverlapping(path.as_ptr(), at, path.len()) };
-        let result =
-            unsafe { libc::syscall(libc::SYS_newfstatat, directory.as_raw_fd(), at, buffer, 0) };
-        assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
-        let stat = unsafe { stat.assume_init() };
-        assert_eq!(
-            stat.st_mode,
-            libc::S_IFDIR | 0o555,
-            "the result wrote no \"mA\""
-        );
-        assert_ne!(stat.st_ino, fds, "the entry took /proc/self/fd's number");
-        let task = std::fs::metadata("/proc/self/task").unwrap().ino();
-        assert_eq!(task, stat.st_ino, "named, the entry was renumbered");
-    });
-    assert_eq!(
-        detcore::detlog::determinism_loss().as_deref(),
-        Some("procfs inode numbers: the call's result overwrote the guest's path")
+    in_its_own_process(
+        "an_overwritten_path_does_not_name_the_entry_it_now_leads_to",
+        || {
+            let links = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink("/proc/self/task", links.path().join("orig")).unwrap();
+            std::os::unix::fs::symlink("/proc/self/fd", links.path().join("mA")).unwrap();
+            under_detcore(|| {
+                let fds = std::fs::metadata("/proc/self/fd").unwrap().ino();
+                let directory = File::open(links.path()).unwrap();
+                let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+                let buffer = stat.as_mut_ptr().cast::<u8>();
+                let path = b"orig\0";
+                let at = unsafe { buffer.add(24) };
+                unsafe { std::ptr::copy_nonoverlapping(path.as_ptr(), at, path.len()) };
+                let result = unsafe {
+                    libc::syscall(libc::SYS_newfstatat, directory.as_raw_fd(), at, buffer, 0)
+                };
+                assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+                let stat = unsafe { stat.assume_init() };
+                assert_eq!(
+                    stat.st_mode,
+                    libc::S_IFDIR | 0o555,
+                    "the result wrote no \"mA\""
+                );
+                assert_ne!(stat.st_ino, fds, "the entry took /proc/self/fd's number");
+                let task = std::fs::metadata("/proc/self/task").unwrap().ino();
+                assert_eq!(task, stat.st_ino, "named, the entry was renumbered");
+            });
+            assert_eq!(
+                detcore::detlog::determinism_loss().as_deref(),
+                Some("procfs inode numbers: the call's result overwrote the guest's path")
+            );
+        },
     );
 }
 
@@ -375,56 +430,58 @@ fn a_write_to_a_procfs_file_moves_its_mtime() {
 /// second call again found nothing to name the directory by.
 #[test]
 fn a_listing_keeps_its_keys_after_its_task_exits() {
-    under_detcore(|| {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let (finish, finished) = std::sync::mpsc::channel::<()>();
-        let thread = std::thread::spawn(move || {
-            sender.send(unsafe { libc::gettid() }).unwrap();
-            finished.recv().unwrap();
+    in_its_own_process("a_listing_keeps_its_keys_after_its_task_exits", || {
+        under_detcore(|| {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let (finish, finished) = std::sync::mpsc::channel::<()>();
+            let thread = std::thread::spawn(move || {
+                sender.send(unsafe { libc::gettid() }).unwrap();
+                finished.recv().unwrap();
+            });
+            let tid = receiver.recv().unwrap();
+            let task = format!("{}/task/{tid}", proc_dir());
+            let fds = format!("{task}/fd");
+            let fd = File::open("/dev/null").unwrap().into_raw_fd();
+            let entry = format!("{fds}/{fd}");
+            let lstat = || std::fs::symlink_metadata(&entry).map(|metadata| metadata.ino());
+            let stat_before = lstat().unwrap();
+            assert_eq!(unsafe { libc::close(fd) }, 0, "close({fd})");
+            // The lookup of a closed descriptor's entry fails and drops its
+            // dentry, which the listing builds again.
+            assert!(lstat().is_err(), "{entry} exists after close");
+            let again = File::open("/dev/null").unwrap().into_raw_fd();
+            assert_eq!(again, fd, "the reopened file must take the closed number");
+            let directory = File::open(&fds).unwrap();
+            // `.` and `..` take 24 bytes each, so the first call returns only
+            // them, and takes the snapshot.
+            let mut buffer = vec![0u8; 48];
+            let read = unsafe {
+                libc::syscall(
+                    libc::SYS_getdents64,
+                    directory.as_raw_fd(),
+                    buffer.as_mut_ptr(),
+                    buffer.len(),
+                )
+            };
+            assert_eq!(read, 48, "getdents64: {}", std::io::Error::last_os_error());
+            finish.send(()).unwrap();
+            thread.join().unwrap();
+            // The join returns when the thread clears its ID, before it is reaped.
+            let mut tries = 0;
+            while std::fs::symlink_metadata(&task).is_ok() {
+                tries += 1;
+                assert!(tries < 100_000, "{task} outlived its thread");
+                unsafe { libc::sched_yield() };
+            }
+            let rest = rest_of_listing(&directory);
+            assert_eq!(
+                rest.get(&fd.to_string()).copied(),
+                Some(stat_before),
+                "{fds} listed {fd} under another number: {rest:?}"
+            );
         });
-        let tid = receiver.recv().unwrap();
-        let task = format!("{}/task/{tid}", proc_dir());
-        let fds = format!("{task}/fd");
-        let fd = File::open("/dev/null").unwrap().into_raw_fd();
-        let entry = format!("{fds}/{fd}");
-        let lstat = || std::fs::symlink_metadata(&entry).map(|metadata| metadata.ino());
-        let stat_before = lstat().unwrap();
-        assert_eq!(unsafe { libc::close(fd) }, 0, "close({fd})");
-        // The lookup of a closed descriptor's entry fails and drops its
-        // dentry, which the listing builds again.
-        assert!(lstat().is_err(), "{entry} exists after close");
-        let again = File::open("/dev/null").unwrap().into_raw_fd();
-        assert_eq!(again, fd, "the reopened file must take the closed number");
-        let directory = File::open(&fds).unwrap();
-        // `.` and `..` take 24 bytes each, so the first call returns only
-        // them, and takes the snapshot.
-        let mut buffer = vec![0u8; 48];
-        let read = unsafe {
-            libc::syscall(
-                libc::SYS_getdents64,
-                directory.as_raw_fd(),
-                buffer.as_mut_ptr(),
-                buffer.len(),
-            )
-        };
-        assert_eq!(read, 48, "getdents64: {}", std::io::Error::last_os_error());
-        finish.send(()).unwrap();
-        thread.join().unwrap();
-        // The join returns when the thread clears its ID, before it is reaped.
-        let mut tries = 0;
-        while std::fs::symlink_metadata(&task).is_ok() {
-            tries += 1;
-            assert!(tries < 100_000, "{task} outlived its thread");
-            unsafe { libc::sched_yield() };
-        }
-        let rest = rest_of_listing(&directory);
-        assert_eq!(
-            rest.get(&fd.to_string()).copied(),
-            Some(stat_before),
-            "{fds} listed {fd} under another number: {rest:?}"
-        );
+        assert_eq!(detcore::detlog::determinism_loss(), None);
     });
-    assert_eq!(detcore::detlog::determinism_loss(), None);
 }
 
 /// The entries `getdents64` returns from `directory`'s position on, by name.
@@ -464,25 +521,27 @@ fn rest_of_listing(directory: &File) -> std::collections::HashMap<String, u64> {
 /// tests pin the guard itself.
 #[test]
 fn naming_an_entry_leaves_the_guests_errno() {
-    under_detcore(|| {
-        const SENTINEL: i32 = 4242;
-        let path = CString::new("/proc/self/stat").unwrap();
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
-        unsafe { *libc::__errno_location() = SENTINEL };
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_newfstatat,
-                libc::AT_FDCWD,
-                path.as_ptr(),
-                stat.as_mut_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        };
-        let errno = unsafe { *libc::__errno_location() };
-        assert_eq!(result, 0, "newfstatat failed");
-        assert_eq!(errno, SENTINEL, "naming the entry changed errno");
+    in_its_own_process("naming_an_entry_leaves_the_guests_errno", || {
+        under_detcore(|| {
+            const SENTINEL: i32 = 4242;
+            let path = CString::new("/proc/self/stat").unwrap();
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            unsafe { *libc::__errno_location() = SENTINEL };
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_newfstatat,
+                    libc::AT_FDCWD,
+                    path.as_ptr(),
+                    stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            let errno = unsafe { *libc::__errno_location() };
+            assert_eq!(result, 0, "newfstatat failed");
+            assert_eq!(errno, SENTINEL, "naming the entry changed errno");
+        });
+        assert_eq!(detcore::detlog::determinism_loss(), None);
     });
-    assert_eq!(detcore::detlog::determinism_loss(), None);
 }
 
 /// The descriptor the `O_PATH` open that names a procfs path gets in the
@@ -585,13 +644,15 @@ fn stat_a_procfs_path_with_close_filtered(errno: u32) -> Option<String> {
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn a_close_that_never_runs_ends_in_a_determinism_loss() {
-    let loss = stat_a_procfs_path_with_close_filtered(ERESTARTSYS);
-    assert_eq!(
-        loss.as_deref(),
-        Some(
-            "procfs inode numbers: close of the guest's O_PATH descriptor did not run in 8 attempts"
-        )
-    );
+    in_its_own_process("a_close_that_never_runs_ends_in_a_determinism_loss", || {
+        let loss = stat_a_procfs_path_with_close_filtered(ERESTARTSYS);
+        assert_eq!(
+            loss.as_deref(),
+            Some(
+                "procfs inode numbers: close of the guest's O_PATH descriptor did not run in 8 attempts"
+            )
+        );
+    });
 }
 
 /// A close that a filter refuses, as a filter that blocks a call does, leaves
@@ -600,11 +661,16 @@ fn a_close_that_never_runs_ends_in_a_determinism_loss() {
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn a_close_that_a_filter_refuses_ends_in_a_determinism_loss() {
-    let loss = stat_a_procfs_path_with_close_filtered(libc::EPERM as u32);
-    assert_eq!(
-        loss.as_deref(),
-        Some(
-            "procfs inode numbers: close left the guest's O_PATH descriptor open, returning Err(EPERM)"
-        )
+    in_its_own_process(
+        "a_close_that_a_filter_refuses_ends_in_a_determinism_loss",
+        || {
+            let loss = stat_a_procfs_path_with_close_filtered(libc::EPERM as u32);
+            assert_eq!(
+                loss.as_deref(),
+                Some(
+                    "procfs inode numbers: close left the guest's O_PATH descriptor open, returning Err(EPERM)"
+                )
+            );
+        },
     );
 }
