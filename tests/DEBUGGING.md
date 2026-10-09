@@ -195,7 +195,10 @@ source bytes.
   number. Not covered: a path lookup through `/proc/self` or
   `/proc/thread-self` (those name the tracer) of an entry rebuilt since its
   last sighting, an entry rebuilt before Detcore first saw its path, and
-  record/replay modes. The fix also reports a link count of 1 for `/proc`,
+  record/replay modes, nor (https://github.com/rrnewton/hermit/issues/3988)
+  a descriptor that a backgrounded call allocates while Detcore's `O_PATH`
+  descriptor for a path is open. The fix also reports a link count of 1 for
+  `/proc`,
   whose host count includes every host process.
 - Ruled out / next: not a scheduling divergence (the runs agree on every
   scheduling record). A reproducer that closes a descriptor, fails an `lstat`

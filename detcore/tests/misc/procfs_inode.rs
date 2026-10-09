@@ -292,38 +292,69 @@ fn an_entry_detcore_cannot_name_records_a_determinism_loss() {
     );
 }
 
-/// Without sequentialized threads, another guest thread could close the
-/// descriptor Detcore opens to name an entry reached by path, and take its
-/// number for one of its own, before Detcore reads and closes it. So Detcore
-/// does not open the path again: it records a determinism loss, the stat
-/// still succeeds, and the guest's next descriptor takes the number it would
-/// have taken without the stat.
+/// Run `guest` under Detcore without sequentialized threads, in a process of
+/// its own as the test `name`, and require the one procfs determinism loss
+/// that refuses naming in that mode. Another guest thread could then close
+/// the descriptor Detcore opens to name an entry reached by path, and take
+/// its number for one of its own, before Detcore reads and closes it; or
+/// change what a descriptor or the working directory leads to between
+/// Detcore's look at its identity and at its link. So Detcore names no
+/// procfs entry then, whatever the guest named it by.
+fn without_sequentialized_threads_nothing_is_named(name: &str, guest: fn()) {
+    in_its_own_process(name, || {
+        let config = Config {
+            sequentialize_threads: false,
+            ..config()
+        };
+        under_detcore_with(config, guest);
+        assert_eq!(
+            detcore::detlog::determinism_loss().as_deref(),
+            Some(
+                "procfs inode numbers: the guest's threads are not sequentialized, \
+                 so Detcore does not name procfs files"
+            )
+        );
+    });
+}
+
+/// By path, the stat still succeeds, and the guest's next descriptor takes
+/// the number it would have taken without the stat: Detcore opened nothing.
 #[test]
 fn without_sequentialized_threads_a_path_is_not_opened_again() {
-    in_its_own_process(
+    without_sequentialized_threads_nothing_is_named(
         "without_sequentialized_threads_a_path_is_not_opened_again",
         || {
-            let config = Config {
-                sequentialize_threads: false,
-                ..config()
+            let lowest_free = || {
+                let fd = File::open("/dev/null").unwrap().into_raw_fd();
+                assert_eq!(unsafe { libc::close(fd) }, 0, "close({fd})");
+                fd
             };
-            under_detcore_with(config, || {
-                let lowest_free = || {
-                    let fd = File::open("/dev/null").unwrap().into_raw_fd();
-                    assert_eq!(unsafe { libc::close(fd) }, 0, "close({fd})");
-                    fd
-                };
-                let free = lowest_free();
-                std::fs::symlink_metadata("/proc/self/stat").unwrap();
-                assert_eq!(lowest_free(), free, "the stat left a descriptor open");
-            });
-            assert_eq!(
-                detcore::detlog::determinism_loss().as_deref(),
-                Some(
-                    "procfs inode numbers: the guest's threads are not sequentialized, \
-                     so Detcore does not open its path again"
-                )
-            );
+            let free = lowest_free();
+            std::fs::symlink_metadata("/proc/self/stat").unwrap();
+            assert_eq!(lowest_free(), free, "the stat left a descriptor open");
+        },
+    );
+}
+
+#[test]
+fn without_sequentialized_threads_a_descriptor_is_not_named() {
+    without_sequentialized_threads_nothing_is_named(
+        "without_sequentialized_threads_a_descriptor_is_not_named",
+        || {
+            let file = File::open("/proc/self/stat").unwrap();
+            file.metadata().unwrap();
+        },
+    );
+}
+
+#[test]
+fn without_sequentialized_threads_the_working_directory_is_not_named() {
+    without_sequentialized_threads_nothing_is_named(
+        "without_sequentialized_threads_the_working_directory_is_not_named",
+        || {
+            std::env::set_current_dir("/proc/self").unwrap();
+            let (inode, _) = statx(libc::AT_FDCWD, "", libc::AT_EMPTY_PATH).unwrap();
+            assert_ne!(inode, 0);
         },
     );
 }
