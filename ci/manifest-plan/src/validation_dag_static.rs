@@ -1735,9 +1735,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_killed_vfork_parent_with_an_unregistered_child_leaves_a_tombstone,
     // a_killed_vfork_parents_barrier_lasts_until_its_childs_release_edge,
     // a_vfork_childs_exit_grant_releases_its_dead_parents_barrier and
-    // a_new_vfork_by_a_reused_tid_clears_a_stale_tombstone
-    // (https://github.com/rrnewton/hermit/issues/3984) retain all 1275: 1280.
-    ("test.detcore_unit", 1280),
+    // a_new_vfork_by_a_reused_tid_clears_a_stale_tombstone,
+    // a_vfork_parent_retired_after_its_childs_exec_releases_the_barrier,
+    // a_released_vfork_barrier_ends_at_the_parents_continuation and
+    // a_new_vfork_by_a_reused_tid_replaces_a_kept_barrier
+    // (https://github.com/rrnewton/hermit/issues/3984) retain all 1275: 1283.
+    ("test.detcore_unit", 1283),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2256,8 +2259,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // all 258: 260, measured with this node's Nextest listing. Both require
     // CPUID faulting and join only the hosted exact-name exclusions.
     // a_killed_vfork_parent_does_not_stop_the_schedule
-    // (https://github.com/rrnewton/hermit/issues/3984) retains all 260: 261.
-    ("test.cli", 261),
+    // and a_vfork_child_that_kills_its_parent_and_execs_lets_its_own_child_run
+    // (https://github.com/rrnewton/hermit/issues/3984) retain all 260: 262.
+    ("test.cli", 262),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2462,8 +2466,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two DBT guest-environment tests: 198 + 2 = 200 (listed).
     // The three self-signal-death tests start in-guest LiteInst guests, so they
     // join the exact-name filterset: 200 + 3 - 3 = 200.
-    // And the killed-vfork-parent CLI test: 201.
-    ("test.cli_on_host", 201),
+    // And the two killed-vfork-parent CLI tests: 202.
+    ("test.cli_on_host", 202),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 55),
@@ -2583,8 +2587,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the eleven poll-deadline tests: 1261.
     // And the same eleven pause/nanosleep cross-task wake tests: 1241.
     // And the two /proc/cgroups tests: 1275.
-    // And the five vfork-parent barrier tests: 1280.
-    ("test.detcore_unit_on_host", 1280),
+    // And the eight vfork-parent barrier tests: 1283.
+    ("test.detcore_unit_on_host", 1283),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
