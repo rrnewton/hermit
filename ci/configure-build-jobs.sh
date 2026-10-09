@@ -1339,8 +1339,17 @@ fi
 # effective-job-second threshold and the 16-job clamp. This local sample does
 # not replace the original n=3 hosted calibration or satisfy the >=5-sample
 # replacement rule; fresh validation is required.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 54adc5eebf40c8f407399b02dcd9ca1f62b7f157 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 54adc5eebf40c8f407399b02dcd9ca1f62b7f157 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO da551e45d0f66d9048ea6c29c70fc9c15808b3e5 (2026-10-09): from
+# 54adc5eebf40c8f407399b02dcd9ca1f62b7f157. The one commit changes reverie-ptrace (an
+# injected syscall that a signal stopped before it ran is reported as a
+# restart, ERESTARTSYS, rather than as what the result register held, and
+# tests of it) and reverie/src/guest.rs (Guest::inject documents that
+# result); no file under reverie-dbt, the root Cargo.toml, third-party or
+# rust-toolchain.toml changes, so the four budget inputs are unchanged. Carry,
+# not recalibration: no new timing sample or >=5-sample replacement claim is
+# made.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != da551e45d0f66d9048ea6c29c70fc9c15808b3e5 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie da551e45d0f66d9048ea6c29c70fc9c15808b3e5 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
