@@ -2,10 +2,12 @@
 """Real-ELF tests for the guest-preload gate in the E2E artifact scripts.
 
 ci/publish-hermit-e2e-artifact.sh and ci/verify-hermit-e2e-artifact.sh each carry
-require_portable_guest_preload, which refuses a guest preload (libdetcore_sabre.so,
-libdetcore_liteinst.so) that every guest's own loader could not
-load: one that records an RPATH or RUNPATH, needs a library glibc does not provide, or
-requires a glibc symbol version newer than GUEST_PRELOAD_GLIBC_MINOR_FLOOR
+require_portable_guest_preload, which refuses a shipped guest preload that a guest's own
+loader could not load (libdetcore_sabre.so and libdetcore_liteinst.so, which Hermit
+preloads, and libreverie_liteinst.so, which Hermit ships but has not preloaded since
+2d8bada7e9 and Reverie's own tools preload): one that records an RPATH or RUNPATH,
+needs a library glibc does not provide, or requires a glibc symbol version newer than
+GUEST_PRELOAD_GLIBC_MINOR_FLOOR
 (https://github.com/rrnewton/hermit/issues/3652,
 https://github.com/rrnewton/hermit/issues/3967,
 https://github.com/rrnewton/reverie/issues/980). The publication fixtures in
@@ -28,8 +30,8 @@ the gate's message for that defect.
 GuestPreloadCallSiteTest checks that the scripts apply the gate to every shipped guest
 preload. It publishes a bundle with the real publish script, using the script stand-ins
 of scripts/validate.rs's publication fixtures, and checks that the real verify script
-accepts it. Then, for each of libdetcore_sabre.so and libdetcore_liteinst.so:
-publishing with that file replaced by the RUNPATH fixture is
+accepts it. Then, for each of libdetcore_sabre.so, libdetcore_liteinst.so and
+libreverie_liteinst.so: publishing with that file replaced by the RUNPATH fixture is
 refused by the publish script's own gate on the source install, naming the file (the
 verify script that publish runs on its staged bundle would also refuse, so the message's
 script name is checked); and replacing that file in the published bundle makes verify
@@ -225,6 +227,7 @@ class GuestPreloadGateTest(unittest.TestCase):
 GUEST_PRELOADS = {
     "libdetcore_sabre.so": "SaBRe plugin",
     "libdetcore_liteinst.so": "In-guest LiteInst runtime",
+    "libreverie_liteinst.so": "LiteInst preload",
 }
 # Every file the scripts require in a complete bundle's rsrcs/.
 BUNDLE_RESOURCES = (

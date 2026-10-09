@@ -64,16 +64,22 @@ function require_runtime_closure {
         fail "runtime bundle contains files outside the exact unwind closure: $runtime"
 }
 
-# The guest preloads that Detcore ships, the SaBRe plugin
-# (https://github.com/rrnewton/hermit/issues/3652) and the in-guest LiteInst
-# runtime (https://github.com/rrnewton/hermit/issues/3967), are loaded by each
-# guest's own dynamic loader, against the libc that guest already has. Each may
-# need only libraries every glibc provides, may name no build-root directory to
-# find them in, and may require no glibc symbol version newer than the oldest
-# supported host's: glibc 2.34, measured on the host recorded for
-# GUEST_PRELOAD_GLIBC_MINOR_FLOOR in docs/TESTING_ENVIRONMENTS.md under "Named
-# measurement hosts". detcore-sabre/build.rs, detcore-liteinst/build.rs and
-# detcore-sabre/src/glibc_compat.rs build them that way.
+# The SaBRe plugin (https://github.com/rrnewton/hermit/issues/3652) and the
+# in-guest LiteInst runtime (https://github.com/rrnewton/hermit/issues/3967) are
+# guest preloads: each guest's own dynamic loader loads them, against the libc
+# that guest already has. The bundle also ships Reverie's plain LiteInst preload
+# (https://github.com/rrnewton/reverie/issues/980), which no Hermit run path has
+# preloaded since 2d8bada7e9 (2026-10-04); Reverie's own strace tool and tests
+# preload it, and it is checked the same way so that every shipped preload keeps
+# the contract. Each may need only libraries every glibc provides, may name no
+# build-root directory to find them in, and may require no glibc symbol version
+# newer than the oldest supported host's: glibc 2.34, measured on the host
+# recorded for GUEST_PRELOAD_GLIBC_MINOR_FLOOR in docs/TESTING_ENVIRONMENTS.md
+# under "Named measurement hosts". detcore-sabre/build.rs,
+# detcore-liteinst/build.rs, detcore-sabre/src/glibc_compat.rs and Reverie's
+# reverie-liteinst/build.rs build them that way. ci/test_guest_preload_gate.py
+# runs this gate on real ELF files and checks that both scripts apply it to all
+# three.
 GUEST_PRELOAD_GLIBC_MINOR_FLOOR=34
 
 function require_portable_guest_preload {
@@ -114,6 +120,7 @@ function require_complete_resources {
     done
     require_portable_guest_preload "SaBRe plugin" "$install/rsrcs/libdetcore_sabre.so"
     require_portable_guest_preload "In-guest LiteInst runtime" "$install/rsrcs/libdetcore_liteinst.so"
+    require_portable_guest_preload "LiteInst preload" "$install/rsrcs/libreverie_liteinst.so"
     if [[ $require_runtime == true ]]; then
         require_runtime_closure "$install/rsrcs/hermit-runtime"
     elif [[ -e $install/rsrcs/hermit-runtime ]]; then

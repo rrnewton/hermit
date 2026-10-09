@@ -1375,8 +1375,20 @@ fi
 # root Cargo.toml and rust-toolchain.toml are byte-identical by Git object.
 # Carry the existing budget and job clamp; this is source evidence, not a
 # new timing calibration. Validate the changed in-guest behavior separately.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 5ba26897e1db46071f2a00f9ef4bee10e29c94ad ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 5ba26897e1db46071f2a00f9ef4bee10e29c94ad (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 255d2e0b8f5ba017bcc7233711c63583e4fe419e (2026-10-09): from
+# 5ba26897e1db46071f2a00f9ef4bee10e29c94ad. Five commits, none in reverie-dbt:
+# reverie-liteinst tests its self-signal cases with default dispositions
+# (https://github.com/rrnewton/reverie/pull/988), and its guest preload links
+# its unwinder statically, records no RUNPATH and finds glibc's
+# _dl_find_object through reverie-core's new glibc_symbol module
+# (https://github.com/rrnewton/reverie/pull/984). None of the seven recorded
+# inputs changes (reverie-dbt/Cargo.toml, reverie-dbt/build.rs,
+# reverie-dbt/native/CMakeLists.txt, reverie-dbt/vendor/dynamorio,
+# third-party, the root Cargo.toml and rust-toolchain.toml are
+# byte-identical), so the DynamoRIO SDK recipe key is unchanged. Carry, not
+# recalibration: no new timing sample or >=5-sample replacement claim is made.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 255d2e0b8f5ba017bcc7233711c63583e4fe419e ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 255d2e0b8f5ba017bcc7233711c63583e4fe419e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
