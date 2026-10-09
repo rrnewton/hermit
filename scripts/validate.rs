@@ -130,6 +130,7 @@ mod validate_super; // Normalizes and audits extracted Cargo tests/synthetic arg
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::io::Read;
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -12999,17 +13000,28 @@ fn compat_manifest_rows(
         population: Some(hermit_manifest_plan::runner::Population::Required),
         ..Default::default()
     })?;
+    // Each of these ptrace verify cells is equalized, so its guest names the
+    // cell's XDG configuration copy at its guest path.
+    let xdg_config_home = hermit_manifest_plan::runner::EQUALIZED_INPUTS
+        .iter()
+        .find(|input| input.env == "XDG_CONFIG_HOME")
+        .map(|input| Path::new(input.guest_path))
+        .ok_or("the runner no longer equalizes XDG_CONFIG_HOME")?;
     let mut rows = BTreeMap::new();
     for cell in cells {
         let Some(hermit_manifest_plan::runner::DirectCommand::Argv(argv)) = &cell.test.direct
         else {
             return Err(format!("{} is not a direct argv row", cell.test.id));
         };
+        if !hermit_manifest_plan::runner::equalizes_guest_inputs(&cell.id.mode) {
+            return Err(format!("{} is not an equalized verify cell", cell.test.id));
+        }
         let argv = hermit_manifest_plan::manifest_corpus::resolve_direct_placeholders(
             &cell.test.id,
             argv,
             root,
             Some(run_state.as_os_str()),
+            Some(xdg_config_home),
         )?;
         let label = cell
             .test
@@ -13492,6 +13504,78 @@ fn compat_compression_fixture_bracket(root: &Path) -> Result<String, String> {
     Ok("compression fixture: 4 old false passes reproduced; 8 constructed/committed argv preserve real input; 24 failed-producer/unreadable/missing cases fail".into())
 }
 
+/// Require the canonicalization rows to exercise the checked-in nested file,
+/// rather than allowing a successful cwd-only probe to replace stat coverage.
+fn canonicalizing_compat_operands(
+    rows: &BTreeMap<String, Vec<OsString>>,
+    root: &Path,
+) -> Result<(), String> {
+    let operand = "/tmp/e2e/xdg-config/git/config";
+    for (label, want) in [
+        ("realpath", vec!["/usr/bin/realpath", operand]),
+        ("readlink", vec!["/usr/bin/readlink", "-f", operand]),
+    ] {
+        let want = want.into_iter().map(OsString::from).collect::<Vec<_>>();
+        if rows.get(label) != Some(&want) {
+            return Err(format!(
+                "strict-compat bucket: {label} lost its nested cell-private operand: {:?}",
+                rows.get(label)
+            ));
+        }
+    }
+    let seed = root.join("tests/e2e/xdg-config/git/config");
+    let metadata = std::fs::symlink_metadata(&seed)
+        .map_err(|error| format!("strict-compat bucket: cannot stat nested seed: {error}"))?;
+    if !metadata.file_type().is_file() || metadata.len() == 0 {
+        return Err("strict-compat bucket: nested seed must be a nonempty regular file".into());
+    }
+    let config = std::fs::read_to_string(seed)
+        .map_err(|error| format!("strict-compat bucket: cannot read nested seed: {error}"))?;
+    if !config.contains("[user]") || !config.contains("Hermit E2E") {
+        return Err(
+            "strict-compat bucket: nested seed lost its checked-in configuration content".into(),
+        );
+    }
+    Ok(())
+}
+
+fn canonicalizing_compat_operand_bracket(root: &Path) -> Result<(), String> {
+    let rows = compat_manifest_argv(root, Path::new("/run-state"))?;
+    canonicalizing_compat_operands(&rows, root)?;
+    // Negative controls preserve this gate against the cwd-only weakening and
+    // against paths whose shared ancestors can change during verification.
+    for label in ["realpath", "readlink"] {
+        for bad in [
+            ".",
+            "/run-state/strict-compat/real-compat-fixtures/README.md",
+            "/repo/tests/e2e/xdg-config/git/config",
+        ] {
+            let mut changed = rows.clone();
+            *changed.get_mut(label).unwrap().last_mut().unwrap() = bad.into();
+            if canonicalizing_compat_operands(&changed, root).is_ok() {
+                return Err(format!(
+                    "strict-compat bucket: nested operand gate admitted {label} {bad}"
+                ));
+            }
+        }
+    }
+    let fixture = tempfile::tempdir()
+        .map_err(|error| format!("strict-compat bucket: cannot prepare seed controls: {error}"))?;
+    let negative_seed_root = fixture.path().join("negative-seed");
+    let negative_seed = negative_seed_root.join("tests/e2e/xdg-config/git/config");
+    std::fs::create_dir_all(negative_seed.parent().unwrap())
+        .map_err(|error| format!("strict-compat bucket: cannot prepare negative seed: {error}"))?;
+    if canonicalizing_compat_operands(&rows, &negative_seed_root).is_ok() {
+        return Err("strict-compat bucket: nested operand gate admitted a missing seed".into());
+    }
+    std::fs::write(&negative_seed, "")
+        .map_err(|error| format!("strict-compat bucket: cannot prepare empty seed: {error}"))?;
+    if canonicalizing_compat_operands(&rows, &negative_seed_root).is_ok() {
+        return Err("strict-compat bucket: nested operand gate admitted an empty seed".into());
+    }
+    Ok(())
+}
+
 /// Exercise the committed strict-compatibility bucket through the real outer
 /// scheduler without running the corpus.
 ///
@@ -13641,6 +13725,7 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
             "strict-compat bucket: README consumers are not bound to the run-owned fixture: labels={readme_labels:?} fixture={fixture_readme}"
         ));
     }
+    canonicalizing_compat_operand_bracket(root)?;
     let workload = root.join("tests/compat/real_compat_workload.sh");
     for label in ["cargo", "df"] {
         let argv = rows
@@ -30081,6 +30166,7 @@ mod committed_selection_preservation_tests {
     #[test]
     fn hosted_portable_public_selection_retains_exact_nodes_and_compat_fixture() {
         let root = Path::new(file!()).parent().and_then(Path::parent).unwrap();
+        canonicalizing_compat_operand_bracket(root).unwrap();
         let (committed, _, _) = load_committed_validation_dag(root).unwrap();
         let public = [
             "test.app_strict_verify",

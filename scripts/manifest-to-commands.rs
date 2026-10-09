@@ -196,6 +196,8 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
     let cell = format!("ignored/e2e-commands/work/{}", slug(id));
     let mut commands = vec![
         format!("cell={}", shell_quote(&cell)),
+        // Shell argv expansion happens before the later env command runs.
+        "XDG_CONFIG_HOME=\"$PWD/$cell/xdg-config\"".to_owned(),
         "hermit_bin=${HERMIT_BIN:-target/release/hermit}".to_owned(),
         "run_verify_strict=; if run_help=$(\"$hermit_bin\" run --help 2>&1); then case \"$run_help\" in *--verify-strict*) run_verify_strict=--verify-strict;; esac; fi".to_owned(),
         "record_verify_strict=; if record_help=$(\"$hermit_bin\" record start --help 2>&1); then case \"$record_help\" in *--verify-strict*) record_verify_strict=--verify-strict;; esac; fi".to_owned(),
@@ -817,6 +819,59 @@ test:
             guest_with_args(&tests[0].2, "\"$cell/guest\"", &args),
             "\"$cell/guest\" multi 'value with spaces'"
         );
+
+        // Execute a rendered direct argv: env assignments alone happen too
+        // late to supply placeholders expanded by the caller's shell.
+        let nested = manifest(
+            r#"
+test:
+  - id: c-programs/nested-xdg
+    direct: ["/bin/cat", "{{XDG_CONFIG_HOME}}/git/config"]
+    modes:
+      naked:
+        backends_enabled: [native]
+        runs: 1
+"#,
+        );
+        let dir = std::env::temp_dir().join(format!("manifest-nested-xdg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let seed = dir.join("tests/e2e/xdg-config/git/config");
+        std::fs::create_dir_all(seed.parent().unwrap()).unwrap();
+        std::fs::write(&seed, "cell-private nested input\n").unwrap();
+        let commands = commands_for_test(&nested[0].2, "c-programs", 15);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].lines().count(), 1);
+        for ambient in [None, Some("/unrelated/ambient xdg")] {
+            let mut command = std::process::Command::new("bash");
+            command
+                .args(["-c", &commands[0]])
+                .current_dir(&dir)
+                .env_remove("XDG_CONFIG_HOME");
+            // Probe only rendering/native fixture execution, never a real Hermit.
+            command.env("HERMIT_BIN", "/bin/false");
+            if let Some(value) = ambient {
+                command.env("XDG_CONFIG_HOME", value);
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(output.stdout, b"cell-private nested input\n");
+        }
+        std::fs::remove_file(&seed).unwrap();
+        // Remove the prepared copy too: an unrelated ambient tree cannot stand
+        // in for an absent cell-owned operand.
+        let (setup, guest) = setup_prefix(&nested[0].2, "c-programs/nested-xdg");
+        let output = std::process::Command::new("bash")
+            .args([
+                "-c",
+                &format!("{setup}; rm -f \"$cell/xdg-config/git/config\"; {RUN_ENV} {guest}"),
+            ])
+            .current_dir(&dir)
+            .env("HERMIT_BIN", "/bin/false")
+            .env("XDG_CONFIG_HOME", "/unrelated/ambient")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A replay cell runs its verify cell's guest arguments for every backend

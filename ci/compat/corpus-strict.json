@@ -920,7 +920,7 @@
    "label": "realpath",
    "argv": [
     "/usr/bin/realpath",
-    "."
+    "/tmp/e2e/xdg-config/git/config"
    ]
   },
   {
@@ -928,7 +928,7 @@
    "argv": [
     "/usr/bin/readlink",
     "-f",
-    "."
+    "/tmp/e2e/xdg-config/git/config"
    ]
   },
   {

@@ -1160,20 +1160,41 @@ pub const ROOT_DIR_PLACEHOLDER: &str = "{{ROOT_DIR}}";
 /// without one is refused rather than run with the literal text.
 pub const VALIDATE_RUN_STATE_PLACEHOLDER: &str = "{{VALIDATE_RUN_STATE}}";
 const VALIDATE_RUN_STATE_ENV: &str = "VALIDATE_RUN_STATE";
+/// The cell's own copy of tests/e2e/xdg-config, in a `direct` argv element:
+/// the directory the guest's `XDG_CONFIG_HOME` names. The harness prepares it
+/// in the cell directory before the run, and a verify guest on every backend
+/// sees it at /tmp/e2e/xdg-config, bound from there (the runner's
+/// equalized inputs), so every directory on a path below it is one the cell's
+/// own run owns: the guest's private /tmp, the /tmp/e2e directory Hermit
+/// creates in it for the binds, and the bound copy. A program that stats every
+/// ancestor of its argument (`readlink -f`, `realpath`) therefore reads no
+/// directory another cell can change, which a path below
+/// {{VALIDATE_RUN_STATE}} cannot promise
+/// (<https://github.com/rrnewton/hermit/issues/3975>). Any other mode names the
+/// cell directory's copy on the host.
+pub const XDG_CONFIG_HOME_PLACEHOLDER: &str = "{{XDG_CONFIG_HOME}}";
+const XDG_CONFIG_HOME_ENV: &str = "XDG_CONFIG_HOME";
 
-/// Refuse a `direct` argv that spells any `{{...}}` token other than the two
+/// Every placeholder a `direct` argv element may spell.
+const DIRECT_PLACEHOLDERS: [&str; 3] = [
+    ROOT_DIR_PLACEHOLDER,
+    VALIDATE_RUN_STATE_PLACEHOLDER,
+    XDG_CONFIG_HOME_PLACEHOLDER,
+];
+
+/// Refuse a `direct` argv that spells any `{{...}}` token other than the
 /// known placeholders, so a typo cannot reach a guest as literal text.
 pub fn check_direct_placeholders(id: &str, argv: &[String]) -> Result<(), String> {
     for arg in argv {
         let mut rest = arg.as_str();
         while let Some(start) = rest.find("{{") {
             let tail = &rest[start..];
-            let known = [ROOT_DIR_PLACEHOLDER, VALIDATE_RUN_STATE_PLACEHOLDER]
+            let known = DIRECT_PLACEHOLDERS
                 .into_iter()
                 .find(|token| tail.starts_with(token));
             let Some(token) = known else {
                 return Err(format!(
-                    "{id}: direct argv element `{arg}` names an unknown placeholder; only {ROOT_DIR_PLACEHOLDER} and {VALIDATE_RUN_STATE_PLACEHOLDER} exist"
+                    "{id}: direct argv element `{arg}` names an unknown placeholder; only {ROOT_DIR_PLACEHOLDER}, {VALIDATE_RUN_STATE_PLACEHOLDER} and {XDG_CONFIG_HOME_PLACEHOLDER} exist"
                 ));
             };
             rest = &tail[token.len()..];
@@ -1182,13 +1203,15 @@ pub fn check_direct_placeholders(id: &str, argv: &[String]) -> Result<(), String
     Ok(())
 }
 
-/// Substitute the two placeholders in a `direct` argv. `run_state` is the
-/// harness's `VALIDATE_RUN_STATE`, when it has one.
+/// Substitute the placeholders in a `direct` argv. `run_state` is the
+/// harness's `VALIDATE_RUN_STATE`, when it has one, and `xdg_config_home` the
+/// cell's XDG configuration directory, when the caller has a cell.
 pub fn resolve_direct_placeholders(
     id: &str,
     argv: &[String],
     root: &std::path::Path,
     run_state: Option<&std::ffi::OsStr>,
+    xdg_config_home: Option<&std::path::Path>,
 ) -> Result<Vec<String>, String> {
     check_direct_placeholders(id, argv)?;
     argv.iter()
@@ -1202,6 +1225,14 @@ pub fn resolve_direct_placeholders(
                 })?;
                 out = out.replace(VALIDATE_RUN_STATE_PLACEHOLDER, &state.to_string_lossy());
             }
+            if out.contains(XDG_CONFIG_HOME_PLACEHOLDER) {
+                let xdg = xdg_config_home.ok_or_else(|| {
+                    format!(
+                        "{id}: its argv names {XDG_CONFIG_HOME_PLACEHOLDER} but this caller has no cell XDG configuration directory"
+                    )
+                })?;
+                out = out.replace(XDG_CONFIG_HOME_PLACEHOLDER, &xdg.to_string_lossy());
+            }
             Ok(out)
         })
         .collect()
@@ -1214,9 +1245,9 @@ pub fn validate_run_state() -> Option<std::ffi::OsString> {
 
 /// Render one `direct` argv element as a shell word for a command line run
 /// from the repository root, as the rerunnable command files do: literal text
-/// through `quote`, `{{ROOT_DIR}}` as `"$PWD"`, and `{{VALIDATE_RUN_STATE}}` as
-/// an expansion that refuses to run when `VALIDATE_RUN_STATE` is unset, as the
-/// harness does.
+/// through `quote`, `{{ROOT_DIR}}` as `"$PWD"`, and `{{VALIDATE_RUN_STATE}}`
+/// and `{{XDG_CONFIG_HOME}}` as expansions of their variables that refuse to
+/// run when the variable is unset, as the harness does.
 pub fn direct_shell_word(
     id: &str,
     arg: &str,
@@ -1225,7 +1256,7 @@ pub fn direct_shell_word(
     check_direct_placeholders(id, &[arg.to_string()])?;
     let mut out = String::new();
     let mut rest = arg;
-    while let Some((index, token)) = [ROOT_DIR_PLACEHOLDER, VALIDATE_RUN_STATE_PLACEHOLDER]
+    while let Some((index, token)) = DIRECT_PLACEHOLDERS
         .into_iter()
         .filter_map(|token| rest.find(token).map(|index| (index, token)))
         .min()
@@ -1233,11 +1264,16 @@ pub fn direct_shell_word(
         if index > 0 {
             out.push_str(&quote(&rest[..index]));
         }
-        out.push_str(if token == ROOT_DIR_PLACEHOLDER {
-            "\"$PWD\""
-        } else {
-            "\"${VALIDATE_RUN_STATE:?VALIDATE_RUN_STATE is not set}\""
-        });
+        out.push_str(
+            match token {
+                ROOT_DIR_PLACEHOLDER => "\"$PWD\"".to_string(),
+                VALIDATE_RUN_STATE_PLACEHOLDER => format!(
+                    "\"${{{VALIDATE_RUN_STATE_ENV}:?{VALIDATE_RUN_STATE_ENV} is not set}}\""
+                ),
+                _ => format!("\"${{{XDG_CONFIG_HOME_ENV}:?{XDG_CONFIG_HOME_ENV} is not set}}\""),
+            }
+            .as_str(),
+        );
         rest = &rest[index + token.len()..];
     }
     if !rest.is_empty() || out.is_empty() {
@@ -2199,24 +2235,61 @@ mod tests {
     #[test]
     fn placeholders_resolve_or_refuse() {
         let root = std::path::Path::new("/repo");
+        let xdg = std::path::Path::new("/cell/xdg-config");
         let argv = [
             "{{ROOT_DIR}}/tool".to_string(),
             "{{VALIDATE_RUN_STATE}}/in".to_string(),
+            "{{XDG_CONFIG_HOME}}/git/config".to_string(),
         ];
         assert_eq!(
-            resolve_direct_placeholders("t", &argv, root, Some(std::ffi::OsStr::new("/state")))
-                .unwrap(),
-            ["/repo/tool", "/state/in"]
+            resolve_direct_placeholders(
+                "t",
+                &argv,
+                root,
+                Some(std::ffi::OsStr::new("/state")),
+                Some(xdg)
+            )
+            .unwrap(),
+            ["/repo/tool", "/state/in", "/cell/xdg-config/git/config"]
         );
         for missing in [None, Some(std::ffi::OsStr::new(""))] {
             assert!(
-                resolve_direct_placeholders("t", &argv, root, missing)
+                resolve_direct_placeholders("t", &argv, root, missing, Some(xdg))
                     .unwrap_err()
                     .contains("VALIDATE_RUN_STATE is not set")
             );
         }
+        // A caller without a cell refuses the cell placeholder rather than
+        // passing its literal text to a guest.
+        assert!(
+            resolve_direct_placeholders(
+                "t",
+                &argv,
+                root,
+                Some(std::ffi::OsStr::new("/state")),
+                None
+            )
+            .unwrap_err()
+            .contains("no cell XDG configuration directory")
+        );
+        assert_eq!(
+            resolve_direct_placeholders(
+                "t",
+                &argv[..2],
+                root,
+                Some(std::ffi::OsStr::new("/s")),
+                None
+            )
+            .unwrap(),
+            ["/repo/tool", "/s/in"]
+        );
         assert!(
             check_direct_placeholders("t", &["{{ROOT}}".to_string()])
+                .unwrap_err()
+                .contains("unknown placeholder")
+        );
+        assert!(
+            check_direct_placeholders("t", &["{{XDG_CONFIG}}".to_string()])
                 .unwrap_err()
                 .contains("unknown placeholder")
         );
@@ -2230,6 +2303,7 @@ mod tests {
             "{{ROOT_DIR}}/a b",
             "x={{VALIDATE_RUN_STATE}}/{{ROOT_DIR}}",
             "",
+            "{{XDG_CONFIG_HOME}}/git/config",
         ]
         .map(|arg| direct_shell_word("t", arg, quote).unwrap());
         let script = format!("cd /tmp && printf '%s\\n' {}", words.join(" "));
@@ -2237,7 +2311,8 @@ mod tests {
             let mut command = std::process::Command::new("bash");
             command
                 .args(["-c", &script])
-                .env_remove("VALIDATE_RUN_STATE");
+                .env_remove("VALIDATE_RUN_STATE")
+                .env("XDG_CONFIG_HOME", "/xdg");
             if let Some(state) = state {
                 command.env("VALIDATE_RUN_STATE", state);
             }
@@ -2247,11 +2322,18 @@ mod tests {
         assert!(output.status.success(), "{output:?}");
         assert_eq!(
             String::from_utf8(output.stdout).unwrap(),
-            "plain\n/tmp/a b\nx=/state//tmp\n\n"
+            "plain\n/tmp/a b\nx=/state//tmp\n\n/xdg/git/config\n"
         );
         let output = run(None);
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("VALIDATE_RUN_STATE is not set"));
+        let output = std::process::Command::new("bash")
+            .args(["-c", &format!("printf '%s\\n' {}", words[4])])
+            .env_remove("XDG_CONFIG_HOME")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("XDG_CONFIG_HOME is not set"));
         assert!(direct_shell_word("t", "{{TYPO}}", quote).is_err());
     }
 }

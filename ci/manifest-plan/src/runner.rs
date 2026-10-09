@@ -4357,11 +4357,15 @@ fn prepare_test_until(
             argv
         }
         (None, Some(DirectCommand::Argv(argv))) => {
+            // The cell's XDG configuration copy is named by its host path
+            // here; an equalized (verify) cell's argv then names it at its
+            // guest path, /tmp/e2e/xdg-config ([`equalized_guest_argv`]).
             crate::manifest_corpus::resolve_direct_placeholders(
                 &cell.test.id,
                 argv,
                 &context.root,
                 crate::manifest_corpus::validate_run_state().as_deref(),
+                Some(&dir.join("xdg-config")),
             )?
         }
         _ => return Err(format!("{} has unsupported program kind", cell.test.id)),
@@ -9891,6 +9895,7 @@ corpus:
             argv,
             &root,
             Some(std::ffi::OsStr::new("/run-state")),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -15702,6 +15707,7 @@ backends_disabled:
                     format!("{host}/fixtures/program"),
                     format!("{host}/home/test/.rc"),
                     format!("{host}/xdg-config"),
+                    format!("{host}/xdg-config/git/config"),
                     // Embedded and look-alike paths are not rewritten.
                     format!("--input={host}/fixtures/data"),
                     format!("{host}/fixtures-extra"),
@@ -15740,6 +15746,7 @@ backends_disabled:
                     "/tmp/e2e/fixtures/program".to_string(),
                     "/tmp/e2e/home/test/.rc".to_string(),
                     "/tmp/e2e/xdg-config".to_string(),
+                    "/tmp/e2e/xdg-config/git/config".to_string(),
                     format!("--input={reference_dir}/fixtures/data"),
                     format!("{reference_dir}/fixtures-extra"),
                     "plain".to_string(),
@@ -15764,7 +15771,7 @@ backends_disabled:
                 );
             }
 
-            for backend in ["dbt", "kvm", "liteinst", "sabre"] {
+            for backend in ["dbt", "kvm", "liteinst", "in-guest-trap", "sabre"] {
                 let (dir, candidate) = spec_for(backend, "verify");
                 assert_ne!(dir, reference_dir);
                 assert_equalized_guest_env(&candidate.argv, &dir, tmp, jobs);
@@ -15772,8 +15779,8 @@ backends_disabled:
                 let (env, targets, argv) = guest_view(&candidate);
                 let (reference_env, reference_targets, reference_argv) = guest_view(&reference);
                 assert_eq!((env, targets), (reference_env, reference_targets));
-                assert_eq!(argv[..3], reference_argv[..3], "{backend}");
-                assert_eq!(argv[5], reference_argv[5], "{backend}");
+                assert_eq!(argv[..4], reference_argv[..4], "{backend}");
+                assert_eq!(argv[6], reference_argv[6], "{backend}");
             }
 
             // dbt refuses --mount: its adapter mounts the hermetic /test itself,
@@ -15798,6 +15805,8 @@ backends_disabled:
                     spec.argv
                 );
                 assert_eq!(spec.guest_argv[0], format!("{dir}/fixtures/program"));
+                assert_eq!(spec.guest_argv[2], format!("{dir}/xdg-config"));
+                assert_eq!(spec.guest_argv[3], format!("{dir}/xdg-config/git/config"));
             }
         }
         assert!(equalizes_guest_inputs("verify"));

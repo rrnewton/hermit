@@ -18,6 +18,8 @@ bucket: compat
 # validate.sh's run_compatibility_corpus. In an argv, `{{ROOT_DIR}}` is the
 # repository root and `{{VALIDATE_RUN_STATE}}` the validation's per-run state
 # directory; compatprep.fixtures fills its strict-compat/real-compat-fixtures.
+# `{{XDG_CONFIG_HOME}}` is the cell-owned configuration copy, equalized to
+# /tmp/e2e/xdg-config for verify and kept at its own host path for replay.
 corpus:
   description: Real program under the portable strict compatibility corpus
   lane: portable
@@ -1747,16 +1749,12 @@ corpus:
     - {label: "tty", argv: ["bash", "-c", "output=$(tty 2>&1); status=$?; printf \"%s\\n\" \"$output\"; test \"$status\" -eq 1"]}
     - {label: "nproc", argv: ["/usr/bin/nproc"]}
     - {label: "arch", argv: ["/usr/bin/arch"]}
-    # realpath and readlink -f lstat every ancestor of the path they resolve.
-    # The fixture path's ancestors include the run-state directory's parents,
-    # which in the Buck bucket sit in buck-out/v2/test/execution/hermit, a
-    # directory that grows whenever another cell starts, so the two runs of a
-    # verify saw different st_size values
-    # (https://github.com/rrnewton/hermit/issues/3971). They resolve the
-    # cell's own working directory instead, whose ancestors only that cell
-    # creates.
-    - {label: "realpath", argv: ["/usr/bin/realpath", "."]}
-    - {label: "readlink", argv: ["/usr/bin/readlink", "-f", "."]}
+    # Canonicalize a real nested file in the cell's own configuration copy.
+    # Verify binds it below private /tmp/e2e, avoiding shared Buck/run-state
+    # ancestors while retaining canonicalization and full stat comparisons.
+    # Replay names the same fixture in its own host cell directory.
+    - {label: "realpath", argv: ["/usr/bin/realpath", "{{XDG_CONFIG_HOME}}/git/config"]}
+    - {label: "readlink", argv: ["/usr/bin/readlink", "-f", "{{XDG_CONFIG_HOME}}/git/config"]}
     - {label: "mktemp", argv: ["bash", "-c", "set -euo pipefail; d=$(mktemp -d /tmp/hermit-compat.XXXXXX); test -d \"$d\"; rmdir \"$d\"; printf \"mktemp-ok\\n\""]}
     - {label: "sha256sum", argv: ["/usr/bin/sha256sum", "{{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures/README.md"]}
     - {label: "sha1sum", argv: ["/usr/bin/sha1sum", "{{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures/README.md"]}

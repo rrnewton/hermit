@@ -452,9 +452,15 @@ measured red: each stays enabled with `ci: false` and a `ci_disabled_reason`
 carrying the class's `result`, `evidence` (an issue) and `reason`. A row's
 `argv` is a `direct` argv list, run without a shell; in it `{{ROOT_DIR}}` is
 the repository root and `{{VALIDATE_RUN_STATE}}` the validation's per-run state
-directory (`$VALIDATE_RUN_STATE`). A row that names the latter is refused, not
-run with the literal text, when the variable is unset, and any other `{{...}}`
-token is refused outright.
+directory (`$VALIDATE_RUN_STATE`). A row that names the latter is refused when
+that variable is unset. `{{XDG_CONFIG_HOME}}` names the cell's prepared copy of
+`tests/e2e/xdg-config`; verify equalizes it to `/tmp/e2e/xdg-config`, while replay
+keeps the cell's host path. A caller without cell context refuses that token.
+`readlink -f` and `realpath` canonicalize its existing nested `git/config` file,
+retaining ancestor stat coverage without shared Buck or run-state ancestors.
+Rerunnable shell commands assign their prepared cell path before expanding this
+token, so an unset or unrelated ambient XDG directory cannot change the operand.
+Any other `{{...}}` token is refused outright.
 
 A verify mode may declare `no_retry_reason`: the cell then gets one attempt
 instead of the runner's retry after a product failure, so a first-attempt
