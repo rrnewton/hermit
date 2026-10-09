@@ -81,14 +81,19 @@ corpus:
   # In-guest LiteInst (https://github.com/rrnewton/hermit/issues/3745, step 1
   # of https://github.com/rrnewton/hermit/issues/3520): the full validation
   # runs a verify cell on liteinst and on in-guest-trap for each row that
-  # passed 10 of 10 verify runs on that backend in the local survey of
-  # 2026-10-08 (the manifest harness, release Hermit 84d5db7e, the maximum
-  # timeslice forced off). Unlike the lane's cell, each has the global default
-  # budget and none of the row's run-type labels, so the full validation runs
-  # it on the three sabre-compat-only rows (df-direct, lua-direct and
-  # perl-direct) too. Not switched on: python3, whose in-guest-trap cell
-  # diverged in 1 of 10 runs, and the strict-compat-only variant, which exists
-  # to run with preemption on, which the survey did not measure.
+  # passed 10 of 10 verify runs on that backend in a local survey of
+  # 2026-10-08 (the manifest harness, the maximum timeslice forced off): 43
+  # rows in the first survey (release Hermit 84d5db7e), and 20 more in the
+  # second (release Hermit 81f3e50d, with the in-guest heap-layout fix and the
+  # compat fixtures prepared, which the first survey had not done). Unlike the
+  # lane's cell, each has the global default budget and none of the row's
+  # run-type labels, so the full validation runs it on the three
+  # sabre-compat-only rows (df-direct, lua-direct and perl-direct) too. Each
+  # row left off names the failure class of its first run in the second
+  # survey; the 27 sabre-compat-only rows that survey did not run keep the
+  # first survey's result. The strict-compat-only variant stays off: it exists
+  # to run with preemption on, which neither survey measured. python3 stays
+  # off by coordinator ruling (its `disabled` entries say why).
   additional:
     - backend: liteinst
       hermit_args: [--max-timeslice=disabled]
@@ -99,24 +104,666 @@ corpus:
         (https://github.com/rrnewton/hermit/issues/3745)
       rows:
         [
-          arch, basename, bash, bracket, cal, curl, date, df-direct, dirname,
-          echo, expr, findmnt, free, getopt, groups, hostname, id, kill,
-          logname, lsirq, lsmod, lua-direct, nproc, numactl-hardware, numastat,
-          numfmt, openssl, perl-direct, pinky, printf, ps, pwd, sleep, stat,
+          arch, b2sum, base32, base64, basename, bash, bracket, cal, cat, cksum,
+          curl, date, df-direct, dirname, du, echo, expr, findmnt, free, getopt,
+          groups, head, hostname, id, kill, logname, ls, lsirq, lsmod,
+          lua-direct, md5sum, nproc, numactl-hardware, numastat, numfmt,
+          openssl, perl-direct, pinky, pr, printf, ps, pwd, readlink, realpath,
+          sha1sum, sha224sum, sha256sum, sha384sum, sha512sum, sleep, stat, sum,
           sysctl-random-uuid, test, "true", uname, uptime, users, vmstat,
-          vmstat-disk, whoami
+          vmstat-disk, wc, wc-lines, whoami
         ]
       disabled_reason: >-
         Did not pass 10 of 10 verify runs on liteinst with the maximum
-        timeslice disabled in the local survey of 2026-10-08
-        (https://github.com/rrnewton/hermit/issues/3745)
+        timeslice disabled in the first local survey of 2026-10-08, which ran
+        without the compat fixtures; the second survey did not run this
+        sabre-compat-only row (https://github.com/rrnewton/hermit/issues/3745)
       disabled:
+        seq: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        lua: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        perl: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        bc: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        tcl: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        dc: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        awk: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        sqlite3: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        jq: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        xmllint: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        shell-build: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        cargo: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        clang: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        ruby: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): a
+          guest process exited without deregistering from the in-guest runtime
+          (determinism loss) (https://github.com/rrnewton/hermit/issues/3745)
         python3: >-
-          Passed 10 of 10 verify runs on liteinst in the local survey of
-          2026-10-08, but stays off with its in-guest-trap cell, which diverged
-          in 1 of 10 (first divergence at record 10, the guest heap address of
-          the first trapped readlink;
-          https://github.com/rrnewton/hermit/issues/3745)
+          Kept off by coordinator ruling: in-guest-trap diverged in 1 of 10
+          runs before the in-guest start-up heap-layout fix; the second local
+          survey of 2026-10-08, at the fixed tree 81f3e50d, passed 10 of 10 on
+          both backends (https://github.com/rrnewton/hermit/issues/3745)
+        git: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        cmake: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        pkg-config: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        m4: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        gcc: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        "g++": >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        make: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        ar: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        as: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        ld: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        nm: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        objcopy: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        objdump: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        ranlib: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        readelf: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        size: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        strip: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        addr2line: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        "c++filt": >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        elfedit: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        gprof: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        cpp: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        gcov: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        bzip2: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        gzip: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        xz: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        zstd: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        gzip-roundtrip: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        bzip2-roundtrip: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        xz-roundtrip: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        zstd-roundtrip: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        tar-roundtrip: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        cpio-roundtrip: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        wget-localhost: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        curl-localhost: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        zip-unzip: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        sort: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        uniq: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        tr: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        cut: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        tee: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        paste: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        comm: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        join: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        find: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        file: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        env: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        printenv: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        factor: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        dd: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        df: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        ip: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        ss: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        netlink-route: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        netlink-sock-diag: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        lscpu: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        lsof: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        tty: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        mktemp: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        nl: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        expand: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        unexpand: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        xargs: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        time: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        iconv: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        stdbuf: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        nohup: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        nice: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        ionice: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        taskset: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        chrt: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        flock: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        logger: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        column: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        hexdump: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        xxd: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        strings: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        od: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        tsort: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        ptx: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        iostat: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): a
+          guest process exited without deregistering from the in-guest runtime
+          (determinism loss) (https://github.com/rrnewton/hermit/issues/3745)
+        pidstat-disk: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): a
+          guest process exited without deregistering from the in-guest runtime
+          (determinism loss) (https://github.com/rrnewton/hermit/issues/3745)
+        sar-resource-tables: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        mpstat-softirqs: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): a
+          guest process exited without deregistering from the in-guest runtime
+          (determinism loss) (https://github.com/rrnewton/hermit/issues/3745)
+        top: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        pgrep: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        pkill: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        diff: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        patch: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        grep: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        egrep: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        fgrep: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        sed: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        tar: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        cp: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        mv: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        rm: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        mkdir: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        rmdir: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        touch: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        chmod: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        chown: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        ln: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        "yes": >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        tac: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        rev: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        fold: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        fmt: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        shuf: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        csplit: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        split: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        install: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        mkfifo: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
+        cmp: >-
+          Its first verify run on liteinst failed in the second local survey
+          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
+          execve of a further program image returned EOPNOTSUPP (exec refused)
+          (https://github.com/rrnewton/hermit/issues/3745)
     - backend: in-guest-trap
       hermit_args: [--max-timeslice=disabled]
       hermit_args_reason: >-
@@ -126,23 +773,666 @@ corpus:
         (https://github.com/rrnewton/hermit/issues/3745)
       rows:
         [
-          arch, basename, bash, bracket, cal, curl, date, df-direct, dirname,
-          echo, expr, findmnt, free, getopt, groups, hostname, id, kill,
-          logname, lsirq, lsmod, lua-direct, nproc, numactl-hardware, numastat,
-          numfmt, openssl, perl-direct, pinky, printf, ps, pwd, sleep, stat,
+          arch, b2sum, base32, base64, basename, bash, bracket, cal, cat, cksum,
+          curl, date, df-direct, dirname, du, echo, expr, findmnt, free, getopt,
+          groups, head, hostname, id, kill, logname, ls, lsirq, lsmod,
+          lua-direct, md5sum, nproc, numactl-hardware, numastat, numfmt,
+          openssl, perl-direct, pinky, pr, printf, ps, pwd, readlink, realpath,
+          sha1sum, sha224sum, sha256sum, sha384sum, sha512sum, sleep, stat, sum,
           sysctl-random-uuid, test, "true", uname, uptime, users, vmstat,
-          vmstat-disk, whoami
+          vmstat-disk, wc, wc-lines, whoami
         ]
       disabled_reason: >-
         Did not pass 10 of 10 verify runs on in-guest-trap with the maximum
-        timeslice disabled in the local survey of 2026-10-08
-        (https://github.com/rrnewton/hermit/issues/3745)
+        timeslice disabled in the first local survey of 2026-10-08, which ran
+        without the compat fixtures; the second survey did not run this
+        sabre-compat-only row (https://github.com/rrnewton/hermit/issues/3745)
       disabled:
+        seq: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        lua: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        perl: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        bc: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        tcl: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        dc: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        awk: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        sqlite3: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        jq: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        xmllint: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        shell-build: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        cargo: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        clang: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        ruby: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): Hermit refused the run because no guest process reported
+          LiteInst statistics (https://github.com/rrnewton/hermit/issues/3745)
         python3: >-
-          Diverged in 1 of 10 verify runs on in-guest-trap in the local survey
-          of 2026-10-08 (repetition 8; first divergence at record 10, the guest
-          heap address of the first trapped readlink;
-          https://github.com/rrnewton/hermit/issues/3745)
+          Kept off by coordinator ruling: in-guest-trap diverged in 1 of 10
+          runs before the in-guest start-up heap-layout fix; the second local
+          survey of 2026-10-08, at the fixed tree 81f3e50d, passed 10 of 10 on
+          both backends (https://github.com/rrnewton/hermit/issues/3745)
+        git: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        cmake: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        pkg-config: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        m4: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        gcc: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        "g++": >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        make: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        ar: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        as: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        ld: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        nm: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        objcopy: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        objdump: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        ranlib: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        readelf: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        size: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        strip: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        addr2line: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        "c++filt": >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        elfedit: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        gprof: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        cpp: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        gcov: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        bzip2: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        gzip: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        xz: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        zstd: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        gzip-roundtrip: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        bzip2-roundtrip: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        xz-roundtrip: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        zstd-roundtrip: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        tar-roundtrip: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        cpio-roundtrip: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        wget-localhost: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        curl-localhost: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        zip-unzip: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        sort: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        uniq: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        tr: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        cut: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        tee: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        paste: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        comm: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        join: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        find: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        file: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        env: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        printenv: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        factor: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        dd: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        df: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        ip: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        ss: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        netlink-route: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        netlink-sock-diag: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        lscpu: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        lsof: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        tty: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        mktemp: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        nl: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        expand: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        unexpand: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        xargs: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        time: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        iconv: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        stdbuf: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        nohup: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        nice: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        ionice: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        taskset: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        chrt: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        flock: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        logger: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        column: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        hexdump: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        xxd: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        strings: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        od: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        tsort: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        ptx: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        iostat: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): Hermit refused the run because no guest process reported
+          LiteInst statistics (https://github.com/rrnewton/hermit/issues/3745)
+        pidstat-disk: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): Hermit refused the run because no guest process reported
+          LiteInst statistics (https://github.com/rrnewton/hermit/issues/3745)
+        sar-resource-tables: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        mpstat-softirqs: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): Hermit refused the run because no guest process reported
+          LiteInst statistics (https://github.com/rrnewton/hermit/issues/3745)
+        top: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        pgrep: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        pkill: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        diff: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        patch: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        grep: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        egrep: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        fgrep: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        sed: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        tar: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        cp: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        mv: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        rm: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        mkdir: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        rmdir: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        touch: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        chmod: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        chown: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        ln: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        "yes": >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        tac: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        rev: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        fold: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        fmt: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        shuf: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        csplit: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        split: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        install: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        mkfifo: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
+        cmp: >-
+          Its first verify run on in-guest-trap failed in the second local
+          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
+          prepared): execve of a further program image returned EOPNOTSUPP
+          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
   # Cells measured red on 2026-10-01 (release Hermit at 03bbb8358, through
   # this bucket): each stays enabled with ci: false and its failure class's
   # issue, so the SaBRe run type does not require it.

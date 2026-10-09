@@ -13909,16 +13909,24 @@ test:
           ptrace: true
           kvm: true
           dbt: true
+          liteinst: true
+          in-guest-trap: true
         backends_enabled:
           - ptrace
           - kvm
           - dbt
+          - liteinst
+          - in-guest-trap
         assert:
           bitwise_parity: true
         backends_disabled:
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
-          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a second local survey on 2026-10-08, with the in-guest heap-layout fix (https://github.com/rrnewton/hermit/issues/3745)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
