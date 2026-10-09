@@ -1339,8 +1339,20 @@ fi
 # effective-job-second threshold and the 16-job clamp. This local sample does
 # not replace the original n=3 hosted calibration or satisfy the >=5-sample
 # replacement rule; fresh validation is required.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 54adc5eebf40c8f407399b02dcd9ca1f62b7f157 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 54adc5eebf40c8f407399b02dcd9ca1f62b7f157 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO ae8a078ea8f68dab5cc73007fa7d56935d62f11f (2026-10-09): from
+# 54adc5eebf40c8f407399b02dcd9ca1f62b7f157. The one commit changes reverie-dbt's native client
+# (native/client.c and native/virtual_identity.h: asynchronous-I/O owners set
+# through fcntl F_SETOWN/F_SETOWN_EX and the socket ioctls FIOSETOWN/SIOCSPGRP
+# are translated from guest to host IDs and the owner queries back,
+# https://github.com/rrnewton/hermit/issues/3955) and adds reverie-dbt tests.
+# None of the seven recorded inputs changes (reverie-dbt/Cargo.toml,
+# reverie-dbt/build.rs, reverie-dbt/native/CMakeLists.txt,
+# reverie-dbt/vendor/dynamorio, third-party, the root Cargo.toml and
+# rust-toolchain.toml are byte-identical), so the DynamoRIO SDK recipe key is
+# unchanged. Carry, not recalibration: no new timing sample or >=5-sample
+# replacement claim is made.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != ae8a078ea8f68dab5cc73007fa7d56935d62f11f ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie ae8a078ea8f68dab5cc73007fa7d56935d62f11f (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
