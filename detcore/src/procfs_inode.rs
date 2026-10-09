@@ -41,12 +41,14 @@
 //! opens with the guest's own path, directory and root, and closes again
 //! ([`read_open`], [`read_close`]). The mount the object was reached through,
 //! which `statx` names, gives the mount point to take off that path and the
-//! directory of procfs it shows, once a `statx` of that mount point finds the
-//! root of the same mount there ([`path_within`]). When it cannot name a
-//! procfs entry (the mount table cannot be read, the guest has no descriptor
-//! left or no longer holds the path it named, an injected call may not have
-//! run, the object found is not the one the guest saw, or was reached through
-//! a mount the table does not list at a mount point that holds it) it numbers
+//! directory of procfs it shows, once that mount point, resolved without
+//! following a link, leads to the root of the same mount ([`path_within`],
+//! [`mount_root`]). When it cannot name a procfs entry (the mount table cannot
+//! be read, the guest has no descriptor left or no longer holds the path it
+//! named, the call named a path while the guest's threads are not
+//! sequentialized, an injected call had no effect in every attempt, the
+//! object found is not the one the guest saw, or was reached through a mount
+//! the table does not list at a mount point that holds it) it numbers
 //! the entry by its host inode and records a determinism loss, so the run is
 //! not compared.
 //!
@@ -66,6 +68,7 @@
 //!   those IDs.
 
 use std::collections::HashMap;
+use std::ffi::CStr;
 use std::ffi::CString;
 use std::ffi::OsStr;
 use std::ffi::OsString;
@@ -371,9 +374,10 @@ fn unescape(field: &[u8]) -> PathBuf {
 /// (see [`mount_root`]).
 ///
 /// That check makes the name the object's, whichever table the mount point
-/// came from. The reader reaches the root of a mount only through its one
-/// mount point, and `canonical` reads, from the same root, through that
-/// mount point and then the object's path within the mount. So a prefix of
+/// came from. Along a path that follows no link, which `mount_root` resolves
+/// the mount point as, the reader reaches the root of a mount only through
+/// its one mount point, and `canonical` reads, from the same root, through
+/// that mount point and then the object's path within the mount. So a prefix of
 /// `canonical` where the reader finds the mount is that mount point, and the
 /// rest is the path within. Without it, a mount point remembered from before
 /// a rename of a directory above it, or one read in another frame than the
@@ -535,18 +539,28 @@ struct FileIdentity {
 /// is set, as a magic link is followed: to the object it leads to, through
 /// the mount it was reached through.
 fn identify(path: &Path, follow: bool) -> io::Result<FileIdentity> {
-    let path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| io::Error::other(format!("{} contains a NUL byte", path.display())))?;
-    let mut buf = std::mem::MaybeUninit::<libc::statx>::zeroed();
-    let mask = libc::STATX_INO | libc::STATX_MNT_ID;
-    // `AT_NO_AUTOMOUNT`, which `stat` implies, so that looking never mounts
-    // anything.
+    // `AT_NO_AUTOMOUNT`, which `stat` implies, so that looking does not
+    // trigger an automount at the path's last component.
     let mut flags = libc::AT_NO_AUTOMOUNT;
     if !follow {
         flags |= libc::AT_SYMLINK_NOFOLLOW;
     }
+    identify_at(libc::AT_FDCWD, &c_path(path)?, flags)
+}
+
+/// `path` as a C string.
+fn c_path(path: &Path) -> io::Result<CString> {
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::other(format!("{} contains a NUL byte", path.display())))
+}
+
+/// The identity of the file at `path`, looked up from the directory `dirfd`
+/// with the statx flags `flags`.
+fn identify_at(dirfd: RawFd, path: &CStr, flags: i32) -> io::Result<FileIdentity> {
+    let mut buf = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    let mask = libc::STATX_INO | libc::STATX_MNT_ID;
     // SAFETY: `path` is NUL-terminated and `buf` is large enough for statx.
-    if unsafe { libc::statx(libc::AT_FDCWD, path.as_ptr(), flags, mask, buf.as_mut_ptr()) } != 0 {
+    if unsafe { libc::statx(dirfd, path.as_ptr(), flags, mask, buf.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: statx succeeded, so it filled `buf`.
@@ -565,11 +579,50 @@ fn identify(path: &Path, follow: bool) -> io::Result<FileIdentity> {
 }
 
 /// The ID of the mount whose root the path `path` leads to, as the calling
-/// thread resolves it, without following a final link or mounting anything:
-/// `None` when it leads to no mount's root, and an error when the kernel does
-/// not report mount roots.
+/// thread resolves it, without following a link anywhere in the path: `None`
+/// when it leads to no mount's root, and an error when the path holds a link,
+/// or the kernel does not report mount roots.
+///
+/// The path is resolved with `openat2`'s `RESOLVE_NO_SYMLINKS`, which refuses
+/// every link, a magic link included. A path that follows no link and holds
+/// no `..` reaches the root of a mount only through that mount's one mount
+/// point, which [`path_within`] relies on; a link can lead to the same
+/// directory along another path. The descriptor is opened `O_PATH`, which,
+/// like `stat`, does not trigger an automount at the path's last component
+/// (the lookup of an earlier component can, as any lookup's can), and must
+/// close, as for [`read_checking_close`].
 pub(crate) fn mount_root(path: &Path) -> io::Result<Option<u64>> {
-    let found = identify(path, false)?;
+    let path = c_path(path)?;
+    // SAFETY: `open_how` holds only integers, and zero is the value the
+    // kernel requires of every field this call does not set.
+    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+    how.flags = (libc::O_PATH | libc::O_CLOEXEC) as u64;
+    how.resolve = libc::RESOLVE_NO_SYMLINKS;
+    // SAFETY: `path` is NUL-terminated, and `how` is an `open_how` of the
+    // size passed. glibc has no wrapper for openat2.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            &how as *const libc::open_how,
+            std::mem::size_of::<libc::open_how>(),
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = RawFd::try_from(fd)
+        .map_err(|_| io::Error::other(format!("openat2 returned {fd}, which is no descriptor")))?;
+    let found = identify_at(fd, c"", libc::AT_EMPTY_PATH | libc::AT_NO_AUTOMOUNT);
+    // SAFETY: `fd` is the descriptor openat2 opened, and nothing else uses it.
+    if unsafe { libc::close(fd) } != 0 {
+        return Err(io::Error::other(format!(
+            "cannot close descriptor {fd}: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    let found = found?;
     match (found.mount_root, found.mount_id) {
         (Some(false), _) => Ok(None),
         (Some(true), Some(id)) => Ok(Some(id)),
@@ -580,8 +633,9 @@ pub(crate) fn mount_root(path: &Path) -> io::Result<Option<u64>> {
 }
 
 /// What a system call Detcore injected into a guest did, read from its
-/// result: it ran, and returned this; it did not run, as the result reports
-/// (`NotRun`), and may be injected again; or it failed, for this reason.
+/// result: it ran, and returned this; it had no effect, as the result
+/// reports (`NotRun`), and may be injected again; or it failed, for this
+/// reason.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Injected<T> {
     Ran(T),
@@ -589,60 +643,16 @@ pub(crate) enum Injected<T> {
     Failed(String),
 }
 
-/// The descriptor whose number is `openat`'s own system call number, which
-/// Reverie can report as the result of an `openat` that did not run (see
-/// [`read_open`]).
-pub(crate) const OPENAT_OWN_NUMBER: RawFd = libc::SYS_openat as RawFd;
-
-/// Whether the process of the guest thread `tid` holds descriptor `fd`: its
-/// `/proc/<tid>/fd/<fd>` is there, a magic link that is not followed.
-pub(crate) fn holds_descriptor(tid: i32, fd: RawFd) -> Result<bool, String> {
-    let link = format!("/proc/{tid}/fd/{fd}");
-    match std::fs::symlink_metadata(&link) {
-        Ok(_) => Ok(true),
-        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(false),
-        Err(error) => Err(format!("cannot stat {link}: {error}")),
-    }
-}
-
 /// What an `openat` Detcore injected into the guest to open an `O_PATH`
 /// descriptor did, from its result.
 ///
 /// Reverie reports an injection that a signal stopped before it ran as a
-/// restart, and an `O_PATH` open does not sleep, so `EINTR` too means that
-/// it did not run. And when the tracer runs under a seccomp filter of its
-/// own, Reverie reports an injection that a SIGTRAP stopped before it ran as
-/// returning its own system call number, which on x86_64 the result register
-/// holds until the call runs. So that number is a descriptor the call opened
-/// only when the guest did not hold that descriptor before the call
-/// (`held_before`), as an open takes the lowest free descriptor, and holds it
-/// now (`holds_now`). Were it taken for one otherwise, Detcore would read the
-/// guest's own descriptor, and then close it. Another guest thread that opens
-/// or closes that descriptor between the two looks, which thread
-/// sequentialization rules out, can mislead them.
-pub(crate) fn read_open(
-    result: Result<i64, Errno>,
-    held_before: &Result<bool, String>,
-    holds_now: impl FnOnce() -> Result<bool, String>,
-) -> Injected<RawFd> {
-    let own_number = i64::from(OPENAT_OWN_NUMBER);
+/// restart (`ERESTARTSYS`). An open that returns a restart or `EINTR` opened
+/// no descriptor, whether it ran or not (a signal can interrupt a lookup, as
+/// on FUSE), so it is tried again. Any other result is the call's own: a
+/// descriptor, or the error that refused the open.
+pub(crate) fn read_open(result: Result<i64, Errno>) -> Injected<RawFd> {
     match result {
-        Ok(fd) if fd == own_number => {
-            let unchanged = match held_before {
-                Ok(true) => Ok(true),
-                Ok(false) => holds_now().map(|holds| !holds),
-                Err(reason) => Err(reason.clone()),
-            };
-            match unchanged {
-                Ok(false) => Injected::Ran(OPENAT_OWN_NUMBER),
-                Ok(true) => Injected::NotRun(format!(
-                    "{fd}, its own number, with descriptor {fd} unchanged"
-                )),
-                Err(reason) => Injected::Failed(format!(
-                    "cannot open the guest's path again: openat returned {fd}, its own number, and cannot tell whether it ran: {reason}"
-                )),
-            }
-        }
         Ok(fd) => RawFd::try_from(fd).map_or_else(
             |_| Injected::Failed(format!("openat returned {fd}, which is no descriptor")),
             Injected::Ran,
@@ -664,16 +674,12 @@ pub(crate) fn read_open(
 /// Linux's close releases the descriptor before anything that can fail, and
 /// an `O_PATH` descriptor has nothing to flush, so a close that runs returns
 /// 0, and the descriptor is gone. A restart means that the close did not run,
-/// and so does its own system call number, as for [`read_open`]: close never
-/// returns a positive number. Any other error, `EINTR` and `EBADF` among
-/// them, is a seccomp filter the guest inherited refusing the close (or a
-/// descriptor that was not open), which leaves the descriptor open.
+/// as for [`read_open`]. Any other error, `EINTR` and `EBADF` among them, is
+/// a seccomp filter the guest inherited refusing the close (or a descriptor
+/// that was not open), which leaves the descriptor open.
 pub(crate) fn read_close(result: Result<i64, Errno>) -> Injected<()> {
     match result {
         Ok(0) => Injected::Ran(()),
-        Ok(number) if number == libc::SYS_close => {
-            Injected::NotRun(format!("{number}, its own number"))
-        }
         Ok(other) => Injected::Failed(format!(
             "close of the guest's O_PATH descriptor returned {other}, which close never returns"
         )),
@@ -1318,51 +1324,17 @@ mod tests {
         );
     }
 
-    /// Under a tracer that runs under a seccomp filter, Reverie can report an
-    /// `openat` that did not run as returning its own number. That number is
-    /// a descriptor the call opened only when the guest did not hold it
-    /// before the call and holds it after: an open takes the lowest free
-    /// descriptor.
+    /// A descriptor is the open's, whatever its number, `openat`'s own
+    /// system call number included; a restart, or `EINTR`, is an open that
+    /// opened nothing; and any other error refused the open.
     #[test]
-    fn an_open_returning_its_own_number_ran_only_if_it_took_that_descriptor() {
-        let own = i64::from(OPENAT_OWN_NUMBER);
-        let free = Ok(false);
-        let held = Ok(true);
-        let unknown = Err("cannot stat".to_string());
-        let unchanged = format!("{own}, its own number, with descriptor {own} unchanged");
+    fn an_open_ran_unless_it_reports_a_restart() {
+        let own = libc::SYS_openat;
+        for fd in [0, 3, own - 1, own, own + 1] {
+            assert_eq!(read_open(Ok(fd)), Injected::Ran(fd as RawFd));
+        }
         assert_eq!(
-            read_open(Ok(own), &free, || Ok(true)),
-            Injected::Ran(OPENAT_OWN_NUMBER)
-        );
-        assert_eq!(
-            read_open(Ok(own), &free, || Ok(false)),
-            Injected::NotRun(unchanged.clone())
-        );
-        assert_eq!(
-            read_open(Ok(own), &held, || panic!("looked again")),
-            Injected::NotRun(unchanged)
-        );
-        let uncertain = |reason: &str| {
-            Injected::Failed(format!(
-                "cannot open the guest's path again: openat returned {own}, its own number, and cannot tell whether it ran: {reason}"
-            ))
-        };
-        assert_eq!(
-            read_open(Ok(own), &unknown, || panic!("looked again")),
-            uncertain("cannot stat")
-        );
-        assert_eq!(
-            read_open(Ok(own), &free, || Err("gone".into())),
-            uncertain("gone")
-        );
-        // Any other descriptor is the call's.
-        assert_eq!(read_open(Ok(3), &held, || panic!()), Injected::Ran(3));
-        assert_eq!(
-            read_open(Ok(own + 1), &unknown, || panic!()),
-            Injected::Ran(OPENAT_OWN_NUMBER + 1)
-        );
-        assert_eq!(
-            read_open(Ok(1 << 40), &free, || panic!()),
+            read_open(Ok(1 << 40)),
             Injected::Failed(format!(
                 "openat returned {}, which is no descriptor",
                 1i64 << 40
@@ -1375,13 +1347,10 @@ mod tests {
             Errno::ERESTARTNOHAND,
             Errno::ERESTART_RESTARTBLOCK,
         ] {
-            assert_eq!(
-                read_open(Err(errno), &free, || panic!()),
-                Injected::NotRun(errno.to_string())
-            );
+            assert_eq!(read_open(Err(errno)), Injected::NotRun(errno.to_string()));
         }
         assert_eq!(
-            read_open(Err(Errno::EPERM), &free, || panic!()),
+            read_open(Err(Errno::EPERM)),
             Injected::Failed(format!(
                 "cannot open the guest's path again: {}",
                 Errno::EPERM
@@ -1389,14 +1358,18 @@ mod tests {
         );
     }
 
-    /// A close that runs returns 0. Its own number reports one that did not
-    /// run, as for `openat`, and any other number is one close never returns.
+    /// A close that runs returns 0, and a restart reports one that did not
+    /// run. Any other number, `close`'s own system call number included, is
+    /// one close never returns.
     #[test]
     fn only_a_close_returning_0_ran() {
         assert_eq!(read_close(Ok(0)), Injected::Ran(()));
         assert_eq!(
             read_close(Ok(libc::SYS_close)),
-            Injected::NotRun(format!("{}, its own number", libc::SYS_close))
+            Injected::Failed(format!(
+                "close of the guest's O_PATH descriptor returned {}, which close never returns",
+                libc::SYS_close
+            ))
         );
         assert_eq!(
             read_close(Ok(5)),
@@ -1417,19 +1390,6 @@ mod tests {
                 ))
             );
         }
-    }
-
-    #[test]
-    fn a_process_holds_the_descriptors_it_has_open() {
-        let pid = std::process::id() as i32;
-        let null = File::open("/dev/null").unwrap();
-        // A number far above those that other tests running in this process
-        // take, so that none takes it once it is closed.
-        let fd = unsafe { libc::fcntl(null.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 777) };
-        assert!(fd >= 777, "{}", io::Error::last_os_error());
-        assert_eq!(holds_descriptor(pid, fd), Ok(true));
-        assert_eq!(unsafe { libc::close(fd) }, 0);
-        assert_eq!(holds_descriptor(pid, fd), Ok(false));
     }
 
     #[test]
@@ -1473,11 +1433,24 @@ mod tests {
         assert_eq!(mount_root(&mount.mount_point).unwrap(), Some(mount_id));
         let directory = mount.mount_point.join(pid.to_string());
         assert_eq!(mount_root(&directory).unwrap(), None);
+        // A path that holds a link: a final one, and a magic link to this
+        // process's root, which leads to the same mount's root along another
+        // path. A lookup that follows it finds that root there.
+        let refused = |path: &Path| mount_root(path).map_err(|error| error.raw_os_error());
         assert_eq!(
-            mount_root(&mount.mount_point.join("self")).unwrap(),
-            None,
-            "a link that is not followed"
+            refused(&mount.mount_point.join("self")),
+            Err(Some(libc::ELOOP))
         );
+        let through_root = mount
+            .mount_point
+            .join(format!("{pid}/root"))
+            .join(mount.mount_point.strip_prefix("/").unwrap());
+        let followed = identify(&through_root, false).unwrap();
+        assert_eq!(
+            (followed.mount_root, followed.mount_id),
+            (Some(true), Some(mount_id))
+        );
+        assert_eq!(refused(&through_root), Err(Some(libc::ELOOP)));
         assert!(inspect_link(&link, stat.dev(), stat.ino() + 1).is_err());
         assert!(inspect_link(&link, stat.dev() + 1, stat.ino()).is_err());
         let cwd = PathBuf::from(format!("/proc/{pid}/cwd"));
