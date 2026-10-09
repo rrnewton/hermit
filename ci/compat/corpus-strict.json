@@ -920,7 +920,7 @@
    "label": "realpath",
    "argv": [
     "/usr/bin/realpath",
-    "{{REAL_COMPAT_FIXTURES}}/README.md"
+    "."
    ]
   },
   {
@@ -928,7 +928,7 @@
    "argv": [
     "/usr/bin/readlink",
     "-f",
-    "{{REAL_COMPAT_FIXTURES}}/README.md"
+    "."
    ]
   },
   {

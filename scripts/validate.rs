@@ -13619,8 +13619,6 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
         "ls",
         "md5sum",
         "pr",
-        "readlink",
-        "realpath",
         "sha1sum",
         "sha224sum",
         "sha256sum",
