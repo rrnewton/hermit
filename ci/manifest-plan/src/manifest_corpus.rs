@@ -1344,11 +1344,12 @@ mod tests {
     /// count its RR_COMPAT_EXPECTED guard held before ci/compat/corpus-rr.json
     /// was retired), each the replay cell of its row's own test, carrying the
     /// rr run type alone and none of the verify cell's settings, and select
-    /// the 137 that record and replay: the other 2 stay enabled with
-    /// `ci: false` and the issue of the replay divergence that fails them. A
-    /// row moved into or out of the run type, a second test for a
-    /// program, the rr run type reaching a verify cell, or an unselected cell
-    /// quietly reselected, fails here.
+    /// all 139: make and node, unselected until the rejoin log of
+    /// https://github.com/rrnewton/hermit/pull/3908 fixed their replay
+    /// (https://github.com/rrnewton/hermit/issues/3934), record and replay too.
+    /// A row moved into or out of the run type, a second test for a program,
+    /// the rr run type reaching a verify cell, or a cell quietly unselected,
+    /// fails here.
     #[test]
     fn the_replay_cells_keep_the_rr_lane_programs_and_gate_only_those_that_replay() {
         let expanded = expand_corpus(serde_yaml::from_str(COMPAT_YAML).unwrap()).unwrap();
@@ -1381,19 +1382,10 @@ mod tests {
             }
             match &replay["ci"] {
                 Value::Bool(true) => gated += 1,
-                ci => {
-                    assert_eq!(ci["ptrace"], Value::Bool(false), "{id}");
-                    let reason = &replay["ci_disabled_reason"]["ptrace"];
-                    assert_eq!(reason["result"], "replay-failure", "{id}");
-                    assert_eq!(
-                        reason["evidence"], "https://github.com/rrnewton/hermit/issues/3934",
-                        "{id}"
-                    );
-                    refused += 1;
-                }
+                _ => refused += 1,
             }
         }
-        assert_eq!((gated, refused), (137, 2));
+        assert_eq!((gated, refused), (139, 0));
     }
 
     #[test]
