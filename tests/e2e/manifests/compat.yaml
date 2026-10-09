@@ -4,10 +4,12 @@ bucket: compat
 # validation host, each run under Hermit's verify. The verify cells of the rows
 # labelled sabre-compat-only, and every row's SaBRe cell (`focused`), belong to
 # the SaBRe run type alone; the full validation runs the ptrace verify cells of
-# the other rows. The rr lane's rows also have a replay cell (`replay`) that
-# records and replays the program on ptrace, for the rr run type alone. The
-# `variants` entry repeats the strict corpus's rows as strict-<row> tests for
-# the strict run type alone, on ptrace with none of the relaxations below.
+# the other rows, and the liteinst and in-guest-trap verify cells of the rows
+# each `additional` entry names. The rr lane's rows also have a replay cell
+# (`replay`) that records and replays the program on ptrace, for the rr run
+# type alone. The `variants` entry repeats the strict corpus's rows as
+# strict-<row> tests for the strict run type alone, on ptrace with none of the
+# relaxations below.
 # The scheduled super suite still runs its four heavy rows (rustc, javac, java,
 # node) on ptrace from ci/compat/corpus-strict.json. Lane settings are stated
 # once below and every row is expanded into an ordinary test recipe
@@ -76,6 +78,71 @@ corpus:
         shell-build: >-
           Not in the SaBRe corpus this replaced (ci/compat/corpus-sabre.json
           had no shell-build row)
+  # In-guest LiteInst (https://github.com/rrnewton/hermit/issues/3745, step 1
+  # of https://github.com/rrnewton/hermit/issues/3520): the full validation
+  # runs a verify cell on liteinst and on in-guest-trap for each row that
+  # passed 10 of 10 verify runs on that backend in the local survey of
+  # 2026-10-08 (the manifest harness, release Hermit 84d5db7e, the maximum
+  # timeslice forced off). Unlike the lane's cell, each has the global default
+  # budget and none of the row's run-type labels, so the full validation runs
+  # it on the three sabre-compat-only rows (df-direct, lua-direct and
+  # perl-direct) too. Not switched on: python3, whose in-guest-trap cell
+  # diverged in 1 of 10 runs, and the strict-compat-only variant, which exists
+  # to run with preemption on, which the survey did not measure.
+  additional:
+    - backend: liteinst
+      hermit_args: [--max-timeslice=disabled]
+      hermit_args_reason: >-
+        In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption
+        timer, so these cells run with the maximum timeslice disabled; each
+        passed 10 of 10 verify runs that way in a local survey on 2026-10-08
+        (https://github.com/rrnewton/hermit/issues/3745)
+      rows:
+        [
+          arch, basename, bash, bracket, cal, curl, date, df-direct, dirname,
+          echo, expr, findmnt, free, getopt, groups, hostname, id, kill,
+          logname, lsirq, lsmod, lua-direct, nproc, numactl-hardware, numastat,
+          numfmt, openssl, perl-direct, pinky, printf, ps, pwd, sleep, stat,
+          sysctl-random-uuid, test, "true", uname, uptime, users, vmstat,
+          vmstat-disk, whoami
+        ]
+      disabled_reason: >-
+        Did not pass 10 of 10 verify runs on liteinst with the maximum
+        timeslice disabled in the local survey of 2026-10-08
+        (https://github.com/rrnewton/hermit/issues/3745)
+      disabled:
+        python3: >-
+          Passed 10 of 10 verify runs on liteinst in the local survey of
+          2026-10-08, but stays off with its in-guest-trap cell, which diverged
+          in 1 of 10 (first divergence at record 10, the guest heap address of
+          the first trapped readlink;
+          https://github.com/rrnewton/hermit/issues/3745)
+    - backend: in-guest-trap
+      hermit_args: [--max-timeslice=disabled]
+      hermit_args_reason: >-
+        In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption
+        timer, so these cells run with the maximum timeslice disabled; each
+        passed 10 of 10 verify runs that way in a local survey on 2026-10-08
+        (https://github.com/rrnewton/hermit/issues/3745)
+      rows:
+        [
+          arch, basename, bash, bracket, cal, curl, date, df-direct, dirname,
+          echo, expr, findmnt, free, getopt, groups, hostname, id, kill,
+          logname, lsirq, lsmod, lua-direct, nproc, numactl-hardware, numastat,
+          numfmt, openssl, perl-direct, pinky, printf, ps, pwd, sleep, stat,
+          sysctl-random-uuid, test, "true", uname, uptime, users, vmstat,
+          vmstat-disk, whoami
+        ]
+      disabled_reason: >-
+        Did not pass 10 of 10 verify runs on in-guest-trap with the maximum
+        timeslice disabled in the local survey of 2026-10-08
+        (https://github.com/rrnewton/hermit/issues/3745)
+      disabled:
+        python3: >-
+          Diverged in 1 of 10 verify runs on in-guest-trap in the local survey
+          of 2026-10-08 (repetition 8; first divergence at record 10, the guest
+          heap address of the first trapped readlink;
+          https://github.com/rrnewton/hermit/issues/3745)
   # Cells measured red on 2026-10-01 (release Hermit at 03bbb8358, through
   # this bucket): each stays enabled with ci: false and its failure class's
   # issue, so the SaBRe run type does not require it.

@@ -817,6 +817,88 @@ fn generated_plan_populations_preserve_command_policy() {
             .unwrap_err()
             .ends_with("result ownership differs from its expected manifest selection")
     );
+    // The portable-strict-compat-only compat step omits the in-guest cells its
+    // release build cannot run, carrying the flags after its selector, and
+    // owns exactly the other compat cells. Without the flags, or owning the
+    // in-guest cells under them, it no longer matches its selector.
+    let focused_now =
+        dagrun::select_steps_by_labels(&generated, &["portable-strict-compat-only".to_owned()])
+            .unwrap();
+    let focused_plan = ConstructedValidationPlanV10 {
+        run_id: "generated-portable-strict-compat-only-current".into(),
+        dag_json: dag_to_json(&focused_now),
+        ..current_hosted.clone()
+    };
+    let focused_cells = expected_cells
+        .iter()
+        .filter(|cell| {
+            cell.lane == "portable"
+                && cell.category == "compat"
+                && !crate::validation_dag::PORTABLE_FOCUSED_EXCLUDED_BACKENDS
+                    .contains(&cell.backend.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    // Not vacuous: the compat bucket has in-guest cells to omit.
+    assert!(
+        focused_cells.len()
+            < expected_cells
+                .iter()
+                .filter(|cell| cell.lane == "portable" && cell.category == "compat")
+                .count()
+    );
+    assert_eq!(focused_plan.planned_cells().unwrap(), focused_cells);
+    let focused_flags = crate::validation_dag::PORTABLE_FOCUSED_EXCLUDED_BACKENDS
+        .iter()
+        .map(|backend| format!(" --exclude-backend {backend}"))
+        .collect::<String>();
+    let in_guest_compat = generated
+        .steps
+        .iter()
+        .find(|step| step.tag() == "e2e.manifest_compat")
+        .unwrap()
+        .result_manifests
+        .iter()
+        .flatten()
+        .filter(|manifest| {
+            matches!(
+                manifest,
+                dagrun::model::ResultManifest::ManifestCell(cell)
+                    if cell.backend.as_deref().is_some_and(|backend| {
+                        crate::validation_dag::PORTABLE_FOCUSED_EXCLUDED_BACKENDS
+                            .contains(&backend)
+                    })
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(!in_guest_compat.is_empty());
+    for change in ["strip-flags", "own-in-guest"] {
+        let mut changed = focused_now.clone();
+        let step = changed
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "portablecompat.manifest_compat")
+            .unwrap();
+        assert_eq!(step.cmd.matches(&focused_flags).count(), 1);
+        match change {
+            "strip-flags" => step.cmd = step.cmd.replace(&focused_flags, ""),
+            _ => step
+                .result_manifests
+                .as_mut()
+                .unwrap()
+                .extend(in_guest_compat.iter().cloned()),
+        }
+        let plan = ConstructedValidationPlanV10 {
+            dag_json: dag_to_json(&changed),
+            ..focused_plan.clone()
+        };
+        let error = plan.planned_cells().unwrap_err();
+        assert!(
+            error.ends_with("result ownership differs from its expected manifest selection"),
+            "{change}: {error}"
+        );
+    }
     let pre_fold_json = pre_fold_expected_json(&expected_json);
     let pre_fold_cells = crate::validation_dag::expected_cells_from_json(&pre_fold_json)
         .unwrap()

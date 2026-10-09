@@ -30,7 +30,9 @@ Seven buckets currently contain calibrated blocking workloads:
 - `applications.yaml`
 - `c-programs.yaml` (eight calibrated Buck-derived C probes)
 - `compat.yaml` (the 189-program strict compatibility corpus, written as a
-  `corpus` section; five of its rows are diagnostics; it also holds the
+  `corpus` section; five of its rows are diagnostics; 43 of its rows also
+  have a verify cell on liteinst and on in-guest-trap that the full run type
+  runs (`additional`); it also holds the
   `sabre-compat-only` run type's SaBRe cells and its 27 extra rows, the
   `rr-compat-only` run type's 139 replay cells, and the
   `strict-compat-only` run type's 193 strict variant tests)

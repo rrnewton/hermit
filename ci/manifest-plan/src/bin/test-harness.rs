@@ -7597,15 +7597,19 @@ sys.exit(1 if failed else 0)
     /// Every committed hosted-portable `test-harness run` command parses and
     /// validates as the harness itself reads it, and names each
     /// hosted-portable excluded backend exactly once; the local steps name
-    /// none. `parse` exits the process on a repeated `--exclude-backend`, so
-    /// the flag is counted before parsing to name the offending step.
+    /// none, except the portable-strict-compat-only compat step, which names
+    /// exactly the backends its release build cannot run. `parse` exits the
+    /// process on a repeated `--exclude-backend`, so the flag is counted
+    /// before parsing to name the offending step.
     #[test]
     fn committed_hosted_portable_harness_commands_exclude_each_backend_once() {
         use hermit_manifest_plan::validation_dag::HOSTED_PORTABLE_EXCLUDED_BACKENDS;
+        use hermit_manifest_plan::validation_dag::PORTABLE_FOCUSED_EXCLUDED_BACKENDS;
         let committed = dagrun::dag_from_json(include_str!("../../../dag/validate.json"))
             .expect("actual committed graph");
         let mut hosted = 0;
         let mut local = 0;
+        let mut portable_focused = 0;
         for step in &committed.steps {
             let Some(values) = harness_run_args(&step.cmd) else {
                 continue;
@@ -7629,6 +7633,14 @@ sys.exit(1 if failed else 0)
                     "{}: {values:?}",
                     step.tag()
                 );
+            } else if step.tag() == "portablecompat.manifest_compat" {
+                portable_focused += 1;
+                assert_eq!(
+                    args.selection.exclude_backends,
+                    PORTABLE_FOCUSED_EXCLUDED_BACKENDS,
+                    "{}: {values:?}",
+                    step.tag()
+                );
             } else {
                 local += 1;
                 assert!(
@@ -7643,6 +7655,7 @@ sys.exit(1 if failed else 0)
         // (https://github.com/rrnewton/hermit/issues/3301), plus compat since
         // fold 1 of https://github.com/rrnewton/hermit/issues/3448.
         assert_eq!(hosted, 13, "hosted-portable harness steps");
+        assert_eq!(portable_focused, 1, "portable-strict-compat-only steps");
         assert!(local > hosted, "local harness steps: {local}");
     }
 
@@ -10691,6 +10704,9 @@ sys.exit(1 if failed else 0)
     fn unflip(source: &str, test: &str, mode: &str, backend: &str) -> String {
         use serde_yaml::Value;
         let mut manifest: Value = serde_yaml::from_str(source).unwrap();
+        if manifest.get("corpus").is_some() {
+            return unflip_corpus(manifest, test, mode, backend);
+        }
         let entry = manifest["test"]
             .as_sequence_mut()
             .unwrap()
@@ -10709,7 +10725,8 @@ sys.exit(1 if failed else 0)
             before,
             "{test} does not enable {backend}"
         );
-        for per_backend in ["ci", "expected_stdout", "hermit_args"] {
+        // A per-backend hermit_args_reason is keyed like hermit_args.
+        for per_backend in ["ci", "expected_stdout", "hermit_args", "hermit_args_reason"] {
             if let Some(map) = mode.get_mut(per_backend).and_then(Value::as_mapping_mut) {
                 map.remove(backend);
             }
@@ -10731,6 +10748,49 @@ sys.exit(1 if failed else 0)
             backend.into(),
             "un-flipped by the sync-cells round-trip test".into(),
         );
+        serde_yaml::to_string(&manifest).unwrap()
+    }
+
+    /// A corpus manifest's cell flip on an additional backend is the row's
+    /// label in that backend's `additional` entry, so the reverse takes the
+    /// label out of it, and the entry out of the list once it names no row.
+    fn unflip_corpus(
+        mut manifest: serde_yaml::Value,
+        test: &str,
+        mode: &str,
+        backend: &str,
+    ) -> String {
+        use serde_yaml::Value;
+        assert_eq!(mode, "verify", "{test}: a corpus flip is a verify cell");
+        let suffix = test.split_once('/').map_or(test, |(_, suffix)| suffix);
+        let label = manifest["corpus"]["rows"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .find(|row| {
+                row.get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| row["label"].as_str().unwrap())
+                    == suffix
+            })
+            .unwrap_or_else(|| panic!("{test} is no corpus row"))["label"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let entries = manifest["corpus"]["additional"]
+            .as_sequence_mut()
+            .unwrap_or_else(|| panic!("{test}: the corpus has no additional backend"));
+        let entry = entries
+            .iter_mut()
+            .find(|entry| entry["backend"].as_str() == Some(backend))
+            .unwrap_or_else(|| panic!("{test}: {backend} is no additional backend"));
+        let rows = entry["rows"].as_sequence_mut().unwrap();
+        let before = rows.len();
+        rows.retain(|row| row.as_str() != Some(label.as_str()));
+        assert_eq!(rows.len() + 1, before, "{test} does not enable {backend}");
+        if rows.is_empty() {
+            entries.retain(|entry| entry["backend"].as_str() != Some(backend));
+        }
         serde_yaml::to_string(&manifest).unwrap()
     }
 

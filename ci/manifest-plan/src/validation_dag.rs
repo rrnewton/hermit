@@ -325,15 +325,38 @@ const HOSTED_PORTABLE_EXCLUSION_GENERATIONS: &[&[&str]] =
 /// exclusion. Only a hosted-portable step whose harness selector carries the
 /// exact exclusion flags of one generation omits that generation's backends; a
 /// plan retained before any exclusion has neither the flags nor the omission,
-/// and keeps reading as before.
+/// and keeps reading as before. The flags follow the bucket's whole selector,
+/// as the generator writes them: `--prebuilt` for most buckets, and
+/// `--diagnostic-results` for the compat bucket, whose selector ends there.
 pub(crate) fn hosted_step_omits_backend(step: &Step, backend: &str) -> bool {
+    let anchor = step.manifest.as_ref().map_or("--prebuilt", |manifest| {
+        manifest_selector_flags(&manifest.category)
+    });
     step.labels == [HOSTED_PORTABLE_LABEL]
         && HOSTED_PORTABLE_EXCLUSION_GENERATIONS
             .iter()
             .any(|excluded| {
                 excluded.contains(&backend)
-                    && carries_exclusion_once(&step.cmd, excluded, "--prebuilt", " ")
+                    && carries_exclusion_once(&step.cmd, excluded, anchor, " ")
             })
+}
+
+/// Whether constructed `step` omits `backend`'s cells: under the
+/// hosted-portable exclusion ([`hosted_step_omits_backend`]), or as the
+/// portable-strict-compat-only compat step that carries exactly the
+/// [`PORTABLE_FOCUSED_EXCLUDED_BACKENDS`] flags after its selector. A plan
+/// retained before that step carried the flags owns every compat cell of its
+/// own expected plan and keeps reading as before.
+pub(crate) fn step_omits_backend(step: &Step, backend: &str) -> bool {
+    hosted_step_omits_backend(step, backend)
+        || (step.tag() == PORTABLE_FOCUSED_COMPAT_TAG
+            && PORTABLE_FOCUSED_EXCLUDED_BACKENDS.contains(&backend)
+            && carries_exclusion_once(
+                &step.cmd,
+                PORTABLE_FOCUSED_EXCLUDED_BACKENDS,
+                manifest_selector_flags("compat"),
+                " ",
+            ))
 }
 
 /// Whether `cmd` carries the current hosted-portable exclusion flags exactly
@@ -957,6 +980,28 @@ pub fn manifest_run_type(tag: &str) -> Option<&'static str> {
 /// The release Hermit compatprep.hermit_release_in_pinned_root builds, as the
 /// host sees it: the pinned root's /src/target is ignored/hermetic/split/target.
 pub const PORTABLE_FOCUSED_HERMIT_BIN: &str = "ignored/hermetic/split/target/release/hermit";
+
+/// The step that runs the compat bucket for the portable-strict-compat-only
+/// run type against [`PORTABLE_FOCUSED_HERMIT_BIN`].
+const PORTABLE_FOCUSED_COMPAT_TAG: &str = "portablecompat.manifest_compat";
+
+/// Backends whose cells [`PORTABLE_FOCUSED_COMPAT_TAG`] omits with
+/// `--exclude-backend`. Its release build, `cargo build --release -p hermit
+/// --features third-party-backends`, does not build the in-guest Detcore
+/// runtime (libdetcore_liteinst.so, the separate detcore-liteinst package)
+/// that the `liteinst` and `in-guest-trap` backends load, so each of their
+/// cells would end backend-unavailable. The run type stays what it was, the
+/// corpus's ptrace cells under one release build; the full and portable
+/// profiles run the in-guest cells (e2e.manifest_compat, whose e2e artifact
+/// ships the runtime). The step's owned results and the run type's expected
+/// population omit the same backends.
+pub const PORTABLE_FOCUSED_EXCLUDED_BACKENDS: &[&str] = &["liteinst", "in-guest-trap"];
+
+fn portable_focused_excludes(cell: &DagManifest) -> bool {
+    cell.backend
+        .as_deref()
+        .is_some_and(|backend| PORTABLE_FOCUSED_EXCLUDED_BACKENDS.contains(&backend))
+}
 
 fn runs_in_pinned_root(step: &Step) -> bool {
     !is_hosted_variant(step)
@@ -2452,10 +2497,12 @@ fn attach_result_ownership(cfg: &mut DagConfig, cells: &Populations) {
             .filter(|manifest| matches!(manifest, ResultManifest::StructuredTestResults(_)))
             .collect::<Vec<_>>();
         let hosted_portable = step.labels == [HOSTED_PORTABLE_LABEL];
+        let portable_focused = step.tag() == PORTABLE_FOCUSED_COMPAT_TAG;
         let mut owned = cells
             .owned_by(step)
             .into_iter()
             .filter(|cell| !(hosted_portable && hosted_portable_excludes(cell)))
+            .filter(|cell| !(portable_focused && portable_focused_excludes(cell)))
             .cloned()
             .collect::<Vec<_>>();
         if step.tag() == "quick.e2e_verify" {
@@ -2827,8 +2874,13 @@ fn expected_for_label<'a>(label: &str, cells: &'a [DagManifest]) -> Vec<&'a DagM
             HOSTED_PRIVILEGED_LABEL => cell.lane == "privileged",
             "privileged" => cell.lane == "privileged",
             "quick" => quick_verify_cell(cell),
-            // The corpus-only run type runs exactly the strict compatibility bucket.
-            "portable-strict-compat-only" => cell.lane == "portable" && cell.category == "compat",
+            // The corpus-only run type runs exactly the strict compatibility
+            // bucket, without the backends its release build cannot run.
+            "portable-strict-compat-only" => {
+                cell.lane == "portable"
+                    && cell.category == "compat"
+                    && !portable_focused_excludes(cell)
+            }
             "super" => false,
             // The import twins own every cell, as the cargo buckets do in full.
             FULL_BUCK_E2E_LABEL => true,
@@ -4014,7 +4066,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     if let Some(step) = cfg
         .steps
         .iter()
-        .find(|step| step.tag() == "portablecompat.manifest_compat")
+        .find(|step| step.tag() == PORTABLE_FOCUSED_COMPAT_TAG)
     {
         if step.env.get("HERMIT_BIN").map(String::as_str) != Some(PORTABLE_FOCUSED_HERMIT_BIN)
             || !step
@@ -4024,6 +4076,19 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
         {
             return Err(format!(
                 "portablecompat.manifest_compat must run HERMIT_BIN={PORTABLE_FOCUSED_HERMIT_BIN}, the pinned-root release build, after portablecompatprep.fixtures"
+            ));
+        }
+        // Its owned results omit the backends that build cannot run, so its
+        // selector must omit the same ones, exactly once.
+        if !carries_exclusion_once(
+            &step.cmd,
+            PORTABLE_FOCUSED_EXCLUDED_BACKENDS,
+            manifest_selector_flags("compat"),
+            " ",
+        ) {
+            return Err(format!(
+                "portablecompat.manifest_compat must carry `{}` exactly once, directly after its selector",
+                exclusion_flags(PORTABLE_FOCUSED_EXCLUDED_BACKENDS).trim_start()
             ));
         }
     }
