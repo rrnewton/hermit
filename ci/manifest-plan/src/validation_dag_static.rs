@@ -927,7 +927,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_futex_wake_yields_under_replay_too,
     // futex_wake_yields_never_enters_the_legacy_form} (lane qemu-rcb,
     // https://github.com/rrnewton/hermit/issues/3874) retain all 1015: 1018.
-    ("test.regular_crates", 1018),
+    // config::tests::inherited_seccomp_never_enters_the_legacy_form,
+    // config::tests::inherited_seccomp_round_trips_through_reverie_bincode and
+    // config::tests::inherited_seccomp_is_read_from_a_status_file (detcore-model)
+    // retain all 1018: 1021, listed with this node's arguments.
+    ("test.regular_crates", 1021),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1669,8 +1673,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_path_linux_marks_deleted_names_nothing,
     // a_procfs_object_is_told_by_its_filesystem_type} (entries of exited tasks
     // and procfs files outside the guest's mounts) retain all 1235: 1238.
+    // procfs_inode::tests::a_failed_host_call_leaves_the_callers_errno (the
+    // guest's errno under SaBRe) retains all 1238: 1239.
     // The poll-deadline wake (https://github.com/rrnewton/hermit/issues/3952)
-    // adds eleven, retaining all 1238: 1249. scheduler::runqueue::tests::
+    // adds eleven, retaining all 1239: 1250. scheduler::runqueue::tests::
     // {restore_poller_priority_moves_one_poller_to_the_back_of_its_level,
     // only_first_entry_heuristics_are_priority_ordered,
     // a_deadline_restored_poller_counts_as_a_poller_until_it_runs,
@@ -1682,7 +1688,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the_controlled_loop_restores_a_poller_whose_deadline_a_refresh_crosses,
     // a_deadline_restored_poller_gates_a_held_sigchld_as_while_backed_off,
     // a_deadline_restored_poller_gates_a_finished_background_call_as_while_backed_off}.
-    ("test.detcore_unit", 1249),
+    ("test.detcore_unit", 1250),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1744,7 +1750,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_close_that_a_filter_refuses_ends_in_a_determinism_loss}
     // (keys decided with the snapshot; the O_PATH descriptor is closed or the
     // run records a loss) retain all 97 (measured 100).
-    ("test.detcore_misc", 100),
+    // procfs_inode::naming_an_entry_leaves_the_guests_errno (the guest's errno
+    // under SaBRe) retains all 100 (measured 101).
+    ("test.detcore_misc", 101),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -2385,8 +2393,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     // The host node carries the identical tests_misc selection.
     // And the same futex wake-order guest test: 89.
-    // And the same procfs inode guest tests: 100.
-    ("test.detcore_misc_on_host", 100),
+    // And the same procfs inode guest tests: 101.
+    ("test.detcore_misc_on_host", 101),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -2484,8 +2492,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the three tests of naming procfs entries through the guest: 1233.
     // And the two tests of where procfs entries are named: 1235.
     // And the three tests of exited tasks and outside procfs files: 1238.
-    // And the eleven poll-deadline tests: 1249.
-    ("test.detcore_unit_on_host", 1249),
+    // And the errno test: 1239.
+    // And the eleven poll-deadline tests: 1250.
+    ("test.detcore_unit_on_host", 1250),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -2692,7 +2701,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Less the same seven retired-parity tests: 1011.
     // And the same four corpus additional-backend tests: 1015.
     // And the same three futex-wake config tests: 1018.
-    ("test.regular_crates_on_host", 1018),
+    // And the three detcore-model inherited_seccomp tests: 1021.
+    ("test.regular_crates_on_host", 1021),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

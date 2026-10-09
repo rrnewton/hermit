@@ -420,12 +420,38 @@ impl DirectoryInodes {
     }
 }
 
+/// Runs `work`, and then puts back the calling thread's `errno` as it was.
+/// Under SaBRe, Detcore shares libc, and so `errno`, with the guest thread
+/// whose call it handles, so a host call of its own that fails, such as a
+/// descriptor lookup that finds nothing, would otherwise change the `errno`
+/// the guest reads after its call returns.
+pub(crate) async fn preserving_errno<F: std::future::Future>(work: F) -> F::Output {
+    let saved = nix::errno::Errno::last_raw();
+    let output = work.await;
+    nix::errno::Errno::set_raw(saved);
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs::File;
     use std::os::fd::AsRawFd;
 
     use super::*;
+
+    /// A host call that fails inside `preserving_errno` leaves the caller's
+    /// `errno`, which under SaBRe is the guest's, as it was.
+    #[test]
+    fn a_failed_host_call_leaves_the_callers_errno() {
+        const SENTINEL: i32 = 4242;
+        nix::errno::Errno::set_raw(SENTINEL);
+        let inside = futures::executor::block_on(preserving_errno(async {
+            assert!(std::fs::symlink_metadata("/proc/self/fd/-1").is_err());
+            nix::errno::Errno::last_raw()
+        }));
+        assert_eq!(inside, libc::ENOENT, "the failed call set errno");
+        assert_eq!(nix::errno::Errno::last_raw(), SENTINEL);
+    }
 
     const PROC_DEVICE: u64 = libc::makedev(0, 23);
 

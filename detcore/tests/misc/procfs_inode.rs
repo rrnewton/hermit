@@ -457,6 +457,34 @@ fn rest_of_listing(directory: &File) -> std::collections::HashMap<String, u64> {
     }
 }
 
+/// Under SaBRe, Detcore shares libc, and so `errno`, with the guest thread
+/// whose call it handles, so naming an entry must leave the guest's `errno`
+/// as it was. These tests run Detcore under ptrace, in another process,
+/// where it cannot change it, so this pins the guest's view; Detcore's unit
+/// tests pin the guard itself.
+#[test]
+fn naming_an_entry_leaves_the_guests_errno() {
+    under_detcore(|| {
+        const SENTINEL: i32 = 4242;
+        let path = CString::new("/proc/self/stat").unwrap();
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        unsafe { *libc::__errno_location() = SENTINEL };
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_newfstatat,
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        let errno = unsafe { *libc::__errno_location() };
+        assert_eq!(result, 0, "newfstatat failed");
+        assert_eq!(errno, SENTINEL, "naming the entry changed errno");
+    });
+    assert_eq!(detcore::detlog::determinism_loss(), None);
+}
+
 /// The descriptor the `O_PATH` open that names a procfs path gets in the
 /// filter tests: the lowest free one once the guest fills those below it.
 #[cfg(target_arch = "x86_64")]

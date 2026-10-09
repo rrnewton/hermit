@@ -8209,6 +8209,10 @@ impl RunOpts {
         }
 
         let mut config = self.effective_det_config();
+        // The guest inherits this thread's seccomp filters, as Hermit installs
+        // none besides the backend's own, and the only `pre_exec` callback of
+        // its command, above, installs none either.
+        config.inherited_seccomp = detcore::InheritedSeccomp::measure();
         config.mountinfo_root_rewrites = identity_sources
             .map(IdentityGuard::mountinfo_root_rewrites)
             .transpose()?
@@ -8322,6 +8326,10 @@ impl RunOpts {
         let command = self.guest_command()?;
 
         let mut config = self.effective_det_config();
+        // The guest inherits this thread's seccomp filters, as Hermit installs
+        // none besides the backend's own, and its command has no `pre_exec`
+        // callback.
+        config.inherited_seccomp = detcore::InheritedSeccomp::measure();
         config.mountinfo_root_rewrites = identity_sources
             .map(IdentityGuard::mountinfo_root_rewrites)
             .transpose()?

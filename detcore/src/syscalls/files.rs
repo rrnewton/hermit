@@ -4252,7 +4252,29 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// has no `/proc`. Nor when the guest's thread IDs do not name host tasks
     /// (see [`procfs_inode::guest_tids_name_host_tasks`]), as there is then no
     /// `/proc/<tid>` to read.
+    ///
+    /// Naming a path injects an `openat` and a `close` into the guest, and
+    /// Detcore trusts the host kernel to run them as Linux defines them. A
+    /// seccomp filter the guest inherited from whatever started it (which
+    /// `Config::inherited_seccomp` records) may refuse them with an error,
+    /// such as `EPERM`, and Detcore then names nothing and records a
+    /// determinism loss. A filter, or a user-space supervisor
+    /// (`SECCOMP_RET_USER_NOTIF`), that returns a result without running the
+    /// call stands in for the kernel, which Detcore does not support.
+    ///
+    /// The guest's `errno` is what it was: under SaBRe, Detcore shares libc,
+    /// and so `errno`, with the guest thread it handles (see
+    /// [`procfs_inode::preserving_errno`]).
     async fn procfs_entry<G: Guest<Self>>(
+        guest: &mut G,
+        stat: &DetStat,
+        target: StatTarget<'_>,
+    ) -> ProcfsEntry {
+        procfs_inode::preserving_errno(Self::name_procfs_entry(guest, stat, target)).await
+    }
+
+    /// [`Self::procfs_entry`], which restores the guest's `errno` afterwards.
+    async fn name_procfs_entry<G: Guest<Self>>(
         guest: &mut G,
         stat: &DetStat,
         target: StatTarget<'_>,
