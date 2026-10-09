@@ -4325,10 +4325,27 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return ProcfsEntry::Unknown;
             }
         };
-        match Self::procfs_canonical_path(guest, stat, target).await {
-            Ok(canonical) => ProcfsEntry::At(procfs_inode::path_within(&mounts, &canonical)),
+        let (canonical, mount_id) = match Self::procfs_canonical_path(guest, stat, target).await {
+            Ok(found) => found,
             Err(reason) => {
                 Self::record_procfs_loss(guest, reason).await;
+                return ProcfsEntry::Unnamed;
+            }
+        };
+        match procfs_inode::path_within(&mounts, mount_id, &canonical) {
+            Some(within) => ProcfsEntry::At(within),
+            // The guest reached the file through a mount that the table, as
+            // Detcore read it, does not list above the file: one outside the
+            // guest's root, or one that appeared since.
+            None => {
+                Self::record_procfs_loss(
+                    guest,
+                    format!(
+                        "{} was reached through mount {mount_id}, which the guest's mount table does not list as a procfs mount above it",
+                        canonical.display()
+                    ),
+                )
+                .await;
                 ProcfsEntry::Unnamed
             }
         }
@@ -4337,14 +4354,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// The canonical path of the procfs file `stat` describes, which the
     /// guest named as `target`, from a magic link to it (see
     /// [`Self::with_object_link`]), if that is still the file `stat`
-    /// describes. An entry the host rebuilt between the guest's stat and an
-    /// `O_PATH` open, a window of one injected call, is not, and goes
-    /// unnamed.
+    /// describes, and the ID of the mount it was reached through. An entry
+    /// the host rebuilt between the guest's stat and an `O_PATH` open, a
+    /// window of one injected call, is not, and goes unnamed.
     async fn procfs_canonical_path<G: Guest<Self>>(
         guest: &mut G,
         stat: &DetStat,
         target: StatTarget<'_>,
-    ) -> Result<PathBuf, String> {
+    ) -> Result<(PathBuf, u64), String> {
         Self::with_object_link(guest, target, |link| {
             procfs_inode::inspect_link(link, stat.dev, stat.inode)
         })
@@ -4422,48 +4439,35 @@ impl<T: RecordOrReplay> Detcore<T> {
         ))
     }
 
-    /// Close the `O_PATH` descriptor `fd` that Detcore opened in the guest,
-    /// and confirm through the guest thread's `/proc/<tid>/fd` that it is
-    /// gone, as a seccomp filter the guest inherited can refuse the close,
-    /// with `EPERM`, say, without running it. A descriptor left open would
-    /// change the numbers the guest's later descriptors take, so it is an
-    /// error. A restart means that the close did not run (Linux's
-    /// close releases the descriptor first, and so turns its own restarts
-    /// into `EINTR`), so it is tried again, but only
-    /// `OBJECT_DESCRIPTOR_ATTEMPTS` times. Without thread sequentialization,
-    /// another guest thread can take the number as soon as it is free, which
-    /// reads as a descriptor left open.
+    /// Close the `O_PATH` descriptor `fd` that Detcore opened in the guest.
+    /// Linux's close releases the descriptor before anything that can fail,
+    /// and an `O_PATH` descriptor has nothing to flush, so a close that runs
+    /// returns 0, and the descriptor is gone. A restart means that the close
+    /// did not run, so it is tried again, but only
+    /// `OBJECT_DESCRIPTOR_ATTEMPTS` times. Any other error, `EINTR` and
+    /// `EBADF` among them, is a seccomp filter the guest inherited refusing
+    /// the close (or a descriptor that was not open), which leaves the
+    /// descriptor open, where it changes the numbers the guest's later
+    /// descriptors take, so it is an error.
     async fn close_object_descriptor<G: Guest<Self>>(
         guest: &mut G,
         fd: RawFd,
     ) -> Result<(), String> {
-        let link = format!("/proc/{}/fd/{fd}", guest.tid().as_raw());
         let close = syscalls::Close::new().with_fd(fd);
         for _ in 0..OBJECT_DESCRIPTOR_ATTEMPTS {
-            let result = guest.inject(close).await;
-            if result == Err(Errno::EBADF) {
-                return Err("close of the guest's O_PATH descriptor returned EBADF".into());
-            }
-            match std::fs::symlink_metadata(&link) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-                Err(error) => {
+            match guest.inject(close).await {
+                Ok(_) => return Ok(()),
+                Err(
+                    Errno::ERESTARTSYS
+                    | Errno::ERESTARTNOINTR
+                    | Errno::ERESTARTNOHAND
+                    | Errno::ERESTART_RESTARTBLOCK,
+                ) => {}
+                Err(errno) => {
                     return Err(format!(
-                        "cannot tell whether close released the guest's O_PATH descriptor: {error}"
+                        "close of the guest's O_PATH descriptor returned {errno:?}"
                     ));
                 }
-                Ok(_) => match result {
-                    Err(
-                        Errno::ERESTARTSYS
-                        | Errno::ERESTARTNOINTR
-                        | Errno::ERESTARTNOHAND
-                        | Errno::ERESTART_RESTARTBLOCK,
-                    ) => {}
-                    result => {
-                        return Err(format!(
-                            "close left the guest's O_PATH descriptor open, returning {result:?}"
-                        ));
-                    }
-                },
             }
         }
         Err(format!(

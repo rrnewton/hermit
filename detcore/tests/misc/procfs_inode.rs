@@ -557,41 +557,47 @@ const ERESTARTSYS: u32 = 512;
 #[cfg(target_arch = "x86_64")]
 const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
 
-/// Make `close(FILTERED_FD)` return `-errno` without running, in this thread
-/// and the processes it forks, as a seccomp filter a guest inherits from
-/// whatever started it can. Detcore refuses a guest's own `seccomp(2)`.
+/// A BPF instruction that loads the 32-bit word at `offset` in seccomp data:
+/// the system call number at 0, its `arch` at 4, and the low half of
+/// argument `n` at 16 + 8n.
 #[cfg(target_arch = "x86_64")]
-fn filter_close(errno: u32) {
-    let load = |offset: u32| libc::sock_filter {
+fn load(offset: u32) -> libc::sock_filter {
+    libc::sock_filter {
         code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
         jt: 0,
         jf: 0,
         k: offset,
-    };
-    let jump_if = |value: u32, jt: u8, jf: u8| libc::sock_filter {
-        code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+    }
+}
+
+/// A BPF jump past `jt` instructions when `test` (`BPF_JEQ` or `BPF_JSET`)
+/// holds for the loaded word and `value`, and past `jf` when it does not.
+#[cfg(target_arch = "x86_64")]
+fn jump(test: u32, value: u32, jt: u8, jf: u8) -> libc::sock_filter {
+    libc::sock_filter {
+        code: (libc::BPF_JMP | test | libc::BPF_K) as u16,
         jt,
         jf,
         k: value,
-    };
-    let ret = |action: u32| libc::sock_filter {
+    }
+}
+
+/// A BPF instruction that ends the filter with `action`.
+#[cfg(target_arch = "x86_64")]
+fn ret(action: u32) -> libc::sock_filter {
+    libc::sock_filter {
         code: (libc::BPF_RET | libc::BPF_K) as u16,
         jt: 0,
         jf: 0,
         k: action,
-    };
-    // seccomp_data: nr at 0, arch at 4, and the low half of args[0] at 16.
-    let mut program = [
-        load(4),
-        jump_if(AUDIT_ARCH_X86_64, 1, 0),
-        ret(libc::SECCOMP_RET_ALLOW),
-        load(0),
-        jump_if(libc::SYS_close as u32, 0, 3),
-        load(16),
-        jump_if(FILTERED_FD as u32, 0, 1),
-        ret(libc::SECCOMP_RET_ERRNO | errno),
-        ret(libc::SECCOMP_RET_ALLOW),
-    ];
+    }
+}
+
+/// Install `program` as a seccomp filter of this thread, which the threads
+/// and processes it starts inherit, as a guest inherits a filter from
+/// whatever started it. Detcore refuses a guest's own `seccomp(2)`.
+#[cfg(target_arch = "x86_64")]
+fn install_filter(program: &mut [libc::sock_filter]) {
     let fprog = libc::sock_fprog {
         len: program.len() as u16,
         filter: program.as_mut_ptr(),
@@ -611,13 +617,54 @@ fn filter_close(errno: u32) {
     assert_eq!(installed, 0, "seccomp: {}", std::io::Error::last_os_error());
 }
 
-/// Run a guest that fills the descriptors below `FILTERED_FD`, so that the
-/// `O_PATH` descriptor Detcore opens to name a procfs path takes it, and then
-/// stats a procfs path. The filter leaves that descriptor open in the guest,
-/// so the run must record a determinism loss, and must end.
+/// Make `close(FILTERED_FD)` return `-errno` without running.
 #[cfg(target_arch = "x86_64")]
-fn stat_a_procfs_path_with_close_filtered(errno: u32) -> Option<String> {
-    filter_close(errno);
+fn filter_close(errno: u32) {
+    install_filter(&mut [
+        load(4),
+        jump(libc::BPF_JEQ, AUDIT_ARCH_X86_64, 1, 0),
+        ret(libc::SECCOMP_RET_ALLOW),
+        load(0),
+        jump(libc::BPF_JEQ, libc::SYS_close as u32, 0, 3),
+        load(16),
+        jump(libc::BPF_JEQ, FILTERED_FD as u32, 0, 1),
+        ret(libc::SECCOMP_RET_ERRNO | errno),
+        ret(libc::SECCOMP_RET_ALLOW),
+    ]);
+}
+
+/// Make `close(FILTERED_FD)` fail with `EPERM` without running, and every
+/// `statx` that does not follow a final link, as `std::fs::symlink_metadata`
+/// stats, fail with `ENOENT`. Both block a call; neither reports a result
+/// for a call that did not run.
+#[cfg(target_arch = "x86_64")]
+fn filter_close_and_lstat() {
+    install_filter(&mut [
+        load(4),
+        jump(libc::BPF_JEQ, AUDIT_ARCH_X86_64, 1, 0),
+        ret(libc::SECCOMP_RET_ALLOW),
+        load(0),
+        jump(libc::BPF_JEQ, libc::SYS_close as u32, 0, 3),
+        load(16),
+        jump(libc::BPF_JEQ, FILTERED_FD as u32, 0, 5),
+        ret(libc::SECCOMP_RET_ERRNO | libc::EPERM as u32),
+        jump(libc::BPF_JEQ, libc::SYS_statx as u32, 0, 3),
+        load(32),
+        jump(libc::BPF_JSET, libc::AT_SYMLINK_NOFOLLOW as u32, 0, 1),
+        ret(libc::SECCOMP_RET_ERRNO | libc::ENOENT as u32),
+        ret(libc::SECCOMP_RET_ALLOW),
+    ]);
+}
+
+/// Install the seccomp filter `filter` installs, then run a guest that fills
+/// the descriptors below `FILTERED_FD`, so that the `O_PATH` descriptor
+/// Detcore opens to name a procfs path takes it, and then stats a procfs
+/// path, following the link as `std::fs::metadata` does. The filter leaves
+/// that descriptor open in the guest, so the run must record a determinism
+/// loss, and must end.
+#[cfg(target_arch = "x86_64")]
+fn stat_a_procfs_path_with_close_filtered(filter: impl FnOnce()) -> Option<String> {
+    filter();
     under_detcore(|| {
         let open = |fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0;
         assert!(!open(FILTERED_FD), "{FILTERED_FD} is open from the start");
@@ -632,7 +679,7 @@ fn stat_a_procfs_path_with_close_filtered(errno: u32) -> Option<String> {
             FILTERED_FD - 1,
             "a descriptor below {FILTERED_FD} was free"
         );
-        std::fs::symlink_metadata("/proc/self/stat").unwrap();
+        std::fs::metadata("/proc/self/stat").unwrap();
         assert!(open(FILTERED_FD), "Detcore's O_PATH descriptor was closed");
     });
     detcore::detlog::determinism_loss()
@@ -645,7 +692,7 @@ fn stat_a_procfs_path_with_close_filtered(errno: u32) -> Option<String> {
 #[test]
 fn a_close_that_never_runs_ends_in_a_determinism_loss() {
     in_its_own_process("a_close_that_never_runs_ends_in_a_determinism_loss", || {
-        let loss = stat_a_procfs_path_with_close_filtered(ERESTARTSYS);
+        let loss = stat_a_procfs_path_with_close_filtered(|| filter_close(ERESTARTSYS));
         assert_eq!(
             loss.as_deref(),
             Some(
@@ -656,20 +703,39 @@ fn a_close_that_never_runs_ends_in_a_determinism_loss() {
 }
 
 /// A close that a filter refuses, as a filter that blocks a call does, leaves
-/// the descriptor open, which Detcore sees in `/proc/<tid>/fd`, where it had
-/// taken the descriptor as closed whatever close returned.
+/// the descriptor open, which Detcore learns from the error close returns,
+/// where it had taken the descriptor as closed whatever close returned.
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn a_close_that_a_filter_refuses_ends_in_a_determinism_loss() {
     in_its_own_process(
         "a_close_that_a_filter_refuses_ends_in_a_determinism_loss",
         || {
-            let loss = stat_a_procfs_path_with_close_filtered(libc::EPERM as u32);
+            let loss = stat_a_procfs_path_with_close_filtered(|| filter_close(libc::EPERM as u32));
             assert_eq!(
                 loss.as_deref(),
-                Some(
-                    "procfs inode numbers: close left the guest's O_PATH descriptor open, returning Err(EPERM)"
-                )
+                Some("procfs inode numbers: close of the guest's O_PATH descriptor returned EPERM")
+            );
+        },
+    );
+}
+
+/// A close that a filter refuses leaves the descriptor open, whatever a
+/// later look at the guest's descriptors finds. Here a filter also makes a
+/// no-follow `statx` report that nothing is there. The tracer's threads start
+/// under it, as Detcore's own calls run under the guest's filter under SaBRe,
+/// and a look at `/proc/<tid>/fd/<n>` after the refused close had then taken
+/// the descriptor as closed and recorded no loss.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn a_refused_close_ends_in_a_determinism_loss_whatever_a_lookup_says() {
+    in_its_own_process(
+        "a_refused_close_ends_in_a_determinism_loss_whatever_a_lookup_says",
+        || {
+            let loss = stat_a_procfs_path_with_close_filtered(filter_close_and_lstat);
+            assert_eq!(
+                loss.as_deref(),
+                Some("procfs inode numbers: close of the guest's O_PATH descriptor returned EPERM")
             );
         },
     );
