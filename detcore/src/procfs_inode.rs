@@ -29,7 +29,9 @@
 //! never seen, reached by a path it has seen, is that path's entry rebuilt,
 //! and takes the path's number. A path key only ever leads to a host key; it
 //! numbers nothing itself. A task ID that a new thread reuses names a new
-//! task, whose entries are new files ([`with_incarnation`]).
+//! task, whose entries are new files ([`with_incarnation`]), and an entry a
+//! directory snapshot lists names the tasks that held its IDs when the
+//! snapshot was taken ([`ProcfsName::in_snapshot`]).
 //!
 //! Detcore names an entry only once the guest's mount table says its device
 //! is a procfs mount ([`procfs_mounts`]), and reads its canonical path from a
@@ -55,8 +57,11 @@
 //!   it.
 //! - `get_next_ino` wraps at 2^32, so a directory other than a procfs root can
 //!   have inode 1, and has its link count reported as 1.
-//! - Under a backend whose guest threads are not host tasks (KVM), there is no
-//!   `/proc/<tid>` to read, and procfs entries keep their host keys.
+//! - Under a backend whose guest thread IDs do not name host tasks, there is
+//!   no `/proc/<tid>` to read, and procfs entries keep their host keys: KVM's
+//!   guest threads are not host tasks, and DBT's thread IDs are its
+//!   scheduler's virtual IDs, in no PID namespace that gives its host tasks
+//!   those IDs.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -73,6 +78,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use detcore_model::fd::RawInode;
+use reverie::BackendCapabilities;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -102,6 +108,21 @@ pub(crate) fn may_be_procfs(device: u64, block_size: i64) -> bool {
     libc::major(device) == 0 && block_size == PROC_BLOCK_SIZE
 }
 
+/// Whether the thread IDs of a guest that `backend` runs name host tasks,
+/// whose `/proc/<tid>` the tracer can read, for a guest thread whose host
+/// thread ID is `physical_tid` when the backend supplies one beside its own.
+/// Not under KVM, the backend that owns process signal control, whose guest
+/// threads are not host tasks, nor under DBT, which supplies `physical_tid`
+/// as its thread IDs are its scheduler's virtual IDs, in no PID namespace
+/// that gives its host tasks those IDs: `/proc/<tid>` would describe an
+/// unrelated host task, if any.
+pub(crate) fn guest_tids_name_host_tasks(
+    backend: &BackendCapabilities,
+    physical_tid: Option<i32>,
+) -> bool {
+    !backend.provides_process_signal_control && physical_tid.is_none()
+}
+
 /// The key for the procfs entry at `path` within procfs on `device`: the
 /// 64-bit FNV-1a hash of the path's bytes, with [`PATH_KEY_BIT`] set.
 pub(crate) fn path_inode(device: u64, path: &Path) -> RawInode {
@@ -128,6 +149,12 @@ pub(crate) fn with_incarnation(key: RawInode, task: i32, incarnation: u32) -> Ra
 pub struct ProcfsName {
     pub path: RawInode,
     pub tasks: Vec<i32>,
+    /// For an entry of a directory snapshot, how many guest threads Detcore
+    /// had counted when the snapshot was taken (`InodePool::count_incarnation`):
+    /// the entry names the tasks that held its task IDs then, though one may
+    /// since have exited and a new thread taken its ID. `None` for an entry
+    /// the guest reaches as it asks.
+    pub threads_counted: Option<u64>,
 }
 
 impl ProcfsName {
@@ -136,6 +163,16 @@ impl ProcfsName {
         Self {
             path: path_inode(device, within),
             tasks: tasks_named(within),
+            threads_counted: None,
+        }
+    }
+
+    /// This name, for an entry of a directory snapshot taken when Detcore had
+    /// counted `threads_counted` guest threads.
+    pub(crate) fn in_snapshot(self, threads_counted: u64) -> Self {
+        Self {
+            threads_counted: Some(threads_counted),
+            ..self
         }
     }
 }
@@ -272,17 +309,13 @@ pub(crate) fn path_within(mounts: &[ProcfsMount], canonical: &Path) -> PathBuf {
 }
 
 /// The canonical path of the procfs object behind the magic link `link` (a
-/// `/proc/<tid>/fd/<n>` or `/proc/<tid>/cwd`), which must be on `device`, and
-/// be inode `inode` when that is given. Following such a link touches only
-/// procfs and the object, which is on procfs.
-pub(crate) fn inspect_link(
-    link: &Path,
-    device: u64,
-    inode: Option<u64>,
-) -> Result<PathBuf, String> {
+/// `/proc/<tid>/fd/<n>` or `/proc/<tid>/cwd`), which must be inode `inode` on
+/// `device`. Following such a link touches only procfs and the object, which
+/// is on procfs.
+pub(crate) fn inspect_link(link: &Path, device: u64, inode: u64) -> Result<PathBuf, String> {
     let metadata = std::fs::metadata(link)
         .map_err(|error| format!("cannot stat {}: {error}", link.display()))?;
-    if metadata.dev() != device || inode.is_some_and(|inode| metadata.ino() != inode) {
+    if metadata.dev() != device || metadata.ino() != inode {
         return Err(format!(
             "{} is not the object the guest saw",
             link.display()
@@ -461,6 +494,38 @@ mod tests {
 27 1 0:21 /sys /srv/my\\040sys rw master:3 - proc proc rw
 ";
 
+    /// Detcore names procfs entries only where the guest's thread IDs are the
+    /// host tasks' IDs. Under KVM and DBT they are not, so procfs entries keep
+    /// their host keys there, rather than being named from whatever host task
+    /// has the guest thread's ID.
+    #[test]
+    fn procfs_entries_are_named_only_where_thread_ids_are_host_ids() {
+        assert!(guest_tids_name_host_tasks(
+            &BackendCapabilities::PTRACE,
+            None
+        ));
+        assert!(guest_tids_name_host_tasks(
+            &BackendCapabilities::SABRE,
+            None
+        ));
+        assert!(guest_tids_name_host_tasks(
+            &BackendCapabilities::LITEINST_IN_GUEST,
+            None
+        ));
+        assert!(!guest_tids_name_host_tasks(&BackendCapabilities::KVM, None));
+        // DBT supplies each thread's host ID beside its virtual one
+        // (detcore-dbt's `init_dbt_thread_state`), as would any backend whose
+        // thread IDs are virtual.
+        assert!(!guest_tids_name_host_tasks(
+            &BackendCapabilities::DBT,
+            Some(4_321)
+        ));
+        assert!(!guest_tids_name_host_tasks(
+            &BackendCapabilities::PTRACE,
+            Some(4_321)
+        ));
+    }
+
     #[test]
     fn mountinfo_names_procfs_mounts_by_type() {
         let mounts = |minor| procfs_mounts_in(MOUNTINFO, libc::makedev(0, minor));
@@ -514,22 +579,17 @@ mod tests {
         let stat = std::fs::metadata(format!("/proc/{pid}/stat")).unwrap();
         let file = File::open("/proc/self/stat").unwrap();
         let link = PathBuf::from(format!("/proc/{pid}/fd/{}", file.as_raw_fd()));
-        let canonical = inspect_link(&link, stat.dev(), Some(stat.ino())).unwrap();
+        let canonical = inspect_link(&link, stat.dev(), stat.ino()).unwrap();
         assert_eq!(
             path_within(&mounts, &canonical),
             PathBuf::from(format!("/{pid}/stat"))
         );
-        assert_eq!(
-            inspect_link(&link, stat.dev(), None).unwrap(),
-            canonical,
-            "a lookup that may find the entry rebuilt checks only the device"
-        );
-        assert!(inspect_link(&link, stat.dev(), Some(stat.ino() + 1)).is_err());
-        assert!(inspect_link(&link, stat.dev() + 1, None).is_err());
+        assert!(inspect_link(&link, stat.dev(), stat.ino() + 1).is_err());
+        assert!(inspect_link(&link, stat.dev() + 1, stat.ino()).is_err());
         let cwd = PathBuf::from(format!("/proc/{pid}/cwd"));
         let here = std::fs::metadata(".").unwrap();
         assert_eq!(
-            inspect_link(&cwd, here.dev(), Some(here.ino())).unwrap(),
+            inspect_link(&cwd, here.dev(), here.ino()).unwrap(),
             std::env::current_dir().unwrap()
         );
     }

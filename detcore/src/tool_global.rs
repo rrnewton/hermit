@@ -181,9 +181,13 @@ struct InodePool {
     /// under (see [`Self::procfs_key`]): the host inode its entry was first
     /// numbered under. Every value is also its own key.
     procfs_keys: HashMap<RawInode, RawInode>,
-    /// How many guest threads each thread ID has been given to (see
+    /// For each thread ID, the value of `threads_counted` just after each
+    /// guest thread given that ID was counted, in order (see
     /// [`Self::count_incarnation`]).
-    incarnations: HashMap<i32, u32>,
+    incarnations: HashMap<i32, Vec<u64>>,
+    /// How many guest threads have been counted (see
+    /// [`Self::count_incarnation`]).
+    threads_counted: u64,
 }
 
 /// How a numbering request reached its file, which decides whether a retired
@@ -206,6 +210,19 @@ pub enum InodeSighting {
     /// <https://github.com/rrnewton/hermit/pull/3849>, P1). So it shows a
     /// new file only for an inode retired before it was taken.
     Listed(u64),
+}
+
+/// What a directory snapshot records of the inode pool when it is taken, so
+/// that the entries it returns later are numbered as they were then.
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct SnapshotMark {
+    /// How many retirements there had been (see [`InodeSighting::Listed`]):
+    /// an entry can be returned after its file's last name is gone.
+    pub retirements: u64,
+    /// How many guest threads had been counted (see
+    /// `InodePool::count_incarnation`): an entry can be returned after a task
+    /// it names exited and a new thread took its ID.
+    pub threads_counted: u64,
 }
 
 /// One file that held a host inode (see `InodePool::generations`). It held
@@ -351,6 +368,7 @@ impl InodePool {
             reused: 0,
             procfs_keys: HashMap::new(),
             incarnations: HashMap::new(),
+            threads_counted: 0,
         }
     }
 
@@ -402,21 +420,31 @@ impl InodePool {
     /// old task's procfs entries when it exits, so the new task's entries
     /// are new files (see [`Self::procfs_path_key`]).
     fn count_incarnation(&mut self, tid: i32) {
-        *self.incarnations.entry(tid).or_default() += 1;
+        self.threads_counted += 1;
+        self.incarnations
+            .entry(tid)
+            .or_default()
+            .push(self.threads_counted);
     }
 
     /// The path key of the procfs entry `name`: the key of its path, salted
     /// with the incarnation of each task the path names (see
     /// [`Self::count_incarnation`]), so that an entry of a task whose ID was
     /// reused does not adopt the number of the old task's entry, which a
-    /// descriptor may still hold.
+    /// descriptor may still hold. An entry of a directory snapshot names the
+    /// incarnation that held the ID when the snapshot was taken.
     fn procfs_path_key(&self, name: &ProcfsName) -> RawInode {
-        name.tasks
-            .iter()
-            .fold(name.path, |key, task| match self.incarnations.get(task) {
-                Some(incarnation) => procfs_inode::with_incarnation(key, *task, *incarnation),
-                None => key,
-            })
+        name.tasks.iter().fold(name.path, |key, task| {
+            let counted = self.incarnations.get(task).map_or(&[][..], Vec::as_slice);
+            let incarnation = match name.threads_counted {
+                Some(snapshot) => counted.partition_point(|at| *at <= snapshot),
+                None => counted.len(),
+            };
+            match u32::try_from(incarnation).unwrap_or(u32::MAX) {
+                0 => key,
+                incarnation => procfs_inode::with_incarnation(key, *task, incarnation),
+            }
+        })
     }
 
     // Allocate the next deterministic inode.  This takes the raw-inode and
@@ -2496,9 +2524,13 @@ impl GlobalTool for GlobalState {
             GlobalRequest::ForgetRetiredInode(ino, procfs) => {
                 R::ForgetRetiredInode(self.recv_forget_retired_inode(from, ino, procfs).await)
             }
-            GlobalRequest::RetirementCount => {
+            GlobalRequest::DirectorySnapshotMark => {
                 let _sched = self.lock_rpc_scheduler(false).await;
-                R::RetirementCount(self.inodes.lock().unwrap().retirements)
+                let inodes = self.inodes.lock().unwrap();
+                R::DirectorySnapshotMark(SnapshotMark {
+                    retirements: inodes.retirements,
+                    threads_counted: inodes.threads_counted,
+                })
             }
             GlobalRequest::TouchFile(ino) => R::TouchFile(self.recv_touch_file(from, ino).await),
             GlobalRequest::SetFileMtime(ino, mtime) => {
@@ -4129,9 +4161,8 @@ pub enum GlobalRequest {
     /// `procfs_inode::ProcfsName` and `InodePool::procfs_key`).
     ForgetRetiredInode(RawInode, Option<ProcfsName>),
 
-    /// How many retirements there have been, for a directory snapshot (see
-    /// `InodeSighting::Listed`).
-    RetirementCount,
+    /// The inode pool's state, for a directory snapshot (see `SnapshotMark`).
+    DirectorySnapshotMark,
 
     /// Bump mtime
     TouchFile(RawInode),
@@ -4298,7 +4329,7 @@ pub enum GlobalResponse {
     ResolveMountinfoIds(Option<Vec<u64>>),
     RetireInode(()),
     ForgetRetiredInode(()),
-    RetirementCount(u64),
+    DirectorySnapshotMark(SnapshotMark),
     TouchFile(()),
     SetFileMtime(()),
     GlobalTimeLowerBound(LogicalTime),
@@ -5171,27 +5202,28 @@ where
     }
 }
 
-/// How many retirements there have been (see `InodeSighting::Listed`).
-pub async fn retirement_count<G, T>(guest: &mut G) -> u64
+/// The inode pool's state for a directory snapshot about to be taken (see
+/// [`SnapshotMark`]).
+pub async fn directory_snapshot_mark<G, T>(guest: &mut G) -> SnapshotMark
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    let resp = send_and_update_time(guest, GlobalRequest::RetirementCount).await;
+    let resp = send_and_update_time(guest, GlobalRequest::DirectorySnapshotMark).await;
     match resp.1 {
-        GlobalResponse::RetirementCount(count) => count,
+        GlobalResponse::DirectorySnapshotMark(mark) => mark,
         _ => unreachable!(),
     }
 }
 
-/// [`determinize_inode`] for an entry of a directory snapshot taken after
-/// `retirements` retirements (see [`InodeSighting::Listed`]). `procfs`
-/// names a procfs entry (see `procfs_inode::ProcfsName`).
+/// [`determinize_inode`] for an entry of a directory snapshot taken at
+/// `mark` (see [`SnapshotMark`]). `procfs` names a procfs entry (see
+/// `procfs_inode::ProcfsName`).
 pub async fn determinize_listed_inode<G, T>(
     guest: &mut G,
     inode: RawInode,
     procfs: Option<ProcfsName>,
-    retirements: u64,
+    mark: SnapshotMark,
 ) -> (DetInode, LogicalTime)
 where
     G: Guest<Detcore<T>>,
@@ -5200,9 +5232,9 @@ where
     determinize_inode_observing_mtime(
         guest,
         inode,
-        procfs,
+        procfs.map(|name| name.in_snapshot(mark.threads_counted)),
         ObservedMtime::Unobserved,
-        InodeSighting::Listed(retirements),
+        InodeSighting::Listed(mark.retirements),
     )
     .await
 }
@@ -10094,6 +10126,50 @@ mod tests {
         let before = pool.procfs_path_key(&thread);
         pool.count_incarnation(9);
         assert_ne!(pool.procfs_path_key(&thread), before);
+    }
+
+    /// A directory snapshot returns its entries after it was taken, and a
+    /// task it lists can exit, and a new thread take its ID, in between. The
+    /// entry still names the task the snapshot listed: an entry of the old
+    /// task rebuilt since keeps the old task's number, rather than adopting
+    /// the new task's.
+    #[test]
+    fn a_snapshot_entry_names_the_task_that_held_its_id() {
+        use std::path::Path;
+
+        use crate::procfs_inode::ProcfsName;
+        use crate::types::RawInode;
+
+        let t = LogicalTime::from_nanos(0);
+        let seen = super::ObservedMtime::Unobserved;
+        let device = libc::makedev(0, 23);
+        let host = |ino| RawInode::new(device, ino);
+        let number = |pool: &mut super::InodePool, raw: RawInode, name: &ProcfsName| {
+            let path = pool.procfs_path_key(name);
+            pool.procfs_key(raw, path);
+            pool.add_inode(raw, seen, t).0
+        };
+        let process = ProcfsName::new(device, Path::new("/7"));
+        let mut pool = super::InodePool::new();
+        pool.count_incarnation(7);
+        let first = number(&mut pool, host(4_100), &process);
+        let listed = process.clone().in_snapshot(pool.threads_counted);
+        pool.count_incarnation(7);
+        let second = number(&mut pool, host(5_000), &process);
+        assert_ne!(second, first, "a new process took the old one's number");
+        assert_eq!(
+            number(&mut pool, host(4_900), &listed),
+            first,
+            "the listed process's entry, rebuilt"
+        );
+        // An ID no thread held when the snapshot was taken names no task.
+        let unborn = ProcfsName::new(device, Path::new("/8"));
+        let listed = unborn.clone().in_snapshot(pool.threads_counted);
+        let unsalted = pool.procfs_path_key(&listed);
+        assert_eq!(unsalted, pool.procfs_path_key(&unborn));
+        pool.count_incarnation(8);
+        assert_eq!(pool.procfs_path_key(&listed), unsalted);
+        assert_ne!(pool.procfs_path_key(&unborn), unsalted);
     }
 
     /// Only an exact whole-second 0 or 1 host mtime is canonical

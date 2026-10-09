@@ -19,6 +19,8 @@ use reverie::syscalls::Errno;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::tool_global::SnapshotMark;
+
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Dirent64<'a> {
@@ -400,21 +402,22 @@ pub(crate) struct DirectoryStream {
     resume: Vec<i64>,
     /// Index of the next entry to return.
     position: u64,
-    /// How many inode retirements there had been when the snapshot was taken
-    /// (`InodeSighting::Listed`): an entry can be returned after its file's
-    /// last name is gone.
-    retirements: u64,
+    /// The inode pool's state when the snapshot was taken (`SnapshotMark`):
+    /// an entry can be returned after its file's last name is gone, or after
+    /// a task it names exited and a new thread took its ID.
+    snapshot: SnapshotMark,
 }
 
 impl DirectoryStream {
-    /// Record how many inode retirements preceded the snapshot just installed.
-    pub(crate) fn note_snapshot_retirements(&mut self, retirements: u64) {
-        self.retirements = retirements;
+    /// Record the inode pool's state when the snapshot just installed was
+    /// taken.
+    pub(crate) fn note_snapshot_mark(&mut self, mark: SnapshotMark) {
+        self.snapshot = mark;
     }
 
-    /// How many inode retirements preceded the current snapshot.
-    pub(crate) fn snapshot_retirements(&self) -> u64 {
-        self.retirements
+    /// The inode pool's state when the current snapshot was taken.
+    pub(crate) fn snapshot_mark(&self) -> SnapshotMark {
+        self.snapshot
     }
 
     pub(crate) fn needs_snapshot(&self) -> bool {
