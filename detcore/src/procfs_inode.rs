@@ -67,7 +67,10 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::ffi::OsStr;
 use std::ffi::OsString;
+use std::fs::File;
 use std::io;
+use std::io::Read;
+use std::os::fd::IntoRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
@@ -219,10 +222,12 @@ pub(crate) struct ProcfsMount {
 /// The procfs mounts of `device` in the mount namespace of the guest thread
 /// `tid`, by its `/proc/<tid>/mountinfo`, which Linux writes without touching
 /// any mounted file system: `Ok(None)` when `device` is not procfs there, and
-/// an error when the tracer cannot tell. Detcore refuses `mount`, `unshare`
-/// and `setns` once it starts, so a guest's procfs mount stays one: the mounts
-/// of a device found to be procfs are remembered with its mount namespace,
-/// while any other device is looked up again, as it may yet become one.
+/// an error when the tracer cannot tell, or when the descriptor that read the
+/// table did not close (see [`read_checking_close`]). Detcore refuses
+/// `mount`, `unshare` and `setns` once it starts, so a guest's procfs mount
+/// stays one: the mounts of a device found to be procfs are remembered with
+/// its mount namespace, while any other device is looked up again, as it may
+/// yet become one.
 pub(crate) fn procfs_mounts(tid: i32, device: u64) -> io::Result<Option<Arc<[ProcfsMount]>>> {
     type Known = HashMap<(u64, u64), Arc<[ProcfsMount]>>;
     static PROCFS_DEVICES: OnceLock<Mutex<Known>> = OnceLock::new();
@@ -232,7 +237,7 @@ pub(crate) fn procfs_mounts(tid: i32, device: u64) -> io::Result<Option<Arc<[Pro
     if let Some(mounts) = known.lock().unwrap().get(&key) {
         return Ok(Some(mounts.clone()));
     }
-    let mountinfo = std::fs::read(format!("/proc/{tid}/mountinfo"))?;
+    let mountinfo = read_checking_close(&format!("/proc/{tid}/mountinfo"))?;
     let mounts = procfs_mounts_in(&mountinfo, device);
     if mounts.is_empty() {
         return Ok(None);
@@ -240,6 +245,28 @@ pub(crate) fn procfs_mounts(tid: i32, device: u64) -> io::Result<Option<Arc<[Pro
     let mounts: Arc<[ProcfsMount]> = mounts.into();
     known.lock().unwrap().insert(key, mounts.clone());
     Ok(Some(mounts))
+}
+
+/// The contents of the file at `path`, read through a descriptor that must
+/// close. Under SaBRe, Detcore runs in the guest's process, so its
+/// descriptors are in the guest's descriptor table. A `close` that a seccomp
+/// filter refuses leaves the descriptor open there, where the guest sees it
+/// and its later descriptors get other numbers, and `File` ignores that
+/// error when it drops. So a failed close is an error, as it is for the
+/// descriptors Detcore opens in the guest to name a path.
+fn read_checking_close(path: &str) -> io::Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    let mut contents = Vec::new();
+    let read = file.read_to_end(&mut contents);
+    let fd = file.into_raw_fd();
+    // SAFETY: `fd` is the descriptor `file` owned, and nothing else uses it.
+    if unsafe { libc::close(fd) } != 0 {
+        return Err(io::Error::other(format!(
+            "cannot close descriptor {fd} of {path}: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    read.map(|_| contents)
 }
 
 /// The procfs mounts of `device` a `mountinfo` table lists: lines whose third
@@ -451,6 +478,89 @@ mod tests {
         }));
         assert_eq!(inside, libc::ENOENT, "the failed call set errno");
         assert_eq!(nix::errno::Errno::last_raw(), SENTINEL);
+    }
+
+    /// Make every `close` of the calling thread fail with `EPERM` without
+    /// running, as a seccomp filter can. The filter binds this thread and
+    /// what it starts afterwards, and no other thread.
+    #[cfg(target_arch = "x86_64")]
+    fn refuse_close_in_this_thread() {
+        const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+        let load = |offset: u32| libc::sock_filter {
+            code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+            jt: 0,
+            jf: 0,
+            k: offset,
+        };
+        let jump_if = |value: u32, jt: u8, jf: u8| libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            jt,
+            jf,
+            k: value,
+        };
+        let ret = |action: u32| libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: action,
+        };
+        // seccomp_data: nr at 0, arch at 4.
+        let mut program = [
+            load(4),
+            jump_if(AUDIT_ARCH_X86_64, 1, 0),
+            ret(libc::SECCOMP_RET_ALLOW),
+            load(0),
+            jump_if(libc::SYS_close as u32, 0, 1),
+            ret(libc::SECCOMP_RET_ERRNO | libc::EPERM as u32),
+            ret(libc::SECCOMP_RET_ALLOW),
+        ];
+        let fprog = libc::sock_fprog {
+            len: program.len() as u16,
+            filter: program.as_mut_ptr(),
+        };
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+            0
+        );
+        let installed = unsafe {
+            libc::syscall(
+                libc::SYS_seccomp,
+                libc::SECCOMP_SET_MODE_FILTER,
+                0,
+                &fprog as *const libc::sock_fprog,
+            )
+        };
+        assert_eq!(installed, 0, "seccomp: {}", io::Error::last_os_error());
+    }
+
+    /// Under SaBRe, Detcore reads a guest's mount table through a descriptor
+    /// in the guest's own descriptor table. It reads the table again for any
+    /// device it has not found to be procfs, such as that of `/`, and when a
+    /// filter refuses that descriptor's close, the read is an error, which
+    /// records a determinism loss. The descriptor is still open, as the
+    /// guest would see it.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_mount_table_read_whose_close_is_refused_is_an_error() {
+        let root = std::fs::metadata("/").unwrap().dev();
+        let error = std::thread::spawn(move || {
+            refuse_close_in_this_thread();
+            let tid = unsafe { libc::gettid() };
+            procfs_mounts(tid, root).unwrap_err().to_string()
+        })
+        .join()
+        .unwrap();
+        let fd: i32 = error
+            .strip_prefix("cannot close descriptor ")
+            .and_then(|rest| rest.split_once(' '))
+            .and_then(|(fd, _)| fd.parse().ok())
+            .unwrap_or_else(|| panic!("not a refused close: {error}"));
+        assert!(
+            error.ends_with("Operation not permitted (os error 1)"),
+            "{error}"
+        );
+        assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0, "{error}");
+        assert_eq!(unsafe { libc::close(fd) }, 0);
     }
 
     const PROC_DEVICE: u64 = libc::makedev(0, 23);

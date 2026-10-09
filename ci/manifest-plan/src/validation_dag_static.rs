@@ -1675,8 +1675,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and procfs files outside the guest's mounts) retain all 1235: 1238.
     // procfs_inode::tests::a_failed_host_call_leaves_the_callers_errno (the
     // guest's errno under SaBRe) retains all 1238: 1239.
+    // procfs_inode::tests::a_mount_table_read_whose_close_is_refused_is_an_error
+    // (a mount table read under a filter that refuses close) retains all
+    // 1239: 1240.
     // The poll-deadline wake (https://github.com/rrnewton/hermit/issues/3952)
-    // adds eleven, retaining all 1239: 1250. scheduler::runqueue::tests::
+    // adds eleven, retaining all 1240: 1251. scheduler::runqueue::tests::
     // {restore_poller_priority_moves_one_poller_to_the_back_of_its_level,
     // only_first_entry_heuristics_are_priority_ordered,
     // a_deadline_restored_poller_counts_as_a_poller_until_it_runs,
@@ -1688,7 +1691,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the_controlled_loop_restores_a_poller_whose_deadline_a_refresh_crosses,
     // a_deadline_restored_poller_gates_a_held_sigchld_as_while_backed_off,
     // a_deadline_restored_poller_gates_a_finished_background_call_as_while_backed_off}.
-    ("test.detcore_unit", 1250),
+    ("test.detcore_unit", 1251),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2493,8 +2496,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two tests of where procfs entries are named: 1235.
     // And the three tests of exited tasks and outside procfs files: 1238.
     // And the errno test: 1239.
-    // And the eleven poll-deadline tests: 1250.
-    ("test.detcore_unit_on_host", 1250),
+    // And the mount table close test: 1240.
+    // And the eleven poll-deadline tests: 1251.
+    ("test.detcore_unit_on_host", 1251),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
