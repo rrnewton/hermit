@@ -12619,74 +12619,218 @@ type ValidatedComparisonAttempts = BTreeMap<(DirectEvidenceBase, String), u64>;
 /// streams remain outside Git; a ledger-only reader verifies the attachment
 /// to the original comparison and immutable typed series events.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "PublishedAttemptBindings")]
 struct ComparisonAttemptBindings {
     schema: u64,
     authority: String,
     bindings: Vec<ComparisonAttemptBinding>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     retired_canonical_comparisons: Vec<RetiredCanonicalComparison>,
-    /// The retired ptrace rerun's receipts
-    /// (https://github.com/rrnewton/hermit/issues/3301). Read and dropped;
-    /// never written.
-    #[serde(default, skip_serializing)]
-    retired_backend_parity_comparisons: NoRetiredParityReceipts,
 }
 
-/// The receipts of the retired ptrace rerun that a history document published
-/// before the rerun was retired still holds. The scorecard no longer verifies
-/// or keeps them: it reads them as a list of anything, drops them, and writes
-/// none, so the next history it publishes holds none. Refusing them instead
-/// would refuse every published history that still holds them, and so every
-/// scorecard generation from it.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct NoRetiredParityReceipts;
+/// [`ComparisonAttemptBindings`] as a history document holds them. One
+/// published before the ptrace rerun was retired
+/// (https://github.com/rrnewton/hermit/issues/3301) also holds that rerun's
+/// receipts, each the original comparison of one binding. The scorecard no
+/// longer verifies or keeps them, so it reads each receipt's key, drops the
+/// receipts and the bindings they key, and writes neither: the next history
+/// it publishes holds none. Refusing them instead would refuse every
+/// published history that still holds them, and so every scorecard
+/// generation from it; dropping only the receipts would leave their bindings
+/// without an original comparison.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublishedAttemptBindings {
+    schema: u64,
+    authority: String,
+    bindings: Vec<ComparisonAttemptBinding>,
+    #[serde(default)]
+    retired_canonical_comparisons: Vec<RetiredCanonicalComparison>,
+    #[serde(default)]
+    retired_backend_parity_comparisons: Vec<RetiredRerunReceipt>,
+}
 
-impl<'de> Deserialize<'de> for NoRetiredParityReceipts {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Vec::<serde::de::IgnoredAny>::deserialize(deserializer)?;
-        Ok(Self)
+/// What the scorecard reads of a receipt of the retired ptrace rerun: the key
+/// of the comparison it records, which is [`binding_key`] of the binding that
+/// names it.
+#[derive(Deserialize)]
+struct RetiredRerunReceipt {
+    cell: CellId,
+    provenance: ObservationProvenance,
+    detcore_tree: String,
+    comparison: RetiredRerunComparison,
+}
+
+#[derive(Deserialize)]
+struct RetiredRerunComparison {
+    hermit_sha: String,
+    run_id: String,
+    evidence_sha256: String,
+}
+
+impl RetiredRerunReceipt {
+    fn key(&self) -> (DirectEvidenceBase, String) {
+        (
+            DirectEvidenceBase {
+                cell: series_cell_key(&self.cell),
+                identity: SeriesObservationIdentity::DetcoreTree(self.detcore_tree.clone()),
+                provenance: self.provenance,
+                hermit_sha: self.comparison.hermit_sha.clone(),
+                run_id: self.comparison.run_id.clone(),
+            },
+            self.comparison.evidence_sha256.clone(),
+        )
+    }
+}
+
+impl From<PublishedAttemptBindings> for ComparisonAttemptBindings {
+    fn from(published: PublishedAttemptBindings) -> Self {
+        let retired = published
+            .retired_backend_parity_comparisons
+            .iter()
+            .map(RetiredRerunReceipt::key)
+            .collect::<BTreeSet<_>>();
+        Self {
+            schema: published.schema,
+            authority: published.authority,
+            bindings: published
+                .bindings
+                .into_iter()
+                .filter(|binding| !retired.contains(&binding_key(binding)))
+                .collect(),
+            retired_canonical_comparisons: published.retired_canonical_comparisons,
+        }
     }
 }
 
 #[cfg(test)]
-mod retired_parity_receipt_tests {
+mod retired_rerun_receipt_tests {
     use super::*;
 
+    fn binding(test: &str, backend: &str) -> ComparisonAttemptBinding {
+        ComparisonAttemptBinding {
+            cell: CellId {
+                lane: "portable".into(),
+                category: "c-programs".into(),
+                test: test.into(),
+                mode: "verify".into(),
+                backend: backend.into(),
+            },
+            provenance: ObservationProvenance::Validate,
+            hermit_sha: "5".repeat(40),
+            detcore_tree: "4".repeat(40),
+            run_id: "run".into(),
+            evidence_sha256: "6".repeat(64),
+            attempt: 1,
+            result: ObservedResult::Pass,
+            kind: AttemptBindingKind::Retained,
+            producer_hermit_sha: "4".repeat(40),
+            input: AttemptBindingInput {
+                file_sha256: "a".repeat(64),
+                file_bytes: 1,
+                line: 1,
+                row_sha256: "b".repeat(64),
+            },
+            snapshot: AttemptBindingSnapshot {
+                repository: TEST_LEDGER_REPOSITORY.into(),
+                source: "series".into(),
+                commit: "6af85b80566730f212cf6c7a550d409cc27ae782".into(),
+                tree: "7".repeat(40),
+                rows_sha256: "c".repeat(64),
+            },
+            events: Vec::new(),
+        }
+    }
+
+    /// A receipt of the retired rerun, as published, for `binding`'s
+    /// comparison.
+    fn receipt(binding: &ComparisonAttemptBinding) -> serde_json::Value {
+        serde_json::json!({
+            "cell": binding.cell,
+            "provenance": binding.provenance,
+            "detcore_tree": binding.detcore_tree,
+            "comparison": {
+                "hermit_sha": binding.hermit_sha,
+                "run_id": binding.run_id,
+                "evidence_sha256": binding.evidence_sha256,
+                "reference_backend": "ptrace",
+                "candidate_backend": binding.cell.backend,
+                "result": "matched",
+            },
+            "typed_comparison_sha256": "d".repeat(64),
+        })
+    }
+
     /// A history published before the ptrace rerun was retired holds its
-    /// receipts. It is read, the receipts are dropped, and the document
-    /// written back holds none.
+    /// receipts. It is read, the receipts and the bindings they key are
+    /// dropped, every other binding stays, and the document written back holds
+    /// no receipt.
     #[test]
-    fn retired_rerun_receipts_are_read_and_dropped() {
+    fn retired_rerun_receipts_and_their_bindings_are_dropped() {
+        let retired = binding("c-programs/a", "kvm");
+        let kept = binding("c-programs/b", "kvm");
         let bindings: ComparisonAttemptBindings = serde_json::from_value(serde_json::json!({
             "schema": 1,
             "authority": ATTEMPT_BINDING_AUTHORITY,
-            "bindings": [],
-            "retired_backend_parity_comparisons": [
-                {"cell": {"backend": "kvm"}, "comparison": {"verdict": "matched"}},
-                {"cell": {"backend": "liteinst"}, "typed_comparison_sha256": "0"},
-            ],
+            "bindings": [retired, kept],
+            "retired_backend_parity_comparisons": [receipt(&retired)],
         }))
         .unwrap();
+        assert_eq!(bindings.bindings, vec![kept]);
         let written = serde_json::to_value(&bindings).unwrap();
         assert!(
             written.get("retired_backend_parity_comparisons").is_none(),
             "{written}"
         );
-        assert_eq!(written["bindings"], serde_json::json!([]));
+        let again: ComparisonAttemptBindings = serde_json::from_value(written).unwrap();
+        assert_eq!(again, bindings);
     }
 
-    /// The field still holds a list: anything else is a malformed history.
+    /// A receipt is matched by its whole key: one for another run of the same
+    /// cell drops nothing.
     #[test]
-    fn retired_rerun_receipts_must_be_a_list() {
-        let error = serde_json::from_value::<ComparisonAttemptBindings>(serde_json::json!({
+    fn a_receipt_drops_only_the_binding_with_its_key() {
+        let kept = binding("c-programs/a", "liteinst");
+        let mut other_run = kept.clone();
+        other_run.run_id = "another-run".into();
+        let bindings: ComparisonAttemptBindings = serde_json::from_value(serde_json::json!({
+            "schema": 1,
+            "authority": ATTEMPT_BINDING_AUTHORITY,
+            "bindings": [kept],
+            "retired_backend_parity_comparisons": [receipt(&other_run)],
+        }))
+        .unwrap();
+        assert_eq!(bindings.bindings, vec![kept]);
+    }
+
+    /// The field still holds a list of receipts with their keys: anything else
+    /// is a malformed history.
+    #[test]
+    fn retired_rerun_receipts_must_carry_their_keys() {
+        for receipts in [
+            serde_json::json!({"cell": "kvm"}),
+            serde_json::json!([{"cell": {"backend": "kvm"}, "comparison": {"verdict": "matched"}}]),
+        ] {
+            serde_json::from_value::<ComparisonAttemptBindings>(serde_json::json!({
+                "schema": 1,
+                "authority": ATTEMPT_BINDING_AUTHORITY,
+                "bindings": [],
+                "retired_backend_parity_comparisons": receipts,
+            }))
+            .unwrap_err();
+        }
+    }
+
+    /// An unknown field is still refused.
+    #[test]
+    fn an_unknown_bindings_field_is_refused() {
+        serde_json::from_value::<ComparisonAttemptBindings>(serde_json::json!({
             "schema": 1,
             "authority": ATTEMPT_BINDING_AUTHORITY,
             "bindings": [],
-            "retired_backend_parity_comparisons": {"cell": "kvm"},
+            "surprise": [],
         }))
         .unwrap_err();
-        assert!(error.to_string().contains("expected a sequence"), "{error}");
     }
 }
 
@@ -13929,7 +14073,6 @@ fn append_attempt_bindings(
             authority: ATTEMPT_BINDING_AUTHORITY.into(),
             bindings: Vec::new(),
             retired_canonical_comparisons: Vec::new(),
-            retired_backend_parity_comparisons: NoRetiredParityReceipts,
         });
     envelope.bindings.extend(additions);
     envelope.bindings.sort_by_key(binding_key);
@@ -38211,7 +38354,6 @@ mod attempt_binding_tests {
             schema: 1,
             authority: ATTEMPT_BINDING_AUTHORITY.into(),
             retired_canonical_comparisons: Vec::new(),
-            retired_backend_parity_comparisons: NoRetiredParityReceipts,
             bindings: ["c".repeat(64), "d".repeat(64)]
                 .into_iter()
                 .enumerate()
@@ -40061,7 +40203,6 @@ mod regeneration_notice_tests {
                     authority: ATTEMPT_BINDING_AUTHORITY.into(),
                     bindings,
                     retired_canonical_comparisons: Vec::new(),
-                    retired_backend_parity_comparisons: NoRetiredParityReceipts,
                 }),
             }),
             cells: Vec::new(),
