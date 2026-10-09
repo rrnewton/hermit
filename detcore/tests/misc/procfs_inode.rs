@@ -366,3 +366,217 @@ fn a_write_to_a_procfs_file_moves_its_mtime() {
         assert_ne!(mtime(&comm), before, "the write left the mtime unchanged");
     });
 }
+
+/// The guest lists a thread's descriptor directory in two calls, the thread
+/// exits between them, and its directory loses its name: the second call
+/// returns entries from the snapshot the first took, keyed as they were
+/// then. A descriptor entry rebuilt before the listing keeps the number
+/// `lstat` reported, and no determinism loss is recorded, where keying the
+/// second call again found nothing to name the directory by.
+#[test]
+fn a_listing_keeps_its_keys_after_its_task_exits() {
+    under_detcore(|| {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let (finish, finished) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            sender.send(unsafe { libc::gettid() }).unwrap();
+            finished.recv().unwrap();
+        });
+        let tid = receiver.recv().unwrap();
+        let task = format!("{}/task/{tid}", proc_dir());
+        let fds = format!("{task}/fd");
+        let fd = File::open("/dev/null").unwrap().into_raw_fd();
+        let entry = format!("{fds}/{fd}");
+        let lstat = || std::fs::symlink_metadata(&entry).map(|metadata| metadata.ino());
+        let stat_before = lstat().unwrap();
+        assert_eq!(unsafe { libc::close(fd) }, 0, "close({fd})");
+        // The lookup of a closed descriptor's entry fails and drops its
+        // dentry, which the listing builds again.
+        assert!(lstat().is_err(), "{entry} exists after close");
+        let again = File::open("/dev/null").unwrap().into_raw_fd();
+        assert_eq!(again, fd, "the reopened file must take the closed number");
+        let directory = File::open(&fds).unwrap();
+        // `.` and `..` take 24 bytes each, so the first call returns only
+        // them, and takes the snapshot.
+        let mut buffer = vec![0u8; 48];
+        let read = unsafe {
+            libc::syscall(
+                libc::SYS_getdents64,
+                directory.as_raw_fd(),
+                buffer.as_mut_ptr(),
+                buffer.len(),
+            )
+        };
+        assert_eq!(read, 48, "getdents64: {}", std::io::Error::last_os_error());
+        finish.send(()).unwrap();
+        thread.join().unwrap();
+        // The join returns when the thread clears its ID, before it is reaped.
+        let mut tries = 0;
+        while std::fs::symlink_metadata(&task).is_ok() {
+            tries += 1;
+            assert!(tries < 100_000, "{task} outlived its thread");
+            unsafe { libc::sched_yield() };
+        }
+        let rest = rest_of_listing(&directory);
+        assert_eq!(
+            rest.get(&fd.to_string()).copied(),
+            Some(stat_before),
+            "{fds} listed {fd} under another number: {rest:?}"
+        );
+    });
+    assert_eq!(detcore::detlog::determinism_loss(), None);
+}
+
+/// The entries `getdents64` returns from `directory`'s position on, by name.
+fn rest_of_listing(directory: &File) -> std::collections::HashMap<String, u64> {
+    let mut buffer = vec![0u8; 32 * 1024];
+    let mut entries = std::collections::HashMap::new();
+    loop {
+        let read = unsafe {
+            libc::syscall(
+                libc::SYS_getdents64,
+                directory.as_raw_fd(),
+                buffer.as_mut_ptr(),
+                buffer.len(),
+            )
+        };
+        assert!(read >= 0, "getdents64: {}", std::io::Error::last_os_error());
+        if read == 0 {
+            return entries;
+        }
+        let mut offset = 0;
+        while offset < read as usize {
+            let record = &buffer[offset..];
+            let ino = u64::from_ne_bytes(record[0..8].try_into().unwrap());
+            let length = usize::from(u16::from_ne_bytes(record[16..18].try_into().unwrap()));
+            let name = &record[19..length];
+            let name = &name[..name.iter().position(|byte| *byte == 0).unwrap()];
+            entries.insert(String::from_utf8_lossy(name).into_owned(), ino);
+            offset += length;
+        }
+    }
+}
+
+/// The descriptor the `O_PATH` open that names a procfs path gets in the
+/// filter tests: the lowest free one once the guest fills those below it.
+#[cfg(target_arch = "x86_64")]
+const FILTERED_FD: i32 = 100;
+
+/// Linux's `ERESTARTSYS`, which it does not export to user space.
+#[cfg(target_arch = "x86_64")]
+const ERESTARTSYS: u32 = 512;
+
+/// `AUDIT_ARCH_X86_64`, the `arch` of an x86_64 system call in seccomp data.
+#[cfg(target_arch = "x86_64")]
+const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+
+/// Make `close(FILTERED_FD)` return `-errno` without running, in this thread
+/// and the processes it forks, as a seccomp filter a guest inherits from
+/// whatever started it can. Detcore refuses a guest's own `seccomp(2)`.
+#[cfg(target_arch = "x86_64")]
+fn filter_close(errno: u32) {
+    let load = |offset: u32| libc::sock_filter {
+        code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+        jt: 0,
+        jf: 0,
+        k: offset,
+    };
+    let jump_if = |value: u32, jt: u8, jf: u8| libc::sock_filter {
+        code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+        jt,
+        jf,
+        k: value,
+    };
+    let ret = |action: u32| libc::sock_filter {
+        code: (libc::BPF_RET | libc::BPF_K) as u16,
+        jt: 0,
+        jf: 0,
+        k: action,
+    };
+    // seccomp_data: nr at 0, arch at 4, and the low half of args[0] at 16.
+    let mut program = [
+        load(4),
+        jump_if(AUDIT_ARCH_X86_64, 1, 0),
+        ret(libc::SECCOMP_RET_ALLOW),
+        load(0),
+        jump_if(libc::SYS_close as u32, 0, 3),
+        load(16),
+        jump_if(FILTERED_FD as u32, 0, 1),
+        ret(libc::SECCOMP_RET_ERRNO | errno),
+        ret(libc::SECCOMP_RET_ALLOW),
+    ];
+    let fprog = libc::sock_fprog {
+        len: program.len() as u16,
+        filter: program.as_mut_ptr(),
+    };
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+        0
+    );
+    let installed = unsafe {
+        libc::syscall(
+            libc::SYS_seccomp,
+            libc::SECCOMP_SET_MODE_FILTER,
+            0,
+            &fprog as *const libc::sock_fprog,
+        )
+    };
+    assert_eq!(installed, 0, "seccomp: {}", std::io::Error::last_os_error());
+}
+
+/// Run a guest that fills the descriptors below `FILTERED_FD`, so that the
+/// `O_PATH` descriptor Detcore opens to name a procfs path takes it, and then
+/// stats a procfs path. The filter leaves that descriptor open in the guest,
+/// so the run must record a determinism loss, and must end.
+#[cfg(target_arch = "x86_64")]
+fn stat_a_procfs_path_with_close_filtered(errno: u32) -> Option<String> {
+    filter_close(errno);
+    under_detcore(|| {
+        let open = |fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0;
+        assert!(!open(FILTERED_FD), "{FILTERED_FD} is open from the start");
+        let null = File::open("/dev/null").unwrap().into_raw_fd();
+        let mut last = null;
+        while last < FILTERED_FD - 1 {
+            last = unsafe { libc::dup(null) };
+            assert!(last >= 0, "dup: {}", std::io::Error::last_os_error());
+        }
+        assert_eq!(
+            last,
+            FILTERED_FD - 1,
+            "a descriptor below {FILTERED_FD} was free"
+        );
+        std::fs::symlink_metadata("/proc/self/stat").unwrap();
+        assert!(open(FILTERED_FD), "Detcore's O_PATH descriptor was closed");
+    });
+    detcore::detlog::determinism_loss()
+}
+
+/// A close that reports a restart every time has not run. Detcore tries it a
+/// bounded number of times, where it had tried for ever, and records that
+/// the descriptor stays open.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn a_close_that_never_runs_ends_in_a_determinism_loss() {
+    let loss = stat_a_procfs_path_with_close_filtered(ERESTARTSYS);
+    assert_eq!(
+        loss.as_deref(),
+        Some(
+            "procfs inode numbers: close of the guest's O_PATH descriptor did not run in 8 attempts"
+        )
+    );
+}
+
+/// A close that a filter refuses, as a filter that blocks a call does, leaves
+/// the descriptor open, which Detcore sees in `/proc/<tid>/fd`, where it had
+/// taken the descriptor as closed whatever close returned.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn a_close_that_a_filter_refuses_ends_in_a_determinism_loss() {
+    let loss = stat_a_procfs_path_with_close_filtered(libc::EPERM as u32);
+    assert_eq!(
+        loss.as_deref(),
+        Some(
+            "procfs inode numbers: close left the guest's O_PATH descriptor open, returning Err(EPERM)"
+        )
+    );
+}
