@@ -1678,7 +1678,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // procfs_inode::tests::a_mount_table_read_whose_close_is_refused_is_an_error
     // (a mount table read under a filter that refuses close) retains all
     // 1239: 1240.
-    ("test.detcore_unit", 1240),
+    // procfs_inode::tests::{mount_points_are_read_in_the_frame_of_the_guests_root,
+    // a_stale_table_names_nothing_rather_than_another_entry} (mount points read
+    // in the frame of the guest's root, matched by mount ID) retain all 1240:
+    // 1242.
+    ("test.detcore_unit", 1242),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1742,7 +1746,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run records a loss) retain all 97 (measured 100).
     // procfs_inode::naming_an_entry_leaves_the_guests_errno (the guest's errno
     // under SaBRe) retains all 100 (measured 101).
-    ("test.detcore_misc", 101),
+    // procfs_inode::a_refused_close_ends_in_a_determinism_loss_whatever_a_lookup_says
+    // (a refused close is a loss whatever a later look finds) retains all 101
+    // (measured 102).
+    ("test.detcore_misc", 102),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -2381,8 +2388,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     // The host node carries the identical tests_misc selection.
     // And the same futex wake-order guest test: 89.
-    // And the same procfs inode guest tests: 101.
-    ("test.detcore_misc_on_host", 101),
+    // And the same procfs inode guest tests: 102.
+    ("test.detcore_misc_on_host", 102),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -2482,7 +2489,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the three tests of exited tasks and outside procfs files: 1238.
     // And the errno test: 1239.
     // And the mount table close test: 1240.
-    ("test.detcore_unit_on_host", 1240),
+    // And the two tests of mount points in the guest's frame: 1242.
+    ("test.detcore_unit_on_host", 1242),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
