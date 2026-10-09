@@ -12778,13 +12778,17 @@ struct CompatManifestRow {
 
 /// Each row of the strict compatibility corpus (tests/e2e/manifests/compat.yaml),
 /// keyed by its corpus label (the last backquoted word of the description the
-/// expansion writes; `g++` has the test id `compat/gxx`).
+/// expansion writes; `g++` has the test id `compat/gxx`): the row's required
+/// cell on the corpus backend, ptrace. A row's verify cells on the corpus's
+/// additional backends (liteinst and in-guest-trap) run the same argv and are
+/// not rows of their own.
 fn compat_manifest_rows(
     root: &Path,
     run_state: &Path,
 ) -> Result<BTreeMap<String, CompatManifestRow>, String> {
     let cells = ManifestSet::load(root)?.select(&hermit_manifest_plan::runner::Selection {
         category: Some("compat".into()),
+        backend: Some("ptrace".into()),
         population: Some(hermit_manifest_plan::runner::Population::Required),
         ..Default::default()
     })?;
