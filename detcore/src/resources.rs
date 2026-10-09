@@ -425,6 +425,17 @@ pub struct Resources {
     /// `false` outside replay.
     #[serde(default)]
     pub(crate) replay_served_from_log: bool,
+    /// The absolute virtual deadline of the timed wait that a polling request
+    /// (`poll_attempt > 0`) retries: `ppoll`, `poll`, `epoll_wait`,
+    /// `epoll_pwait`, `rt_sigtimedwait`, `select`, `pselect6` or a polling
+    /// `FUTEX_WAIT` with a timeout. Once committed virtual time passes it, the
+    /// scheduler restores the backed-off poller's normal priority so its next
+    /// retry can return the timeout
+    /// (`Scheduler::step2b_restore_due_pollers`,
+    /// <https://github.com/rrnewton/hermit/issues/3952>). `None` for every other
+    /// request, and always under record/replay.
+    #[serde(default)]
+    pub(crate) poll_deadline: Option<LogicalTime>,
 }
 
 impl fmt::Debug for Resources {
@@ -447,6 +458,9 @@ impl fmt::Debug for Resources {
         if self.replay_served_from_log {
             debug.field("replay_served_from_log", &true);
         }
+        if let Some(deadline) = self.poll_deadline {
+            debug.field("poll_deadline", &deadline);
+        }
         debug.finish()
     }
 }
@@ -463,6 +477,7 @@ impl Resources {
             backend_runtime_bootstrap: false,
             blocked_signal_mask: None,
             replay_served_from_log: false,
+            poll_deadline: None,
         }
     }
 
@@ -494,6 +509,11 @@ impl Resources {
             (Some(_), None) => {}
         }
         self.replay_served_from_log |= other.replay_served_from_log;
+        // A merged request waits for the earlier of two deadlines.
+        self.poll_deadline = match (self.poll_deadline, other.poll_deadline) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (left, right) => left.or(right),
+        };
     }
 
     pub fn set_signal_interrupt_errno(&mut self, errno: Errno) {

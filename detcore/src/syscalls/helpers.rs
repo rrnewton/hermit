@@ -1751,6 +1751,25 @@ fn held_signal_restart_errno(restart_errno: Errno, signal: i32) -> Errno {
     }
 }
 
+/// The deadline a polling request carries so the scheduler can restore a
+/// backed-off poller once committed virtual time passes it
+/// (`Resources::poll_deadline`, <https://github.com/rrnewton/hermit/issues/3952>).
+/// `None` under record/replay, whose schedule must not change.
+pub(crate) fn poll_deadline_for<T, G>(
+    guest: &G,
+    deadline: Option<LogicalTime>,
+) -> Option<LogicalTime>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    if guest.config().recordreplay_modes {
+        None
+    } else {
+        deadline
+    }
+}
+
 /// Retry a non-blocking syscall until it succeeds. Set the timeout to zero for the actual
 /// syscalls (retries), while monitoring the clock to see if/when the logical timeout
 /// should trigger.  Timeout is passed as an ABSOLUTE TIME (not duration).
@@ -1796,6 +1815,7 @@ where
     // surviving multiple syscall injections:
     let (call, _maybe_stackguard) = call0.into_nonblocking(guest).await;
     let mut rsrc = rsrc.clone();
+    rsrc.poll_deadline = poll_deadline_for(guest, maybe_timeout.map(|(deadline, _)| deadline));
 
     loop {
         let resumed = match call.into() {
@@ -1919,6 +1939,7 @@ where
     )
     .with_deadline(maybe_timeout.is_some());
     let mut rsrc = rsrc.clone();
+    rsrc.poll_deadline = poll_deadline_for(guest, maybe_timeout.map(|(deadline, _)| deadline));
     let (mut call, mut guard) = call0.into_nonblocking(guest).await;
     let mut first_turn = true;
 

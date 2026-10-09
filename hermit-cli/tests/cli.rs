@@ -115,6 +115,7 @@ static HB_TWO_THREADS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_SOURCE_THEN_FUTEX_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_SIGNAL_WHILE_HELD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_SPAWN_DUP2_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static POLL_TIMEOUT_VS_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_LSEEK_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_INODE_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REPLAY_EPOCH_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -653,6 +654,32 @@ fn hb_spawn_dup2_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "hb-spawn-dup2 guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn poll_timeout_vs_spinner_guest() -> &'static Path {
+    POLL_TIMEOUT_VS_SPINNER_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("poll-timeout-vs-spinner");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create poll-timeout-vs-spinner guest directory");
+        let guest = build_root.join("poll_timeout_vs_spinner");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/poll_timeout_vs_spinner.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile poll-timeout-vs-spinner guest");
+        assert!(
+            output.status.success(),
+            "poll-timeout-vs-spinner guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -19010,4 +19037,62 @@ fn run_kvm_waitid_parked_foreign_waiters_contend_for_one_child() {
 #[test]
 fn run_kvm_wait4_parked_foreign_waiters_contend_for_one_child() {
     kvm_waitid_copyout::run_parked_foreign_waiters("wait4");
+}
+
+/// A `ppoll` with a timeout returns on time while another thread spins without
+/// syscalls (https://github.com/rrnewton/hermit/issues/3952). The guest waits
+/// five times for 50 ms each; every wait must return 0 after at least 50 ms and
+/// less than 100 ms of virtual time. Before the poll-deadline wake each took
+/// about 1.05 s: the poller was backed off after its first retry and waited up
+/// to 200 of the spinner's timeslices for a poll upgrade.
+///
+/// PMU SUBJECT: the spinner makes no syscall and is preempted only by the PMU
+/// timer (`--max-timeslice`), so without a PMU nothing interleaves the two
+/// threads and this case proves nothing. test.cli and test.cli_on_host skip it
+/// by exact name; privileged-test.pmu_cli_cases runs it.
+#[test]
+fn poll_timeout_returns_on_time_while_another_thread_spins() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = poll_timeout_vs_spinner_guest().to_str().unwrap().to_owned();
+    // A deadline, so the old behaviour (about 5 s of virtual time and minutes
+    // of wall) fails with a message instead of stalling the suite.
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "run",
+            "--strict",
+            "--max-timeslice",
+            "5000000",
+            "--",
+            guest.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "the run must finish within 120 s and exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
+    );
+    let waits: Vec<(i32, u64)> = stdout
+        .lines()
+        .map(|line| {
+            let (rc, elapsed) = line
+                .strip_prefix("ppoll rc=")
+                .and_then(|rest| rest.split_once(" elapsed_ns="))
+                .unwrap_or_else(|| panic!("unexpected guest output line {line:?}"));
+            (rc.parse().unwrap(), elapsed.parse().unwrap())
+        })
+        .collect();
+    assert_eq!(waits.len(), 5, "five waits expected:\n{stdout}");
+    for (rc, elapsed_ns) in waits {
+        assert_eq!(rc, 0, "every wait must time out:\n{stdout}");
+        assert!(
+            (50_000_000..100_000_000).contains(&elapsed_ns),
+            "a 50 ms ppoll returned after {elapsed_ns} ns of virtual time:\n{stdout}"
+        );
+    }
 }

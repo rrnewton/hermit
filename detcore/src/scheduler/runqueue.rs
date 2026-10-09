@@ -133,6 +133,18 @@ impl fmt::Display for PrioritizedOrder {
     }
 }
 
+/// The outcome of [`RunQueue::restore_poller_priority`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollerRestore {
+    /// The thread was queued as a backed-off poller and now has its normal priority.
+    Restored,
+    /// The thread is queued, but not backed off: a poll upgrade or a priority
+    /// change has already restored it.
+    NotBackedOff,
+    /// The thread is not in the run queue.
+    NotQueued,
+}
+
 /// After queueing this many new tasks, perform a "poll upgrade," in which
 /// we upgrade all outstanding polling tasks their original priority levels,
 /// temporarily negating backoff behavior.
@@ -629,6 +641,41 @@ impl RunQueue {
         }
     }
 
+    /// Whether selection follows priority order: `None` and `ConnectBind` pop
+    /// the first queued entry, so a backed-off poller can be starved; `Random`
+    /// and `StickyRandom` draw a uniform index into the queue and never are.
+    pub fn is_priority_ordered(&self) -> bool {
+        matches!(
+            self.sched_strategy,
+            SchedHeuristic::None | SchedHeuristic::ConnectBind
+        )
+    }
+
+    /// Restore one backed-off poller to the normal priority recorded when it
+    /// was queued, as `do_poll_upgrade` does for every poller. The entry keeps
+    /// its round-robin turn, and no push happens, so the push counter and the
+    /// queue's other keys are unchanged
+    /// (<https://github.com/rrnewton/hermit/issues/3952>).
+    ///
+    /// Mutating operation: this will error if a tentative_pop/commit transaction is underway.
+    pub fn restore_poller_priority(&mut self, tid: DetTid) -> PollerRestore {
+        assert!(self.tentative_selection.is_none());
+        let Some((&key, value)) = self.queue.iter().find(|(_, value)| value.tid == tid) else {
+            return PollerRestore::NotQueued;
+        };
+        let Some(normal_priority) = value.poll_upgrade else {
+            return PollerRestore::NotBackedOff;
+        };
+        let mut value = self.queue.remove(&key).expect("located queue entry");
+        value.poll_upgrade = None;
+        let restored = PrioritizedOrder {
+            priority: normal_priority,
+            turn: key.turn,
+        };
+        assert!(self.queue.insert(restored, value).is_none());
+        PollerRestore::Restored
+    }
+
     /// Upgrade polled tasks to their specified normal priority.
     #[cold]
     fn do_poll_upgrade(&mut self) {
@@ -660,6 +707,69 @@ impl Default for RunQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `restore_poller_priority` restores one backed-off poller to its recorded
+    /// priority and keeps its turn, so it sorts ahead of a thread pushed after
+    /// it at that priority. Other pollers stay backed off, and the restore is
+    /// not a push (https://github.com/rrnewton/hermit/issues/3952).
+    #[test]
+    fn restore_poller_priority_restores_one_poller_in_place() {
+        let poller = DetTid::from_raw(1);
+        let other = DetTid::from_raw(2);
+        let spinner = DetTid::from_raw(3);
+        let mut queue = RunQueue::new(SchedHeuristic::None, 0, 0.0);
+        queue.push_poller(poller, DEFAULT_PRIORITY, 3);
+        queue.push_poller(other, DEFAULT_PRIORITY, 3);
+        queue.push_back(spinner, DEFAULT_PRIORITY);
+        let pushes = queue.turn_counter();
+        // Backed off, the poller loses to the spinner.
+        assert_eq!(queue.tentative_pop_next(), Some(spinner));
+        queue.undo_tentative_pop();
+
+        assert_eq!(
+            queue.restore_poller_priority(poller),
+            PollerRestore::Restored
+        );
+        assert_eq!(queue.turn_counter(), pushes, "a restore is not a push");
+        assert_eq!(queue.tentative_pop_next(), Some(poller));
+        queue.undo_tentative_pop();
+        let (other_key, other_value) = queue
+            .queue
+            .iter()
+            .find(|(_, value)| value.tid == other)
+            .unwrap();
+        assert_eq!(other_key.priority, 8 * DEFAULT_PRIORITY);
+        assert_eq!(other_value.poll_upgrade, Some(DEFAULT_PRIORITY));
+
+        assert_eq!(
+            queue.restore_poller_priority(poller),
+            PollerRestore::NotBackedOff
+        );
+        assert_eq!(
+            queue.restore_poller_priority(spinner),
+            PollerRestore::NotBackedOff
+        );
+        assert_eq!(
+            queue.restore_poller_priority(DetTid::from_raw(9)),
+            PollerRestore::NotQueued
+        );
+    }
+
+    #[test]
+    fn only_first_entry_heuristics_are_priority_ordered() {
+        for (strategy, ordered) in [
+            (SchedHeuristic::None, true),
+            (SchedHeuristic::ConnectBind, true),
+            (SchedHeuristic::Random, false),
+            (SchedHeuristic::StickyRandom, false),
+        ] {
+            assert_eq!(
+                RunQueue::new(strategy, 0, 0.5).is_priority_ordered(),
+                ordered,
+                "{strategy:?}"
+            );
+        }
+    }
 
     #[test]
     fn transport_suspend_restore_preserves_all_queue_state() {

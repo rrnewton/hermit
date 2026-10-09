@@ -2864,6 +2864,7 @@ impl<T> ThreadState<T> {
             backend_runtime_bootstrap: false,
             blocked_signal_mask: None,
             replay_served_from_log: false,
+            poll_deadline: None,
         }
     }
 

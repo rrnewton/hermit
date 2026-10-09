@@ -34,6 +34,7 @@ use reverie::SignalTaskIdentity;
 use super::parked::*;
 use super::real_timer::TimerFailure;
 use super::*;
+use crate::config::SchedHeuristic;
 use crate::tool_global::SigalrmControl;
 
 #[derive(Default)]
@@ -4310,4 +4311,270 @@ fn a_refused_turn_charge_returns_before_a_controlled_observation() {
         NextTurnOwner::Ordinary
     );
     assert!(!state.run_queue.tentative_pop_in_progress());
+}
+
+// ---- poll deadlines (https://github.com/rrnewton/hermit/issues/3952) ----
+
+/// Queue `tid` as a backed-off poller through `step4_resource_block`'s real
+/// polling branch, retrying a timed wait whose deadline is `deadline`.
+fn backed_off_poller(s: &mut Scheduler, tid: DetTid, deadline: Option<LogicalTime>) -> Resources {
+    let mut request = Resources::new(tid);
+    request.insert(ResourceID::InternalIOPolling, Permission::W);
+    request.poll_attempt = 1;
+    request.poll_deadline = deadline;
+    s.next_turns[&tid].req.put(Ok(request.clone()));
+    s.run_queue.push_front(tid, DEFAULT_PRIORITY);
+    assert_eq!(s.run_queue.tentative_pop_next(), Some(tid));
+    let response = s.next_turns[&tid].resp.clone();
+    assert!(s.step4_resource_block(tid, &request, &response).is_err());
+    request
+}
+
+/// A thread with a filled ordinary request, queued at the back.
+fn runnable(s: &mut Scheduler, tid: DetTid) {
+    s.next_turns[&tid].req.put(Ok(Resources::new(tid)));
+    s.runqueue_push_back(tid);
+}
+
+fn next_selection(s: &mut Scheduler) -> Option<DetTid> {
+    let next = s.run_queue.tentative_pop_next();
+    if next.is_some() {
+        s.run_queue.undo_tentative_pop();
+    }
+    next
+}
+
+fn uncontrolled() -> Scheduler {
+    Scheduler::new(&Config {
+        sequentialize_threads: true,
+        ..Config::default()
+    })
+}
+
+/// A backed-off poller loses every selection to a runnable thread until
+/// committed time reaches its deadline. Then the ordinary loop's step2 restores
+/// its normal priority, it is selected first, and a second pass at the same
+/// committed time changes nothing.
+#[test]
+fn a_due_poll_deadline_restores_the_backed_off_poller_before_selection() {
+    let mut s = uncontrolled();
+    let global = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+    let (spinner, _, _) = add(&mut s, 100, 100);
+    let (poller, _, _) = add(&mut s, 100, 101);
+    s.committed_time = at(50);
+    backed_off_poller(&mut s, poller, Some(at(100)));
+    // The spinner is requeued after the poller, as at every preemption.
+    runnable(&mut s, spinner);
+    assert_eq!(s.poll_deadline_of.get(&poller), Some(&at(100)));
+
+    s.step2b_restore_due_pollers();
+    assert_eq!(next_selection(&mut s), Some(spinner), "not due yet");
+
+    s.committed_time = at(100);
+    s.step2_process_blocked(&global).unwrap();
+    assert_eq!(next_selection(&mut s), Some(poller));
+    assert!(s.poll_deadlines.is_empty() && s.poll_deadline_of.is_empty());
+    let after = format!("{:?}", s.run_queue);
+    s.step2b_restore_due_pollers();
+    assert_eq!(format!("{:?}", s.run_queue), after, "idempotent");
+}
+
+/// A due entry that no longer describes a waiting poller changes nothing: the
+/// thread started another request, a poll upgrade already restored it, or it
+/// was removed. A thread whose suspended entry a parked observation holds keeps
+/// its entry until the entry is back, and is restored then.
+#[test]
+fn stale_poll_deadlines_are_dropped_and_suspended_ones_kept() {
+    // The thread's request no longer carries the deadline.
+    let mut s = uncontrolled();
+    let (spinner, _, _) = add(&mut s, 100, 100);
+    let (poller, _, _) = add(&mut s, 100, 101);
+    backed_off_poller(&mut s, poller, Some(at(100)));
+    runnable(&mut s, spinner);
+    let mut newer = Resources::new(poller);
+    newer.insert(ResourceID::InternalIOPolling, Permission::W);
+    s.next_turns.get_mut(&poller).unwrap().req = Ivar::full(Ok(newer));
+    s.committed_time = at(100);
+    s.step2b_restore_due_pollers();
+    assert!(s.poll_deadline_of.is_empty());
+    assert_eq!(next_selection(&mut s), Some(spinner), "still backed off");
+
+    // Queued, but a poll upgrade already restored it.
+    let mut s = uncontrolled();
+    let (spinner, _, _) = add(&mut s, 100, 100);
+    let (poller, _, _) = add(&mut s, 100, 101);
+    backed_off_poller(&mut s, poller, Some(at(100)));
+    runnable(&mut s, spinner);
+    assert_eq!(
+        s.run_queue.restore_poller_priority(poller),
+        PollerRestore::Restored
+    );
+    let before = format!("{:?}", s.run_queue);
+    s.committed_time = at(100);
+    s.step2b_restore_due_pollers();
+    assert!(s.poll_deadline_of.is_empty());
+    assert_eq!(format!("{:?}", s.run_queue), before);
+
+    // Suspended by a parked observation: kept, then restored once it is back.
+    let mut s = uncontrolled();
+    let (spinner, _, _) = add(&mut s, 100, 100);
+    let (poller, _, _) = add(&mut s, 100, 101);
+    backed_off_poller(&mut s, poller, Some(at(100)));
+    runnable(&mut s, spinner);
+    let saved = s.run_queue.suspend(poller, DEFAULT_PRIORITY).unwrap();
+    s.committed_time = at(100);
+    s.step2b_restore_due_pollers();
+    assert_eq!(s.poll_deadline_of.get(&poller), Some(&at(100)), "kept");
+    s.run_queue.restore(saved, DEFAULT_PRIORITY);
+    s.step2b_restore_due_pollers();
+    assert!(s.poll_deadline_of.is_empty());
+    assert_eq!(next_selection(&mut s), Some(poller));
+
+    // Removed.
+    let mut s = uncontrolled();
+    let (poller, _, _) = add(&mut s, 100, 100);
+    backed_off_poller(&mut s, poller, Some(at(100)));
+    s.remove_blocking_entries(&poller);
+    assert!(s.poll_deadlines.is_empty() && s.poll_deadline_of.is_empty());
+}
+
+/// No deadline is recorded for a poll without a timeout, under record/replay,
+/// or under a heuristic that does not select in priority order.
+#[test]
+fn poll_deadlines_are_recorded_only_where_they_can_matter() {
+    let mut s = uncontrolled();
+    let (poller, _, _) = add(&mut s, 100, 100);
+    backed_off_poller(&mut s, poller, None);
+    assert!(s.poll_deadline_of.is_empty(), "no timeout");
+
+    let mut s = uncontrolled();
+    s.recordreplay_modes = true;
+    let (poller, _, _) = add(&mut s, 100, 100);
+    backed_off_poller(&mut s, poller, Some(at(100)));
+    assert!(s.poll_deadline_of.is_empty(), "record/replay");
+
+    for heuristic in [SchedHeuristic::Random, SchedHeuristic::StickyRandom] {
+        let mut s = Scheduler::new(&Config {
+            sequentialize_threads: true,
+            sched_heuristic: heuristic,
+            ..Config::default()
+        });
+        let (poller, _, _) = add(&mut s, 100, 100);
+        backed_off_poller(&mut s, poller, Some(at(100)));
+        assert!(s.poll_deadline_of.is_empty(), "{heuristic:?}");
+    }
+}
+
+/// KVM's controlled turn loop restores a due poller in maintenance stage 1:
+/// the turn's charge makes the deadline due, and the poller is granted ahead
+/// of the runnable thread.
+#[test]
+fn the_controlled_loop_restores_a_due_poller_in_maintenance() {
+    use futures::FutureExt;
+
+    let (mut s, _backend) = fixture();
+    let global = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+    let start = global.lock().unwrap().as_nanos();
+    let (spinner, _, _) = add(&mut s, 100, 100);
+    let (poller, _, _) = add(&mut s, 100, 101);
+    backed_off_poller(&mut s, poller, Some(start));
+    runnable(&mut s, spinner);
+    let scheduler = Arc::new(Mutex::new(s));
+    let result = do_a_turn_blocking(scheduler.clone(), global, &Err(SkipTurn))
+        .now_or_never()
+        .expect("nothing to wait for")
+        .expect("a runnable thread commits");
+    assert_eq!(result.tid, poller);
+    let s = scheduler.lock().unwrap();
+    assert_eq!(s.controlled_turn_entries, 1);
+    assert!(s.poll_deadline_of.is_empty());
+}
+
+/// The controlled loop also restores a poller whose deadline is crossed while
+/// the turn waits after maintenance stage 1: a real-timer observation parks the
+/// turn, global time advances past the deadline, and only the refresh that
+/// follows the resume sees it.
+#[test]
+fn the_controlled_loop_restores_a_poller_whose_deadline_a_refresh_crosses() {
+    use futures::FutureExt;
+
+    let (mut s, backend) = fixture();
+    let global = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+    let start = global.lock().unwrap().as_nanos();
+    let (waiter, mm, site) = add(&mut s, 100, 100);
+    let response = sleep(&mut s, waiter, mm, site, (start + at(1_000)).as_nanos());
+    s.replace_real_timer(waiter, waiter, start, at(1), at(0), Signal::SIGALRM)
+        .unwrap();
+    global
+        .lock()
+        .unwrap()
+        .add_extra_time(std::time::Duration::from_nanos(1));
+    s.committed_time = start + at(1);
+    s.step2b_process_timed();
+    backend.recipients.lock().unwrap().push(SignalRecipient {
+        task: task(100, 100),
+    });
+    let (spinner, _, _) = add(&mut s, 100, 101);
+    let (poller, _, _) = add(&mut s, 100, 102);
+    backed_off_poller(&mut s, poller, Some(start + at(200)));
+    runnable(&mut s, spinner);
+
+    let scheduler = Arc::new(Mutex::new(s));
+    let last = Err(SkipTurn);
+    let mut turn = Box::pin(do_a_turn_blocking(scheduler.clone(), global.clone(), &last));
+    assert!(
+        turn.as_mut().now_or_never().is_none(),
+        "the observation parks the turn"
+    );
+    let control = selected(&response);
+    let ack = Ivar::new();
+    {
+        let mut s = scheduler.lock().unwrap();
+        assert_eq!(s.committed_time, start + at(1));
+        assert_eq!(s.poll_deadline_of.get(&poller), Some(&(start + at(200))));
+        s.post_control(
+            waiter,
+            mm,
+            ControlIntent::Finish {
+                wait: control.continuation,
+                lease: control.lease,
+                site,
+                finish: ObservationFinish::ResumeSameWait,
+                ack: ack.clone(),
+            },
+        )
+        .unwrap();
+    }
+    assert!(turn.as_mut().now_or_never().is_none());
+    let ticket = match ack.try_read().unwrap().unwrap() {
+        FinishAck::AwaitResume(ticket) => ticket,
+        other => panic!("{other:?}"),
+    };
+    global
+        .lock()
+        .unwrap()
+        .add_extra_time(std::time::Duration::from_nanos(299));
+    backend.recipients.lock().unwrap().clear();
+    let resumed = Ivar::new();
+    scheduler
+        .lock()
+        .unwrap()
+        .post_control(
+            waiter,
+            mm,
+            ControlIntent::Resume {
+                ticket,
+                site,
+                response: resumed.clone(),
+            },
+        )
+        .unwrap();
+    let result = turn
+        .as_mut()
+        .now_or_never()
+        .expect("resume restored a filled request");
+    let s = scheduler.lock().unwrap();
+    assert_eq!(s.committed_time, start + at(300));
+    assert_eq!(result.unwrap().tid, poller);
+    assert!(s.poll_deadline_of.is_empty());
 }

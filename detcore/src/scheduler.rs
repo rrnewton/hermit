@@ -60,6 +60,7 @@ use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 pub use runqueue::DEFAULT_PRIORITY;
 use runqueue::LAST_PRIORITY;
+use runqueue::PollerRestore;
 use runqueue::PrioritizedOrder;
 pub use runqueue::Priority;
 use runqueue::REPLAY_DEFERRED_PRIORITY;
@@ -1175,6 +1176,14 @@ pub struct Scheduler {
     stop_after_iter: Option<u64>,
     /// A cached copy of the same (immutable) field in Config.
     recordreplay_modes: bool,
+    /// The timeout deadlines of backed-off pollers, in the order
+    /// `step2b_restore_due_pollers` resolves them: once committed time passes
+    /// a deadline, the poller's normal priority is restored so its next retry
+    /// can return the timeout (<https://github.com/rrnewton/hermit/issues/3952>).
+    /// At most one entry per thread, mirrored by `poll_deadline_of`.
+    poll_deadlines: BTreeSet<(LogicalTime, DetTid)>,
+    /// Each thread's entry in `poll_deadlines`.
+    poll_deadline_of: BTreeMap<DetTid, LogicalTime>,
     /// A cached copy of the same (immutable) field in Config.
     fuzz_futexes: bool,
     /// A cached copy of the same (immutable) field in Config. When set (and only
@@ -2106,6 +2115,9 @@ pub async fn do_a_turn_blocking(
                         if !timed_event_processed {
                             timed_event_processed = state.step2b_process_timed();
                         }
+                        // Idempotent and spends no event budget, so it runs on
+                        // every refresh, even one before stage 0's drain.
+                        state.step2b_restore_due_pollers();
                         if let Err(error) = state.select_parked_alarm() {
                             state.fail_parked_selection(error);
                             continue;
@@ -2125,6 +2137,7 @@ pub async fn do_a_turn_blocking(
                             if !timed_event_processed {
                                 timed_event_processed = state.step2b_process_timed();
                             }
+                            state.step2b_restore_due_pollers();
                             if let Err(error) = state.select_parked_alarm() {
                                 state.fail_parked_selection(error);
                             }
@@ -2381,6 +2394,8 @@ impl Scheduler {
             stop_after_turn: cfg.stop_after_turn,
             stop_after_iter: cfg.stop_after_iter,
             recordreplay_modes: cfg.recordreplay_modes,
+            poll_deadlines: BTreeSet::new(),
+            poll_deadline_of: BTreeMap::new(),
             run_queue: RunQueue::new(
                 cfg.sched_heuristic,
                 cfg.sched_seed(),
@@ -3691,6 +3706,7 @@ impl Scheduler {
             !waiters.is_empty()
         });
         self.pending_run_queue_admissions.remove(dtid);
+        self.forget_poll_deadline(*dtid);
         let _ = self.remove_futex_waiter(dtid);
         // A killed thread must not keep the scheduler loop alive as a parked
         // happens-before thread. (`force_unblock_thread_at` never reaches here
@@ -4022,6 +4038,7 @@ impl Scheduler {
         self.step2_release_signaled_background()?;
         self.step2_drain_prefix()?;
         self.step2b_process_timed();
+        self.step2b_restore_due_pollers();
         // A timed signal that just armed a background thread is followed by an
         // empty pass, so the barrier above requeues it at the top of the next
         // one whether or not its continuation is already posted.
@@ -4215,6 +4232,86 @@ impl Scheduler {
                 self.vfork_barriers
             );
             Err(SkipTurn)
+        }
+    }
+
+    /// Record the timeout deadline of a poller that `step4_resource_block` just
+    /// requeued backed off, replacing any earlier entry of the thread. Nothing
+    /// is recorded under record/replay, whose schedule must not change, or
+    /// under a heuristic that does not select in priority order (there a
+    /// backed-off poller is never starved, and re-keying it would only remap
+    /// seeds) (<https://github.com/rrnewton/hermit/issues/3952>).
+    fn note_poll_deadline(&mut self, dettid: DetTid, rs: &Resources) {
+        self.forget_poll_deadline(dettid);
+        let Some(deadline) = rs.poll_deadline else {
+            return;
+        };
+        if self.recordreplay_modes || !self.run_queue.is_priority_ordered() {
+            return;
+        }
+        self.poll_deadlines.insert((deadline, dettid));
+        self.poll_deadline_of.insert(dettid, deadline);
+    }
+
+    fn forget_poll_deadline(&mut self, dettid: DetTid) {
+        if let Some(deadline) = self.poll_deadline_of.remove(&dettid) {
+            self.poll_deadlines.remove(&(deadline, dettid));
+        }
+    }
+
+    /// Restore the normal priority of every backed-off poller whose timeout
+    /// deadline committed time has reached, so its next retry runs at the next
+    /// selection and returns the timeout instead of waiting up to
+    /// `POLLING_UPGRADE_INTERVAL` pushes for a poll upgrade
+    /// (<https://github.com/rrnewton/hermit/issues/3952>).
+    ///
+    /// Each due entry resolves one of four ways:
+    /// 1. the thread is gone, or its pending request no longer carries this
+    ///    deadline (it ran, finished the call, or started another one): drop;
+    /// 2. it is queued backed off: restore its priority, then drop;
+    /// 3. it is queued but no longer backed off (`do_poll_upgrade`, or a
+    ///    replayed priority change, restored it already): drop;
+    /// 4. its request still carries the deadline but it is out of the run
+    ///    queue, which happens while a parked alarm observation holds its
+    ///    suspended entry (`take_validated_membership`): keep, so a later pass
+    ///    restores it once the original entry is back.
+    ///
+    /// Deterministic: it reads only the deadlines threads computed in their own
+    /// turns, `committed_time`, the run queue and the pending requests. It is
+    /// idempotent for a given `committed_time` and monotone in it, so how many
+    /// passes run between commits does not change its result; it is the same
+    /// exposure `step2b_process_timed` already has to `committed_time`. It
+    /// re-keys entries in place and never pushes.
+    fn step2b_restore_due_pollers(&mut self) {
+        let due: Vec<(LogicalTime, DetTid)> = self
+            .poll_deadlines
+            .iter()
+            .take_while(|(deadline, _)| *deadline <= self.committed_time)
+            .copied()
+            .collect();
+        for (deadline, dettid) in due {
+            let still_waiting = self
+                .next_turns
+                .get(&dettid)
+                .and_then(|next_turn| next_turn.req.try_read())
+                .is_some_and(
+                    |request| matches!(request, Ok(rs) if rs.poll_deadline == Some(deadline)),
+                );
+            if still_waiting {
+                match self.run_queue.restore_poller_priority(dettid) {
+                    PollerRestore::Restored => {
+                        info!(
+                            "[scheduler] dettid {} restored to its normal priority: its poll \
+                             deadline {} has passed (committed time {})",
+                            dettid, deadline, self.committed_time
+                        );
+                    }
+                    PollerRestore::NotBackedOff => {}
+                    PollerRestore::NotQueued => continue,
+                }
+            }
+            self.poll_deadlines.remove(&(deadline, dettid));
+            self.poll_deadline_of.remove(&dettid);
         }
     }
 
@@ -6306,6 +6403,7 @@ impl Scheduler {
                 dettid, &self.run_queue
             );
             self.upgrade_polled_to_runnable(dettid, rs); // Indicate the thread gets to run next time
+            self.note_poll_deadline(dettid, rs);
             self.skip_turn()
         } else {
             match rs.resources.len() {

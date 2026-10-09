@@ -46,6 +46,7 @@ use crate::syscalls::helpers::RestartCall;
 use crate::syscalls::helpers::is_accepted_connection;
 use crate::syscalls::helpers::keep_restart_block;
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
+use crate::syscalls::helpers::poll_deadline_for;
 use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::refuse_held_signal_loss;
 use crate::syscalls::helpers::result_after_restore;
@@ -682,6 +683,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut resources = Resources::new(guest.thread_state().dettid);
         resources.insert(ResourceID::InternalIOPolling, Permission::W);
         resources.fyi("pselect6");
+        resources.poll_deadline = poll_deadline_for(guest, deadline);
         // Keep the request metadata accurate, but do not make it eligible for
         // the scheduler's ERESTARTSYS wakeup. A cross-task signal must first be
         // checked against pselect6's snapshotted temporary mask and disposition.
@@ -961,6 +963,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut resources = Resources::new(guest.thread_state().dettid);
         resources.insert(ResourceID::InternalIOPolling, Permission::W);
         resources.fyi("select");
+        resources.poll_deadline = poll_deadline_for(guest, deadline);
         // EINTR records select's interruption result. The scheduler only wakes
         // ERESTARTSYS requests: blocked and ignored signals still need a target-
         // side disposition check before this Signaled path can be used.

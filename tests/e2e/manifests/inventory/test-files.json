@@ -1141,6 +1141,12 @@
       "why": "tests/c/poll_readiness.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/poll_timeout_vs_spinner.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/poll_timeout_vs_spinner.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test poll_timeout_returns_on_time_while_another_thread_spins compiles this two-thread pthread guest, in which one thread busy-loops without syscalls while the other waits five times in a 50 ms ppoll on an empty pipe, and requires every wait to return 0 within [50 ms, 100 ms) of virtual time under --max-timeslice 5000000 (https://github.com/rrnewton/hermit/issues/3952); it remains a guest fixture because a generic manifest cannot assert per-call virtual elapsed times, and the case needs the PMU timer, so it runs in privileged-test.pmu_cli_cases."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/ppoll_readv.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
