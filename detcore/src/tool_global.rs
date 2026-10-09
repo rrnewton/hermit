@@ -6928,6 +6928,14 @@ mod tests {
             (Sysno::close, 2, 0),
             // No ioctl is placed.
             (Sysno::ioctl, 1, libc::TCGETS as usize),
+            // Buffered credentials and native process relations remain outside
+            // the four scalar identity queries.
+            (Sysno::getresuid, 0x1000, 0x2000),
+            (Sysno::getresgid, 0x1000, 0x2000),
+            (Sysno::getgroups, 1, 0x1000),
+            (Sysno::getppid, 0, 0),
+            (Sysno::getpgid, 0, 0),
+            (Sysno::getsid, 0, 0),
         ] {
             assert_eq!(
                 tool.sigalrm_phase1_gate(&guest, raw(sysno, a0, a1)),
@@ -6935,7 +6943,14 @@ mod tests {
                 "{sysno}"
             );
         }
-        for (sysno, a0, a1) in [(Sysno::getpid, 0, 0), (Sysno::write, 1, 0x1000)] {
+        for (sysno, a0, a1) in [
+            (Sysno::getpid, 0, 0),
+            (Sysno::write, 1, 0x1000),
+            (Sysno::getuid, 0, 0),
+            (Sysno::geteuid, 0, 0),
+            (Sysno::getgid, 0, 0),
+            (Sysno::getegid, 0, 0),
+        ] {
             assert_eq!(
                 tool.sigalrm_phase1_gate(&guest, raw(sysno, a0, a1)),
                 None,

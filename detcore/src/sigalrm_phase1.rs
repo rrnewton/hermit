@@ -259,6 +259,13 @@ pub(crate) const ALWAYS_ALLOWED: &[Sysno] = &[
     Sysno::exit,
     Sysno::getpid,
     Sysno::gettid,
+    // Existing fixed virtual-root scalar returns: these dispatch arms neither
+    // inject credential queries nor access a guest result buffer or wait.
+    // Shared signal eligibility, scheduling and accounting are unchanged.
+    Sysno::getuid,
+    Sysno::geteuid,
+    Sysno::getgid,
+    Sysno::getegid,
     // The trapping vDSO stubs of a run with site patching off.
     Sysno::clock_gettime,
     Sysno::clock_getres,
@@ -495,10 +502,14 @@ mod tests {
                 "faccessat",
                 "fstat",
                 "getdents64",
+                "getegid",
+                "geteuid",
+                "getgid",
                 "getitimer",
                 "getpid",
                 "gettid",
                 "gettimeofday",
+                "getuid",
                 "mmap",
                 "mprotect",
                 "munmap",
@@ -529,6 +540,47 @@ mod tests {
             refused += 1;
         }
         assert_eq!(refused + placed.len(), all_pinned_syscalls().count());
+    }
+
+    /// Only the four fixed scalar credential returns are admitted. Buffered
+    /// credentials, native process relations and new path operations keep their
+    /// existing refusal; none of these decisions may consult a descriptor.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn sigalrm_phase1_scalar_identity_keeps_neighboring_refusals() {
+        for sysno in [Sysno::getuid, Sysno::geteuid, Sysno::getgid, Sysno::getegid] {
+            assert_eq!(
+                classify(sysno, &args([0; 6]), |_| panic!(
+                    "no descriptor for {sysno}"
+                )),
+                Phase1Class::Allowed,
+                "{sysno}"
+            );
+        }
+        for sysno in [
+            Sysno::getresuid,
+            Sysno::getresgid,
+            Sysno::getgroups,
+            Sysno::getppid,
+            Sysno::getpgrp,
+            Sysno::getpgid,
+            Sysno::getsid,
+            Sysno::uname,
+            Sysno::getrandom,
+            Sysno::stat,
+            Sysno::lstat,
+            Sysno::statx,
+            Sysno::readlink,
+            Sysno::readlinkat,
+        ] {
+            assert_eq!(
+                classify(sysno, &args([0; 6]), |_| panic!(
+                    "no descriptor for {sysno}"
+                )),
+                Phase1Class::Refused("a syscall phase 1 has not placed"),
+                "{sysno}"
+            );
+        }
     }
 
     /// The kernel's account of a descriptor: a procfs file of a safe kind is

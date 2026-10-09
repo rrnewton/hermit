@@ -556,6 +556,122 @@ fn sigalrm_fixture(name: &str) -> std::path::PathBuf {
     guest
 }
 
+/// Runs the scalar fixture with exact outputs and current typed canonical
+/// verification. The official CLI runner owns these Hermit invocations.
+fn sigalrm_scalar_identity_run(
+    guest: &Path,
+    backend: &str,
+    admission: Option<&str>,
+    patching: &str,
+    mode: &str,
+) -> Vec<u8> {
+    use hermit::canonical_verdict::VerificationReport;
+
+    use super::kvm_cancellation::bounded_command_with_timeout;
+    use super::kvm_cancellation::bounded_read;
+
+    let directory = process_build_root(&format!("sigalrm-scalars-{backend}-{mode}"));
+    fs::create_dir_all(&directory).expect("scalar verification directory");
+    let report_path = directory.join("verify.json");
+    let mut command = Command::new(hermit_binary());
+    command
+        .args(["--log=info", "--backend", backend, "run"])
+        .arg(format!("--epoch={VIRTUAL_TIME_EPOCH}"))
+        .args([
+            "--strict",
+            "--max-timeslice=disabled",
+            "--base-env=minimal",
+            "--verify",
+            "--verify-strict",
+        ])
+        .arg(format!("--verify-json={}", report_path.display()))
+        .arg(format!("--env=REVERIE_LITEINST_SITE_PATCHING={patching}"))
+        .env_remove("REVERIE_LITEINST_SIGALRM_HANDLERS")
+        .env_remove("RUST_LOG")
+        .env_remove("HERMIT_LOG")
+        .env_remove("HERMIT_LOG_FILE")
+        .stdin(Stdio::null());
+    if let Some(value) = admission {
+        command.arg(format!("--env=REVERIE_LITEINST_SIGALRM_HANDLERS={value}"));
+    }
+    command.arg("--").arg(guest).arg(mode);
+    let status = bounded_command_with_timeout(&mut command, &directory, Duration::from_secs(57));
+    let stdout = bounded_read(&directory.join("stdout"), 1024 * 1024);
+    let stderr = bounded_read(&directory.join("stderr"), 16 * 1024 * 1024);
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "{backend}/{mode}: stdout={} stderr={}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr),
+    );
+    let report =
+        VerificationReport::from_current_json_slice(&bounded_read(&report_path, 16 * 1024 * 1024))
+            .expect("complete current scalar verification report");
+    report
+        .require_canonical_match()
+        .expect("nonempty canonical INFO comparison must match");
+    report
+        .require_exact_output_match()
+        .expect("exact status/stdout/stderr comparison must match");
+    assert_eq!(report.guest_exit_code, Some(0));
+    assert!(report.guest_signal.is_none());
+    stdout
+}
+
+/// Only four existing virtual-root scalar queries are admitted by this slice.
+/// Every raw value/errno and the one-shot alarm/handler/pause lifecycle must
+/// match ptrace, including queries made inside the installed handler.
+#[test]
+fn in_guest_trap_sigalrm_scalar_identity_matches_ptrace() {
+    let _guard = hermit_run_guard();
+    let guest = sigalrm_fixture("liteinst_sigalrm_scalar_identity");
+    let mut expected = String::from(
+        "install=0 errno=0 alarm=0 errno=0 pause=-1 errno=4 hits=1 signal=14 remove=0 errno=0\n",
+    );
+    for stage in [
+        "before",
+        "installed",
+        "handler",
+        "after_delivery",
+        "removed",
+    ] {
+        for query in ["getuid", "geteuid", "getgid", "getegid"] {
+            expected.push_str(&format!("{stage} {query} value=0 errno=0\n"));
+        }
+    }
+    let mut outputs = Vec::new();
+    for backend in ["ptrace", "in-guest-trap"] {
+        let stdout = sigalrm_scalar_identity_run(&guest, backend, Some("1"), "0", "handled");
+        assert_eq!(stdout, expected.as_bytes(), "{backend} scalar lifecycle");
+        outputs.push(stdout);
+    }
+    assert_eq!(
+        outputs[0], outputs[1],
+        "same scalar guest/input under both backends"
+    );
+}
+
+/// Opt-in alone is insufficient: no opt-in and true patched LiteInst both
+/// retain EPERM installation refusal, leaving the scalar queries unchanged.
+#[test]
+fn liteinst_sigalrm_scalar_identity_keeps_handler_admission_controls() {
+    let _guard = hermit_run_guard();
+    let guest = sigalrm_fixture("liteinst_sigalrm_scalar_identity");
+    let mut expected = String::from("install=-1 errno=1 hits=0\n");
+    for stage in ["before", "after_refusal"] {
+        for query in ["getuid", "geteuid", "getgid", "getegid"] {
+            expected.push_str(&format!("{stage} {query} value=0 errno=0\n"));
+        }
+    }
+    for (backend, admission, patching) in
+        [("in-guest-trap", None, "0"), ("liteinst", Some("1"), "1")]
+    {
+        let stdout = sigalrm_scalar_identity_run(&guest, backend, admission, patching, "refused");
+        assert_eq!(stdout, expected.as_bytes(), "{backend} admission control");
+    }
+}
+
 /// Runs a SIGALRM guest whose handler is delivered before a syscall that has
 /// not run (the I4 addendum's point c), once without --verify, where its
 /// output must be `expected` (the program's output on native Linux), then

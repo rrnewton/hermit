@@ -245,7 +245,8 @@ pub const HOSTED_PORTABLE_EXCLUDED_BACKENDS: &[&str] = &["kvm", "liteinst", "in-
 /// a runner with one it would fail the same way. The four `in_guest_trap_`
 /// cases run guests under the same runtime with site patching off
 /// (`--backend=in-guest-trap`), and the three self-signal-death cases run
-/// guests under both in-guest backends. Only `test.cli_on_host`
+/// guests under both in-guest backends. The two scalar SIGALRM tests also
+/// require this runtime capability. Only `test.cli_on_host`
 /// excludes them, with one exact-name filterset (`-E 'not (test(=NAME) |
 /// ...)'`) rather than substring `--skip`s; the local `test.cli` keeps running
 /// every one in the pinned root, and a test below holds both sides to this
@@ -255,6 +256,7 @@ pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_in_guest_programs::in_guest_trap_dispatch_record_reports_no_patched_sites",
     "liteinst_in_guest_programs::in_guest_trap_refuses_a_guest_library_that_turns_site_patching_back_on",
     "liteinst_in_guest_programs::in_guest_trap_sets_site_patching_off_and_refuses_a_caller_who_turns_it_on",
+    "liteinst_in_guest_programs::in_guest_trap_sigalrm_scalar_identity_matches_ptrace",
     "liteinst_in_guest_programs::in_guest_trap_verifies_a_program_with_no_site_patched",
     "liteinst_in_guest_programs::liteinst_in_guest_a_root_that_aborts_ends_with_its_own_status",
     "liteinst_in_guest_programs::liteinst_in_guest_abnormal_exit_after_registration_does_not_hang",
@@ -302,6 +304,7 @@ pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_in_guest_programs::liteinst_in_guest_unscheduled_deaths_complete_and_refuse_verification",
     "liteinst_in_guest_programs::liteinst_in_guest_user_address_limit_queries_keep_the_guest_errno",
     "liteinst_in_guest_programs::liteinst_in_guest_virtual_identity_and_time",
+    "liteinst_in_guest_programs::liteinst_sigalrm_scalar_identity_keeps_handler_admission_controls",
     "liteinst_in_guest_refuses_a_guest_socket_at_the_forwarding_number",
     "liteinst_in_guest_verify_compares_the_records_the_guest_forwards",
     "liteinst_in_guest_verify_forwards_records_by_the_cli_filters_per_target_answer",

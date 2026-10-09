@@ -288,6 +288,16 @@ signal another process sends, a signal the scheduler delivers (such as the
 SIGALRM of an `alarm` with no handler, which is also what a program gets
 when in-guest LiteInst refuses its handler), and a SIGPIPE from a write.
 
+On a run qualified for guest SIGALRM handlers, `in-guest-trap` with the
+per-run opt-in `REVERIE_LITEINST_SIGALRM_HANDLERS=1` permits `getuid`,
+`geteuid`, `getgid` and `getegid` while the handler is installed, including
+inside the handler. They return Hermit's existing virtual-root identity
+(`0`). Handler admission still requires site patching to be off; requesting
+the opt-in on patched LiteInst does not admit a handler. Buffered credential
+queries, `getppid` and the other unplaced calls remain refused with
+`EOPNOTSUPP` while a handler is installed, as does closing inherited stderr.
+Handler admission remains disabled unless explicitly requested.
+
 The default namespace, mount, and network setup is shared with Hermit's other
 backends; `--no-namespace` remains available for trusted guests. The in-guest
 runtime reserves `SIGSYS` for itself. This experimental path is not a security
