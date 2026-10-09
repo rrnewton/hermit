@@ -9074,6 +9074,75 @@ mod tests {
         }
     }
 
+    /// A corpus's additional-backend flags reach the expanded verify mode's
+    /// per-backend `hermit_args`, so the manifest validator holds them to the
+    /// same allowlist and once-per-flag rule as any hand-written cell's, and
+    /// the relaxation each cell records names its own flags.
+    #[test]
+    fn corpus_additional_backend_flags_meet_the_manifest_validator() {
+        let corpus = r#"schema: 3
+bucket: fixture
+corpus:
+  description: Fixture program
+  lane: portable
+  requires: [linux]
+  backend: ptrace
+  verify:
+    hermit_args: [--no-virtualize-cpuid]
+    hermit_args_reason: fixture configuration
+    timeout_seconds: 60
+    cpu_timeout_seconds: 59
+    slow_reason: fixture budget
+  additional:
+    - backend: liteinst
+      hermit_args: [--max-timeslice=disabled]
+      hermit_args_reason: fixture in-guest reason
+      rows: [echo]
+      disabled_reason: not measured on liteinst
+  rows:
+    - {label: "echo", argv: ["/bin/echo", "x"]}
+    - {label: "true", argv: ["/bin/true"]}
+"#;
+        let load = |text: &str| -> Result<ManifestDocument, String> {
+            let value = crate::manifest_corpus::expand_corpus(
+                serde_yaml::from_str(text).map_err(|error| error.to_string())?,
+            )?;
+            let document: ManifestDocument =
+                serde_yaml::from_value(value).map_err(|error| error.to_string())?;
+            validate_document(&document, "fixture", Path::new("/"), 15)?;
+            Ok(document)
+        };
+        let document = load(corpus).unwrap();
+        let verify = &document.test[0].modes["verify"];
+        assert_eq!(verify.backends_enabled, ["ptrace", "liteinst"]);
+        assert_eq!(
+            cell_hermit_args(verify, "liteinst"),
+            ["--max-timeslice=disabled"]
+        );
+        assert_eq!(
+            cell_hermit_args(verify, "ptrace"),
+            ["--no-virtualize-cpuid"]
+        );
+        for refused_flag in ["--no-strict", "--chaos", "--max-timeslice=", "--epoch=1"] {
+            let error = load(&corpus.replace(
+                "hermit_args: [--max-timeslice=disabled]",
+                &format!("hermit_args: [\"{refused_flag}\"]"),
+            ))
+            .unwrap_err();
+            assert!(error.contains("is not one of"), "{refused_flag}: {error}");
+        }
+        let error = load(&corpus.replace(
+            "hermit_args: [--max-timeslice=disabled]",
+            "hermit_args: [--max-timeslice=1, --max-timeslice=disabled]",
+        ))
+        .unwrap_err();
+        assert!(error.contains("repeats `--max-timeslice`"), "{error}");
+        let error =
+            load(&corpus.replace("      hermit_args_reason: fixture in-guest reason\n", ""))
+                .unwrap_err();
+        assert!(error.contains("require a hermit_args_reason"), "{error}");
+    }
+
     #[test]
     fn verify_extensions_are_verify_only_reasoned_and_allowlisted() {
         let accepted = ModeRecipe {
