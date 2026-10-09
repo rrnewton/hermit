@@ -2966,3 +2966,559 @@ fn another_process_stdin_pipe_reads_as_the_readers_own() {
         true,
     );
 }
+
+/// The `d_ino` that one `getdents64` listing of `dir` gives `name`, if listed.
+fn listed_inode(dir: &str, name: &str) -> Option<u64> {
+    let dir = CString::new(dir).unwrap();
+    let fd = unsafe { libc::open(dir.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+    assert!(fd >= 0, "open {dir:?}");
+    let mut buf = [0u8; 8192];
+    let mut found = None;
+    loop {
+        let n = getdents64(fd, &mut buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        let mut offset = 0;
+        while offset < n {
+            let record = &buf[offset..n];
+            let d_ino = u64::from_ne_bytes(record[..8].try_into().unwrap());
+            let reclen = u16::from_ne_bytes(record[16..18].try_into().unwrap()) as usize;
+            let entry = CStr::from_bytes_until_nul(&record[19..reclen]).unwrap();
+            if entry.to_bytes() == name.as_bytes() {
+                found = Some(d_ino);
+            }
+            offset += reclen;
+        }
+    }
+    unsafe { libc::close(fd) };
+    found
+}
+
+/// The inodes Detcore reports for descriptor `fd`'s procfs entries, in this
+/// order: the `getdents64` records of `/proc/self/fd` and `/proc/<pid>/fd`,
+/// `newfstatat` and `statx` of `/proc/self/fd/<fd>` without following it, the
+/// `getdents64` record of `/proc/self/fdinfo`, and `newfstatat` of
+/// `/proc/self/fdinfo/<fd>`.
+fn descriptor_entry_inodes(fd: i32) -> [u64; 6] {
+    let name = fd.to_string();
+    let pid = unsafe { libc::getpid() };
+    let link = CString::new(format!("/proc/self/fd/{fd}")).unwrap();
+    let info = CString::new(format!("/proc/self/fdinfo/{fd}")).unwrap();
+    let nofollow = libc::AT_SYMLINK_NOFOLLOW;
+    [
+        listed_inode("/proc/self/fd", &name).expect("fd not listed"),
+        listed_inode(&format!("/proc/{pid}/fd"), &name).expect("fd not listed by pid"),
+        raw_stat(libc::SYS_newfstatat, libc::AT_FDCWD, &link, nofollow).0,
+        raw_stat(libc::SYS_statx, libc::AT_FDCWD, &link, nofollow).0,
+        listed_inode("/proc/self/fdinfo", &name).expect("fdinfo not listed"),
+        raw_stat(libc::SYS_newfstatat, libc::AT_FDCWD, &info, 0).0,
+    ]
+}
+
+/// Linux gives a `/proc/<pid>/fd/<n>` or `fdinfo/<n>` entry a fresh inode
+/// number each time it instantiates the entry's dentry, so the number a
+/// listing or `lstat` reports changes whenever the host drops the cached
+/// dentry, which memory pressure does at a time no guest chooses
+/// (https://github.com/rrnewton/hermit/issues/3873). Here the guest forces
+/// that: it closes the descriptor, looks the entry up (which drops the
+/// dentry), and opens the descriptor again; natively both numbers change.
+/// Detcore must report the same numbers before and after, the same for
+/// `/proc/self` and `/proc/<pid>`, and the same in a listing as in a stat
+/// that does not follow the link.
+fn descriptor_entry_guest() {
+    const FD: i32 = 40;
+    let reopen = || {
+        let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+        assert_eq!(unsafe { libc::dup2(null, FD) }, FD);
+        assert_eq!(unsafe { libc::close(null) }, 0);
+    };
+    reopen();
+    let before = descriptor_entry_inodes(FD);
+    assert_eq!(unsafe { libc::close(FD) }, 0);
+    for path in [c"/proc/self/fd/40", c"/proc/self/fdinfo/40"] {
+        let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+        assert_eq!(unsafe { libc::lstat(path.as_ptr(), &mut stat) }, -1);
+    }
+    assert_eq!(listed_inode("/proc/self/fd", "40"), None);
+    reopen();
+    let after = descriptor_entry_inodes(FD);
+    assert_eq!(unsafe { libc::close(FD) }, 0);
+    assert_eq!(
+        before[..4],
+        [before[0]; 4],
+        "fd entry: listings and nofollow stats disagree"
+    );
+    assert_eq!(
+        before[4], before[5],
+        "fdinfo entry: listing and stat disagree"
+    );
+    assert_eq!(
+        after, before,
+        "the reopened descriptor's entries were renumbered"
+    );
+    println!("fd entry {} fdinfo entry {}", before[0], before[4]);
+}
+
+#[test]
+fn descriptor_entries_keep_their_inodes_when_procfs_recreates_them() {
+    run_five_times(descriptor_entry_guest);
+}
+
+/// `(st_dev, st_ino)` from raw `newfstatat(dirfd, path, flags)`.
+fn at_identity(dirfd: i32, path: &CStr, flags: i32) -> (u64, u64) {
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_newfstatat,
+            dirfd,
+            path.as_ptr(),
+            &raw mut stat,
+            flags,
+        )
+    };
+    assert_eq!(rc, 0, "newfstatat {path:?} relative to {dirfd}");
+    (stat.st_dev, stat.st_ino)
+}
+
+/// `(st_dev, st_ino)` from raw `fstat(fd)`.
+fn fd_identity(fd: i32) -> (u64, u64) {
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    assert_eq!(
+        unsafe { libc::syscall(libc::SYS_fstat, fd, &raw mut stat) },
+        0,
+        "fstat {fd}"
+    );
+    (stat.st_dev, stat.st_ino)
+}
+
+/// Opens `/dev/null` as descriptor 40.
+fn open_slot_40() {
+    let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+    assert_eq!(unsafe { libc::dup2(null, 40) }, 40);
+    assert_eq!(unsafe { libc::close(null) }, 0);
+}
+
+/// The `d_ino` of `name` in a fresh listing of the directory `dirfd` holds.
+fn listed_in(dirfd: i32, name: &str) -> u64 {
+    assert_eq!(unsafe { libc::lseek(dirfd, 0, libc::SEEK_SET) }, 0);
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = getdents64(dirfd, &mut buf).unwrap();
+        assert_ne!(n, 0, "{name} not listed");
+        let mut offset = 0;
+        while offset < n {
+            let record = &buf[offset..n];
+            let reclen = u16::from_ne_bytes(record[16..18].try_into().unwrap()) as usize;
+            let entry = CStr::from_bytes_until_nul(&record[19..reclen]).unwrap();
+            if entry.to_bytes() == name.as_bytes() {
+                return u64::from_ne_bytes(record[..8].try_into().unwrap());
+            }
+            offset += reclen;
+        }
+    }
+}
+
+/// An opened `/proc/self/fdinfo/40` is the entry its path names: `fstat`
+/// and `newfstatat(fd, "", AT_EMPTY_PATH)` report the identity a stat of the
+/// path reports (codex review of
+/// https://github.com/rrnewton/hermit/pull/3972, P2-1).
+fn fdinfo_descriptor_identity_guest() {
+    open_slot_40();
+    let path = at_identity(libc::AT_FDCWD, c"/proc/self/fdinfo/40", 0);
+    let fd = unsafe { libc::open(c"/proc/self/fdinfo/40".as_ptr(), libc::O_RDONLY) };
+    assert!(fd >= 0);
+    let actual = fd_identity(fd);
+    let empty = at_identity(fd, c"", libc::AT_EMPTY_PATH);
+    assert_eq!(
+        (actual, empty),
+        (path, path),
+        "fdinfo: path, fstat and empty path"
+    );
+    assert_eq!(unsafe { libc::close(fd) }, 0);
+    assert_eq!(unsafe { libc::close(40) }, 0);
+    println!("fdinfo entry {}", path.1);
+}
+
+#[test]
+fn an_opened_fdinfo_entry_has_the_identity_its_path_has() {
+    run_five_times(fdinfo_descriptor_identity_guest);
+}
+
+/// `/proc/self/fd/40` opened with `O_PATH|O_NOFOLLOW` is the link itself:
+/// `fstat` and an empty-path stat report what `lstat` of the path reports
+/// (P2-1 of the same review).
+fn opath_proc_link_identity_guest() {
+    open_slot_40();
+    let link = c"/proc/self/fd/40";
+    let path = at_identity(libc::AT_FDCWD, link, libc::AT_SYMLINK_NOFOLLOW);
+    let fd = unsafe { libc::open(link.as_ptr(), libc::O_PATH | libc::O_NOFOLLOW) };
+    assert!(fd >= 0);
+    let actual = fd_identity(fd);
+    let empty = at_identity(fd, c"", libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW);
+    assert_eq!(
+        (actual, empty),
+        (path, path),
+        "fd link: lstat, fstat and empty path"
+    );
+    assert_eq!(unsafe { libc::close(fd) }, 0);
+    assert_eq!(unsafe { libc::close(40) }, 0);
+    println!("fd link {}", path.1);
+}
+
+#[test]
+fn an_opath_proc_fd_link_has_the_identity_its_path_has() {
+    run_five_times(opath_proc_link_identity_guest);
+}
+
+/// A descriptor table directory a parent opened as `/proc/self/<table>` and
+/// a child inherited still holds the parent's table: the child's listing
+/// and its stat of `"40"` relative to it give the parent's entry (P2-2).
+fn inherited_table_guest(table: &str) {
+    open_slot_40();
+    let path = CString::new(format!("/proc/self/{table}")).unwrap();
+    let dir = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+    assert!(dir >= 0);
+    let parent = listed_in(dir, "40");
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0);
+    if child == 0 {
+        let listed = listed_in(dir, "40");
+        let relative = at_identity(dir, c"40", libc::AT_SYMLINK_NOFOLLOW).1;
+        let same = listed == parent && relative == parent;
+        unsafe { libc::_exit(if same { 0 } else { 42 }) };
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "{table}: the child's listing or relative stat named another entry: {status:#x}"
+    );
+    assert_eq!(unsafe { libc::close(dir) }, 0);
+    assert_eq!(unsafe { libc::close(40) }, 0);
+    println!("{table} entry {parent}");
+}
+
+#[test]
+fn an_inherited_fd_table_names_the_parents_entries() {
+    run_five_times(|| inherited_table_guest("fd"));
+}
+
+#[test]
+fn an_inherited_fdinfo_table_names_the_parents_entries() {
+    run_five_times(|| inherited_table_guest("fdinfo"));
+}
+
+/// With `/proc/self/fd` as the working directory, a stat of `"40"` relative
+/// to it gives the entry a listing gives (P2-2).
+fn cwd_table_guest() {
+    open_slot_40();
+    let dir = unsafe {
+        libc::open(
+            c"/proc/self/fd".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY,
+        )
+    };
+    assert!(dir >= 0);
+    assert_eq!(unsafe { libc::fchdir(dir) }, 0);
+    let listed = listed_in(dir, "40");
+    let relative = at_identity(libc::AT_FDCWD, c"40", libc::AT_SYMLINK_NOFOLLOW).1;
+    assert_eq!(relative, listed, "cwd-relative stat and listing");
+    assert_eq!(unsafe { libc::close(dir) }, 0);
+    assert_eq!(unsafe { libc::close(40) }, 0);
+    println!("cwd entry {listed}");
+}
+
+#[test]
+fn a_cwd_relative_stat_names_the_listed_entry() {
+    run_five_times(cwd_table_guest);
+}
+
+/// Following `/proc/self/fd/40`, when descriptor 40 holds an ordinary
+/// symlink opened with `O_PATH|O_NOFOLLOW`, describes that symlink: the stat
+/// keeps the symlink's identity, which `lstat` of its name and `fstat(40)`
+/// report, while `lstat` of the proc link describes the link (P2-3).
+fn followed_opath_symlink_guest() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target");
+    let link = dir.path().join("link");
+    std::fs::write(&target, b"x").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let link = CString::new(link.as_os_str().as_bytes()).unwrap();
+    let fd = unsafe { libc::open(link.as_ptr(), libc::O_PATH | libc::O_NOFOLLOW) };
+    assert_eq!(unsafe { libc::dup2(fd, 40) }, 40);
+    assert_eq!(unsafe { libc::close(fd) }, 0);
+    let original = at_identity(libc::AT_FDCWD, &link, libc::AT_SYMLINK_NOFOLLOW);
+    let actual = fd_identity(40);
+    let followed = at_identity(libc::AT_FDCWD, c"/proc/self/fd/40", 0);
+    let proc_link = at_identity(
+        libc::AT_FDCWD,
+        c"/proc/self/fd/40",
+        libc::AT_SYMLINK_NOFOLLOW,
+    );
+    assert_eq!(
+        (actual, followed),
+        (original, original),
+        "the symlink's identity"
+    );
+    assert_ne!(proc_link, original, "the proc link is a separate object");
+    assert_eq!(unsafe { libc::close(40) }, 0);
+    println!("symlink {} proc link {}", original.1, proc_link.1);
+}
+
+#[test]
+fn a_followed_fd_link_to_an_opath_symlink_keeps_the_symlinks_identity() {
+    run_five_times(followed_opath_symlink_guest);
+}
+
+/// Restores the soft `RLIMIT_NOFILE` it lowered when dropped.
+struct LoweredNofile(libc::rlimit);
+
+impl Drop for LoweredNofile {
+    fn drop(&mut self) {
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.0) }, 0);
+    }
+}
+
+/// Lowers this process's soft `RLIMIT_NOFILE` to `soft` until the result is
+/// dropped, so that a guest forked from it inherits a physical table it can
+/// fill. Detcore keeps a guest's own `setrlimit` virtual.
+fn lower_nofile(soft: libc::rlim_t) -> LoweredNofile {
+    let mut limit = unsafe { std::mem::zeroed::<libc::rlimit>() };
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+        0
+    );
+    let lowered = libc::rlimit {
+        rlim_cur: soft.min(limit.rlim_cur),
+        rlim_max: limit.rlim_max,
+    };
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
+    LoweredNofile(limit)
+}
+
+/// With the guest's descriptor table full, a stat of `/proc/self/fdinfo/40`
+/// still reports the identity `fstat` of an opened descriptor for it does:
+/// recovering the entry's identity must not need a free guest descriptor
+/// (codex re-check of https://github.com/rrnewton/hermit/pull/3972, P2-1).
+fn full_table_guest(_lowered: &LoweredNofile) {
+    open_slot_40();
+    let info = unsafe { libc::open(c"/proc/self/fdinfo/40".as_ptr(), libc::O_RDONLY) };
+    assert!(info >= 0);
+    let mut filler = Vec::new();
+    let errno = loop {
+        let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+        if fd < 0 {
+            break std::io::Error::last_os_error().raw_os_error();
+        }
+        filler.push(fd);
+        assert!(filler.len() < 4096, "the descriptor table never filled");
+    };
+    assert_eq!(errno, Some(libc::EMFILE));
+    let path = at_identity(libc::AT_FDCWD, c"/proc/self/fdinfo/40", 0);
+    let actual = fd_identity(info);
+    for fd in filler {
+        assert_eq!(unsafe { libc::close(fd) }, 0);
+    }
+    assert_eq!(path, actual, "path and descriptor stats with a full table");
+    assert_eq!(unsafe { libc::close(info) }, 0);
+    assert_eq!(unsafe { libc::close(40) }, 0);
+    println!("fdinfo entry {}", path.1);
+}
+
+#[test]
+fn a_stat_with_a_full_descriptor_table_keeps_the_entrys_identity() {
+    run_five_times_on(|| lower_nofile(256), full_table_guest, true);
+}
+
+/// Storage for a pathname that the stat result then overwrites, which Linux
+/// allows: it copies the pathname in before it copies the result out.
+#[repr(C)]
+union Overlapping<T: Copy> {
+    result: T,
+    path: [u8; 256],
+}
+
+/// A stat whose pathname shares its storage with the result reports the
+/// identity `fstat` of an opened descriptor for the same entry does, for
+/// `newfstatat` and `statx` (P2-2 of the same re-check).
+fn overlapping_path_guest() {
+    open_slot_40();
+    let info = unsafe { libc::open(c"/proc/self/fdinfo/40".as_ptr(), libc::O_RDONLY) };
+    assert!(info >= 0);
+    let actual = fd_identity(info);
+    let path = c"/proc/self/fdinfo/40".to_bytes_with_nul();
+
+    let mut stat = Overlapping::<libc::stat> { path: [0; 256] };
+    unsafe { stat.path[..path.len()].copy_from_slice(path) };
+    let rc = unsafe {
+        let buffer = &raw mut stat;
+        libc::syscall(
+            libc::SYS_newfstatat,
+            libc::AT_FDCWD,
+            buffer.cast::<u8>(),
+            buffer.cast::<libc::stat>(),
+            0,
+        )
+    };
+    assert_eq!(rc, 0);
+    let by_newfstatat = unsafe { (stat.result.st_dev, stat.result.st_ino) };
+
+    let mut statx = Overlapping::<libc::statx> { path: [0; 256] };
+    unsafe { statx.path[..path.len()].copy_from_slice(path) };
+    let rc = unsafe {
+        let buffer = &raw mut statx;
+        libc::syscall(
+            libc::SYS_statx,
+            libc::AT_FDCWD,
+            buffer.cast::<u8>(),
+            0,
+            libc::STATX_INO,
+            buffer.cast::<libc::statx>(),
+        )
+    };
+    assert_eq!(rc, 0);
+    let result = unsafe { statx.result };
+    let by_statx = (
+        libc::makedev(result.stx_dev_major, result.stx_dev_minor),
+        result.stx_ino,
+    );
+
+    assert_eq!(
+        (by_newfstatat, by_statx),
+        (actual, actual),
+        "overlapping-path stats"
+    );
+    assert_eq!(unsafe { libc::close(info) }, 0);
+    assert_eq!(unsafe { libc::close(40) }, 0);
+    println!("fdinfo entry {}", actual.1);
+}
+
+#[test]
+fn a_stat_whose_path_overlaps_its_result_keeps_the_entrys_identity() {
+    run_five_times(overlapping_path_guest);
+}
+
+/// A directory, made outside the guest, whose name is not UTF-8 and which
+/// holds `entry`, a symlink to `/proc/self/fdinfo/40`. Made outside because
+/// the test harness's RPC validation cannot carry a non-UTF-8 path for the
+/// guest's own `mkdir`; the guest only resolves it.
+fn non_utf8_directory() -> tempfile::TempDir {
+    use std::os::unix::ffi::OsStrExt;
+    let root = tempfile::tempdir().unwrap();
+    let directory = root
+        .path()
+        .join(std::ffi::OsStr::from_bytes(b"nonutf8-\xff"));
+    std::fs::create_dir(&directory).unwrap();
+    std::os::unix::fs::symlink("/proc/self/fdinfo/40", directory.join("entry")).unwrap();
+    root
+}
+
+/// A stat that reaches `/proc/self/fdinfo/40` through a directory whose name
+/// is not UTF-8 reports the identity `fstat` of an opened descriptor for the
+/// entry does: a pathname is bytes, and every component of it is legal
+/// (codex's second re-check of https://github.com/rrnewton/hermit/pull/3972,
+/// P2-1).
+fn non_utf8_path_guest(root: &tempfile::TempDir) {
+    use std::os::unix::ffi::OsStrExt;
+    open_slot_40();
+    let info = unsafe { libc::open(c"/proc/self/fdinfo/40".as_ptr(), libc::O_RDONLY) };
+    assert!(info >= 0);
+    let alias = root
+        .path()
+        .join(std::ffi::OsStr::from_bytes(b"nonutf8-\xff"))
+        .join("entry");
+    let alias = CString::new(alias.as_os_str().as_bytes()).unwrap();
+    let path = at_identity(libc::AT_FDCWD, &alias, 0);
+    let actual = fd_identity(info);
+    assert_eq!(
+        path, actual,
+        "a non-UTF-8 directory on the way to the entry"
+    );
+    assert_eq!(unsafe { libc::close(info) }, 0);
+    assert_eq!(unsafe { libc::close(40) }, 0);
+    println!("fdinfo entry {}", actual.1);
+}
+
+#[test]
+fn a_non_utf8_path_to_an_entry_keeps_the_entrys_identity() {
+    run_five_times_on(non_utf8_directory, non_utf8_path_guest, true);
+}
+
+/// Following `/proc/self/fd/40`, when descriptor 40 holds the
+/// `/proc/self/fd/41` link itself (opened with `O_PATH|O_NOFOLLOW`), jumps
+/// to that link object and stops: `fstat(40)`, the followed stat and a
+/// non-following stat of `/proc/self/fd/41` describe one object (codex's
+/// third re-check of https://github.com/rrnewton/hermit/pull/3972, P2-1).
+fn held_proc_link_guest() {
+    let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+    assert_eq!(unsafe { libc::dup2(null, 41) }, 41);
+    assert_eq!(unsafe { libc::close(null) }, 0);
+    let link = unsafe {
+        libc::open(
+            c"/proc/self/fd/41".as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW,
+        )
+    };
+    assert_eq!(unsafe { libc::dup2(link, 40) }, 40);
+    assert_eq!(unsafe { libc::close(link) }, 0);
+    let held = fd_identity(40);
+    let followed = at_identity(libc::AT_FDCWD, c"/proc/self/fd/40", 0);
+    let original = at_identity(
+        libc::AT_FDCWD,
+        c"/proc/self/fd/41",
+        libc::AT_SYMLINK_NOFOLLOW,
+    );
+    assert_eq!((followed, original), (held, held), "the held proc link");
+    assert_eq!(unsafe { libc::close(40) }, 0);
+    assert_eq!(unsafe { libc::close(41) }, 0);
+    println!("held link {}", held.1);
+}
+
+#[test]
+fn a_followed_fd_link_to_a_held_proc_link_stops_at_that_link() {
+    run_five_times(held_proc_link_guest);
+}
+
+/// A 64-byte symlink to `/proc/self/fdinfo/41` (the slashes are redundant)
+/// on tmpfs, whose device has major number 0, so that it passes the cheap
+/// gate a procfs fd link passes.
+fn ordinary_64_byte_link() -> tempfile::TempDir {
+    let root = tempfile::tempdir_in("/dev/shm").unwrap();
+    let target = format!("{}proc/self/fdinfo/41", "/".repeat(45));
+    assert_eq!(target.len(), 64);
+    std::os::unix::fs::symlink(target, root.path().join("link")).unwrap();
+    root
+}
+
+/// Following `/proc/self/fd/40`, when descriptor 40 holds an ordinary
+/// symlink (opened with `O_PATH|O_NOFOLLOW`) whose 64-byte text names a
+/// procfs entry, stops at that symlink: `fstat(40)`, the followed stat and
+/// `lstat` of the symlink describe one object, not the entry its text names
+/// (P2-1 of the same re-check).
+fn held_ordinary_link_guest(root: &tempfile::TempDir) {
+    use std::os::unix::ffi::OsStrExt;
+    let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+    assert_eq!(unsafe { libc::dup2(null, 41) }, 41);
+    assert_eq!(unsafe { libc::close(null) }, 0);
+    let path = CString::new(root.path().join("link").as_os_str().as_bytes()).unwrap();
+    let link = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_NOFOLLOW) };
+    assert_eq!(unsafe { libc::dup2(link, 40) }, 40);
+    assert_eq!(unsafe { libc::close(link) }, 0);
+    let held = fd_identity(40);
+    let followed = at_identity(libc::AT_FDCWD, c"/proc/self/fd/40", 0);
+    let direct = at_identity(libc::AT_FDCWD, &path, libc::AT_SYMLINK_NOFOLLOW);
+    assert_eq!(
+        (followed, direct),
+        (held, held),
+        "the held ordinary symlink"
+    );
+    assert_eq!(unsafe { libc::close(40) }, 0);
+    assert_eq!(unsafe { libc::close(41) }, 0);
+    println!("held symlink {}", held.1);
+}
+
+#[test]
+fn a_followed_fd_link_to_a_held_ordinary_link_stops_at_that_link() {
+    run_five_times_on(ordinary_64_byte_link, held_ordinary_link_guest, true);
+}

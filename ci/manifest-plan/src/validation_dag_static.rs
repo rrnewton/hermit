@@ -1808,7 +1808,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // without_sequentialized_threads_the_working_directory_is_not_named} (no
     // procfs entry is named while the guest's threads are not sequentialized,
     // whatever names it) retain all 104 (measured 106).
-    ("test.detcore_misc", 106),
+    // readdir_order's twelve procfs descriptor-entry identity tests (the
+    // review cases of https://github.com/rrnewton/hermit/pull/3972): 118.
+    ("test.detcore_misc", 118),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -2464,7 +2466,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host node carries the identical tests_misc selection.
     // And the same futex wake-order guest test: 89.
     // And the same procfs inode guest tests: 106.
-    ("test.detcore_misc_on_host", 106),
+    // And the same twelve descriptor-entry identity tests: 118.
+    ("test.detcore_misc_on_host", 118),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
