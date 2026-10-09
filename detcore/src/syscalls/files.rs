@@ -1017,7 +1017,7 @@ impl<'a> StatTarget<'a> {
 
 /// How many times Detcore injects the `openat` or the `close` of the
 /// `O_PATH` descriptor it opens in the guest to name a procfs entry when the
-/// call did not run, before it records a determinism loss instead.
+/// call had no effect, before it records a determinism loss instead.
 const OBJECT_DESCRIPTOR_ATTEMPTS: usize = 8;
 
 /// What Detcore learned of a stat result that may describe a procfs file
@@ -4253,7 +4253,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// (see [`procfs_inode::guest_tids_name_host_tasks`]), as there is then no
     /// `/proc/<tid>` to read.
     ///
-    /// Naming a path injects an `openat` and a `close` into the guest, and
+    /// Naming a path injects an `openat` and a `close` into the guest, only
+    /// with sequentialized threads (see [`Self::with_object_link`]), and
     /// Detcore trusts the host kernel to run them as Linux defines them. A
     /// seccomp filter the guest inherited from whatever started it (which
     /// `Config::inherited_seccomp` records) may refuse them with an error,
@@ -4378,6 +4379,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// closes it again (see [`Self::open_object_descriptor`] and
     /// [`Self::close_object_descriptor`]). An error is the reason Detcore
     /// learned nothing, or that the guest's descriptors may have changed.
+    ///
+    /// A path is opened only with sequentialized threads. Only then do the
+    /// open, the look at the link and the close run in one turn; otherwise
+    /// another guest thread can close the descriptor Detcore opened and take
+    /// its number for one of its own in between, which Detcore would then
+    /// read, and close.
     async fn with_object_link<G: Guest<Self>, R>(
         guest: &mut G,
         target: StatTarget<'_>,
@@ -4388,6 +4395,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             StatTarget::Descriptor(fd) => inspect(Path::new(&format!("/proc/{tid}/fd/{fd}"))),
             StatTarget::Cwd => inspect(Path::new(&format!("/proc/{tid}/cwd"))),
             StatTarget::Overwritten => Err("the call's result overwrote the guest's path".into()),
+            StatTarget::Path { .. } if !guest.config().sequentialize_threads => Err(
+                "the guest's threads are not sequentialized, so Detcore does not open its path again"
+                    .into(),
+            ),
             StatTarget::Path {
                 dirfd,
                 path,
@@ -4410,20 +4421,17 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Open the `O_PATH` descriptor `open` describes in the guest. An open
-    /// that did not run (see [`procfs_inode::read_open`]) is tried again, but
-    /// only `OBJECT_DESCRIPTOR_ATTEMPTS` times, as a seccomp filter the guest
+    /// that opened no descriptor and reported a restart or `EINTR` (see
+    /// [`procfs_inode::read_open`]) is tried again, but only
+    /// `OBJECT_DESCRIPTOR_ATTEMPTS` times, as a seccomp filter the guest
     /// inherited can return a restart every time without running the call.
     async fn open_object_descriptor<G: Guest<Self>>(
         guest: &mut G,
         open: syscalls::Openat,
     ) -> Result<RawFd, String> {
-        let tid = guest.tid().as_raw();
-        let holds = || procfs_inode::holds_descriptor(tid, procfs_inode::OPENAT_OWN_NUMBER);
-        let held_before = holds();
         let mut last = Errno::EINTR.to_string();
         for _ in 0..OBJECT_DESCRIPTOR_ATTEMPTS {
-            let result = guest.inject(open).await;
-            match procfs_inode::read_open(result, &held_before, holds) {
+            match procfs_inode::read_open(guest.inject(open).await) {
                 procfs_inode::Injected::Ran(fd) => return Ok(fd),
                 procfs_inode::Injected::NotRun(reported) => last = reported,
                 procfs_inode::Injected::Failed(reason) => return Err(reason),
