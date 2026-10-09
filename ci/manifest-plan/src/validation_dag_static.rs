@@ -2099,7 +2099,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 250, listed with this node's arguments. Each starts an in-guest LiteInst
     // guest, so they join the hosted CPUID-faulting exact-name filterset and
     // test.cli_on_host does not change.
-    ("test.cli", 253),
+    // run_dbt_guest_sees_ptraces_environment_before_and_after_exec and
+    // run_dbt_verifies_a_guest_that_prints_its_environment retain all 253:
+    // 255 (cargo nextest list with this node's arguments). Neither starts a
+    // LiteInst guest, so test.cli_on_host selects both.
+    ("test.cli", 255),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2294,7 +2298,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The four in-guest heap tests (heap at main, fork child, admitted SIGALRM,
     // preloaded libc wrappers) start in-guest LiteInst guests, so they join the
     // exact-name filterset: 195 + 4 - 4 = 195.
-    ("test.cli_on_host", 198),
+    // And the two DBT guest-environment tests: 198 + 2 = 200 (listed).
+    ("test.cli_on_host", 200),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 55),

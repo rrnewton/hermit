@@ -1314,8 +1314,33 @@ fi
 # clamp. These two local samples do not replace the original n=3 hosted
 # calibration or satisfy the >=5-sample replacement rule, and they are not a
 # Hermit guest or replay result; fresh validation is required.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != d9f0affc97430885ca79d02dffa7611419a07129 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie d9f0affc97430885ca79d02dffa7611419a07129 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# BOUND TO 54adc5eebf40c8f407399b02dcd9ca1f62b7f157 (2026-10-08): from
+# d9f0affc97430885ca79d02dffa7611419a07129. The one commit (54adc5ee "reverie-dbt: hide
+# DynamoRIO's and the runtime's private variables from the guest's
+# environment") changes the vendored DynamoRIO source, so the DynamoRIO SDK
+# recipe key changes; the other six recorded inputs are byte-identical:
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: ff1eeb32b140ae477894126af21296723c1ba582
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a -> ec2cc0a9bca71c9a6fad3dc39e713f77a8cccf50
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 7177e96f4575158230e2473b4cbfdb1ad902710d
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# The vendored change is to core/unix/loader.c and core/unix/os.c (hide the
+# injector's variables at early injection; pass them to injected children);
+# the cmake options and job-count rule are unchanged.
+# BOUNDED COLD SDK OBSERVATION AT 54adc5ee: a cold
+# `cargo check -p reverie-dbt --offline` (CARGO_BUILD_JOBS=16 NUM_JOBS=16, a
+# fresh target directory) on a 316-CPU host at load average ~240 reported
+# MISS, then "completed in 12.60s (jobs=16, 201.61 job-seconds; NUM_JOBS=16,
+# available CPUs=316)", and PUBLISHED for
+#     key=sha256:75c3067d4692cd8aa168d6791e718f21e6535e672b957291142070a0edc27234
+# 201.61 effective-job-seconds is below 1050. Retain the conservative 1050
+# effective-job-second threshold and the 16-job clamp. This local sample does
+# not replace the original n=3 hosted calibration or satisfy the >=5-sample
+# replacement rule; fresh validation is required.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 54adc5eebf40c8f407399b02dcd9ca1f62b7f157 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 54adc5eebf40c8f407399b02dcd9ca1f62b7f157 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

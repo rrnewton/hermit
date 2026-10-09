@@ -107,6 +107,7 @@ static GETTIMEOFDAY_UNREADABLE_BUFFER_GUEST: OnceLock<PathBuf> = OnceLock::new()
 static DBT_SELF_SIGQUEUE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_STDERR_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_LOG_ENV_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static DBT_GUEST_ENVIRONMENT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "liteinst")]
 static LITEINST_INERT_RUNTIME: OnceLock<PathBuf> = OnceLock::new();
 static EXEC_CLOCK_CONTINUITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -378,6 +379,32 @@ fn dbt_log_env_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "DBT log-env guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn dbt_guest_environment_guest() -> &'static Path {
+    DBT_GUEST_ENVIRONMENT_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("dbt-guest-environment");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create DBT guest-environment guest directory");
+        let guest = build_root.join("guest_environment");
+        let output = Command::new("cc")
+            .args(["-O2", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("hermit-cli/tests/fixtures/dbt/guest_environment.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile DBT guest-environment guest");
+        assert!(
+            output.status.success(),
+            "DBT guest-environment guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -4467,6 +4494,88 @@ fn run_dbt_numbers_syscalls_like_ptrace_from_the_initial_execve() {
         "{ptrace:#?}"
     );
     assert_eq!(numbered("dbt"), ptrace);
+}
+
+/// A DBT guest sees the environment ptrace's does, before and after an exec.
+///
+/// DynamoRIO runs the guest on the stack the kernel built for drrun's exec. The
+/// guest's environment used to carry DynamoRIO's variables and the runtime's
+/// HERMIT_DBT_* ones, among them Detcore's configuration and a coordinator
+/// socket path that is random per run, and an exec'd child also got
+/// DYNAMORIO_OPTIONS and DynamoRIO's other propagation variables
+/// (https://github.com/rrnewton/hermit/issues/3944). The bundled DynamoRIO now
+/// removes them before the guest starts. /proc/self/environ is compared
+/// without its empty entries: the kernel's range still covers the removed
+/// strings, erased to NUL bytes.
+#[test]
+fn run_dbt_guest_sees_ptraces_environment_before_and_after_exec() {
+    if dbt_unavailable("run_dbt_guest_sees_ptraces_environment_before_and_after_exec") {
+        return;
+    }
+    let guest = dbt_guest_environment_guest()
+        .to_str()
+        .expect("DBT guest-environment guest path should be UTF-8");
+    let environment = |backend: &str| {
+        let args = [
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--",
+            guest,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let ptrace = environment("ptrace");
+    for line in ["parent env PATH=", "child env PATH=", "child procenv PATH="] {
+        assert!(
+            ptrace.lines().any(|printed| printed.starts_with(line)),
+            "the ptrace guest did not print `{line}`:\n{ptrace}"
+        );
+    }
+    let dbt = environment("dbt");
+    for private in ["HERMIT_DBT_", "DYNAMORIO_", "__disabled__"] {
+        assert!(
+            !dbt.contains(private),
+            "the DBT guest saw {private}:\n{dbt}"
+        );
+    }
+    assert_eq!(dbt, ptrace);
+}
+
+/// DBT verification of a guest that prints its environment passes. It failed
+/// with "Mismatch in stdout between run 1 and run 2" on the coordinator socket
+/// path, which was random per run and in the guest's environment.
+#[test]
+fn run_dbt_verifies_a_guest_that_prints_its_environment() {
+    if dbt_unavailable("run_dbt_verifies_a_guest_that_prints_its_environment") {
+        return;
+    }
+    let guest = dbt_guest_environment_guest()
+        .to_str()
+        .expect("DBT guest-environment guest path should be UTF-8");
+    let args = [
+        "--backend",
+        "dbt",
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--",
+        guest,
+        "child",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert!(
+        stderr(&output).contains("Determinism verified"),
+        "{}",
+        stderr(&output)
+    );
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
