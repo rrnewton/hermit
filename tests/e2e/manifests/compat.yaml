@@ -1528,16 +1528,6 @@ corpus:
         [
           timeout
         ]
-    - backend: ptrace
-      result: determinism-failure
-      evidence: https://github.com/rrnewton/hermit/issues/3495
-      reason: >-
-        Diverges at a read whose content differs between runs (syscall
-        134)
-      rows:
-        [
-          java, javac
-        ]
   # The rr run type (scripts/validate.rs --rr-compat-only): every program
   # the rr lane listed as passing record/replay (its 139
   # RR_COMPAT_PASSING_LABELS) recorded and replayed once on ptrace by
@@ -1642,16 +1632,6 @@ corpus:
             these programs through the rows of the same name without the
             suffix
           rows: [lua-direct, perl-direct, df-direct]
-      # Measured red on 2026-10-02 with the release Hermit built at
-      # 03bbb8358: through this bucket, and 2 of 2 runs each of the retired
-      # strictcompat.<program> command.
-      unselected:
-        - result: determinism-failure
-          evidence: https://github.com/rrnewton/hermit/issues/3495
-          reason: >-
-            Diverges at a read whose content differs between runs (syscall
-            134, after the JVM's .hotspotrc lookup)
-          rows: [java, javac]
   rows:
     - {label: "echo", argv: ["/bin/echo", "hermit-compat"]}
     - {label: "true", argv: ["/usr/bin/true"]}

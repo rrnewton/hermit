@@ -16538,6 +16538,20 @@
         {
           "lane": "portable",
           "category": "compat",
+          "test": "compat/java",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/javac",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
           "test": "compat/kill",
           "mode": "verify",
           "backend": "sabre"
@@ -17501,6 +17515,20 @@
           "lane": "portable",
           "category": "compat",
           "test": "compat/strict-ip",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/strict-java",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/strict-javac",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -20763,7 +20791,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1273",
+        "NEXTEST_EXPECTED_EXECUTED": "1275",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -42808,7 +42836,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1273",
+        "NEXTEST_EXPECTED_EXECUTED": "1275",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,

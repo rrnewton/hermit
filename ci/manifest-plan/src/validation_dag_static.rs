@@ -1728,7 +1728,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1241.
     // The scalar SIGALRM admission/neighbor regression retains all 1272:
     // 1273, measured with this node's Nextest listing.
-    ("test.detcore_unit", 1273),
+    // procfs::tests::{cgroups_hides_the_host_cgroup_counts,
+    // cgroups_leaves_unknown_formats_untouched} (lane qemu-rcb,
+    // https://github.com/rrnewton/hermit/issues/3987) retain all 1273: 1275.
+    ("test.detcore_unit", 1275),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2567,7 +2570,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the four tests of interrupted mount table reads: 1250.
     // And the eleven poll-deadline tests: 1261.
     // And the same eleven pause/nanosleep cross-task wake tests: 1241.
-    ("test.detcore_unit_on_host", 1273),
+    // And the two /proc/cgroups tests: 1275.
+    ("test.detcore_unit_on_host", 1275),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

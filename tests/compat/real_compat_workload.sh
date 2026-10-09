@@ -581,9 +581,14 @@ public final class CompilerCompat {
 }
 EOF
         # Avoid live NSS queries while the JVM initializes user properties.
+        # An explicit class path keeps javac from listing its working directory
+        # (its default class path is "."). The manifest gate gives each cell a
+        # fresh private one, but a run from a shared directory, such as an
+        # ad-hoc run from the repository root, would otherwise compare entries
+        # other jobs change (https://github.com/rrnewton/hermit/issues/3987).
         javac -J-Duser.name=hermit -J-Duser.home="$WORK_DIR" \
             -J-Xint -J-XX:+UseSerialGC -J-XX:ActiveProcessorCount=1 \
-            -g:none -d "$WORK_DIR" "$WORK_DIR/CompilerCompat.java"
+            -g:none -cp "$WORK_DIR" -d "$WORK_DIR" "$WORK_DIR/CompilerCompat.java"
         # Direct execution avoids a parent/child command-substitution pipe.
         java -Duser.name=hermit -Duser.home="$WORK_DIR" \
             -Xint -XX:+UseSerialGC -XX:ActiveProcessorCount=1 \
@@ -627,8 +632,10 @@ class Compat {
 }
 EOF
         # Bound JVM-internal workers while retaining Compat's application thread.
+        # An explicit class path keeps javac from listing its working
+        # directory, as in the javac row.
         javac -J-Xint -J-XX:+UseSerialGC -J-XX:ActiveProcessorCount=1 \
-            -d "$WORK_DIR" "$WORK_DIR/Compat.java"
+            -cp "$WORK_DIR" -d "$WORK_DIR" "$WORK_DIR/Compat.java"
         java -Xint -XX:+UseSerialGC -XX:ActiveProcessorCount=1 \
             -cp "$WORK_DIR" Compat "$WORK_DIR"
         ;;

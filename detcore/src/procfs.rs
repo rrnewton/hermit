@@ -94,6 +94,7 @@ enum ProcfsKind {
     InodeNr,
     InodeState,
     Protocols,
+    Cgroups,
     BtrfsBytesReserved,
     BtrfsBytesPinned,
     Rtc,
@@ -795,6 +796,11 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-916): Review live protocol allocation counter normalization.
             "/proc/net/protocols" => ProcfsKind::Protocols,
             // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-3996): Review host cgroup count normalization.
+            // HotSpot reads this at JVM start to detect its container
+            // (https://github.com/rrnewton/hermit/issues/3987).
+            "/proc/cgroups" => ProcfsKind::Cgroups,
+            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-926): Review kernel lock identity normalization.
             "/proc/locks" => ProcfsKind::Locks,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1012,6 +1018,7 @@ impl ProcfsFile {
             ProcfsKind::InodeNr => sanitize_inode_nr(&contents),
             ProcfsKind::InodeState => sanitize_inode_state(&contents),
             ProcfsKind::Protocols => sanitize_protocols(&contents),
+            ProcfsKind::Cgroups => sanitize_cgroups(&contents),
             ProcfsKind::BtrfsBytesReserved => sanitize_btrfs_bytes_reserved(&contents),
             ProcfsKind::BtrfsBytesPinned => sanitize_btrfs_bytes_pinned(&contents),
             ProcfsKind::Rtc => sanitize_rtc(&contents, virtual_realtime_seconds),
@@ -3664,6 +3671,51 @@ fn zero_decimal_runs(text: &str) -> String {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-3996): Review the /proc/cgroups field policy.
+/// `/proc/cgroups` lists each cgroup controller with its hierarchy ID, the
+/// number of cgroups in that hierarchy, and whether it is enabled. The count is
+/// host-global: it changes whenever any service, session or container on the
+/// host creates or removes a cgroup, so two runs read different bytes
+/// (https://github.com/rrnewton/hermit/issues/3987). The controller list, the
+/// hierarchy IDs and the enabled flags describe the kernel's configuration and
+/// are kept; each count is reported as 1, the root cgroup alone. The kernel's
+/// tab-separated layout is preserved. Anything that does not have the kernel's
+/// header and four integer-valued columns is returned unchanged.
+fn sanitize_cgroups(contents: &[u8]) -> Vec<u8> {
+    const HEADER: &str = "#subsys_name\thierarchy\tnum_cgroups\tenabled";
+
+    let Ok(text) = std::str::from_utf8(contents) else {
+        return contents.to_vec();
+    };
+    let mut lines = text.lines();
+    if lines.next() != Some(HEADER) {
+        return contents.to_vec();
+    }
+
+    let mut normalized = vec![HEADER.to_owned()];
+    for line in lines {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        let [name, hierarchy, count, enabled] = fields[..] else {
+            return contents.to_vec();
+        };
+        if name.is_empty()
+            || hierarchy.parse::<u32>().is_err()
+            || count.parse::<u64>().is_err()
+            || enabled.parse::<u32>().is_err()
+        {
+            return contents.to_vec();
+        }
+        normalized.push(format!("{name}\t{hierarchy}\t1\t{enabled}"));
+    }
+
+    let mut output = normalized.join("\n").into_bytes();
+    if text.ends_with('\n') {
+        output.push(b'\n');
+    }
+    output
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-916): Review the /proc/net/protocols field policy.
 fn sanitize_protocols(contents: &[u8]) -> Vec<u8> {
     const HEADER: &[&str] = &[
@@ -4250,6 +4302,12 @@ mod tests {
                 .unwrap()
                 .kind,
             ProcfsKind::Protocols
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/proc/cgroups"))
+                .unwrap()
+                .kind,
+            ProcfsKind::Cgroups
         );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/locks"))
@@ -5976,6 +6034,50 @@ domain0 SMT 00000003 0 0 0\n"
     cpu: 7\n\
               count:    0\n"
         );
+    }
+
+    #[test]
+    fn cgroups_hides_the_host_cgroup_counts() {
+        // Modelled on two reads of a cgroup v2 host while other units came and
+        // went; one real read prints the same count on every line.
+        let contents = b"#subsys_name\thierarchy\tnum_cgroups\tenabled\n\
+cpu\t0\t6409\t1\n\
+cpuacct\t0\t6409\t1\n\
+memory\t0\t6399\t1\n\
+pids\t0\t6409\t0\n";
+
+        assert_eq!(
+            sanitize_cgroups(contents),
+            b"#subsys_name\thierarchy\tnum_cgroups\tenabled\n\
+cpu\t0\t1\t1\n\
+cpuacct\t0\t1\t1\n\
+memory\t0\t1\t1\n\
+pids\t0\t1\t0\n"
+        );
+        // A cgroup v1 host keeps its hierarchy IDs; two hosts that differ
+        // only in how many cgroups exist read the same bytes.
+        let v1_busy = b"#subsys_name\thierarchy\tnum_cgroups\tenabled\n\
+cpuset\t3\t42\t1\nmemory\t7\t180\t1\n";
+        let v1_idle = b"#subsys_name\thierarchy\tnum_cgroups\tenabled\n\
+cpuset\t3\t1\t1\nmemory\t7\t2\t1\n";
+        assert_eq!(sanitize_cgroups(v1_busy), sanitize_cgroups(v1_idle));
+        assert_eq!(
+            sanitize_cgroups(v1_busy),
+            b"#subsys_name\thierarchy\tnum_cgroups\tenabled\n\
+cpuset\t3\t1\t1\nmemory\t7\t1\t1\n"
+        );
+    }
+
+    #[test]
+    fn cgroups_leaves_unknown_formats_untouched() {
+        let other_header = b"#subsys_name hierarchy num_cgroups enabled\ncpu 0 6409 1\n";
+        assert_eq!(sanitize_cgroups(other_header), other_header);
+
+        let missing_column = b"#subsys_name\thierarchy\tnum_cgroups\tenabled\ncpu\t0\t6409\n";
+        assert_eq!(sanitize_cgroups(missing_column), missing_column);
+
+        let invalid_count = b"#subsys_name\thierarchy\tnum_cgroups\tenabled\ncpu\t0\tmany\t1\n";
+        assert_eq!(sanitize_cgroups(invalid_count), invalid_count);
     }
 
     #[test]
