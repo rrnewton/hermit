@@ -1274,7 +1274,18 @@ fi
 # rust-toolchain.toml are byte-identical), so the DynamoRIO SDK recipe key is
 # unchanged. Carry, not recalibration: no new timing sample or >=5-sample
 # replacement claim is made.
-expected_pin=ae8a078ea8f68dab5cc73007fa7d56935d62f11f
+# CARRY TO 5ba26897e1db46071f2a00f9ef4bee10e29c94ad (2026-10-09): from
+# ae8a078ea8f68dab5cc73007fa7d56935d62f11f. The intervening main commits add
+# the seccomp TSYNC test, inactive launcher preparation, the ptrace not-run
+# injection result, and the frozen in-guest self-signal lifecycle contract.
+# All seven SDK inputs recorded above remain byte-identical by Git object:
+# reverie-dbt/Cargo.toml, reverie-dbt/build.rs, native/CMakeLists.txt,
+# vendor/dynamorio, third-party, root Cargo.toml and rust-toolchain.toml.
+# `git diff ae8a078e 5ba26897 -- reverie-dbt third-party Cargo.toml
+# rust-toolchain.toml` is empty. Carry the existing budget and job clamp;
+# this is source evidence, not a new timing calibration. Fresh validation
+# still checks the changed runtime and ptrace behavior.
+expected_pin=5ba26897e1db46071f2a00f9ef4bee10e29c94ad
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
