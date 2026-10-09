@@ -242,6 +242,7 @@ LINT_CHECK_TARGETS := \
     lint-check-buck-e2e-cell \
     lint-check-buck-e2e-stage \
     lint-check-buck-e2e-stages \
+    lint-check-guest-preload-gate \
     lint-check-reverie-dbt-budget
 .PHONY: lint-checks $(LINT_CHECK_TARGETS)
 lint-checks: $(LINT_CHECK_TARGETS) ## The lint checkers CI schedules as one node (everything in `lint` except the two cargo passes)
@@ -391,6 +392,9 @@ lint-check-buck-e2e-stage:
 
 lint-check-buck-e2e-stages:
 	python3 ./ci/test_buck_e2e_stages.py
+
+lint-check-guest-preload-gate:
+	python3 ./ci/test_guest_preload_gate.py
 
 lint-check-reverie-dbt-budget:
 	./ci/run-with-reverie-dbt-budget-test.sh
