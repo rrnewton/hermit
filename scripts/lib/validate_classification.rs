@@ -240,6 +240,19 @@ pub(super) struct RunClassification {
 }
 
 impl RunClassification {
+    /// Account `--frozen-run` withheld nodes exactly as host-inapplicable ones
+    /// are: understood prerequisite failures. They are planned (see
+    /// `plan_planned_tags`), never a pass and never unaccounted, and the run
+    /// that carries one is incomplete, so even a row that lost its
+    /// intentional-skip entry reads as a short run rather than a clean one.
+    pub(super) fn account_withheld(&mut self, withheld: &[String]) {
+        for tag in withheld {
+            self.no_result_nodes.remove(tag);
+            self.understood_prerequisite_failure_nodes
+                .insert(tag.clone());
+        }
+    }
+
     pub(super) fn no_results(&self) -> usize {
         self.understood_infrastructure_failure_nodes.len()
             + self.understood_prerequisite_failure_nodes.len()

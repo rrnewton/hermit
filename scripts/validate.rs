@@ -907,6 +907,10 @@ struct Args {
     ignore_cache: bool,
     label_pr: bool,
     no_label_pr_explicit: bool,
+    /// `ci-hub validate-run --frozen-validate` asked for this run: withhold the
+    /// nodes that cannot run outside the dev-hermit parent. See
+    /// [`frozen_run_refusal`] and [`withhold_frozen_run_nodes`].
+    frozen_run: bool,
     verbosity: i64,
     jobs: Option<i64>,
     keep_going: bool,
@@ -936,6 +940,20 @@ const SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_OPTION: &str =
 const SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_ENV: &str =
     "VALIDATE_SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS";
 const ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION: &str = "--allow-local-off-the-record-run";
+const FROZEN_RUN_OPTION: &str = "--frozen-run";
+/// The one node `--frozen-run` withholds, matched by exact tag. A frozen
+/// validation checkout lives outside the dev-hermit parent, and this node's
+/// accept arm needs the parent's ledger adapter, so there it can only report
+/// NO_RESULT (exit 75) and fail the run without saying anything about the tree.
+const FROZEN_RUN_WITHHELD_TAG: &str = "check.canonical_adapter_accept";
+/// The ledger reason of a frozen-run withholding. It is deliberately NOT in the
+/// parent consumer's closed allowlist of qualification-safe intentional-skip
+/// reasons (ci-hub/validate/gate_completeness.py), so a row carrying it can
+/// never qualify as landing authority.
+const FROZEN_RUN_WITHHELD_REASON: &str = "frozen-run-outside-parent";
+const FROZEN_RUN_WITHHELD_ISSUE: &str = "https://github.com/rrnewton/dev-hermit/issues/549";
+/// The selection mode of a plan that `--frozen-run` withheld a node from.
+const FROZEN_RUN_SELECTION_MODE: &str = "frozen";
 const RELEASE_BUILD_MODE_ENV: &str = "HERMIT_VALIDATE_RELEASE_BUILD_MODE";
 const RELEASE_BUILDER_CARGO: &str = validate_receipt::RELEASE_BUILDER_CARGO;
 const RELEASE_BUILDER_BUCK: &str = "buck";
@@ -1270,6 +1288,10 @@ fn usage() -> &'static str {
      \x20                  Permit a clean, commit-anchored quick or focused local run for\n\
      \x20                  iterative testing. It writes no ledger row, publishes no receipt,\n\
      \x20                  and cannot be cited as validation evidence.\n\
+     \x20 --frozen-run     Set by `ci-hub validate-run --frozen-validate` only. Withholds\n\
+     \x20                  check.canonical_adapter_accept, which needs the dev-hermit\n\
+     \x20                  parent, as an intentional skip (never a pass). Refused without\n\
+     \x20                  --no-label-pr or under a canonical (landing) admission.\n\
      \x20 --verbose        Verbosity level 2: stream tagged per-step output.\n\
      \x20 --verbosity N    Output level 1..5 (default 1; levels 3/4 currently equal 2;\n\
      \x20                  level 5 prefixes every streamed line with test identity).\n\
@@ -1418,6 +1440,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         ignore_cache: env_flag("VALIDATE_IGNORE_CACHE", "1"),
         label_pr: !env_flag("VALIDATE_LABEL_PR", "0"),
         no_label_pr_explicit: false,
+        frozen_run: false,
         verbosity,
         jobs: None,
         keep_going: false,
@@ -1615,6 +1638,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
                 args.label_pr = false;
                 args.no_label_pr_explicit = true;
             }
+            FROZEN_RUN_OPTION => args.frozen_run = true,
             "--verbose" => args.verbosity = 2,
             "--verbosity" => {
                 i += 1;
@@ -10546,6 +10570,61 @@ fn product_front_door_applies(
     parent_detected && ci_hub_dir_present && !show_plan
 }
 
+/// Why `--frozen-run` must not run here, or `None` when it may.
+///
+/// The flag withholds a node, so it may only reach a run whose result can never
+/// be landing evidence. That is exactly a frozen-validate admission: ci-hub's
+/// lock authority labels it noncanonical (`admissible=false`), its receipt is
+/// written outside the canonical ledger, and it never carries a label. So:
+/// - a labeled run is refused (`--no-label-pr` must be explicit);
+/// - a canonical admission (held lock kind `validate`) is refused;
+/// - no admission at all is refused, since only ci-hub's frozen path sets the flag.
+/// `admission_canonical` is `Some(proof.canonical())` for an admitted run.
+#[cfg(test)]
+fn frozen_run_refusal(
+    frozen_run: bool,
+    label_pr: bool,
+    no_label_pr_explicit: bool,
+    admission_canonical: Option<bool>,
+) -> Option<String> {
+    frozen_run_label_refusal(frozen_run, label_pr, no_label_pr_explicit)
+        .or_else(|| frozen_run_admission_refusal(frozen_run, admission_canonical))
+}
+
+/// The label half of [`frozen_run_refusal`], checked before the product front
+/// door so it binds even where no admission is attempted.
+fn frozen_run_label_refusal(frozen_run: bool, label_pr: bool, no_label_pr_explicit: bool) -> Option<String> {
+    if !frozen_run {
+        return None;
+    }
+    if label_pr || !no_label_pr_explicit {
+        return Some(format!(
+            "{FROZEN_RUN_OPTION} requires an explicit --no-label-pr: a labeled run is landing evidence, \
+             and {FROZEN_RUN_OPTION} withholds {FROZEN_RUN_WITHHELD_TAG}"
+        ));
+    }
+    None
+}
+
+/// The admission half of [`frozen_run_refusal`].
+fn frozen_run_admission_refusal(frozen_run: bool, admission_canonical: Option<bool>) -> Option<String> {
+    if !frozen_run {
+        return None;
+    }
+    match admission_canonical {
+        Some(false) => None,
+        Some(true) => Some(format!(
+            "{FROZEN_RUN_OPTION} is refused under a canonical validate-lock admission (holder kind \
+             \"validate\"): that run's receipt is landing evidence, and {FROZEN_RUN_OPTION} withholds \
+             {FROZEN_RUN_WITHHELD_TAG}"
+        )),
+        None => Some(format!(
+            "{FROZEN_RUN_OPTION} needs a frozen-validate admission from `ci-hub validate-run \
+             --frozen-validate`; none was established for this run"
+        )),
+    }
+}
+
 /// A local off-the-record run is an iteration tool, not a cheaper publication
 /// path. It therefore requires an explicitly narrowed profile; full-cost
 /// validation and every publishable result stay in ci-hub. It may run on a
@@ -10711,6 +10790,11 @@ struct Plan {
     /// parent's separately-reviewed consumer allowlist does not admit, so a run
     /// carrying one does not qualify as landing authority.
     host_inapplicable: Vec<validate_plan::HostInapplicableNode>,
+    /// Nodes `--frozen-run` withheld, by exact tag ([`FROZEN_RUN_WITHHELD_TAG`]).
+    /// Like a host-inapplicable node, neither a pass nor a failure: each is
+    /// named in the summary and written to the ledger as an intentional skip
+    /// with reason [`FROZEN_RUN_WITHHELD_REASON`].
+    frozen_run_withheld: Vec<String>,
     /// May a prior passing record for this tree be reused instead of running?
     ///
     /// The tree-keyed cache is only sound when the run is a pure function of the
@@ -10769,6 +10853,7 @@ impl Default for Plan {
             nonblocking: BTreeSet::new(),
             force_keep_going: false,
             host_inapplicable: Vec::new(),
+            frozen_run_withheld: Vec::new(),
             cacheable: true,
             cell_evidence_expected: None,
         }
@@ -12144,6 +12229,119 @@ fn load_committed_validation_dag(root: &Path) -> Result<(DagConfig, PathBuf, Vec
     Ok((cfg, path, bytes))
 }
 
+/// Remove the `--frozen-run` node from the plan before its selection is
+/// recorded, so the scheduler-boundary snapshot is of the plan that will run.
+/// Matches [`FROZEN_RUN_WITHHELD_TAG`] exactly and nothing else, and refuses a
+/// plan in which any remaining node depends on it.
+fn withhold_frozen_run_nodes(plan: &mut Plan) -> Result<(), String> {
+    let mut withheld = Vec::new();
+    for cfg in std::iter::once(&mut plan.cfg).chain(plan.second.iter_mut()) {
+        let before = cfg.steps.len();
+        cfg.steps.retain(|step| step.tag() != FROZEN_RUN_WITHHELD_TAG);
+        if cfg.steps.len() == before {
+            continue;
+        }
+        if let Some(dependent) = cfg
+            .steps
+            .iter()
+            .find(|step| step.deps.iter().any(|dep| dep == FROZEN_RUN_WITHHELD_TAG))
+        {
+            return Err(format!(
+                "{FROZEN_RUN_OPTION} cannot withhold {FROZEN_RUN_WITHHELD_TAG}: {} depends on it",
+                dependent.tag()
+            ));
+        }
+        withheld.push(FROZEN_RUN_WITHHELD_TAG.to_string());
+    }
+    if !withheld.is_empty() {
+        // A run missing a node is not the complete suite, whatever it selected,
+        // and it must not call itself "full": every qualification consumer's
+        // first selection clause refuses anything else.
+        plan.suite_complete = false;
+        plan.selection_mode = FROZEN_RUN_SELECTION_MODE;
+        plan.planned_test_nodes = test_nodes_of(&plan.cfg);
+    }
+    plan.frozen_run_withheld = withheld;
+    Ok(())
+}
+
+/// The `--frozen-run` withholdings a ledger row records, derived from what the
+/// row already carries rather than plumbed beside it: in a plan whose selection
+/// mode is [`FROZEN_RUN_SELECTION_MODE`] (set only by
+/// [`withhold_frozen_run_nodes`]), the exact [`FROZEN_RUN_WITHHELD_TAG`] when it
+/// is planned and has no outcome. A row that lost its mode reads that tag as
+/// planned work with no result (incomplete and short), never as clean.
+fn ledger_frozen_run_withheld(
+    selection_mode: &str,
+    planned_tags: &BTreeSet<String>,
+    outcomes: &[StepOutcome],
+) -> Vec<String> {
+    if selection_mode != FROZEN_RUN_SELECTION_MODE
+        || !planned_tags.contains(FROZEN_RUN_WITHHELD_TAG)
+        || outcomes.iter().any(|outcome| outcome.tag == FROZEN_RUN_WITHHELD_TAG)
+    {
+        return Vec::new();
+    }
+    vec![FROZEN_RUN_WITHHELD_TAG.to_string()]
+}
+
+/// One `intentional_skipped_nodes` entry for a `--frozen-run` withholding.
+/// Its reason is outside the parent consumer's qualification-safe allowlist, so
+/// a row carrying it cannot qualify as landing authority.
+fn frozen_run_skip_record(tag: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": tag,
+        "reason": FROZEN_RUN_WITHHELD_REASON,
+        "evidence": format!(
+            "{FROZEN_RUN_OPTION}: a frozen validation checkout lives outside the dev-hermit parent \
+             ({FROZEN_RUN_WITHHELD_ISSUE})"
+        ),
+    })
+}
+
+/// The `Plan:` line's clause for `--frozen-run` withholdings, or "".
+fn frozen_run_plan_summary(withheld: &[String]) -> String {
+    if withheld.is_empty() {
+        return String::new();
+    }
+    format!(
+        "; {} planned node(s) withheld by {FROZEN_RUN_OPTION} as intentional skips and NOT counted \
+         as passing: {}",
+        withheld.len(),
+        withheld.join(", ")
+    )
+}
+
+/// The summary lines naming each `--frozen-run` withholding. Never a pass.
+fn frozen_run_withheld_lines(withheld: &[String]) -> Vec<String> {
+    withheld
+        .iter()
+        .map(|tag| {
+            format!(
+                "FROZEN-RUN: {tag} will NOT RUN: a frozen validation checkout lives outside the \
+                 dev-hermit parent, and this node needs the parent's ledger adapter. This is NOT \
+                 a pass and carries NO coverage for what that node verifies; it is recorded in the \
+                 ledger as an intentional skip with reason '{FROZEN_RUN_WITHHELD_REASON}' \
+                 ({FROZEN_RUN_WITHHELD_ISSUE}), so this run cannot be landing authority."
+            )
+        })
+        .collect()
+}
+
+/// [`finish_committed_selection`] for this invocation: `--frozen-run` nodes are
+/// withheld first.
+fn finish_selection_for(
+    args: &Args,
+    mut plan: Plan,
+    source_path: PathBuf,
+    source_bytes: Vec<u8>,
+) -> Result<Plan, String> {
+    if args.frozen_run {
+        withhold_frozen_run_nodes(&mut plan)?;
+    }
+    Ok(finish_committed_selection(plan, source_path, source_bytes))
+}
+
 fn finish_committed_selection(mut plan: Plan, source_path: PathBuf, source_bytes: Vec<u8>) -> Plan {
     plan.committed_selection = Some(dag_to_json(&plan.cfg));
     plan.committed_source = Some((source_path, source_bytes));
@@ -12422,7 +12620,7 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
             cacheable: false,
             ..Default::default()
         };
-        return Ok(finish_committed_selection(plan, source_path, source_bytes));
+        return finish_selection_for(args, plan, source_path, source_bytes);
     }
 
     if let Some(Focused::RequalifyCell {
@@ -12474,7 +12672,7 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
             cell_evidence_expected: Some(selected_population),
             ..Default::default()
         };
-        return Ok(finish_committed_selection(plan, source_path, source_bytes));
+        return finish_selection_for(args, plan, source_path, source_bytes);
     }
 
     if let Some(Focused::Selective { shallow }) = &args.focused {
@@ -12520,7 +12718,7 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
             cacheable: false,
             ..Default::default()
         };
-        return Ok(finish_committed_selection(plan, source_path, source_bytes));
+        return finish_selection_for(args, plan, source_path, source_bytes);
     }
 
     let committed_label = match (&args.focused, args.level) {
@@ -12625,7 +12823,7 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
                 && !matches!(label, "portable" | "full" | "envelope-only"),
             ..Default::default()
         };
-        return Ok(finish_committed_selection(plan, source_path, source_bytes));
+        return finish_selection_for(args, plan, source_path, source_bytes);
     }
     Err(format!(
         "no committed validation selection is defined for level={:?} focused={:?}",
@@ -21332,7 +21530,40 @@ fn product_front_door_process_bracket() -> Result<(), String> {
     ));
 
     let result = (|| {
-        let cases: [(&str, &[&str], bool, bool, &str); 3] = [
+        let cases: [(&str, &[&str], bool, bool, &str, bool); 5] = [
+            (
+                // The admission half binds through the real entry path too: an
+                // off-the-record run has no admission, so --frozen-run is
+                // refused there even with --no-label-pr.
+                "frozen-run-without-admission",
+                &[
+                    ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION,
+                    "--only",
+                    "portable",
+                    "test.cli",
+                    "--no-label-pr",
+                    FROZEN_RUN_OPTION,
+                    SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_OPTION,
+                ],
+                false,
+                false,
+                "--frozen-run needs a frozen-validate admission",
+                false,
+            ),
+            (
+                // The label half of the --frozen-run guard binds through the
+                // real entry path, before the front door is consulted.
+                "frozen-run-without-no-label-pr",
+                &[
+                    "full",
+                    FROZEN_RUN_OPTION,
+                    SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_OPTION,
+                ],
+                false,
+                false,
+                "--frozen-run requires an explicit --no-label-pr",
+                false,
+            ),
             (
                 "top-level-missing-launcher",
                 &[
@@ -21342,6 +21573,7 @@ fn product_front_door_process_bracket() -> Result<(), String> {
                 false,
                 false,
                 "launcher is unavailable",
+                true,
             ),
             (
                 "focused-invalid-authority",
@@ -21352,6 +21584,7 @@ fn product_front_door_process_bracket() -> Result<(), String> {
                 false,
                 true,
                 "Publishing because the code is ready requires ci-hub",
+                true,
             ),
             (
                 "nested-marker-invalid-authority",
@@ -21362,10 +21595,11 @@ fn product_front_door_process_bracket() -> Result<(), String> {
                 true,
                 true,
                 "Publishing because the code is ready requires ci-hub",
+                true,
             ),
         ];
 
-        for (label, args, nested, launcher_present, expected_remediation) in cases {
+        for (label, args, nested, launcher_present, expected_remediation, front_door) in cases {
             let parent = tmp.join(label);
             let checkout = parent.join("hermit");
             let ci_hub_dir = parent.join("ci-hub");
@@ -21442,10 +21676,14 @@ fn product_front_door_process_bracket() -> Result<(), String> {
             })?;
             let stdout = String::from_utf8_lossy(&output.stdout);
             let rendered = format!("{}{}", stdout, String::from_utf8_lossy(&output.stderr));
+            // The front-door cases also print its two-way choice; the
+            // --frozen-run label guard refuses before the front door.
+            let front_door_text = !front_door
+                || (rendered.contains("choose whether this is iterative testing or publishing")
+                    && rendered.contains("--only portable test.cli"));
             if output.status.code() != Some(i32::from(COULD_NOT_RUN_EXIT_CODE))
-                || !rendered.contains("choose whether this is iterative testing or publishing")
+                || !front_door_text
                 || !rendered.contains(expected_remediation)
-                || !rendered.contains("--only portable test.cli")
                 || stdout.lines().last() != Some("FINAL_VALIDATE_STATUS: COULD_NOT_RUN")
             {
                 return Err(format!(
@@ -21587,6 +21825,9 @@ fn plan_planned_tags(plan: &Plan) -> BTreeSet<String> {
         .chain(plan.second.iter())
         .flat_map(|cfg| cfg.steps.iter().map(|s| s.tag()))
         .chain(plan.host_inapplicable.iter().map(|n| n.tag.clone()))
+        // Planned, as host-inapplicable nodes are: a withheld node is selected
+        // work that did not run, so it counts in gates_expected.
+        .chain(plan.frozen_run_withheld.iter().cloned())
         .collect()
 }
 
@@ -23880,7 +24121,10 @@ fn write_ledger_with_snapshot(
     let gate_records = outcomes.len();
     let executed_nodes = u64::try_from(completed_node_count(outcomes, attempts))
         .expect("executed node count fits u64");
-    let classification = classify_run(outcomes, attempts, skipped, planned_tags, host_inapplicable);
+    let frozen_run_withheld = ledger_frozen_run_withheld(&ctx.selection_mode, planned_tags, outcomes);
+    let mut classification =
+        classify_run(outcomes, attempts, skipped, planned_tags, host_inapplicable);
+    classification.account_withheld(&frozen_run_withheld);
     let failures = classification.product_failure_nodes.len();
     let no_results = classification.no_results();
     let validation_complete =
@@ -23915,6 +24159,7 @@ fn write_ledger_with_snapshot(
                 "evidence": n.evidence,
             })
         })
+        .chain(frozen_run_withheld.iter().map(|tag| frozen_run_skip_record(tag)))
         .collect();
     // A node that RAN with host-inapplicable cells is in `gates` with its own
     // verdict and is no skip, so it is named here instead. `classify_run` has
@@ -26495,6 +26740,12 @@ fn run(
     // their caller-supplied nesting marker.
     // Help, self-test and the stop-test seam returned above; `--show-plan` is
     // explicitly inert here.
+    if let Some(refusal) =
+        frozen_run_label_refusal(args.frozen_run, args.label_pr, args.no_label_pr_explicit)
+    {
+        eprintln!("validate: {refusal}");
+        return RunSummary::refused(2, &profile_name, "the --frozen-run label guard", vec![refusal]);
+    }
     let mut admitted_context = None;
     let ci_hub_dir_present = tool_root
         .as_ref()
@@ -26560,6 +26811,18 @@ fn run(
                 detail,
             );
         }
+    }
+
+    // `--show-plan` is inert (it schedules nothing and publishes nothing), so it
+    // may display a frozen plan without an admission.
+    if let Some(refusal) = frozen_run_admission_refusal(
+        args.frozen_run && !args.show_plan,
+        admitted_context
+            .as_ref()
+            .map(validate_admission::AuthenticatedValidationAdmission::canonical),
+    ) {
+        eprintln!("validate: {refusal}");
+        return RunSummary::refused(2, &profile_name, "the --frozen-run admission guard", vec![refusal]);
     }
 
     if let Some(proof) = admitted_context.as_ref() {
@@ -26941,6 +27204,9 @@ fn run(
         &validate_plan::probe_host_capability,
     ) {
         return *refusal;
+    }
+    for line in frozen_run_withheld_lines(&plan.frozen_run_withheld) {
+        println!("{line}");
     }
 
     // Per-gate budget overrides, preserved from validate.sh
@@ -27680,13 +27946,14 @@ fn run(
     );
     println!("Build cache: {cache}; host cores: {host_cpus}; scheduler width: -j {jobs}");
     println!(
-        "Plan: {node_count} boxed DAG node(s){}{}",
+        "Plan: {node_count} boxed DAG node(s){}{}{}",
         if plan.second.is_some() {
             " across 2 sequential lanes"
         } else {
             ""
         },
-        host_inapplicable_plan_summary(&plan.host_inapplicable)
+        host_inapplicable_plan_summary(&plan.host_inapplicable),
+        frozen_run_plan_summary(&plan.frozen_run_withheld)
     );
     // Printed after the durable log is established so the receipt carries the
     // prediction next to the outcome.
@@ -27766,16 +28033,25 @@ fn run(
             run_timeout.unwrap_or(0)
         );
     }
-    let classification = classify_run(
+    let mut classification = classify_run(
         &outcomes,
         &attempts,
         &skipped,
         &planned_tags,
         &plan.host_inapplicable,
     );
+    classification.account_withheld(&plan.frozen_run_withheld);
     let validation_complete =
         validation_is_complete(execution_complete, &classification, &planned_tags);
     print_cost_table(&outcomes, &attempts, &skipped, &plan.host_inapplicable);
+    // Like host-inapplicable nodes, listed outside the status table: a withheld
+    // node has no status in that vocabulary.
+    for tag in &plan.frozen_run_withheld {
+        println!(
+            "\nfrozen-run (NOT RUN, NOT a pass, no coverage): {tag} -- intentional skip, reason \
+             '{FROZEN_RUN_WITHHELD_REASON}' ({FROZEN_RUN_WITHHELD_ISSUE})"
+        );
+    }
     print_retry_ledger(&attempts);
 
     // ---- the single cleanup / evidence-commit point (validate.sh:1812) -------
@@ -32562,6 +32838,76 @@ mod scorecard_cutover_tests {
         }
     }
 
+    fn frozen_writer_row(selection_mode: &str) -> serde_json::Value {
+        let temp = tempfile::tempdir().unwrap();
+        let mut ctx = context(
+            temp.path(),
+            "full",
+            "frozen-run-writer-fixture",
+            HEAD.into(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+        );
+        ctx.selection_mode = selection_mode.into();
+        ctx.executed_tests = Some(0);
+        ctx.passed_tests = Some(0);
+        let tags: BTreeSet<String> = BTreeSet::from([FROZEN_RUN_WITHHELD_TAG.to_string()]);
+        write_ledger(
+            &temp.path().join("rows.jsonl"),
+            &ctx,
+            &[],
+            &[],
+            &[],
+            &[],
+            &tags,
+            0.0,
+            75,
+            "",
+            true,
+            serde_json::json!({}),
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// The real writer records a frozen-run withholding as an intentional skip
+    /// with its reason and issue, counts it in gates_expected, and never calls
+    /// the row complete or "full".
+    #[test]
+    fn the_writer_records_a_frozen_run_withholding_as_an_intentional_skip() {
+        let row = frozen_writer_row(FROZEN_RUN_SELECTION_MODE);
+        let skips = row["intentional_skipped_nodes"].as_array().unwrap();
+        assert_eq!(skips.len(), 1, "{row}");
+        assert_eq!(skips[0]["name"], FROZEN_RUN_WITHHELD_TAG);
+        assert_eq!(skips[0]["reason"], FROZEN_RUN_WITHHELD_REASON);
+        assert!(skips[0]["evidence"].as_str().unwrap().contains(FROZEN_RUN_WITHHELD_ISSUE));
+        assert_eq!(row["selection_mode"], FROZEN_RUN_SELECTION_MODE);
+        assert_eq!(row["gates_expected"], 1);
+        assert_eq!(row["validation_complete"], false);
+        assert!(row["understood_prerequisite_failure_nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tag| tag == FROZEN_RUN_WITHHELD_TAG));
+    }
+
+    /// Belt and braces: a row whose frozen mode was lost still reads the
+    /// withheld node as planned work with no result -- incomplete and short --
+    /// never as a clean full pass.
+    #[test]
+    fn a_row_that_lost_its_frozen_mode_reads_short_not_clean() {
+        let row = frozen_writer_row("full");
+        assert!(row["intentional_skipped_nodes"].as_array().unwrap().is_empty());
+        assert_eq!(row["gates_expected"], 1);
+        assert_eq!(row["gates_run"], 0);
+        assert_eq!(row["validation_complete"], false);
+        assert!(row["no_result_nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tag| tag == FROZEN_RUN_WITHHELD_TAG));
+    }
+
     #[test]
     fn a_buck_row_names_its_release_payload_and_mints_neither_cache_nor_receipt() {
         let temp = tempfile::tempdir().unwrap();
@@ -33925,5 +34271,177 @@ mod inherited_repository_location_tests {
             &clean.main,
             &location(SHAPES[3], &dirty),
         );
+    }
+}
+
+#[cfg(test)]
+mod frozen_run_tests {
+    use super::*;
+
+    fn full_plan() -> Plan {
+        let root = test_source_root();
+        let (committed, _path, _bytes) = load_committed_validation_dag(&root).unwrap();
+        let cfg = dagrun::select_steps_by_labels(&committed, &["full".into()]).unwrap();
+        Plan {
+            planned_test_nodes: test_nodes_of(&cfg),
+            cfg,
+            profile: "full".into(),
+            selection_mode: "full",
+            suite_complete: true,
+            ..Plan::default()
+        }
+    }
+
+    fn tags(cfg: &DagConfig) -> BTreeSet<String> {
+        cfg.steps.iter().map(Step::tag).collect()
+    }
+
+    #[test]
+    fn the_flag_parses_and_defaults_off() {
+        let on = parse_argv(&["full".into(), "--no-label-pr".into(), FROZEN_RUN_OPTION.into()])
+            .unwrap();
+        assert!(on.frozen_run);
+        let off = parse_argv(&["full".into(), "--no-label-pr".into()]).unwrap();
+        assert!(!off.frozen_run);
+    }
+
+    /// Guard (a): only a frozen-validate admission may carry --frozen-run.
+    #[test]
+    fn frozen_run_is_refused_wherever_it_could_produce_landing_evidence() {
+        // Not requested: never refused.
+        assert_eq!(frozen_run_refusal(false, true, false, Some(true)), None);
+        // A canonical full run (admission kind "validate") is refused, even
+        // with --no-label-pr.
+        let canonical = frozen_run_refusal(true, false, true, Some(true)).unwrap();
+        assert!(canonical.contains("canonical validate-lock admission"), "{canonical}");
+        // A labeled run is refused, whatever its admission.
+        let labeled = frozen_run_refusal(true, true, false, Some(false)).unwrap();
+        assert!(labeled.contains("--no-label-pr"), "{labeled}");
+        // The label default (no explicit --no-label-pr) is refused too.
+        assert!(frozen_run_refusal(true, false, false, Some(false)).is_some());
+        // No admission at all (off the record, or no parent) is refused.
+        let unadmitted = frozen_run_refusal(true, false, true, None).unwrap();
+        assert!(unadmitted.contains("frozen-validate admission"), "{unadmitted}");
+        // Exactly one combination is accepted: explicit --no-label-pr under a
+        // noncanonical (frozen-validate) admission.
+        assert_eq!(frozen_run_refusal(true, false, true, Some(false)), None);
+    }
+
+    /// Guard (b): the exact tag and nothing else, on the real committed plan.
+    #[test]
+    fn only_the_canonical_adapter_node_is_withheld_from_the_real_full_plan() {
+        let mut plan = full_plan();
+        // A sibling whose tag merely STARTS with the withheld one must survive.
+        let mut sibling = plan
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == FROZEN_RUN_WITHHELD_TAG)
+            .cloned()
+            .expect("the full plan lost the node");
+        sibling.job = format!("{}_sibling", sibling.job);
+        plan.cfg.steps.push(sibling);
+        let before = tags(&plan.cfg);
+        withhold_frozen_run_nodes(&mut plan).unwrap();
+        let after = tags(&plan.cfg);
+        let gone: BTreeSet<String> = before.difference(&after).cloned().collect();
+        assert_eq!(gone, BTreeSet::from([FROZEN_RUN_WITHHELD_TAG.to_string()]));
+        assert_eq!(plan.frozen_run_withheld, vec![FROZEN_RUN_WITHHELD_TAG.to_string()]);
+        assert!(!plan.suite_complete, "a plan missing a node is not the complete suite");
+        assert!(plan.cfg.steps.iter().all(|step| step.skip_reason.is_none()));
+    }
+
+    /// The withheld node stays planned, is accounted as host-inapplicable
+    /// nodes are, leaves the run incomplete, and the writer derives the same
+    /// withholding the plan made.
+    #[test]
+    fn a_withheld_plan_is_planned_accounted_incomplete_and_not_full() {
+        let mut plan = full_plan();
+        let committed = plan_planned_tags(&plan);
+        withhold_frozen_run_nodes(&mut plan).unwrap();
+        assert_eq!(plan.selection_mode, FROZEN_RUN_SELECTION_MODE);
+        let planned = plan_planned_tags(&plan);
+        assert_eq!(planned, committed, "a withheld node is still planned work");
+        let mut classification = classify_run(&[], &[], &[], &planned, &[]);
+        classification.account_withheld(&plan.frozen_run_withheld);
+        assert!(classification
+            .understood_prerequisite_failure_nodes
+            .contains(FROZEN_RUN_WITHHELD_TAG));
+        assert!(!classification.no_result_nodes.contains(FROZEN_RUN_WITHHELD_TAG));
+        assert!(!validation_is_complete(true, &classification, &planned));
+        assert_eq!(
+            ledger_frozen_run_withheld(plan.selection_mode, &planned, &[]),
+            plan.frozen_run_withheld
+        );
+        assert!(ledger_frozen_run_withheld("full", &planned, &[]).is_empty());
+    }
+
+    /// The flag reaches plan construction: `finish_selection_for` withholds
+    /// with `--frozen-run` and leaves the plan alone without it.
+    #[test]
+    fn plan_construction_withholds_only_under_the_flag() {
+        let root = test_source_root();
+        let (_committed, path, bytes) = load_committed_validation_dag(&root).unwrap();
+        let on = parse_argv(&["full".into(), "--no-label-pr".into(), FROZEN_RUN_OPTION.into()])
+            .unwrap();
+        let plan = finish_selection_for(&on, full_plan(), path.clone(), bytes.clone()).unwrap();
+        assert_eq!(plan.frozen_run_withheld, vec![FROZEN_RUN_WITHHELD_TAG.to_string()]);
+        assert!(!tags(&plan.cfg).contains(FROZEN_RUN_WITHHELD_TAG));
+        let off = parse_argv(&["full".into(), "--no-label-pr".into()]).unwrap();
+        let plan = finish_selection_for(&off, full_plan(), path, bytes).unwrap();
+        assert!(plan.frozen_run_withheld.is_empty());
+        assert!(tags(&plan.cfg).contains(FROZEN_RUN_WITHHELD_TAG));
+    }
+
+    #[test]
+    fn a_plan_without_the_node_is_left_alone() {
+        let mut plan = full_plan();
+        plan.cfg.steps.retain(|step| step.tag() != FROZEN_RUN_WITHHELD_TAG);
+        let before = tags(&plan.cfg);
+        withhold_frozen_run_nodes(&mut plan).unwrap();
+        assert_eq!(tags(&plan.cfg), before);
+        assert!(plan.frozen_run_withheld.is_empty());
+        assert!(plan.suite_complete);
+    }
+
+    #[test]
+    fn a_node_that_depends_on_the_withheld_node_refuses_the_plan() {
+        let mut plan = full_plan();
+        let dependent = plan
+            .cfg
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() != FROZEN_RUN_WITHHELD_TAG)
+            .unwrap();
+        dependent.deps.push(FROZEN_RUN_WITHHELD_TAG.into());
+        let error = withhold_frozen_run_nodes(&mut plan).unwrap_err();
+        assert!(error.contains("depends on it"), "{error}");
+    }
+
+    /// Guard (c): named as an intentional skip, never as a pass.
+    #[test]
+    fn the_withholding_is_reported_as_an_intentional_skip_not_a_pass() {
+        let withheld = vec![FROZEN_RUN_WITHHELD_TAG.to_string()];
+        let lines = frozen_run_withheld_lines(&withheld);
+        assert_eq!(lines.len(), 1);
+        for needle in [
+            FROZEN_RUN_WITHHELD_TAG,
+            "will NOT RUN",
+            "This is NOT a pass",
+            FROZEN_RUN_WITHHELD_REASON,
+            FROZEN_RUN_WITHHELD_ISSUE,
+        ] {
+            assert!(lines[0].contains(needle), "missing {needle:?}: {}", lines[0]);
+        }
+        let plan_clause = frozen_run_plan_summary(&withheld);
+        assert!(plan_clause.contains("NOT counted as passing"), "{plan_clause}");
+        assert_eq!(frozen_run_plan_summary(&[]), "");
+        let record = frozen_run_skip_record(FROZEN_RUN_WITHHELD_TAG);
+        assert_eq!(record["name"], FROZEN_RUN_WITHHELD_TAG);
+        assert_eq!(record["reason"], FROZEN_RUN_WITHHELD_REASON);
+        assert!(record["evidence"].as_str().unwrap().contains(FROZEN_RUN_WITHHELD_ISSUE));
+        // The reason must stay outside the consumer's qualification-safe set,
+        // which today is exactly {"empty-manifest-bucket"}.
+        assert_ne!(FROZEN_RUN_WITHHELD_REASON, "empty-manifest-bucket");
     }
 }
