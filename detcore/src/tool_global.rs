@@ -2285,10 +2285,6 @@ impl GlobalTool for GlobalState {
                 // The exec resets the process's exit signal to SIGCHLD and turns
                 // its existing children's notifications into SIGCHLD.
                 sched.record_successful_exec(detpid);
-                // A successful exec is a vfork child's release edge: a barrier
-                // whose parent has died ends here, while the caller still owns
-                // its turn (https://github.com/rrnewton/hermit/issues/3984).
-                sched.release_dead_parent_vfork_barrier(dtid);
                 // Reloading backends consumed the preparation in their
                 // registration reconnect; state-preserving leaders consume it
                 // here after the terminal exec notification was authenticated.

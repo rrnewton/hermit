@@ -2228,6 +2228,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/vfork_kill_exec.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/vfork_kill_exec.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_vfork_child_that_kills_its_parent_and_execs_lets_its_own_child_run compiles this guest, in which a vfork child sends SIGKILL to its parent and execs into a program that forks and waits, and requires exit 0 with 'A killed by signal 9' then 'forkwait ok' (https://github.com/rrnewton/hermit/issues/3984); it remains a guest fixture because a generic manifest cannot bound the run with a deadline and assert this exact output for a scheduler-liveness regression."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/vfork_parent_killed.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/vfork_parent_killed.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_killed_vfork_parent_does_not_stop_the_schedule compiles this guest, in which a vfork child sends SIGKILL to its parent and exits while the grandparent waits, and requires the run to finish with exit 0 and print 'A killed by signal 9' (https://github.com/rrnewton/hermit/issues/3984); it remains a guest fixture because a generic manifest cannot bound the run with a deadline and assert this exact output for a scheduler-liveness regression."

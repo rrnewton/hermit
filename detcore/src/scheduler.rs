@@ -878,6 +878,14 @@ pub struct Scheduler {
     /// retires its target only at the target's deregistration
     /// (<https://github.com/rrnewton/hermit/issues/3984>).
     dead_parent_vfork_barriers: BTreeSet<DetTid>,
+    /// Vfork parents whose registered child reached a release edge (its
+    /// `Exit` grant, its successful exec, or its logical kill) while the
+    /// parent was alive. The barrier stays, and step2a waits without
+    /// committing a turn until the parent's fate is known (its continuation
+    /// or its retirement), then drops it. Recording the release whether or
+    /// not the parent's death has been seen keeps the drop independent of the
+    /// order in which those host-timed events arrive.
+    released_vfork_barriers: BTreeSet<DetTid>,
 
     /// Threads whose run-queue admission was recorded by a global-request
     /// handler while a `tentative_pop` transaction was live, deferred to the
@@ -2426,6 +2434,7 @@ impl Scheduler {
             vfork_registration_origins: Default::default(),
             dead_vfork_parents: Default::default(),
             dead_parent_vfork_barriers: Default::default(),
+            released_vfork_barriers: Default::default(),
             pending_run_queue_admissions: Default::default(),
             pending_run_queue_removals: Default::default(),
             pending_cross_task_signals: Default::default(),
@@ -3042,7 +3051,7 @@ impl Scheduler {
         // (https://github.com/rrnewton/hermit/issues/3984).
         self.retire_vfork_parent(*dtid);
         // A killed vfork child is its own barrier's release edge.
-        self.release_dead_parent_vfork_barrier(*dtid);
+        self.release_vfork_child(*dtid);
         self.vfork_registration_origins.remove(dtid);
         self.saved_guest_sigmasks.remove(dtid);
         if dtid.as_raw() == detpid.as_raw() {
@@ -3271,51 +3280,66 @@ impl Scheduler {
     }
 
     /// Install the barrier for a vfork parent whose `BlockingVfork` was just
-    /// granted. A tombstone left by an earlier parent with the same TID is
-    /// stale: that parent's child can no longer register against it.
+    /// granted. State left by an earlier thread with the same TID is stale:
+    /// that thread is gone, so a barrier it kept for its child, and a
+    /// tombstone its child never settled, are dropped here, inside this
+    /// committed turn.
     fn begin_vfork_barrier(&mut self, parent: DetTid) {
-        assert!(self.vfork_barriers.insert(parent, None).is_none());
+        self.drop_vfork_barrier(parent);
         self.dead_vfork_parents.remove(&parent);
+        self.vfork_barriers.insert(parent, None);
+    }
+
+    /// Remove `parent`'s barrier and every record about it.
+    fn drop_vfork_barrier(&mut self, parent: DetTid) {
+        self.vfork_barriers.remove(&parent);
+        self.vfork_registration_origins.remove(&parent);
         self.dead_parent_vfork_barriers.remove(&parent);
+        self.released_vfork_barriers.remove(&parent);
     }
 
     /// `parent` is being logically killed. With no child registered yet, its
     /// barrier goes and a tombstone lets the child register as an orphan.
-    /// With a registered child the scheduler still knows, the barrier stays,
-    /// marked parent-dead, until the child's next release edge; with that
-    /// child already gone it goes now. Either way the drop happens while the
-    /// barrier's child cannot be selected, so its timing cannot change the
-    /// committed schedule.
+    /// With a registered child the barrier goes now if the child already
+    /// reached a release edge or is gone, because then the child cannot be
+    /// selected in its vfork role any more; otherwise it stays, marked
+    /// parent-dead, until the child's next release edge. The outcome does not
+    /// depend on whether this retirement arrives before or after that edge.
     fn retire_vfork_parent(&mut self, parent: DetTid) {
         match self.vfork_barriers.get(&parent).copied() {
             None => {}
             Some(None) => {
-                self.vfork_barriers.remove(&parent);
+                self.drop_vfork_barrier(parent);
                 self.dead_vfork_parents.insert(parent);
             }
-            Some(Some(child)) if self.next_turns.contains_key(&child) => {
+            Some(Some(child))
+                if self.next_turns.contains_key(&child)
+                    && !self.released_vfork_barriers.contains(&parent) =>
+            {
                 self.dead_parent_vfork_barriers.insert(parent);
             }
-            Some(Some(_)) => {
-                self.vfork_barriers.remove(&parent);
-                self.dead_parent_vfork_barriers.remove(&parent);
-            }
+            Some(Some(_)) => self.drop_vfork_barrier(parent),
         }
     }
 
-    /// `child` reached a release edge (its `Exit` grant, its successful exec,
-    /// or its logical kill): drop its barrier if the parent has died.
-    pub(crate) fn release_dead_parent_vfork_barrier(&mut self, child: DetTid) {
+    /// `child` reached a release edge: its `Exit` grant, its successful exec
+    /// (`record_successful_exec`), or its logical kill. A barrier whose parent
+    /// has died goes now. Otherwise the barrier is marked released, and step2a
+    /// waits, committing nothing, until the parent's continuation or
+    /// retirement, then drops it.
+    pub(crate) fn release_vfork_child(&mut self, child: DetTid) {
         let parents: Vec<DetTid> = self
-            .dead_parent_vfork_barriers
+            .vfork_barriers
             .iter()
-            .copied()
-            .filter(|parent| self.vfork_barriers.get(parent) == Some(&Some(child)))
+            .filter(|(_, registered)| **registered == Some(child))
+            .map(|(parent, _)| *parent)
             .collect();
         for parent in parents {
-            self.vfork_barriers.remove(&parent);
-            self.vfork_registration_origins.remove(&parent);
-            self.dead_parent_vfork_barriers.remove(&parent);
+            if self.dead_parent_vfork_barriers.contains(&parent) {
+                self.drop_vfork_barrier(parent);
+            } else {
+                self.released_vfork_barriers.insert(parent);
+            }
         }
     }
 
@@ -3326,6 +3350,8 @@ impl Scheduler {
         self.vfork_registration_origins
             .retain(|parent, _| self.vfork_barriers.contains_key(parent));
         self.dead_parent_vfork_barriers
+            .retain(|parent| self.vfork_barriers.contains_key(parent));
+        self.released_vfork_barriers
             .retain(|parent| self.vfork_barriers.contains_key(parent));
     }
 
@@ -3553,6 +3579,12 @@ impl Scheduler {
     /// (`ThreadTree::record_successful_exec`).
     pub(crate) fn record_successful_exec(&mut self, process: DetPid) {
         self.thread_tree.record_successful_exec(process);
+        // The exec is a vfork child's release edge, while the exec caller
+        // still owns its turn (https://github.com/rrnewton/hermit/issues/3984).
+        // A vfork child is a single-threaded process, so the caller is
+        // `process`; an exec that retires a vfork child as a sibling or a
+        // non-leader caller goes through `remove_exec_vfork_barriers`.
+        self.release_vfork_child(process);
     }
 
     /// Record (`Some`) or clear (`None`) the guest's own signal mask while
@@ -4293,12 +4325,15 @@ impl Scheduler {
             })
             .collect();
         for parent in completed_parents {
-            self.vfork_barriers.remove(&parent);
-            self.vfork_registration_origins.remove(&parent);
-            self.dead_parent_vfork_barriers.remove(&parent);
+            self.drop_vfork_barrier(parent);
         }
 
-        if self.vfork_barriers.values().all(Option::is_some) {
+        // A released barrier waits for its parent's continuation or
+        // retirement; no turn commits meanwhile, so when that host-timed event
+        // arrives cannot change the schedule.
+        if self.vfork_barriers.values().all(Option::is_some)
+            && self.released_vfork_barriers.is_empty()
+        {
             Ok(())
         } else {
             trace!(
@@ -6740,7 +6775,7 @@ impl Scheduler {
                 };
                 // The grant is a vfork child's release edge: a barrier whose
                 // parent has died ends here, inside this committed turn.
-                self.release_dead_parent_vfork_barrier(dettid);
+                self.release_vfork_child(dettid);
                 // An exit that ends its process leaves the host some time after
                 // this grant. Hold turn selection from here until the backend
                 // reports the process physically gone (asynchronous exit
@@ -10074,6 +10109,83 @@ mod test {
                 .is_ok()
         );
         assert!(scheduler.vfork_barriers.is_empty());
+        assert!(scheduler.dead_parent_vfork_barriers.is_empty());
+    }
+
+    /// A scheduler with vfork parent 3 and its registered child 5, both alive,
+    /// for the release-edge tests below.
+    fn live_vfork_pair() -> (Scheduler, DetTid, DetTid) {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let parent = DetTid::from_raw(3);
+        let child = DetTid::from_raw(5);
+        for tid in [parent, child] {
+            scheduler.thread_tree.add_child(tid, tid, true);
+            scheduler.priorities.insert(tid, DEFAULT_PRIORITY);
+            scheduler.next_turns.insert(
+                tid,
+                ThreadNextTurn {
+                    dettid: tid,
+                    child_tid_addr: 0,
+                    req: Ivar::full(Ok(Resources::new(tid))),
+                    resp: Ivar::new(),
+                    protocol: Default::default(),
+                },
+            );
+        }
+        scheduler.vfork_barriers.insert(parent, Some(child));
+        (scheduler, parent, child)
+    }
+
+    /// The child's successful exec is a release edge even while its parent is
+    /// alive: step2a then waits, committing nothing, until the parent's fate is
+    /// known. Here the parent's retirement arrives after the exec edge, the
+    /// order in which the barrier used to outlive the exec; it drops the
+    /// barrier, exactly as a retirement before the edge does
+    /// (https://github.com/rrnewton/hermit/issues/3984).
+    #[test]
+    fn a_vfork_parent_retired_after_its_childs_exec_releases_the_barrier() {
+        let (mut scheduler, parent, child) = live_vfork_pair();
+        scheduler.record_successful_exec(child);
+        assert!(scheduler.released_vfork_barriers.contains(&parent));
+        assert!(
+            scheduler.step2a_wait_for_vfork_barrier().is_err(),
+            "waits for the parent's fate"
+        );
+
+        scheduler.logically_kill_thread(&parent, &parent, MmId::initial(parent));
+        assert!(scheduler.vfork_barriers.is_empty());
+        assert!(scheduler.released_vfork_barriers.is_empty());
+        assert!(scheduler.dead_parent_vfork_barriers.is_empty());
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
+    }
+
+    /// After the child's exec edge, the live parent's continuation ends the
+    /// released barrier.
+    #[test]
+    fn a_released_vfork_barrier_ends_at_the_parents_continuation() {
+        let (mut scheduler, parent, child) = live_vfork_pair();
+        scheduler.record_successful_exec(child);
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_err());
+
+        let op_id = ExternalOpId::new(parent, 7);
+        let mut continuation = Resources::new(parent);
+        continuation.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
+        scheduler.next_turns.get_mut(&parent).unwrap().req = Ivar::full(Ok(continuation));
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
+        assert!(scheduler.vfork_barriers.is_empty());
+        assert!(scheduler.released_vfork_barriers.is_empty());
+    }
+
+    /// A barrier kept for a dead parent's still-running child is stale once
+    /// that TID begins a new vfork: the new grant replaces it instead of
+    /// asserting.
+    #[test]
+    fn a_new_vfork_by_a_reused_tid_replaces_a_kept_barrier() {
+        let (mut scheduler, parent, _child) = live_vfork_pair();
+        scheduler.logically_kill_thread(&parent, &parent, MmId::initial(parent));
+        assert!(scheduler.dead_parent_vfork_barriers.contains(&parent));
+        scheduler.begin_vfork_barrier(parent);
+        assert_eq!(scheduler.vfork_barriers.get(&parent), Some(&None));
         assert!(scheduler.dead_parent_vfork_barriers.is_empty());
     }
 

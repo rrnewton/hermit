@@ -117,6 +117,7 @@ static HB_SIGNAL_WHILE_HELD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_SPAWN_DUP2_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_TIMEOUT_VS_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_PARENT_KILLED_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static VFORK_KILL_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_LSEEK_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_INODE_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REPLAY_EPOCH_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -707,6 +708,31 @@ fn vfork_parent_killed_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "vfork-parent-killed guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn vfork_kill_exec_guest() -> &'static Path {
+    VFORK_KILL_EXEC_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("vfork-kill-exec");
+        fs::create_dir_all(&build_root).expect("failed to create vfork-kill-exec guest directory");
+        let guest = build_root.join("vfork_kill_exec");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/vfork_kill_exec.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile vfork-kill-exec guest");
+        assert!(
+            output.status.success(),
+            "vfork-kill-exec guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -19149,4 +19175,32 @@ fn a_killed_vfork_parent_does_not_stop_the_schedule() {
         "the run must finish and exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
     );
     assert_eq!(stdout, "A killed by signal 9\n", "stderr:\n{log}");
+}
+
+/// A vfork child that kills its parent and then execs into a program that
+/// forks and waits must not keep the vfork serialization after its exec
+/// (https://github.com/rrnewton/hermit/issues/3984): its own child has to run.
+/// main must report `A killed by signal 9`, then the exec'd image's
+/// `forkwait ok`, as natively.
+#[test]
+fn a_vfork_child_that_kills_its_parent_and_execs_lets_its_own_child_run() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = vfork_kill_exec_guest().to_str().unwrap().to_owned();
+    let (status, log) = run_with_deadline(
+        hermit_command(&["run", "--strict", "--timeout", "30", "--", guest.as_str()]),
+        directory.path(),
+        Duration::from_secs(60),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "the run must finish and exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(
+        stdout, "A killed by signal 9\nforkwait ok\n",
+        "stderr:\n{log}"
+    );
 }
