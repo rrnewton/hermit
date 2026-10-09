@@ -93,7 +93,10 @@ corpus:
   # survey; the 27 sabre-compat-only rows that survey did not run keep the
   # first survey's result. The strict-compat-only variant stays off: it exists
   # to run with preemption on, which neither survey measured. python3 stays
-  # off by coordinator ruling (its `disabled` entries say why).
+  # off by coordinator ruling, and readlink and realpath, which passed the
+  # survey, are off because they stat every ancestor directory of the run
+  # state, an input shared with other cells under Buck (their `disabled`
+  # entries say why).
   additional:
     - backend: liteinst
       hermit_args: [--max-timeslice=disabled]
@@ -108,10 +111,10 @@ corpus:
           curl, date, df-direct, dirname, du, echo, expr, findmnt, free, getopt,
           groups, head, hostname, id, kill, logname, ls, lsirq, lsmod,
           lua-direct, md5sum, nproc, numactl-hardware, numastat, numfmt,
-          openssl, perl-direct, pinky, pr, printf, ps, pwd, readlink, realpath,
-          sha1sum, sha224sum, sha256sum, sha384sum, sha512sum, sleep, stat, sum,
-          sysctl-random-uuid, test, "true", uname, uptime, users, vmstat,
-          vmstat-disk, wc, wc-lines, whoami
+          openssl, perl-direct, pinky, pr, printf, ps, pwd, sha1sum, sha224sum,
+          sha256sum, sha384sum, sha512sum, sleep, stat, sum, sysctl-random-uuid,
+          test, "true", uname, uptime, users, vmstat, vmstat-disk, wc, wc-lines,
+          whoami
         ]
       disabled_reason: >-
         Did not pass 10 of 10 verify runs on liteinst with the maximum
@@ -119,6 +122,22 @@ corpus:
         without the compat fixtures; the second survey did not run this
         sabre-compat-only row (https://github.com/rrnewton/hermit/issues/3745)
       disabled:
+        readlink: >-
+          readlink -f / realpath lstat every ancestor directory of the
+          validation run state; under Buck those ancestors include buck-out
+          directories shared with concurrently running cells, whose size
+          changes between the two --verify runs, so the logged stat differs
+          (an environment input, not a backend defect; the ptrace cell is
+          exposed too). Tracked by an issue to be filed: canonicalizing rows
+          must run under a cell-private path.
+        realpath: >-
+          readlink -f / realpath lstat every ancestor directory of the
+          validation run state; under Buck those ancestors include buck-out
+          directories shared with concurrently running cells, whose size
+          changes between the two --verify runs, so the logged stat differs
+          (an environment input, not a backend defect; the ptrace cell is
+          exposed too). Tracked by an issue to be filed: canonicalizing rows
+          must run under a cell-private path.
         seq: >-
           Its first verify run on liteinst failed in the second local survey
           of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
@@ -777,10 +796,10 @@ corpus:
           curl, date, df-direct, dirname, du, echo, expr, findmnt, free, getopt,
           groups, head, hostname, id, kill, logname, ls, lsirq, lsmod,
           lua-direct, md5sum, nproc, numactl-hardware, numastat, numfmt,
-          openssl, perl-direct, pinky, pr, printf, ps, pwd, readlink, realpath,
-          sha1sum, sha224sum, sha256sum, sha384sum, sha512sum, sleep, stat, sum,
-          sysctl-random-uuid, test, "true", uname, uptime, users, vmstat,
-          vmstat-disk, wc, wc-lines, whoami
+          openssl, perl-direct, pinky, pr, printf, ps, pwd, sha1sum, sha224sum,
+          sha256sum, sha384sum, sha512sum, sleep, stat, sum, sysctl-random-uuid,
+          test, "true", uname, uptime, users, vmstat, vmstat-disk, wc, wc-lines,
+          whoami
         ]
       disabled_reason: >-
         Did not pass 10 of 10 verify runs on in-guest-trap with the maximum
@@ -788,6 +807,22 @@ corpus:
         without the compat fixtures; the second survey did not run this
         sabre-compat-only row (https://github.com/rrnewton/hermit/issues/3745)
       disabled:
+        readlink: >-
+          readlink -f / realpath lstat every ancestor directory of the
+          validation run state; under Buck those ancestors include buck-out
+          directories shared with concurrently running cells, whose size
+          changes between the two --verify runs, so the logged stat differs
+          (an environment input, not a backend defect; the ptrace cell is
+          exposed too). Tracked by an issue to be filed: canonicalizing rows
+          must run under a cell-private path.
+        realpath: >-
+          readlink -f / realpath lstat every ancestor directory of the
+          validation run state; under Buck those ancestors include buck-out
+          directories shared with concurrently running cells, whose size
+          changes between the two --verify runs, so the logged stat differs
+          (an environment input, not a backend defect; the ptrace cell is
+          exposed too). Tracked by an issue to be filed: canonicalizing rows
+          must run under a cell-private path.
         seq: >-
           Its first verify run on in-guest-trap failed in the second local
           survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
