@@ -264,7 +264,19 @@ In-guest LiteInst needs Linux 6.5 or later (`SO_PEERPIDFD`) and refuses to
 start on an older kernel. `--verify` refuses to compare a run that recorded a
 determinism loss (an in-guest process died at a moment the host chose,
 without finishing its exit, or a DETLOG record was lost) or whose log failed
-a write, even if later writes succeeded.
+a write, even if later writes succeeded. A process that ends itself with a
+signal it sends itself (`abort`, `raise`, or `kill`, `tkill` or `tgkill` of
+its own process or thread, with the signal unblocked and its default action)
+dies in its own turn: the runtime finishes its exit first, so its run can
+verify. Because that exit is reported before the death, the status Detcore
+receives names the signal exactly, but whether a core was dumped is only
+predicted (from the signal, the process's dumpable mode, `RLIMIT_CORE` and
+`core_pattern`) and differs when the kernel fails to write the core; Detcore
+does not use it, and the guest's parent sees the kernel's own status. A
+death by any other signal records the loss, including a hardware fault, a
+signal another process sends, a signal the scheduler delivers (such as the
+SIGALRM of an `alarm` with no handler, which is also what a program gets
+when in-guest LiteInst refuses its handler), and a SIGPIPE from a write.
 
 The default namespace, mount, and network setup is shared with Hermit's other
 backends; `--no-namespace` remains available for trusted guests. The in-guest
