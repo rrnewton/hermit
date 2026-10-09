@@ -175,6 +175,10 @@ struct InodePool {
     /// another file (see [`Self::forget_retired`]). Diagnostic only: it
     /// follows host state and never reaches the guest.
     reused: u64,
+    /// The key each procfs host inode, and each procfs path key, is pooled
+    /// under (see [`Self::procfs_key`]): the host inode its entry was first
+    /// numbered under. Every value is also its own key.
+    procfs_keys: HashMap<RawInode, RawInode>,
 }
 
 /// How a numbering request reached its file, which decides whether a retired
@@ -340,7 +344,51 @@ impl InodePool {
             #[cfg(test)]
             listed_probes: 0,
             reused: 0,
+            procfs_keys: HashMap::new(),
         }
+    }
+
+    /// The key to pool the procfs entry at host inode `host` under, given the
+    /// key of the path it was reached by (`procfs_inode::path_inode`).
+    ///
+    /// Linux numbers per-process procfs entries when it builds their
+    /// dentries, and builds an evicted one again under a new host inode
+    /// (see `procfs_inode`). A host inode the pool has seen keeps its key,
+    /// so aliases (`/proc/<pid>/net/tcp` and `/proc/<pid>/task/<tid>/net/tcp`
+    /// are one inode) and sightings without a path agree. A host inode the
+    /// pool has not seen, reached by a path that already named an entry, is
+    /// that entry rebuilt: it takes the entry's key, and with it its number
+    /// and virtual mtime. Consumes no counter value.
+    fn procfs_key(&mut self, host: RawInode, path: RawInode) -> RawInode {
+        let key = match self.procfs_keys.get(&host) {
+            Some(key) => *key,
+            None if self.inodes.contains_key(&host)
+                || self.retired.contains_key(&host)
+                || self.retired_unnumbered.contains_key(&host) =>
+            {
+                host
+            }
+            None => self.procfs_keys.get(&path).copied().unwrap_or(host),
+        };
+        self.procfs_keys.insert(host, key);
+        self.procfs_keys.insert(path, key);
+        // A write through a descriptor nothing had registered left its mtime
+        // under the host inode.
+        if key != host
+            && let Some(mtime) = self.pending_mtimes.remove(&host)
+        {
+            self.set_mtime(key, mtime);
+        }
+        key
+    }
+
+    /// The key `raw_inode` is pooled under: its procfs key if it has one
+    /// (see [`Self::procfs_key`]), otherwise itself.
+    fn key(&self, raw_inode: RawInode) -> RawInode {
+        self.procfs_keys
+            .get(&raw_inode)
+            .copied()
+            .unwrap_or(raw_inode)
     }
 
     // Allocate the next deterministic inode.  This takes the raw-inode and
@@ -386,6 +434,7 @@ impl InodePool {
         epoch: LogicalTime,
         sighting: InodeSighting,
     ) -> (DetInode, LogicalTime) {
+        let raw_inode = self.key(raw_inode);
         let ordinal = self.next_inode;
         self.next_inode += 1;
         match sighting {
@@ -483,6 +532,7 @@ impl InodePool {
     // every file numbered after it. A file not yet numbered keeps the mtime
     // pending until its first numbering request.
     fn set_mtime(&mut self, raw_inode: RawInode, mtime: LogicalTime) {
+        let raw_inode = self.key(raw_inode);
         // A retired file is written through a descriptor opened before its
         // last name went away; a new file's descriptor was opened by name,
         // which discarded the retired mapping.
@@ -526,6 +576,7 @@ impl InodePool {
     /// removal reaches here follows host state (its `st_nlink`), and must not
     /// shift other files' numbers.
     fn retire(&mut self, raw_inode: RawInode) {
+        let raw_inode = self.key(raw_inode);
         let stamp = self.retirements;
         self.retired_at.insert(raw_inode, stamp);
         self.retirements += 1;
@@ -633,6 +684,7 @@ impl InodePool {
     /// of it described a file the host has freed: discard it. Consumes no
     /// counter value.
     fn forget_retired(&mut self, raw_inode: RawInode) {
+        let raw_inode = self.key(raw_inode);
         self.retired_at.remove(&raw_inode);
         // Its number and mtime stay in `generations` and `detinodes_info` for
         // directory snapshots taken while it held the inode.
@@ -2374,10 +2426,12 @@ impl GlobalTool for GlobalState {
             GlobalRequest::RobustListWakes(wakes) => {
                 R::RobustListWakes(self.recv_robust_list_wakes(wakes))
             }
-            GlobalRequest::DeterminizeInode(ino, observed, sighting) => R::DeterminizeInode(
-                self.recv_determinize_inode(from, ino, observed, sighting)
-                    .await,
-            ),
+            GlobalRequest::DeterminizeInode(ino, observed, sighting, procfs_path) => {
+                R::DeterminizeInode(
+                    self.recv_determinize_inode(from, ino, procfs_path, observed, sighting)
+                        .await,
+                )
+            }
             GlobalRequest::DeterminizeMappingInodes(inodes) => R::DeterminizeMappingInodes(
                 self.recv_determinize_mapping_inodes(from, inodes).await,
             ),
@@ -2401,8 +2455,8 @@ impl GlobalTool for GlobalState {
             GlobalRequest::RetireInode(ino) => {
                 R::RetireInode(self.recv_retire_inode(from, ino).await)
             }
-            GlobalRequest::ForgetRetiredInode(ino) => {
-                R::ForgetRetiredInode(self.recv_forget_retired_inode(from, ino).await)
+            GlobalRequest::ForgetRetiredInode(ino, procfs_path) => {
+                R::ForgetRetiredInode(self.recv_forget_retired_inode(from, ino, procfs_path).await)
             }
             GlobalRequest::RetirementCount => {
                 let _sched = self.lock_rpc_scheduler(false).await;
@@ -3407,6 +3461,7 @@ impl GlobalState {
         &self,
         from: Tid,
         ino: RawInode,
+        procfs_path: Option<RawInode>,
         observed: ObservedMtime,
         sighting: InodeSighting,
     ) -> (DetInode, LogicalTime) {
@@ -3415,11 +3470,12 @@ impl GlobalState {
         // the epoch, unless its host mtime is one of the canonical values in
         // `CANONICAL_FILE_MTIME_SECONDS`, which it keeps.
         let epoch = self.epoch_logical_time();
-        let (dino, ns) = self
-            .inodes
-            .lock()
-            .unwrap()
-            .add_sighted_inode(ino, observed, epoch, sighting);
+        let mut pool = self.inodes.lock().unwrap();
+        if let Some(path) = procfs_path {
+            pool.procfs_key(ino, path);
+        }
+        let (dino, ns) = pool.add_sighted_inode(ino, observed, epoch, sighting);
+        drop(pool);
         trace!(
             "[detcore, dtid {}] resolved (raw) inode {:?} to {:?}, mtime {}",
             from, ino, dino, ns
@@ -3502,13 +3558,22 @@ impl GlobalState {
         self.inodes.lock().unwrap().retire(ino);
     }
 
-    async fn recv_forget_retired_inode(&self, from: Tid, ino: RawInode) {
+    async fn recv_forget_retired_inode(
+        &self,
+        from: Tid,
+        ino: RawInode,
+        procfs_path: Option<RawInode>,
+    ) {
         let _sched = self.lock_rpc_scheduler(false).await;
         trace!(
             "[detcore, dtid {}] forget retired (raw) inode {:?}",
             from, ino
         );
-        self.inodes.lock().unwrap().forget_retired(ino);
+        let mut pool = self.inodes.lock().unwrap();
+        if let Some(path) = procfs_path {
+            pool.procfs_key(ino, path);
+        }
+        pool.forget_retired(ino);
     }
 
     async fn recv_touch_file(&self, from: Tid, ino: RawInode) {
@@ -3983,9 +4048,10 @@ pub enum GlobalRequest {
     FutexAction(DetTid, FutexAction, FutexID, i32, u32),
 
     /// Translate nondeterministic to deterministic inode, and report what the
-    /// caller observed of the host mtime (see `ObservedMtime`) and how it
-    /// reached the file (see `InodeSighting`).
-    DeterminizeInode(RawInode, ObservedMtime, InodeSighting),
+    /// caller observed of the host mtime (see `ObservedMtime`), how it
+    /// reached the file (see `InodeSighting`), and, for a procfs entry, the
+    /// key of its path (see `InodePool::procfs_key`).
+    DeterminizeInode(RawInode, ObservedMtime, InodeSighting, Option<RawInode>),
 
     /// Translate the inode of every file-backed line of one `/proc/*/maps`
     /// read, in line order, repeats included: one numbering request per line.
@@ -4013,8 +4079,9 @@ pub enum GlobalRequest {
     RetireInode(RawInode),
 
     /// An `open` found this host inode linked or freshly created (see
-    /// `InodePool::forget_retired`).
-    ForgetRetiredInode(RawInode),
+    /// `InodePool::forget_retired`); for a procfs entry, also the key of its
+    /// path (see `InodePool::procfs_key`).
+    ForgetRetiredInode(RawInode, Option<RawInode>),
 
     /// How many retirements there have been, for a directory snapshot (see
     /// `InodeSighting::Listed`).
@@ -4887,6 +4954,7 @@ where
     determinize_inode_observing_mtime(
         guest,
         inode,
+        None,
         ObservedMtime::Unobserved,
         InodeSighting::Descriptor,
     )
@@ -4894,26 +4962,36 @@ where
 }
 
 /// [`determinize_inode`] for a directory entry, which names a linked file
-/// (see [`InodeSighting::Name`]).
+/// (see [`InodeSighting::Name`]). `procfs_path` is the key of a procfs
+/// entry's path (see `InodePool::procfs_key`).
 pub async fn determinize_named_inode<G, T>(
     guest: &mut G,
     inode: RawInode,
+    procfs_path: Option<RawInode>,
 ) -> (DetInode, LogicalTime)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    determinize_inode_observing_mtime(guest, inode, ObservedMtime::Unobserved, InodeSighting::Name)
-        .await
+    determinize_inode_observing_mtime(
+        guest,
+        inode,
+        procfs_path,
+        ObservedMtime::Unobserved,
+        InodeSighting::Name,
+    )
+    .await
 }
 
 /// Like [`determinize_inode`], for a caller that observed the file's host
 /// mtime. If the file's virtual mtime is still unresolved, `observed` resolves
 /// it: a canonical mtime (see [`CANONICAL_FILE_MTIME_SECONDS`]) is kept, and any
-/// other becomes the epoch.
+/// other becomes the epoch. `procfs_path` is the key of a procfs entry's path
+/// (see `InodePool::procfs_key`).
 pub async fn determinize_inode_observing_mtime<G, T>(
     guest: &mut G,
     inode: RawInode,
+    procfs_path: Option<RawInode>,
     observed: ObservedMtime,
     sighting: InodeSighting,
 ) -> (DetInode, LogicalTime)
@@ -4923,7 +5001,7 @@ where
 {
     let resp = send_and_update_time(
         guest,
-        GlobalRequest::DeterminizeInode(inode, observed, sighting),
+        GlobalRequest::DeterminizeInode(inode, observed, sighting, procfs_path),
     )
     .await;
     match resp.1 {
@@ -5037,10 +5115,12 @@ where
 }
 
 /// [`determinize_inode`] for an entry of a directory snapshot taken after
-/// `retirements` retirements (see [`InodeSighting::Listed`]).
+/// `retirements` retirements (see [`InodeSighting::Listed`]). `procfs_path`
+/// is the key of a procfs entry's path (see `InodePool::procfs_key`).
 pub async fn determinize_listed_inode<G, T>(
     guest: &mut G,
     inode: RawInode,
+    procfs_path: Option<RawInode>,
     retirements: u64,
 ) -> (DetInode, LogicalTime)
 where
@@ -5050,6 +5130,7 @@ where
     determinize_inode_observing_mtime(
         guest,
         inode,
+        procfs_path,
         ObservedMtime::Unobserved,
         InodeSighting::Listed(retirements),
     )
@@ -5057,13 +5138,19 @@ where
 }
 
 /// An `open` found `inode` linked or freshly created (see
-/// `InodePool::forget_retired`).
-pub async fn forget_retired_inode<G, T>(guest: &mut G, inode: RawInode)
-where
+/// `InodePool::forget_retired`). `procfs_path` is the key of a procfs
+/// entry's path (see `InodePool::procfs_key`), so that writes through the
+/// new descriptor update the entry that stats number.
+pub async fn forget_retired_inode<G, T>(
+    guest: &mut G,
+    inode: RawInode,
+    procfs_path: Option<RawInode>,
+) where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    let resp = send_and_update_time(guest, GlobalRequest::ForgetRetiredInode(inode)).await;
+    let resp =
+        send_and_update_time(guest, GlobalRequest::ForgetRetiredInode(inode, procfs_path)).await;
     match resp.1 {
         GlobalResponse::ForgetRetiredInode(x) => x,
         _ => unreachable!(),
@@ -9756,6 +9843,155 @@ mod tests {
             pool.add_inode(rootfs, ObservedMtime::Unobserved, epoch).0,
             on_rootfs
         );
+    }
+
+    /// Linux numbers a per-process procfs entry when it builds the entry's
+    /// dentry, and the host can evict the dentry and build it again under a
+    /// new number. Two `lsof` listings of `/proc/3/fd` found the same numbers
+    /// in one `--verify` run and new ones in the other, where the host had
+    /// rebuilt the entries between the listings. A rebuilt entry reached by
+    /// its path keeps its number, so the guest sees the same numbers either
+    /// way.
+    #[test]
+    fn a_rebuilt_procfs_entry_keeps_its_number() {
+        use std::path::PathBuf;
+
+        use crate::procfs_inode::DirectoryInodes;
+        use crate::procfs_inode::ProcfsDirectory;
+        use crate::types::DetInode;
+
+        let t = LogicalTime::from_nanos(0);
+        let seen = super::ObservedMtime::Unobserved;
+        let proc_device = libc::makedev(0, 23);
+        let names: [&[u8]; 4] = [b".", b"..", b"0", b"1"];
+        // The guest numbers of two listings of `/proc/3/fd`, in which the
+        // host reports the inode numbers `first` and then `second`, as
+        // `recv_determinize_inode` numbers them.
+        let listings = |with_paths: bool, first: [u64; 4], second: [u64; 4]| -> Vec<DetInode> {
+            let mut pool = super::InodePool::new();
+            let directory =
+                with_paths.then(|| ProcfsDirectory::new(PathBuf::from("/proc/3/fd"), false));
+            let inodes = DirectoryInodes::new(proc_device, directory);
+            let mut numbers = Vec::new();
+            for host in [first, second] {
+                for (name, ino) in names.iter().zip(host) {
+                    let (raw, path) = inodes.entry_inode(name, ino);
+                    if let Some(path) = path {
+                        pool.procfs_key(raw, path);
+                    }
+                    let sighting = super::InodeSighting::Listed(0);
+                    numbers.push(pool.add_sighted_inode(raw, seen, t, sighting).0);
+                }
+            }
+            numbers
+        };
+        let cached = [4_100, 4_000, 4_101, 4_102];
+        // The open directory pins `.` and `..`; the fd entries were rebuilt.
+        let rebuilt = [4_100, 4_000, 4_901, 4_902];
+        assert_eq!(
+            listings(true, cached, cached),
+            listings(true, cached, rebuilt),
+            "a host rebuilding procfs dentries changed guest inode numbers"
+        );
+        // The control: by host inode alone, the rebuilt entries were renumbered.
+        assert_ne!(
+            listings(false, cached, cached),
+            listings(false, cached, rebuilt)
+        );
+    }
+
+    /// One procfs entry reached by two paths, as `/proc/<pid>/net/tcp` and
+    /// `/proc/<pid>/task/<pid>/net/tcp` are, is one host inode, so it keeps
+    /// one number however it is reached, and after the host rebuilds it.
+    #[test]
+    fn procfs_aliases_share_one_number() {
+        use std::path::Path;
+
+        use crate::procfs_inode::path_inode;
+
+        let t = LogicalTime::from_nanos(0);
+        let seen = super::ObservedMtime::Unobserved;
+        let device = libc::makedev(0, 23);
+        let host = |ino| crate::types::RawInode::new(device, ino);
+        let net = path_inode(device, Path::new("/proc/3/net/tcp"));
+        let task = path_inode(device, Path::new("/proc/3/task/3/net/tcp"));
+        let mut pool = super::InodePool::new();
+        let mut number = |raw, path| {
+            pool.procfs_key(raw, path);
+            pool.add_inode(raw, seen, t).0
+        };
+        let listed = number(host(4_100), net);
+        assert_eq!(number(host(4_100), task), listed, "an alias");
+        assert_eq!(number(host(4_900), task), listed, "rebuilt, by the alias");
+        assert_eq!(number(host(4_901), net), listed, "rebuilt again");
+        let other = number(
+            host(4_200),
+            path_inode(device, Path::new("/proc/3/net/udp")),
+        );
+        assert_ne!(other, listed);
+    }
+
+    /// A rebuilt procfs entry first seen without its path is new to the pool,
+    /// as it was before paths were named; its path then leads to its new
+    /// number, which it keeps across the next rebuild.
+    #[test]
+    fn a_numbered_host_inode_keeps_its_number_when_its_path_is_named() {
+        use std::path::Path;
+
+        use crate::procfs_inode::path_inode;
+
+        let t = LogicalTime::from_nanos(0);
+        let seen = super::ObservedMtime::Unobserved;
+        let device = libc::makedev(0, 23);
+        let host = |ino| crate::types::RawInode::new(device, ino);
+        let path = path_inode(device, Path::new("/proc/3/fd/0"));
+        let mut pool = super::InodePool::new();
+        pool.procfs_key(host(4_100), path);
+        let first = pool.add_inode(host(4_100), seen, t).0;
+        let without_path = pool.add_inode(host(4_900), seen, t).0;
+        assert_ne!(without_path, first);
+        pool.procfs_key(host(4_900), path);
+        assert_eq!(pool.add_inode(host(4_900), seen, t).0, without_path);
+        pool.procfs_key(host(4_901), path);
+        assert_eq!(pool.add_inode(host(4_901), seen, t).0, without_path);
+        assert_eq!(pool.add_inode(host(4_100), seen, t).0, first);
+    }
+
+    /// A write to a rebuilt procfs entry, which names the host inode only,
+    /// sets the mtime of the number the entry kept, whether the descriptor's
+    /// open named the path before the write (`procfs_key` then `set_mtime`) or
+    /// after it (a pending mtime).
+    #[test]
+    fn a_write_to_a_rebuilt_procfs_entry_sets_the_mtime_of_its_number() {
+        use std::path::Path;
+
+        use crate::procfs_inode::path_inode;
+
+        let t = LogicalTime::from_nanos(0);
+        let written = LogicalTime::from_secs(7);
+        let seen = super::ObservedMtime::Unobserved;
+        let device = libc::makedev(0, 23);
+        let host = |ino| crate::types::RawInode::new(device, ino);
+        let path = path_inode(device, Path::new("/proc/3/comm"));
+        for open_first in [true, false] {
+            let mut pool = super::InodePool::new();
+            pool.procfs_key(host(4_100), path);
+            let (number, mtime) = pool.add_inode(host(4_100), seen, t);
+            assert_ne!(mtime, written);
+            if open_first {
+                pool.procfs_key(host(4_900), path);
+                pool.set_mtime(host(4_900), written);
+            } else {
+                pool.set_mtime(host(4_900), written);
+                pool.procfs_key(host(4_900), path);
+            }
+            assert_eq!(
+                pool.add_inode(host(4_100), seen, t),
+                (number, written),
+                "open_first={open_first}"
+            );
+            assert_eq!(pool.add_inode(host(4_900), seen, t), (number, written));
+        }
     }
 
     /// Only an exact whole-second 0 or 1 host mtime is canonical
