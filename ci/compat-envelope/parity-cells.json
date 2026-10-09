@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 3940,
-      "applicable": 1704,
-      "selectable": 1400,
+      "applicable": 1705,
+      "selectable": 1401,
       "population": 2765,
-      "population_candidate_selected": 1400,
+      "population_candidate_selected": 1401,
       "population_candidate_not_selected": 260,
-      "population_candidate_disabled": 1105
+      "population_candidate_disabled": 1104
     },
     "by_backend": {
       "dbt": {
@@ -28,12 +28,12 @@
       },
       "in-guest-trap": {
         "cells": 788,
-        "applicable": 319,
-        "selectable": 313,
+        "applicable": 320,
+        "selectable": 314,
         "population": 553,
-        "population_candidate_selected": 313,
+        "population_candidate_selected": 314,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 240
+        "population_candidate_disabled": 239
       },
       "kvm": {
         "cells": 788,
@@ -746,7 +746,7 @@
     {"test_id":"c-programs/path-file-ops","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/path-file-ops","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/pause-alarm-interrupt","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"c-programs/pause-alarm-interrupt","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
+    {"test_id":"c-programs/pause-alarm-interrupt","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/pause-alarm-interrupt","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/pause-alarm-interrupt","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)"},
     {"test_id":"c-programs/pause-alarm-interrupt","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

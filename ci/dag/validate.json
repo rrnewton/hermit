@@ -5852,6 +5852,13 @@
           "category": "c-programs",
           "test": "c-programs/pause-alarm-interrupt",
           "mode": "verify",
+          "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pause-alarm-interrupt",
+          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -48341,6 +48348,13 @@
           "test": "c-programs/pause-alarm-interrupt",
           "mode": "verify",
           "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pause-alarm-interrupt",
+          "mode": "verify",
+          "backend": "in-guest-trap"
         },
         {
           "lane": "portable",

@@ -5462,16 +5462,33 @@ test:
           sabre: true
           kvm: true
           dbt: true
+          in-guest-trap: true
         backends_enabled:
           - ptrace
           - sabre
           - kvm
           - dbt
+          - in-guest-trap
         assert:
           bitwise_parity: true
         backends_disabled:
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+        hermit_args:
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so this cell runs with the maximum timeslice disabled; with guest SIGALRM handlers admitted by its env REVERIE_LITEINST_SIGALRM_HANDLERS=1 (signal-handler phase 1), it passed 10 of 10 verify runs on in-guest-trap in a local survey on 2026-10-09, its stdout identical to ptrace's (https://github.com/rrnewton/hermit/issues/3745)
+        # REVERIE_LITEINST_SIGALRM_HANDLERS=1 lets the in-guest LiteInst runtime
+        # admit this guest's SIGALRM handler (signal-handler phase 1); without it
+        # sigaction returns EPERM. The mode-level env reaches every backend's
+        # guest, but only the in-guest runtime reads it; the ptrace, sabre, kvm
+        # and dbt cells also passed 10 of 10 with it set. It is set per cell, not by
+        # default: a process with a handler installed has every syscall routed
+        # through Detcore's narrow phase-1 table, and turning it on for every
+        # in-guest-trap run regressed compat/ps (EOPNOTSUPP for regular-file
+        # reads and getppid). Widening that table is the follow-up
+        # (https://github.com/rrnewton/hermit/issues/3520).
+        env:
+          REVERIE_LITEINST_SIGALRM_HANDLERS: '1'
       naked:
         ci: false
         backends_enabled: []
