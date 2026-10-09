@@ -1033,7 +1033,8 @@ enum ProcfsEntry {
     /// loss.
     Unnamed,
     /// A file Detcore could not tell from a procfs file, as it could not read
-    /// the guest's mount table or the file's filesystem type. It recorded a
+    /// the guest's mount table or the file's filesystem type, or did not look,
+    /// as the guest's threads are not sequentialized. It recorded a
     /// determinism loss.
     Unknown,
 }
@@ -4253,9 +4254,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// (see [`procfs_inode::guest_tids_name_host_tasks`]), as there is then no
     /// `/proc/<tid>` to read.
     ///
-    /// Naming a path injects an `openat` and a `close` into the guest, only
-    /// with sequentialized threads (see [`Self::with_object_link`]), and
-    /// Detcore trusts the host kernel to run them as Linux defines them. A
+    /// Nor without sequentialized threads (see [`Self::name_procfs_entry`]).
+    ///
+    /// Naming a path injects an `openat` and a `close` into the guest (see
+    /// [`Self::with_object_link`]), and Detcore trusts the host kernel to run
+    /// them as Linux defines them. A
     /// seccomp filter the guest inherited from whatever started it (which
     /// `Config::inherited_seccomp` records) may refuse them with an error,
     /// such as `EPERM`, and Detcore then names nothing and records a
@@ -4275,6 +4278,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// [`Self::procfs_entry`], which restores the guest's `errno` afterwards.
+    ///
+    /// Without sequentialized threads, another guest thread can change what a
+    /// descriptor, the working directory or a path leads to between any two
+    /// of the steps that name an entry, and under SaBRe it shares the
+    /// descriptor table Detcore reads the mount table through. So Detcore
+    /// names nothing then, before any of those steps, and records a
+    /// determinism loss for any file that may be on procfs (see
+    /// [`procfs_inode::may_be_procfs`]), devpts files among them.
     async fn name_procfs_entry<G: Guest<Self>>(
         guest: &mut G,
         stat: &DetStat,
@@ -4288,6 +4299,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             || !procfs_inode::may_be_procfs(stat.dev, stat.blksize)
         {
             return ProcfsEntry::NotProcfs;
+        }
+        if !guest.config().sequentialize_threads {
+            Self::record_procfs_loss(
+                guest,
+                "the guest's threads are not sequentialized, so Detcore does not name procfs files"
+                    .into(),
+            )
+            .await;
+            return ProcfsEntry::Unknown;
         }
         let tid = guest.tid().as_raw();
         let mounts = match procfs_inode::procfs_mounts(tid, stat.dev, false) {
@@ -4321,7 +4341,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             Err(error) => {
                 Self::record_procfs_loss(
                     guest,
-                    format!("cannot read the guest's mount table: {error}"),
+                    format!(
+                        "cannot read the guest's mount table: {}",
+                        crate::util::describe_io_error(&error)
+                    ),
                 )
                 .await;
                 return ProcfsEntry::Unknown;
@@ -4380,11 +4403,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// [`Self::close_object_descriptor`]). An error is the reason Detcore
     /// learned nothing, or that the guest's descriptors may have changed.
     ///
-    /// A path is opened only with sequentialized threads. Only then do the
-    /// open, the look at the link and the close run in one turn; otherwise
-    /// another guest thread can close the descriptor Detcore opened and take
-    /// its number for one of its own in between, which Detcore would then
-    /// read, and close.
+    /// It runs only with sequentialized threads (see
+    /// [`Self::name_procfs_entry`]). Only then do the open, the look at the
+    /// link and the close run in one turn, and does the guest's descriptor or
+    /// working directory lead to one file throughout; otherwise another guest
+    /// thread can close the descriptor Detcore opened and take its number for
+    /// one of its own in between, which Detcore would then read, and close.
     async fn with_object_link<G: Guest<Self>, R>(
         guest: &mut G,
         target: StatTarget<'_>,
@@ -4395,10 +4419,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             StatTarget::Descriptor(fd) => inspect(Path::new(&format!("/proc/{tid}/fd/{fd}"))),
             StatTarget::Cwd => inspect(Path::new(&format!("/proc/{tid}/cwd"))),
             StatTarget::Overwritten => Err("the call's result overwrote the guest's path".into()),
-            StatTarget::Path { .. } if !guest.config().sequentialize_threads => Err(
-                "the guest's threads are not sequentialized, so Detcore does not open its path again"
-                    .into(),
-            ),
             StatTarget::Path {
                 dirfd,
                 path,
