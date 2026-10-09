@@ -931,7 +931,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // config::tests::inherited_seccomp_round_trips_through_reverie_bincode and
     // config::tests::inherited_seccomp_is_read_from_a_status_file (detcore-model)
     // retain all 1018: 1021, listed with this node's arguments.
-    ("test.regular_crates", 1021),
+    // runner::tests::a_probed_in_guest_cell_runs_without_a_preemption_timer
+    // (hermit-manifest-plan; a probe of a disabled in-guest LiteInst cell runs
+    // with --max-timeslice=disabled) retains all 1021: 1022.
+    ("test.regular_crates", 1022),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2799,7 +2802,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same four corpus additional-backend tests: 1015.
     // And the same three futex-wake config tests: 1018.
     // And the three detcore-model inherited_seccomp tests: 1021.
-    ("test.regular_crates_on_host", 1021),
+    // And the probed in-guest timeslice test: 1022.
+    ("test.regular_crates_on_host", 1022),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

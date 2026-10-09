@@ -2153,6 +2153,9 @@ pub fn cell_relaxations(cell: &SelectedCell) -> Vec<String> {
         for arg in cell_hermit_args(recipe, backend) {
             relaxations.push(format!("{arg}: {args_reason}"));
         }
+        if let Some(arg) = probe_relaxation(cell, backend) {
+            relaxations.push(format!("{arg}: {PROBE_RELAXATION_REASON}"));
+        }
     }
     if recipe.comparator == Some(Comparator::Stripped) {
         relaxations.push(format!(
@@ -4731,6 +4734,36 @@ struct VerifiedInvocationArgs<'a> {
     guest_argv: &'a [String],
 }
 
+/// The backends that run Detcore inside the guest process with in-guest
+/// LiteInst. Hermit refuses to run them with a preemption timer, which their
+/// in-guest Tool host cannot deliver yet, so every enabled cell of theirs
+/// declares `--max-timeslice=disabled`
+/// (https://github.com/rrnewton/hermit/issues/3745).
+const IN_GUEST_LITEINST_BACKENDS: [&str; 2] = ["liteinst", "in-guest-trap"];
+
+/// Why a probe of a disabled in-guest LiteInst cell runs with
+/// `--max-timeslice=disabled` (see [`probe_relaxation`]).
+const PROBE_RELAXATION_REASON: &str = "a probe of a disabled in-guest LiteInst cell runs without a preemption timer, which Hermit refuses to start that backend with (https://github.com/rrnewton/hermit/issues/3745)";
+
+/// The relaxation a probe of a disabled verify cell (`test-harness run
+/// --probe-disabled`) adds to the cell's own flags: `--max-timeslice=disabled`
+/// for an in-guest LiteInst backend when the cell names no `--max-timeslice`
+/// of its own. A disabled cell usually declares no flags for its backend, and
+/// without that one Hermit refuses every in-guest LiteInst run before the
+/// guest starts, so the probe would measure the refusal instead of the
+/// program. The flag stays in the recorded argv, which is where an enabled
+/// cell's declared relaxation is recorded too.
+fn probe_relaxation(cell: &SelectedCell, backend: &str) -> Option<&'static str> {
+    let declared = cell_hermit_args(&cell.test.modes[&cell.id.mode], backend);
+    (!cell.enabled
+        && cell.id.mode == "verify"
+        && IN_GUEST_LITEINST_BACKENDS.contains(&backend)
+        && !declared
+            .iter()
+            .any(|arg| arg.starts_with("--max-timeslice")))
+    .then_some("--max-timeslice=disabled")
+}
+
 /// The one argv builder for verify, replay and chaos cells.
 ///
 /// The three modes run the same guest under the same base environment,
@@ -4779,6 +4812,7 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
     // still rendered for a recipe built without validation, such as one that
     // reproduces a retained row recorded before the refusal.
     argv.extend(cell_hermit_args(mode_recipe, backend).iter().cloned());
+    argv.extend(probe_relaxation(cell, backend).map(str::to_string));
     if mode_recipe.compare_io_buffers == Some(false) {
         argv.push("--no-detlog-io-buffers".into());
     }
@@ -9734,26 +9768,51 @@ corpus:
     }
 
     fn extended_verify_spec(comparator: Option<Comparator>) -> CellRunSpec {
+        let hermit_args = BTreeMap::from([("ptrace".into(), vec!["--no-virtualize-cpuid".into()])]);
+        verify_spec("ptrace", true, hermit_args, comparator)
+    }
+
+    /// The run spec of a fixture verify cell on `backend`, enabled or not,
+    /// with these per-backend flags.
+    fn verify_spec(
+        backend: &str,
+        enabled: bool,
+        hermit_args: BTreeMap<String, Vec<String>>,
+        comparator: Option<Comparator>,
+    ) -> CellRunSpec {
+        verify_spec_of(verify_cell(backend, enabled, hermit_args, comparator))
+    }
+
+    /// A fixture verify cell on `backend`, enabled or not, with these
+    /// per-backend flags.
+    fn verify_cell(
+        backend: &str,
+        enabled: bool,
+        hermit_args: BTreeMap<String, Vec<String>>,
+        comparator: Option<Comparator>,
+    ) -> SelectedCell {
         let mut test = recipe(true);
         let mode = test.modes.get_mut("verify").unwrap();
-        mode.hermit_args =
-            BTreeMap::from([("ptrace".into(), vec!["--no-virtualize-cpuid".into()])]);
+        mode.hermit_args = hermit_args;
         mode.hermit_args_reason = Some("fixture configuration".into());
         mode.env = Some(BTreeMap::from([("TMPDIR".into(), "/tmp".into())]));
         mode.comparator = comparator;
         mode.comparator_reason = comparator.map(|_| "fixture policy".into());
-        let cell = SelectedCell {
+        SelectedCell {
             category: "fixture".into(),
             id: CellId {
                 test: test.id.clone(),
                 mode: "verify".into(),
-                backend: Some("ptrace".into()),
+                backend: Some(backend.into()),
             },
             test,
-            enabled: true,
+            enabled,
             timeout_seconds: 15,
             cpu_timeout_seconds: 10,
-        };
+        }
+    }
+
+    fn verify_spec_of(cell: SelectedCell) -> CellRunSpec {
         let context = RunContext {
             root: PathBuf::from("/repo"),
             hermit_bin: PathBuf::from("/repo/hermit"),
@@ -9789,6 +9848,59 @@ corpus:
             cell.timeout_seconds,
         )
         .unwrap()
+    }
+
+    /// A probe of a disabled in-guest LiteInst cell runs it with the maximum
+    /// timeslice disabled, as Hermit requires of that backend; an enabled
+    /// cell, another backend, or a cell that names its own `--max-timeslice`
+    /// runs with exactly its declared flags.
+    #[test]
+    fn a_probed_in_guest_cell_runs_without_a_preemption_timer() {
+        let timeslices = |spec: &CellRunSpec| {
+            let separator = spec.argv.iter().position(|a| a == "--").unwrap();
+            spec.argv[..separator]
+                .iter()
+                .filter(|a| a.starts_with("--max-timeslice"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for backend in ["liteinst", "in-guest-trap"] {
+            let probed = verify_spec(backend, false, BTreeMap::new(), None);
+            assert_eq!(
+                timeslices(&probed),
+                ["--max-timeslice=disabled"],
+                "{backend}"
+            );
+            assert_eq!(
+                cell_relaxations(&verify_cell(backend, false, BTreeMap::new(), None)),
+                [format!(
+                    "--max-timeslice=disabled: {PROBE_RELAXATION_REASON}"
+                )]
+            );
+            let verify = probed.argv.iter().position(|a| a == "--verify").unwrap();
+            let flag = probed
+                .argv
+                .iter()
+                .position(|a| a == "--max-timeslice=disabled")
+                .unwrap();
+            assert!(flag < verify, "{:?}", probed.argv);
+            assert!(timeslices(&verify_spec(backend, true, BTreeMap::new(), None)).is_empty());
+            let declared = BTreeMap::from([(backend.into(), vec!["--max-timeslice=1".into()])]);
+            assert_eq!(
+                timeslices(&verify_spec(backend, false, declared, None)),
+                ["--max-timeslice=1"]
+            );
+        }
+        for backend in ["ptrace", "dbt", "kvm"] {
+            assert!(
+                timeslices(&verify_spec(backend, false, BTreeMap::new(), None)).is_empty(),
+                "{backend}"
+            );
+        }
+        // A SaBRe spec writes its path evidence under the cell directory, so
+        // that backend is checked on the relaxation alone.
+        let sabre = verify_cell("sabre", false, BTreeMap::new(), None);
+        assert_eq!(probe_relaxation(&sabre, "sabre"), None);
     }
 
     #[test]
