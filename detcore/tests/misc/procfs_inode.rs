@@ -16,9 +16,13 @@
 //! it closes a descriptor, looks up the descriptor's entry, which fails and
 //! drops the dentry, and opens a file at the same number again.
 //!
-//! The guest names its entries as `/proc/<pid>/...`: Detcore finds a procfs
-//! entry's path from the tracer, where `/proc/self` is the tracer's own.
+//! Detcore names an entry by its path within procfs, which it reads back from
+//! a descriptor the guest holds or opens for it, so the guest may reach the
+//! entry as `/proc/<pid>`, `/proc/self` or `/proc/thread-self`. When it
+//! cannot name the entry it records a determinism loss, so verification
+//! refuses to compare the run rather than trusting host numbering.
 
+use std::ffi::CStr;
 use std::ffi::CString;
 use std::fs::File;
 use std::io::Write;
@@ -41,7 +45,7 @@ fn config() -> Config {
 }
 
 /// Run `guest` under Detcore and require that it exits 0.
-fn under_detcore(guest: fn()) {
+fn under_detcore(guest: impl FnOnce() + Send) {
     let (output, _) =
         detcore_testutils::test_fn_with_config::<Detcore, _>(guest, config(), true).unwrap();
     assert_eq!(
@@ -105,9 +109,10 @@ fn statx(dirfd: i32, path: &str, flags: i32) -> std::io::Result<(u64, u32)> {
     Ok((buf.stx_ino, buf.stx_nlink))
 }
 
-/// The inode numbers of one `/proc/<pid>/fd/<n>` entry before and after it is
-/// rebuilt: as `getdents64` lists it, and as `lstat`, `fstatat` relative to
-/// the directory and `statx` report it, which see the rebuilt entry first.
+/// The inode numbers of one entry of the descriptor directory `fds` before
+/// and after it is rebuilt: as `getdents64` lists it, and as `lstat`,
+/// `fstatat` relative to the directory and `statx` report it, which see the
+/// rebuilt entry first.
 #[derive(Debug)]
 struct Sightings {
     listed_before: u64,
@@ -116,27 +121,26 @@ struct Sightings {
     listed_after: u64,
 }
 
-fn rebuild_a_descriptor_entry() -> Sightings {
-    let fds = format!("{}/fd", proc_dir());
+fn rebuild_a_descriptor_entry(fds: &str) -> Sightings {
     let fd = File::open("/dev/null").unwrap().into_raw_fd();
     let name = fd.to_string();
     let entry = format!("{fds}/{name}");
     let lstat = || std::fs::symlink_metadata(&entry).map(|metadata| metadata.ino());
-    let listed_before = listed(&fds, &name);
+    let listed_before = listed(fds, &name);
     let stat_before = lstat().unwrap();
     assert_eq!(unsafe { libc::close(fd) }, 0, "close({fd})");
     // The lookup of a closed descriptor's entry fails and drops its dentry.
     assert!(lstat().is_err(), "{entry} exists after close");
     let again = File::open("/dev/null").unwrap().into_raw_fd();
     assert_eq!(again, fd, "the reopened file must take the closed number");
-    let directory = File::open(&fds).unwrap();
+    let directory = File::open(fds).unwrap();
     let nofollow = libc::AT_SYMLINK_NOFOLLOW;
     let stat_after = [
         lstat().unwrap(),
         statx(directory.as_raw_fd(), &name, nofollow).unwrap().0,
         statx(libc::AT_FDCWD, &entry, nofollow).unwrap().0,
     ];
-    let listed_after = listed(&fds, &name);
+    let listed_after = listed(fds, &name);
     assert_eq!(unsafe { libc::close(again) }, 0, "close({again})");
     Sightings {
         listed_before,
@@ -146,25 +150,91 @@ fn rebuild_a_descriptor_entry() -> Sightings {
     }
 }
 
-#[test]
-fn a_rebuilt_proc_fd_entry_keeps_its_number() {
+/// Rebuilds an entry of each descriptor directory `fds` names, natively and
+/// then under Detcore, and requires that the guest saw each keep its number.
+fn rebuilt_entries_keep_their_numbers(fds: fn() -> Vec<String>) {
     // Natively the rebuilt entry gets a new number. Were the host to keep the
     // dentry, the guest below would keep its number at any Detcore revision.
-    let native = rebuild_a_descriptor_entry();
-    assert_ne!(
-        native.listed_before, native.listed_after,
-        "the host did not rebuild the entry, so this test cannot tell: {native:?}"
-    );
+    for fds in fds() {
+        let native = rebuild_a_descriptor_entry(&fds);
+        assert_ne!(
+            native.listed_before, native.listed_after,
+            "the host did not rebuild the entry in {fds}, so this test cannot tell: {native:?}"
+        );
+    }
+    under_detcore(move || {
+        for fds in fds() {
+            let seen = rebuild_a_descriptor_entry(&fds);
+            let number = seen.listed_before;
+            assert!(
+                seen.stat_before == number
+                    && seen.stat_after.iter().all(|stat| *stat == number)
+                    && seen.listed_after == number,
+                "the guest saw the rebuilt entry in {fds} renumbered: {seen:?}"
+            );
+        }
+    });
+}
+
+#[test]
+fn a_rebuilt_proc_fd_entry_keeps_its_number() {
+    rebuilt_entries_keep_their_numbers(|| vec![format!("{}/fd", proc_dir())]);
+}
+
+/// `/proc/self` and `/proc/thread-self` name the guest, not the tracer, when
+/// Detcore names the entry a guest reached through them. The thread's own
+/// `fd` directory is a second directory, whose entries are other inodes.
+#[test]
+fn a_rebuilt_entry_reached_through_self_keeps_its_number() {
+    rebuilt_entries_keep_their_numbers(|| {
+        vec![
+            "/proc/self/fd".to_owned(),
+            "/proc/thread-self/fd".to_owned(),
+        ]
+    });
+}
+
+/// Detcore names an entry the guest reached by path by opening the path
+/// again after the stat. A stat whose result buffer holds its own path has
+/// overwritten the path by then (Linux reads the path before it writes the
+/// result), so Detcore cannot name the entry. It records a determinism loss
+/// instead of passing host numbering on silently, and the stat still
+/// succeeds. Named by a later stat, the entry keeps the number it was given
+/// unnamed, and keeps it when the host rebuilds the entry.
+#[test]
+fn an_entry_detcore_cannot_name_records_a_determinism_loss() {
     under_detcore(|| {
-        let seen = rebuild_a_descriptor_entry();
-        let number = seen.listed_before;
-        assert!(
-            seen.stat_before == number
-                && seen.stat_after.iter().all(|stat| *stat == number)
-                && seen.listed_after == number,
-            "the guest saw the rebuilt entry renumbered: {seen:?}"
+        let fd = File::open("/dev/null").unwrap().into_raw_fd();
+        let entry = format!("/proc/self/fd/{fd}");
+        let lstat = || std::fs::symlink_metadata(&entry).map(|metadata| metadata.ino());
+        let path = CString::new(entry.clone()).unwrap();
+        let path = path.as_bytes_with_nul();
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        assert!(path.len() <= std::mem::size_of::<libc::stat>());
+        let buffer = stat.as_mut_ptr();
+        unsafe { std::ptr::copy_nonoverlapping(path.as_ptr(), buffer.cast(), path.len()) };
+        let flags = libc::AT_SYMLINK_NOFOLLOW;
+        let result =
+            unsafe { libc::syscall(libc::SYS_newfstatat, libc::AT_FDCWD, buffer, buffer, flags) };
+        assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+        let unnamed = unsafe { stat.assume_init() }.st_ino;
+        assert_eq!(lstat().unwrap(), unnamed, "named, the entry was renumbered");
+        assert_eq!(unsafe { libc::close(fd) }, 0, "close({fd})");
+        assert!(lstat().is_err(), "{entry} exists after close");
+        let again = File::open("/dev/null").unwrap().into_raw_fd();
+        assert_eq!(again, fd, "the reopened file must take the closed number");
+        assert_eq!(
+            lstat().unwrap(),
+            unnamed,
+            "the rebuilt entry was renumbered"
         );
     });
+    let loss = detcore::detlog::determinism_loss();
+    assert!(
+        loss.as_deref()
+            .is_some_and(|loss| loss.starts_with("procfs inode numbers: ")),
+        "no procfs determinism loss was recorded: {loss:?}"
+    );
 }
 
 /// `tcp` listed in `/proc/<pid>/net` and reached as
@@ -202,6 +272,34 @@ fn the_proc_root_link_count_does_not_count_host_processes() {
     let native = proc_root_link_counts();
     assert!(native.iter().all(|count| *count > 2), "{native:?}");
     under_detcore(|| assert_eq!(proc_root_link_counts(), [1, 1, 1]));
+}
+
+/// The link count `statx(AT_FDCWD, path, AT_EMPTY_PATH)` reports for the
+/// current directory, where `path` is empty or NULL.
+fn cwd_link_count(path: Option<&CStr>) -> std::io::Result<u32> {
+    let path = path.map_or(std::ptr::null(), CStr::as_ptr);
+    let mut buf = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    let (flags, mask) = (libc::AT_EMPTY_PATH, libc::STATX_NLINK);
+    if unsafe { libc::statx(libc::AT_FDCWD, path, flags, mask, buf.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { buf.assume_init() }.stx_nlink)
+}
+
+/// `statx` of the current directory, by an empty path or (from Linux 6.11)
+/// a NULL one, reports `/proc`'s link count as `stat` of `/proc` does.
+#[test]
+fn the_proc_root_link_count_through_the_cwd_does_not_count_host_processes() {
+    under_detcore(|| {
+        std::env::set_current_dir("/proc").unwrap();
+        let empty = CString::new("").unwrap();
+        assert_eq!(cwd_link_count(Some(&empty)).unwrap(), 1, "an empty path");
+        match cwd_link_count(None) {
+            // Linux before 6.11 refuses a NULL path.
+            Err(error) if error.raw_os_error() == Some(libc::EFAULT) => {}
+            count => assert_eq!(count.unwrap(), 1, "a NULL path"),
+        }
+    });
 }
 
 #[test]

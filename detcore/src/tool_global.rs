@@ -77,6 +77,8 @@ use crate::fd::SharedOpenFileError;
 use crate::ivar::Ivar;
 use crate::preemptions::PreemptionReader;
 use crate::preemptions::ThreadHistory;
+use crate::procfs_inode;
+use crate::procfs_inode::ProcfsName;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::ChaosEpochTransition;
 use crate::resources::Permission;
@@ -179,6 +181,9 @@ struct InodePool {
     /// under (see [`Self::procfs_key`]): the host inode its entry was first
     /// numbered under. Every value is also its own key.
     procfs_keys: HashMap<RawInode, RawInode>,
+    /// How many guest threads each thread ID has been given to (see
+    /// [`Self::count_incarnation`]).
+    incarnations: HashMap<i32, u32>,
 }
 
 /// How a numbering request reached its file, which decides whether a retired
@@ -345,11 +350,12 @@ impl InodePool {
             listed_probes: 0,
             reused: 0,
             procfs_keys: HashMap::new(),
+            incarnations: HashMap::new(),
         }
     }
 
     /// The key to pool the procfs entry at host inode `host` under, given the
-    /// key of the path it was reached by (`procfs_inode::path_inode`).
+    /// key of the path it was reached by (see [`Self::procfs_path_key`]).
     ///
     /// Linux numbers per-process procfs entries when it builds their
     /// dentries, and builds an evicted one again under a new host inode
@@ -389,6 +395,28 @@ impl InodePool {
             .get(&raw_inode)
             .copied()
             .unwrap_or(raw_inode)
+    }
+
+    /// Counts a new guest thread with thread ID `tid`. A process or thread
+    /// ID the kernel gives out again names a new task, and Linux drops the
+    /// old task's procfs entries when it exits, so the new task's entries
+    /// are new files (see [`Self::procfs_path_key`]).
+    fn count_incarnation(&mut self, tid: i32) {
+        *self.incarnations.entry(tid).or_default() += 1;
+    }
+
+    /// The path key of the procfs entry `name`: the key of its path, salted
+    /// with the incarnation of each task the path names (see
+    /// [`Self::count_incarnation`]), so that an entry of a task whose ID was
+    /// reused does not adopt the number of the old task's entry, which a
+    /// descriptor may still hold.
+    fn procfs_path_key(&self, name: &ProcfsName) -> RawInode {
+        name.tasks
+            .iter()
+            .fold(name.path, |key, task| match self.incarnations.get(task) {
+                Some(incarnation) => procfs_inode::with_incarnation(key, *task, *incarnation),
+                None => key,
+            })
     }
 
     // Allocate the next deterministic inode.  This takes the raw-inode and
@@ -1809,6 +1837,13 @@ impl GlobalTool for GlobalState {
             self.host_mutations.lock().unwrap().insert(path);
             return (None, R::RecordHostMutation(()));
         }
+        // A determinism loss is recorded where verification reads it, and,
+        // like the observations above, moves no clock: whether the host made
+        // a guest-side handler lose determinism must not change guest time.
+        if let GlobalRequest::RecordDeterminismLoss(reason) = request {
+            crate::detlog::write_loss_notice(&reason);
+            return (None, R::RecordDeterminismLoss(()));
+        }
         // Control traffic for a shared open file description: like the
         // observations above, it carries no logical time, changes no
         // scheduler state, and its answer carries no time back.
@@ -2051,6 +2086,9 @@ impl GlobalTool for GlobalState {
             }
             GlobalRequest::ChildExitSigchld(_) => {
                 unreachable!("child-exit SIGCHLD control answered before clock accounting")
+            }
+            GlobalRequest::RecordDeterminismLoss(_) => {
+                unreachable!("determinism loss answered before clock accounting")
             }
             GlobalRequest::ParkedRequest(rs, pid, capability) => {
                 let (response, _) = self
@@ -2426,9 +2464,9 @@ impl GlobalTool for GlobalState {
             GlobalRequest::RobustListWakes(wakes) => {
                 R::RobustListWakes(self.recv_robust_list_wakes(wakes))
             }
-            GlobalRequest::DeterminizeInode(ino, observed, sighting, procfs_path) => {
+            GlobalRequest::DeterminizeInode(ino, observed, sighting, procfs) => {
                 R::DeterminizeInode(
-                    self.recv_determinize_inode(from, ino, procfs_path, observed, sighting)
+                    self.recv_determinize_inode(from, ino, procfs, observed, sighting)
                         .await,
                 )
             }
@@ -2455,8 +2493,8 @@ impl GlobalTool for GlobalState {
             GlobalRequest::RetireInode(ino) => {
                 R::RetireInode(self.recv_retire_inode(from, ino).await)
             }
-            GlobalRequest::ForgetRetiredInode(ino, procfs_path) => {
-                R::ForgetRetiredInode(self.recv_forget_retired_inode(from, ino, procfs_path).await)
+            GlobalRequest::ForgetRetiredInode(ino, procfs) => {
+                R::ForgetRetiredInode(self.recv_forget_retired_inode(from, ino, procfs).await)
             }
             GlobalRequest::RetirementCount => {
                 let _sched = self.lock_rpc_scheduler(false).await;
@@ -2959,6 +2997,12 @@ impl GlobalState {
                 flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_VM)),
             );
             sched.register_reused_transferred_exec_tid(child_dettid, child_mm);
+            // The guest's procfs paths name a task by its thread ID in the
+            // guest's PID namespace, which is the raw value of its DetTid.
+            self.inodes
+                .lock()
+                .unwrap()
+                .count_incarnation(child_dettid.as_raw());
 
             // Don't fill in the request, as the child will do it:
             let _entry = sched
@@ -3461,7 +3505,7 @@ impl GlobalState {
         &self,
         from: Tid,
         ino: RawInode,
-        procfs_path: Option<RawInode>,
+        procfs: Option<ProcfsName>,
         observed: ObservedMtime,
         sighting: InodeSighting,
     ) -> (DetInode, LogicalTime) {
@@ -3471,7 +3515,8 @@ impl GlobalState {
         // `CANONICAL_FILE_MTIME_SECONDS`, which it keeps.
         let epoch = self.epoch_logical_time();
         let mut pool = self.inodes.lock().unwrap();
-        if let Some(path) = procfs_path {
+        if let Some(name) = procfs {
+            let path = pool.procfs_path_key(&name);
             pool.procfs_key(ino, path);
         }
         let (dino, ns) = pool.add_sighted_inode(ino, observed, epoch, sighting);
@@ -3562,7 +3607,7 @@ impl GlobalState {
         &self,
         from: Tid,
         ino: RawInode,
-        procfs_path: Option<RawInode>,
+        procfs: Option<ProcfsName>,
     ) {
         let _sched = self.lock_rpc_scheduler(false).await;
         trace!(
@@ -3570,7 +3615,8 @@ impl GlobalState {
             from, ino
         );
         let mut pool = self.inodes.lock().unwrap();
-        if let Some(path) = procfs_path {
+        if let Some(name) = procfs {
+            let path = pool.procfs_path_key(&name);
             pool.procfs_key(ino, path);
         }
         pool.forget_retired(ino);
@@ -4049,9 +4095,9 @@ pub enum GlobalRequest {
 
     /// Translate nondeterministic to deterministic inode, and report what the
     /// caller observed of the host mtime (see `ObservedMtime`), how it
-    /// reached the file (see `InodeSighting`), and, for a procfs entry, the
-    /// key of its path (see `InodePool::procfs_key`).
-    DeterminizeInode(RawInode, ObservedMtime, InodeSighting, Option<RawInode>),
+    /// reached the file (see `InodeSighting`), and, for a procfs entry, its
+    /// name (see `procfs_inode::ProcfsName` and `InodePool::procfs_key`).
+    DeterminizeInode(RawInode, ObservedMtime, InodeSighting, Option<ProcfsName>),
 
     /// Translate the inode of every file-backed line of one `/proc/*/maps`
     /// read, in line order, repeats included: one numbering request per line.
@@ -4079,9 +4125,9 @@ pub enum GlobalRequest {
     RetireInode(RawInode),
 
     /// An `open` found this host inode linked or freshly created (see
-    /// `InodePool::forget_retired`); for a procfs entry, also the key of its
-    /// path (see `InodePool::procfs_key`).
-    ForgetRetiredInode(RawInode, Option<RawInode>),
+    /// `InodePool::forget_retired`); for a procfs entry, also its name (see
+    /// `procfs_inode::ProcfsName` and `InodePool::procfs_key`).
+    ForgetRetiredInode(RawInode, Option<ProcfsName>),
 
     /// How many retirements there have been, for a directory snapshot (see
     /// `InodeSighting::Listed`).
@@ -4202,6 +4248,12 @@ pub enum GlobalRequest {
     /// A child-exit `SIGCHLD` control message
     /// (`scheduler::child_exit_sigchld`).
     ChildExitSigchld(crate::scheduler::child_exit_sigchld::ChildExitSigchldControl),
+    /// A determinism loss to record for the run (see
+    /// `crate::detlog::write_loss_notice`), from a guest-side handler, which
+    /// may run in a process whose own record verification never reads.
+    /// Answered before any clock or scheduler accounting. Appended after
+    /// `ChildExitSigchld`, for the same reason.
+    RecordDeterminismLoss(String),
 }
 
 /// Responses from the global object
@@ -4296,6 +4348,8 @@ pub enum GlobalResponse {
     /// `SharedOpenFile`, for the same reason.
     Sigalrm(bool),
     ChildExitSigchld(crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer),
+    /// Appended after `ChildExitSigchld`, for the same reason.
+    RecordDeterminismLoss(()),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -4446,6 +4500,22 @@ where
     assert_eq!(
         (time, response),
         (None, GlobalResponse::RecordHostMutation(()))
+    );
+}
+
+/// Record a determinism loss for the run in the global state's process,
+/// whose losses verification reads (see `crate::detlog::determinism_loss`),
+/// whichever process this handler runs in. The answer carries no time.
+pub(crate) async fn report_determinism_loss<G, T>(guest: &mut G, reason: String)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (time, response) =
+        send_and_update_time(guest, GlobalRequest::RecordDeterminismLoss(reason)).await;
+    assert_eq!(
+        (time, response),
+        (None, GlobalResponse::RecordDeterminismLoss(()))
     );
 }
 
@@ -4962,12 +5032,12 @@ where
 }
 
 /// [`determinize_inode`] for a directory entry, which names a linked file
-/// (see [`InodeSighting::Name`]). `procfs_path` is the key of a procfs
-/// entry's path (see `InodePool::procfs_key`).
+/// (see [`InodeSighting::Name`]). `procfs` names a procfs entry (see
+/// `procfs_inode::ProcfsName`).
 pub async fn determinize_named_inode<G, T>(
     guest: &mut G,
     inode: RawInode,
-    procfs_path: Option<RawInode>,
+    procfs: Option<ProcfsName>,
 ) -> (DetInode, LogicalTime)
 where
     G: Guest<Detcore<T>>,
@@ -4976,7 +5046,7 @@ where
     determinize_inode_observing_mtime(
         guest,
         inode,
-        procfs_path,
+        procfs,
         ObservedMtime::Unobserved,
         InodeSighting::Name,
     )
@@ -4986,12 +5056,12 @@ where
 /// Like [`determinize_inode`], for a caller that observed the file's host
 /// mtime. If the file's virtual mtime is still unresolved, `observed` resolves
 /// it: a canonical mtime (see [`CANONICAL_FILE_MTIME_SECONDS`]) is kept, and any
-/// other becomes the epoch. `procfs_path` is the key of a procfs entry's path
-/// (see `InodePool::procfs_key`).
+/// other becomes the epoch. `procfs` names a procfs entry (see
+/// `procfs_inode::ProcfsName`).
 pub async fn determinize_inode_observing_mtime<G, T>(
     guest: &mut G,
     inode: RawInode,
-    procfs_path: Option<RawInode>,
+    procfs: Option<ProcfsName>,
     observed: ObservedMtime,
     sighting: InodeSighting,
 ) -> (DetInode, LogicalTime)
@@ -5001,7 +5071,7 @@ where
 {
     let resp = send_and_update_time(
         guest,
-        GlobalRequest::DeterminizeInode(inode, observed, sighting, procfs_path),
+        GlobalRequest::DeterminizeInode(inode, observed, sighting, procfs),
     )
     .await;
     match resp.1 {
@@ -5115,12 +5185,12 @@ where
 }
 
 /// [`determinize_inode`] for an entry of a directory snapshot taken after
-/// `retirements` retirements (see [`InodeSighting::Listed`]). `procfs_path`
-/// is the key of a procfs entry's path (see `InodePool::procfs_key`).
+/// `retirements` retirements (see [`InodeSighting::Listed`]). `procfs`
+/// names a procfs entry (see `procfs_inode::ProcfsName`).
 pub async fn determinize_listed_inode<G, T>(
     guest: &mut G,
     inode: RawInode,
-    procfs_path: Option<RawInode>,
+    procfs: Option<ProcfsName>,
     retirements: u64,
 ) -> (DetInode, LogicalTime)
 where
@@ -5130,7 +5200,7 @@ where
     determinize_inode_observing_mtime(
         guest,
         inode,
-        procfs_path,
+        procfs,
         ObservedMtime::Unobserved,
         InodeSighting::Listed(retirements),
     )
@@ -5138,19 +5208,15 @@ where
 }
 
 /// An `open` found `inode` linked or freshly created (see
-/// `InodePool::forget_retired`). `procfs_path` is the key of a procfs
-/// entry's path (see `InodePool::procfs_key`), so that writes through the
-/// new descriptor update the entry that stats number.
-pub async fn forget_retired_inode<G, T>(
-    guest: &mut G,
-    inode: RawInode,
-    procfs_path: Option<RawInode>,
-) where
+/// `InodePool::forget_retired`). `procfs` names a procfs entry (see
+/// `procfs_inode::ProcfsName`), so that writes through the new descriptor
+/// update the entry that stats number.
+pub async fn forget_retired_inode<G, T>(guest: &mut G, inode: RawInode, procfs: Option<ProcfsName>)
+where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    let resp =
-        send_and_update_time(guest, GlobalRequest::ForgetRetiredInode(inode, procfs_path)).await;
+    let resp = send_and_update_time(guest, GlobalRequest::ForgetRetiredInode(inode, procfs)).await;
     match resp.1 {
         GlobalResponse::ForgetRetiredInode(x) => x,
         _ => unreachable!(),
@@ -9869,14 +9935,14 @@ mod tests {
         // `recv_determinize_inode` numbers them.
         let listings = |with_paths: bool, first: [u64; 4], second: [u64; 4]| -> Vec<DetInode> {
             let mut pool = super::InodePool::new();
-            let directory =
-                with_paths.then(|| ProcfsDirectory::new(PathBuf::from("/proc/3/fd"), false));
+            let directory = with_paths.then(|| ProcfsDirectory::new(PathBuf::from("/3/fd")));
             let inodes = DirectoryInodes::new(proc_device, directory);
             let mut numbers = Vec::new();
             for host in [first, second] {
                 for (name, ino) in names.iter().zip(host) {
-                    let (raw, path) = inodes.entry_inode(name, ino);
-                    if let Some(path) = path {
+                    let (raw, procfs) = inodes.entry_inode(name, ino);
+                    if let Some(procfs) = procfs {
+                        let path = pool.procfs_path_key(&procfs);
                         pool.procfs_key(raw, path);
                     }
                     let sighting = super::InodeSighting::Listed(0);
@@ -9913,8 +9979,8 @@ mod tests {
         let seen = super::ObservedMtime::Unobserved;
         let device = libc::makedev(0, 23);
         let host = |ino| crate::types::RawInode::new(device, ino);
-        let net = path_inode(device, Path::new("/proc/3/net/tcp"));
-        let task = path_inode(device, Path::new("/proc/3/task/3/net/tcp"));
+        let net = path_inode(device, Path::new("/3/net/tcp"));
+        let task = path_inode(device, Path::new("/3/task/3/net/tcp"));
         let mut pool = super::InodePool::new();
         let mut number = |raw, path| {
             pool.procfs_key(raw, path);
@@ -9924,10 +9990,7 @@ mod tests {
         assert_eq!(number(host(4_100), task), listed, "an alias");
         assert_eq!(number(host(4_900), task), listed, "rebuilt, by the alias");
         assert_eq!(number(host(4_901), net), listed, "rebuilt again");
-        let other = number(
-            host(4_200),
-            path_inode(device, Path::new("/proc/3/net/udp")),
-        );
+        let other = number(host(4_200), path_inode(device, Path::new("/3/net/udp")));
         assert_ne!(other, listed);
     }
 
@@ -9944,7 +10007,7 @@ mod tests {
         let seen = super::ObservedMtime::Unobserved;
         let device = libc::makedev(0, 23);
         let host = |ino| crate::types::RawInode::new(device, ino);
-        let path = path_inode(device, Path::new("/proc/3/fd/0"));
+        let path = path_inode(device, Path::new("/3/fd/0"));
         let mut pool = super::InodePool::new();
         pool.procfs_key(host(4_100), path);
         let first = pool.add_inode(host(4_100), seen, t).0;
@@ -9972,7 +10035,7 @@ mod tests {
         let seen = super::ObservedMtime::Unobserved;
         let device = libc::makedev(0, 23);
         let host = |ino| crate::types::RawInode::new(device, ino);
-        let path = path_inode(device, Path::new("/proc/3/comm"));
+        let path = path_inode(device, Path::new("/3/comm"));
         for open_first in [true, false] {
             let mut pool = super::InodePool::new();
             pool.procfs_key(host(4_100), path);
@@ -9992,6 +10055,45 @@ mod tests {
             );
             assert_eq!(pool.add_inode(host(4_900), seen, t), (number, written));
         }
+    }
+
+    /// A process ID the kernel gives out again names a new process, whose
+    /// procfs entries are new files: Linux drops the old process's entries
+    /// when it exits. The new process's `/proc/<pid>` takes a number of its
+    /// own and keeps it across rebuilds, while a descriptor still open on
+    /// the old process's entry keeps the old number.
+    #[test]
+    fn a_reused_task_id_names_new_procfs_entries() {
+        use std::path::Path;
+
+        use crate::procfs_inode::ProcfsName;
+        use crate::types::RawInode;
+
+        let t = LogicalTime::from_nanos(0);
+        let seen = super::ObservedMtime::Unobserved;
+        let device = libc::makedev(0, 23);
+        let host = |ino| RawInode::new(device, ino);
+        let process = ProcfsName::new(device, Path::new("/7"));
+        let number = |pool: &mut super::InodePool, raw: RawInode| {
+            let path = pool.procfs_path_key(&process);
+            pool.procfs_key(raw, path);
+            pool.add_inode(raw, seen, t).0
+        };
+        let mut pool = super::InodePool::new();
+        pool.count_incarnation(7);
+        let first = number(&mut pool, host(4_100));
+        assert_eq!(number(&mut pool, host(4_900)), first, "rebuilt");
+        pool.count_incarnation(7);
+        let second = number(&mut pool, host(5_000));
+        assert_ne!(second, first, "a new process took the old one's number");
+        assert_eq!(pool.add_inode(host(4_900), seen, t).0, first, "held");
+        assert_eq!(number(&mut pool, host(5_001)), second, "rebuilt");
+        // A thread's directory also names the thread's incarnation.
+        let thread = ProcfsName::new(device, Path::new("/7/task/9/stat"));
+        assert_eq!(thread.tasks, [7, 9]);
+        let before = pool.procfs_path_key(&thread);
+        pool.count_incarnation(9);
+        assert_ne!(pool.procfs_path_key(&thread), before);
     }
 
     /// Only an exact whole-second 0 or 1 host mtime is canonical
