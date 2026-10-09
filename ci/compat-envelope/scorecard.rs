@@ -12627,28 +12627,66 @@ struct ComparisonAttemptBindings {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     retired_canonical_comparisons: Vec<RetiredCanonicalComparison>,
     /// The retired ptrace rerun's receipts
-    /// (https://github.com/rrnewton/hermit/issues/3301). Accepted only empty;
+    /// (https://github.com/rrnewton/hermit/issues/3301). Read and dropped;
     /// never written.
     #[serde(default, skip_serializing)]
     retired_backend_parity_comparisons: NoRetiredParityReceipts,
 }
 
-/// A history document that still holds receipts of the retired ptrace rerun
-/// is refused: the scorecard no longer verifies or keeps them, and no history
-/// document holds any.
+/// The receipts of the retired ptrace rerun that a history document published
+/// before the rerun was retired still holds. The scorecard no longer verifies
+/// or keeps them: it reads them as a list of anything, drops them, and writes
+/// none, so the next history it publishes holds none. Refusing them instead
+/// would refuse every published history that still holds them, and so every
+/// scorecard generation from it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct NoRetiredParityReceipts;
 
 impl<'de> Deserialize<'de> for NoRetiredParityReceipts {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let receipts = Vec::<serde::de::IgnoredAny>::deserialize(deserializer)?;
-        if receipts.is_empty() {
-            Ok(Self)
-        } else {
-            Err(serde::de::Error::custom(
-                "history holds receipts of the retired ptrace rerun (https://github.com/rrnewton/hermit/issues/3301)",
-            ))
-        }
+        Vec::<serde::de::IgnoredAny>::deserialize(deserializer)?;
+        Ok(Self)
+    }
+}
+
+#[cfg(test)]
+mod retired_parity_receipt_tests {
+    use super::*;
+
+    /// A history published before the ptrace rerun was retired holds its
+    /// receipts. It is read, the receipts are dropped, and the document
+    /// written back holds none.
+    #[test]
+    fn retired_rerun_receipts_are_read_and_dropped() {
+        let bindings: ComparisonAttemptBindings = serde_json::from_value(serde_json::json!({
+            "schema": 1,
+            "authority": ATTEMPT_BINDING_AUTHORITY,
+            "bindings": [],
+            "retired_backend_parity_comparisons": [
+                {"cell": {"backend": "kvm"}, "comparison": {"verdict": "matched"}},
+                {"cell": {"backend": "liteinst"}, "typed_comparison_sha256": "0"},
+            ],
+        }))
+        .unwrap();
+        let written = serde_json::to_value(&bindings).unwrap();
+        assert!(
+            written.get("retired_backend_parity_comparisons").is_none(),
+            "{written}"
+        );
+        assert_eq!(written["bindings"], serde_json::json!([]));
+    }
+
+    /// The field still holds a list: anything else is a malformed history.
+    #[test]
+    fn retired_rerun_receipts_must_be_a_list() {
+        let error = serde_json::from_value::<ComparisonAttemptBindings>(serde_json::json!({
+            "schema": 1,
+            "authority": ATTEMPT_BINDING_AUTHORITY,
+            "bindings": [],
+            "retired_backend_parity_comparisons": {"cell": "kvm"},
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("expected a sequence"), "{error}");
     }
 }
 
