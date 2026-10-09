@@ -13,6 +13,14 @@
 //! tracer sits on the system-call path.
 #![deny(missing_docs)]
 
+// SHARED FILE: the SaBRe plugin's glibc compatibility definitions, compiled
+// into this runtime as well (https://github.com/rrnewton/hermit/issues/3967);
+// an edit there changes both guest preloads. build.rs explains why this
+// runtime needs them.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[path = "../../detcore-sabre/src/glibc_compat.rs"]
+mod glibc_compat;
+
 use std::path::Path;
 
 // Errors are printed without the C library's errno messages: strerror_r can

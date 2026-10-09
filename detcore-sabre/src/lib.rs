@@ -8,6 +8,9 @@
 
 //! SaBRe plugin that executes Hermit's Detcore tool inside each guest process.
 
+// SHARED FILE: detcore-liteinst/src/lib.rs compiles glibc_compat.rs too
+// (https://github.com/rrnewton/hermit/issues/3967); an edit changes both guest
+// preloads.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 mod glibc_compat;
 

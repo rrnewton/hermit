@@ -10,14 +10,21 @@
 //! supported host's glibc (2.34), so the guest's dynamic loader never has to
 //! find them (<https://github.com/rrnewton/hermit/issues/3652>).
 //!
+//! SHARED FILE: detcore-liteinst/src/lib.rs compiles this same file into the
+//! in-guest LiteInst runtime with `#[path]`
+//! (<https://github.com/rrnewton/hermit/issues/3967>), so an edit here changes
+//! both guest preloads. Each preload compiles its own copy because the hidden
+//! definitions must sit in that cdylib's own object for its static link to
+//! bind them.
+//!
 //! Statically linked C code would otherwise import them from the guest's libc:
 //!
 //! - `__isoc23_strtol` (GLIBC_2.38): glibc 2.38+ headers rename `strtol` to it
 //!   when C is compiled as C23, GCC 15's default; mimalloc's options.c calls
 //!   `strtol`.
-//! - `_dl_find_object` (GLIBC_2.35): libgcc_eh.a (see build.rs) looks up a
-//!   program counter's unwind tables with it when it was built against glibc
-//!   2.35+.
+//! - `_dl_find_object` (GLIBC_2.35): libgcc_eh.a (see each crate's
+//!   build.rs) looks up a program counter's unwind tables with it when it was
+//!   built against glibc 2.35+.
 //!
 //! The assembly below defines both names with hidden visibility. The static
 //! link binds those references here, and the names stay out of the plugin's
