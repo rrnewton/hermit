@@ -5878,6 +5878,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/pause-cross-task-signal",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/perf-event-hardware-enosys",
           "mode": "verify",
           "backend": "in-guest-trap"
@@ -20756,7 +20763,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1261",
+        "NEXTEST_EXPECTED_EXECUTED": "1272",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -23482,6 +23489,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/pause-alarm-interrupt",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pause-cross-task-signal",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -30066,6 +30080,13 @@
           "test": "c-programs/pause-alarm-interrupt",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pause-cross-task-signal",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -42787,7 +42808,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1261",
+        "NEXTEST_EXPECTED_EXECUTED": "1272",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -48376,6 +48397,13 @@
           "test": "c-programs/pause-alarm-interrupt",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pause-cross-task-signal",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",

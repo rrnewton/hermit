@@ -1711,7 +1711,22 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the_controlled_loop_restores_a_poller_whose_deadline_a_refresh_crosses,
     // a_deadline_restored_poller_gates_a_held_sigchld_as_while_backed_off,
     // a_deadline_restored_poller_gates_a_finished_background_call_as_while_backed_off}.
-    ("test.detcore_unit", 1261),
+    // The cross-task wake of an emulated pause or nanosleep
+    // (https://github.com/rrnewton/hermit/issues/3982) adds eleven, retaining
+    // all 1230, listed with this node's arguments. scheduler::test::
+    // {a_caught_or_fatal_cross_task_signal_ends_a_parked_pause,
+    // a_cross_task_signal_ends_a_pause_still_on_the_run_queue,
+    // a_blocked_or_ignored_cross_task_signal_leaves_a_pause_parked,
+    // a_cross_task_signal_withdrawn_before_the_drain_leaves_the_sleep_parked,
+    // a_signal_ignored_when_sent_never_ends_the_sleep,
+    // a_held_signal_never_ends_the_sleep,
+    // an_unreadable_sleeper_state_never_wakes_the_sleep,
+    // a_default_stop_ends_a_pause_but_not_a_nanosleep,
+    // a_cross_task_signal_after_a_nanosleep_deadline_leaves_it_to_complete,
+    // sleeps_that_cross_task_signals_do_not_reach}, and
+    // syscalls::threads::tests::a_thread_reported_under_another_pid_is_read_and_alive:
+    // 1241.
+    ("test.detcore_unit", 1272),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2535,7 +2550,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Less the test of the removed descriptor guess: 1246.
     // And the four tests of interrupted mount table reads: 1250.
     // And the eleven poll-deadline tests: 1261.
-    ("test.detcore_unit_on_host", 1261),
+    // And the same eleven pause/nanosleep cross-task wake tests: 1241.
+    ("test.detcore_unit_on_host", 1272),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

@@ -5524,6 +5524,75 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/pause-cross-task-signal
+    description: Strict verification for tests/c/pause_cross_task_signal.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/pause_cross_task_signal.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci:
+          ptrace: true
+        backends_enabled:
+          - ptrace
+        assert:
+          bitwise_parity: true
+        backends_disabled:
+          dbt: Config::backend_supports_blocked_wait_signal_interruption is false on DBT, so the scheduler does not model signal targets and a cross-task signal to a thread parked in an emulated pause or nanosleep is not recorded for the step2 drain (https://github.com/rrnewton/hermit/issues/3982); qualify DBT separately
+          kvm: Config::backend_supports_blocked_wait_signal_interruption is false on KVM, so the scheduler does not model signal targets and a cross-task signal to a thread parked in an emulated pause or nanosleep is not recorded for the step2 drain (https://github.com/rrnewton/hermit/issues/3982); qualify KVM separately
+          sabre: Config::backend_supports_blocked_wait_signal_interruption is false on SaBRe, so the scheduler does not model signal targets and a cross-task signal to a thread parked in an emulated pause or nanosleep is not recorded for the step2 drain (https://github.com/rrnewton/hermit/issues/3982); qualify SaBRe separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
+          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+      naked:
+        ci: false
+        ci_disabled_reason: This fixture asserts cross-task signal delivery to pause and nanosleep under verification; it has no native nondeterminism oracle.
+        backends_enabled: []
+        backends_disabled:
+          native: This guest asserts cross-task signal delivery to pause and nanosleep under strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        ci_disabled_reason: Record/replay runs Detcore with backend_supports_blocked_wait_signal_interruption false, where a cross-task signal does not end an emulated pause, so the guest hangs under record as it did before https://github.com/rrnewton/hermit/issues/3982.
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay configures Detcore with backend_supports_blocked_wait_signal_interruption false, so a cross-task signal does not end an emulated pause and the recording hangs (https://github.com/rrnewton/hermit/issues/3982)
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: This fixture has no schedule-diversity oracle; verify owns its signal-delivery assertions.
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: The guest takes no arguments; its six cases always run.
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
   - id: c-programs/perf-event-hardware-enosys
     description: Strict verification for tests/c/perf_event_hardware_enosys.c
     lane: portable
