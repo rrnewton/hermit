@@ -675,11 +675,24 @@ impl RunQueue {
         )
     }
 
+    /// The priority `tid` is queued at, if it is queued.
+    #[cfg(test)]
+    pub fn queued_priority(&self, tid: DetTid) -> Option<Priority> {
+        self.queue
+            .iter()
+            .find(|(_, value)| value.tid == tid)
+            .map(|(key, _)| key.priority)
+    }
+
     /// Restore one backed-off poller to the normal priority recorded when it
-    /// was queued, as `do_poll_upgrade` does for every poller. The entry keeps
-    /// its round-robin turn, and no push happens, so the push counter and the
-    /// queue's other keys are unchanged
-    /// (<https://github.com/rrnewton/hermit/issues/3952>).
+    /// was queued, and move it to the back of that priority level, as a push
+    /// does (<https://github.com/rrnewton/hermit/issues/3952>). At the back,
+    /// it runs after every thread that was already runnable when its deadline
+    /// passed, as it would have while backed off, and before any thread pushed
+    /// later, such as a spinner requeued at its next preemption. Keeping its
+    /// older round-robin turn instead let it overtake a thread that became
+    /// runnable before its deadline. The move is a queueing operation: it
+    /// takes a new back turn and counts toward the poll-upgrade interval.
     ///
     /// Mutating operation: this will error if a tentative_pop/commit transaction is underway.
     pub fn restore_poller_priority(&mut self, tid: DetTid) -> PollerRestore {
@@ -693,11 +706,13 @@ impl RunQueue {
         let mut value = self.queue.remove(&key).expect("located queue entry");
         value.poll_upgrade = None;
         value.deadline_restored = true;
+        self.last_back_turn += 1;
         let restored = PrioritizedOrder {
             priority: normal_priority,
-            turn: key.turn,
+            turn: self.last_back_turn,
         };
         assert!(self.queue.insert(restored, value).is_none());
+        self.check_poll_upgrade();
         PollerRestore::Restored
     }
 
@@ -734,11 +749,12 @@ mod tests {
     use super::*;
 
     /// `restore_poller_priority` restores one backed-off poller to its recorded
-    /// priority and keeps its turn, so it sorts ahead of a thread pushed after
-    /// it at that priority. Other pollers stay backed off, and the restore is
-    /// not a push (https://github.com/rrnewton/hermit/issues/3952).
+    /// priority at the back of that level: behind a thread queued before the
+    /// restore, ahead of one pushed after it, such as a spinner requeued at its
+    /// next preemption. Other pollers stay backed off, and the restore counts
+    /// as one push (https://github.com/rrnewton/hermit/issues/3952).
     #[test]
-    fn restore_poller_priority_restores_one_poller_in_place() {
+    fn restore_poller_priority_moves_one_poller_to_the_back_of_its_level() {
         let poller = DetTid::from_raw(1);
         let other = DetTid::from_raw(2);
         let spinner = DetTid::from_raw(3);
@@ -755,8 +771,16 @@ mod tests {
             queue.restore_poller_priority(poller),
             PollerRestore::Restored
         );
-        assert_eq!(queue.turn_counter(), pushes, "a restore is not a push");
-        assert_eq!(queue.tentative_pop_next(), Some(poller));
+        assert_eq!(queue.turn_counter(), pushes + 1, "a restore is one push");
+        assert_eq!(queue.queued_priority(poller), Some(DEFAULT_PRIORITY));
+        assert_eq!(queue.tentative_pop_next(), Some(spinner), "queued first");
+        assert_eq!(queue.commit_tentative_pop(), spinner);
+        queue.push_back(spinner, DEFAULT_PRIORITY);
+        assert_eq!(
+            queue.tentative_pop_next(),
+            Some(poller),
+            "ahead of the requeue"
+        );
         queue.undo_tentative_pop();
         let (other_key, other_value) = queue
             .queue

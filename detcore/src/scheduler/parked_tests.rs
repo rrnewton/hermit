@@ -4344,6 +4344,13 @@ fn next_selection(s: &mut Scheduler) -> Option<DetTid> {
     next
 }
 
+/// The spinner's turn ends at a preemption and it is requeued at the back.
+fn requeue_after_turn(s: &mut Scheduler, tid: DetTid) {
+    assert_eq!(s.run_queue.tentative_pop_next(), Some(tid));
+    assert_eq!(s.run_queue.commit_tentative_pop(), tid);
+    s.runqueue_push_back(tid);
+}
+
 fn uncontrolled() -> Scheduler {
     Scheduler::new(&Config {
         sequentialize_threads: true,
@@ -4353,8 +4360,9 @@ fn uncontrolled() -> Scheduler {
 
 /// A backed-off poller loses every selection to a runnable thread until
 /// committed time reaches its deadline. Then the ordinary loop's step2 restores
-/// its normal priority, it is selected first, and a second pass at the same
-/// committed time changes nothing.
+/// its normal priority at the back of that level: the spinner, queued first,
+/// runs once more, and once requeued at its preemption it is behind the
+/// poller. A second pass at the same committed time changes nothing.
 #[test]
 fn a_due_poll_deadline_restores_the_backed_off_poller_before_selection() {
     let mut s = uncontrolled();
@@ -4372,11 +4380,13 @@ fn a_due_poll_deadline_restores_the_backed_off_poller_before_selection() {
 
     s.committed_time = at(100);
     s.step2_process_blocked(&global).unwrap();
-    assert_eq!(next_selection(&mut s), Some(poller));
+    assert_eq!(s.run_queue.queued_priority(poller), Some(DEFAULT_PRIORITY));
     assert!(s.poll_deadlines.is_empty() && s.poll_deadline_of.is_empty());
     let after = format!("{:?}", s.run_queue);
     s.step2b_restore_due_pollers();
     assert_eq!(format!("{:?}", s.run_queue), after, "idempotent");
+    requeue_after_turn(&mut s, spinner);
+    assert_eq!(next_selection(&mut s), Some(poller));
 }
 
 /// A due entry that no longer describes a waiting poller changes nothing: the
@@ -4397,7 +4407,12 @@ fn stale_poll_deadlines_are_dropped_and_suspended_ones_kept() {
     s.committed_time = at(100);
     s.step2b_restore_due_pollers();
     assert!(s.poll_deadline_of.is_empty());
-    assert_eq!(next_selection(&mut s), Some(spinner), "still backed off");
+    assert!(
+        s.run_queue
+            .queued_priority(poller)
+            .is_some_and(|priority| priority > DEFAULT_PRIORITY),
+        "still backed off"
+    );
 
     // Queued, but a poll upgrade already restored it.
     let mut s = uncontrolled();
@@ -4428,7 +4443,7 @@ fn stale_poll_deadlines_are_dropped_and_suspended_ones_kept() {
     s.run_queue.restore(saved, DEFAULT_PRIORITY);
     s.step2b_restore_due_pollers();
     assert!(s.poll_deadline_of.is_empty());
-    assert_eq!(next_selection(&mut s), Some(poller));
+    assert_eq!(s.run_queue.queued_priority(poller), Some(DEFAULT_PRIORITY));
 
     // Removed.
     let mut s = uncontrolled();
@@ -4466,8 +4481,9 @@ fn poll_deadlines_are_recorded_only_where_they_can_matter() {
 }
 
 /// KVM's controlled turn loop restores a due poller in maintenance stage 1:
-/// the turn's charge makes the deadline due, and the poller is granted ahead
-/// of the runnable thread.
+/// the turn's charge makes the deadline due, and by the time the turn selects,
+/// the poller is back at its normal priority, behind the runnable thread that
+/// was queued first.
 #[test]
 fn the_controlled_loop_restores_a_due_poller_in_maintenance() {
     use futures::FutureExt;
@@ -4484,10 +4500,11 @@ fn the_controlled_loop_restores_a_due_poller_in_maintenance() {
         .now_or_never()
         .expect("nothing to wait for")
         .expect("a runnable thread commits");
-    assert_eq!(result.tid, poller);
+    assert_eq!(result.tid, spinner, "queued before the restore");
     let s = scheduler.lock().unwrap();
     assert_eq!(s.controlled_turn_entries, 1);
     assert!(s.poll_deadline_of.is_empty());
+    assert_eq!(s.run_queue.queued_priority(poller), Some(DEFAULT_PRIORITY));
 }
 
 /// The controlled loop also restores a poller whose deadline is crossed while
@@ -4575,8 +4592,9 @@ fn the_controlled_loop_restores_a_poller_whose_deadline_a_refresh_crosses() {
         .expect("resume restored a filled request");
     let s = scheduler.lock().unwrap();
     assert_eq!(s.committed_time, start + at(300));
-    assert_eq!(result.unwrap().tid, poller);
+    assert_eq!(result.unwrap().tid, spinner, "queued before the restore");
     assert!(s.poll_deadline_of.is_empty());
+    assert_eq!(s.run_queue.queued_priority(poller), Some(DEFAULT_PRIORITY));
 }
 
 /// A poller restored by its deadline does not block the deterministic-work-first
