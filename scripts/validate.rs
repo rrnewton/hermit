@@ -7857,22 +7857,31 @@ fn check_raw_census(
 fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> {
     let tag = step.tag();
     let (selection, _) = manifest_step_policy(step)?;
-    // The only admitted backend omission is the hosted-portable one: exactly
-    // HOSTED_PORTABLE_EXCLUDED_BACKENDS, carried by a step labelled only
-    // hosted-portable. Any other exclusion shape is not a normal publisher,
-    // so an omission cannot leak into a local profile's raw census.
+    // Two backend omissions are admitted: the hosted-portable one, exactly
+    // HOSTED_PORTABLE_EXCLUDED_BACKENDS carried by a step labelled only
+    // hosted-portable, and the portable-strict-compat-only one, exactly
+    // PORTABLE_FOCUSED_EXCLUDED_BACKENDS carried by portablecompat.manifest_compat
+    // labelled only with that run type, whose release build lacks the in-guest
+    // Detcore runtime. Any other exclusion shape is not a normal publisher,
+    // so an omission cannot leak into another profile's raw census.
+    let excludes_exactly = |label: &str, backends: &[&str]| {
+        step.labels.iter().map(String::as_str).eq([label])
+            && selection
+                .exclude_backends
+                .iter()
+                .map(String::as_str)
+                .eq(backends.iter().copied())
+    };
     let exclusions = if selection.exclude_backends.is_empty() {
         String::new()
-    } else if step
-        .labels
-        .iter()
-        .map(String::as_str)
-        .eq(["hosted-portable"])
-        && selection.exclude_backends.iter().map(String::as_str).eq(
-            hermit_manifest_plan::validation_dag::HOSTED_PORTABLE_EXCLUDED_BACKENDS
-                .iter()
-                .copied(),
-        )
+    } else if excludes_exactly(
+        "hosted-portable",
+        hermit_manifest_plan::validation_dag::HOSTED_PORTABLE_EXCLUDED_BACKENDS,
+    ) || (tag == "portablecompat.manifest_compat"
+        && excludes_exactly(
+            "portable-strict-compat-only",
+            hermit_manifest_plan::validation_dag::PORTABLE_FOCUSED_EXCLUDED_BACKENDS,
+        ))
     {
         selection
             .exclude_backends
@@ -7881,7 +7890,7 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
             .collect()
     } else {
         return Err(format!(
-            "{tag} omits backend(s) {:?} outside the hosted-portable exclusion contract",
+            "{tag} omits backend(s) {:?} outside the admitted backend exclusion contracts",
             selection.exclude_backends
         ));
     };
@@ -12778,13 +12787,17 @@ struct CompatManifestRow {
 
 /// Each row of the strict compatibility corpus (tests/e2e/manifests/compat.yaml),
 /// keyed by its corpus label (the last backquoted word of the description the
-/// expansion writes; `g++` has the test id `compat/gxx`).
+/// expansion writes; `g++` has the test id `compat/gxx`): the row's required
+/// cell on the corpus backend, ptrace. A row's verify cells on the corpus's
+/// additional backends (liteinst and in-guest-trap) run the same argv and are
+/// not rows of their own.
 fn compat_manifest_rows(
     root: &Path,
     run_state: &Path,
 ) -> Result<BTreeMap<String, CompatManifestRow>, String> {
     let cells = ManifestSet::load(root)?.select(&hermit_manifest_plan::runner::Selection {
         category: Some("compat".into()),
+        backend: Some("ptrace".into()),
         population: Some(hermit_manifest_plan::runner::Population::Required),
         ..Default::default()
     })?;
@@ -18737,6 +18750,44 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             }
         }
     }
+    // The portable-strict-compat-only exclusion is admitted only with exactly
+    // its two backends: the committed node publishes, and the same node
+    // omitting one more backend is refused by the exclusion contract.
+    {
+        let tag = "portablecompat.manifest_compat";
+        let focused = committed
+            .steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .ok_or_else(|| format!("retry bounds: committed DAG lost {tag}"))?;
+        normal_raw_result_path(focused, "parity-control")?;
+        let mut planted = focused.clone();
+        let pair = " --exclude-backend liteinst --exclude-backend in-guest-trap";
+        if planted.cmd.matches(pair).count() != 1 {
+            return Err(format!(
+                "retry bounds: {tag} no longer carries its exclusion once to plant into"
+            ));
+        }
+        planted.cmd = planted
+            .cmd
+            .replace(pair, &format!(" --exclude-backend kvm{pair}"));
+        let expected = format!(
+            "{tag} omits backend(s) [\"kvm\", \"liteinst\", \"in-guest-trap\"] outside the admitted backend exclusion contracts"
+        );
+        match normal_raw_result_path(&planted, "parity-control") {
+            Err(refusal) if refusal == expected => {}
+            Err(refusal) => {
+                return Err(format!(
+                    "retry bounds: a widened exclusion on {tag} was refused for the wrong reason: {refusal}"
+                ));
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "retry bounds: a widened exclusion on {tag} was accepted as a normal publisher"
+                ));
+            }
+        }
+    }
     // The hosted exclusion must not be admitted on a local publisher: planting
     // it into the local node must be refused by the exclusion contract, not
     // accepted as a normal (smaller) raw census.
@@ -18758,7 +18809,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             "--prebuilt --exclude-backend kvm --results",
         );
         let expected = format!(
-            "{tag} omits backend(s) [\"kvm\"] outside the hosted-portable exclusion contract"
+            "{tag} omits backend(s) [\"kvm\"] outside the admitted backend exclusion contracts"
         );
         match normal_raw_result_path(&planted, "parity-control") {
             Err(refusal) if refusal == expected => {}
