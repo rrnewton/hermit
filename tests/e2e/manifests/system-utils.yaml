@@ -1748,8 +1748,8 @@ test:
           - sabre
           - dbt
         backends_disabled:
-          liteinst: Qualify the LiteInst startup TLS path independently after the ptrace and SaBRe ownership boundary is fixed
-          in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
+          liteinst: "glibc copies the kernel's AT_RANDOM into the TLS stack canary and pointer guard in the loader window before the in-guest runtime starts (the named loader-window divergence); Detcore's post-exec AT_RANDOM rewrite comes after, so STACK_CANARY and POINTER_GUARD differ between runs while AT_RANDOM_BYTES match. Closed when the root launch goes through the launcher (launcher design 7.1, phase LC)."
+          in-guest-trap: "glibc copies the kernel's AT_RANDOM into the TLS stack canary and pointer guard in the loader window before the in-guest runtime starts (the named loader-window divergence); Detcore's post-exec AT_RANDOM rewrite comes after, so STACK_CANARY and POINTER_GUARD differ between runs while AT_RANDOM_BYTES match. Closed when the root launch goes through the launcher (launcher design 7.1, phase LC)."
       naked:
         ci: false
         ci_disabled_reason: Native execution intentionally receives fresh kernel AT_RANDOM bytes, so repeated TLS guards differ by design
