@@ -1645,6 +1645,12 @@
       "why": "tests/c/seccomp_refusal.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/self_signal_death_probe.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/self_signal_death_probe.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this probe of processes that end themselves with a signal they send themselves (abort, raise, kill, tgkill and tkill of their own process or thread), requires both in-guest LiteInst backends to verify the forking mode with Linux's output and no recorded determinism loss, and requires a root that aborts to end the run with its own status; it remains a guest fixture because a generic manifest cannot express those per-backend verdicts."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/sendfile_copy.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

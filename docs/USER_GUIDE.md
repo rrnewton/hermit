@@ -264,7 +264,29 @@ In-guest LiteInst needs Linux 6.5 or later (`SO_PEERPIDFD`) and refuses to
 start on an older kernel. `--verify` refuses to compare a run that recorded a
 determinism loss (an in-guest process died at a moment the host chose,
 without finishing its exit, or a DETLOG record was lost) or whose log failed
-a write, even if later writes succeeded.
+a write, even if later writes succeeded. The runtime schedules a process's
+own `kill`, `tkill` or `tgkill` (including `abort` and `raise`) when it names
+the calling process or thread and sends an unblocked standard signal with a
+terminating default action. This includes the guest's default SIGTRAP action,
+but excludes SIGSYS and SIGSEGV when the runtime owns its handler. It also
+excludes real-time signals, process-group sends and signal deaths after a
+guest seccomp filter is admitted; filter installation may itself be refused
+by the runtime's existing admission policy. These excluded deaths retain
+the deregistration-loss check and cannot gain verification credit.
+
+For a supported self-signal, the runtime finishes its exit in its own turn
+before the kernel kills it. Verification can then compare the run if the
+program's result otherwise qualifies; scheduling an abort does not turn a
+failing program into a passing one. Because that exit is reported before
+the death, the status Detcore
+receives names the signal exactly, but whether a core was dumped is only
+predicted (from the signal, the process's dumpable mode, `RLIMIT_CORE` and
+`core_pattern`) and differs when the kernel fails to write the core; Detcore
+does not use it, and the guest's parent sees the kernel's own status. A
+death by any other signal records the loss, including a hardware fault, a
+signal another process sends, a signal the scheduler delivers (such as the
+SIGALRM of an `alarm` with no handler, which is also what a program gets
+when in-guest LiteInst refuses its handler), and a SIGPIPE from a write.
 
 The default namespace, mount, and network setup is shared with Hermit's other
 backends; `--no-namespace` remains available for trusted guests. The in-guest

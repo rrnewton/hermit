@@ -1292,7 +1292,13 @@ fi
 #     key=sha256:75c3067d4692cd8aa168d6791e718f21e6535e672b957291142070a0edc27234
 # Carry, not recalibration: no new timing sample or >=5-sample replacement
 # claim is made.
-expected_pin=7215adf9345a93e283338acfe7afb64ea4045d0d
+# CARRY TO 5ba26897e1db46071f2a00f9ef4bee10e29c94ad (2026-10-09): from
+# 7215adf9345a93e283338acfe7afb64ea4045d0d. The frozen in-guest self-signal
+# contract changes no SDK input recorded above. reverie-dbt, third-party,
+# root Cargo.toml and rust-toolchain.toml are byte-identical by Git object.
+# Carry the existing budget and job clamp; this is source evidence, not a
+# new timing calibration. Validate the changed in-guest behavior separately.
+expected_pin=5ba26897e1db46071f2a00f9ef4bee10e29c94ad
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

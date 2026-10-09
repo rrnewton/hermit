@@ -65,6 +65,7 @@ static USERFAULTFD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CONSTRUCTOR_MUTATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static EXIT_REAPING_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static UNSCHEDULED_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SELF_SIGNAL_DEATH_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DUP_ALIAS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLOSE_RANGE_PORT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static IOV_OVERWRITTEN_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -2549,13 +2550,14 @@ fn liteinst_in_guest_reads_a_plain_file_on_a_fuse_filesystem() {
     assert_eq!(output.stdout, expected, "{}", file.display());
 }
 
-/// Compiles `tests/c/<name>.c` once per test process into `cell`.
+/// Compiles `tests/c/<name>.c` once into this test process's private directory.
+/// Nextest processes must not replace the executable another test is running.
 fn c_guest(cell: &'static OnceLock<PathBuf>, name: &str) -> &'static Path {
     cell.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("liteinst-advanced");
+        let build_root = process_build_root("liteinst-advanced");
         fs::create_dir_all(&build_root).expect("failed to create LiteInst guest directory");
         let guest = build_root.join(name);
         let source = repository.join(format!("tests/c/{name}.c"));
@@ -2668,6 +2670,164 @@ fn liteinst_in_guest_exit_reaping_matches_ptrace() {
             assert_eq!(
                 outputs[0], outputs[1],
                 "{mode}: ptrace and in-guest LiteInst differ"
+            );
+        }
+    }
+}
+
+/// What `self_signal_death_probe children` prints, as Linux runs it: six
+/// children end themselves with a signal they send themselves, and three send
+/// themselves one that does not end them (blocked, then two ignored) and exit.
+const SELF_SIGNAL_DEATH_CHILDREN: &str = "abort: signal 6\n\
+    raise-sigterm: signal 15\n\
+    kill-sigkill: signal 9\n\
+    tgkill-sigusr1: signal 10\n\
+    tkill-sigquit: signal 3\n\
+    raise-sigtrap: signal 5\n\
+    blocked-sigusr2: exit 3\n\
+    ignored-sigusr2: exit 4\n\
+    ignored-sigtrap: exit 5\n";
+
+/// One in-guest run of `self_signal_death_probe` (`tests/c`) under `backend`,
+/// at log level `info`, with `extra` run options.
+fn run_self_signal_death_probe(backend: &str, extra: &[&str], mode: &str) -> Output {
+    let guest = c_guest(&SELF_SIGNAL_DEATH_GUEST, "self_signal_death_probe");
+    Command::new(hermit_binary())
+        .args(["--log=info", "--backend", backend, "run"])
+        .args([
+            "--max-timeslice=disabled",
+            "--strict",
+            "--base-env=minimal",
+            "--mount=type=tmpfs,target=/test",
+            "--workdir=/test",
+        ])
+        .args(extra)
+        .arg("--")
+        .arg(guest)
+        .arg(mode)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run Hermit")
+}
+
+/// A process that ends itself with a signal it sends itself (`abort`, `raise`,
+/// `kill` of its own pid, raw `tgkill` and `tkill` of its own thread) dies at
+/// a point of its own program order, in its own turn. The in-guest runtime
+/// runs the Tool's signal and exit callbacks before sending such a signal, so
+/// the process deregisters, and reports its statistics, before it dies, as
+/// for an exit. Before, it died without deregistering: Detcore recorded a
+/// determinism loss ("process N exited without deregistering; its exit was
+/// not scheduled"), and `--backend=in-guest-trap` refused every run because
+/// no process had reported LiteInst statistics. That ended the verify cells
+/// of every program that aborts (the sigtimedwait tests and ruby, whose
+/// signal-handler installs in-guest LiteInst refuses) with that loss instead
+/// of the program's own status.
+///
+/// Both in-guest backends must now verify the probe, print what Linux prints,
+/// and record no loss. The three control children prove the prediction is
+/// not "every self-sent signal": a blocked and an ignored signal leave the
+/// child running to its own exit code. The SIGTRAP child's death is judged by
+/// its own action (the default), not by the handler LiteInst installs for
+/// SIGTRAP to route its own breakpoints: before Reverie judged it so, that
+/// child still died without deregistering.
+#[test]
+fn liteinst_in_guest_self_signal_deaths_are_scheduled_and_verify() {
+    let _guard = hermit_run_guard();
+    for (backend, selected) in [
+        ("liteinst", IN_GUEST_SELECTED),
+        ("in-guest-trap", IN_GUEST_TRAP_SELECTED),
+    ] {
+        let output =
+            run_self_signal_death_probe(backend, &["--verify", "--verify-strict"], "children");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{backend}: status={:?}\nstdout={stdout}\nstderr={stderr}",
+            output.status
+        );
+        assert!(
+            stderr.lines().any(|line| line == selected),
+            "{backend}: {stderr}"
+        );
+        assert_eq!(stdout, SELF_SIGNAL_DEATH_CHILDREN, "{backend}");
+        assert!(
+            stderr.contains("Determinism verified"),
+            "{backend}: {stderr}"
+        );
+        assert!(!stderr.contains("determinism loss"), "{backend}: {stderr}");
+        assert!(
+            !stderr.contains("exited without deregistering"),
+            "{backend}: {stderr}"
+        );
+    }
+}
+
+/// A root process that aborts ends the run with its own status, SIGABRT, on
+/// both in-guest backends, and verification refuses it for that status,
+/// as on ptrace: never for a recorded determinism loss, and never, under
+/// `--backend=in-guest-trap`, because no process reported LiteInst statistics
+/// (which is what both did before the runtime ran the exit callbacks of a
+/// process that ends itself with a signal).
+#[test]
+fn liteinst_in_guest_a_root_that_aborts_ends_with_its_own_status() {
+    let _guard = hermit_run_guard();
+    for backend in ["liteinst", "in-guest-trap"] {
+        let output = run_self_signal_death_probe(backend, &[], "root-abort");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Hermit ends itself with the signal that ended its guest.
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGABRT),
+            "{backend}: status={:?}\n{stderr}",
+            output.status
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "root aborts\n");
+        assert!(
+            !stderr.contains("no guest process reported LiteInst statistics"),
+            "{backend}: {stderr}"
+        );
+
+        let output =
+            run_self_signal_death_probe(backend, &["--verify", "--verify-strict"], "root-abort");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{backend}: {stderr}");
+        assert!(
+            stderr.contains("First run during --verify terminated by signal 6 (SIGABRT)"),
+            "{backend}: {stderr}"
+        );
+        assert!(!stderr.contains("determinism loss"), "{backend}: {stderr}");
+        assert!(
+            !stderr.contains("no guest process reported LiteInst statistics"),
+            "{backend}: {stderr}"
+        );
+    }
+}
+
+/// The self-signal contract excludes the runtime-owned SIGSEGV and SIGSYS
+/// handlers. Run both excluded cases on both in-guest backends: a parent's
+/// normal exit must not hide its child's missing exit callbacks or allow
+/// strict verification to report a match.
+#[test]
+fn liteinst_in_guest_runtime_owned_self_signals_refuse_verification() {
+    let _guard = hermit_run_guard();
+    for backend in ["liteinst", "in-guest-trap"] {
+        for mode in ["excluded-sigsegv", "excluded-sigsys"] {
+            let output =
+                run_self_signal_death_probe(backend, &["--verify", "--verify-strict"], mode);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success(),
+                "{backend} {mode}: verification matched: {stderr}"
+            );
+            assert!(
+                stderr.contains("run 1: determinism loss recorded: process ")
+                    && stderr.contains(" exited without deregistering; its exit was not scheduled"),
+                "{backend} {mode}: {stderr}"
+            );
+            assert!(
+                !stderr.contains("Determinism verified"),
+                "{backend} {mode}: {stderr}"
             );
         }
     }
