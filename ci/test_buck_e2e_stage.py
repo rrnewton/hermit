@@ -439,6 +439,18 @@ class StageReproducibleTest(unittest.TestCase):
         self.assertEqual(holder.read_text(), "pid 4242 since 2026-10-08T00:00:00Z for /elsewhere\n")
         self.assertEqual(self.sentinel.read_text(), "previous staging\n")
 
+    def test_the_lock_timeout_default_leaves_the_node_time_to_name_the_holder(self) -> None:
+        # A stage that waits out the lock must still be alive to print the holder,
+        # so the default wait plus one stage stays inside e2e.buck_stage's wall
+        # timeout, and the waiter fails naming the holder rather than being killed.
+        import re
+        defaults = set(re.findall(r"HERMIT_BUCK_STAGE_LOCK_TIMEOUT:-(\d+)", STAGE.read_text()))
+        self.assertEqual(len(defaults), 1, defaults)
+        default = int(defaults.pop())
+        dag = json.loads((STAGE.parent.parent / "dag" / "validate.json").read_text())
+        (node,) = [s for s in dag["steps"] if (s["group"], s["job"]) == ("e2e", "buck_stage")]
+        self.assertLess(default + node["hint"]["est_duration_s"], node["timeout"], (default, node))
+
     def test_a_missing_host_package_is_refused_before_the_lock(self) -> None:
         (self.bin / "patchelf").unlink()
         proc = self.run_stage()

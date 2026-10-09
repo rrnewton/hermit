@@ -76,9 +76,11 @@ fi
 #     removed after, and only staged/ is copied back into this checkout.
 # One stage at a time holds the fixed directory: concurrent validations on a host
 # wait for the lock (about three minutes, one stage's length), up to
-# HERMIT_BUCK_STAGE_LOCK_TIMEOUT seconds (default 1800). flock releases the lock
+# HERMIT_BUCK_STAGE_LOCK_TIMEOUT seconds (default 1200). flock releases the lock
 # when its holder dies, so only a holder that hangs can make others wait out the
-# timeout, and then they fail naming it. HERMIT_BUCK_STAGE_REPRODUCIBLE=0 stages
+# timeout, and then they fail naming it. The default stays well under the
+# e2e.buck_stage node's 1800-s wall timeout less one stage (about 180 s), so the
+# message naming the holder is printed before the node itself is killed. HERMIT_BUCK_STAGE_REPRODUCIBLE=0 stages
 # in place, as before.
 if [[ $mode == cargo && -z ${HERMIT_BUCK_STAGE_INNER:-} && ${HERMIT_BUCK_STAGE_REPRODUCIBLE:-1} != 0 ]]; then
     fixed=${HERMIT_BUCK_STAGE_DIR:-$HOME/.cache/hermit-buck-stage}
@@ -88,8 +90,9 @@ if [[ $mode == cargo && -z ${HERMIT_BUCK_STAGE_INNER:-} && ${HERMIT_BUCK_STAGE_R
     mkdir -p "$fixed"
     lock=$fixed.lock
     exec 9>>"$lock"
-    if ! flock -w "${HERMIT_BUCK_STAGE_LOCK_TIMEOUT:-1800}" 9; then
-        echo "ci/buck-e2e/stage: timed out after ${HERMIT_BUCK_STAGE_LOCK_TIMEOUT:-1800}s waiting for $lock;" \
+    lock_timeout=${HERMIT_BUCK_STAGE_LOCK_TIMEOUT:-1200}
+    if ! flock -w "$lock_timeout" 9; then
+        echo "ci/buck-e2e/stage: timed out after ${lock_timeout}s waiting for $lock;" \
             "the stage holding it is: $(cat "$fixed.holder" 2>/dev/null || echo unknown)" >&2
         exit 1
     fi

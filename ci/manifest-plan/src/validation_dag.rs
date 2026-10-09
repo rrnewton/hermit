@@ -1785,13 +1785,17 @@ fn materialize_buck_e2e(cfg: &mut DagConfig) -> Result<(), String> {
     stage.deps = vec!["pre.reverie_pin".into()];
     // ci/buck-e2e/stage with its builds side by side (02eba338ab), cold:
     // 143.3 to 144.2 s wall at 32 jobs and 128.6 s at 96, 2276 to 2312 CPU-s.
-    // The CPU bound is the next 300-s bucket above 1.5 x 2312 (3468). The wall
-    // bound keeps build.buck_release_artifact's 1800 s for the same builds:
-    // over 12 times the measurement, room for the rust-script and
-    // manifest-plan builds it now shares the host with.
+    // Since reproducible staging (https://github.com/rrnewton/hermit/pull/3948)
+    // it builds in a fixed directory: six full validations on 2026-10-08/09
+    // measured 172.6 to 181.2 s wall and 2438 to 2561 CPU-s.
+    // The CPU bound is the next 300-s bucket above 1.5 x 2561 (3842). The wall
+    // bound keeps build.buck_release_artifact's 1800 s for the same builds,
+    // about 10 times the measurement; it also encloses the stage's lock wait,
+    // whose default (HERMIT_BUCK_STAGE_LOCK_TIMEOUT, 1200 s) leaves room for one
+    // stage after it.
     stage.timeout = 1800;
-    stage.cpu_timeout = 3600;
-    stage.hint.est_duration_s = 145.0;
+    stage.cpu_timeout = 3900;
+    stage.hint.est_duration_s = 177.0;
     // The baseline cloned from build.buck_release_artifact (8.39 GiB) is below
     // what ci/buck-e2e/stage peaks at with its builds running side by side:
     // cgroup memory.peak 8.69 and 9.27 GiB cold at 32 jobs, 9.47 GiB at 96.
