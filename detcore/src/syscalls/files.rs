@@ -4288,7 +4288,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return ProcfsEntry::NotProcfs;
         }
-        let mounts = match procfs_inode::procfs_mounts(guest.tid().as_raw(), stat.dev) {
+        let tid = guest.tid().as_raw();
+        let mounts = match procfs_inode::procfs_mounts(tid, stat.dev, false) {
             Ok(Some(mounts)) => mounts,
             // No procfs mount in the guest's mount table is on the device, but
             // a procfs file can be, opened outside the guest's mounts: one
@@ -4332,20 +4333,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return ProcfsEntry::Unnamed;
             }
         };
-        match procfs_inode::path_within(&mounts, mount_id, &canonical) {
-            Some(within) => ProcfsEntry::At(within),
-            // The guest reached the file through a mount that the table, as
-            // Detcore read it, does not list above the file: one outside the
-            // guest's root, or one that appeared since.
-            None => {
-                Self::record_procfs_loss(
-                    guest,
-                    format!(
-                        "{} was reached through mount {mount_id}, which the guest's mount table does not list as a procfs mount above it",
-                        canonical.display()
-                    ),
-                )
-                .await;
+        let reread = || procfs_inode::procfs_mounts(tid, stat.dev, true);
+        match procfs_inode::path_within(
+            &mounts,
+            mount_id,
+            &canonical,
+            reread,
+            procfs_inode::mount_root,
+        ) {
+            Ok(within) => ProcfsEntry::At(within),
+            // The guest reached the file through a mount that its mount
+            // table, read again, does not list at a mount point where Detcore
+            // finds the mount: one outside the guest's root, or one whose
+            // mount point reads in another frame than the file's path.
+            Err(reason) => {
+                Self::record_procfs_loss(guest, reason).await;
                 ProcfsEntry::Unnamed
             }
         }
@@ -4407,31 +4409,24 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
-    /// Open the `O_PATH` descriptor `open` describes in the guest. Reverie
-    /// reports an injection that a signal stopped before it ran as a restart,
-    /// and an `O_PATH` open does not sleep, so `EINTR` too means that it did
-    /// not run. Either is tried again, but only `OBJECT_DESCRIPTOR_ATTEMPTS`
-    /// times, as a seccomp filter the guest inherited can return it every
-    /// time without running the call.
+    /// Open the `O_PATH` descriptor `open` describes in the guest. An open
+    /// that did not run (see [`procfs_inode::read_open`]) is tried again, but
+    /// only `OBJECT_DESCRIPTOR_ATTEMPTS` times, as a seccomp filter the guest
+    /// inherited can return a restart every time without running the call.
     async fn open_object_descriptor<G: Guest<Self>>(
         guest: &mut G,
         open: syscalls::Openat,
     ) -> Result<RawFd, String> {
-        let mut last = Errno::EINTR;
+        let tid = guest.tid().as_raw();
+        let holds = || procfs_inode::holds_descriptor(tid, procfs_inode::OPENAT_OWN_NUMBER);
+        let held_before = holds();
+        let mut last = Errno::EINTR.to_string();
         for _ in 0..OBJECT_DESCRIPTOR_ATTEMPTS {
-            match guest.inject(open).await {
-                Ok(fd) => {
-                    return RawFd::try_from(fd)
-                        .map_err(|_| format!("openat returned {fd}, which is no descriptor"));
-                }
-                Err(
-                    errno @ (Errno::EINTR
-                    | Errno::ERESTARTSYS
-                    | Errno::ERESTARTNOINTR
-                    | Errno::ERESTARTNOHAND
-                    | Errno::ERESTART_RESTARTBLOCK),
-                ) => last = errno,
-                Err(errno) => return Err(format!("cannot open the guest's path again: {errno}")),
+            let result = guest.inject(open).await;
+            match procfs_inode::read_open(result, &held_before, holds) {
+                procfs_inode::Injected::Ran(fd) => return Ok(fd),
+                procfs_inode::Injected::NotRun(reported) => last = reported,
+                procfs_inode::Injected::Failed(reason) => return Err(reason),
             }
         }
         Err(format!(
@@ -4439,35 +4434,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         ))
     }
 
-    /// Close the `O_PATH` descriptor `fd` that Detcore opened in the guest.
-    /// Linux's close releases the descriptor before anything that can fail,
-    /// and an `O_PATH` descriptor has nothing to flush, so a close that runs
-    /// returns 0, and the descriptor is gone. A restart means that the close
-    /// did not run, so it is tried again, but only
-    /// `OBJECT_DESCRIPTOR_ATTEMPTS` times. Any other error, `EINTR` and
-    /// `EBADF` among them, is a seccomp filter the guest inherited refusing
-    /// the close (or a descriptor that was not open), which leaves the
-    /// descriptor open, where it changes the numbers the guest's later
-    /// descriptors take, so it is an error.
+    /// Close the `O_PATH` descriptor `fd` that Detcore opened in the guest. A
+    /// close that did not run (see [`procfs_inode::read_close`]) is tried
+    /// again, but only `OBJECT_DESCRIPTOR_ATTEMPTS` times. One that failed
+    /// leaves the descriptor open, where it changes the numbers the guest's
+    /// later descriptors take, so it is an error.
     async fn close_object_descriptor<G: Guest<Self>>(
         guest: &mut G,
         fd: RawFd,
     ) -> Result<(), String> {
         let close = syscalls::Close::new().with_fd(fd);
         for _ in 0..OBJECT_DESCRIPTOR_ATTEMPTS {
-            match guest.inject(close).await {
-                Ok(_) => return Ok(()),
-                Err(
-                    Errno::ERESTARTSYS
-                    | Errno::ERESTARTNOINTR
-                    | Errno::ERESTARTNOHAND
-                    | Errno::ERESTART_RESTARTBLOCK,
-                ) => {}
-                Err(errno) => {
-                    return Err(format!(
-                        "close of the guest's O_PATH descriptor returned {errno:?}"
-                    ));
-                }
+            match procfs_inode::read_close(guest.inject(close).await) {
+                procfs_inode::Injected::Ran(()) => return Ok(()),
+                procfs_inode::Injected::NotRun(_) => {}
+                procfs_inode::Injected::Failed(reason) => return Err(reason),
             }
         }
         Err(format!(
