@@ -47,8 +47,14 @@ fn config() -> Config {
 
 /// Run `guest` under Detcore and require that it exits 0.
 fn under_detcore(guest: impl FnOnce() + Send) {
+    under_detcore_with(config(), guest)
+}
+
+/// Run `guest` under Detcore configured by `config` and require that it
+/// exits 0.
+fn under_detcore_with(config: Config, guest: impl FnOnce() + Send) {
     let (output, _) =
-        detcore_testutils::test_fn_with_config::<Detcore, _>(guest, config(), true).unwrap();
+        detcore_testutils::test_fn_with_config::<Detcore, _>(guest, config, true).unwrap();
     assert_eq!(
         output.status,
         ExitStatus::Exited(0),
@@ -281,6 +287,42 @@ fn an_entry_detcore_cannot_name_records_a_determinism_loss() {
                 loss.as_deref()
                     .is_some_and(|loss| loss.starts_with("procfs inode numbers: ")),
                 "no procfs determinism loss was recorded: {loss:?}"
+            );
+        },
+    );
+}
+
+/// Without sequentialized threads, another guest thread could close the
+/// descriptor Detcore opens to name an entry reached by path, and take its
+/// number for one of its own, before Detcore reads and closes it. So Detcore
+/// does not open the path again: it records a determinism loss, the stat
+/// still succeeds, and the guest's next descriptor takes the number it would
+/// have taken without the stat.
+#[test]
+fn without_sequentialized_threads_a_path_is_not_opened_again() {
+    in_its_own_process(
+        "without_sequentialized_threads_a_path_is_not_opened_again",
+        || {
+            let config = Config {
+                sequentialize_threads: false,
+                ..config()
+            };
+            under_detcore_with(config, || {
+                let lowest_free = || {
+                    let fd = File::open("/dev/null").unwrap().into_raw_fd();
+                    assert_eq!(unsafe { libc::close(fd) }, 0, "close({fd})");
+                    fd
+                };
+                let free = lowest_free();
+                std::fs::symlink_metadata("/proc/self/stat").unwrap();
+                assert_eq!(lowest_free(), free, "the stat left a descriptor open");
+            });
+            assert_eq!(
+                detcore::detlog::determinism_loss().as_deref(),
+                Some(
+                    "procfs inode numbers: the guest's threads are not sequentialized, \
+                     so Detcore does not open its path again"
+                )
             );
         },
     );
@@ -745,13 +787,12 @@ fn a_refused_close_ends_in_a_determinism_loss_whatever_a_lookup_says() {
 #[cfg(target_arch = "x86_64")]
 const OPENAT_OWN_NUMBER: i32 = libc::SYS_openat as i32;
 
-/// Reverie can report an `openat` that did not run as returning its own
-/// number, under a tracer that runs under a seccomp filter, but the `O_PATH`
-/// descriptor Detcore opens to name a procfs path can take that number too.
-/// The guest did not hold that descriptor before the call and holds it
-/// after, so the call ran: Detcore names the entry, records no loss, and
-/// closes the descriptor, rather than opening another and leaving this one
-/// open.
+/// The `O_PATH` descriptor Detcore opens to name a procfs path can take the
+/// number of `openat`'s own system call, which the result register holds
+/// until the call runs. Reverie reports an `openat` that a signal stopped
+/// before it ran as a restart, never as that number, so the number is the
+/// call's descriptor: Detcore names the entry, records no loss, and closes
+/// the descriptor, rather than opening another and leaving this one open.
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn a_descriptor_numbered_as_openat_is_detcores_when_it_was_free() {
