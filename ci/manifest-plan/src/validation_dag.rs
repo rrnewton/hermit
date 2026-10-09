@@ -985,7 +985,7 @@ pub const PORTABLE_FOCUSED_HERMIT_BIN: &str = "ignored/hermetic/split/target/rel
 /// run type against [`PORTABLE_FOCUSED_HERMIT_BIN`].
 const PORTABLE_FOCUSED_COMPAT_TAG: &str = "portablecompat.manifest_compat";
 
-/// Backends whose cells [`PORTABLE_FOCUSED_COMPAT_TAG`] omits with
+/// Backends whose cells the `PORTABLE_FOCUSED_COMPAT_TAG` step omits with
 /// `--exclude-backend`. Its release build, `cargo build --release -p hermit
 /// --features third-party-backends`, does not build the in-guest Detcore
 /// runtime (libdetcore_liteinst.so, the separate detcore-liteinst package)
