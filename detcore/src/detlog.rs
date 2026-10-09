@@ -466,8 +466,15 @@ pub fn send_forwarded_record(
 /// socket.
 pub fn socket_identity(fd: libc::c_int) -> Option<(u64, u64)> {
     // SAFETY: fstat writes only into `metadata`.
+    // The raw syscall: this runs inside the guest under in-guest LiteInst
+    // (see crate::util::raw_syscall).
     let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
-    let status = unsafe { libc::fstat(fd, &raw mut metadata) };
+    let status = unsafe {
+        crate::util::raw_syscall(
+            libc::SYS_fstat,
+            [fd as u64, (&raw mut metadata) as u64, 0, 0, 0, 0],
+        )
+    };
     (status == 0 && metadata.st_mode & libc::S_IFMT == libc::S_IFSOCK)
         .then_some((metadata.st_dev, metadata.st_ino))
 }
@@ -1130,8 +1137,10 @@ static FORWARDING_UNCOUNTED: std::sync::atomic::AtomicBool =
 pub const UNCOUNTED: u64 = u64::MAX;
 
 fn current_pid() -> i32 {
-    // SAFETY: getpid has no arguments and cannot fail.
-    unsafe { libc::getpid() }
+    // SAFETY: getpid has no arguments and cannot fail. The raw syscall, not
+    // libc's interposable getpid: this runs inside the guest under in-guest
+    // LiteInst (see crate::util::raw_syscall).
+    unsafe { crate::util::raw_syscall(libc::SYS_getpid, [0; 6]) as i32 }
 }
 
 fn forwarded_count_slot(tid: i32) -> Option<&'static ForwardedCount> {

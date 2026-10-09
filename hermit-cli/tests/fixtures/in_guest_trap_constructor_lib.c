@@ -14,10 +14,14 @@
  *
  * - `set`: sets REVERIE_LITEINST_SITE_PATCHING=1;
  * - `unset`: removes REVERIE_LITEINST_SITE_PATCHING;
- * - `set-then-restore`: sets it to 1, and the library's `mprotect`, which
- *   interposes on the C library's, sets it back to 0 at the first call that
- *   changes the vDSO's protection: the runtime makes that call while it
- *   rewrites the vDSO, after it has read 1 and before it constructs its Tool;
+ * - `set-then-restore`: sets it to 1, and the library's `getenv`, which
+ *   interposes on the C library's, sets it back to 0 at the first lookup of
+ *   another name after the runtime has looked up
+ *   REVERIE_LITEINST_SITE_PATCHING: the runtime reads its settings through
+ *   Rust's std::env, which calls getenv, so that lookup comes after it has
+ *   read 1 and before it constructs its Tool. (The hook used to be the
+ *   runtime's mprotect of the vDSO, which no longer goes through the C
+ *   library.);
  * - `no-stats`: removes REVERIE_LITEINST_STATS_COORDINATOR, so the runtime
  *   collects no statistics;
  * - anything else: changes nothing.
@@ -26,12 +30,11 @@
 #define _GNU_SOURCE
 #include <stdlib.h>
 #include <string.h>
-#include <sys/auxv.h>
-#include <sys/syscall.h>
 #include <unistd.h>
 
 static const char* mode = "none";
 static int restore_pending = 0;
+static int site_patching_read = 0;
 static int restored = 0;
 
 __attribute__((constructor)) static void change_settings(void) {
@@ -55,20 +58,28 @@ __attribute__((constructor)) static void change_settings(void) {
   }
 }
 
-/* The vDSO is a few pages; the runtime changes the protection of its text. */
-static int in_vdso(const void* address) {
-  unsigned long vdso = getauxval(AT_SYSINFO_EHDR);
-  unsigned long at = (unsigned long)address;
-  return vdso != 0 && at >= vdso && at < vdso + 0x10000;
-}
+extern char** environ;
 
-int mprotect(void* address, size_t length, int protection) {
-  if (restore_pending && in_vdso(address)) {
-    restore_pending = 0;
-    setenv("REVERIE_LITEINST_SITE_PATCHING", "0", 1);
-    restored = 1;
+/* Looks the name up in the environment block itself, as the C library's
+ * getenv does, so it needs no other symbol. */
+char* getenv(const char* name) {
+  static const char site_patching[] = "REVERIE_LITEINST_SITE_PATCHING";
+  if (restore_pending) {
+    if (strcmp(name, site_patching) == 0) {
+      site_patching_read = 1;
+    } else if (site_patching_read) {
+      restore_pending = 0;
+      setenv(site_patching, "0", 1);
+      restored = 1;
+    }
   }
-  return (int)syscall(SYS_mprotect, address, length, protection);
+  size_t length = strlen(name);
+  for (char** entry = environ; entry != NULL && *entry != NULL; entry++) {
+    if (strncmp(*entry, name, length) == 0 && (*entry)[length] == '=') {
+      return *entry + length + 1;
+    }
+  }
+  return NULL;
 }
 
 const char* in_guest_trap_fixture_mode(void) {

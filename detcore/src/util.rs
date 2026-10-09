@@ -15,6 +15,97 @@ use std::time::Duration;
 
 use crate::types::NANOS_PER_RCB;
 
+/// Issues syscall `number` with `args` through the syscall instruction itself
+/// on x86-64, returning the kernel's result (a negative errno on failure).
+/// Under in-guest LiteInst Detcore runs inside the guest, where libc's
+/// wrappers (`open`, `fstat`, `syscall`, ...) are dynamic symbols the program
+/// or a preloaded library may define, and allocate in.
+///
+/// # Safety
+///
+/// As for the syscall itself: pointer arguments must be valid for it.
+pub unsafe fn raw_syscall(number: libc::c_long, args: [u64; 6]) -> i64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let result: i64;
+        // SAFETY: the caller vouches for the arguments.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") number => result,
+                in("rdi") args[0],
+                in("rsi") args[1],
+                in("rdx") args[2],
+                in("r10") args[3],
+                in("r8") args[4],
+                in("r9") args[5],
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack),
+            );
+        }
+        result
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // SAFETY: the caller vouches for the arguments.
+        let result =
+            unsafe { libc::syscall(number, args[0], args[1], args[2], args[3], args[4], args[5]) };
+        if result < 0 {
+            -i64::from(
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO),
+            )
+        } else {
+            result
+        }
+    }
+}
+
+/// [`raw_syscall`]'s result as an `io::Result`.
+pub fn raw_result(result: i64) -> std::io::Result<u64> {
+    if (-4095..0).contains(&result) {
+        Err(std::io::Error::from_raw_os_error(-result as i32))
+    } else {
+        Ok(result as u64)
+    }
+}
+
+/// [`raw_syscall`]'s result for a syscall whose only success value is 0
+/// (`fstat`, `pipe2`, `socketpair`, ...): any other value is refused, a
+/// negative one as the error it names. [`raw_result`] would take a positive
+/// return as success, which for such a call the kernel never gives.
+pub fn raw_zero_result(result: i64) -> std::io::Result<()> {
+    match raw_result(result)? {
+        0 => Ok(()),
+        other => Err(std::io::Error::other(format!(
+            "a syscall that returns 0 on success returned {other}"
+        ))),
+    }
+}
+
+/// Describes `error` without asking the C library for an errno message.
+///
+/// `std::io::Error`'s `Display` and `Debug` render an operating-system error
+/// through `strerror_r`, which can call `gettext` and allocate through the C
+/// library's malloc: under in-guest LiteInst, where Detcore runs inside the
+/// guest, the guest's own heap. An operating-system error is described by its
+/// kind and number instead; any other error, or an I/O error wrapping one, as
+/// before.
+pub fn describe_io_error(error: &std::io::Error) -> String {
+    if let Some(code) = error.raw_os_error() {
+        return format!("{:?} (errno {code})", error.kind());
+    }
+    match error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<std::io::Error>())
+    {
+        Some(inner) => describe_io_error(inner),
+        None => error.to_string(),
+    }
+}
+
 #[allow(dead_code)]
 /// A simple debugging helper function that makes it easy to printf-debug through
 /// layers of stdout/stderr caputure, such as when running under buck test/tpx.
@@ -603,26 +694,41 @@ pub fn find_in_directory<T>(
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    // SAFETY: a NUL-terminated path; the descriptor is closed below.
-    let fd = unsafe {
-        libc::open(
-            path.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    // Raw syscalls throughout (see raw_syscall). SAFETY: a NUL-terminated
+    // path; the descriptor is closed below on every path, a panicking visitor
+    // included.
+    let fd = raw_result(unsafe {
+        raw_syscall(
+            libc::SYS_openat,
+            [
+                libc::AT_FDCWD as u64,
+                path.as_ptr() as u64,
+                (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+                0,
+                0,
+                0,
+            ],
         )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
+    })?;
+    struct CloseOnDrop(u64);
+    impl Drop for CloseOnDrop {
+        fn drop(&mut self) {
+            // SAFETY: a descriptor find_in_directory opened and owns.
+            unsafe { raw_syscall(libc::SYS_close, [self.0, 0, 0, 0, 0, 0]) };
+        }
     }
-    // SAFETY: a descriptor this function just opened and owns; dropping it
-    // closes it on every path, a panicking visitor included.
-    let directory = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+    let directory = CloseOnDrop(fd);
     let mut buffer = vec![0_u8; 32 * 1024];
     let result = 'listing: loop {
         // SAFETY: the buffer is writable for its length.
-        let read =
-            unsafe { libc::syscall(libc::SYS_getdents64, fd, buffer.as_mut_ptr(), buffer.len()) };
+        let read = unsafe {
+            raw_syscall(
+                libc::SYS_getdents64,
+                [fd, buffer.as_mut_ptr() as u64, buffer.len() as u64, 0, 0, 0],
+            )
+        };
         if read < 0 {
-            break Err(std::io::Error::last_os_error());
+            break Err(std::io::Error::from_raw_os_error(-read as i32));
         }
         if read == 0 {
             break Ok(None);
