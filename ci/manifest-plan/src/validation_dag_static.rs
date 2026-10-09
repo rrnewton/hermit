@@ -1651,8 +1651,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (lane qemu-rcb, https://github.com/rrnewton/hermit/issues/3874) retains
     // all 1218: 1219.
     // The poll-deadline wake (https://github.com/rrnewton/hermit/issues/3952)
-    // adds nine, retaining all 1219: 1228. scheduler::runqueue::tests::
-    // {restore_poller_priority_restores_one_poller_in_place,
+    // adds ten, retaining all 1219: 1229. scheduler::runqueue::tests::
+    // {restore_poller_priority_moves_one_poller_to_the_back_of_its_level,
     // only_first_entry_heuristics_are_priority_ordered,
     // a_deadline_restored_poller_counts_as_a_poller_until_it_runs} and
     // scheduler::parked_tests::{a_due_poll_deadline_restores_the_backed_off_poller_before_selection,
@@ -1660,8 +1660,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // poll_deadlines_are_recorded_only_where_they_can_matter,
     // the_controlled_loop_restores_a_due_poller_in_maintenance,
     // the_controlled_loop_restores_a_poller_whose_deadline_a_refresh_crosses,
-    // a_deadline_restored_poller_does_not_defer_a_held_sigchld}.
-    ("test.detcore_unit", 1228),
+    // a_deadline_restored_poller_gates_a_held_sigchld_as_while_backed_off,
+    // a_deadline_restored_poller_gates_a_finished_background_call_as_while_backed_off}.
+    ("test.detcore_unit", 1229),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2445,8 +2446,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the device-probe error description test: 1214.
     // And the same four futex wake-order tests: 1218.
     // And the same futex-waker requeue test: 1219.
-    // And the nine poll-deadline tests: 1228.
-    ("test.detcore_unit_on_host", 1228),
+    // And the ten poll-deadline tests: 1229.
+    ("test.detcore_unit_on_host", 1229),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
