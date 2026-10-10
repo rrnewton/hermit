@@ -29,8 +29,12 @@ use super::SchedRequest;
 use super::SchedResponse;
 use super::Scheduler;
 use super::ThreadNextTurn;
+use super::exit_on_scheduler_refusal;
+use super::kernel_signal_bit;
 use super::real_timer::TimerFailure;
 use super::runqueue::SuspendedRunQueueEntry;
+use super::sleep_signal::SleeperStateUnreadable;
+use super::timed_waiters;
 use super::timed_waiters::SignalTimerId;
 use crate::ivar::Ivar;
 use crate::resources::Permission;
@@ -645,10 +649,34 @@ impl Scheduler {
         deadline: LogicalTime,
         id: SignalTimerId,
         tid: DetTid,
-        signal: nix::sys::signal::Signal,
+        signal: timed_waiters::TimerSignal,
         normal_due: bool,
         observed_now: LogicalTime,
     ) {
+        let signal = match signal {
+            timed_waiters::TimerSignal::Send(signal) => signal,
+            // Linux discards a signal generated while it is ignored and unblocked
+            // (`sig_ignored`), so such an expiration changes nothing and the run
+            // goes on, as it does natively; a target already gone has nobody to
+            // deliver to. A blocked one would be queued (glibc's SIGEV_THREAD
+            // helper blocks its signal and collects it with sigwaitinfo).
+            timed_waiters::TimerSignal::RefuseRealTime(signo)
+                if match self.read_sleeper_signal_state(tid) {
+                    Ok(state) => state.discarded_at_generation() & kernel_signal_bit(signo) != 0,
+                    Err(SleeperStateUnreadable::Gone) => true,
+                    Err(SleeperStateUnreadable::Unreadable(_)) => false,
+                } =>
+            {
+                return;
+            }
+            // Only a fail-closed run registers such an expiration
+            // (`Detcore::handle_timer_settime`); a permissive one never arms it.
+            timed_waiters::TimerSignal::RefuseRealTime(signo) => {
+                exit_on_scheduler_refusal(&format_args!(
+                    "hermit: a POSIX timer expired that notifies with real-time signal {signo}, which Detcore cannot deliver; refusing the run rather than dropping the expiration (https://github.com/rrnewton/hermit/issues/3893)"
+                ))
+            }
+        };
         if self.signal_control_installed() && matches!(id, SignalTimerId::Alarm(_)) {
             if let Err(failure) = self.publish_real_expiry(id.process(), deadline) {
                 self.fail_parked(tid, failure);

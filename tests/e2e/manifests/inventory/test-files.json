@@ -2155,6 +2155,12 @@
       "why": "tests/c/timer_create_determinism.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/timer_create_rt_signal_refused.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/timer_create_rt_signal_refused.c is owned by hermit-cli/tests/cli.rs: POSIX timers that notify with a real-time signal (SIGEV_SIGNAL SIGRTMIN+1, and glibc SIGEV_THREAD, which uses SIGEV_THREAD_ID with an internal real-time signal) are created, armed, read and deleted as on Linux, and an expiration Detcore cannot deliver ends a run --strict with a named policy refusal; under --allow-unsupported-syscalls the expiration stays undelivered and is logged (https://github.com/rrnewton/hermit/issues/3893). It stays a fixture because the generic manifest cannot express a refusal exit plus a second permissive run."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/timer_family_identity.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",

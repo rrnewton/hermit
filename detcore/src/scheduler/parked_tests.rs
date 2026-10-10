@@ -2249,7 +2249,7 @@ fn controlled_exit_mode_never_enqueues_legacy_timed_sigchld() {
                     parent,
                 },
                 parent,
-                Signal::SIGCHLD,
+                Signal::SIGCHLD.into(),
             ),
         )]
     );

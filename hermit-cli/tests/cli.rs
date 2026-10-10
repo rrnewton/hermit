@@ -122,6 +122,7 @@ static POLL_TIMEOUT_VS_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_PARENT_KILLED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_KILL_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_WAKE_COUNT_ZERO_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static TIMER_CREATE_RT_SIGNAL_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_LSEEK_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_INODE_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REPLAY_EPOCH_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -787,6 +788,32 @@ fn vfork_parent_killed_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "vfork-parent-killed guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn timer_create_rt_signal_refused_guest() -> &'static Path {
+    TIMER_CREATE_RT_SIGNAL_REFUSED_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("timer-create-rt-signal-refused");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create timer-create-rt-signal-refused guest directory");
+        let guest = build_root.join("timer_create_rt_signal_refused");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/timer_create_rt_signal_refused.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile timer-create-rt-signal-refused guest");
+        assert!(
+            output.status.success(),
+            "timer-create-rt-signal-refused guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -20358,5 +20385,85 @@ fn a_futex_wake_count_of_zero_or_negative_wakes_one_waiter() {
     assert_eq!(
         stdout, "count 0 woke 1\ncount 0xffffffff woke 1\ncount 0 with no waiter woke 0\n",
         "stderr:\n{log}"
+    );
+}
+
+/// A POSIX timer that notifies with a real-time signal
+/// (https://github.com/rrnewton/hermit/issues/3893). Detcore cannot deliver
+/// real-time signals, and such a timer used to be armed and then silently never
+/// fire. Creating, arming, reading and deleting one before it expires behave as
+/// on Linux, as do one in a process that exits or execs and one whose signal is
+/// ignored and unblocked (Linux discards it); when one expires, a fail-closed
+/// run stops with the policy-refusal
+/// status and names the signal. A run with `--allow-unsupported-syscalls` keeps
+/// the expiration undelivered, and says so.
+#[test]
+fn a_real_time_signal_timer_is_refused_by_name_when_it_expires() {
+    let guest = timer_create_rt_signal_refused_guest()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&["run", "--strict", "--timeout", "60", "--", guest.as_str()]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "a fail-closed run must stop with the policy-refusal status:\nstdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert!(
+        log.contains("a POSIX timer expired that notifies with real-time signal 35"),
+        "the refusal must name the signal:\nstderr:\n{log}"
+    );
+    assert_eq!(
+        stdout,
+        "unexpired SIGRTMIN+1 timer: armed 1, delete 0\n\
+         child exited with a SIGRTMIN+1 timer armed: status 0\n\
+         child execed with a SIGRTMIN+1 timer armed: status 0\n\
+         ignored SIGRTMIN+2 timer expired: the run goes on\n",
+        "unexpired, exited, execed and ignored timers must work as on Linux, and the \
+         run must stop at the first delivered expiry:\nstderr:\n{log}"
+    );
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        // `--strict` refuses the opt-out, so the compatibility run is not strict.
+        hermit_command(&[
+            "run",
+            "--allow-unsupported-syscalls",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(
+        stdout,
+        "unexpired SIGRTMIN+1 timer: armed 1, delete 0\n\
+         child exited with a SIGRTMIN+1 timer armed: status 0\n\
+         child execed with a SIGRTMIN+1 timer armed: status 0\n\
+         ignored SIGRTMIN+2 timer expired: the run goes on\n\
+         SIGRTMIN+1 timer expired: -1 EAGAIN\n\
+         SIGEV_THREAD timer fired: 0\n",
+        "stderr:\n{log}"
+    );
+    assert!(
+        log.contains("which Detcore cannot deliver; it is armed but will never fire"),
+        "the permissive run must say the timer will never fire:\nstderr:\n{log}"
     );
 }

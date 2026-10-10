@@ -894,6 +894,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Whether a POSIX timer notifying with `signo` registers its expirations
+    /// with the scheduler. A standard signal always does. A real-time signal
+    /// (32 to 64; glibc's SIGEV_THREAD timers use one through SIGEV_THREAD_ID)
+    /// cannot be delivered by Detcore, whose signal model carries nix's `Signal`
+    /// (https://github.com/rrnewton/hermit/issues/3893). Creating, arming, reading
+    /// and deleting such a timer still behave as on Linux; only an expiration is
+    /// unserviceable. A fail-closed run registers it anyway, and the scheduler
+    /// refuses the run by name if it ever comes due; a permissive run
+    /// (`--allow-unsupported-syscalls`) leaves it unregistered, so it never fires.
+    fn posix_timer_expiry_is_registered(&self, signo: i32) -> bool {
+        Signal::try_from(signo).is_ok() || self.cfg.panic_on_unsupported_syscalls
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#869)
     /// timer_create: allocate a per-process POSIX timer and hand back a
@@ -906,7 +919,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // The kernel writes the new timer id here; a null pointer is EFAULT.
         let timerid_ptr = call.timerid().ok_or(Errno::EFAULT)?;
         let clockid = call.clockid();
-        let signal = if let Some(event_ptr) = call.sevp() {
+        let signo = if let Some(event_ptr) = call.sevp() {
             let event: libc::sigevent = guest.memory().read_value(event_ptr)?;
             match event.sigev_notify {
                 libc::SIGEV_NONE => None,
@@ -916,19 +929,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                     if !(1..=64).contains(&event.sigev_signo) {
                         return Err(Errno::EINVAL.into());
                     }
-                    Signal::try_from(event.sigev_signo).ok()
+                    Some(event.sigev_signo)
                 }
                 _ => return Err(Errno::ENOSYS.into()),
             }
         } else {
-            Some(Signal::SIGALRM)
+            Some(libc::SIGALRM)
         };
+        // `None` for a real-time signal (32 to 64): see `handle_timer_settime`.
+        let signal = signo.and_then(|signo| Signal::try_from(signo).ok());
         if signal == Some(Signal::SIGALRM) {
             refuse_sigalrm(guest, SigalrmControl::ArmProducer).await?;
         }
         let id = {
             let mut timers = guest.thread_state().posix_timers.lock().unwrap();
-            timers.create(signal.map(|sig| sig as i32))
+            timers.create(signo)
         };
         guest
             .memory()
@@ -985,15 +1000,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest.memory().write_value(old_ptr, &old_spec)?;
         }
 
-        if let Some(signal) = signal_number.and_then(|signum| Signal::try_from(signum).ok()) {
-            register_posix_timer(
-                guest,
-                id,
-                deadline,
-                LogicalTime::from_nanos(interval_ns),
-                signal,
-            )
-            .await;
+        if let Some(signo) = signal_number {
+            if self.posix_timer_expiry_is_registered(signo) {
+                register_posix_timer(
+                    guest,
+                    id,
+                    deadline,
+                    LogicalTime::from_nanos(interval_ns),
+                    signo,
+                )
+                .await;
+            } else if deadline.is_some() {
+                tracing::error!(
+                    "[detcore, dtid {}] POSIX timer {} notifies with real-time signal {}, which Detcore cannot deliver; it is armed but will never fire",
+                    guest.thread_state().dettid,
+                    id,
+                    signo,
+                );
+            }
         }
 
         detlog!(
@@ -1071,8 +1095,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             timers.remove(id)
         };
         if existed {
-            if let Some(signal) = signal_number.and_then(|signum| Signal::try_from(signum).ok()) {
-                register_posix_timer(guest, id, None, LogicalTime::ZERO, signal).await;
+            if let Some(signo) = signal_number
+                && self.posix_timer_expiry_is_registered(signo)
+            {
+                register_posix_timer(guest, id, None, LogicalTime::ZERO, signo).await;
             }
             detlog!(
                 "[dtid {}] timer_delete(id={})",

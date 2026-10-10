@@ -166,7 +166,7 @@ impl Scheduler {
         })
     }
 
-    fn read_sleeper_signal_state(
+    pub(super) fn read_sleeper_signal_state(
         &self,
         dettid: DetTid,
     ) -> Result<KernelSignalState, SleeperStateUnreadable> {

@@ -3952,7 +3952,10 @@ impl GlobalState {
             timer_id,
             deadline,
             interval,
-            alarm_signal(sig),
+            match sig.signal() {
+                Some(signal) => signal.into(),
+                None => crate::scheduler::timed_waiters::TimerSignal::RefuseRealTime(sig.raw()),
+            },
         );
         SchedulerRpcResult::Continue(())
     }
@@ -5604,7 +5607,7 @@ pub async fn register_posix_timer<G, T>(
     timer_id: i32,
     deadline: Option<LogicalTime>,
     interval: LogicalTime,
-    sig: Signal,
+    signo: i32,
 ) where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -5619,7 +5622,7 @@ pub async fn register_posix_timer<G, T>(
             timer_id,
             deadline,
             interval,
-            SigWrapper::from(sig),
+            SigWrapper(signo),
         ),
     )
     .await;
@@ -8457,7 +8460,7 @@ mod tests {
                 0,
                 Some(deadline),
                 deadline,
-                Signal::SIGUSR2,
+                Signal::SIGUSR2.into(),
             );
         }
         let before: Vec<_> = state

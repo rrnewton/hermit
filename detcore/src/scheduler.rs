@@ -9187,7 +9187,7 @@ impl Scheduler {
         timer_id: i32,
         deadline: Option<LogicalTime>,
         interval: LogicalTime,
-        sig: Signal,
+        sig: timed_waiters::TimerSignal,
     ) {
         if let Some(deadline) = deadline {
             self.blocked
@@ -10308,7 +10308,7 @@ mod test {
                 0,
                 Some(deadline),
                 deadline,
-                Signal::SIGUSR2,
+                Signal::SIGUSR2.into(),
             );
             sched.reconnect_after_exec(ExecReconnect {
                 caller: if nonleader { sibling } else { leader },
@@ -10332,7 +10332,7 @@ mod test {
                     TimedEvent::SignalEvt(
                         timed_waiters::SignalTimerId::Alarm(detpid),
                         leader,
-                        Signal::SIGALRM
+                        Signal::SIGALRM.into()
                     )
                 ),]
             );
@@ -14355,7 +14355,7 @@ mod test {
             LogicalTime::from_nanos(1),
             timed_waiters::SignalTimerId::ChildExit { child, parent },
             creator,
-            Signal::SIGCHLD,
+            Signal::SIGCHLD.into(),
             true,
             scheduler.committed_time,
         );
@@ -14492,7 +14492,7 @@ mod test {
                         parent,
                     },
                     creator,
-                    Signal::SIGCHLD,
+                    Signal::SIGCHLD.into(),
                 ),
             )]
         );
@@ -14538,7 +14538,7 @@ mod test {
                 scheduler.committed_time,
                 timed_waiters::SignalTimerId::ChildExit { child, parent },
                 parent,
-                Signal::SIGCHLD,
+                Signal::SIGCHLD.into(),
                 true,
                 scheduler.committed_time,
             );
@@ -15257,7 +15257,7 @@ mod test {
                 TimedEvent::SignalEvt(
                     timed_waiters::SignalTimerId::Alarm(detpid),
                     dettid,
-                    Signal::SIGALRM,
+                    Signal::SIGALRM.into(),
                 )
             )]
         );
@@ -15873,7 +15873,7 @@ mod test {
             7,
             Some(LogicalTime::MAX - LogicalTime::from_nanos(0)),
             LogicalTime::ZERO,
-            Signal::SIGALRM,
+            Signal::SIGALRM.into(),
         );
         assert_eq!(
             scheduler.blocked.timed_waiters.next_deadline(),
@@ -15918,7 +15918,7 @@ mod test {
             7,
             Some(LogicalTime::INDEFINITE),
             LogicalTime::ZERO,
-            Signal::SIGALRM,
+            Signal::SIGALRM.into(),
         );
 
         // Branch order sends this to the indefinite arm, because a timed waiter
@@ -18183,7 +18183,10 @@ mod test {
                     event_ns,
                     id,
                     tid,
-                    signal,
+                    match signal {
+                        timed_waiters::TimerSignal::Send(signal) => signal,
+                        other => panic!("an alarm sends a deliverable signal, not {other}"),
+                    },
                     observed_now
                 ));
                 assert_eq!(

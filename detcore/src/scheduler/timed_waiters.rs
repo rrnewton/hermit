@@ -69,11 +69,38 @@ struct SignalTimerState {
     interval: LogicalTime,
 }
 
+/// What a signal timer does when it expires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TimerSignal {
+    /// Send this signal.
+    Send(Signal),
+    /// End the run with a named refusal. The POSIX timer notifies with this
+    /// real-time signal, which Detcore cannot deliver; the timer could be
+    /// created and armed as on Linux, and only its expiration is unserviceable
+    /// (<https://github.com/rrnewton/hermit/issues/3893>).
+    RefuseRealTime(i32),
+}
+
+impl From<Signal> for TimerSignal {
+    fn from(signal: Signal) -> Self {
+        TimerSignal::Send(signal)
+    }
+}
+
+impl fmt::Display for TimerSignal {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            TimerSignal::Send(signal) => write!(f, "{}", signal),
+            TimerSignal::RefuseRealTime(signo) => write!(f, "real-time signal {}", signo),
+        }
+    }
+}
+
 /// An event that occurs at a particular time in the execution, typically at an offset in the future.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TimedEvent {
     // An upcoming timer signal, destined for a process with a preferred target thread.
-    SignalEvt(SignalTimerId, DetTid, Signal),
+    SignalEvt(SignalTimerId, DetTid, TimerSignal),
 
     /// A timed event on a particular thread (sleep, timeout, etc)
     ThreadEvt(DetTid),
@@ -108,7 +135,7 @@ impl TimedEvents {
         id: SignalTimerId,
         ns: LogicalTime,
         dt: DetTid,
-        sig: Signal,
+        sig: TimerSignal,
         interval: LogicalTime,
     ) -> Option<SignalTimerState> {
         let old = self.signal_timers.insert(
@@ -142,7 +169,7 @@ impl TimedEvents {
         sig: Signal,
         interval: LogicalTime,
     ) -> Option<(LogicalTime, LogicalTime)> {
-        self.insert_signal_timer(SignalTimerId::Alarm(dp), ns, dt, sig, interval)
+        self.insert_signal_timer(SignalTimerId::Alarm(dp), ns, dt, sig.into(), interval)
             .map(|state| (state.deadline, state.interval))
     }
 
@@ -159,7 +186,7 @@ impl TimedEvents {
             .insert(TimedEvent::SignalEvt(
                 SignalTimerId::Alarm(pid),
                 pid,
-                Signal::SIGALRM,
+                Signal::SIGALRM.into(),
             ));
     }
 
@@ -247,7 +274,7 @@ impl TimedEvents {
         let evt = TimedEvent::SignalEvt(
             SignalTimerId::ChildExit { child, parent },
             parent_tid,
-            Signal::SIGCHLD,
+            Signal::SIGCHLD.into(),
         );
         // BTreeSet::insert returns false on a duplicate; coalescing it is
         // intentional (see doc comment) rather than a panic.
@@ -262,7 +289,7 @@ impl TimedEvents {
         dp: DetPid,
         dt: DetTid,
         timer_id: i32,
-        sig: Signal,
+        sig: TimerSignal,
         interval: LogicalTime,
     ) {
         self.insert_signal_timer(SignalTimerId::Posix(dp, timer_id), ns, dt, sig, interval);
@@ -488,7 +515,7 @@ mod test {
             ev.pop(),
             Some((
                 at(1000),
-                TimedEvent::SignalEvt(SignalTimerId::Alarm(p), tid(100), Signal::SIGALRM),
+                TimedEvent::SignalEvt(SignalTimerId::Alarm(p), tid(100), Signal::SIGALRM.into()),
             ))
         );
         assert!(ev.is_empty());
@@ -538,7 +565,11 @@ mod test {
             ev.iter().collect::<Vec<_>>(),
             vec![(
                 deadline,
-                TimedEvent::SignalEvt(SignalTimerId::Alarm(second_pid), tid(201), Signal::SIGALRM,)
+                TimedEvent::SignalEvt(
+                    SignalTimerId::Alarm(second_pid),
+                    tid(201),
+                    Signal::SIGALRM.into(),
+                )
             )]
         );
         assert_eq!(
@@ -579,7 +610,7 @@ mod test {
             ev.pop(),
             Some((
                 at(2000),
-                TimedEvent::SignalEvt(SignalTimerId::Alarm(p), tid(100), Signal::SIGALRM),
+                TimedEvent::SignalEvt(SignalTimerId::Alarm(p), tid(100), Signal::SIGALRM.into()),
             ))
         );
         assert!(ev.is_empty());
@@ -591,7 +622,8 @@ mod test {
     fn periodic_alarm_rearms_at_its_interval() {
         let mut ev = TimedEvents::default();
         let p = pid(100);
-        let event = TimedEvent::SignalEvt(SignalTimerId::Alarm(p), tid(100), Signal::SIGALRM);
+        let event =
+            TimedEvent::SignalEvt(SignalTimerId::Alarm(p), tid(100), Signal::SIGALRM.into());
         ev.insert_alarm(at(1000), p, tid(100), Signal::SIGALRM, at(250));
 
         assert_eq!(ev.pop_if_before(at(1000)), Some((at(1000), event)));
@@ -630,12 +662,12 @@ mod test {
         assert!(popped.contains(&TimedEvent::SignalEvt(
             SignalTimerId::Alarm(parent),
             tid(100),
-            Signal::SIGALRM
+            Signal::SIGALRM.into()
         )));
         assert!(popped.contains(&TimedEvent::SignalEvt(
             SignalTimerId::ChildExit { child, parent },
             tid(100),
-            Signal::SIGCHLD
+            Signal::SIGCHLD.into()
         )));
         assert!(ev.is_empty());
 
@@ -674,7 +706,7 @@ mod test {
                     parent
                 },
                 tid(100),
-                Signal::SIGCHLD
+                Signal::SIGCHLD.into()
             )));
         assert!(ev.iter().any(|(_, e)| e
             == TimedEvent::SignalEvt(
@@ -683,7 +715,7 @@ mod test {
                     parent
                 },
                 tid(100),
-                Signal::SIGCHLD
+                Signal::SIGCHLD.into()
             )));
     }
 
@@ -694,13 +726,20 @@ mod test {
         let mut ev = TimedEvents::default();
         let p = pid(100);
         ev.insert_alarm(at(1000), p, tid(100), Signal::SIGALRM, LogicalTime::ZERO);
-        ev.insert_posix_timer(at(500), p, tid(100), 7, Signal::SIGUSR1, LogicalTime::ZERO);
+        ev.insert_posix_timer(
+            at(500),
+            p,
+            tid(100),
+            7,
+            Signal::SIGUSR1.into(),
+            LogicalTime::ZERO,
+        );
 
         assert_eq!(
             ev.pop(),
             Some((
                 at(500),
-                TimedEvent::SignalEvt(SignalTimerId::Posix(p, 7), tid(100), Signal::SIGUSR1,),
+                TimedEvent::SignalEvt(SignalTimerId::Posix(p, 7), tid(100), Signal::SIGUSR1.into(),),
             ))
         );
         assert_eq!(ev.remove_alarm(p), Some((at(1000), LogicalTime::ZERO)));
@@ -725,7 +764,7 @@ mod test {
                 pid(200),
                 tid(200),
                 7,
-                Signal::SIGUSR2,
+                Signal::SIGUSR2.into(),
                 LogicalTime::ZERO,
             );
             let preserved: Vec<_> = ev.iter().collect();
@@ -734,9 +773,16 @@ mod test {
 
             // Two same-deadline timers, one armed by a sibling, and a timer
             // with its own bucket exercise both map cleanup paths.
-            ev.insert_posix_timer(deadline, p, tid(100), 7, Signal::SIGUSR2, at(50));
-            ev.insert_posix_timer(deadline, p, tid(101), 8, Signal::SIGUSR1, at(70));
-            ev.insert_posix_timer(at(900), p, tid(100), 9, Signal::SIGUSR2, LogicalTime::ZERO);
+            ev.insert_posix_timer(deadline, p, tid(100), 7, Signal::SIGUSR2.into(), at(50));
+            ev.insert_posix_timer(deadline, p, tid(101), 8, Signal::SIGUSR1.into(), at(70));
+            ev.insert_posix_timer(
+                at(900),
+                p,
+                tid(100),
+                9,
+                Signal::SIGUSR2.into(),
+                LogicalTime::ZERO,
+            );
             ev.remove_posix_timers(p);
             ev.remove_posix_timers(p); // Empty/repeated exec is harmless.
 
@@ -756,12 +802,12 @@ mod test {
     fn exec_cancels_periodic_rearm_after_an_expiration() {
         let mut ev = TimedEvents::default();
         let p = pid(100);
-        ev.insert_posix_timer(at(100), p, tid(101), 7, Signal::SIGUSR2, at(50));
+        ev.insert_posix_timer(at(100), p, tid(101), 7, Signal::SIGUSR2.into(), at(50));
         assert_eq!(
             ev.pop_if_before(at(100)),
             Some((
                 at(100),
-                TimedEvent::SignalEvt(SignalTimerId::Posix(p, 7), tid(101), Signal::SIGUSR2),
+                TimedEvent::SignalEvt(SignalTimerId::Posix(p, 7), tid(101), Signal::SIGUSR2.into()),
             ))
         );
         assert_eq!(ev.next_deadline(), Some(at(150)));
@@ -770,13 +816,20 @@ mod test {
         assert!(ev.signal_timers.is_empty());
         assert_eq!(ev.pop(), None);
 
-        ev.insert_posix_timer(at(300), p, tid(100), 8, Signal::SIGUSR1, LogicalTime::ZERO);
+        ev.insert_posix_timer(
+            at(300),
+            p,
+            tid(100),
+            8,
+            Signal::SIGUSR1.into(),
+            LogicalTime::ZERO,
+        );
         assert_eq!(ev.pop_if_before(at(299)), None);
         assert_eq!(
             ev.pop_if_before(at(300)),
             Some((
                 at(300),
-                TimedEvent::SignalEvt(SignalTimerId::Posix(p, 8), tid(100), Signal::SIGUSR1),
+                TimedEvent::SignalEvt(SignalTimerId::Posix(p, 8), tid(100), Signal::SIGUSR1.into()),
             ))
         );
         assert!(ev.is_empty());
