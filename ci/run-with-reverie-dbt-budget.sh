@@ -1331,7 +1331,13 @@ fi
 # vendor/dynamorio, third-party and rust-toolchain.toml are unchanged Git
 # objects. The tracked reverie-dbt file population remains939. This carries
 # the same SDK recipe budget, not an earlier runtime validation receipt.
-expected_pin=4203a25399da4e01fab49c0b85f8ee503c8869bc
+# PRIVATE MATCHED-CONFIG EXPERIMENT TO 222cb4ef154a240411b100eecd3df45556fab285 (2026-10-10):
+# Local unpublished utility on public 4203a25399da4e01fab49c0b85f8ee503c8869bc.
+# The build.rs, Cargo.toml, DynamoRIO vendor, third-party and toolchain
+# Git inputs are identical. Preserve CMAKE/CMAKE_GENERATOR, the 1050
+# effective-job-second threshold and sixteen-job clamp. This carries only
+# SDK build cost; matched ABI6 client/runtime and guest results are fresh.
+expected_pin=222cb4ef154a240411b100eecd3df45556fab285
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

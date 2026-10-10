@@ -608,11 +608,9 @@ fn prepare_dbt_container_command(
     identity: Option<&super::container::IdentityGuard>,
 ) -> Result<(StdCommand, Config), Error> {
     super::container::configure_detcore_identity(&mut config, identity)?;
-    let mut command = prepare_dbt_physical_command(guest)?;
-    command.env(
-        detcore_dbt::DETCONFIG_ENV,
-        hermit::dbt_detconfig_json(&config)?,
-    );
+    // Full physical Config reaches the runtime in the existing first RPC
+    // frame. Keep the inherited pre-physical JSON launch bytes unchanged.
+    let command = prepare_dbt_physical_command(guest)?;
     Ok((command, config))
 }
 
