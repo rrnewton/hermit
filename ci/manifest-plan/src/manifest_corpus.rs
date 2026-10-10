@@ -1325,10 +1325,42 @@ mod tests {
     /// under rust-script, where CARGO_MANIFEST_DIR is not ci/manifest-plan.
     const COMPAT_YAML: &str = include_str!("../../../tests/e2e/manifests/compat.yaml");
 
+    /// The 23 corpus rows the strict variant took on 2026-10-10, when the
+    /// compat corpus was given uniform strict treatment. They are labelled
+    /// sabre-compat-only, so their corpus cells are not the full run's and
+    /// ci/compat/corpus-strict.json, which validate.rs binds to the full run's
+    /// portable rows, does not hold them.
+    const STRICT_VARIANT_ROWS_BEYOND_THE_STRICT_CORPUS: [&str; 23] = [
+        "basenc",
+        "col",
+        "colrm",
+        "crc32",
+        "cscope",
+        "diff3",
+        "dos2unix",
+        "envsubst",
+        "fallocate",
+        "flex",
+        "getconf",
+        "mountpoint",
+        "msgfmt",
+        "msgunfmt",
+        "namei",
+        "pathchk",
+        "setfacl",
+        "setfattr",
+        "shred",
+        "sync",
+        "timeout",
+        "truncate",
+        "uuidgen",
+    ];
+
     /// compat.yaml's strict variant runs exactly the programs of
     /// ci/compat/corpus-strict.json, the corpus STRICT_COMPAT_TOTAL counts and
-    /// the super suite still reads: a row added to either file without the
-    /// other fails here instead of silently changing the strict run type.
+    /// the super suite still reads, plus the named rows beyond it: a row added
+    /// to either file, or to the strict variant, without the others fails here
+    /// instead of silently changing the strict run type.
     #[test]
     fn the_strict_variant_runs_exactly_the_strict_corpus_programs() {
         let document: Value = serde_yaml::from_str(COMPAT_YAML).unwrap();
@@ -1370,8 +1402,16 @@ mod tests {
             .map(|row| row["label"].as_str().unwrap().to_owned())
             .collect::<BTreeSet<_>>();
         assert_eq!(strict.len(), 193);
+        let mut expected = strict.clone();
+        for row in STRICT_VARIANT_ROWS_BEYOND_THE_STRICT_CORPUS {
+            assert!(
+                expected.insert(row.to_owned()),
+                "{row} is already in the strict corpus"
+            );
+        }
+        assert_eq!(expected.len(), 216);
         assert_eq!(
-            variant.symmetric_difference(&strict).collect::<Vec<_>>(),
+            variant.symmetric_difference(&expected).collect::<Vec<_>>(),
             Vec::<&String>::new()
         );
     }
