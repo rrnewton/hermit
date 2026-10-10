@@ -18,6 +18,8 @@
 //! plugin. This module retains the separate
 //! `hermit --backend sabre strace` diagnostic path.
 
+#[cfg(feature = "dbt")]
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 #[cfg(feature = "dbt")]
 use std::collections::BTreeSet;
@@ -42,6 +44,8 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 #[cfg(feature = "dbt")]
 use std::os::fd::FromRawFd;
+#[cfg(feature = "dbt")]
+use std::os::unix::fs::OpenOptionsExt as _;
 #[cfg(any(feature = "sabre", feature = "dbt"))]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(any(feature = "dbt", test))]
@@ -53,6 +57,10 @@ use std::path::PathBuf;
 use std::process::Command as StdCommand;
 #[cfg(any(feature = "dbt", test))]
 use std::process::Output;
+#[cfg(feature = "dbt")]
+use std::sync::Arc;
+#[cfg(feature = "dbt")]
+use std::sync::Weak;
 
 use detcore::Config;
 #[cfg(feature = "dbt")]
@@ -75,6 +83,7 @@ use tracing::metadata::LevelFilter;
 
 #[cfg(feature = "dbt")]
 use super::record_envelope::RecordEnvelope;
+use super::run::RunOpts;
 use super::run::VerifyAllow;
 #[cfg(feature = "dbt")]
 use super::verify::ComparedRun;
@@ -250,8 +259,14 @@ fn finalize_dbt_verification(
 /// runner has reaped the whole isolated process group before reading it.
 #[cfg(feature = "dbt")]
 struct DbtStatsCapture {
-    directory: tempfile::TempDir,
+    directory: Arc<DbtStatsDirectory>,
     path: PathBuf,
+}
+
+#[cfg(feature = "dbt")]
+struct DbtStatsDirectory {
+    _directory: tempfile::TempDir,
+    descriptor: std::fs::File,
 }
 
 #[cfg(feature = "dbt")]
@@ -259,20 +274,38 @@ impl DbtStatsCapture {
     fn new() -> Result<Self, Error> {
         let directory = tempfile::Builder::new()
             .prefix("hermit-dbt-verify-stats-")
-            .tempdir()
+            .tempdir_in("/tmp")
             .map_err(|error| {
                 Error::msg(format!(
                     "failed to create DBT whole-process statistics sink: {error}"
                 ))
             })?;
         let path = directory.path().join("records.bin");
+        // Pin only this owned sink, not its caller-wide parent. The common
+        // init can address it after scratch replacement through its own procfd.
+        // CLOEXEC keeps it out of the guest's direct inherited descriptor set.
+        let descriptor = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(directory.path())?;
+        let directory = Arc::new(DbtStatsDirectory {
+            _directory: directory,
+            descriptor,
+        });
         Ok(Self { directory, path })
     }
 
-    fn configure(&self, runner: DbtRunner) -> DbtRunner {
-        runner
-            .client_argument("-stats_path")
-            .client_argument(self.path.clone().into_os_string())
+    fn configure(&self, runner: DbtRunner, execution: &DbtExecution) -> DbtRunner {
+        let owner = if execution.options.uses_namespaces() {
+            1
+        } else {
+            std::process::id()
+        };
+        let path = format!(
+            "/proc/{owner}/fd/{}/records.bin",
+            self.directory.descriptor.as_raw_fd()
+        );
+        runner.client_argument("-stats_path").client_argument(path)
     }
 
     fn finish(self) -> Result<DbtBackendStatsSnapshot, Error> {
@@ -550,6 +583,37 @@ fn prepare_dbt_physical_command(guest: &StdCommand) -> Result<StdCommand, Error>
         command.current_dir(workdir);
     }
     Ok(command)
+}
+
+#[cfg(feature = "dbt")]
+fn clone_dbt_command(guest: &StdCommand) -> StdCommand {
+    let mut command = StdCommand::new(guest.get_program());
+    command.args(guest.get_args());
+    for (name, value) in guest.get_envs() {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
+    if let Some(workdir) = guest.get_current_dir() {
+        command.current_dir(workdir);
+    }
+    command
+}
+
+#[cfg(feature = "dbt")]
+fn prepare_dbt_container_command(
+    guest: &StdCommand,
+    mut config: Config,
+    identity: Option<&super::container::IdentityGuard>,
+) -> Result<(StdCommand, Config), Error> {
+    super::container::configure_detcore_identity(&mut config, identity)?;
+    let mut command = prepare_dbt_physical_command(guest)?;
+    command.env(
+        detcore_dbt::DETCONFIG_ENV,
+        hermit::dbt_detconfig_json(&config)?,
+    );
+    Ok((command, config))
 }
 
 #[cfg(feature = "dbt")]
@@ -975,8 +1039,7 @@ pub(super) fn run_dbt(
     config: &Config,
     mut environment: BTreeMap<OsString, OsString>,
     workdir: Option<&Path>,
-    binds: Vec<(PathBuf, PathBuf)>,
-    local_networking: bool,
+    container_options: &RunOpts,
     verification_stdin: Option<std::fs::File>,
 ) -> Result<ExitStatus, Error> {
     if let Some(path) = verify_json.filter(|_| verify) {
@@ -1010,29 +1073,6 @@ pub(super) fn run_dbt(
     // isolation and the client flag here.
     let panic_on_unsupported_syscalls = config.panic_on_unsupported_syscalls;
 
-    let marker = std::env::var_os(hermit_test_workdir::REQUEST_ENV);
-    let isolated_workdir = hermit_test_workdir::requested_workdir(marker.as_deref())?;
-    let binds = binds
-        .into_iter()
-        .map(|(source, target)| hermit_test_workdir::BindMount { source, target })
-        .collect::<Vec<_>>();
-    // A bound workdir is as fresh as the bind source the caller made for this
-    // run, which is how the other backends get theirs.
-    let workdir_is_bound =
-        workdir.is_some_and(|workdir| binds.iter().any(|bind| workdir.starts_with(&bind.target)));
-    if isolated_workdir.is_some() && workdir != isolated_workdir && !workdir_is_bound {
-        return Err(Error::msg(
-            "HERMIT_E2E_EMPTY_WORKDIR=/test requires --workdir=/test, or a --workdir inside a \
-             --bind target, for DBT",
-        ));
-    }
-    let isolation = hermit_test_workdir::Isolation {
-        test_workdir: isolated_workdir.is_some() && workdir == isolated_workdir,
-        local_networking,
-        binds,
-        preserve: Vec::new(),
-    };
-    let execution = DbtExecution::new(isolation)?;
     let stdin_is_terminal = std::io::stdin().is_terminal();
 
     let (drrun, client) = detcore_dbt::prepare_native_client().map_err(|error| {
@@ -1040,6 +1080,26 @@ pub(super) fn run_dbt(
             "failed to prepare the Detcore DynamoRIO client: {error}"
         ))
     })?;
+    let mut container_options = container_options.clone();
+    if hermit_resources::install_dir()?.is_none() {
+        // Unpackaged clients name this one runtime library. The launcher needs
+        // its declared DynamoRIO package, not an arbitrary caller tmp parent.
+        container_options.preserve_bootstrap_input(&client)?;
+        container_options.preserve_bootstrap_input(&detcore_dbt::runtime_library_path()?)?;
+        if let Some(package) = drrun.parent().and_then(Path::parent) {
+            if package == Path::new("/tmp") {
+                for entry in ["bin64", "lib64", "lib32", "ext"] {
+                    let source = package.join(entry);
+                    if source.exists() {
+                        container_options.preserve_bootstrap_input(&source)?;
+                    }
+                }
+            } else {
+                container_options.preserve_bootstrap_input(package)?;
+            }
+        }
+    }
+    let execution = DbtExecution::new(container_options);
     // Every single run captures the per-image records, not only a run that
     // prints or exports them: a child's backend failure is found there. Only a
     // run that asked for them fails when they cannot be set up; any other run
@@ -1070,7 +1130,7 @@ pub(super) fn run_dbt(
         .summary(summary)
         .isolated_process_group(panic_on_unsupported_syscalls);
     if let Some(capture) = &single_run_stats {
-        runner = capture.configure(runner);
+        runner = capture.configure(runner, &execution);
     }
     if panic_on_unsupported_syscalls {
         runner = runner.client_argument("-panic-on-unsupported-syscalls");
@@ -1157,17 +1217,17 @@ pub(super) fn run_dbt(
     let evidence_level = dbt_evidence_log_level(log, verify_verbose);
     let mut evidence1 = tempfile::tempfile()?;
     let stats1 = execution.stats_capture()?;
-    let runner1 = stats1.configure(runner.clone());
+    let runner1 = stats1.configure(runner.clone(), &execution);
     let run1_evidence = Some(DbtRunEvidence {
-        file: &evidence1,
+        file: evidence1.try_clone()?,
         log_level: evidence_level,
         label: "run-1",
     });
     let mut evidence2 = tempfile::tempfile()?;
     let stats2 = execution.stats_capture()?;
-    let runner2 = stats2.configure(runner);
+    let runner2 = stats2.configure(runner, &execution);
     let run2_evidence = Some(DbtRunEvidence {
-        file: &evidence2,
+        file: evidence2.try_clone()?,
         log_level: evidence_level,
         label: "run-2",
     });
@@ -1473,65 +1533,34 @@ pub(super) fn run_dbt(
     _config: &Config,
     _environment: BTreeMap<OsString, OsString>,
     _workdir: Option<&Path>,
-    _binds: Vec<(std::path::PathBuf, std::path::PathBuf)>,
-    _local_networking: bool,
+    _container_options: &RunOpts,
     _verification_stdin: Option<std::fs::File>,
 ) -> Result<ExitStatus, Error> {
     Err(Error::msg("DBT support was not included in this build"))
 }
 
-/// Local networking, marked workdirs, and binds create coordinator workers in
-/// fresh namespaces for each physical run. Only host-network runs without mount
-/// isolation share the calling thread's coordinator runtime.
+/// Every physical DBT run enters the shared owned container before creating
+/// coordinator threads or abstract network listeners.
 #[cfg(feature = "dbt")]
 struct DbtExecution {
-    runtime: Option<tokio::runtime::Runtime>,
-    isolation: Option<std::sync::Mutex<hermit_test_workdir::Isolation>>,
+    options: RunOpts,
+    statistics: RefCell<Vec<Weak<DbtStatsDirectory>>>,
 }
 
 #[cfg(feature = "dbt")]
 impl DbtExecution {
-    fn new(isolation: hermit_test_workdir::Isolation) -> Result<Self, Error> {
-        Ok(if isolation.is_empty() {
-            Self {
-                runtime: Some(Self::new_runtime()?),
-                isolation: None,
-            }
-        } else {
-            // The run's mount/network namespaces need CAP_SYS_ADMIN. A caller without it
-            // takes it the way every other backend's container does (root mapped
-            // to the caller), so a bound DBT run needs no privileged host; such a
-            // caller has no capability to lose, and its file access is unchanged.
-            // A caller that holds it keeps its own credentials, so nothing it
-            // writes after the run (verify reports, retained logs) loses one.
-            // Nothing has started a thread yet.
-            if !hermit_test_workdir::has_cap_sys_admin()? {
-                hermit_test_workdir::enter_root_user_namespace().map_err(|error| {
-                    Error::msg(format!(
-                        "failed to give the DBT run the user namespace its local networking \
-                         or private mounts need: {error}"
-                    ))
-                })?;
-            }
-            Self {
-                runtime: None,
-                isolation: Some(std::sync::Mutex::new(isolation)),
-            }
-        })
+    fn new(options: RunOpts) -> Self {
+        Self {
+            options,
+            statistics: RefCell::new(Vec::new()),
+        }
     }
 
-    /// A statistics sink the client can still write once binds replace /tmp:
-    /// its directory is made before the run, below the original /tmp, so the
-    /// namespace re-binds it at the same path.
     fn stats_capture(&self) -> Result<DbtStatsCapture, Error> {
         let capture = DbtStatsCapture::new()?;
-        if let Some(isolation) = &self.isolation {
-            isolation
-                .lock()
-                .expect("DBT isolation lock")
-                .preserve
-                .push(capture.directory.path().to_path_buf());
-        }
+        self.statistics
+            .borrow_mut()
+            .push(Arc::downgrade(&capture.directory));
         Ok(capture)
     }
 
@@ -1546,34 +1575,38 @@ impl DbtExecution {
 
     fn run<F, T>(&self, run: F) -> Result<T, Error>
     where
-        F: FnOnce(&tokio::runtime::Runtime) -> Result<T, Error> + Send,
-        T: Send,
+        F: FnOnce(
+                &tokio::runtime::Runtime,
+                Option<&super::container::IdentityGuard>,
+            ) -> Result<T, Error>
+            + 'static,
+        T: serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
-        if let Some(runtime) = &self.runtime {
-            return run(runtime);
-        }
-        let mut isolation = self
-            .isolation
-            .as_ref()
-            .expect("a DBT execution without a runtime is isolated")
-            .lock()
-            .expect("DBT isolation lock")
-            .clone();
-        // A verification's run-1 statistics sink is finished and removed before
-        // run 2; only the sinks that still exist are this run's to preserve.
-        isolation.preserve.retain(|path| path.exists());
-        hermit_test_workdir::with_isolation(&isolation, move || {
-            let runtime = Self::new_runtime()?;
-            // The operation consumes GlobalState cleanup before returning;
-            // runtime Drop joins its workers before this scoped thread exits.
-            run(&runtime)
-        })
-        .map_err(|error| {
-            Error::msg(format!(
-                "failed to set up the DBT run's private namespaces for local networking \
-                 or private mounts: {error}"
-            ))
-        })?
+        // Only still-live sinks belong to this physical run. In particular,
+        // finishing run 1 removes its TempDir before verification's run 2.
+        let statistics = self
+            .statistics
+            .borrow()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        let mut run = Some(run);
+        self.options
+            .with_container(
+                statistics,
+                "DBT statistics directories, input and evidence descriptors".into(),
+                None,
+                move |_, identity| {
+                    let run = run.take().ok_or_else(|| {
+                        Error::msg("the DBT physical launch callback was invoked twice")
+                    })?;
+                    let runtime = Self::new_runtime()?;
+                    // GlobalState cleanup finishes before this returns, and
+                    // runtime Drop joins every worker before init publishes.
+                    run(&runtime, identity)
+                },
+            )
+            .map(|(value, _guards)| value)
     }
 }
 
@@ -1581,8 +1614,8 @@ impl DbtExecution {
 /// run's network namespace. A listener created by the caller would be invisible
 /// to the guest. The completed artifact is an ordinary file read by the caller.
 #[cfg(feature = "dbt")]
-struct DbtRunEvidence<'a> {
-    file: &'a std::fs::File,
+struct DbtRunEvidence {
+    file: std::fs::File,
     log_level: DbtEvidenceLogLevel,
     label: &'static str,
 }
@@ -1590,12 +1623,12 @@ struct DbtRunEvidence<'a> {
 #[cfg(feature = "dbt")]
 fn configure_dbt_run_evidence(
     runner: &DbtRunner,
-    evidence: Option<DbtRunEvidence<'_>>,
+    evidence: Option<DbtRunEvidence>,
 ) -> Result<DbtRunner, Error> {
     let runner = runner.clone();
     match evidence {
         Some(evidence) => runner
-            .evidence_file(evidence.file)
+            .evidence_file(&evidence.file)
             .map(|runner| runner.evidence_log_level(evidence.log_level))
             .map_err(|error| {
                 Error::msg(format!(
@@ -1608,30 +1641,61 @@ fn configure_dbt_run_evidence(
 }
 
 #[cfg(feature = "dbt")]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DbtPhysicalOutput {
+    raw_status: i32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[cfg(feature = "dbt")]
+impl DbtPhysicalOutput {
+    fn from_output(output: Output) -> Self {
+        Self {
+            raw_status: output.status.into_raw(),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        }
+    }
+
+    fn into_output(self) -> Output {
+        Output {
+            status: std::process::ExitStatus::from_raw(self.raw_status),
+            stdout: self.stdout,
+            stderr: self.stderr,
+        }
+    }
+}
+
+#[cfg(feature = "dbt")]
 fn run_once<R: Read + Send + 'static>(
     execution: &DbtExecution,
     runner: &DbtRunner,
     guest: &StdCommand,
     drrun: &Path,
     config: &Config,
-    evidence: Option<DbtRunEvidence<'_>>,
+    evidence: Option<DbtRunEvidence>,
     input: R,
 ) -> Result<Output, Error> {
-    execution.run(move |runtime| {
-        let runner = configure_dbt_run_evidence(runner, evidence)?;
-        let guest = prepare_dbt_physical_command(guest)?;
-        let (output, global) = runtime
-            .block_on(
-                runner.output_with_detached_reader_and_global::<detcore::GlobalState, _>(
-                    &guest,
-                    input,
-                    config.clone(),
-                ),
-            )
-            .map_err(|error| dbt_run_error(drrun, error))?;
-        runtime.block_on(clean_up_dbt_global(&output.status, global));
-        Ok(output)
-    })
+    let runner = runner.clone();
+    let guest = clone_dbt_command(guest);
+    let drrun = drrun.to_path_buf();
+    let config = config.clone();
+    execution
+        .run(move |runtime, identity| {
+            let runner = configure_dbt_run_evidence(&runner, evidence)?;
+            let (guest, config) = prepare_dbt_container_command(&guest, config, identity)?;
+            let (output, global) = runtime
+                .block_on(
+                    runner.output_with_detached_reader_and_global::<detcore::GlobalState, _>(
+                        &guest, input, config,
+                    ),
+                )
+                .map_err(|error| dbt_run_error(&drrun, error))?;
+            runtime.block_on(clean_up_dbt_global(&output.status, global));
+            Ok(DbtPhysicalOutput::from_output(output))
+        })
+        .map(DbtPhysicalOutput::into_output)
 }
 
 #[cfg(feature = "dbt")]
@@ -1641,22 +1705,27 @@ fn run_once_with_terminal_input(
     guest: &StdCommand,
     drrun: &Path,
     config: &Config,
-    evidence: Option<DbtRunEvidence<'_>>,
+    evidence: Option<DbtRunEvidence>,
 ) -> Result<Output, Error> {
-    execution.run(move |runtime| {
-        let runner = configure_dbt_run_evidence(runner, evidence)?;
-        let guest = prepare_dbt_physical_command(guest)?;
-        let (output, global) = runtime
-            .block_on(
-                runner.output_with_inherited_stdin_and_global::<detcore::GlobalState>(
-                    &guest,
-                    config.clone(),
-                ),
-            )
-            .map_err(|error| dbt_run_error(drrun, error))?;
-        runtime.block_on(clean_up_dbt_global(&output.status, global));
-        Ok(output)
-    })
+    let runner = runner.clone();
+    let guest = clone_dbt_command(guest);
+    let drrun = drrun.to_path_buf();
+    let config = config.clone();
+    execution
+        .run(move |runtime, identity| {
+            let runner = configure_dbt_run_evidence(&runner, evidence)?;
+            let (guest, config) = prepare_dbt_container_command(&guest, config, identity)?;
+            let (output, global) = runtime
+                .block_on(
+                    runner.output_with_inherited_stdin_and_global::<detcore::GlobalState>(
+                        &guest, config,
+                    ),
+                )
+                .map_err(|error| dbt_run_error(&drrun, error))?;
+            runtime.block_on(clean_up_dbt_global(&output.status, global));
+            Ok(DbtPhysicalOutput::from_output(output))
+        })
+        .map(DbtPhysicalOutput::into_output)
 }
 
 #[cfg(feature = "dbt")]
@@ -1667,14 +1736,20 @@ fn run_status(
     drrun: &Path,
     config: &Config,
 ) -> Result<std::process::ExitStatus, Error> {
-    execution.run(move |runtime| {
-        let guest = prepare_dbt_physical_command(guest)?;
-        let (status, global) = runtime
-            .block_on(runner.status_with_global::<detcore::GlobalState>(&guest, config.clone()))
-            .map_err(|error| dbt_run_error(drrun, error))?;
-        runtime.block_on(clean_up_dbt_global(&status, global));
-        Ok(status)
-    })
+    let runner = runner.clone();
+    let guest = clone_dbt_command(guest);
+    let drrun = drrun.to_path_buf();
+    let config = config.clone();
+    execution
+        .run(move |runtime, identity| {
+            let (guest, config) = prepare_dbt_container_command(&guest, config, identity)?;
+            let (status, global) = runtime
+                .block_on(runner.status_with_global::<detcore::GlobalState>(&guest, config))
+                .map_err(|error| dbt_run_error(&drrun, error))?;
+            runtime.block_on(clean_up_dbt_global(&status, global));
+            Ok(status.into_raw())
+        })
+        .map(std::process::ExitStatus::from_raw)
 }
 
 #[cfg(feature = "dbt")]
@@ -2501,6 +2576,26 @@ mod tests {
         assert!(report.verified);
         assert!(report.bitwise_parity);
         assert_eq!(outcome.into_exit_status().unwrap(), ExitStatus::Exited(23));
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn physical_output_transport_preserves_unix_wait_status_and_bytes() {
+        // The owned init crosses a serialization boundary. Exit codes alone
+        // lose signal/core bits, and text conversion would lose arbitrary I/O.
+        for raw_status in [0, 23 << 8, libc::SIGTERM, libc::SIGABRT | 0x80] {
+            let output = Output {
+                status: std::process::ExitStatus::from_raw(raw_status),
+                stdout: vec![0, 0xff, b'\n'],
+                stderr: vec![0x80, 0, b'\r'],
+            };
+            let wire = serde_json::to_vec(&DbtPhysicalOutput::from_output(output)).unwrap();
+            let transported: DbtPhysicalOutput = serde_json::from_slice(&wire).unwrap();
+            let transported = transported.into_output();
+            assert_eq!(transported.status.into_raw(), raw_status);
+            assert_eq!(transported.stdout, [0, 0xff, b'\n']);
+            assert_eq!(transported.stderr, [0x80, 0, b'\r']);
+        }
     }
 
     #[test]

@@ -30,6 +30,21 @@ load(
 
 oncall("hermit")
 
+# These fixtures are driven by the isolation-specific Rust assertion harness.
+# Raw namespace identities intentionally differ between physical launches, so
+# the generic stdout verification macros cannot express this contract.
+cpp_binary(
+    name = "backend_isolation_guest",
+    srcs = ["isolation/backend_isolation.c"],
+    allocator = "malloc",
+)
+
+cpp_binary(
+    name = "backend_isolation_native_launcher",
+    srcs = ["isolation/native_launcher.c"],
+    allocator = "malloc",
+)
+
 [
     hermit_shell_test(
         chaos = True,

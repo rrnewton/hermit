@@ -9,110 +9,21 @@
 
 use std::fs;
 use std::io::Read;
-use std::io::Write;
-use std::os::fd::AsRawFd;
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Child;
 use std::process::Command;
 use std::process::ExitStatus;
-use std::process::Stdio;
 use std::time::Duration;
 use std::time::Instant;
+
+#[path = "bounded_command.rs"]
+mod command_capture;
 
 use hermit::canonical_verdict::VerificationReport;
 use regex::Regex;
 
 const MIB: u64 = 1024 * 1024;
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-
-struct ProcessGroup {
-    child: Child,
-    reaped: bool,
-}
-
-impl Drop for ProcessGroup {
-    fn drop(&mut self) {
-        if self.reaped {
-            // Reaping releases ownership of the numeric PID/process-group ID.
-            // Never send a signal to that number after it may be reused.
-            return;
-        }
-        // Only this newly created child process group is targeted. The outer
-        // official runner retains ownership of its complete descendant cgroup.
-        unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) };
-        let _ = self.child.wait();
-    }
-}
-
-struct CapturedStream<R> {
-    pipe: R,
-    output: fs::File,
-    name: &'static str,
-    limit: u64,
-    written: u64,
-    eof: bool,
-}
-
-impl<R: Read + AsRawFd> CapturedStream<R> {
-    fn new(pipe: R, directory: &Path, name: &'static str, limit: u64) -> Self {
-        // SAFETY: this is the parent's owned pipe read end. Its nonblocking
-        // flag does not change the child's separate write end.
-        let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
-        assert!(
-            flags >= 0,
-            "read capture flags: {}",
-            std::io::Error::last_os_error()
-        );
-        let changed =
-            unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
-        assert_eq!(
-            changed,
-            0,
-            "set capture flags: {}",
-            std::io::Error::last_os_error()
-        );
-        Self {
-            pipe,
-            output: fs::File::create(directory.join(name)).expect("capture file"),
-            name,
-            limit,
-            written: 0,
-            eof: false,
-        }
-    }
-
-    fn drain(&mut self) {
-        if self.eof {
-            return;
-        }
-        let mut buffer = [0; 8192];
-        // Bound each poll's work so a continuously writing child cannot keep
-        // the other stream, log checks or wall deadline from being serviced.
-        for _ in 0..8 {
-            let count = match self.pipe.read(&mut buffer) {
-                Ok(0) => {
-                    self.eof = true;
-                    break;
-                }
-                Ok(count) => count,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) => panic!("read {}: {error}", self.name),
-            };
-            let keep = count.min((self.limit - self.written) as usize);
-            self.output
-                .write_all(&buffer[..keep])
-                .expect("retain stream");
-            self.written += keep as u64;
-            // Retained files never exceed their bound. An observed extra byte
-            // fails the test and the still-owned ProcessGroup kills/reaps it;
-            // truncated output can never be accepted as a successful command.
-            assert_eq!(keep, count, "{} exceeded its output bound", self.name);
-        }
-    }
-}
 
 pub(super) fn bounded_read(path: &Path, limit: u64) -> Vec<u8> {
     let mut bytes = Vec::new();
@@ -201,57 +112,29 @@ fn bounded_command_polling(
     fs::create_dir_all(directory).expect("create retained command directory");
     fs::write(directory.join("command.txt"), format!("{command:?}\n"))
         .expect("retain actual command");
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
-    // Limit the captured streams, not all file descriptors: RLIMIT_FSIZE also
-    // rejects the KVM backend's required 1 GiB anonymous memory backing file.
     let start = Instant::now();
-    let mut child = ProcessGroup {
-        child: command.spawn().expect("start bounded command"),
-        reaped: false,
-    };
-    let mut stdout = CapturedStream::new(
-        child.child.stdout.take().expect("stdout pipe"),
+    let receipt = command_capture::run(
+        command,
         directory,
-        "stdout",
-        64 * MIB,
+        command_capture::Limits {
+            wall: wall_limit,
+            stdout: 64 * MIB,
+            stderr: 16 * MIB,
+        },
+        || {
+            check_outputs(directory);
+            poll();
+        },
     );
-    let mut stderr = CapturedStream::new(
-        child.child.stderr.take().expect("stderr pipe"),
-        directory,
-        "stderr",
-        16 * MIB,
+    assert!(
+        receipt.complete(),
+        "bounded command failed: {receipt:?}; evidence at {}",
+        directory.display()
     );
-    let status = loop {
-        stdout.drain();
-        stderr.drain();
-        check_outputs(directory);
-        poll();
-        // Do not reap the direct child until both pipes reach EOF. If a
-        // descendant retains a write end after the child exits, the unchanged
-        // deadline fails while we still own the unreaped process-group ID.
-        // There are no reader threads whose join could block after reaping.
-        if stdout.eof
-            && stderr.eof
-            && let Some(status) = child.child.try_wait().expect("poll bounded command")
-        {
-            child.reaped = true;
-            break status;
-        }
-        assert!(
-            start.elapsed() < wall_limit,
-            "{}-second wall limit exceeded; evidence at {}",
-            wall_limit.as_secs(),
-            directory.display()
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    };
     // Fast exit must still pass size and wall checks.
     check_outputs(directory);
     assert!(start.elapsed() < wall_limit);
+    let status = receipt.status.expect("complete command status");
     fs::write(directory.join("status.txt"), format!("{status}\n")).expect("retain actual status");
     status
 }

@@ -1,6 +1,8 @@
 # Backend isolation audit
 
 Source baseline: `5a3fdbb3c80a6f1673d8a51f617c660ffa2e6ca3`.
+This audit describes that historical baseline, not later implementations or
+their conformance.
 Reverie dependency: `255d2e0b8f5ba017bcc7233711c63583e4fe419e`, as pinned in
 `hermit-cli/Cargo.toml:67`. Source findings below are not live pass claims.
 Exact-baseline host measurements are summarized below; other required mode/root
@@ -204,8 +206,9 @@ observer lacked complete thread/sibling traversal; guest raw stat and sentinel
 results are retained as evidence, while independent physical corroboration
 remains pending. No observer limitation changes the required assertions.
 
-Raw outputs, stderr, exit status, resource reports and physical observations are
-retained under `ignored/backend-isolation-measurement/host-BACKEND-run-default-v2.*`.
+Each of the seven host-root probes retained raw stdout/stderr, exit status,
+resource accounting and physical observations. The stdout digests below bind
+those collections; their private run artifacts are not part of this repository.
 The original `default-matrix-v2.sh` producer bytes were overwritten during
 observer iteration and are unavailable; its current contents are not the exact
 driver of these retained collections. The retained launcher-v2 binary SHA256 is

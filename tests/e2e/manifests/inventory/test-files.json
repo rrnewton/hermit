@@ -3625,6 +3625,30 @@
       "why": "tests/helpers.bzl is owned by Meta Buck test targets: helpers.bzl defines Buck macros and target wiring for internal tests. Buck evaluates it during graph construction; it is build policy, not guest code runnable by the public manifest harness."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/isolation/backend_isolation.c",
+      "runner": "hermit-cli/tests/backend_isolation_launch.rs and tests/isolation/conformance.rs",
+      "why": "tests/isolation/backend_isolation.c is owned by the isolation assertion harness: This guest reports complete namespace, filesystem, network, and descriptor observations. Raw physical identities require relational assertions against the immediate host and other backends; generic stdout verification cannot express that contract. The limited launch regression retains the same full report."
+    },
+    {
+      "disposition": "special-driver",
+      "path": "tests/isolation/conformance.rs",
+      "runner": "backend isolation conformance operators",
+      "why": "tests/isolation/conformance.rs is owned by backend isolation conformance operators: This rust-script driver defaults to the full required backend, runner, launch-path, and namespace-policy matrix. Explicit selections name their smaller scope. Missing resources or incomplete evidence fail requested cells rather than disappearing as successful skips."
+    },
+    {
+      "disposition": "integration-helper",
+      "path": "tests/isolation/driver.rs",
+      "runner": "hermit-cli isolation integration targets and tests/isolation/conformance.rs",
+      "why": "tests/isolation/driver.rs is owned by the isolation integration targets and standalone runner: This shared module snapshots and compiles the fixtures, records producer and executable hashes, invokes bounded safehermit collection, and preserves typed full-contract assertion failures independently of a named limited launch regression. It is not itself a guest or standalone executable."
+    },
+    {
+      "disposition": "integration-helper",
+      "path": "tests/isolation/native_launcher.c",
+      "runner": "hermit-cli isolation integration targets and tests/isolation/conformance.rs",
+      "why": "tests/isolation/native_launcher.c is owned by the isolation assertion harness: This native helper supplies controlled inheritable descriptor, network, and IPC sentinels and observes only the known CLI descendant tree. Independent physical receipts remain required; missing discovery APIs, races, and incomplete observations are explicit failures."
+    },
+    {
       "disposition": "special-driver",
       "path": "tests/manifest-cli.rs",
       "runner": "test-corpus operators",

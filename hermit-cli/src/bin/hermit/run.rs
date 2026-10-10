@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::collections::VecDeque;
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsStr;
 use std::fmt;
@@ -68,6 +71,7 @@ use reverie::process::MountFlags;
 use reverie::process::Namespace;
 use reverie::process::Output;
 
+use super::container::ContainerInputs;
 use super::container::IdentityGuard;
 use super::container::PolicyRefusal;
 use super::container::apply_affinity;
@@ -778,6 +782,49 @@ fn forwarded_records_in_log(path: &Path) -> Result<usize, Error> {
 struct PreparedMounts {
     mounts: Vec<Mount>,
     identity_sources: IdentityGuard,
+    inputs: ContainerInputs,
+}
+
+/// Retain the public parser's complete operation and its filesystem intent.
+/// Source presence alone cannot distinguish a bind from a fresh filesystem.
+#[derive(Debug, Clone)]
+struct RequestedMount {
+    mount: Mount,
+    fresh_filesystem: bool,
+}
+
+impl RequestedMount {
+    fn get_source(&self) -> Option<&Path> {
+        self.mount.get_source()
+    }
+
+    fn get_target(&self) -> &Path {
+        self.mount.get_target()
+    }
+}
+
+impl FromStr for RequestedMount {
+    type Err = <Mount as FromStr>::Err;
+
+    fn from_str(request: &str) -> Result<Self, Self::Err> {
+        let mount = Mount::from_str(request)?;
+        // Match the public parser: trim each whole item, retain the last exact
+        // key, and do not separately trim keys/values. Bare type means bind;
+        // an explicit empty value remains the filesystem branch's kernel error.
+        let mut fstype = None;
+        for item in request.split(',').map(str::trim) {
+            let (key, value) = item
+                .split_once('=')
+                .map_or((item, None), |(key, value)| (key, Some(value)));
+            if key == "type" {
+                fstype = value;
+            }
+        }
+        Ok(Self {
+            mount,
+            fresh_filesystem: fstype.is_some_and(|fstype| fstype != "bind"),
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -791,6 +838,105 @@ enum GuestPathMapping {
     Mapped(PathBuf),
     Hidden,
     Unchanged,
+}
+
+/// The real links and traversal directories used by a declared program input.
+/// The guest still executes its original spelling, including parent components.
+#[derive(Default)]
+struct ScratchInputGraph {
+    directories: BTreeSet<PathBuf>,
+    links: BTreeMap<PathBuf, PathBuf>,
+}
+
+impl ScratchInputGraph {
+    fn extend(&mut self, other: Self) {
+        self.directories.extend(other.directories);
+        self.links.extend(other.links);
+    }
+}
+
+struct ScratchExecutable {
+    guest: PathBuf,
+    host: PathBuf,
+    graph: ScratchInputGraph,
+}
+
+struct ScratchPathResolution {
+    target: PathBuf,
+    graph: ScratchInputGraph,
+    directory: bool,
+}
+
+#[derive(Default)]
+struct ScratchTargetPlan {
+    graph: ScratchInputGraph,
+    ready_binds: BTreeSet<usize>,
+}
+
+struct ScratchBinding {
+    guest: PathBuf,
+    host: PathBuf,
+    directory: bool,
+    readonly: bool,
+}
+
+/// The actual staging view before a user mount and the final /tmp bind.
+struct ScratchMountView<'a> {
+    backing: &'a Path,
+    previous: &'a [(PathBuf, &'a RequestedMount)],
+    directory_inputs: &'a [ScratchBinding],
+    directory_target: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ScratchPathPurpose<'a> {
+    Executable,
+    MountTarget(&'a ScratchMountView<'a>),
+}
+
+fn prepare_scratch_target(backing: &Path, guest: &Path, directory: bool) -> Result<PathBuf, Error> {
+    let target = backing.join(guest.strip_prefix(TMP_DIR)?);
+    anyhow::ensure!(
+        !target
+            .components()
+            .any(|component| component == std::path::Component::ParentDir),
+        "prepared scratch target contains a parent component"
+    );
+    if directory {
+        fs::create_dir_all(&target)?;
+    } else {
+        fs::create_dir_all(target.parent().context("scratch input has no parent")?)?;
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+        {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                anyhow::ensure!(
+                    fs::symlink_metadata(&target)?.is_file(),
+                    "prepared scratch input target is not a regular file"
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(target)
+}
+
+/// Keep dot components (and a trailing slash) because Linux requires their
+/// preceding object to be a directory, even when that component is cancelled.
+fn scratch_path_components(path: &Path) -> VecDeque<std::ffi::OsString> {
+    let bytes = path.as_os_str().as_bytes();
+    let mut components: VecDeque<_> = bytes
+        .split(|byte| *byte == b'/')
+        .filter(|component| !component.is_empty())
+        .map(|component| OsStr::from_bytes(component).to_owned())
+        .collect();
+    if bytes.last() == Some(&b'/') {
+        components.push_back(OsStr::new(".").to_owned());
+    }
+    components
 }
 
 // Just a place to put the clap(flatten) directive..
@@ -854,8 +1000,8 @@ pub struct RunOpts {
     #[clap(skip)]
     backend: Option<Backend>,
 
-    /// Program to run. Bare names are resolved using the guest PATH. Paths under host `/tmp` are
-    /// hidden by Hermit's isolated `/tmp` unless `--tmp=/tmp` or an explicit mount exposes them.
+    /// Program to run. Bare names use the guest PATH. Program and interpreter files hidden by
+    /// default private `/tmp` are preserved as declared inputs; other files need explicit binds.
     #[clap(value_name = "PROGRAM")]
     program: PathBuf,
 
@@ -914,6 +1060,12 @@ pub struct RunOpts {
     /// never serialized, like `resolved_happens_before`.
     #[clap(skip)]
     host_input_log: Option<PathBuf>,
+
+    /// Resolved backend bootstrap inputs, pinned by the common launch before
+    /// private scratch hides them. These are never CLI arguments or serialized
+    /// run configuration. Their visible mounts remain conformance observations.
+    #[clap(skip)]
+    bootstrap_inputs: Vec<PathBuf>,
 
     /// Opt in to keeping a core file for each guest process that a
     /// core-dumping signal (SIGSEGV, SIGABRT, SIGBUS, ...) kills. The core is
@@ -1045,7 +1197,7 @@ pub struct RunOpts {
     /// Mount a file or directory. This uses the same syntax as Docker's `--mount` option. The
     /// source must exist on the host. For simple bind mounts into guest `/tmp`, use `--bind`.
     #[clap(long, value_name = "path")]
-    mount: Vec<Mount>,
+    mount: Vec<RequestedMount>,
 
     /// Bind-mount a host file or directory into guest `/tmp`. Use `SOURCE` to preserve its path or
     /// `SOURCE:TARGET` to choose a target under `/tmp`; the source must already exist.
@@ -1371,6 +1523,12 @@ pub struct RunOpts {
     /// isolated path such as `/tmp` refers to the guest view.
     #[clap(long, value_name = "path")]
     workdir: Option<String>,
+
+    /// The explicit logical cwd captured before entering the container. Keep
+    /// parent and symlink components for Linux to resolve against the completed
+    /// mounts, and use the same absolute spelling for the carrier and guest.
+    #[clap(skip)]
+    resolved_workdir: Option<PathBuf>,
 
     /// Load options from a run config file: YAML (or JSON) naming `hermit run` options by their
     /// long names, as `--save-config` writes it. The file's options count as given on the command
@@ -2554,6 +2712,744 @@ fn non_e9patch_validation_preserves_parent_component_paths() {
     ro.validate_program().unwrap();
 }
 
+#[test]
+fn explicit_workdir_keeps_kernel_symlink_parent_resolution() {
+    let root = tempfile::tempdir().unwrap();
+    let actual = root.path().join("actual");
+    fs::create_dir_all(actual.join("nested")).unwrap();
+    let link = root.path().join("link");
+    std::os::unix::fs::symlink(actual.join("nested"), &link).unwrap();
+    let selected = link.join("..");
+    let selected_arg = format!("--workdir={}", selected.display());
+    let mut options = run_opts_for(&["hermit", "run", &selected_arg, "/bin/true"]);
+    options.capture_workdir().unwrap();
+
+    let command = options.guest_command().unwrap();
+    let cwd = command.get_current_dir().unwrap();
+    assert_eq!(cwd, selected);
+    assert_eq!(fs::canonicalize(cwd).unwrap(), actual);
+    // This remains a distinct policy from mapping a rewrite onto a guest path.
+    assert!(normalize_guest_path(cwd).is_err());
+}
+
+#[test]
+fn scratch_executable_preserves_a_parent_relative_input() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path().join("cwd");
+    fs::create_dir(&cwd).unwrap();
+    let tool = root.path().join("tool");
+    fs::write(&tool, b"fixture").unwrap();
+    let options = run_opts_for(&["hermit", "run", "../tool"]);
+    let input = options
+        .resolve_scratch_executable(Path::new("../tool"), &cwd, OsStr::new(""))
+        .unwrap();
+    assert_eq!(input.guest, tool);
+    assert_eq!(input.host, fs::canonicalize(cwd.join("../tool")).unwrap());
+    assert_eq!(options.guest_command().unwrap().get_program(), "../tool");
+}
+
+#[test]
+fn scratch_input_keeps_a_real_link_and_cancelled_directory() {
+    let root = tempfile::TempDir::new_in(TMP_DIR).unwrap();
+    let cwd = root.path().join("cwd");
+    let tools = root.path().join("tools");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(tools.join("nested")).unwrap();
+    let tool = tools.join("guest");
+    fs::write(&tool, b"fixture").unwrap();
+    let alias = root.path().join("alias");
+    std::os::unix::fs::symlink("tools/nested/..", &alias).unwrap();
+    let options = run_opts_for(&["hermit", "run", "../alias/guest"]);
+    let input = options
+        .resolve_scratch_executable(Path::new("../alias/guest"), &cwd, OsStr::new(""))
+        .unwrap();
+    assert_eq!(input.guest, tool);
+    assert_eq!(input.host, tool);
+    assert_eq!(input.graph.links.get(&alias), Some(&alias));
+    assert!(input.graph.directories.contains(&tools.join("nested")));
+
+    fs::write(root.path().join("not-a-directory"), b"fixture").unwrap();
+    assert!(
+        options
+            .resolve_scratch_executable(
+                Path::new("../not-a-directory/../tools/guest"),
+                &cwd,
+                OsStr::new("")
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn requested_mount_preserves_the_public_parser_and_filesystem_intent() {
+    for (request, filesystem) in [
+        ("source=/source,target=/tmp/target", false),
+        ("type,source=/source,target=/tmp/target", false),
+        ("type=bind,source=/source,target=/tmp/target", false),
+        ("type=tmpfs,target=/tmp/target,readonly", true),
+        ("type=ext4,source=/source,target=/tmp/target", true),
+        ("type=,target=/tmp/target", true),
+        (
+            "type=tmpfs,type=bind,source=/source,target=/tmp/target",
+            false,
+        ),
+        ("type=bind, type=tmpfs,target=/tmp/target", true),
+        ("type= tmpfs,target=/tmp/target", true),
+    ] {
+        let retained = RequestedMount::from_str(request).unwrap();
+        assert_eq!(retained.mount, Mount::from_str(request).unwrap());
+        assert_eq!(retained.fresh_filesystem, filesystem, "{request}");
+    }
+    for request in [
+        "type=tmpfs,target=/tmp/target,bind-propagation=private",
+        "type =tmpfs,target=/tmp/target",
+    ] {
+        assert!(Mount::from_str(request).is_err());
+        assert!(RequestedMount::from_str(request).is_err());
+    }
+}
+
+#[test]
+fn requested_filesystem_targets_keep_the_physical_staging_boundary() {
+    let root = tempfile::TempDir::new_in(TMP_DIR).unwrap();
+    let backing = tempfile::TempDir::new_in(TMP_DIR).unwrap();
+    let outside = root.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    let link = root.path().join("absolute-link");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    let target = link.join("missing");
+    let requested = format!("--mount=type=tmpfs,target={}", target.display());
+    let options = run_opts_for(&["hermit", "run", &requested, "/bin/true"]);
+    let plan = options.scratch_mount_targets(backing.path(), &[]).unwrap();
+    assert!(plan.ready_binds.is_empty());
+    let graph = plan.graph;
+    assert!(graph.directories.is_empty());
+    assert!(graph.links.is_empty());
+    assert!(!outside.join("missing").exists());
+    assert_eq!(fs::read_dir(backing.path()).unwrap().count(), 0);
+    assert_eq!(options.mount[0].get_target(), target);
+
+    let escaped = run_opts_for(&[
+        "hermit",
+        "run",
+        "--mount=type=tmpfs,target=/tmp/../unprepared-target",
+        "/bin/true",
+    ]);
+    let plan = escaped.scratch_mount_targets(backing.path(), &[]).unwrap();
+    assert!(plan.ready_binds.is_empty());
+    let graph = plan.graph;
+    assert!(graph.directories.is_empty());
+    assert!(graph.links.is_empty());
+
+    let source = root.path().join("source");
+    fs::create_dir(&source).unwrap();
+    let bind_target = root.path().join("bound");
+    let bind = format!(
+        "--mount=type=bind,source={},target={}",
+        source.display(),
+        bind_target.display()
+    );
+    let nested = format!(
+        "--mount=type=tmpfs,target={}",
+        bind_target.join("missing").display()
+    );
+    let covered = run_opts_for(&["hermit", "run", &bind, &nested, "/bin/true"]);
+    let plan = covered.scratch_mount_targets(backing.path(), &[]).unwrap();
+    assert!(plan.ready_binds.is_empty());
+    let graph = plan.graph;
+    assert_eq!(
+        graph.directories,
+        BTreeSet::from([root.path().to_path_buf()])
+    );
+    assert!(graph.links.is_empty());
+    assert_eq!(fs::read_dir(&source).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(backing.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn common_container_prepares_an_independent_target_after_an_opaque_mount() {
+    let root = tempfile::TempDir::new_in(TMP_DIR).unwrap();
+    let source = root.path().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("marker"), b"declared bind").unwrap();
+    let first = root.path().join("first");
+    let selected = root.path().join("independent");
+    let source_file = root.path().join("source-file");
+    fs::write(&source_file, b"declared file").unwrap();
+    let file_target = root.path().join("bound-file");
+    let first_mount = format!("--mount=type=tmpfs,target={}", first.display());
+    let nested_bind = format!(
+        "--mount=type=bind,source={},target={}",
+        source.display(),
+        first.join("sub").display()
+    );
+    let independent_mount = format!("--mount=type=tmpfs,target={}", selected.display());
+    let file_bind = format!(
+        "--mount=type=bind,source={},target={}",
+        source_file.display(),
+        file_target.display()
+    );
+    let workdir = format!("--workdir={}", selected.display());
+    let mut options = run_opts_for(&[
+        "hermit",
+        "run",
+        &first_mount,
+        &nested_bind,
+        &independent_mount,
+        &file_bind,
+        &workdir,
+        "/bin/true",
+    ]);
+    options.capture_workdir().unwrap();
+    let child_file = file_target.clone();
+    let child_first = first.clone();
+    let (observations, ()) = options
+        .with_container(
+            (),
+            "native independent requested target control".to_owned(),
+            Some(Duration::from_secs(10)),
+            move |_, _| {
+                let current = std::env::current_dir()?;
+                let directory = std::ffi::CString::new(current.as_os_str().as_bytes())?;
+                let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+                // SAFETY: the CString and output buffer are valid for statfs.
+                let result = unsafe { libc::statfs(directory.as_ptr(), filesystem.as_mut_ptr()) };
+                if result != 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                // SAFETY: successful statfs initialized the output above.
+                let filesystem = unsafe { filesystem.assume_init() };
+                Ok((
+                    current,
+                    filesystem.f_type,
+                    fs::read_dir(".")?.count(),
+                    fs::read(child_first.join("sub/marker"))?,
+                    fs::read(&child_file)?,
+                    fs::metadata(&child_file)?.is_file(),
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(observations.0, selected);
+    assert_eq!(observations.1, libc::TMPFS_MAGIC);
+    assert_eq!(observations.2, 0);
+    assert_eq!(observations.3, b"declared bind");
+    assert_eq!(observations.4, b"declared file");
+    assert!(observations.5);
+    assert!(!first.exists());
+    assert!(!file_target.exists());
+    assert_eq!(fs::read(source.join("marker")).unwrap(), b"declared bind");
+    assert_eq!(fs::read(&source_file).unwrap(), b"declared file");
+}
+
+#[test]
+fn common_container_preserves_a_prior_bind_target_real_link_and_source_view() {
+    use std::os::unix::fs::MetadataExt;
+
+    for link_target in ["tools/nested/..", "tools"] {
+        let root = tempfile::TempDir::new_in(TMP_DIR).unwrap();
+        let tools = root.path().join("tools");
+        fs::create_dir_all(tools.join("nested")).unwrap();
+        fs::write(root.path().join("unrelated-caller-entry"), b"hidden").unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(link_target, &alias).unwrap();
+        let original = fs::symlink_metadata(&alias).unwrap();
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(source.join("nested")).unwrap();
+        fs::create_dir(source.join("leaf")).unwrap();
+        fs::write(source.join("marker"), b"bound source view").unwrap();
+        let source_identity = fs::metadata(&source).unwrap();
+        let selected = tools.join("leaf");
+        let bind = format!(
+            "--mount=type=bind,source={},target={}",
+            source.display(),
+            alias.display()
+        );
+        let filesystem = format!("--mount=type=tmpfs,target={}", selected.display());
+        let workdir = format!("--workdir={}", selected.display());
+        let mut options =
+            run_opts_for(&["hermit", "run", &bind, &filesystem, &workdir, "/bin/true"]);
+        options.capture_workdir().unwrap();
+        let child_alias = alias.clone();
+        let child_tools = tools.clone();
+        let unrelated = root.path().join("unrelated-caller-entry");
+        let (observations, ()) = options
+            .with_container(
+                (),
+                "native prior-bind real target link control".to_owned(),
+                Some(Duration::from_secs(10)),
+                move |_, _| {
+                    let current = std::env::current_dir()?;
+                    let directory = std::ffi::CString::new(current.as_os_str().as_bytes())?;
+                    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+                    // SAFETY: the CString and output buffer are valid for statfs.
+                    let result =
+                        unsafe { libc::statfs(directory.as_ptr(), filesystem.as_mut_ptr()) };
+                    if result != 0 {
+                        return Err(std::io::Error::last_os_error().into());
+                    }
+                    // SAFETY: successful statfs initialized the output above.
+                    let filesystem = unsafe { filesystem.assume_init() };
+                    let link = fs::symlink_metadata(&child_alias)?;
+                    let bound = fs::metadata(&child_tools)?;
+                    Ok((
+                        current,
+                        filesystem.f_type,
+                        fs::read_dir(".")?.count(),
+                        fs::read_link(&child_alias)?,
+                        (link.dev(), link.ino(), link.mode()),
+                        (bound.dev(), bound.ino(), bound.mode()),
+                        fs::read(child_alias.join("marker"))?,
+                        unrelated.try_exists()?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(observations.0, selected);
+        assert_eq!(observations.1, libc::TMPFS_MAGIC);
+        assert_eq!(observations.2, 0);
+        assert_eq!(observations.3, Path::new(link_target));
+        assert_eq!(
+            observations.4,
+            (original.dev(), original.ino(), original.mode())
+        );
+        assert_eq!(
+            observations.5,
+            (
+                source_identity.dev(),
+                source_identity.ino(),
+                source_identity.mode()
+            )
+        );
+        assert_eq!(observations.6, b"bound source view");
+        assert!(!observations.7);
+        assert_eq!(options.mount[0].get_target(), alias);
+        assert_eq!(fs::read_dir(source.join("leaf")).unwrap().count(), 0);
+        assert_eq!(
+            fs::read(source.join("marker")).unwrap(),
+            b"bound source view"
+        );
+    }
+}
+
+#[test]
+fn common_container_prepares_a_raw_filesystem_target_before_real_links() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = tempfile::TempDir::new_in(TMP_DIR).unwrap();
+    let tools = root.path().join("tools");
+    fs::create_dir_all(tools.join("nested")).unwrap();
+    fs::write(root.path().join("unrelated-caller-entry"), b"hidden").unwrap();
+    let alias = root.path().join("alias");
+    std::os::unix::fs::symlink("tools/nested/..", &alias).unwrap();
+    let original = fs::symlink_metadata(&alias).unwrap();
+    let target = alias.join("fresh");
+    let requested = format!("--mount=type=tmpfs,target={}", target.display());
+    let workdir = format!("--workdir={}", target.display());
+    let mut options = run_opts_for(&["hermit", "run", &requested, &workdir, "/bin/true"]);
+    options.capture_workdir().unwrap();
+    assert_eq!(options.mount[0].get_target(), target);
+    let child_alias = alias.clone();
+    let unrelated = root.path().join("unrelated-caller-entry");
+    let (observations, ()) = options
+        .with_container(
+            (),
+            "native requested filesystem target control".to_owned(),
+            Some(Duration::from_secs(10)),
+            move |_, _| {
+                let current = std::env::current_dir()?;
+                let directory = std::ffi::CString::new(current.as_os_str().as_bytes())?;
+                let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+                // SAFETY: the CString and output buffer are valid for statfs.
+                let result = unsafe { libc::statfs(directory.as_ptr(), filesystem.as_mut_ptr()) };
+                if result != 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                // SAFETY: successful statfs initialized the output above.
+                let filesystem = unsafe { filesystem.assume_init() };
+                let link = fs::symlink_metadata(&child_alias)?;
+                Ok((
+                    current,
+                    fs::read_link(&child_alias)?,
+                    (link.dev(), link.ino(), link.mode()),
+                    filesystem.f_type,
+                    fs::read_dir(".")?.count(),
+                    unrelated.try_exists()?,
+                    fs::read_to_string("/proc/self/mountinfo")?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(observations.0, tools.join("fresh"));
+    assert_eq!(observations.1, Path::new("tools/nested/.."));
+    assert_eq!(
+        observations.2,
+        (original.dev(), original.ino(), original.mode())
+    );
+    assert_eq!(observations.3, libc::TMPFS_MAGIC);
+    assert_eq!(observations.4, 0);
+    assert!(!observations.5);
+    assert!(observations.6.contains(" - tmpfs "));
+    assert_eq!(options.mount[0].get_target(), target);
+    assert!(!tools.join("fresh").exists());
+
+    let not_directory = root.path().join("not-directory");
+    fs::write(&not_directory, b"file").unwrap();
+    let invalid = format!(
+        "--mount=type=tmpfs,target={}",
+        not_directory.join("../invalid").display()
+    );
+    let options = run_opts_for(&["hermit", "run", &invalid, "/bin/true"]);
+    let backing = tempfile::TempDir::new_in(TMP_DIR).unwrap();
+    assert!(options.scratch_mount_targets(backing.path(), &[]).is_err());
+    assert_eq!(fs::read(&not_directory).unwrap(), b"file");
+    assert_eq!(fs::read_dir(backing.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn common_container_keeps_a_missing_target_inside_an_earlier_user_bind_missing() {
+    let root = tempfile::TempDir::new_in(TMP_DIR).unwrap();
+    let source = root.path().join("source");
+    fs::create_dir(&source).unwrap();
+    let target = root.path().join("bound");
+    let bind = format!(
+        "--mount=type=bind,source={},target={}",
+        source.display(),
+        target.display()
+    );
+    let filesystem = format!(
+        "--mount=type=tmpfs,target={}",
+        target.join("missing").display()
+    );
+    let options = run_opts_for(&["hermit", "run", &bind, &filesystem, "/bin/true"]);
+    let outcome = options.with_container(
+        (),
+        "native prior-bind target refusal control".to_owned(),
+        Some(Duration::from_secs(10)),
+        |_, _| Ok(()),
+    );
+    let error = outcome.unwrap_err();
+    assert!(
+        error.to_string().contains("errno: ENOENT, context: Mount"),
+        "{error}"
+    );
+    assert_eq!(fs::read_dir(&source).unwrap().count(), 0);
+}
+
+#[test]
+fn common_container_preserves_a_raw_link_and_selected_cwd() {
+    let root = tempfile::TempDir::new_in(TMP_DIR).unwrap();
+    let tools = root.path().join("tools");
+    fs::create_dir_all(tools.join("nested")).unwrap();
+    let tool = tools.join("guest");
+    fs::write(&tool, b"fixture").unwrap();
+    let alias = root.path().join("alias");
+    std::os::unix::fs::symlink("tools/nested", &alias).unwrap();
+    let selected = alias.join("..");
+    let selected_arg = format!("--workdir={}", selected.display());
+    let mut options = run_opts_for(&["hermit", "run", &selected_arg, "./guest"]);
+    options.capture_workdir().unwrap();
+    let (observations, ()) = options
+        .with_container(
+            (),
+            "native input graph control".to_owned(),
+            Some(Duration::from_secs(10)),
+            move |_, _| {
+                Ok((
+                    std::env::current_dir()?,
+                    fs::read("./guest")?,
+                    fs::read_link(&alias)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        observations,
+        (tools, b"fixture".to_vec(), PathBuf::from("tools/nested"))
+    );
+}
+
+#[test]
+fn common_container_retires_child_input_handles_and_keeps_parent_pins_until_reap() {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::net::UnixStream;
+    use std::process::Child;
+    use std::process::ExitStatus;
+    use std::process::Stdio;
+
+    const SAMPLER_FIXTURE: &str = "HERMIT_TEST_INPUT_PIN_SAMPLER";
+
+    struct SamplerChild(Option<Child>);
+    impl SamplerChild {
+        fn wait(mut self) -> std::io::Result<ExitStatus> {
+            let status = self.0.as_mut().unwrap().wait()?;
+            self.0.take();
+            Ok(status)
+        }
+    }
+    impl Drop for SamplerChild {
+        fn drop(&mut self) {
+            let Some(mut child) = self.0.take() else {
+                return;
+            };
+            // Child::drop does not reap. On an early error or unwind, terminate
+            // this exact helper and consume its status before releasing it.
+            let state = child.try_wait();
+            let kill = match &state {
+                Ok(Some(_)) => Ok(()),
+                _ => child.kill(),
+            };
+            let wait = child.wait();
+            let mut failed = false;
+            for (operation, result) in [
+                ("inspect", state.map(|_| ())),
+                ("terminate", kill),
+                ("reap", wait.map(|_| ())),
+            ] {
+                if let Err(error) = result {
+                    eprintln!("native sampler cleanup could not {operation}: {error}");
+                    failed = true;
+                }
+            }
+            if failed && !std::thread::panicking() {
+                panic!("native sampler cleanup failed");
+            }
+        }
+    }
+
+    type Object = (u64, u64, u32);
+    fn object(path: &Path) -> Object {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.mode() & libc::S_IFMT,
+        )
+    }
+    fn source_handles(
+        directory: &Path,
+        fdinfo: &Path,
+        objects: &[Object],
+    ) -> Result<Vec<usize>, Error> {
+        let mut counts = vec![0; objects.len()];
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let contents = fs::read_to_string(fdinfo.join(&name))?;
+            let flags = contents
+                .lines()
+                .find_map(|line| line.strip_prefix("flags:"))
+                .context("fdinfo omitted flags")?;
+            let flags = u32::from_str_radix(flags.trim(), 8)?;
+            if flags & libc::O_PATH as u32 == 0 {
+                continue;
+            }
+            let metadata = fs::metadata(entry.path())?;
+            let identity = (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.mode() & libc::S_IFMT,
+            );
+            for (object, count) in objects.iter().zip(&mut counts) {
+                if *object == identity {
+                    *count += 1;
+                }
+            }
+        }
+        Ok(counts)
+    }
+    fn send(channel: &mut UnixStream, packet: [u64; 3]) -> Result<(), Error> {
+        let mut bytes = [0; 24];
+        for (value, chunk) in packet.iter().zip(bytes.as_chunks_mut::<8>().0) {
+            chunk.copy_from_slice(&value.to_le_bytes());
+        }
+        channel.write_all(&bytes)?;
+        Ok(())
+    }
+    fn receive(channel: &mut UnixStream) -> Result<[u64; 3], Error> {
+        let mut bytes = [0; 24];
+        channel.read_exact(&mut bytes)?;
+        Ok(std::array::from_fn(|index| {
+            u64::from_le_bytes(bytes[index * 8..(index + 1) * 8].try_into().unwrap())
+        }))
+    }
+    fn acknowledge(channel: &mut UnixStream, expected: u8) -> Result<(), Error> {
+        let mut ack = [0];
+        channel.read_exact(&mut ack)?;
+        anyhow::ensure!(ack == [expected], "native sampler acknowledgement mismatch");
+        Ok(())
+    }
+    fn bound(channel: &UnixStream) {
+        channel
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        channel
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+    }
+
+    if let Some(fixture) = std::env::var_os(SAMPLER_FIXTURE) {
+        // A fresh exec keeps this observer outside the new user namespace. The
+        // test harness receives the declared socket on stdin; no pre-exec hook
+        // or allocation in a forked helper is required.
+        let mut channel = UnixStream::from(std::io::stdin().as_fd().try_clone_to_owned().unwrap());
+        bound(&channel);
+        let root = PathBuf::from(fixture);
+        let objects = vec![
+            object(&root.join("cwd")),
+            object(&root.join("tools/guest")),
+            object(&root.join("alias")),
+        ];
+        let [phase, parent_pid, child_pid] = receive(&mut channel).unwrap();
+        assert_eq!(phase, 1);
+        assert!(parent_pid > 0 && parent_pid <= i32::MAX as u64);
+        assert!(child_pid > 0 && child_pid <= i32::MAX as u64);
+        assert_ne!(parent_pid, child_pid);
+        let parent = PathBuf::from(format!("/proc/{parent_pid}"));
+        assert_eq!(
+            source_handles(&parent.join("fd"), &parent.join("fdinfo"), &objects).unwrap(),
+            vec![1; 3]
+        );
+        channel.write_all(&[1]).unwrap();
+        let [phase, reaping_parent, consumed_wait] = receive(&mut channel).unwrap();
+        assert_eq!(phase, 2);
+        assert_eq!(reaping_parent, parent_pid);
+        assert_eq!(consumed_wait, 1);
+        assert_eq!(
+            source_handles(&parent.join("fd"), &parent.join("fdinfo"), &objects).unwrap(),
+            vec![0; 3]
+        );
+        channel.write_all(&[2]).unwrap();
+        return;
+    }
+
+    let root = tempfile::TempDir::new_in(TMP_DIR).unwrap();
+    let cwd = root.path().join("cwd");
+    let tools = root.path().join("tools");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(tools.join("nested")).unwrap();
+    let tool = tools.join("guest");
+    fs::write(&tool, b"fixture").unwrap();
+    let alias = root.path().join("alias");
+    std::os::unix::fs::symlink("tools/nested/..", &alias).unwrap();
+    let objects = vec![object(&cwd), object(&tool), object(&alias)];
+    let expected_cwd = cwd.clone();
+    let (observer, channel) = UnixStream::pair().unwrap();
+    bound(&channel);
+    let mut channel = Some(channel);
+    let observer_log = File::create(root.path().join("sampler.log")).unwrap();
+    let sampler = SamplerChild(Some(
+        std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "run::common_container_retires_child_input_handles_and_keeps_parent_pins_until_reap",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(SAMPLER_FIXTURE, root.path())
+        .stdin(Stdio::from(std::os::fd::OwnedFd::from(observer)))
+        .stdout(Stdio::from(observer_log.try_clone().unwrap()))
+        .stderr(Stdio::from(observer_log))
+            .spawn()
+            .unwrap(),
+    ));
+    let observations = Container::new()
+        .current_dir(cwd)
+        .run(move || -> Result<_, String> {
+            (|| -> Result<_, Error> {
+                // This native evidence handle reports the child's physical PID
+                // in the outer procfs. It is a test guard, never a guest input.
+                let parent_proc = File::open("/proc")?;
+                let parent_pid = std::process::id();
+                let channel = channel
+                    .take()
+                    .context("native proof factory was called twice")?;
+                let options = run_opts_for(&["hermit", "run", "../alias/guest"]);
+                let child_objects = objects.clone();
+                let child_alias = alias.clone();
+                let (observations, (_, mut channel)) = options.with_container(
+                    (parent_proc, channel),
+                    "native source capability lifetime control".to_owned(),
+                    Some(Duration::from_secs(10)),
+                    move |(parent_proc, channel), _| {
+                        let child = source_handles(
+                            Path::new("/proc/self/fd"),
+                            Path::new("/proc/self/fdinfo"),
+                            &child_objects,
+                        )?;
+                        let init = source_handles(
+                            Path::new("/proc/1/fd"),
+                            Path::new("/proc/1/fdinfo"),
+                            &child_objects,
+                        )?;
+                        let mut tasks = Vec::new();
+                        for task in fs::read_dir("/proc/1/task")? {
+                            let task = task?.path();
+                            tasks.push(source_handles(
+                                &task.join("fd"),
+                                &task.join("fdinfo"),
+                                &child_objects,
+                            )?);
+                        }
+                        let host_proc =
+                            PathBuf::from(format!("/proc/self/fd/{}", parent_proc.as_raw_fd()));
+                        let status = fs::read_to_string(host_proc.join("self/status"))?;
+                        let host_pid = status
+                            .lines()
+                            .find_map(|line| line.strip_prefix("Pid:"))
+                            .context("native self status omitted PID")?
+                            .trim()
+                            .parse::<i32>()?;
+                        anyhow::ensure!(host_pid > 0, "native child PID must be positive");
+                        send(channel, [1, parent_pid as u64, host_pid as u64])?;
+                        acknowledge(channel, 1)?;
+                        Ok((
+                            child,
+                            init,
+                            tasks,
+                            host_pid,
+                            std::env::current_dir()?,
+                            fs::read("../alias/guest")?,
+                            fs::read_link(&child_alias)?,
+                        ))
+                    },
+                )?;
+                let parent_after_reap = source_handles(
+                    Path::new("/proc/self/fd"),
+                    Path::new("/proc/self/fdinfo"),
+                    &objects,
+                )?;
+                // The shared owned runner must have actually consumed the wait
+                // status before returning and releasing the parent's pins.
+                // SAFETY: this positive PID was reported by the actual child;
+                // waitpid accepts a null status with WNOHANG.
+                let wait =
+                    unsafe { libc::waitpid(observations.3, std::ptr::null_mut(), libc::WNOHANG) };
+                let reaped = wait == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD);
+                send(&mut channel, [2, parent_pid as u64, u64::from(reaped)])?;
+                acknowledge(&mut channel, 2)?;
+                Ok((observations, parent_after_reap, reaped))
+            })()
+            .map_err(|error| format!("{error:#}"))
+        })
+        .unwrap();
+    assert!(sampler.wait().unwrap().success());
+    let ((child, init, tasks, _, actual_cwd, contents, link), after_reap, reaped) =
+        observations.unwrap();
+    assert_eq!(child, vec![0; 3]);
+    assert_eq!(init, vec![0; 3]);
+    assert!(!tasks.is_empty());
+    assert!(tasks.iter().all(|counts| *counts == vec![0; 3]));
+    assert_eq!(after_reap, vec![0; 3]);
+    assert!(reaped);
+    assert_eq!(actual_cwd, expected_cwd);
+    assert_eq!(contents, b"fixture");
+    assert_eq!(link, Path::new("tools/nested/.."));
+}
+
 /// The guest environment must be identical across backends. Sanitizer leak
 /// detection is disabled in `guest_command()` (the single backend-independent
 /// place) rather than only in the ptrace tracer, so the out-of-process KVM
@@ -2663,7 +3559,7 @@ fn namespace_only_guest_command_preserves_sanitizer_environment() {
 }
 
 #[test]
-fn dbt_rejects_mount_but_accepts_bind_and_workdir() {
+fn dbt_accepts_common_mount_bind_and_workdir_policy() {
     let mut with_mount = run_opts_for(&[
         "hermit",
         "--backend",
@@ -2672,11 +3568,15 @@ fn dbt_rejects_mount_but_accepts_bind_and_workdir() {
         "--mount=type=tmpfs,target=/test",
         "/bin/true",
     ]);
-    let error = with_mount
-        .validate_args_with_perf_support(true)
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("dbt backend cannot apply --mount"));
+    with_mount.validate_args_with_perf_support(true).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let prepared = with_mount.mounts(tmp.path()).unwrap();
+    assert!(
+        prepared
+            .mounts
+            .iter()
+            .any(|mount| mount.get_target() == Path::new("/test"))
+    );
 
     // The adapter applies a bind under /tmp; one outside it has no effect, as
     // for the other backends.
@@ -2692,9 +3592,18 @@ fn dbt_rejects_mount_but_accepts_bind_and_workdir() {
         "/bin/true",
     ]);
     with_bind.validate_args_with_perf_support(true).unwrap();
-    assert_eq!(
-        with_bind.dbt_binds(),
-        vec![(PathBuf::from("/tmp"), PathBuf::from("/tmp/test"))]
+    let prepared = with_bind.mounts(tmp.path()).unwrap();
+    assert!(
+        prepared
+            .mounts
+            .iter()
+            .any(|mount| mount.get_target() == tmp.path().join("test"))
+    );
+    assert!(
+        !prepared
+            .mounts
+            .iter()
+            .any(|mount| mount.get_target() == Path::new("/test"))
     );
 
     let mut with_workdir = run_opts_for(&[
@@ -4161,18 +5070,14 @@ fn no_namespace_uses_host_resources_and_disables_uts_assumption() {
 }
 
 #[test]
-fn dbt_backend_disables_uts_assumption() {
-    // The DBT backend runs the guest under DynamoRIO without Reverie's
-    // `Container`, so it never enters a UTS namespace or applies the
-    // deterministic hostname. `has_uts_namespace` must therefore be false even
-    // with namespaces otherwise enabled, so Detcore's `handle_uname` rewrites
-    // the nodename to `hermetic-container.local` instead of leaking the host
-    // FQDN. Regression guard for DBT uname parity with the ptrace backend.
+fn dbt_backend_keeps_common_uts_assumption() {
+    // DBT now enters the same physical UTS namespace and configured hostname
+    // before starting DynamoRIO or the shared Detcore runtime.
     let mut opts = run_opts_for(&["hermit", "--backend=dbt", "run", "fakeprog"]);
     opts.validate_args_with_perf_support(true).unwrap();
     assert_eq!(opts.selected_backend(), Backend::Dbt);
     assert!(!opts.no_namespace);
-    assert!(!opts.det_opts.det_config.has_uts_namespace);
+    assert!(opts.det_opts.det_config.has_uts_namespace);
 }
 
 #[test]
@@ -5171,9 +6076,8 @@ impl RunOpts {
         self.selected_backend().ensure_available()
     }
 
-    /// Why `--max-log-bytes` cannot end a run of this backend in this namespace
-    /// mode, or `None` when the guest runs inside hermit's PID namespace, which
-    /// dies with the hermit process that would end the run.
+    /// Why `--max-log-bytes` is refused for this backend and namespace mode, or
+    /// `None` when its shutdown path is qualified for this cap.
     ///
     /// The cap ends a run by `_exit(123)` in whichever hermit process crossed
     /// it: the outer process or a container init. That ends the RUN only if the
@@ -5188,13 +6092,18 @@ impl RunOpts {
     /// Reverie sets that option only after the guest exists (below), so it
     /// binds the guest for the rest of the run, not for all of it.
     ///
-    /// So every `--no-namespace` configuration is refused, and DBT, whose guest
-    /// is outside hermit's namespace in both modes, is refused in both:
+    /// Every `--no-namespace` configuration remains refused. DBT also remains
+    /// refused in both namespace modes until its complete log-cap shutdown and
+    /// reaping path is qualified:
     ///
-    /// - DBT, in every namespace mode: `backends::run_dbt` starts `drrun` as a
-    ///   plain child of the outer process. It creates no namespace, and Reverie's
-    ///   DBT launcher sets only a process group and the personality: no
-    ///   parent-death signal and no ptrace attachment.
+    /// - DBT, in default namespace mode, now starts each physical run inside the
+    ///   common owned PID namespace. Its external scheduler runs in a
+    ///   DynamoRIO-managed client task, which is not necessarily the namespace
+    ///   init. Namespace containment alone does not qualify every process that
+    ///   can cross the cap or prove that its guest and runtime have been reaped.
+    ///   `--no-namespace` supplies no PID-namespace containment. The refusal in
+    ///   both modes is retained conservatively; this migration does not qualify
+    ///   those shutdown paths.
     /// - ptrace with `--no-namespace`, and `--backend=e9patch` with it (e9patch
     ///   preprocessing, whose rewritten guest runs on the ptrace backend,
     ///   `runtime_backend`): Reverie's
@@ -5245,9 +6154,9 @@ impl RunOpts {
     fn log_cap_refusal(backend: Backend, no_namespace: bool) -> Option<&'static str> {
         match backend {
             Backend::Dbt => Some(
-                "--backend=dbt: the DynamoRIO guest is a plain child of this hermit process, \
-                 and no PID namespace, parent-death signal or ptrace attachment binds it to \
-                 hermit, so exiting 123 at the cap would leave the guest running",
+                "--backend=dbt: complete log-cap shutdown and reaping of the DynamoRIO guest and runtime \
+                 have not been qualified in either namespace mode; a private PID namespace alone does not \
+                 establish cleanup for every process that can cross the cap",
             ),
             Backend::Liteinst if no_namespace => Some(
                 "--backend=liteinst and --no-namespace: the in-guest LiteInst guest is neither \
@@ -5285,13 +6194,11 @@ impl RunOpts {
         }
     }
 
-    /// Refuses `--max-log-bytes` (exit 122) where [`Self::log_cap_refusal`]
-    /// says the cap could end hermit and leave the guest running: DBT, and
-    /// `--no-namespace` with any backend (`--gdbserver` included, which used
-    /// to be a separate rule here and is now a case of `--no-namespace`).
-    /// Hermit does not supervise the guest tree itself, so the honest answer
-    /// is to refuse the combination rather than report a run as stopped when
-    /// it is not.
+    /// Refuses `--max-log-bytes` (exit 122) for configurations whose complete
+    /// guest shutdown is unqualified by [`Self::log_cap_refusal`]: DBT in both
+    /// namespace modes, and every backend with `--no-namespace` (including
+    /// `--gdbserver`). Namespace containment alone does not qualify every process
+    /// exit or cleanup window.
     pub(crate) fn refuse_unsupervised_log_cap(
         &self,
         max_log_bytes: Option<u64>,
@@ -5456,6 +6363,7 @@ impl RunOpts {
         // Right after validation, which may have turned the preemption timer
         // off, and still before stdin is read or anything is launched.
         self.refuse_happens_before_without_preemption()?;
+        self.capture_workdir()?;
         self.adopt_replayed_schedule_epoch()?;
         // Once every implicit input it records is resolved, and before the
         // guest starts, so a run that fails or hangs still leaves it.
@@ -5607,8 +6515,19 @@ impl RunOpts {
         // Last, so that a run refused above creates no directory.
         self.open_fatal_core_dir()?;
 
-        // DBT uses its dedicated CLI launch adapter. SaBRe, LiteInst, KVM,
-        // e9patch, and ptrace use the common container and run/verify machinery.
+        if self.no_namespace {
+            // A warning must not terminate the run if stderr's reader is gone.
+            let _ = writeln!(
+                std::io::stderr(),
+                "WARNING: --no-namespace is not a sandbox; run trusted guests only. The guest \
+                 inherits the caller UID/GID/capabilities and shares host /proc, filesystem, /tmp, \
+                 localhost/network, ports, Unix sockets, and mutable state between runs. Unsupported \
+                 syscalls can mutate host state; --verify may be less deterministic due to shared state."
+            );
+        }
+
+        // DBT retains its DynamoRIO adapter inside the same physical container
+        // boundary used by the other instrumented paths.
         match backend {
             Backend::Ptrace
             | Backend::Liteinst
@@ -5617,7 +6536,8 @@ impl RunOpts {
             | Backend::Kvm
             | Backend::E9patch => {}
             Backend::Dbt => {
-                let environment = self.guest_command()?.get_captured_envs();
+                let command = self.guest_command()?;
+                let environment = command.get_captured_envs();
                 // Keep the dedicated DynamoRIO launcher, but give it the same
                 // backend capability configuration as the public library path.
                 let config = hermit::prepare_backend_config(self.effective_det_config(), backend);
@@ -5638,9 +6558,8 @@ impl RunOpts {
                     global.log_file.as_deref(),
                     &config,
                     environment,
-                    self.workdir.as_deref().map(Path::new),
-                    self.dbt_binds(),
-                    self.network.uses_local_namespace(self.analyze_networking),
+                    command.get_current_dir(),
+                    self,
                     dbt_verification_stdin,
                 );
             }
@@ -5657,19 +6576,6 @@ impl RunOpts {
             crate::tracing::diagnostic_eprintln!(
                 "hermit: [in-guest-trap] selected: the guest preload is to host the Detcore Tool, \
                  with syscall site patching off (REVERIE_LITEINST_SITE_PATCHING=0)"
-            );
-        }
-
-        if self.no_namespace {
-            // Not `eprintln!`, which panics when stderr's reader has gone
-            // (EPIPE): a warning must not end the run with 101.
-            use std::io::Write as _;
-            let _ = writeln!(
-                std::io::stderr(),
-                "WARNING: --no-namespace is not a sandbox; run trusted guests only. The guest \
-                 inherits the caller UID/GID/capabilities and shares host /proc, filesystem, /tmp, \
-                 localhost/network, ports, Unix sockets, and mutable state between runs. Unsupported \
-                 syscalls can mutate host state; --verify may be less deterministic due to shared state."
             );
         }
 
@@ -5815,12 +6721,6 @@ impl RunOpts {
                 backend.as_str()
             );
         }
-        if backend == Backend::Dbt && !self.mount.is_empty() {
-            anyhow::bail!(
-                "the dbt backend cannot apply --mount because its DynamoRIO adapter has no guest \
-                 mount namespace to apply it in; it applies only --bind targets under /tmp"
-            );
-        }
         if self.backend_engagement_json.is_some()
             && !matches!(backend, Backend::Ptrace | Backend::E9patch | Backend::Dbt)
         {
@@ -5841,19 +6741,9 @@ impl RunOpts {
 
         let config = &mut self.det_opts.det_config;
 
-        // Only the ptrace-family backends launch the guest through Reverie's
-        // `Container` (see `container::default_container`), which unshares
-        // `CLONE_NEWUTS` and applies the deterministic hostname
-        // `hermetic-container.local`. The DBT backend returns early from
-        // dispatch and runs the guest under DynamoRIO with no UTS namespace, so
-        // its `uname()` nodename would otherwise leak the real host FQDN.
-        // Reflect that reality here so Detcore's `handle_uname` deterministic
-        // nodename/domainname rewrite fires for DBT (it is gated on
-        // `!has_uts_namespace`). Guest `sethostname`/`setdomainname` are refused
-        // with a deterministic `EPERM` on every backend, so this never masks a
-        // hostname the guest legitimately set.
-        let backend_applies_uts_hostname = !matches!(backend, Backend::Dbt);
-        config.has_uts_namespace = !self.no_namespace && backend_applies_uts_hostname;
+        // Every physical carrier applies the common UTS configuration before
+        // starting backend workers. Host mode keeps Detcore's emulation policy.
+        config.has_uts_namespace = !self.no_namespace;
 
         if self.no_namespace {
             self.network = NetworkingMode::Host;
@@ -6438,16 +7328,37 @@ impl RunOpts {
     }
 
     fn guest_current_dir(&self, command: &Command) -> Result<PathBuf, Error> {
+        normalize_guest_path(&self.kernel_guest_current_dir(command)?)
+    }
+
+    fn kernel_guest_current_dir(&self, command: &Command) -> Result<PathBuf, Error> {
         let directory = command
             .get_current_dir()
             .map(Path::to_path_buf)
             .unwrap_or(std::env::current_dir()?);
-        let absolute = if directory.is_absolute() {
-            directory
+        if directory.is_absolute() {
+            Ok(directory)
         } else {
-            std::path::absolute(directory)?
-        };
-        normalize_guest_path(&absolute)
+            Ok(std::path::absolute(directory)?)
+        }
+    }
+
+    fn capture_workdir(&mut self) -> Result<(), Error> {
+        if self.resolved_workdir.is_none()
+            && let Some(directory) = &self.workdir
+        {
+            let directory = Path::new(directory);
+            self.resolved_workdir = Some(if directory.is_absolute() {
+                directory.to_path_buf()
+            } else if self.image.is_some() {
+                // The image carrier starts at its root before an explicit
+                // relative cwd is applied.
+                Path::new("/").join(directory)
+            } else {
+                std::path::absolute(directory)?
+            });
+        }
+        Ok(())
     }
 
     fn mapped_or_visible_host_program(&self, guest: &Path) -> Option<PathBuf> {
@@ -6456,6 +7367,28 @@ impl RunOpts {
             GuestPathMapping::Hidden => None,
             GuestPathMapping::Unchanged => Some(guest.to_path_buf()),
         }
+    }
+
+    fn pins_scratch_input(&self, path: &Path) -> bool {
+        !self.no_namespace
+            && self.image.is_none()
+            && self.tmp.is_none()
+            && path.starts_with(TMP_DIR)
+            && !self
+                .mount
+                .iter()
+                .any(|mount| path.starts_with(mount.get_target()))
+            && !self.bind.iter().any(|bind| {
+                let target = Path::new(OsStr::from_bytes(bind.target.to_bytes()));
+                target.starts_with(TMP_DIR) && path.starts_with(target)
+            })
+    }
+
+    /// Only declared executable inputs receive automatic scratch preservation.
+    /// Other paths (including output paths) retain the ordinary visibility rule.
+    fn declared_input_source(&self, guest: &Path) -> Option<PathBuf> {
+        self.mapped_or_visible_host_program(guest)
+            .or_else(|| self.pins_scratch_input(guest).then(|| guest.to_path_buf()))
     }
 
     /// Load the `--happens-before` spec, resolve its anchors against the guest
@@ -6679,10 +7612,24 @@ impl RunOpts {
     fn resolve_guest_and_host_program(&self) -> Result<(PathBuf, PathBuf), Error> {
         let command = self.guest_command()?;
         let requested = Path::new(command.get_program());
+        let current_dir = self.guest_current_dir(&command)?;
+        let environment = command.get_captured_envs();
+        let path = environment
+            .get(OsStr::new("PATH"))
+            .cloned()
+            .unwrap_or_default();
+        self.resolve_declared_input(requested, &current_dir, &path)
+    }
 
+    fn resolve_declared_input(
+        &self,
+        requested: &Path,
+        current_dir: &Path,
+        path: &OsStr,
+    ) -> Result<(PathBuf, PathBuf), Error> {
         if requested.is_absolute() {
             let requested = normalize_guest_path(requested)?;
-            if let Some(host) = self.mapped_or_visible_host_program(&requested) {
+            if let Some(host) = self.declared_input_source(&requested) {
                 return Ok((requested, host));
             }
             if requested.starts_with(TMP_DIR) && requested.exists() {
@@ -6699,10 +7646,9 @@ impl RunOpts {
             );
         }
 
-        let current_dir = self.guest_current_dir(&command)?;
         if requested.components().count() > 1 {
             let guest = normalize_guest_path(&current_dir.join(requested))?;
-            let host = self.mapped_or_visible_host_program(&guest).ok_or_else(|| {
+            let host = self.declared_input_source(&guest).ok_or_else(|| {
                 Error::msg(format!(
                     "Program {} is not visible through the configured guest mounts",
                     requested.display()
@@ -6711,11 +7657,6 @@ impl RunOpts {
             return Ok((guest, host));
         }
 
-        let environment = command.get_captured_envs();
-        let path = environment
-            .get(OsStr::new("PATH"))
-            .cloned()
-            .unwrap_or_default();
         for directory in path
             .as_bytes()
             .split(|byte| *byte == b':')
@@ -6727,13 +7668,297 @@ impl RunOpts {
                 current_dir.join(directory).join(requested)
             };
             let guest = normalize_guest_path(&candidate)?;
-            let Some(host) = self.mapped_or_visible_host_program(&guest) else {
+            let Some(host) = self.declared_input_source(&guest) else {
                 continue;
             };
             if fs::metadata(&host).is_ok_and(|metadata| {
                 metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
             }) {
                 return Ok((guest, host));
+            }
+        }
+        anyhow::bail!(
+            "Could not resolve program {:?} in the guest PATH. Check PATH or use an absolute \
+             executable path.",
+            requested
+        )
+    }
+
+    /// A source-less mount may acquire directory targets for explicit mounts
+    /// below it during setup. They have no caller object to inspect or preserve.
+    fn prepared_mount_directory(&self, guest: &Path) -> bool {
+        self.mount.iter().any(|mount| {
+            (mount.get_source().is_none() && mount.get_target() == guest)
+                || (mount.get_target().starts_with(TMP_DIR)
+                    && mount.get_target() != guest
+                    && mount.get_target().starts_with(guest))
+        }) || self.bind.iter().any(|bind| {
+            let target = Path::new(OsStr::from_bytes(bind.target.to_bytes()));
+            target.starts_with(TMP_DIR) && target != guest && target.starts_with(guest)
+        })
+    }
+
+    /// Resolve one kernel pathname, following each real symlink before applying
+    /// a later parent component. Keep the link objects and cancelled traversal
+    /// directories needed to execute the unchanged spelling after private tmp.
+    fn scratch_input_path(&self, path: &Path) -> Result<(PathBuf, ScratchInputGraph), Error> {
+        let resolved = self
+            .scratch_path(path, ScratchPathPurpose::Executable)?
+            .context("declared input escaped its lookup view")?;
+        Ok((resolved.target, resolved.graph))
+    }
+
+    fn scratch_path(
+        &self,
+        path: &Path,
+        purpose: ScratchPathPurpose<'_>,
+    ) -> Result<Option<ScratchPathResolution>, Error> {
+        anyhow::ensure!(path.is_absolute(), "declared input path must be absolute");
+        let mut graph = ScratchInputGraph::default();
+        let (mut resolved, mut pending) = match purpose {
+            ScratchPathPurpose::Executable => (PathBuf::from("/"), scratch_path_components(path)),
+            ScratchPathPurpose::MountTarget(view) => (
+                view.backing.to_path_buf(),
+                scratch_path_components(path.strip_prefix(view.backing)?),
+            ),
+        };
+        // The starting root, and every successfully traversed parent, is a
+        // directory. Missing bind leaves are kept separate from this fact.
+        let mut directory = true;
+        let mut followed_links = 0;
+        while let Some(component) = pending.pop_front() {
+            if component == OsStr::new(".") {
+                continue;
+            }
+            if component == OsStr::new("..") {
+                resolved.pop();
+                directory = true;
+                if let ScratchPathPurpose::MountTarget(view) = purpose
+                    && !resolved.starts_with(view.backing)
+                {
+                    // The syscall still uses its raw staging pathname. Do not
+                    // reinterpret an escape as final guest /tmp or create an
+                    // unused substituted directory in either filesystem.
+                    return Ok(None);
+                }
+                continue;
+            }
+            resolved.push(component);
+            let (guest, host, covered) = match purpose {
+                ScratchPathPurpose::Executable => {
+                    let Some(host) = self.declared_input_source(&resolved) else {
+                        anyhow::ensure!(
+                            self.prepared_mount_directory(&resolved),
+                            "Declared input {} is not visible through the configured guest mounts",
+                            resolved.display()
+                        );
+                        graph.directories.insert(resolved.clone());
+                        continue;
+                    };
+                    (resolved.clone(), host, false)
+                }
+                ScratchPathPurpose::MountTarget(view) => {
+                    let guest = Path::new(TMP_DIR).join(resolved.strip_prefix(view.backing)?);
+                    let previous = view.previous.iter().rev().find_map(|(target, mount)| {
+                        resolved
+                            .strip_prefix(target)
+                            .ok()
+                            .map(|suffix| (suffix, mount))
+                    });
+                    let directory = view.directory_inputs.iter().rev().find_map(|input| {
+                        input
+                            .directory
+                            .then(|| guest.strip_prefix(&input.guest).ok())
+                            .flatten()
+                            .map(|suffix| input.host.join(suffix))
+                    });
+                    let (host, covered) = if let Some((suffix, mount)) = previous {
+                        if mount.fresh_filesystem {
+                            // Its contents exist only after this earlier mount.
+                            // Leave missing targets to that actual kernel view.
+                            return Ok(None);
+                        }
+                        let Some(source) = mount.get_source() else {
+                            return Ok(None);
+                        };
+                        (source.join(suffix), true)
+                    } else if let Some(host) = directory {
+                        (host, true)
+                    } else {
+                        (guest.clone(), false)
+                    };
+                    (guest, host, covered)
+                }
+            };
+            let metadata = match fs::symlink_metadata(&host) {
+                Ok(metadata) => metadata,
+                Err(error)
+                    if matches!(purpose, ScratchPathPurpose::MountTarget(_))
+                        && error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    if covered {
+                        // Never populate a declared source tree or guess a
+                        // directory that an earlier user mount did not provide.
+                        return Ok(None);
+                    }
+                    if pending.is_empty()
+                        && matches!(purpose, ScratchPathPurpose::MountTarget(view) if !view.directory_target)
+                    {
+                        // A bind creates its own leaf using the source object's
+                        // type. Only its traversal parents belong in this graph.
+                        directory = false;
+                        continue;
+                    }
+                    graph.directories.insert(guest);
+                    directory = true;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("resolving declared input {}", resolved.display())
+                    });
+                }
+            };
+            if metadata.is_symlink() {
+                followed_links += 1;
+                anyhow::ensure!(followed_links <= 40, "too many symlinks in declared input");
+                let target = fs::read_link(&host)?;
+                if !covered {
+                    graph.links.insert(guest, host);
+                }
+                if target.is_absolute() {
+                    if let ScratchPathPurpose::MountTarget(view) = purpose {
+                        if !target.starts_with(view.backing) {
+                            return Ok(None);
+                        }
+                        resolved = view.backing.to_path_buf();
+                        directory = true;
+                        let mut components =
+                            scratch_path_components(target.strip_prefix(view.backing)?);
+                        components.append(&mut pending);
+                        pending = components;
+                        continue;
+                    }
+                    resolved = PathBuf::from("/");
+                } else {
+                    resolved.pop();
+                }
+                directory = true;
+                let mut components = scratch_path_components(&target);
+                components.append(&mut pending);
+                pending = components;
+            } else {
+                anyhow::ensure!(
+                    metadata.is_dir()
+                        || (pending.is_empty()
+                            && !matches!(purpose, ScratchPathPurpose::MountTarget(view) if view.directory_target)),
+                    "Declared input {} is not a directory",
+                    resolved.display()
+                );
+                directory = metadata.is_dir();
+                if directory && !covered {
+                    graph.directories.insert(guest);
+                }
+            }
+        }
+        Ok(Some(ScratchPathResolution {
+            target: resolved,
+            graph,
+            directory,
+        }))
+    }
+
+    fn scratch_mount_targets(
+        &self,
+        backing: &Path,
+        directory_inputs: &[ScratchBinding],
+    ) -> Result<ScratchTargetPlan, Error> {
+        let mut plan = ScratchTargetPlan::default();
+        let mut previous = Vec::new();
+        for (index, request) in self.mount.iter().enumerate() {
+            let Ok(suffix) = request.get_target().strip_prefix(TMP_DIR) else {
+                continue;
+            };
+            let view = ScratchMountView {
+                backing,
+                previous: &previous,
+                directory_inputs,
+                directory_target: request.fresh_filesystem,
+            };
+            let Some(resolved) = self.scratch_path(
+                &backing.join(suffix),
+                ScratchPathPurpose::MountTarget(&view),
+            )?
+            else {
+                // This destination has no discoverable parent-side view. The
+                // earlier known coverage still guards its descendants; keep
+                // preparing unrelated later destinations in the owned tree.
+                continue;
+            };
+            if !request.fresh_filesystem && resolved.directory {
+                plan.ready_binds.insert(index);
+            }
+            previous.push((resolved.target, request));
+            plan.graph.directories.extend(resolved.graph.directories);
+            for (guest, host) in resolved.graph.links {
+                if let Some(existing) = plan.graph.links.insert(guest, host.clone()) {
+                    anyhow::ensure!(existing == host, "conflicting requested mount link inputs");
+                }
+            }
+        }
+        Ok(plan)
+    }
+
+    /// Discover executable inputs without the stricter e9 mapping normalizer.
+    /// Cwd lookup and executable lookup have separate Linux symlink budgets.
+    fn resolve_scratch_executable(
+        &self,
+        requested: &Path,
+        current_dir: &Path,
+        path: &OsStr,
+    ) -> Result<ScratchExecutable, Error> {
+        let source = |requested: &Path| -> Result<ScratchExecutable, Error> {
+            let (guest, mut graph) = if requested.is_absolute() {
+                self.scratch_input_path(requested)?
+            } else {
+                let (cwd, mut cwd_graph) = self.scratch_input_path(current_dir)?;
+                if let Some(host) = self.declared_input_source(&cwd) {
+                    anyhow::ensure!(
+                        fs::metadata(host)?.is_dir(),
+                        "declared working directory is not a directory"
+                    );
+                }
+                let (guest, executable_graph) = self.scratch_input_path(&cwd.join(requested))?;
+                cwd_graph.extend(executable_graph);
+                (guest, cwd_graph)
+            };
+            let host = self.declared_input_source(&guest).ok_or_else(|| {
+                Error::msg(format!(
+                    "Program {} is not visible through the configured guest mounts",
+                    requested.display()
+                ))
+            })?;
+            // The leaf's parent may also be needed when the input is a file.
+            if let Some(parent) = guest.parent() {
+                graph.directories.insert(parent.to_path_buf());
+            }
+            Ok(ScratchExecutable { guest, host, graph })
+        };
+        if requested.as_os_str().as_bytes().contains(&b'/') {
+            return source(requested);
+        }
+        for directory in path
+            .as_bytes()
+            .split(|byte| *byte == b':')
+            .map(|bytes| Path::new(OsStr::from_bytes(bytes)))
+        {
+            let Ok(input) = source(&directory.join(requested)) else {
+                continue;
+            };
+            if fs::metadata(&input.host).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            }) {
+                return Ok(input);
             }
         }
         anyhow::bail!(
@@ -6856,7 +8081,11 @@ impl RunOpts {
             if let GuestPathMapping::Mapped(host) = self.mapped_host_program(requested) {
                 return validate_executable(&host, requested, None);
             }
-            if requested.starts_with(TMP_DIR) && self.tmp.is_none() && requested.exists() {
+            if requested.starts_with(TMP_DIR)
+                && self.tmp.is_none()
+                && !self.pins_scratch_input(requested)
+                && requested.exists()
+            {
                 anyhow::bail!(
                     "Program {} is under host /tmp, but Hermit replaces guest /tmp with an \
                      isolated directory. Pass --tmp=/tmp to expose host /tmp or bind the program \
@@ -7039,8 +8268,82 @@ impl RunOpts {
                 fs::create_dir_all(path)?;
                 Ok(Tmpfs::Path(path.to_path_buf()))
             }
-            None => Ok(Tmpfs::Temp(tempfile::TempDir::new()?)),
+            // The backing must not be inside a caller cwd that we preserve by
+            // binding it into scratch. In particular, do not honor a TMPDIR
+            // nested below that cwd and recursively expose the backing itself.
+            None => Ok(Tmpfs::Temp(tempfile::TempDir::new_in(TMP_DIR)?)),
         }
+    }
+
+    /// The physical launch boundary shared by every instrumented run.
+    ///
+    /// Setup happens before logging, RPC listeners or backend runtime workers.
+    /// Owned guards remain with the actual reaping owner on every error path.
+    pub(super) fn with_container<G, F, T>(
+        &self,
+        guards: G,
+        resources: String,
+        timeout: Option<Duration>,
+        mut work: F,
+    ) -> Result<(T, G), Error>
+    where
+        G: 'static,
+        F: FnMut(&mut G, Option<&IdentityGuard>) -> Result<T, Error> + 'static,
+        T: serde::Serialize + serde::de::DeserializeOwned + 'static,
+    {
+        if self.no_namespace {
+            let mut process = Container::new();
+            apply_affinity(&mut process, self.pin_threads);
+            return super::owned_container::run(
+                &mut process,
+                guards,
+                format!("{resources}; no PID namespace"),
+                false,
+                "with_container",
+                timeout,
+                move |guards| work(guards, None),
+            );
+        }
+
+        let tmpfs = self.tmpfs()?;
+        let (mut container, identity, inputs) = self.container(tmpfs.path())?;
+        let resources = format!(
+            "private tmp {}, identity mounts, pinned inputs, {resources}",
+            tmpfs.path().display()
+        );
+        super::owned_container::run(
+            &mut container,
+            (tmpfs, identity, inputs, guards),
+            resources,
+            true,
+            "with_container",
+            timeout,
+            move |(_, identity, inputs, guards)| {
+                // Source handles are setup capabilities. Retire the child's
+                // copies before backend code; the parent retains its copies
+                // until the container owner proves the child was reaped.
+                inputs.retire_sources()?;
+                work(guards, Some(identity))
+            },
+        )
+        .map(|(value, (_, _, _, guards))| (value, guards))
+    }
+
+    #[cfg(feature = "dbt")]
+    pub(super) fn uses_namespaces(&self) -> bool {
+        !self.no_namespace
+    }
+
+    #[cfg(feature = "dbt")]
+    pub(super) fn preserve_bootstrap_input(&mut self, input: &Path) -> Result<(), Error> {
+        let input = normalize_guest_path(&std::path::absolute(input)?)?;
+        if self.pins_scratch_input(&input)
+            && input != Path::new(TMP_DIR)
+            && !self.bootstrap_inputs.contains(&input)
+        {
+            self.bootstrap_inputs.push(input);
+        }
+        Ok(())
     }
 
     pub fn run(
@@ -7048,7 +8351,9 @@ impl RunOpts {
         global: &GlobalOpts,
         capture_output: bool,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
-        self.run_with_guest_capture(global, capture_output, None)
+        let mut options = self.clone();
+        options.capture_workdir()?;
+        options.run_with_guest_capture(global, capture_output, None)
     }
 
     fn run_with_guest_capture(
@@ -7073,61 +8378,22 @@ impl RunOpts {
         let guest_capture = guest_capture
             .map(GuestRunCaptureSession::try_clone_for_child)
             .transpose()?;
-        let timeout = self.run_timeout();
-        if self.no_namespace {
-            let mut process = Container::new();
-            apply_affinity(&mut process, self.pin_threads);
-            let resources = if network_trace.is_some() {
-                "held summary/output and network trace descriptors; no PID namespace"
-            } else {
-                "held summary/output descriptors; no PID namespace"
-            };
-            return super::owned_container::run(
-                &mut process,
-                (summary_output, network_trace),
-                resources.into(),
-                false,
-                "with_container",
-                timeout,
-                move |(summary, _)| {
-                    options.run_in_container(
-                        &global,
-                        capture_output,
-                        guest_capture.as_ref(),
-                        summary.as_ref(),
-                        None,
-                    )
-                },
-            )
-            .map(|(value, _guards)| value);
-        }
-        let tmpfs = self.tmpfs()?;
-        let (mut container, identity) = self.container(tmpfs.path())?;
         let resources = if network_trace.is_some() {
-            format!(
-                "private tmp {}, identity mounts, summary/output and network trace descriptors",
-                tmpfs.path().display()
-            )
+            "summary/output and network trace descriptors"
         } else {
-            format!(
-                "private tmp {}, identity mounts and summary/output descriptors",
-                tmpfs.path().display()
-            )
+            "summary/output descriptors"
         };
-        super::owned_container::run(
-            &mut container,
-            (tmpfs, identity, summary_output, network_trace),
-            resources,
-            true,
-            "with_container",
-            timeout,
-            move |(_, identity, summary, _)| {
+        self.with_container(
+            (summary_output, network_trace),
+            resources.into(),
+            self.run_timeout(),
+            move |(summary, _), identity| {
                 options.run_in_container(
                     &global,
                     capture_output,
                     guest_capture.as_ref(),
                     summary.as_ref(),
-                    Some(identity),
+                    identity,
                 )
             },
         )
@@ -7143,6 +8409,7 @@ impl RunOpts {
         let PreparedMounts {
             mounts,
             identity_sources: _identity_sources,
+            inputs: _inputs,
         } = self.mounts(tmpfs.path())?;
 
         let mut command = self.namespace_only_guest_command()?;
@@ -7699,46 +8966,53 @@ impl RunOpts {
         Ok(status)
     }
 
-    /// The `--bind`s the DBT adapter applies, as (source, target) pairs: those
-    /// with a target under guest `/tmp`, which is where [`Self::mounts`] applies
-    /// binds for the other backends. Any other bind gets the same warning
-    /// there and here, and has no effect.
-    fn dbt_binds(&self) -> Vec<(PathBuf, PathBuf)> {
-        let mut binds = Vec::with_capacity(self.bind.len());
-        for bind in &self.bind {
-            let source = PathBuf::from(OsStr::from_bytes(bind.source.to_bytes()));
-            let target = PathBuf::from(OsStr::from_bytes(bind.target.to_bytes()));
-            if target.starts_with(TMP_DIR) {
-                binds.push((source, target));
-            } else {
-                warn_bind_outside_tmp(bind);
-            }
-        }
-        binds
-    }
-
     /// Returns the mounts to be used with the container.
     fn mounts(&self, tmpfs: &Path) -> Result<PreparedMounts, Error> {
         let (mut identity_mounts, identity_sources) = identity_hardening_mounts()?;
         let mut identity_sources = identity_sources;
+        let mut input_mounts = Vec::new();
+        let (inputs, ready_bind_targets) = self.scratch_inputs(tmpfs, &mut input_mounts)?;
+        // The pinned test runner supplies the /test mountpoint. Apply its
+        // explicit fresh-workdir request inside every physical container, with
+        // user mount intent retaining precedence below.
+        if let Some(requested) = std::env::var_os("HERMIT_E2E_EMPTY_WORKDIR") {
+            if requested != OsStr::new("/test") {
+                anyhow::bail!("HERMIT_E2E_EMPTY_WORKDIR requires the /test mountpoint");
+            }
+            if !self
+                .mount
+                .iter()
+                .any(|mount| Path::new("/test").starts_with(mount.get_target()))
+            {
+                input_mounts.push(Mount::tmpfs("/test"));
+            }
+        }
         let mut explicit_tmp_mount = false;
         let mut user_mounts = Vec::with_capacity(self.mount.len() + self.bind.len());
 
-        for mount in &self.mount {
+        for (index, mount) in self.mount.iter().enumerate() {
             let user_target = mount.get_target();
             identity_sources.discard_mounts_shadowed_by(&mut identity_mounts, user_target);
             if let Ok(path) = mount.get_target().strip_prefix(TMP_DIR) {
                 explicit_tmp_mount |= path.as_os_str().is_empty();
                 // If the target is in /tmp, change it so it goes to our
                 // temporary /tmp instead.
-                user_mounts.push(mount.clone().target(tmpfs.join(path)).touch_target());
+                let translated = mount.mount.clone().target(tmpfs.join(path));
+                // The ordered physical plan has already supplied these
+                // directory targets, including real final links. Preserve
+                // kernel lookup instead of mkdir on an existing symlink.
+                user_mounts.push(if ready_bind_targets.contains(&index) {
+                    translated
+                } else {
+                    translated.touch_target()
+                });
             } else {
-                user_mounts.push(mount.clone());
+                user_mounts.push(mount.mount.clone());
             }
         }
 
         for bind in &self.bind {
-            let mount = Mount::from(bind.clone()).rshared();
+            let mount = Mount::from(bind.clone()).recursive();
 
             // Bind mounts currently only make sense for things in `/tmp` since
             // that is the only directory we overlay.
@@ -7771,6 +9045,8 @@ impl RunOpts {
         }
 
         let mut mounts = identity_mounts;
+        // Explicit user mounts follow declared defaults and remain authoritative.
+        mounts.extend(input_mounts);
         mounts.extend(user_mounts);
 
         if let Some(overlay) = &self.e9patch_overlay {
@@ -7792,16 +9068,177 @@ impl RunOpts {
         // Bind the /tmp/tmpXXXXXX tmpfs mount over /tmp to hide it. This way,
         // we still preserve the files or directories bind-mounted inside of it
         // while hiding the real /tmp.
-        mounts.push(Mount::bind(tmpfs, TMP_DIR).rshared());
+        mounts.push(Mount::bind(tmpfs, TMP_DIR).recursive());
 
         Ok(PreparedMounts {
             mounts,
             identity_sources,
+            inputs,
         })
     }
 
+    fn scratch_inputs(
+        &self,
+        tmpfs: &Path,
+        mounts: &mut Vec<Mount>,
+    ) -> Result<(ContainerInputs, BTreeSet<usize>), Error> {
+        let mut inputs = ContainerInputs::default();
+        if !self.pins_scratch_input(Path::new(TMP_DIR)) {
+            return Ok((inputs, BTreeSet::new()));
+        }
+
+        let mut graph = ScratchInputGraph::default();
+        let mut ordinary = Vec::new();
+        let mut bootstrap = self.bootstrap_inputs.clone();
+        if let Some(installation) = hermit_resources::install_dir()? {
+            // A configured packaged resource tree is the same declared input
+            // for every backend, including when the package lives below tmp.
+            bootstrap.push(installation.join("rsrcs"));
+        }
+        for source in bootstrap {
+            let (guest, input_graph) = self.scratch_input_path(&source)?;
+            graph.extend(input_graph);
+            if self.pins_scratch_input(&guest) && guest != Path::new(TMP_DIR) {
+                let host = self
+                    .declared_input_source(&guest)
+                    .context("declared bootstrap input has no source")?;
+                let directory = fs::metadata(&host)?.is_dir();
+                ordinary.push(ScratchBinding {
+                    guest,
+                    host,
+                    directory,
+                    readonly: true,
+                });
+            }
+        }
+
+        let command = self.guest_command()?;
+        let cwd = std::env::current_dir()?;
+        let preserved_cwd =
+            self.workdir.is_none() && self.pins_scratch_input(&cwd) && cwd != Path::new(TMP_DIR);
+        if preserved_cwd {
+            ordinary.push(ScratchBinding {
+                guest: cwd.clone(),
+                host: cwd,
+                directory: true,
+                readonly: false,
+            });
+        }
+        let directory_inputs: Vec<_> = ordinary
+            .iter()
+            .filter(|input| input.directory)
+            .map(|input| input.guest.clone())
+            .collect();
+        let covered = |guest: &Path| directory_inputs.iter().any(|root| guest.starts_with(root));
+        // Exact /tmp deliberately enters fresh scratch. A strict descendant is
+        // a declared cwd input, not permission to bind all of the caller's tmp.
+        let guest_cwd = self.kernel_guest_current_dir(&command)?;
+        let environment = command.get_captured_envs();
+        let path = environment
+            .get(OsStr::new("PATH"))
+            .cloned()
+            .unwrap_or_default();
+        let initial =
+            self.resolve_scratch_executable(Path::new(command.get_program()), &guest_cwd, &path)?;
+        let mut pending = VecDeque::from([initial]);
+        let mut seen = BTreeSet::new();
+        while let Some(ScratchExecutable {
+            guest,
+            host,
+            graph: input_graph,
+        }) = pending.pop_front()
+        {
+            // Distinct original spellings can require different real links even
+            // when they ultimately execute the same file.
+            graph.extend(input_graph);
+            if !seen.insert(guest.clone()) {
+                continue;
+            }
+            if self.pins_scratch_input(&guest) && !covered(&guest) {
+                ordinary.push(ScratchBinding {
+                    guest,
+                    host: host.clone(),
+                    directory: false,
+                    readonly: false,
+                });
+            }
+            let interpreter = shebang_interpreter(&host).or_else(|| hermit::elf_get_interp(&host));
+            if let Some(interpreter) = interpreter {
+                pending.push_back(self.resolve_scratch_executable(
+                    &interpreter,
+                    &guest_cwd,
+                    &path,
+                )?);
+            }
+            // The simple env form already resolved by DBT declares another
+            // executable input. Preserve the same PATH match for every backend
+            // without altering the script's kernel argument/exec semantics.
+            if let Some(shebang) = hermit::Shebang::new(&host) {
+                let (interpreter, arguments) = shebang.into_parts();
+                if interpreter.file_name() == Some(OsStr::new("env"))
+                    && let [target] = arguments.as_slice()
+                    && !target.as_bytes().starts_with(b"-")
+                    && !target.as_bytes().contains(&b'=')
+                    && let Ok(input) =
+                        self.resolve_scratch_executable(Path::new(target), &guest_cwd, &path)
+                {
+                    pending.push_back(input);
+                }
+            }
+        }
+
+        // The backing is a fresh owned directory, not an overmounted tmpfs.
+        // Canonical traversal-only directories therefore survive its final
+        // recursive bind. Never materialize inside declared directory inputs
+        // or explicit user mounts, and prepare every target before real links.
+        for directory in graph.directories {
+            if self.pins_scratch_input(&directory) && !covered(&directory) {
+                prepare_scratch_target(tmpfs, &directory, true)?;
+            }
+        }
+        let mut links: BTreeMap<_, _> = graph
+            .links
+            .into_iter()
+            .filter(|(guest, _)| self.pins_scratch_input(guest) && !covered(guest))
+            .collect();
+        let ScratchTargetPlan {
+            graph: target_graph,
+            ready_binds,
+        } = self.scratch_mount_targets(tmpfs, &ordinary)?;
+        for directory in target_graph.directories {
+            prepare_scratch_target(tmpfs, &directory, true)?;
+        }
+        for (guest, host) in target_graph.links {
+            if let Some(existing) = links.insert(guest, host.clone()) {
+                anyhow::ensure!(existing == host, "conflicting declared mount link inputs");
+            }
+        }
+        for input in &ordinary {
+            prepare_scratch_target(tmpfs, &input.guest, input.directory)?;
+        }
+        for guest in links.keys() {
+            prepare_scratch_target(tmpfs, guest, false)?;
+        }
+        for input in ordinary {
+            let target = tmpfs.join(input.guest.strip_prefix(TMP_DIR)?);
+            let mount = inputs.bind(&input.host, &target, input.directory)?;
+            mounts.push(if input.readonly {
+                mount.readonly()
+            } else {
+                mount
+            });
+        }
+        for (guest, host) in links {
+            mounts.push(inputs.bind(&host, &tmpfs.join(guest.strip_prefix(TMP_DIR)?), false)?);
+        }
+        Ok((inputs, ready_binds))
+    }
+
     /// Returns a configured container to run a function in.
-    fn container(&self, tmpfs: &Path) -> Result<(Container, IdentityGuard), Error> {
+    fn container(
+        &self,
+        tmpfs: &Path,
+    ) -> Result<(Container, IdentityGuard, ContainerInputs), Error> {
         // PROTOTYPE: when an OCI image is requested, the guest runs against the
         // image's materialized rootfs (deterministic file inputs) rather than
         // the host filesystem. This replaces the default namespace+mounts setup
@@ -7812,7 +9249,7 @@ impl RunOpts {
                 image_container(&rootfs, tmpfs, self.pin_threads, self.tmp.is_none())?;
             self.network
                 .configure(&mut container, self.analyze_networking);
-            return Ok((container, identity_sources));
+            return Ok((container, identity_sources, ContainerInputs::default()));
         }
 
         let mut container = default_container(self.pin_threads);
@@ -7822,10 +9259,14 @@ impl RunOpts {
         let PreparedMounts {
             mounts,
             identity_sources,
+            inputs,
         } = self.mounts(tmpfs)?;
         container.mounts(mounts);
+        // Re-enter the declared logical cwd after scratch is installed instead
+        // of retaining an unreachable cwd below the covered caller mount.
+        container.current_dir(self.kernel_guest_current_dir(&self.guest_command()?)?);
 
-        Ok((container, identity_sources))
+        Ok((container, identity_sources, inputs))
     }
 
     fn run_verify(
@@ -7837,40 +9278,8 @@ impl RunOpts {
         let mut options = self.clone();
         let network_trace = options.open_network_trace()?;
         let global = global.clone();
-        if self.no_namespace {
-            let mut process = Container::new();
-            apply_affinity(&mut process, self.pin_threads);
-            let resources = format!(
-                "verification log{}{} descriptors; no PID namespace",
-                if network_trace.is_some() {
-                    ", network trace"
-                } else {
-                    ""
-                },
-                if forwarded_detlogs.is_some() {
-                    ", forwarded DETLOG"
-                } else {
-                    ""
-                },
-            );
-            return super::owned_container::run(
-                &mut process,
-                (Some(log_file), network_trace, forwarded_detlogs),
-                resources,
-                false,
-                "with_container",
-                None,
-                move |(log, _, forwarded)| {
-                    options.run_verify_in_container(log, forwarded, &global, None)
-                },
-            )
-            .map(|(value, _guards)| value);
-        }
-        let tmpfs = self.tmpfs()?;
-        let (mut container, identity) = self.container(tmpfs.path())?;
         let resources = format!(
-            "private tmp {}, identity mounts, verification log{}{} descriptors",
-            tmpfs.path().display(),
+            "verification log{}{} descriptors",
             if network_trace.is_some() {
                 ", network trace"
             } else {
@@ -7882,21 +9291,12 @@ impl RunOpts {
                 ""
             },
         );
-        super::owned_container::run(
-            &mut container,
-            (
-                tmpfs,
-                identity,
-                Some(log_file),
-                network_trace,
-                forwarded_detlogs,
-            ),
+        self.with_container(
+            (Some(log_file), network_trace, forwarded_detlogs),
             resources,
-            true,
-            "with_container",
             None,
-            move |(_, identity, log, _, forwarded)| {
-                options.run_verify_in_container(log, forwarded, &global, Some(identity))
+            move |(log, _, forwarded), identity| {
+                options.run_verify_in_container(log, forwarded, &global, identity)
             },
         )
         .map(|(value, _guards)| value)
@@ -7944,7 +9344,11 @@ impl RunOpts {
         // chroot leaves cwd pointing at the — now unreachable — host cwd, which
         // makes `getcwd` fail inside the guest). An explicit `--workdir` wins.
         if let Some(current_dir) = &self.workdir {
-            command.current_dir(current_dir);
+            command.current_dir(
+                self.resolved_workdir
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new(current_dir)),
+            );
         } else if let Some(image) = &self.image {
             let cfg = crate::image::read_image_config(image)?;
             command.current_dir(cfg.workdir.as_deref().unwrap_or("/"));
@@ -8336,18 +9740,7 @@ impl RunOpts {
         // The guest inherits this thread's seccomp filters, as Hermit installs
         // none besides the backend's own, and the only `pre_exec` callback of
         // its command, above, installs none either.
-        config.inherited_seccomp = detcore::InheritedSeccomp::measure();
-        config.mountinfo_root_rewrites = identity_sources
-            .map(IdentityGuard::mountinfo_root_rewrites)
-            .transpose()?
-            .unwrap_or_default();
-        let mountinfo_order = identity_sources
-            .map(IdentityGuard::mountinfo_identity_order)
-            .transpose()?
-            .unwrap_or_default();
-        config.mountinfo_mount_ids = mountinfo_order;
-        config.mountinfo_mount_ids_captured = identity_sources.is_some();
-        config.mount_id_assignment_order.clear();
+        super::container::configure_detcore_identity(&mut config, identity_sources)?;
 
         let timeout = self.run_timeout();
         super::staged_summary::with_published_summary(
@@ -8453,18 +9846,7 @@ impl RunOpts {
         // The guest inherits this thread's seccomp filters, as Hermit installs
         // none besides the backend's own, and its command has no `pre_exec`
         // callback.
-        config.inherited_seccomp = detcore::InheritedSeccomp::measure();
-        config.mountinfo_root_rewrites = identity_sources
-            .map(IdentityGuard::mountinfo_root_rewrites)
-            .transpose()?
-            .unwrap_or_default();
-        let mountinfo_order = identity_sources
-            .map(IdentityGuard::mountinfo_identity_order)
-            .transpose()?
-            .unwrap_or_default();
-        config.mountinfo_mount_ids = mountinfo_order;
-        config.mountinfo_mount_ids_captured = identity_sources.is_some();
-        config.mount_id_assignment_order.clear();
+        super::container::configure_detcore_identity(&mut config, identity_sources)?;
 
         let forwarding = forwarded_detlogs.take().map(|(sender, receiver)| {
             hermit::forward_in_guest_detlogs_to(sender);

@@ -49,6 +49,7 @@ use reverie::process::ExitStatus;
 use reverie::process::Mount;
 use reverie::process::MountFlags;
 use reverie::process::Namespace;
+use reverie::process::PinnedMountSource;
 use reverie::process::RunError;
 
 const GROUP_FILE: &str = "/etc/group";
@@ -69,17 +70,85 @@ struct MountInfoRootSource {
 }
 
 fn open_path(path: &Path) -> io::Result<File> {
+    open_path_with_flags(path, 0)
+}
+
+fn open_path_with_flags(path: &Path, flags: libc::c_int) -> io::Result<File> {
     let path = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
     // O_PATH pins the object without requiring read permission.  The descriptor
     // remains valid if a path is renamed after this point, which is exactly why
     // provenance is carried by descriptors rather than by a second stat(path).
-    let fd = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC | flags) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: `open` returned a new owned descriptor above.
     Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// Inputs pinned before a private scratch mount hides their caller paths.
+///
+/// The parent owns its copy until the container is reaped. The completed child
+/// drops its copy before creating logging or backend workers; a source directory
+/// must not remain an alternate route into the caller's filesystem.
+#[derive(Default)]
+pub(super) struct ContainerInputs {
+    sources: Vec<PinnedMountSource>,
+}
+
+impl ContainerInputs {
+    pub(super) fn bind(
+        &mut self,
+        source: &Path,
+        target: &Path,
+        directory: bool,
+    ) -> Result<Mount, Error> {
+        let pinned = PinnedMountSource::open(source).with_context(|| {
+            format!(
+                "failed to pin declared container input {}",
+                source.display()
+            )
+        })?;
+        if pinned.is_dir() != directory {
+            anyhow::bail!(
+                "declared input type changed while pinning {}",
+                source.display()
+            );
+        }
+        let mount = Mount::bind_pinned(&pinned, target).touch_target();
+        self.sources.push(pinned);
+        Ok(if directory { mount.recursive() } else { mount })
+    }
+
+    pub(super) fn retire_sources(&mut self) -> Result<(), Error> {
+        for source in &self.sources {
+            source
+                .retire()
+                .context("failed to retire a declared container input capability")?;
+        }
+        self.sources.clear();
+        Ok(())
+    }
+}
+
+/// Capture the completed physical launch's identity inputs for shared Detcore.
+pub(super) fn configure_detcore_identity(
+    config: &mut detcore::Config,
+    identity: Option<&IdentityGuard>,
+) -> Result<(), Error> {
+    config.inherited_seccomp = detcore::InheritedSeccomp::measure();
+    config.mountinfo_root_rewrites = identity
+        .map(IdentityGuard::mountinfo_root_rewrites)
+        .transpose()?
+        .unwrap_or_default();
+    config.mountinfo_mount_ids = identity
+        .map(IdentityGuard::mountinfo_identity_order)
+        .transpose()?
+        .unwrap_or_default();
+    config.mountinfo_mount_ids_captured = identity.is_some();
+    config.mount_id_assignment_order.clear();
+    Ok(())
 }
 
 fn mount_id_for_fd(fd: i32) -> io::Result<u64> {
@@ -360,7 +429,7 @@ fn frozen_group_file() -> Result<tempfile::NamedTempFile, Error> {
         contents.push_str(":\n");
     }
 
-    let mut group_file = tempfile::NamedTempFile::new()
+    let mut group_file = tempfile::NamedTempFile::new_in("/tmp")
         .context("Failed to create the frozen group database for the guest")?;
     group_file
         .write_all(contents.as_bytes())
@@ -389,8 +458,8 @@ pub(super) fn identity_hardening_mounts() -> Result<(Vec<Mount>, IdentityGuard),
 
     // Host nscd cache readiness is external state and can differ between runs.
     let nscd_dir = if Path::new(NSCD_DIR).is_dir() {
-        let directory =
-            tempfile::TempDir::new().context("Failed to create the empty guest nscd directory")?;
+        let directory = tempfile::TempDir::new_in("/tmp")
+            .context("Failed to create the empty guest nscd directory")?;
         // Preserve Linux pathname resolution: on distributions where
         // /var/run is a symlink to /run, mounting the hardening directory at
         // the resolved target keeps it reachable even if a user later mounts
@@ -447,6 +516,7 @@ pub fn default_container(pin_threads: bool) -> Container {
         .map_root()
         .hostname("hermetic-container.local")
         .domainname("local")
+        .mount(Mount::new("/").rprivate())
         .mount(Mount::proc().allow_readonly_fallback());
 
     apply_affinity(&mut container, pin_threads);
@@ -483,7 +553,8 @@ pub(super) fn image_container(
         .unshare(Namespace::PID)
         .map_root()
         .hostname("hermetic-container.local")
-        .domainname("local");
+        .domainname("local")
+        .mount(Mount::new("/").rprivate());
 
     // The cache is a deterministic input, not a writable container layer. Bind
     // it onto itself and remount it read-only so a guest cannot poison later
@@ -498,7 +569,7 @@ pub(super) fn image_container(
     // its read-only remount; the hand-written remount did not, so every image
     // run failed at spawn under such a cache.
     container.mount(Mount::bind(rootfs, rootfs).readonly());
-    container.mount(Mount::bind(tmpfs, rootfs.join("tmp")).rshared());
+    container.mount(Mount::bind(tmpfs, rootfs.join("tmp")).recursive());
 
     // Mount the deterministic /proc into the target root. The materializer
     // guarantees <rootfs>/proc exists, so we do not need `touch_target()` (which

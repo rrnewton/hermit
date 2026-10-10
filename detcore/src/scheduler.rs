@@ -2278,17 +2278,19 @@ impl std::error::Error for VforkBarrierRefusal {}
 /// arms the release barrier or runs record/replay, and a ptrace guest does not
 /// outlive this process (Reverie sets `PTRACE_O_EXITKILL`). A vfork barrier
 /// refusal can come from any backend; it ends the run the way a terminal
-/// deadlock refusal does. In Hermit's default container no guest outlives it:
-/// the scheduler then runs in the init of the private PID namespace that
-/// `Container::run` forks the guest into, and when a namespace init exits the
-/// kernel `SIGKILL`s every remaining member (hermit-cli's container.rs,
-/// `on_container_init_stop_signal`). That does not hold everywhere. With
-/// `--no-namespace` the run gets no PID namespace, and hermit-cli's run.rs
-/// (`log_cap_refusal`) names, for every backend, a way its guest can outlive an
-/// exit like this one, ptrace's being the window before `PTRACE_O_EXITKILL`
-/// binds the guest. On DBT the scheduler runs in the DBT runtime
-/// (`GlobalState::init_for_external_scheduler`), and the DynamoRIO guest is a
-/// plain child of hermit that no PID namespace binds.
+/// deadlock refusal does.
+///
+/// In Hermit's default namespace mode, each physical CLI backend run starts
+/// inside an owned private PID namespace. Exiting that namespace's init
+/// causes Linux to kill its remaining members; the CLI arms the init's
+/// parent-death signal before starting backend work.
+/// The scheduler need not run in that init. DBT initializes its external
+/// scheduler in a DynamoRIO-managed client task
+/// (`GlobalState::init_for_external_scheduler`), so this function's process
+/// exit does not itself prove that the init exited or every guest was reaped.
+/// `--no-namespace` supplies no such PID-namespace containment.
+/// `RunOpts::log_cap_refusal` separately keeps DBT log caps refused in both
+/// namespace modes and documents the other unqualified exit windows.
 pub(crate) fn exit_on_scheduler_refusal(refusal: &dyn std::fmt::Display) -> ! {
     {
         use std::io::Write;
