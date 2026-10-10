@@ -33093,6 +33093,96 @@ mod scorecard_cutover_tests {
         assert!(summary.starts_with("history: cache bracketed"), "{summary}");
     }
 
+    /// The ledger read holds one line and the projected rows, never the whole
+    /// adapter output. A fake adapter that refuses the projection flags, as one
+    /// from before them does, prints 256 rows of 1 MiB each; the reader must
+    /// fall back to the whole view and still stay far below that. It runs in a
+    /// child process so the peak is the reader's own, not the test harness's.
+    #[test]
+    fn the_ledger_read_streams_and_its_peak_does_not_scale_with_the_output() {
+        const CHILD: &str = "HERMIT_TEST_LEDGER_READ_PEAK_CHILD";
+        const ROWS: usize = 256;
+        const CELLS: usize = 64;
+        const CELL_DETAIL_BYTES: usize = 16 << 10;
+        // Measured on the development host on 2026-10-10: the child peaked at
+        // 11,444 to 11,860 KiB over three runs. The same reader made to buffer
+        // the adapter's whole output before parsing it peaked at 268,024 KiB,
+        // just over the 262,144 KiB printed, and failed this bound.
+        const PEAK_BOUND_KIB: u64 = 64 << 10;
+        if let Some(root) = std::env::var_os(CHILD).map(PathBuf::from) {
+            unsafe {
+                std::env::set_var("DEV_HERMIT_TOOL_ROOT", &root);
+                std::env::remove_var("HERMIT_VALIDATE_LEDGER");
+            }
+            let rows = validate_history::read_rows(&root.join("ledger"));
+            assert_eq!(rows.len(), ROWS);
+            for row in &rows {
+                assert!(row.get("raw_result_input_census_v1").is_none());
+                assert_eq!(
+                    row["cell_results"]["cells"],
+                    serde_json::json!([{"cell_verdict": {"state": "compared-and-matched"}}])
+                );
+                assert_eq!(row["cell_results"]["run_id"], "r");
+            }
+            let status = std::fs::read_to_string("/proc/self/status").unwrap();
+            let peak = status
+                .lines()
+                .find_map(|line| line.strip_prefix("VmHWM:"))
+                .and_then(|value| value.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+                .unwrap();
+            std::fs::write(root.join("peak-kib"), peak.to_string()).unwrap();
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "validate-ledger-read-peak-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("ledger")).unwrap();
+        std::fs::create_dir_all(root.join("ci-hub/ledger")).unwrap();
+        std::fs::write(
+            root.join("ci-hub/ledger/validate_rows.py"),
+            format!(
+                "import json, sys\n\
+                 if sys.argv[1:] != ['rows', '--preserve-admission']:\n\
+                 \x20   sys.stderr.write('validate_rows.py: error: unrecognized arguments: ' + ' '.join(sys.argv[3:]) + '\\n')\n\
+                 \x20   sys.exit(2)\n\
+                 cell = {{'cell_verdict': {{'state': 'compared-and-matched', 'detail': 'x' * {CELL_DETAIL_BYTES}}}}}\n\
+                 row = {{'schema_version': 10, 'result': 'pass', 'raw_result_input_census_v1': ['y' * 4096],\n\
+                 \x20      'cell_results': {{'run_id': 'r', 'cells': [cell] * {CELLS}}}}}\n\
+                 line = json.dumps(row) + '\\n'\n\
+                 for _ in range({ROWS}):\n\
+                 \x20   sys.stdout.write(line)\n"
+            ),
+        )
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "scorecard_cutover_tests::the_ledger_read_streams_and_its_peak_does_not_scale_with_the_output",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, &root)
+            .output()
+            .unwrap();
+        let peak = std::fs::read_to_string(root.join("peak-kib")).ok();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(output.status.success(), "child failed: {output:?}");
+        let peak: u64 = peak.expect("the child recorded no peak").parse().unwrap();
+        let printed = (ROWS * CELLS * CELL_DETAIL_BYTES) as u64 >> 10;
+        eprintln!("ledger read peak {peak} KiB for {printed} KiB of adapter output");
+        assert!(
+            peak <= PEAK_BOUND_KIB,
+            "the ledger read peaked at {peak} KiB for {printed} KiB of adapter output; \
+             the bound is {PEAK_BOUND_KIB} KiB"
+        );
+    }
+
     #[test]
     fn explicit_selections_and_other_labels_do_not_acquire_full_scope() {
         let source = test_source_root();

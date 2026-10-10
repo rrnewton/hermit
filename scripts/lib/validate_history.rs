@@ -106,6 +106,42 @@ pub(crate) fn canonical_ledger_reader(adapter: &Path) -> Command {
     command
 }
 
+/// The adapter flags that cut each row to what these readers use: of
+/// `cell_results`, only its distinct `cell_verdict.state` values and its
+/// `run_id`; of each gate, only [`HISTORY_GATE_FIELDS`]; and no
+/// `raw_result_input_census_v1`. [`history_projection`] applies the same cut
+/// here, so an adapter that predates the flags gives the same rows.
+const HISTORY_PROJECTION_ARGS: [&str; 15] = [
+    "--cell-verdict-states",
+    "--omit-field",
+    "raw_result_input_census_v1",
+    "--keep-gate-field",
+    HISTORY_GATE_FIELDS[5],
+    "--keep-gate-field",
+    HISTORY_GATE_FIELDS[0],
+    "--keep-gate-field",
+    HISTORY_GATE_FIELDS[1],
+    "--keep-gate-field",
+    HISTORY_GATE_FIELDS[2],
+    "--keep-gate-field",
+    HISTORY_GATE_FIELDS[3],
+    "--keep-gate-field",
+    HISTORY_GATE_FIELDS[4],
+];
+
+/// The fields of a `gates` entry that [`failure_row_blocks_pass_cache`] reads,
+/// and `name`, which a `HistoryRow` requires of every gate: without it the
+/// admission check on a projected row fails, and a pass row could never be a
+/// cache hit. No other reader here looks inside a gate.
+const HISTORY_GATE_FIELDS: [&str; 6] = [
+    "result",
+    "exit_code",
+    "real_seconds",
+    "failure_origin",
+    "failed_substeps",
+    "name",
+];
+
 /// Read the one logical ledger into rows, skipping unparseable lines.
 ///
 /// In an admitted dev-hermit run, `ledger` is the parent's logical `ledger/`
@@ -113,12 +149,24 @@ pub(crate) fn canonical_ledger_reader(adapter: &Path) -> Command {
 /// shard (or the retired raw shadow file) here would create a second receipt
 /// authority.  An ordinary file remains supported only for isolated fixtures
 /// and genuinely standalone checkouts.
+///
+/// # Memory
+///
+/// Rows are parsed one line at a time as the adapter writes them, and each is
+/// kept only as its [`history_projection`]. On the 2026-10-10 ledger the adapter
+/// printed 979 MB for 3,208 rows, and `cell_results` was 798 MB of it. Holding
+/// that whole output and then every parsed row took this process to 8.2 GB, and
+/// the adapter itself peaked at 6.9 GB just before. Inside a validation unit
+/// capped at 8 GiB the kernel killed the driver, systemd then stopped the
+/// unit, and every Hermit validation from 05:07Z on was abandoned as
+/// "supervisor received signal 15". What is held now is one line plus the
+/// projected rows, and the projected rows are 137 MB as text.
 pub fn read_rows(ledger: &Path) -> Vec<serde_json::Value> {
     let explicit = std::env::var("HERMIT_VALIDATE_LEDGER")
         .ok()
         .filter(|value| !value.is_empty())
         .is_some_and(|value| Path::new(&value) == ledger);
-    let text = if !explicit && ledger.file_name().is_some_and(|name| name == "ledger") {
+    if !explicit && ledger.file_name().is_some_and(|name| name == "ledger") {
         let configured_tool_root = std::env::var_os("DEV_HERMIT_TOOL_ROOT")
             .filter(|value| !value.is_empty())
             .map(std::path::PathBuf::from);
@@ -126,36 +174,166 @@ pub fn read_rows(ledger: &Path) -> Vec<serde_json::Value> {
         else {
             return Vec::new();
         };
-        let Ok(output) = canonical_ledger_reader(&adapter).output() else {
+        return match read_adapter_rows(&adapter, true) {
+            AdapterRead::Rows(rows) => rows,
+            // A tool root from before the projection flags refuses them with
+            // argparse's usage error; read the whole view and cut it here.
+            AdapterRead::ProjectionRefused => match read_adapter_rows(&adapter, false) {
+                AdapterRead::Rows(rows) => rows,
+                AdapterRead::ProjectionRefused | AdapterRead::Failed => Vec::new(),
+            },
+            AdapterRead::Failed => Vec::new(),
+        };
+    }
+    let Ok(file) = std::fs::File::open(ledger) else {
+        return Vec::new();
+    };
+    projected_rows(std::io::BufReader::new(file)).unwrap_or_default()
+}
+
+enum AdapterRead {
+    Rows(Vec<serde_json::Value>),
+    /// The adapter exited 2 naming an unrecognized argument.
+    ProjectionRefused,
+    /// Already reported on stderr.
+    Failed,
+}
+
+fn read_adapter_rows(adapter: &Path, project: bool) -> AdapterRead {
+    use std::process::Stdio;
+    let mut command = canonical_ledger_reader(adapter);
+    if project {
+        command.args(HISTORY_PROJECTION_ARGS);
+    }
+    let Ok(mut child) = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    else {
+        eprintln!(
+            "validate: warning: cannot launch canonical ledger reader {}",
+            adapter.display()
+        );
+        return AdapterRead::Failed;
+    };
+    // Drained beside stdout so a chatty refusal cannot fill its pipe and stall
+    // the adapter while this thread waits on stdout.
+    let stderr = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut text = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut pipe, &mut text);
+            text
+        })
+    });
+    let rows = child
+        .stdout
+        .take()
+        .map(|pipe| projected_rows(std::io::BufReader::new(pipe)));
+    let status = child.wait();
+    let stderr = stderr
+        .and_then(|handle| handle.join().ok())
+        .map(|text| String::from_utf8_lossy(&text).trim().to_string())
+        .unwrap_or_default();
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status)
+            if project && status.code() == Some(2) && stderr.contains("unrecognized arguments") =>
+        {
+            return AdapterRead::ProjectionRefused;
+        }
+        _ => {
             eprintln!(
-                "validate: warning: cannot launch canonical ledger reader {}",
+                "validate: warning: canonical ledger reader {} refused: {stderr}",
                 adapter.display()
             );
-            return Vec::new();
-        };
-        if !output.status.success() {
-            eprintln!(
-                "validate: warning: canonical ledger reader {} refused: {}",
-                adapter.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-            return Vec::new();
+            return AdapterRead::Failed;
         }
-        let Ok(text) = String::from_utf8(output.stdout) else {
-            eprintln!("validate: warning: canonical ledger reader emitted non-UTF-8 data");
-            return Vec::new();
-        };
-        text
-    } else {
-        let Ok(text) = std::fs::read_to_string(ledger) else {
-            return Vec::new();
-        };
-        text
+    }
+    match rows {
+        Some(Ok(rows)) => AdapterRead::Rows(rows),
+        Some(Err(error)) => {
+            eprintln!("validate: warning: canonical ledger reader output unreadable: {error}");
+            AdapterRead::Failed
+        }
+        None => AdapterRead::Failed,
+    }
+}
+
+/// Parse and project one line at a time. Unreadable or non-UTF-8 input is an
+/// error for the whole read, as it was when the output was decoded at once;
+/// an unparseable line is skipped.
+fn projected_rows(mut input: impl std::io::BufRead) -> std::io::Result<Vec<serde_json::Value>> {
+    let mut rows = Vec::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if input.read_line(&mut line)? == 0 {
+            return Ok(rows);
+        }
+        let raw = line.trim_end_matches(['\n', '\r']);
+        if raw.trim().is_empty() {
+            continue;
+        }
+        if let Some(row) = admission_cache_row(raw) {
+            rows.push(history_projection(row));
+        }
+    }
+}
+
+/// Cut a row to what this module's readers use: of `cell_results`, one cell per
+/// distinct `cell_verdict.state`, in first-seen order (a cell without one
+/// stands for itself as `{}`), and the `run_id` that the admission check
+/// compares; of each gate, only [`HISTORY_GATE_FIELDS`]; and no
+/// `raw_result_input_census_v1`. The readers ask only whether
+/// any cell has a given state, so the cell count and which cell had which
+/// state are not kept. Kept per cell, the 666,101 cells of the 2026-10-10
+/// ledger cost this process 1.7 GB as parsed values. A `cell_results` without a `cells` list is
+/// left as written. It runs after [`admission_cache_row`], which checks the
+/// admission claim on the complete line.
+pub(crate) fn history_projection(mut row: serde_json::Value) -> serde_json::Value {
+    let Some(object) = row.as_object_mut() else {
+        return row;
     };
-    text.lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(admission_cache_row)
-        .collect()
+    object.remove("raw_result_input_census_v1");
+    if let Some(gates) = object
+        .get_mut("gates")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for gate in gates {
+            if let Some(gate) = gate.as_object_mut() {
+                gate.retain(|key, _| HISTORY_GATE_FIELDS.contains(&key.as_str()));
+            }
+        }
+    }
+    if let Some(cell_results) = object.get_mut("cell_results") {
+        let cells = cell_results
+            .get("cells")
+            .and_then(serde_json::Value::as_array)
+            .map(|cells| {
+                let mut states: Vec<serde_json::Value> = Vec::new();
+                for cell in cells {
+                    let projected = match cell.pointer("/cell_verdict/state") {
+                        Some(state) => serde_json::json!({"cell_verdict": {"state": state}}),
+                        None => serde_json::json!({}),
+                    };
+                    if !states.contains(&projected) {
+                        states.push(projected);
+                    }
+                }
+                states
+            });
+        if let Some(cells) = cells {
+            let mut kept = serde_json::Map::new();
+            kept.insert("cells".into(), serde_json::Value::Array(cells));
+            // The admission check compares it with the claimed run.
+            if let Some(run_id) = cell_results.get("run_id") {
+                kept.insert("run_id".into(), run_id.clone());
+            }
+            *cell_results = serde_json::Value::Object(kept);
+        }
+    }
+    row
 }
 
 /// Preserve original duplicate evidence before the generic history view can
@@ -1302,6 +1480,105 @@ pub fn self_test() -> Result<String, String> {
         return Err("cache: an ordinary pass erased a schema-10 divergence".into());
     }
 
+    // The streamed reader keeps each row only as its projection, and the
+    // projection must decide every lookup exactly as the whole row does: a
+    // divergence still latches over a pass, and a clean pass is still a hit.
+    let mut heavy_failure = failing.clone();
+    heavy_failure["cell_results"] = serde_json::json!({
+        "run_id": "r-heavy",
+        "shared": {"bulk": "x".repeat(4096)},
+        "cells": [
+            {"id": "a", "cell_verdict": {"state": "compared-and-matched", "detail": "y".repeat(512)}},
+            {"id": "b", "cell_verdict": {"state": "compared-and-diverged"}},
+            {"id": "c"},
+            {"id": "d", "cell_verdict": {"state": "compared-and-matched"}},
+            {"id": "e"},
+        ],
+    });
+    heavy_failure["gates"][0]["attempts"] = serde_json::json!([{"log": "w".repeat(2048)}]);
+    heavy_failure["gates"][0]["name"] = serde_json::json!("check.example");
+    heavy_failure["raw_result_input_census_v1"] = serde_json::json!({"inputs": ["z".repeat(1024)]});
+    let mut heavy_pass = rs_pass.clone();
+    heavy_pass["raw_result_input_census_v1"] = serde_json::json!({"inputs": ["z".repeat(1024)]});
+    let jsonl = format!("{heavy_failure}\n\n{heavy_pass}\r\nnot json\n");
+    let streamed = projected_rows(jsonl.as_bytes())
+        .map_err(|error| format!("projection: a readable ledger was refused: {error}"))?;
+    if streamed.len() != 2 {
+        return Err(format!(
+            "projection: expected 2 rows (blank and unparseable lines skipped), got {}",
+            streamed.len()
+        ));
+    }
+    if streamed[0]["cell_results"]
+        != serde_json::json!({"run_id": "r-heavy", "cells": [
+            {"cell_verdict": {"state": "compared-and-matched"}},
+            {"cell_verdict": {"state": "compared-and-diverged"}},
+            {},
+        ]})
+        || streamed
+            .iter()
+            .any(|row| row.get("raw_result_input_census_v1").is_some())
+        || streamed[0]["gates"]
+            != serde_json::json!([{"result": "fail", "exit_code": 1, "real_seconds": 5.0,
+                                   "failure_origin": "outer_gate", "name": "check.example"}])
+    {
+        return Err(format!(
+            "projection: unexpected projected row {}",
+            streamed[0]
+        ));
+    }
+    // A projected row must still be a HistoryRow wherever the whole row is:
+    // pass_row_qualifies and the admission check decode it as one.
+    let history_row = |row: &serde_json::Value| {
+        serde_json::from_value::<hermit_manifest_plan::ledger::HistoryRow>(row.clone()).is_ok()
+    };
+    if !history_row(&heavy_failure) || !history_row(&streamed[0]) {
+        return Err("projection: a projected row is no longer a HistoryRow".into());
+    }
+    let mut unprojected = heavy_failure.clone();
+    unprojected["cell_results"] = serde_json::json!({"run_id": "r-1"});
+    unprojected["gates"] = failing["gates"].clone();
+    if history_projection(unprojected.clone()) != {
+        let mut expected = unprojected.clone();
+        expected
+            .as_object_mut()
+            .unwrap()
+            .remove("raw_result_input_census_v1");
+        expected
+    } {
+        return Err("projection: a cell_results without cells must be left as written".into());
+    }
+    for (label, full, projected) in [
+        (
+            "fail-then-pass",
+            vec![heavy_failure.clone(), heavy_pass.clone()],
+            streamed.clone(),
+        ),
+        (
+            "pass alone",
+            vec![heavy_pass.clone()],
+            vec![streamed[1].clone()],
+        ),
+    ] {
+        if cache_lookup(&full, "pass", &key).is_some()
+            != cache_lookup(&projected, "pass", &key).is_some()
+        {
+            return Err(format!(
+                "projection: {label} decides the pass cache differently"
+            ));
+        }
+    }
+    if cache_lookup(&streamed, "pass", &key).is_some()
+        || cache_lookup(&[streamed[1].clone()], "pass", &key).is_none()
+    {
+        return Err("projection: the projected divergence must latch and the pass must hit".into());
+    }
+    if projected_rows(&b"{\"result\":\"pass\"}\n\xff\n"[..]).is_ok() {
+        return Err("projection: non-UTF-8 output must refuse the whole read".into());
+    }
+    accepted += 3;
+    refused += 3;
+
     // The two historical orderings are both refused: fail-then-pass and
     // pass-then-fail. A cache key is content identity, so append order must not
     // decide whether a known-failing tree gets a zero-gate green.
@@ -1687,6 +1964,7 @@ pub fn self_test() -> Result<String, String> {
     Ok(format!(
         "history: cache bracketed {accepted} accept / {refused} refuse (incl. both \
          cross-producer counter traps), estimate bracketed thin/median/no-ledger/fail-poison, \
-         selective baseline bracketed slot-preference/explicit/missing-commit/builder"
+         selective baseline bracketed slot-preference/explicit/missing-commit/builder, \
+         streamed rows bracketed projection/divergence/non-UTF-8"
     ))
 }
