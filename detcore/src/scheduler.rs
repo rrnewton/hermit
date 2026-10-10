@@ -992,6 +992,23 @@ pub struct Scheduler {
     /// order in which those host-timed events arrive.
     released_vfork_barriers: BTreeSet<DetTid>,
 
+    /// Processes a committed SIGKILL has doomed
+    /// ([`Scheduler::record_committed_sigkill`]). They will die even if a
+    /// thread of theirs is held at a happens-before gate, so a wait for one is
+    /// never part of a deadlock. An entry is dropped when its process is
+    /// reaped.
+    sigkilled_processes: BTreeSet<DetPid>,
+    /// Threads granted their `Exit` (an `exit` or `exit_group`), inside their
+    /// own committed turn. A thread that leaves the scheduler without one died
+    /// of a signal or with its process, so its process is going down
+    /// ([`Scheduler::child_waits_wait_only_on_held_children`]). Cleared when
+    /// the tid is registered again.
+    committed_exits: BTreeSet<DetTid>,
+    /// Set by a SIGKILL whose victim the scheduler cannot name (a pidfd with
+    /// no recorded process): from then on no child wait counts as part of a
+    /// deadlock ([`Scheduler::record_unresolved_sigkill`]).
+    unresolved_sigkill: bool,
+
     /// Threads whose run-queue admission was recorded by a global-request
     /// handler while a `tentative_pop` transaction was live, deferred to the
     /// next deterministic drain point (`step2`) so it cannot mutate the run
@@ -2766,6 +2783,9 @@ impl Scheduler {
             dead_vfork_parents: Default::default(),
             dead_parent_vfork_barriers: Default::default(),
             released_vfork_barriers: Default::default(),
+            sigkilled_processes: Default::default(),
+            committed_exits: Default::default(),
+            unresolved_sigkill: false,
             pending_run_queue_admissions: Default::default(),
             pending_run_queue_removals: Default::default(),
             pending_cross_task_signals: Default::default(),
@@ -2919,6 +2939,70 @@ impl Scheduler {
         self.physical_thread_pidfds
             .get(&dettid)
             .map(|(mm, pid, tid, _)| (*mm, *pid, *tid))
+    }
+
+    /// Record, in the sender's committed turn, that a SIGKILL to `dettid` (or
+    /// to process `target_process`) succeeded. The process will die even
+    /// while one of its threads is held at a happens-before gate, so
+    /// [`Scheduler::child_waits_wait_only_on_held_children`] never counts a
+    /// wait for it as part of a deadlock. On ptrace its retirement comes later,
+    /// at its host-timed deregistration
+    /// (https://github.com/rrnewton/hermit/issues/3994); this record is
+    /// decided by the sender's syscall, so it is deterministic.
+    pub(crate) fn record_committed_sigkill(
+        &mut self,
+        dettid: DetTid,
+        target_process: Option<DetPid>,
+    ) {
+        let process = target_process.or_else(|| {
+            self.thread_tree
+                .thread_to_leader
+                .get(&dettid)
+                .map(|leader| DetPid::from_raw(leader.as_raw()))
+        });
+        match process {
+            Some(process) => {
+                self.sigkilled_processes.insert(process);
+            }
+            None => self.unresolved_sigkill = true,
+        }
+    }
+
+    /// Record a successful SIGKILL the scheduler is not told about one victim
+    /// at a time: every process now in process group `group`, or, for `None`
+    /// (a pidfd whose process Detcore did not record), an unknown process.
+    /// An unknown victim makes every child wait count as input that may still
+    /// arrive for the rest of the run.
+    pub(crate) fn record_unresolved_sigkill(&mut self, group: Option<DetPid>) {
+        match group {
+            Some(group) => {
+                let members: Vec<DetPid> = self
+                    .thread_tree
+                    .process_wait
+                    .iter()
+                    .filter(|(_, metadata)| metadata.process_group == group)
+                    .map(|(process, _)| *process)
+                    .collect();
+                self.sigkilled_processes.extend(members);
+            }
+            None => self.unresolved_sigkill = true,
+        }
+    }
+
+    /// Whether a committed SIGKILL doomed `process`, and whether one with an
+    /// unnamed victim was seen (test observation of the record above).
+    #[cfg(test)]
+    pub(crate) fn sigkill_recorded(&self, process: DetPid) -> (bool, bool) {
+        (
+            self.sigkilled_processes.contains(&process),
+            self.unresolved_sigkill,
+        )
+    }
+
+    /// A thread is being registered on `dettid`: any committed exit recorded
+    /// for an earlier thread with that tid no longer applies.
+    pub(crate) fn forget_committed_exit(&mut self, dettid: DetTid) {
+        self.committed_exits.remove(&dettid);
     }
 
     pub(crate) fn note_process_sigkill(&mut self, dettid: DetTid, detpid: DetPid) {
@@ -5275,6 +5359,115 @@ impl Scheduler {
             }
     }
 
+    /// True, in a happens-before run with a thread held at a gate, when there
+    /// is at least one child wait and every one of them can only be satisfied
+    /// by stuck children: children whose live threads are all held at gates,
+    /// parked in a futex wait, or themselves in a child wait on stuck
+    /// children. None of these runs again until some other thread does (an
+    /// anchor firing, a futex wake, a child exit), so with nothing runnable,
+    /// no timer and no outstanding external I/O, such waits can never end
+    /// (https://github.com/rrnewton/hermit/issues/3904). A chain of waits
+    /// down to a held child is stuck too, so an ancestor's ordinary wait does
+    /// not hide the cycle below it. A wait with no matching child, a child
+    /// with any other live thread or none, a child that has already exited,
+    /// and a child a committed SIGKILL has doomed (it will die at a host-timed
+    /// point, so its wait is real) are treated as able to end, as before.
+    fn child_waits_wait_only_on_held_children(&self) -> bool {
+        let Some(hb) = self.happens_before.as_ref() else {
+            return false;
+        };
+        if self.unresolved_sigkill || hb.parked.is_empty() || self.blocked.child_waiters.is_empty()
+        {
+            return false;
+        }
+        // The stuck processes, as a least fixed point: a process becomes stuck
+        // once each of its live threads is held, futex-parked, or waiting only
+        // on processes already found stuck. Growing the set only makes more
+        // processes qualify, so the iteration ends; the process tree has no
+        // cycles, so a chain is found one level per round.
+        let mut stuck: BTreeSet<DetPid> = BTreeSet::new();
+        loop {
+            let next: BTreeSet<DetPid> = self
+                .thread_tree
+                .process_wait
+                .keys()
+                .copied()
+                .filter(|child| self.child_is_stuck(hb, *child, &stuck))
+                .collect();
+            if next == stuck {
+                break;
+            }
+            stuck = next;
+        }
+        self.blocked
+            .child_waiters
+            .values()
+            .all(|(parent, spec)| self.child_wait_is_stuck(*parent, *spec, &stuck))
+    }
+
+    /// True when the child wait of `parent` with `spec` has at least one
+    /// matching child and every matching child is in `stuck`.
+    fn child_wait_is_stuck(
+        &self,
+        parent: DetPid,
+        spec: ChildWaitSpec,
+        stuck: &BTreeSet<DetPid>,
+    ) -> bool {
+        let mut children = self
+            .thread_tree
+            .process_wait
+            .keys()
+            .copied()
+            .filter(|child| self.child_matches_wait(parent, *child, spec))
+            .peekable();
+        children.peek().is_some() && children.all(|child| stuck.contains(&child))
+    }
+
+    /// True when process `child` can run again only after some other thread
+    /// does, given the processes already known to be `stuck`
+    /// ([`Scheduler::child_waits_wait_only_on_held_children`]).
+    fn child_is_stuck(&self, hb: &HbRuntime, child: DetPid, stuck: &BTreeSet<DetPid>) -> bool {
+        let leader = DetTid::from_raw(child.as_raw());
+        // A process armed with PR_SET_PDEATHSIG(SIGKILL) is killed by the
+        // kernel when its parent thread exits, at a moment set by host
+        // timing. The arming is recorded as a host-timed signal in the
+        // caller's committed turn and never forgotten, so such a process
+        // never counts as stuck (the second Claude re-check of
+        // https://github.com/rrnewton/hermit/pull/4013).
+        if self.logically_exited_processes.contains(&child)
+            || self.sigkilled_processes.contains(&child)
+            || !self.thread_tree.thread_group_leaders.contains(&leader)
+            || self.host_timed_signals(leader) & kernel_signal_bit(libc::SIGKILL) != 0
+        {
+            return false;
+        }
+        // The thread tree keeps every thread a process ever had. A thread no
+        // longer registered that left by its own committed exit is gone
+        // harmlessly; one that left any other way died of a signal or with its
+        // process, so the process is going down and its wait is real. The
+        // dying thread's deregistration is ordered (the scheduler waits for a
+        // running thread to quiesce); the held thread's is not, so only the
+        // dying sibling can tell.
+        let (live, gone): (Vec<DetTid>, Vec<DetTid>) = self
+            .thread_tree
+            .my_thread_group(&leader)
+            .into_iter()
+            .partition(|tid| self.next_turns.contains_key(tid));
+        gone.iter().all(|tid| self.committed_exits.contains(tid))
+            && !live.is_empty()
+            && live.iter().all(|tid| {
+                hb.parked.contains(tid)
+                    || self.parked_futex_waiter(*tid).is_some()
+                    || self
+                        .blocked
+                        .child_waiters
+                        .get(tid)
+                        .is_some_and(|(parent, spec)| {
+                            self.child_wait_is_stuck(*parent, *spec, stuck)
+                        })
+            })
+    }
+
     pub fn ready_child_wait(&self, parent: DetPid, spec: ChildWaitSpec) -> Option<DetPid> {
         self.logically_exited_processes
             .iter()
@@ -5296,6 +5489,7 @@ impl Scheduler {
         }
         self.wake_child_waiters(parent, child);
         self.completed_physical_process_exits.remove(&child);
+        self.sigkilled_processes.remove(&child);
         self.thread_tree.process_parent.remove(&child);
         self.thread_tree.process_wait.remove(&child);
         self.thread_tree.child_subreapers.remove(&child);
@@ -6893,8 +7087,10 @@ impl Scheduler {
         // external input that could let a source run) is a deadlock to report,
         // not an exit to fizzle into
         // (https://github.com/rrnewton/hermit/issues/3149). A child wait counts
-        // as external input here, so a cycle through a parked child is not yet
-        // reported.
+        // as input that may still arrive, unless every child it could reap is
+        // held at a gate: such a child can only exit after it runs, so with
+        // nothing runnable the wait is part of the deadlock
+        // (https://github.com/rrnewton/hermit/issues/3904).
         let hb_parked_empty = self
             .happens_before
             .as_ref()
@@ -6903,6 +7099,10 @@ impl Scheduler {
         let external_waits_empty = self.blocked.external_io_blockers.is_empty()
             && self.blocked.child_waiters.is_empty()
             && self.blocked.physical_child_waiters.is_empty();
+        let external_waits_settled = external_waits_empty
+            || (self.blocked.external_io_blockers.is_empty()
+                && self.blocked.physical_child_waiters.is_empty()
+                && self.child_waits_wait_only_on_held_children());
         let rt_sigsuspend_empty = self.blocked.rt_sigsuspend_blockers.is_empty();
         let futex_empty = self.blocked.no_futex_waiters();
 
@@ -7002,7 +7202,7 @@ impl Scheduler {
             if logically_empty {
                 return Err(SkipTurn);
             } else if timed_empty
-                && external_waits_empty
+                && external_waits_settled
                 && (!futex_empty || !rt_sigsuspend_empty || !hb_parked_empty)
             {
                 return Err(self.report_terminal_deadlock());
@@ -7513,6 +7713,9 @@ impl Scheduler {
                 // The grant is a vfork child's release edge: a barrier whose
                 // parent has died ends here, inside this committed turn.
                 self.release_vfork_child(dettid);
+                // The thread leaves by its own committed exit, not by dying
+                // with its process (https://github.com/rrnewton/hermit/issues/3904).
+                self.committed_exits.insert(dettid);
                 // An exit that ends its process leaves the host some time after
                 // this grant. Hold turn selection from here until the backend
                 // reports the process physically gone (asynchronous exit
@@ -17163,6 +17366,268 @@ mod test {
             ),
             "{report}"
         );
+    }
+
+    /// A child wait is part of a happens-before deadlock only when every child
+    /// it could reap has all its live threads held at gates or parked in a
+    /// futex wait (https://github.com/rrnewton/hermit/issues/3904). A child
+    /// thread doing anything else, an exited child, a child a committed
+    /// SIGKILL has doomed, a wait with no matching child, an unnamed SIGKILL,
+    /// and a run with no held thread keep the wait counted as input that may
+    /// still arrive; a thread that has exited no longer counts.
+    #[test]
+    fn a_child_wait_settles_only_on_children_held_or_in_futex_waits() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.happens_before = Some(hb_runtime(HB_GATE_SPEC));
+        let parent = DetTid::from_raw(3);
+        let child = DetTid::from_raw(5);
+        let child_worker = DetTid::from_raw(6);
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, child, true);
+        register_known_thread(&mut scheduler, child);
+        let spec = ChildWaitSpec {
+            selector: ChildWaitSelector::Any,
+            owner: None,
+            exit_class: ChildWaitExitClass::Sigchld,
+        };
+        scheduler
+            .blocked
+            .child_waiters
+            .insert(parent, (DetPid::from_raw(3), spec));
+        let park_in_futex = |s: &mut Scheduler, tid: DetTid, addr: usize| {
+            let mut futex_request = Resources::new(tid);
+            futex_request.insert(ResourceID::FutexWait, Permission::RW);
+            s.next_turns.get_mut(&tid).unwrap().req = Ivar::full(Ok(futex_request));
+            let futex = FutexID::private(MmId::initial(DetPid::from_raw(5)), addr);
+            s.blocked
+                .futex_waiters
+                .entry(futex)
+                .or_default()
+                .push(futex_waiter(tid.as_raw(), u32::MAX));
+        };
+        // No held thread: the wait still counts as input, even with the
+        // child's only thread parked in a futex wait (the held-thread guard,
+        // not the child's state, decides this case).
+        park_in_futex(&mut scheduler, child, 0x404000);
+        assert!(!scheduler.child_waits_wait_only_on_held_children());
+        scheduler.blocked.futex_waiters.clear();
+        scheduler.next_turns.get_mut(&child).unwrap().req = Ivar::new();
+        assert!(!scheduler.child_waits_wait_only_on_held_children());
+        let hold = |s: &mut Scheduler, tid| {
+            s.happens_before.as_mut().unwrap().parked.insert(tid);
+        };
+        hold(&mut scheduler, child);
+        assert!(scheduler.child_waits_wait_only_on_held_children());
+
+        // A thread the child had that is no longer registered: if it left by
+        // its own committed exit it is gone harmlessly; if it left without one
+        // (a fatal signal, or a kill of its process), the process is going
+        // down and the wait is real.
+        let gone = DetTid::from_raw(8);
+        scheduler.thread_tree.add_child(child, gone, false);
+        assert!(!scheduler.child_waits_wait_only_on_held_children());
+        scheduler.committed_exits.insert(gone);
+        assert!(scheduler.child_waits_wait_only_on_held_children());
+        // A new thread on that tid has not exited.
+        scheduler.forget_committed_exit(gone);
+        assert!(!scheduler.child_waits_wait_only_on_held_children());
+        scheduler.committed_exits.insert(gone);
+
+        // A committed SIGKILL dooms the child: it will die, so the wait is
+        // real, whenever its host-timed retirement arrives.
+        scheduler.record_committed_sigkill(child, Some(DetPid::from_raw(5)));
+        assert!(!scheduler.child_waits_wait_only_on_held_children());
+        scheduler.sigkilled_processes.clear();
+        // A SIGKILL named by thread maps to its process.
+        scheduler.record_committed_sigkill(child, None);
+        assert!(scheduler.sigkilled_processes.contains(&DetPid::from_raw(5)));
+        scheduler.sigkilled_processes.clear();
+        // A process-group kill dooms every process in the group.
+        scheduler.record_unresolved_sigkill(Some(DetPid::from_raw(3)));
+        assert!(scheduler.sigkilled_processes.contains(&DetPid::from_raw(5)));
+        assert!(!scheduler.child_waits_wait_only_on_held_children());
+        scheduler.sigkilled_processes.clear();
+        assert!(scheduler.child_waits_wait_only_on_held_children());
+
+        // A second child thread that is neither held nor in a futex wait could
+        // still run.
+        scheduler.thread_tree.add_child(child, child_worker, false);
+        register_known_thread(&mut scheduler, child_worker);
+        assert!(!scheduler.child_waits_wait_only_on_held_children());
+        // Parked in a futex wait, it can only be woken by another thread.
+        park_in_futex(&mut scheduler, child_worker, 0x404110);
+        assert!(scheduler.child_waits_wait_only_on_held_children());
+
+        // A child that has exited logically is reapable.
+        scheduler
+            .logically_exited_processes
+            .insert(DetPid::from_raw(5));
+        assert!(!scheduler.child_waits_wait_only_on_held_children());
+        scheduler
+            .logically_exited_processes
+            .remove(&DetPid::from_raw(5));
+
+        // A wait that matches no child is left alone.
+        scheduler.blocked.child_waiters.insert(
+            parent,
+            (
+                DetPid::from_raw(3),
+                ChildWaitSpec {
+                    selector: ChildWaitSelector::Exact(DetPid::from_raw(77)),
+                    ..spec
+                },
+            ),
+        );
+        assert!(!scheduler.child_waits_wait_only_on_held_children());
+
+        // A SIGKILL whose victim cannot be named disables settling for good.
+        scheduler
+            .blocked
+            .child_waiters
+            .insert(parent, (DetPid::from_raw(3), spec));
+        assert!(scheduler.child_waits_wait_only_on_held_children());
+        scheduler.record_unresolved_sigkill(None);
+        assert!(!scheduler.child_waits_wait_only_on_held_children());
+
+        // Reaping a doomed process drops its record (last: reaping also drops
+        // the child's wait entry).
+        scheduler
+            .thread_tree
+            .process_parent
+            .insert(DetPid::from_raw(5), DetPid::from_raw(3));
+        scheduler.record_committed_sigkill(child, Some(DetPid::from_raw(5)));
+        assert!(scheduler.sigkilled_processes.contains(&DetPid::from_raw(5)));
+        scheduler.consume_child_wait(DetPid::from_raw(3), DetPid::from_raw(5));
+        assert!(!scheduler.sigkilled_processes.contains(&DetPid::from_raw(5)));
+    }
+
+    /// A chain of child waits down to a held child is stuck: the root waits
+    /// for its child, which waits for a grandchild held at a gate, and the
+    /// root's ordinary wait does not hide the cycle below it (the Codex design
+    /// re-check of https://github.com/rrnewton/hermit/issues/3929). A middle
+    /// process that could still run, or a wait in the chain that matches no
+    /// child, keeps the chain counted as input that may still arrive.
+    #[test]
+    fn a_chain_of_child_waits_down_to_a_held_child_settles() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.happens_before = Some(hb_runtime(HB_GATE_SPEC));
+        let root = DetTid::from_raw(3);
+        let middle = DetTid::from_raw(5);
+        let leaf = DetTid::from_raw(7);
+        let middle_worker = DetTid::from_raw(6);
+        scheduler.thread_tree.add_child(root, root, true);
+        scheduler.thread_tree.add_child(root, middle, true);
+        scheduler.thread_tree.add_child(middle, leaf, true);
+        register_known_thread(&mut scheduler, middle);
+        register_known_thread(&mut scheduler, leaf);
+        let any = ChildWaitSpec {
+            selector: ChildWaitSelector::Any,
+            owner: None,
+            exit_class: ChildWaitExitClass::Sigchld,
+        };
+        scheduler
+            .blocked
+            .child_waiters
+            .insert(root, (DetPid::from_raw(3), any));
+        scheduler
+            .blocked
+            .child_waiters
+            .insert(middle, (DetPid::from_raw(5), any));
+        // The leaf runs: nothing is stuck.
+        assert!(!scheduler.child_waits_wait_only_on_held_children());
+        scheduler
+            .happens_before
+            .as_mut()
+            .unwrap()
+            .parked
+            .insert(leaf);
+        assert!(scheduler.child_waits_wait_only_on_held_children());
+
+        // The middle process's wait matches no child: it may still end.
+        scheduler.blocked.child_waiters.insert(
+            middle,
+            (
+                DetPid::from_raw(5),
+                ChildWaitSpec {
+                    selector: ChildWaitSelector::Exact(DetPid::from_raw(77)),
+                    ..any
+                },
+            ),
+        );
+        assert!(!scheduler.child_waits_wait_only_on_held_children());
+        scheduler
+            .blocked
+            .child_waiters
+            .insert(middle, (DetPid::from_raw(5), any));
+        assert!(scheduler.child_waits_wait_only_on_held_children());
+
+        // A second middle thread that could run keeps the root's wait open.
+        scheduler
+            .thread_tree
+            .add_child(middle, middle_worker, false);
+        register_known_thread(&mut scheduler, middle_worker);
+        assert!(!scheduler.child_waits_wait_only_on_held_children());
+    }
+
+    /// A process armed with PR_SET_PDEATHSIG(SIGKILL) is never stuck: the
+    /// kernel kills it at a host-timed moment when its parent thread exits.
+    /// The arming is recorded as a host-timed signal in the caller's turn
+    /// (`PR_SET_PDEATHSIG` in `syscalls/misc.rs`). Another parent-death signal
+    /// is held off a gated wait like any host-timed signal, so it does not
+    /// change the answer (the second Claude re-check of
+    /// https://github.com/rrnewton/hermit/pull/4013).
+    #[test]
+    fn a_process_armed_with_a_parent_death_sigkill_is_not_stuck() {
+        let any = ChildWaitSpec {
+            selector: ChildWaitSelector::Any,
+            owner: None,
+            exit_class: ChildWaitExitClass::Sigchld,
+        };
+        // The held child, and the middle of a chain down to a held child.
+        for armed in [5, 7] {
+            let mut scheduler = Scheduler::new(&Config::default());
+            scheduler.happens_before = Some(hb_runtime(HB_GATE_SPEC));
+            let root = DetTid::from_raw(3);
+            let (child, leaf) = (DetTid::from_raw(5), DetTid::from_raw(7));
+            scheduler.thread_tree.add_child(root, root, true);
+            scheduler.thread_tree.add_child(root, child, true);
+            register_known_thread(&mut scheduler, child);
+            scheduler
+                .blocked
+                .child_waiters
+                .insert(root, (DetPid::from_raw(3), any));
+            let held = if armed == 7 {
+                scheduler.thread_tree.add_child(child, leaf, true);
+                register_known_thread(&mut scheduler, leaf);
+                scheduler
+                    .blocked
+                    .child_waiters
+                    .insert(child, (DetPid::from_raw(5), any));
+                leaf
+            } else {
+                child
+            };
+            scheduler
+                .happens_before
+                .as_mut()
+                .unwrap()
+                .parked
+                .insert(held);
+            assert!(scheduler.child_waits_wait_only_on_held_children());
+            let doomed = if armed == 7 { child } else { held };
+            scheduler.record_host_timed_signals(
+                doomed,
+                HostTimedSignalScope::Caller,
+                kernel_signal_bit(libc::SIGTERM),
+            );
+            assert!(scheduler.child_waits_wait_only_on_held_children());
+            scheduler.record_host_timed_signals(
+                doomed,
+                HostTimedSignalScope::Caller,
+                kernel_signal_bit(libc::SIGKILL),
+            );
+            assert!(!scheduler.child_waits_wait_only_on_held_children());
+        }
     }
 
     /// The enforcement predicates that drive `hb_checkpoint`: an anchor is

@@ -116,6 +116,8 @@ static HB_SOURCE_THEN_FUTEX_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_SIGNAL_WHILE_HELD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_SPAWN_DUP2_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_RELATIVE_ANCHOR_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static HB_CHILD_WAIT_CYCLE_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static HB_KILL_HELD_CHILD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_TIMEOUT_VS_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_PARENT_KILLED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_KILL_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -658,6 +660,56 @@ fn hb_relative_anchor_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "hb-relative-anchor guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn hb_kill_held_child_guest() -> &'static Path {
+    HB_KILL_HELD_CHILD_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("hb-kill-held-child");
+        fs::create_dir_all(&build_root).expect("failed to create hb-kill-held-child directory");
+        let guest = build_root.join("hb_kill_held_child");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/hb_kill_held_child.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile hb-kill-held-child guest");
+        assert!(
+            output.status.success(),
+            "hb-kill-held-child guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn hb_child_wait_cycle_guest() -> &'static Path {
+    HB_CHILD_WAIT_CYCLE_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("hb-child-wait-cycle");
+        fs::create_dir_all(&build_root).expect("failed to create hb-child-wait-cycle directory");
+        let guest = build_root.join("hb_child_wait_cycle");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/hb_child_wait_cycle.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile hb-child-wait-cycle guest");
+        assert!(
+            output.status.success(),
+            "hb-child-wait-cycle guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -10155,6 +10207,199 @@ Error: Hermit refused the run: a fail-closed policy stopped it before completion
         None,
     ] {
         assert_eq!(skid_overshoot_refusal(code, skid), None, "{code:?}");
+    }
+}
+
+/// A cycle through a child wait is a deadlock to refuse by name, not a hang
+/// (https://github.com/rrnewton/hermit/issues/3904). The parent waits for its
+/// child and only then writes; the spec holds the child's write until the
+/// parent's write. Nothing can run: the child is held at its gate, and the
+/// parent's wait can only end when the held child exits. The run used to spin
+/// until an outside timeout, because a child wait counted as input that could
+/// still arrive. Without the spec the same guest runs to completion.
+#[test]
+fn happens_before_cycle_through_a_child_wait_is_refused_by_name() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = hb_child_wait_cycle_guest().to_str().unwrap().to_owned();
+    let args = ["run", "--strict", "--", guest.as_str()];
+    let ungated = hermit(&args);
+    assert_success(&ungated, &args);
+    assert_eq!(stdout(&ungated), "child\nparent\n");
+
+    let spec = directory.path().join("cycle.json");
+    fs::write(&spec, HB_CHILD_WRITE_AFTER_PARENT_WRITE).unwrap();
+    // "nested": the root forks the parent of the cycle and waits for it, so
+    // an ordinary wait sits above the cycle and must not hide it (the Codex
+    // design re-check of https://github.com/rrnewton/hermit/issues/3929).
+    let nested = directory.path().join("nested.json");
+    fs::write(
+        &nested,
+        r#"{"version": 1,
+            "threads": {"parent": {"spawn_ordinal": 1}, "child": {"spawn_ordinal": 2}},
+            "events": {"parent_writes": {"thread": "parent", "syscall": "write", "fd": 1, "nth": 1},
+                       "child_writes": {"thread": "child", "syscall": "write", "fd": 1, "nth": 1}},
+            "edges": [{"before": "parent_writes", "after": "child_writes", "strength": "hard"}]}"#,
+    )
+    .unwrap();
+    let args = ["run", "--strict", "--", guest.as_str(), "nested"];
+    let ungated = hermit(&args);
+    assert_success(&ungated, &args);
+    assert_eq!(stdout(&ungated), "child\nparent\nroot\n");
+    // "joined": the child first creates and joins a helper thread, which stays
+    // in the thread tree after it exits and must not count as a live thread.
+    for (mode, spec, parent) in [
+        ("plain", &spec, "3"),
+        ("joined", &spec, "3"),
+        ("nested", &nested, "parent"),
+    ] {
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "run",
+                "--strict",
+                "--happens-before",
+                spec.to_str().unwrap(),
+                "--",
+                guest.as_str(),
+                mode,
+            ]),
+            directory.path(),
+            Duration::from_secs(60),
+            false,
+        );
+        let status = status.unwrap_or_else(|| {
+        panic!(
+            "a cycle through a child wait spun instead of being refused: no exit within 60s\n{log}"
+        )
+    });
+        assert_eq!(
+            status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "a cycle through a child wait must be refused with the policy-refusal status:\n{log}"
+        );
+        assert!(
+            log.contains(
+                "HERMIT_HB_ANCHOR_NEVER_FIRED: happens-before BEFORE anchor(s) never fired"
+            ) && log.contains(&format!(
+                "anchor 'parent_writes' on thread {parent}: write(fd=1)#1 never fired; it holds \
+                 dtid"
+            )),
+            "{mode}: no refusal naming the BEFORE anchor of the cycle:\n{log}"
+        );
+    }
+}
+
+/// The spec of the child-wait tests: the first spawned process's first write
+/// to fd 1 is held until the root's first write to fd 1.
+const HB_CHILD_WRITE_AFTER_PARENT_WRITE: &str = r#"{"version": 1,
+    "threads": {"child": {"spawn_ordinal": 1}},
+    "events": {"parent_writes": {"thread": "3", "syscall": "write", "fd": 1, "nth": 1},
+               "child_writes": {"thread": "child", "syscall": "write", "fd": 1, "nth": 1}},
+    "edges": [{"before": "parent_writes", "after": "child_writes", "strength": "hard"}]}"#;
+
+/// A held child that dies is not a deadlock: its parent's wait ends
+/// (https://github.com/rrnewton/hermit/issues/3904; the probes from the
+/// reviews of https://github.com/rrnewton/hermit/pull/4013). On ptrace the
+/// child is retired only at its host-timed deregistration, so the scheduler
+/// marks it doomed at a committed point instead: a SIGKILL sent by another
+/// process (`other`), a process-group SIGKILL recorded before the kill
+/// (`group`, and `group-self`, where the sender dies too), or a sibling thread
+/// of the child that leaves without a committed exit (`raise-kill`, `abort`,
+/// `raise-term`, `segv`). The run must complete: the parent prints how the
+/// child ended, and only the end-of-run report refuses the child's write
+/// anchor, which the child never reached. A false deadlock refusal ends the
+/// run early instead, with no output. A process armed with
+/// PR_SET_PDEATHSIG(SIGKILL) is doomed too (`pdeathsig`, the held child;
+/// `pdeathsig-middle`, the middle of a chain whose orphaned held child then
+/// completes and the run exits 0; the second Claude re-check). The window is
+/// host-timed, so each case runs several times; the scheduler unit tests
+/// `a_child_wait_settles_only_on_children_held_or_in_futex_waits` and
+/// `a_process_armed_with_a_parent_death_sigkill_is_not_stuck` pin the rule
+/// itself.
+#[test]
+fn happens_before_held_child_killed_by_another_process_is_not_a_deadlock() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = hb_kill_held_child_guest().to_str().unwrap().to_owned();
+    let spec = directory.path().join("kill-held.json");
+    fs::write(&spec, HB_CHILD_WRITE_AFTER_PARENT_WRITE).unwrap();
+    // In the pdeathsig modes a helper thread of the root is spawned first, so
+    // the held child is the second spawn (the third behind a middle process).
+    let spawned = |ordinal: u32| {
+        let path = directory.path().join(format!("held-spawn-{ordinal}.json"));
+        fs::write(
+            &path,
+            HB_CHILD_WRITE_AFTER_PARENT_WRITE.replace(
+                r#""spawn_ordinal": 1"#,
+                &format!(r#""spawn_ordinal": {ordinal}"#),
+            ),
+        )
+        .unwrap();
+        path
+    };
+    let (second, third) = (spawned(2), spawned(3));
+    let killed = "parent h-status=killed\n";
+    let mut cases: Vec<(&str, &Path, &str, bool, u32)> = [
+        "other",
+        "group",
+        "group-self",
+        "raise-kill",
+        "abort",
+        "raise-term",
+        "segv",
+    ]
+    .into_iter()
+    .map(|mode| (mode, spec.as_path(), killed, true, 6))
+    .collect();
+    // The parent-death window was 4 in 24 to 36 runs before the fix.
+    cases.push(("pdeathsig", second.as_path(), killed, true, 16));
+    cases.push((
+        "pdeathsig-middle",
+        third.as_path(),
+        "parent m-status=killed\nchild\n",
+        false,
+        16,
+    ));
+    for (mode, spec, expected, child_dies, runs) in cases {
+        for run in 1..=runs {
+            let (status, log) = run_with_deadline(
+                hermit_command(&[
+                    "run",
+                    "--strict",
+                    "--happens-before",
+                    spec.to_str().unwrap(),
+                    "--",
+                    guest.as_str(),
+                    mode,
+                ]),
+                directory.path(),
+                Duration::from_secs(60),
+                false,
+            );
+            let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+                .expect("failed to read the guest's stdout");
+            assert!(
+                !log.contains("BEFORE anchor(s) never fired, and the thread(s) they hold"),
+                "{mode} run {run}: a held child that died was reported as a deadlock:\n{log}"
+            );
+            assert_eq!(stdout, expected, "{mode} run {run}:\n{log}");
+            if !child_dies {
+                assert_eq!(
+                    status.and_then(|s| s.code()),
+                    Some(0),
+                    "{mode} run {run}:\n{log}"
+                );
+                continue;
+            }
+            assert_eq!(
+                status.and_then(|s| s.code()),
+                Some(HERMIT_POLICY_REFUSAL_EXIT),
+                "{mode} run {run}: the dead child's write anchor never fired, so the run ends with \
+             the end-of-run refusal:\n{log}"
+            );
+            assert!(
+                log.contains("anchor 'child_writes' on thread child: write(fd=1)#1 never fired"),
+                "{mode} run {run}:\n{log}"
+            );
+        }
     }
 }
 

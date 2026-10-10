@@ -984,6 +984,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .backend
                 .requires_thread_directed_process_signals,
         ) {
+            // The scheduler is not told about each killed process, but it must
+            // know the group was killed: a held process in it will die, so a
+            // wait for it is not part of a deadlock
+            // (https://github.com/rrnewton/hermit/issues/3904). Told before
+            // the kill, inside this committed turn: the sender may be in the
+            // group and die before the call returns. A kill that then fails
+            // only suppresses a deadlock report, which is the safe direction.
+            crate::tool_global::notify_unresolved_sigkill(guest, Some(DetPid::from_raw(-tgid)))
+                .await;
             return Ok(self.record_or_replay(guest, call).await?);
         }
         if tgid <= 0 {

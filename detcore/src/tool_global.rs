@@ -2616,12 +2616,19 @@ impl GlobalTool for GlobalState {
             GlobalRequest::NotifySignalPending(dettid, SigWrapper(signal), target_process) => {
                 let mut scheduler = self.lock_rpc_scheduler(false).await;
                 scheduler.notify_signal_pending(dettid, SigWrapper(signal));
-                if signal == libc::SIGKILL
-                    && let Some(detpid) = target_process
-                {
-                    scheduler.note_process_sigkill(dettid, detpid);
+                if signal == libc::SIGKILL {
+                    scheduler.record_committed_sigkill(dettid, target_process);
+                    if let Some(detpid) = target_process {
+                        scheduler.note_process_sigkill(dettid, detpid);
+                    }
                 }
                 R::NotifySignalPending(())
+            }
+            GlobalRequest::NotifyUnresolvedSigkill(group) => {
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .record_unresolved_sigkill(group);
+                R::NotifyUnresolvedSigkill(())
             }
             GlobalRequest::ThreadIsLive(dtid) => {
                 R::ThreadIsLive(self.lock_rpc_scheduler(false).await.thread_is_live(dtid))
@@ -3061,6 +3068,8 @@ impl GlobalState {
                 .unwrap()
                 .count_incarnation(child_dettid.as_raw());
 
+            // A new thread on a reused tid has not exited.
+            sched.forget_committed_exit(child_dettid);
             // Don't fill in the request, as the child will do it:
             let _entry = sched
                 .next_turns
@@ -4251,6 +4260,10 @@ pub enum GlobalRequest {
     ResolveKillTargets(DetPid),
     /// A successful kill(2) queued a physical signal for this sole target.
     NotifySignalPending(DetTid, SigWrapper, Option<DetPid>),
+    /// A successful SIGKILL whose victims the scheduler is not told one by
+    /// one: a process-group kill (`Some(group)`), or a pidfd whose process
+    /// Detcore did not record (`None`).
+    NotifyUnresolvedSigkill(Option<DetPid>),
     /// Liveness of one tid, leader or not; see [`thread_is_live`].
     ThreadIsLive(DetTid),
     /// Scheduler-owned lifecycle state for a direct child process.
@@ -4397,6 +4410,7 @@ pub enum GlobalResponse {
     // TODO-HUMAN-REVIEW(#663)
     ResolveKillTargets(Vec<DetTid>),
     NotifySignalPending(()),
+    NotifyUnresolvedSigkill(()),
     ThreadIsLive(bool),
     ExactChildWaitState(ExactChildWaitState),
     // TODO: use void_send_rpc, and remove this bogus response:
@@ -5880,6 +5894,21 @@ where
     let response = send_and_update_time(guest, GlobalRequest::ResolveKillTargets(detpid)).await;
     match response.1 {
         GlobalResponse::ResolveKillTargets(targets) => targets,
+        _ => unreachable!(),
+    }
+}
+
+/// Tell the scheduler that a SIGKILL it is not told about one victim at a time
+/// succeeded: a process-group kill (`Some(group)`), or a pidfd with no recorded
+/// process (`None`). See `Scheduler::record_unresolved_sigkill`.
+pub async fn notify_unresolved_sigkill<G, T>(guest: &mut G, group: Option<DetPid>)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::NotifyUnresolvedSigkill(group)).await;
+    match response.1 {
+        GlobalResponse::NotifyUnresolvedSigkill(()) => {}
         _ => unreachable!(),
     }
 }
@@ -7379,6 +7408,66 @@ mod tests {
                 .unwrap()
                 .child_tid_addr,
             0
+        );
+    }
+
+    /// A successful SIGKILL reaches the scheduler's record through the RPCs a
+    /// sender makes in its turn: a process named by `kill`, and a SIGKILL with
+    /// no named victim; another signal records nothing
+    /// (https://github.com/rrnewton/hermit/issues/3904).
+    #[tokio::test]
+    async fn sigkill_notifications_record_the_doomed_process() {
+        let (config, state, dettid, detpid) = cancellation_test_state();
+        let notify = |request| {
+            state.receive_rpc(
+                reverie::Tid::from_raw(dettid.as_raw()),
+                (DetTime::new(&config), MmId::initial(detpid), request),
+            )
+        };
+        let victim = DetPid::from_raw(41);
+        assert_eq!(
+            notify(GlobalRequest::NotifySignalPending(
+                DetTid::from_raw(41),
+                SigWrapper(libc::SIGKILL),
+                Some(victim),
+            ))
+            .await
+            .1,
+            GlobalResponse::NotifySignalPending(())
+        );
+        assert_eq!(
+            state.sched.lock().unwrap().sigkill_recorded(victim),
+            (true, false)
+        );
+        let other = DetPid::from_raw(43);
+        notify(GlobalRequest::NotifySignalPending(
+            DetTid::from_raw(43),
+            SigWrapper(libc::SIGTERM),
+            Some(other),
+        ))
+        .await;
+        assert_eq!(
+            state.sched.lock().unwrap().sigkill_recorded(other),
+            (false, false)
+        );
+        // A process-group kill records every process in the group.
+        assert_eq!(
+            notify(GlobalRequest::NotifyUnresolvedSigkill(Some(detpid)))
+                .await
+                .1,
+            GlobalResponse::NotifyUnresolvedSigkill(())
+        );
+        assert_eq!(
+            state.sched.lock().unwrap().sigkill_recorded(detpid),
+            (true, false)
+        );
+        assert_eq!(
+            notify(GlobalRequest::NotifyUnresolvedSigkill(None)).await.1,
+            GlobalResponse::NotifyUnresolvedSigkill(())
+        );
+        assert_eq!(
+            state.sched.lock().unwrap().sigkill_recorded(other),
+            (false, true)
         );
     }
 

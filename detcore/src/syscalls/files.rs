@@ -6407,7 +6407,28 @@ impl<T: RecordOrReplay> Detcore<T> {
             };
             refuse_sigalrm(guest, control).await?;
         }
-        Ok(self.record_or_replay(guest, call).await?)
+        let value = self.record_or_replay(guest, call).await?;
+        if signal == libc::SIGKILL {
+            // A process killed through a pidfd will die; the scheduler must
+            // not count a wait for it as part of a deadlock
+            // (https://github.com/rrnewton/hermit/issues/3904).
+            match guest
+                .thread_state()
+                .with_detfd(pidfd, |detfd| detfd.pidfd_target())?
+            {
+                Some(target) => {
+                    crate::tool_global::notify_signal_pending(
+                        guest,
+                        DetTid::from_raw(target.as_raw()),
+                        SigWrapper(libc::SIGKILL),
+                        Some(target),
+                    )
+                    .await
+                }
+                None => crate::tool_global::notify_unresolved_sigkill(guest, None).await,
+            }
+        }
+        Ok(value)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED

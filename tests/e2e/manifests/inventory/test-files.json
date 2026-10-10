@@ -596,6 +596,18 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/hb_child_wait_cycle.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/hb_child_wait_cycle.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test happens_before_cycle_through_a_child_wait_is_refused_by_name compiles this fork-and-wait guest and requires a --happens-before spec that holds the child's write until the parent's post-wait write, a cycle through the child wait, to be refused by name (exit 122) instead of spinning (https://github.com/rrnewton/hermit/issues/3904); it remains a guest fixture because a generic manifest cannot express a happens-before spec, a deadline and a refusal-text assertion."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/hb_kill_held_child.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/hb_kill_held_child.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test happens_before_held_child_killed_by_another_process_is_not_a_deadlock compiles this guest, whose root waits for a child held at a happens-before gate while a second child SIGKILLs it, and requires the run to complete with the parent's output and only the end-of-run refusal, never a deadlock refusal (https://github.com/rrnewton/hermit/issues/3904); it remains a guest fixture because a generic manifest cannot express a happens-before spec, repeated runs and the distinction between the two refusals."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/hb_relative_anchor.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/hb_relative_anchor.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests of version-2 happens-before specs compile this guest, whose main thread writes two markers, makes three getppid calls and writes 'A-after' while a worker writes 'B', and check that a relative anchor holds the first getppid after the second marker until the worker's write, that unfired relative anchors and bases are refused by name, and that the hold budget ends a hold a spinning worker never releases; it remains a guest fixture because a generic manifest cannot compare the gated and ungated orders, the scheduler's hold records or the named refusals."
