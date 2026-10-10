@@ -357,6 +357,29 @@ run_case "bold-style headings are accepted" 0 \
     "$FULL_LABELS" \
     $'**Summary** foo\n**Determinism** bar\n**Linux Semantics** baz\n**Validation** qux\n**Human Review Required** trigger 4'
 
+# AGENTS.md requires every PR description to open with "Plain Language Summary
+# and Project Impact"; that heading satisfies the summary section, as "Summary"
+# still does.
+run_case "the AGENTS.md summary heading is accepted" 0 \
+    "$FULL_LABELS" "${FULL_BODY/\#\# Summary/## Plain Language Summary and Project Impact}"
+
+run_case "the AGENTS.md summary heading is accepted in bold" 0 \
+    "$FULL_LABELS" \
+    $'**Plain Language Summary and Project Impact** foo\n**Determinism** bar\n**Linux Semantics** baz\n**Validation** qux\n**Human Review Required** trigger 4'
+
+run_case "a heading with only part of the AGENTS.md summary title blocks" 1 \
+    "$FULL_LABELS" "${FULL_BODY/\#\# Summary/## Plain Language Summary}"
+
+run_case "prose naming the AGENTS.md summary title does not satisfy it" 1 \
+    "$FULL_LABELS" \
+    $'This plain language summary and project impact is prose.\n## Determinism\nd\n## Linux Semantics\nl\n## Validation\nv\n## Human Review Required\nt'
+
+run_message_case "a missing summary section names both accepted titles" 1 \
+    '"Plain Language Summary and Project Impact" (or "Summary")' \
+    "$FULL_LABELS" \
+    $'## Determinism\nx\n## Linux Semantics\ny\n## Validation\nz\n## Human Review Required\nt' \
+    "$FULL_APPROVALS" "$HEAD_SHA"
+
 # --- Missing review labels blocks --------------------------------------------
 run_case "missing adversarial-review-codex blocks" 1 \
     $'post-facto-human-review\nadversarial-review-claude1\npassed-review-codex\npassed-review-claude' \
