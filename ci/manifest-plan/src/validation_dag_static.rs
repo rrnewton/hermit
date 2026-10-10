@@ -1783,7 +1783,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_released_vfork_barrier_past_its_valve_refuses_the_run_and_stays,
     // a_vfork_barrier_event_inside_the_valve_proceeds_and_stops_the_clock}
     // (https://github.com/rrnewton/hermit/issues/3999) retain all 1301: 1304.
-    ("test.detcore_unit", 1304),
+    // scheduler::tests::{a_futex_wake_count_of_zero_or_below_wakes_one_waiter,
+    // a_futex_wake_bitset_count_of_zero_wakes_the_first_matching_waiter}
+    // (https://github.com/rrnewton/hermit/issues/3957) retain all 1304: 1306.
+    ("test.detcore_unit", 1306),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2325,7 +2328,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // skid_retry_admits_only_a_typed_skid_overshoot_refusal, the retry
     // predicate's unit test (https://github.com/rrnewton/hermit/issues/1845),
     // runs no guest: 268.
-    ("test.cli", 275),
+    // a_futex_wake_count_of_zero_or_negative_wakes_one_waiter
+    // (https://github.com/rrnewton/hermit/issues/3957) retains all 275: 276.
+    ("test.cli", 276),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2537,7 +2542,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The DBT network namespace collision regression: 203, listed.
     // And the six relative-anchor CLI tests: 210.
     // And the skid-retry predicate unit test, which runs no guest: 204.
-    ("test.cli_on_host", 211),
+    // The FUTEX_WAKE count test starts no LiteInst guest: 212.
+    ("test.cli_on_host", 212),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 55),
@@ -2661,7 +2667,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same ten SIGALRM sleep boundary/resource tests retain all 1283: 1293.
     // And the eight relative-anchor scheduler tests: 1301.
     // And the three vfork barrier valve tests: 1304.
-    ("test.detcore_unit_on_host", 1304),
+    // And the two FUTEX_WAKE count tests: 1306.
+    ("test.detcore_unit_on_host", 1306),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

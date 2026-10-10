@@ -119,6 +119,7 @@ static HB_RELATIVE_ANCHOR_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_TIMEOUT_VS_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_PARENT_KILLED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_KILL_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static FUTEX_WAKE_COUNT_ZERO_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_LSEEK_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_INODE_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REPLAY_EPOCH_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -734,6 +735,32 @@ fn vfork_parent_killed_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "vfork-parent-killed guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn futex_wake_count_zero_guest() -> &'static Path {
+    FUTEX_WAKE_COUNT_ZERO_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("futex-wake-count-zero");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create futex-wake-count-zero guest directory");
+        let guest = build_root.join("futex_wake_count_zero");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/futex_wake_count_zero.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile futex-wake-count-zero guest");
+        assert!(
+            output.status.success(),
+            "futex-wake-count-zero guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -20053,6 +20080,35 @@ fn a_vfork_child_that_kills_its_parent_and_execs_lets_its_own_child_run() {
     );
     assert_eq!(
         stdout, "A killed by signal 9\nforkwait ok\n",
+        "stderr:\n{log}"
+    );
+}
+
+/// A `FUTEX_WAKE` count of 0, and a count of 0xffffffff (negative as the
+/// kernel's `int nr_wake`), each wake one waiter, as Linux's `futex_wake`
+/// does; a count of 0 with nobody waiting wakes nobody
+/// (https://github.com/rrnewton/hermit/issues/3957). Before the fix the
+/// count-0 wake never woke the waiter, so the guest gave up and exited 1, and
+/// the 0xffffffff wake panicked Detcore's scheduler.
+#[test]
+fn a_futex_wake_count_of_zero_or_negative_wakes_one_waiter() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = futex_wake_count_zero_guest().to_str().unwrap().to_owned();
+    let (status, log) = run_with_deadline(
+        hermit_command(&["run", "--strict", "--timeout", "60", "--", guest.as_str()]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "the run must finish and exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(
+        stdout, "count 0 woke 1\ncount 0xffffffff woke 1\ncount 0 with no waiter woke 0\n",
         "stderr:\n{log}"
     );
 }

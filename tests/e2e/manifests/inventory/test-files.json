@@ -505,6 +505,12 @@
       "why": "tests/c/futex_waitv_enosys.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Standalone C guest is calibrated under strict verification for ptrace and DBT and runs in blocking GitHub CI"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/futex_wake_count_zero.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/futex_wake_count_zero.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_futex_wake_count_of_zero_or_negative_wakes_one_waiter compiles this guest, which wakes a waiting thread with FUTEX_WAKE counts 0 and 0xffffffff and requires each to wake one waiter, as Linux's futex_wake does (https://github.com/rrnewton/hermit/issues/3957); it remains a guest fixture because a generic manifest cannot bound the run with a deadline and assert this exact output for a scheduler-liveness regression."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/futex_wake_enosys.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

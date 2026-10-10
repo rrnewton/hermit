@@ -4214,10 +4214,17 @@ impl Scheduler {
         max_to_wake: i32,
         wake_mask: u32,
     ) -> Vec<FutexWaiter> {
-        if max_to_wake == 0 {
-            trace!("[detcore] Futex wake of 0 waiters necessarily fizzles...");
-            return Vec::new();
-        }
+        // Linux's `futex_wake` (kernel/futex/waitwake.c) counts a matching waiter
+        // before it compares the count, `if (++ret >= nr_wake) break;`, and
+        // `nr_wake` is the kernel's `int`. So a count of 0, or a `u32` count above
+        // INT_MAX that is negative as an `int`, wakes one waiter, like a count of 1.
+        // (Only futex2's FLAGS_STRICT returns early for a zero count, and futex2 is
+        // refused before it reaches here.)
+        let max_to_wake: usize = if max_to_wake <= 0 {
+            1
+        } else {
+            max_to_wake as usize
+        };
         let mut vec: Vec<FutexWaiter> = {
             match self.blocked.futex_waiters.get_mut(&futexid) {
                 None => {
@@ -4235,7 +4242,6 @@ impl Scheduler {
             max_to_wake,
             vec.len(),
         );
-        let max_to_wake: usize = max_to_wake.try_into().unwrap();
         let to_wake = if self.fuzz_futexes {
             let mut matching = take_matching_futex_waiters(&mut vec, wake_mask);
             let num_woken = std::cmp::min(matching.len(), max_to_wake);
@@ -11792,6 +11798,65 @@ mod test {
             }
             assert!(scheduler.run_queue.contains_tid(waiter));
         }
+    }
+
+    /// A `FUTEX_WAKE` count of 0, or a count that is negative as the kernel's
+    /// `int nr_wake` (-1, which is `u32::MAX` as the guest passes it), wakes one
+    /// waiter, the longest one, as Linux's `futex_wake` does: it counts a waiter
+    /// before comparing, `if (++ret >= nr_wake) break;`
+    /// (https://github.com/rrnewton/hermit/issues/3957). A count of 0 used to wake
+    /// nobody, and a negative count panicked the scheduler.
+    #[test]
+    fn a_futex_wake_count_of_zero_or_below_wakes_one_waiter() {
+        for count in [0, -1, u32::MAX as i32, i32::MIN] {
+            let mut scheduler = Scheduler::new(&Config::default());
+            let waiters = [100, 101].map(DetTid::from_raw);
+            let futex = FutexID::private(MmId::initial(DetPid::from_raw(100)), 0x404110);
+            for waiter in waiters {
+                register_known_thread(&mut scheduler, waiter);
+                scheduler.sleep_futex_waiter(&waiter, futex, None, u32::MAX, None);
+            }
+            assert_eq!(
+                scheduler.wake_futex_waiters(DetTid::from_raw(102), futex, count, u32::MAX),
+                1,
+                "count {count}"
+            );
+            assert!(
+                !scheduler.is_parked_futex_waiter(waiters[0]),
+                "count {count}"
+            );
+            assert!(
+                scheduler.is_parked_futex_waiter(waiters[1]),
+                "count {count}"
+            );
+        }
+        // With no waiter, such a wake still wakes nobody.
+        let mut scheduler = Scheduler::new(&Config::default());
+        let futex = FutexID::private(MmId::initial(DetPid::from_raw(100)), 0x404110);
+        assert_eq!(
+            scheduler.wake_futex_waiters(DetTid::from_raw(102), futex, 0, u32::MAX),
+            0
+        );
+    }
+
+    /// A count of 0 still skips waiters whose bitset does not match, and wakes
+    /// the first one that does, as `futex_wake`'s `continue` before `++ret`.
+    #[test]
+    fn a_futex_wake_bitset_count_of_zero_wakes_the_first_matching_waiter() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let futex = FutexID::private(MmId::initial(DetPid::from_raw(100)), 0x404110);
+        let waiters = [(100, 0b10), (101, 0b01), (102, 0b01)]
+            .map(|(tid, bitset)| (DetTid::from_raw(tid), bitset));
+        for (waiter, bitset) in waiters {
+            register_known_thread(&mut scheduler, waiter);
+            scheduler.sleep_futex_waiter(&waiter, futex, None, bitset, None);
+        }
+        assert_eq!(
+            scheduler.wake_futex_waiters(DetTid::from_raw(103), futex, 0, 0b01),
+            1
+        );
+        let parked = waiters.map(|(waiter, _)| scheduler.is_parked_futex_waiter(waiter));
+        assert_eq!(parked, [true, false, true]);
     }
 
     /// A `FUTEX_WAKE` of several wakes the longest waiters, and they join the
