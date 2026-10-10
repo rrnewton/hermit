@@ -1003,14 +1003,17 @@ fn run_failed_report(
 /// backend whose scheduler runs in this process (DBT) installs it; a backend
 /// whose scheduler runs in a container child reports the same exit as a
 /// container failure.
+#[cfg(feature = "dbt")]
 pub(crate) struct TerminalDeadlockRecording;
 
+#[cfg(feature = "dbt")]
 impl Drop for TerminalDeadlockRecording {
     fn drop(&mut self) {
         detcore::set_terminal_deadlock_hook(None);
     }
 }
 
+#[cfg(feature = "dbt")]
 pub(crate) fn record_terminal_deadlock(
     path: Option<&Path>,
     run: VerificationRun,
