@@ -33390,13 +33390,33 @@ raise SystemExit(0 if result.wasSuccessful() else 1)
 "#).unwrap();
             // Match the normal graph's explicit transport so the custom
             // command still reaches the source-defined producer refusal.
-            let cfg = dag_from_json(&serde_json::json!({"default_jobs_env":"", "steps":[{
+            //
+            // No CPU budget: this fixture tests what the cutover keeps, not
+            // dagrun's CPU guard, which has its own tests. Under the DAG's
+            // 10 s default, an unboxed run is policed by the procfs
+            // process-group floor, and in one validation that floor charged
+            // this 0.05-CPU-second script 10.7 s, killed it, and failed the
+            // fixture for a reason outside its contract
+            // (https://github.com/rrnewton/hermit/issues/3923). Both zeros
+            // disable the guard; the wall timeout still bounds the step. The
+            // DAG document does not carry the default, so it is set here.
+            let mut cfg = dag_from_json(&serde_json::json!({"default_jobs_env":"", "steps":[{
                 "group":"test", "job":"package", "cmd":format!("python3 {}", shell_words::quote(&producer.display().to_string())),
                 "jobs_flag":"", "timeout":10,
                 "env":{"SCORECARD_FIXTURE_FAIL":if fails {"1"} else {"0"}},
                 "result_manifests":[{"kind":"structured-test-results","schema":2,
                     "path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.package"}]
             }]}).to_string()).unwrap();
+            cfg.default_step_cpu_timeout = 0;
+            assert_eq!(
+                dagrun::model::effective_cpu_timeout(
+                    &cfg.steps[0],
+                    cfg.default_step_cpu_timeout,
+                    1.0
+                ),
+                0,
+                "the fixture's step must run without a CPU budget"
+            );
             let dag = dag_to_json(&cfg);
             let dag_path = root.join("ci/dag/validate.json");
             std::fs::write(&dag_path, &dag).unwrap();

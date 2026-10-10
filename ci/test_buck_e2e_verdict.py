@@ -755,6 +755,18 @@ esac
 exit 0
 """
 # What the stand-in run leaves in --work: a hybrid run's two invocations, one with an event log.
+# The retention budget the stalled-summary test gives validate-node, and what the stall may cost
+# it after its exit phase: that budget plus an allowance for everything else (each stalled
+# command's 0.5 s `timeout -k` grace, copying the records, `buck2 kill`, process exit). Measured on
+# the validation host with the test pinned to one CPU shared with 8 busy loops, the interval ran
+# at most 1.217 s beyond a 1 s budget over 128 sub-cases (80 here: 1.175-1.374 s; one of 48 in
+# the review of https://github.com/rrnewton/hermit/pull/4017 reached 2.217 s); idle it is about
+# 0.1 s beyond. The 2 s allowance covers that worst case with 0.78 s to spare, and the 3 s budget
+# keeps a doubled budget (6 s) well above the bound.
+# https://github.com/rrnewton/hermit/issues/3923
+STALLED_SUMMARY_RETENTION_SECONDS = 3
+AFTER_EXIT_BOUND_SECONDS = STALLED_SUMMARY_RETENTION_SECONDS + 2.0
+
 RECORDS = {
     "re.log": "re console\n", "re.rc": "0\n", "re.test_id": "re\n", "re.times": "1.5\n9.25\n",
     "re.event-log.pb.zst": "".join(stages_test.two_cells()),
@@ -917,6 +929,13 @@ class ValidateNodeTest(unittest.TestCase):
         self.assertEqual(times, sorted(times))
         return [what for _, what in rows]
 
+    def exit_phase_time(self, results):
+        """The epoch time at which the node recorded its exit phase, before keeping its records."""
+        rows = [line.split("\t") for line in (self.kept(results) / "phases.tsv").read_text().splitlines()]
+        exits = [float(time) for time, what in rows if what.startswith("exit ")]
+        self.assertEqual(len(exits), 1, rows)
+        return exits[0]
+
     def test_each_invocations_record_is_kept_below_the_e2e_result_root(self):
         results = self.root / "e2e-results"
         (self.kept(results)).mkdir(parents=True)
@@ -971,14 +990,19 @@ class ValidateNodeTest(unittest.TestCase):
                 if stalled == "stages.py":
                     summarizer.write_text("import time\ntime.sleep(600)\n")
                     added = {}
-                started = time.monotonic()
                 process = self.validate_node(str(results), FAKE_RUN_RECORDS=json.dumps(RECORDS),
                                              FAKE_RUN_RC=str(run_status), FAKE_BUCK2_KILLS=str(kills),
-                                             HERMIT_VALIDATE_BUCK_RETENTION_SECONDS="1", **added)
-                elapsed = time.monotonic() - started
+                                             HERMIT_VALIDATE_BUCK_RETENTION_SECONDS=str(STALLED_SUMMARY_RETENTION_SECONDS),
+                                             **added)
+                ended = time.time()
                 self.assertEqual(process.returncode, run_status, process.stdout + process.stderr)
-                # One second of budget, half a second more for the kill after it.
-                self.assertLess(elapsed, 10, process.stderr)
+                # What the stall may cost is what the node does after its exit phase: keeping the
+                # records and the summary within the retention budget, each command's 0.5 s kill
+                # grace, and stopping the daemon. The node's steps before its exit (staging,
+                # regenerating the Buck rules) are not under test, and their wall time is mostly
+                # host load.
+                after_exit = ended - self.exit_phase_time(results)
+                self.assertLess(after_exit, AFTER_EXIT_BOUND_SECONDS, process.stderr)
                 self.assertIn("validate-node: the stage summary of the re invocation is incomplete", process.stderr)
                 self.assertEqual((self.kept(results) / "re.log").read_text(), RECORDS["re.log"])
                 self.assertEqual(self.phases(results)[-1], f"exit {run_status}")
