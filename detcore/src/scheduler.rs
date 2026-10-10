@@ -2109,6 +2109,7 @@ async fn sched_loop_inner(
                 // refusal, distinct from the guest's status and from a failure.
                 std::process::exit(detcore_model::HERMIT_POLICY_REFUSAL_EXIT);
             }
+            report_terminal_deadlock_to_hook(&report);
             immediate_fatal_exit(); // We don't want a backtrace of this thread.
         }
         // Virtual time ran out under a configured --scheduler-turn-cost: end
@@ -2693,6 +2694,32 @@ fn is_futex_request(nextturn: &ThreadNextTurn) -> bool {
     match nextturn.req.try_read() {
         Some(Ok(req)) => Scheduler::is_x_turn(&req, &ResourceID::FutexWait),
         _ => false,
+    }
+}
+
+/// What a process that drives the scheduler in-process does with a terminal
+/// deadlock report before the scheduler exits the process.
+pub type TerminalDeadlockHook = Box<dyn Fn(&str) + Send + Sync>;
+
+static TERMINAL_DEADLOCK_HOOK: Mutex<Option<TerminalDeadlockHook>> = Mutex::new(None);
+
+/// Install (or, with `None`, remove) the hook a terminal deadlock report is
+/// handed to just before the process exits. The exit cannot return an error to
+/// a caller, so `run --verify` uses this to record the run as failed by a
+/// deadlock instead of leaving its pending no-result stamp.
+pub fn set_terminal_deadlock_hook(hook: Option<TerminalDeadlockHook>) {
+    *TERMINAL_DEADLOCK_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+}
+
+fn report_terminal_deadlock_to_hook(report: &str) {
+    if let Some(hook) = TERMINAL_DEADLOCK_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+    {
+        hook(report);
     }
 }
 
@@ -15938,6 +15965,24 @@ mod test {
         hb.parked.insert(held);
         scheduler.happens_before = Some(hb);
         scheduler
+    }
+
+    /// The terminal deadlock exit hands its report to the installed hook first
+    /// (`run --verify` records the run as failed by a deadlock), and nothing
+    /// once the hook is removed.
+    #[test]
+    fn a_terminal_deadlock_report_reaches_the_installed_hook_until_it_is_removed() {
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&seen);
+        set_terminal_deadlock_hook(Some(Box::new(move |report: &str| {
+            sink.lock().unwrap().push(report.to_owned());
+        })));
+        let config = Config::default();
+        let report = deadlocked_scheduler(&config, false).format_terminal_deadlock();
+        report_terminal_deadlock_to_hook(&report);
+        set_terminal_deadlock_hook(None);
+        report_terminal_deadlock_to_hook("after removal");
+        assert_eq!(*seen.lock().unwrap(), vec![report]);
     }
 
     /// The deadlock report reaches stderr, so it must be byte-identical across
