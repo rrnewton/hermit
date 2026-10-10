@@ -1834,7 +1834,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // memory::tests::a_dontunmap_remap_keeps_both_aliases_of_the_object
     // (https://github.com/rrnewton/hermit/pull/4020) retain all 1334: 1340,
     // listed with `cargo nextest list -p hermit-detcore --lib --bins`.
-    // syscalls::threads::tests::an_interrupted_shared_key_probe_is_retried_and_never_taken_as_an_answer
+    // syscalls::threads::tests::an_interrupted_shared_key_probe_is_never_retried_or_taken_as_an_answer
     // (https://github.com/rrnewton/hermit/pull/4020) retains all 1340: 1341.
     ("test.detcore_unit", 1341),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp

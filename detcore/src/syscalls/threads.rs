@@ -3799,14 +3799,15 @@ async fn probe_shared_futex_key<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     address: usize,
     access: KeyAccess,
 ) -> Result<(), Error> {
-    run_shared_futex_key_probe(
-        guest,
-        shared_futex_key_probe(address, access),
-        access,
-        |guest, probe| guest.inject(probe),
-    )
-    .await
-    .map_err(Error::Errno)
+    let probe = shared_futex_key_probe(address, access);
+    match run_shared_futex_key_probe(guest, probe, access, |guest, probe| guest.inject(probe)).await
+    {
+        SharedKeyProbe::Admitted => Ok(()),
+        SharedKeyProbe::Refused(errno) => Err(Error::Errno(errno)),
+        SharedKeyProbe::Interrupted(errno) => {
+            refuse_interrupted_shared_key_probe(guest, address, errno).await
+        }
+    }
 }
 
 /// The effect-free futex call that asks the kernel whether `address` is a
@@ -3832,32 +3833,70 @@ fn shared_futex_key_probe(address: usize, access: KeyAccess) -> syscalls::Futex 
 type KeyProbeAnswer<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<i64, Errno>> + Send + 'a>>;
 
-/// Run a shared-key `probe` with `inject` until the kernel answers it.
+/// What one injected shared-key probe answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SharedKeyProbe {
+    /// The kernel admitted the key: 0, or ENOSYS for a WRITE key (the unknown
+    /// WAKE_OP operation is rejected only after both keys are acquired).
+    Admitted,
+    /// The kernel refused the key with this errno, which is the guest's.
+    Refused(Errno),
+    /// A signal stopped the probe's instruction before it ran (Reverie's
+    /// `Guest::inject` returns ERESTARTSYS; EINTR is never a key answer either,
+    /// since neither probe sleeps). The kernel answered nothing.
+    Interrupted(Errno),
+}
+
+/// Inject a shared-key `probe` once with `inject` and classify the answer.
 ///
-/// The probe is Detcore's own call, not the guest's: a signal that stops its
-/// instruction before it runs makes `inject` return ERESTARTSYS (Reverie's
-/// `Guest::inject`), and EINTR is never a futex key answer either, since
-/// neither probe sleeps. Such a probe had no effect, so it is injected again,
-/// as `Guest::inject_with_retry` does; it is never taken as an answer, so an
-/// interrupted probe neither admits the key nor becomes the guest's result
-/// (https://github.com/rrnewton/hermit/pull/4020). Only the kernel's answer
-/// decides: 0 admits, ENOSYS admits a WRITE key (the unknown WAKE_OP
-/// operation is rejected after both keys), and any other errno is the
-/// guest's.
+/// The probe is never injected again: Reverie holds the signal that stopped
+/// it in a single slot, and a second interrupted injection would replace that
+/// signal, losing one the kernel already dequeued (Codex re-check #4 of
+/// https://github.com/rrnewton/hermit/pull/4020). An interruption is returned
+/// as such, never as an admission or as the guest's errno.
 async fn run_shared_futex_key_probe<C>(
     context: &mut C,
     probe: syscalls::Futex,
     access: KeyAccess,
     inject: for<'a> fn(&'a mut C, syscalls::Futex) -> KeyProbeAnswer<'a>,
-) -> Result<(), Errno> {
-    loop {
-        match inject(context, probe).await {
-            Err(Errno::ERESTARTSYS | Errno::EINTR) => continue,
-            Ok(_) => return Ok(()),
-            Err(Errno::ENOSYS) if access == KeyAccess::Write => return Ok(()),
-            Err(errno) => return Err(errno),
-        }
+) -> SharedKeyProbe {
+    match inject(context, probe).await {
+        Ok(_) => SharedKeyProbe::Admitted,
+        Err(errno @ (Errno::ERESTARTSYS | Errno::EINTR)) => SharedKeyProbe::Interrupted(errno),
+        Err(Errno::ENOSYS) if access == KeyAccess::Write => SharedKeyProbe::Admitted,
+        Err(errno) => SharedKeyProbe::Refused(errno),
     }
+}
+
+/// Stop the run by name because a signal interrupted the shared-key probe for
+/// the futex word at `address`.
+///
+/// The original call has no answer to return: the interruption token is not a
+/// Linux result for it, retrying could lose the held signal
+/// (`run_shared_futex_key_probe`), and admitting the key unchecked could be a
+/// silent wrong answer. The run ends with the policy-refusal status whatever
+/// the unsupported-operation policy, since `--allow-unsupported-syscalls` has
+/// no errno to offer here either. A signal must arrive at exactly that
+/// instruction, which is rare.
+async fn refuse_interrupted_shared_key_probe<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &mut G,
+    address: usize,
+    errno: Errno,
+) -> ! {
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            crate::util::RetryingStderr,
+            "hermit: a signal interrupted Detcore's shared futex key check for word {:#x} in thread {} ({}); \
+             refusing the run rather than retrying it, which could lose that signal \
+             (https://github.com/rrnewton/hermit/pull/4020)",
+            address,
+            guest.thread_state().dettid,
+            errno,
+        );
+    }
+    crate::tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+        .await
 }
 
 /// A futex word's value as a user-mode access reads it, which is what Linux's
@@ -4716,10 +4755,10 @@ mod tests {
 
     fn run_scripted(
         access: KeyAccess,
-        answers: &[Result<i64, Errno>],
-    ) -> (Result<(), Errno>, Vec<ProbeArgs>) {
+        answer: Result<i64, Errno>,
+    ) -> (SharedKeyProbe, Vec<ProbeArgs>) {
         let mut guest = ScriptedProbes {
-            answers: answers.iter().copied().collect(),
+            answers: [answer].into_iter().collect(),
             probes: Vec::new(),
         };
         let result = futures::executor::block_on(run_shared_futex_key_probe(
@@ -4728,22 +4767,20 @@ mod tests {
             access,
             |guest, probe| guest.inject(probe),
         ));
-        assert!(
-            guest.answers.is_empty(),
-            "every scripted answer is consumed"
-        );
         (result, guest.probes)
     }
 
-    /// An admission probe that a signal stops before its instruction runs
-    /// (`Guest::inject` returns ERESTARTSYS, or EINTR) is injected again with
-    /// the same arguments until the kernel answers it, and only that answer
-    /// decides (https://github.com/rrnewton/hermit/pull/4020): the interrupted
-    /// probe neither admits the key nor becomes the guest's errno, a real
-    /// backing-page refusal after a retry is still returned, and ENOSYS admits
-    /// only a WRITE key.
+    /// The shared-key admission probe is injected exactly once
+    /// (https://github.com/rrnewton/hermit/pull/4020). When a signal stops it
+    /// before it runs (`Guest::inject` returns ERESTARTSYS, or EINTR), it is not
+    /// injected again, because Reverie holds that signal in a single slot that a
+    /// second interruption would overwrite, and the interruption is reported as
+    /// such: never as an admitted key and never as the guest's errno. The
+    /// caller stops the run by name on it. The kernel's own answers keep their
+    /// meaning: 0 admits, ENOSYS admits only a WRITE key, EFAULT is the
+    /// guest's.
     #[test]
-    fn an_interrupted_shared_key_probe_is_retried_and_never_taken_as_an_answer() {
+    fn an_interrupted_shared_key_probe_is_never_retried_or_taken_as_an_answer() {
         let read = (libc::FUTEX_REQUEUE, 0x1000, 0x1000, 0, 0);
         let write = (
             libc::FUTEX_WAKE_OP,
@@ -4752,38 +4789,30 @@ mod tests {
             0,
             (7 << 28) | (1 << 12),
         );
+        for (access, args) in [(KeyAccess::Read, read), (KeyAccess::Write, write)] {
+            for errno in [Errno::ERESTARTSYS, Errno::EINTR] {
+                assert_eq!(
+                    run_scripted(access, Err(errno)),
+                    (SharedKeyProbe::Interrupted(errno), vec![args]),
+                    "{access:?} {errno}"
+                );
+            }
+            assert_eq!(
+                run_scripted(access, Ok(0)),
+                (SharedKeyProbe::Admitted, vec![args])
+            );
+            assert_eq!(
+                run_scripted(access, Err(Errno::EFAULT)),
+                (SharedKeyProbe::Refused(Errno::EFAULT), vec![args])
+            );
+        }
         assert_eq!(
-            run_scripted(KeyAccess::Read, &[Err(Errno::ERESTARTSYS), Ok(0)]),
-            (Ok(()), vec![read, read])
+            run_scripted(KeyAccess::Read, Err(Errno::ENOSYS)),
+            (SharedKeyProbe::Refused(Errno::ENOSYS), vec![read])
         );
         assert_eq!(
-            run_scripted(
-                KeyAccess::Read,
-                &[
-                    Err(Errno::EINTR),
-                    Err(Errno::ERESTARTSYS),
-                    Err(Errno::EFAULT)
-                ]
-            ),
-            (Err(Errno::EFAULT), vec![read, read, read])
-        );
-        assert_eq!(
-            run_scripted(KeyAccess::Read, &[Err(Errno::ENOSYS)]),
-            (Err(Errno::ENOSYS), vec![read])
-        );
-        assert_eq!(
-            run_scripted(
-                KeyAccess::Write,
-                &[Err(Errno::ERESTARTSYS), Err(Errno::ENOSYS)]
-            ),
-            (Ok(()), vec![write, write])
-        );
-        assert_eq!(
-            run_scripted(
-                KeyAccess::Write,
-                &[Err(Errno::ERESTARTSYS), Err(Errno::EFAULT)]
-            ),
-            (Err(Errno::EFAULT), vec![write, write])
+            run_scripted(KeyAccess::Write, Err(Errno::ENOSYS)),
+            (SharedKeyProbe::Admitted, vec![write])
         );
     }
 
