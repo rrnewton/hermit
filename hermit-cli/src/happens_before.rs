@@ -323,12 +323,15 @@ pub struct HbLaunch<'a> {
     /// True when the run requests a preemption timer (`--max-timeslice` is not
     /// `disabled`). A version-2 spec needs one to charge its hold budget.
     pub preemption: bool,
+    /// True for `--replay-schedule-from`, which replays a recorded schedule
+    /// event by event and has no event for a posthook gate's turn.
+    pub replay_schedule: bool,
 }
 
 /// Refuse, before anything is launched or any input is read, a program the run
 /// cannot enforce as written:
-/// - a syscall anchor for the polling or posthook phase (syscall anchors are
-///   enforced at the prehook of the thread's nth matching call);
+/// - a syscall anchor for the polling phase (syscall anchors fire at the
+///   prehook of the thread's nth matching call, or when it completes);
 /// - a count or syscall-occurrence anchor when the run bypasses interception
 ///   (`--namespace-only`) or runs the guest under a runtime other than ptrace
 ///   (in-guest Detcore never receives the program,
@@ -337,6 +340,10 @@ pub struct HbLaunch<'a> {
 ///   unintercepted; a count anchor still counts the intercepted ones);
 /// - a syscall anchor on a syscall that never reaches Detcore
 ///   ([`syscall_never_reaches_tracer`]);
+/// - a posthook anchor with `--replay-schedule-from`: its gate adds a
+///   scheduler turn after the syscall's posthook schedule event, and this
+///   version does not claim the composition replays exactly
+///   (<https://github.com/rrnewton/hermit/issues/3929>);
 /// - a version-2 spec with `--max-timeslice disabled`
 ///   ([`refuse_hold_without_preemption`]).
 ///
@@ -351,8 +358,13 @@ pub fn refuse_unenforceable_anchors(
     for anchor in program.anchors.values() {
         let refusal = match &anchor.position {
             Position::Syscall { .. } if !anchor.is_syscall_occurrence() => {
-                "names a syscall phase other than 'prehook'; syscall anchors are enforced only \
-                 at the prehook"
+                "names the polling phase, which is not enforced; syscall anchors fire at the \
+                 prehook or, with \"phase\": \"posthook\", when the syscall completes"
+                    .to_owned()
+            }
+            Position::Syscall { .. } if anchor.fires_at_posthook() && launch.replay_schedule => {
+                "fires at the posthook, which is not supported with --replay-schedule-from: \
+                 its gate adds a scheduler turn the recorded schedule does not have"
                     .to_owned()
             }
             Position::Syscall { sysno, .. } if syscall_never_reaches_tracer(*sysno) => format!(
@@ -594,8 +606,9 @@ mod tests {
     }
 
     /// Every launch-time refusal names its anchor, and a spec the run can
-    /// enforce passes: phase (posthook), an unobservable syscall
-    /// (rt_sigreturn), namespace-only, a non-ptrace backend and --passthru-opt.
+    /// enforce passes: the polling phase, an unobservable syscall
+    /// (rt_sigreturn), namespace-only, a non-ptrace backend, --passthru-opt,
+    /// and a posthook anchor with --replay-schedule-from.
     /// `load_program` itself (shared with `--hb-list-events`) still loads all of
     /// these for preview.
     #[test]
@@ -608,6 +621,7 @@ mod tests {
             namespace_only: false,
             passthru_opt: false,
             preemption: true,
+            replay_schedule: false,
         };
         let check = |json: &str, launch: HbLaunch<'_>| -> Result<(), String> {
             std::fs::write(&spec, json).unwrap();
@@ -618,12 +632,13 @@ mod tests {
             "events": {"w": {"thread": "3", "syscall": "write", "fd": 1}}}"#;
         let err = check(
             r#"{"version": 1,
-                "events": {"closed": {"thread": "3", "syscall": "close", "fd": 4, "phase": "post"}}}"#,
+                "events": {"closed": {"thread": "3", "syscall": "close", "fd": 4, "phase": "polling"}}}"#,
             ptrace,
         )
         .unwrap_err();
         assert!(
-            err.contains("anchor 'closed'") && err.contains("enforced only at the prehook"),
+            err.contains("anchor 'closed'")
+                && err.contains("names the polling phase, which is not enforced"),
             "{err}"
         );
         let err = check(
@@ -673,6 +688,23 @@ mod tests {
             "{err}"
         );
         assert!(check(fd_anchor, ptrace).is_ok());
+        // A posthook anchor is enforced, except with --replay-schedule-from,
+        // whose recorded schedule has no event for its gate's turn
+        // (https://github.com/rrnewton/hermit/issues/3929). A prehook anchor
+        // is still enforced there.
+        let posthook = r#"{"version": 1,
+            "events": {"p": {"thread": "3", "syscall": "write", "fd": 1, "phase": "posthook"}}}"#;
+        assert!(check(posthook, ptrace).is_ok());
+        let replay = HbLaunch {
+            replay_schedule: true,
+            ..ptrace
+        };
+        let err = check(posthook, replay).unwrap_err();
+        assert!(
+            err.contains("anchor 'p'") && err.contains("not supported with --replay-schedule-from"),
+            "{err}"
+        );
+        assert!(check(fd_anchor, replay).is_ok());
         assert!(
             check(
                 r#"{"version": 1,

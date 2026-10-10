@@ -608,6 +608,18 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/hb_pipe_read_held_writer.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/hb_pipe_read_held_writer.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test happens_before_posthook_read_with_a_held_writer_ends_at_the_timeout compiles this guest, whose root reads a pipe that only its held child writes, and pins the documented limitation that a posthook BEFORE anchor on that read ends at --timeout rather than in a named refusal (https://github.com/rrnewton/hermit/issues/3929); it remains a guest fixture because a generic manifest cannot express a happens-before spec or the timeout outcome."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/hb_posthook_futex_interrupt.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/hb_posthook_futex_interrupt.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test happens_before_posthook_anchor_on_an_interrupted_call_is_refused_by_name compiles this guest, whose main thread's shared futex wait is interrupted by a caught signal with and without SA_RESTART, and requires the HERMIT_HB_POSTHOOK_INTERRUPTED refusal for a posthook anchor on that wait (https://github.com/rrnewton/hermit/issues/3929); it remains a guest fixture because a generic manifest cannot express a happens-before spec or the refusal."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/hb_relative_anchor.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/hb_relative_anchor.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests of version-2 happens-before specs compile this guest, whose main thread writes two markers, makes three getppid calls and writes 'A-after' while a worker writes 'B', and check that a relative anchor holds the first getppid after the second marker until the worker's write, that unfired relative anchors and bases are refused by name, and that the hold budget ends a hold a spinning worker never releases; it remains a guest fixture because a generic manifest cannot compare the gated and ungated orders, the scheduler's hold records or the named refusals."
@@ -629,6 +641,12 @@
       "path": "tests/c/hb_spawn_dup2.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/hb_spawn_dup2.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test happens_before_hold_in_a_vfork_child_is_refused_by_name compiles this posix_spawn guest, whose vfork child calls dup2 before execve, and requires a --happens-before spec that would hold the child at that dup2 to be refused by name (exit 122) instead of spinning; it remains a guest fixture because a generic manifest cannot express a happens-before spec and a refusal-text assertion."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/hb_spawn_echo.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/hb_spawn_echo.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test happens_before_posthook_before_anchor_orders_the_completed_write compiles this posix_spawn guest, whose parent and /bin/echo child each write a line, and checks that a happens-before edge from the parent's write to the child's orders only the parent reaching its write when fired at the prehook, and the completed write when fired at the posthook (https://github.com/rrnewton/hermit/issues/3929); it remains a guest fixture because a generic manifest cannot compare the two specs' output orders or check the hold."
     },
     {
       "disposition": "guest-fixture",

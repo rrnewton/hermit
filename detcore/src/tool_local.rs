@@ -1627,6 +1627,11 @@ pub struct ThreadStats {
     /// like `syscall_count`.
     pub hb_occurrences: detcore_model::happens_before::HbThreadCounters,
 
+    /// The posthook happens-before anchors the current syscall entry reached
+    /// (`Anchor::fires_at_posthook`): counted at its prehook, they check in
+    /// with the scheduler when the call completes. Empty between syscalls.
+    pub hb_pending_posthook: Vec<String>,
+
     /// How many register-file samples this thread has CONSIDERED for `--detlog-regs`.
     ///
     /// This is the cadence index, and it exists because no pre-existing counter is a clean

@@ -491,6 +491,26 @@ impl<T: RecordOrReplay> Detcore<T> {
         blocked
     }
 
+    /// Publish the posthook happens-before anchors the current syscall entry
+    /// reached at its prehook, now that `res` is the result the guest will
+    /// get: after the last observer that can replace it, on every path that
+    /// returns a guest result, including an observer's own final errno (the
+    /// Codex review of https://github.com/rrnewton/hermit/pull/4048). Which
+    /// results are a completion is decided by [`posthook_checkpoint`]; the
+    /// pending names are consumed either way.
+    async fn publish_posthook_checkpoint<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        count: u64,
+        res: &Result<i64, Error>,
+    ) {
+        let posthook = std::mem::take(&mut guest.thread_state_mut().stats.hb_pending_posthook);
+        if let Some(checkpoint) = posthook_checkpoint(count, posthook, res) {
+            let request = guest.thread_state().mk_request(checkpoint, Permission::R);
+            resource_request(guest, request).await;
+        }
+    }
+
     /// The completion of a syscall that can resume the guest (a result or an
     /// errno, not a backend failure): in a process that handles SIGALRM, a due
     /// entry is delivered here, where Linux would deliver a signal that became
@@ -1452,6 +1472,48 @@ fn failure_leaves_outputs_unwritten(syscall: &Syscall) -> bool {
 /// tool error is not the syscall's result.
 fn failure_proves_outputs_unwritten(result: &Result<i64, Error>) -> bool {
     matches!(result, Err(Error::Errno(errno)) if *errno != Errno::EFAULT)
+}
+
+/// The happens-before request a syscall entry makes once its result is
+/// decided, for the posthook anchors it reached at its prehook (`anchors`), or
+/// `None` (<https://github.com/rrnewton/hermit/issues/3929>):
+/// - a value or a guest errno other than an internal restart code is a
+///   completion: Linux returns it unchanged, so the anchors fire
+///   ([`ResourceID::HappensBeforeSyscallCheckpoint`]);
+/// - an internal restart code (`ERESTARTSYS`, `ERESTARTNOINTR`,
+///   `ERESTARTNOHAND`, `ERESTART_RESTARTBLOCK`) is refused
+///   ([`ResourceID::HappensBeforePosthookInterrupted`]): the kernel decides
+///   only at signal delivery, after this point, whether the guest sees `EINTR`
+///   or the entry is restarted and never returns, so neither firing nor not
+///   firing would keep the anchor's promise;
+/// - a tool or backend failure is not a result the guest receives; nothing
+///   fires, and the failure ends the run on its own path.
+fn posthook_checkpoint(
+    count: u64,
+    anchors: Vec<String>,
+    result: &Result<i64, Error>,
+) -> Option<ResourceID> {
+    if anchors.is_empty() {
+        return None;
+    }
+    match result {
+        Err(Error::Errno(
+            errno @ (Errno::ERESTARTSYS
+            | Errno::ERESTARTNOINTR
+            | Errno::ERESTARTNOHAND
+            | Errno::ERESTART_RESTARTBLOCK),
+        )) => Some(ResourceID::HappensBeforePosthookInterrupted {
+            count,
+            anchors,
+            code: errno
+                .name()
+                .map_or_else(|| errno.to_string(), str::to_owned),
+        }),
+        Ok(_) | Err(Error::Errno(_)) => {
+            Some(ResourceID::HappensBeforeSyscallCheckpoint { count, anchors })
+        }
+        Err(_) => None,
+    }
 }
 
 #[reverie::tool]
@@ -2665,7 +2727,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 .happens_before
                 .as_ref()
                 .expect("checked above");
-            let reached = if program.has_syscall_occurrence_anchors() {
+            // A posthook anchor this entry reaches checks in when the call
+            // completes, below, not here
+            // (https://github.com/rrnewton/hermit/issues/3929).
+            let mut reached = if program.has_syscall_occurrence_anchors() {
                 let (sysno, args) = call.into_parts();
                 program.count_syscall_occurrences(
                     &mut counters,
@@ -2677,6 +2742,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             } else {
                 Vec::new()
             };
+            let posthook: Vec<String> = reached
+                .extract_if(.., |name| {
+                    program
+                        .anchors
+                        .get(name)
+                        .is_some_and(|a| a.fires_at_posthook())
+                })
+                .collect();
             let checkpoint = if !reached.is_empty() {
                 Some(ResourceID::HappensBeforeSyscallCheckpoint {
                     count: new_count,
@@ -2688,6 +2761,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 None
             };
             guest.thread_state_mut().stats.hb_occurrences = counters;
+            guest.thread_state_mut().stats.hb_pending_posthook = posthook;
             checkpoint
         } else {
             None
@@ -3630,7 +3704,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
 
         if let Err(error) = self.detlog_memory_maps(guest) {
-            return self.complete_syscall(guest, Err(error)).await;
+            let res = Err(error);
+            self.publish_posthook_checkpoint(guest, new_count, &res)
+                .await;
+            return self.complete_syscall(guest, res).await;
         }
         // Same control point again, for the bytes this syscall moved through a guest buffer.
         // Unlike the two mapping hashes above, the extent comes from the syscall's OWN
@@ -3647,7 +3724,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 rng_readv_output.as_deref(),
             )
         {
-            return self.complete_syscall(guest, Err(error)).await;
+            let res = Err(error);
+            self.publish_posthook_checkpoint(guest, new_count, &res)
+                .await;
+            return self.complete_syscall(guest, res).await;
         }
 
         if sequentialize_threads && self.cfg.should_trace_schedevent() {
@@ -3661,6 +3741,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             )
             .await;
         }
+
+        // Posthook happens-before anchors this call reached fire now that its
+        // result is decided and before the guest resumes
+        // (https://github.com/rrnewton/hermit/issues/3929).
+        self.publish_posthook_checkpoint(guest, new_count, &res)
+            .await;
 
         // The syscall is finished; a turn the post-hook takes (a timeslice
         // end) is the thread's own and advances global time as usual.
@@ -4748,6 +4834,50 @@ mod finished_syscall_display_tests {
             line.contains(&format!("tv_sec: {SENTINEL}")),
             "partial timespec copy hidden on EFAULT: {line}"
         );
+    }
+
+    /// A posthook anchor fires on a value or a final guest errno, `EINTR`
+    /// included; an internal restart code is refused; a tool error and an
+    /// entry with no posthook anchor make no request
+    /// (https://github.com/rrnewton/hermit/issues/3929).
+    #[test]
+    fn a_posthook_checkpoint_fires_only_on_a_final_result() {
+        let anchors = || vec!["p".to_owned()];
+        let fires = |result: Result<i64, Error>| {
+            matches!(
+                posthook_checkpoint(9, anchors(), &result),
+                Some(ResourceID::HappensBeforeSyscallCheckpoint { count: 9, anchors })
+                    if anchors == ["p"]
+            )
+        };
+        assert!(fires(Ok(0)));
+        assert!(fires(Ok(6)));
+        for errno in [Errno::EINTR, Errno::EAGAIN, Errno::EBADF, Errno::EFAULT] {
+            assert!(fires(Err(errno.into())), "{errno}");
+        }
+        for errno in [
+            Errno::ERESTARTSYS,
+            Errno::ERESTARTNOINTR,
+            Errno::ERESTARTNOHAND,
+            Errno::ERESTART_RESTARTBLOCK,
+        ] {
+            match posthook_checkpoint(9, anchors(), &Err(errno.into())) {
+                Some(ResourceID::HappensBeforePosthookInterrupted {
+                    count: 9,
+                    anchors,
+                    code,
+                }) => {
+                    assert_eq!(anchors, ["p"]);
+                    assert_eq!(Some(code.as_str()), errno.name());
+                }
+                other => panic!("{errno}: {other:?}"),
+            }
+        }
+        assert!(
+            posthook_checkpoint(9, anchors(), &Err(Error::Tool(anyhow::anyhow!("tool")))).is_none()
+        );
+        assert!(posthook_checkpoint(9, Vec::new(), &Ok(0)).is_none());
+        assert!(posthook_checkpoint(9, Vec::new(), &Err(Errno::ERESTARTSYS.into())).is_none());
     }
 
     /// A tool error is not the syscall's result and proves nothing about the

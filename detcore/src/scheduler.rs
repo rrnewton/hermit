@@ -559,7 +559,12 @@ fn blocking_request_is_ready(
 /// Two position kinds are enforced: [`Position::SyscallCount`] and the syscall
 /// occurrence anchors (`Anchor::is_syscall_occurrence`, "the thread's Nth
 /// `writev` to fd 9"), which the guest counts per thread and names in its
-/// checkpoint ([`HbRuntime::occurrence_anchors_on`]). Other position kinds are retained
+/// checkpoint ([`HbRuntime::occurrence_anchors_on`]). A syscall-occurrence
+/// anchor with the posthook phase checks in after its call's result is final
+/// instead of at its entry, and an interrupted call that reached one is
+/// refused (`HERMIT_HB_POSTHOOK_INTERRUPTED`,
+/// [`Scheduler::hb_posthook_interrupted`];
+/// <https://github.com/rrnewton/hermit/issues/3929>). Other position kinds are retained
 /// for diagnostics but never fire; [`HbRuntime::new`] warns about them so a run
 /// never silently ignores an ordering constraint. An anchor that never fires
 /// is refused by name (`HERMIT_HB_ANCHOR_NEVER_FIRED`, exit 122): a BEFORE
@@ -625,8 +630,8 @@ impl HbRuntime {
         for anchor in program.unenforced_positions() {
             tracing::warn!(
                 "[happens-before] anchor {} uses position '{}', which the scheduler does not yet \
-                 enforce (only 'after N syscalls' is enforced); this ordering constraint will NOT \
-                 be applied",
+                 enforce (only syscall counts and syscall occurrences are enforced); this \
+                 ordering constraint will NOT be applied",
                 anchor.name,
                 anchor.position,
             );
@@ -3027,6 +3032,47 @@ impl Scheduler {
 
     fn should_synthesize_child_exit_signal(&self, parent: DetTid) -> bool {
         !self.physical_thread_pidfds.contains_key(&parent)
+    }
+
+    /// Refuse the run (`HERMIT_HB_POSTHOOK_INTERRUPTED`, exit 122) for a
+    /// syscall entry of `dettid` that reached posthook `anchors` and returned
+    /// the internal restart `code`: whether that entry returns `EINTR` or is
+    /// restarted and never returns is decided by the kernel after this point
+    /// (<https://github.com/rrnewton/hermit/issues/3929>).
+    ///
+    /// The guest names every spawn-ordinal anchor at its nth matching call on
+    /// any thread, as for a completed call, so only the anchors that resolve
+    /// to `dettid` count ([`HbRuntime::occurrence_anchors_on`]); with none,
+    /// the turn proceeds. Otherwise nothing fires, the verdict is recorded (an
+    /// earlier pending verdict and its classification are kept), and the turn
+    /// grants nothing, so no guest code runs alongside the policy exit.
+    fn hb_posthook_interrupted(
+        &mut self,
+        dettid: DetTid,
+        count: u64,
+        anchors: &[String],
+        code: &str,
+    ) -> Result<(), SkipTurn> {
+        let anchors = self
+            .happens_before
+            .as_ref()
+            .expect("posthook refusal issued without a happens-before program")
+            .occurrence_anchors_on(dettid, anchors);
+        if anchors.is_empty() {
+            return Ok(());
+        }
+        if self.terminal_deadlock.is_none() {
+            self.terminal_deadlock = Some(format!(
+                "HERMIT_HB_POSTHOOK_INTERRUPTED: dtid {} reached posthook happens-before \
+                 anchor(s) {:?} at syscall count {}, and the call was interrupted ({}); whether \
+                 it returns EINTR or is restarted is decided by the kernel after Hermit's \
+                 checkpoint, so the anchor cannot be enforced. Anchor the edge at the prehook \
+                 or on a call that is not interrupted.",
+                dettid, anchors, count, code
+            ));
+            self.terminal_is_refusal = true;
+        }
+        self.skip_turn_blocked(dettid)
     }
 
     /// Handle a happens-before checkpoint issued by `dettid` after its `count`th
@@ -7859,6 +7905,11 @@ impl Scheduler {
             ResourceID::HappensBeforeSyscallCheckpoint { count, anchors } => {
                 self.hb_checkpoint(dettid, *count, anchors)
             }
+            ResourceID::HappensBeforePosthookInterrupted {
+                count,
+                anchors,
+                code,
+            } => self.hb_posthook_interrupted(dettid, *count, anchors, code),
 
             // A host-async SIGCHLD (a guest child process exited) is delivered to
             // the parent at a moment decided by host timing. Committing that turn
@@ -17157,6 +17208,128 @@ mod test {
             scheduler.run_queue.undo_tentative_pop();
         }
         granted
+    }
+
+    /// A posthook anchor on the same thread as an entry that returned an
+    /// internal restart code is refused by name and does not fire, the turn
+    /// grants nothing (the thread leaves the run queue), and the thread it
+    /// gates stays held; an earlier pending verdict is kept. A spawn-ordinal
+    /// anchor the guest named at another thread's interrupted call is not on
+    /// that thread, and its turn proceeds (the Claude review of
+    /// https://github.com/rrnewton/hermit/pull/4048). A completed entry's
+    /// posthook checkpoint fires it like a prehook one
+    /// (https://github.com/rrnewton/hermit/issues/3929).
+    #[test]
+    fn an_interrupted_posthook_anchor_is_refused_and_does_not_fire() {
+        const SPEC: &str = r#"{"version": 1,
+            "threads": {"helper": {"spawn_ordinal": 1}},
+            "events": {"src": {"thread": "3", "syscall": "futex", "phase": "posthook"},
+                       "helper_wait": {"thread": "helper", "syscall": "futex",
+                                       "phase": "posthook"},
+                       "dst": {"thread": "5", "syscalls": 43}},
+            "edges": [{"before": "src", "after": "dst", "strength": "hard"}]}"#;
+        let source = DetTid::from_raw(3);
+        let anchors = ["src".to_owned()];
+        let interrupt = |scheduler: &mut Scheduler, anchors: &[String]| {
+            scheduler
+                .priorities
+                .entry(source)
+                .or_insert(DEFAULT_PRIORITY);
+            if !scheduler.run_queue.contains_tid(source) {
+                scheduler.runqueue_push_back(source);
+            }
+            scheduler.run_queue.tentative_pop_tid(source).unwrap();
+            let granted = scheduler
+                .hb_posthook_interrupted(source, 9, anchors, "ERESTARTSYS")
+                .is_ok();
+            if granted {
+                scheduler.run_queue.undo_tentative_pop();
+            }
+            granted
+        };
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.happens_before = Some(hb_runtime(SPEC));
+        // The helper's spawn-ordinal anchor, named at dtid 3's call: not on
+        // dtid 3, so nothing is refused and the turn proceeds.
+        assert!(interrupt(&mut scheduler, &["helper_wait".to_owned()]));
+        assert!(scheduler.terminal_deadlock.is_none());
+        assert!(!interrupt(&mut scheduler, &anchors));
+        assert!(!scheduler.run_queue.contains_tid(source));
+        assert!(scheduler.terminal_is_refusal);
+        assert!(scheduler.happens_before.as_ref().unwrap().fired.is_empty());
+        assert!(!hb_reach(&mut scheduler, DetTid::from_raw(5), 43, 100));
+        assert_eq!(
+            scheduler.take_terminal_deadlock().unwrap(),
+            "HERMIT_HB_POSTHOOK_INTERRUPTED: dtid 3 reached posthook happens-before anchor(s) \
+             [\"src\"] at syscall count 9, and the call was interrupted (ERESTARTSYS); whether \
+             it returns EINTR or is restarted is decided by the kernel after Hermit's \
+             checkpoint, so the anchor cannot be enforced. Anchor the edge at the prehook or \
+             on a call that is not interrupted."
+        );
+
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.happens_before = Some(hb_runtime(SPEC));
+        scheduler.terminal_deadlock = Some("earlier".to_owned());
+        assert!(!interrupt(&mut scheduler, &anchors));
+        assert_eq!(scheduler.take_terminal_deadlock().unwrap(), "earlier");
+
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.happens_before = Some(hb_runtime(SPEC));
+        assert!(scheduler.hb_checkpoint(source, 9, &anchors).is_ok());
+        assert!(
+            scheduler
+                .happens_before
+                .as_ref()
+                .unwrap()
+                .fired
+                .contains("src")
+        );
+        assert!(hb_reach(&mut scheduler, DetTid::from_raw(5), 43, 100));
+    }
+
+    /// Through a whole turn (`block_for_one_resource`): an interrupted entry
+    /// whose posthook anchor is on its thread commits no turn and gets no
+    /// response, so no guest code runs alongside the policy exit; one whose
+    /// only anchor is another thread's spawn-ordinal anchor is an ordinary
+    /// turn (the Claude review of https://github.com/rrnewton/hermit/pull/4048).
+    #[tokio::test]
+    async fn an_interrupted_posthook_refusal_grants_no_turn() {
+        const SPEC: &str = r#"{"version": 1,
+            "threads": {"helper": {"spawn_ordinal": 1}},
+            "events": {"src": {"thread": "3", "syscall": "futex", "phase": "posthook"},
+                       "helper_wait": {"thread": "helper", "syscall": "futex",
+                                       "phase": "posthook"}}}"#;
+        for (anchor, refused) in [("helper_wait", false), ("src", true)] {
+            let config = Config::default();
+            let mut sched = Scheduler::new(&config);
+            sched.happens_before = Some(hb_runtime(SPEC));
+            let thread = DetTid::from_raw(3);
+            register_known_thread(&mut sched, thread);
+            sched.runqueue_push_back(thread);
+            let mut request = Resources::new(thread);
+            request.insert(
+                ResourceID::HappensBeforePosthookInterrupted {
+                    count: 9,
+                    anchors: vec![anchor.to_owned()],
+                    code: "ERESTARTSYS".to_owned(),
+                },
+                Permission::R,
+            );
+            sched.next_turns[&thread].req.put(Ok(request));
+            let response = sched.next_turns[&thread].resp.clone();
+            let sched = Arc::new(Mutex::new(sched));
+            let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(5),
+                do_a_turn_blocking(sched.clone(), global_time, &Err(SkipTurn)),
+            )
+            .await
+            .expect("the turn must not stall");
+            let s = sched.lock().unwrap();
+            assert_eq!(outcome.is_err(), refused, "{anchor}: {outcome:?}");
+            assert_eq!(response.try_read().is_none(), refused, "{anchor}");
+            assert_eq!(s.terminal_deadlock.is_some(), refused, "{anchor}");
+        }
     }
 
     /// The hold budget is charged in committed virtual time from the moment

@@ -323,13 +323,31 @@ pub enum Position {
     /// - The counters belong to the thread, like its syscall count: a new
     ///   thread starts at zero, an exec keeps them, and after a non-leader exec
     ///   the calling thread's counters continue under the leader's thread id.
-    /// - Like every anchor, it fires at the prehook: an edge orders the BEFORE
+    /// - By default it fires at the prehook: an edge then orders the BEFORE
     ///   thread *reaching* its syscall, not that syscall's effect. The held
     ///   thread is re-admitted at the next drain, so a BEFORE syscall that
     ///   takes more scheduler turns than the AFTER thread needs (a `write` to
     ///   stdout takes a checkpoint turn and a resource turn) can let the AFTER
-    ///   thread's effect land first, even under the default scheduler
-    ///   (<https://github.com/rrnewton/hermit/issues/3929>).
+    ///   thread's effect land first, even under the default scheduler.
+    /// - With `phase` posthook it fires when the syscall's result is final:
+    ///   a value or an errno, `EINTR` included, decided before the guest
+    ///   resumes (<https://github.com/rrnewton/hermit/issues/3929>). An entry
+    ///   that returns an internal restart code is refused
+    ///   (`HERMIT_HB_POSTHOOK_INTERRUPTED`), because the kernel decides after
+    ///   that point whether it returns at all. A call that only a signal
+    ///   handler ends (`pause`, `rt_sigsuspend`) always returns one, so a
+    ///   posthook anchor on it always refuses. Occurrences are counted at entry
+    ///   either way, and the five syscalls that do not return on success are
+    ///   refused at load ([`syscall_never_returns_on_success`]).
+    /// - What a hard edge orders depends on both ends. A posthook BEFORE and a
+    ///   prehook AFTER order the BEFORE syscall's completed effect before the
+    ///   AFTER syscall runs. A posthook AFTER holds its thread only after its
+    ///   own call, so that call's effect may come before the BEFORE one's.
+    ///   With a prehook BEFORE, effects may land in either order.
+    /// - A posthook BEFORE on a call that only a held thread can complete
+    ///   never fires. A child wait or futex wait on the held thread ends in
+    ///   `HERMIT_HB_ANCHOR_NEVER_FIRED`; a read whose only writer is held is
+    ///   external input to the scheduler, and the run ends at `--timeout`.
     Syscall {
         /// The syscall number.
         sysno: Sysno,
@@ -427,14 +445,31 @@ impl fmt::Display for Anchor {
 
 impl Anchor {
     /// True for an enforced syscall-occurrence anchor: a [`Position::Syscall`]
-    /// with no phase or the prehook phase. The anchor fires at the prehook of
-    /// the thread's `nth` matching syscall, the point where every enforced
-    /// anchor fires. Other phases are not enforced.
+    /// with no phase, the prehook phase or the posthook phase. Its
+    /// occurrences are counted at the prehook of each matching syscall entry.
+    /// It fires at the prehook of the thread's `nth` matching entry, or, for
+    /// the posthook phase ([`Anchor::fires_at_posthook`]), when that entry
+    /// completes. The polling phase is not enforced.
     pub fn is_syscall_occurrence(&self) -> bool {
         matches!(
             self.position,
             Position::Syscall {
-                phase: None | Some(SyscallPhase::Prehook),
+                phase: None | Some(SyscallPhase::Prehook) | Some(SyscallPhase::Posthook),
+                ..
+            }
+        )
+    }
+
+    /// True for a syscall-occurrence anchor that fires when its syscall
+    /// completes: after the call's effect and result, before the guest
+    /// resumes (<https://github.com/rrnewton/hermit/issues/3929>). An edge
+    /// whose BEFORE anchor fires at the posthook orders that syscall's
+    /// completed effect, not just its entry.
+    pub fn fires_at_posthook(&self) -> bool {
+        matches!(
+            self.position,
+            Position::Syscall {
+                phase: Some(SyscallPhase::Posthook),
                 ..
             }
         )
@@ -473,6 +508,16 @@ impl Anchor {
             _ => false,
         }
     }
+}
+
+/// True for a syscall that does not return to its caller when it succeeds: the
+/// exec family replaces the image, and the exit family ends the thread. A
+/// posthook anchor on one is refused at load.
+pub fn syscall_never_returns_on_success(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        Sysno::execve | Sysno::execveat | Sysno::exit | Sysno::exit_group | Sysno::rt_sigreturn
+    )
 }
 
 /// True for a syscall that never reaches Hermit's tracer on the ptrace
@@ -864,6 +909,14 @@ pub enum HappensBeforeError {
     /// The relative bases and the hard edges together form a cycle, so some
     /// event on it could only be reached after itself.
     FromCycle(Vec<String>),
+    /// A posthook anchor names a syscall that does not return to its caller
+    /// when it succeeds ([`syscall_never_returns_on_success`]).
+    PosthookOnNoReturnSyscall {
+        /// The offending event name.
+        event: String,
+        /// The syscall name.
+        syscall: String,
+    },
     /// A DSL line could not be parsed.
     DslSyntax {
         /// 1-based line number.
@@ -986,6 +1039,12 @@ impl fmt::Display for HappensBeforeError {
                 "event '{}' counts from '{}', which itself uses 'from'; relative chains are not \
                  supported",
                 event, base
+            ),
+            HappensBeforeError::PosthookOnNoReturnSyscall { event, syscall } => write!(
+                f,
+                "event '{}' fires at the posthook of {}, which does not return to its caller when \
+                 it succeeds, so the anchor could only fire on a failed call",
+                event, syscall
             ),
             HappensBeforeError::FromCycle(names) => write!(
                 f,
@@ -1219,6 +1278,12 @@ impl HappensBeforeSpec {
                     }
                 })?),
             };
+            if ev.phase == Some(PhaseSpec::Posthook) && syscall_never_returns_on_success(sysno) {
+                return Err(HappensBeforeError::PosthookOnNoReturnSyscall {
+                    event: name.to_string(),
+                    syscall: sc.clone(),
+                });
+            }
             Position::Syscall {
                 sysno,
                 phase: ev.phase.map(Into::into),
@@ -1810,7 +1875,7 @@ mod tests {
                 "events": {"fd9": {"thread": "7", "syscall": "writev", "fd": 9, "nth": 2},
                            "anyfd": {"thread": "7", "syscall": "writev", "nth": 3},
                            "spawned": {"thread": "S1", "syscall": "write", "fd": 1},
-                           "post": {"thread": "7", "syscall": "close", "phase": "post"}}}"#,
+                           "polling": {"thread": "7", "syscall": "close", "phase": "polling"}}}"#,
         )
         .unwrap()
         .normalize()
@@ -1839,14 +1904,14 @@ mod tests {
         // A spawn-ordinal anchor is returned on any thread at its nth.
         assert_eq!(count(&mut c8, t8, Sysno::write, 1), ["spawned"]);
         assert!(count(&mut c8, t8, Sysno::write, 2).is_empty());
-        // A posthook anchor is not enforced, never counted.
+        // A polling anchor is not enforced, never counted.
         assert!(count(&mut c7, t7, Sysno::close, 3).is_empty());
         assert!(!c7.counts.contains_key(&(Sysno::close as usize, None, None)));
         let unenforced: Vec<&str> = prog
             .unenforced_positions()
             .map(|a| a.name.as_str())
             .collect();
-        assert_eq!(unenforced, ["post"]);
+        assert_eq!(unenforced, ["polling"]);
         // A count anchor is not a syscall-occurrence anchor and is unaffected.
         assert!(!prog.may_have_syscall_count_anchor_at(t7, 2));
         let count_only = HappensBeforeSpec::from_json(
@@ -2273,6 +2338,47 @@ mod tests {
         }
     }
 
+    /// A posthook syscall anchor is enforced: it is counted at its entry like
+    /// any occurrence anchor and named at that entry, and only its firing
+    /// point differs (https://github.com/rrnewton/hermit/issues/3929). It is
+    /// refused at load on syscalls that do not return on success.
+    #[test]
+    fn a_posthook_anchor_is_counted_at_entry_and_refused_on_no_return_syscalls() {
+        let prog = normalize_json(
+            r#"{"version": 1, "events": {
+                "w": {"thread": "7", "syscall": "write", "fd": 1, "phase": "posthook", "nth": 2}}}"#,
+        )
+        .unwrap();
+        let w = &prog.anchors["w"];
+        assert!(w.is_syscall_occurrence() && w.fires_at_posthook());
+        assert_eq!(prog.unenforced_positions().count(), 0);
+        let t7 = DetTid::from_raw(7);
+        let mut c = HbThreadCounters::default();
+        assert!(
+            prog.count_syscall_occurrences(&mut c, t7, Sysno::write, [1, 0], 1)
+                .is_empty()
+        );
+        assert_eq!(
+            prog.count_syscall_occurrences(&mut c, t7, Sysno::write, [1, 0], 2),
+            ["w"]
+        );
+        for syscall in ["execve", "execveat", "exit", "exit_group", "rt_sigreturn"] {
+            assert_eq!(
+                normalize_json(&format!(
+                    r#"{{"version": 1, "events": {{"x": {{"thread": "7", "syscall": "{syscall}", "phase": "posthook"}}}}}}"#
+                ))
+                .unwrap_err(),
+                HappensBeforeError::PosthookOnNoReturnSyscall {
+                    event: "x".to_owned(),
+                    syscall: syscall.to_owned()
+                }
+            );
+        }
+        // At the prehook the same syscalls stay valid anchors.
+        normalize_json(r#"{"version": 1, "events": {"x": {"thread": "7", "syscall": "execve"}}}"#)
+            .unwrap();
+    }
+
     /// `futex_op` restricts `futex` to one operation, compared on the low 32
     /// bits of the second argument as the kernel's `int`; it is refused on any
     /// other syscall and outside `i32`.
@@ -2369,7 +2475,7 @@ mod tests {
         let (event, base) = names("r", "a");
         assert_eq!(
             refused(
-                r#""a": {"thread": "7", "syscall": "write", "phase": "posthook"},
+                r#""a": {"thread": "7", "syscall": "write", "phase": "polling"},
                    "r": {"thread": "7", "syscall": "getppid", "from": "a"}"#,
                 ""
             ),
@@ -2503,5 +2609,42 @@ mod tests {
                 .is_empty()
         );
         assert!(c8.origins.is_empty());
+    }
+
+    /// The phase is not part of an anchor's counting key: a prehook and a
+    /// posthook anchor on one matcher share one counter, and both are named at
+    /// the same entry; a posthook base starts its relative anchor's window at
+    /// its entry, as a prehook base does
+    /// (https://github.com/rrnewton/hermit/issues/3929).
+    #[test]
+    fn a_posthook_anchor_shares_its_counter_and_starts_windows_at_its_entry() {
+        let prog = normalize_json(
+            r#"{"version": 2, "events": {
+                "pre2": {"thread": "7", "syscall": "write", "fd": 1, "nth": 2},
+                "post2": {"thread": "7", "syscall": "write", "fd": 1, "nth": 2,
+                          "phase": "posthook"},
+                "post3": {"thread": "7", "syscall": "write", "fd": 1, "nth": 3,
+                          "phase": "posthook"},
+                "base": {"thread": "7", "syscall": "getpid", "phase": "posthook"},
+                "after_base": {"thread": "7", "syscall": "write", "fd": 1, "from": "base",
+                               "nth": 1}}}"#,
+        )
+        .unwrap();
+        let t7 = DetTid::from_raw(7);
+        let mut c = HbThreadCounters::default();
+        let mut entry = 0;
+        let mut call = |c: &mut HbThreadCounters, sysno: Sysno, arg0: usize| {
+            entry += 1;
+            prog.count_syscall_occurrences(c, t7, sysno, [arg0, 0], entry)
+        };
+        assert!(call(&mut c, Sysno::write, 1).is_empty());
+        assert_eq!(call(&mut c, Sysno::write, 1), ["post2", "pre2"]);
+        // Entry 3: the posthook base, named at its entry; its window starts
+        // at the write count so far.
+        assert_eq!(call(&mut c, Sysno::getpid, 0), ["base"]);
+        assert_eq!(c.origins["after_base"], 2);
+        // Entry 4: write #3 is post3 and the first write after the base.
+        assert_eq!(call(&mut c, Sysno::write, 1), ["after_base", "post3"]);
+        assert_eq!(c.counts[&(Sysno::write as usize, Some(1), None)], 3);
     }
 }

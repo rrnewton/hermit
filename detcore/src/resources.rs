@@ -367,6 +367,20 @@ pub enum ResourceID {
         anchors: Vec<String>,
     },
 
+    /// A syscall entry that reached posthook happens-before anchors returned an
+    /// internal restart code, so whether it completes is decided by the kernel
+    /// after Hermit's checkpoint. The scheduler refuses the run
+    /// (`HERMIT_HB_POSTHOOK_INTERRUPTED`) and fires nothing
+    /// (<https://github.com/rrnewton/hermit/issues/3929>).
+    HappensBeforePosthookInterrupted {
+        /// The post-increment syscall count observed by the guest.
+        count: u64,
+        /// The posthook anchors the entry reached, in name order.
+        anchors: Vec<String>,
+        /// The restart code, by name.
+        code: String,
+    },
+
     /// A real `rt_sigsuspend` executing outside the runnable set while the kernel
     /// atomically installs its temporary signal mask. Unlike arbitrary external
     /// IO, this operation cannot complete without a signal.

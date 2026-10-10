@@ -870,7 +870,12 @@ pub struct RunOpts {
     /// syscall" and anchors that name a syscall, optionally on one file
     /// descriptor ({"syscall": "writev", "fd": 9, "nth": 3}); a syscall anchor
     /// that never fires ends the run with HERMIT_HB_ANCHOR_NEVER_FIRED. A
-    /// version-2 spec ("version": 2) adds `futex_op` (one futex operation,
+    /// syscall anchor fires at the syscall's entry, or, with "phase":
+    /// "posthook", when its result is final, so an edge from it to an entry
+    /// anchor orders its completed effect; a posthook anchor on an interrupted
+    /// call ends the run with HERMIT_HB_POSTHOOK_INTERRUPTED, and posthook
+    /// anchors are refused with `--replay-schedule-from`.
+    /// A version-2 spec ("version": 2) adds `futex_op` (one futex operation,
     /// {"syscall": "futex", "futex_op": 393}), `from` (count a syscall anchor
     /// strictly after another event on the same thread, so no calibration run
     /// is needed) and `max_hold_ns` (how long, in virtual time, a thread may be
@@ -6573,6 +6578,7 @@ impl RunOpts {
                 // The requested timer, before validation; an implicit loss is
                 // refused later (`refuse_happens_before_without_preemption`).
                 preemption: self.det_opts.det_config.max_timeslice.is_some(),
+                replay_schedule: self.det_opts.det_config.replay_schedule_from.is_some(),
             },
         )
         // A spec the launch cannot enforce is a policy refusal (exit 122), not

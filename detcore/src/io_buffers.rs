@@ -799,6 +799,8 @@ mod event_tests {
     use std::sync::Arc;
     use std::sync::Mutex;
 
+    use detcore_model::happens_before::HappensBeforeProgram;
+    use detcore_model::happens_before::HappensBeforeSpec;
     use nix::fcntl::OFlag;
     use reverie::GlobalRPC;
     use reverie::GlobalTool;
@@ -1053,6 +1055,10 @@ mod event_tests {
         /// fails, and how many times it has been asked.
         user_address_limit_fails: bool,
         user_address_limit_queries: Mutex<usize>,
+        /// The happens-before checkpoints requested, in order.
+        hb_requests: Mutex<Vec<ResourceID>>,
+        /// Report the fixture's memory regions without the user-copy audit.
+        report_memory_regions: bool,
     }
 
     impl EventGuest {
@@ -1106,6 +1112,21 @@ mod event_tests {
             message: <GlobalState as GlobalTool>::Request,
         ) -> <GlobalState as GlobalTool>::Response {
             let response = match message.2 {
+                GlobalRequest::RequestResources(request, _)
+                    if request.resources.keys().any(|resource| {
+                        matches!(
+                            resource,
+                            ResourceID::HappensBeforeSyscallCheckpoint { .. }
+                                | ResourceID::HappensBeforePosthookInterrupted { .. }
+                        )
+                    }) =>
+                {
+                    self.hb_requests
+                        .lock()
+                        .unwrap()
+                        .extend(request.resources.keys().cloned());
+                    GlobalResponse::RequestResources(ResumeStatus::Normal)
+                }
                 GlobalRequest::RequestResources(request, _) => {
                     assert_eq!(request.resources.len(), 1);
                     assert_eq!(
@@ -1194,7 +1215,7 @@ mod event_tests {
         }
 
         fn detlog_memory_regions(&self) -> Option<Vec<reverie::DetlogMemoryRegion>> {
-            if !self.audit_call("memory-regions") {
+            if !self.audit_call("memory-regions") && !self.report_memory_regions {
                 return None;
             }
             Some(vec![
@@ -1351,8 +1372,23 @@ mod event_tests {
             backend_runtime_bootstrap: false,
             user_address_limit_fails: false,
             user_address_limit_queries: Mutex::new(0),
+            hb_requests: Mutex::new(Vec::new()),
+            report_memory_regions: false,
         };
         (tool, guest)
+    }
+
+    /// A happens-before program with one posthook anchor, `p`, on the
+    /// thread's first `syscall` (https://github.com/rrnewton/hermit/issues/3929).
+    fn posthook_program(guest: &EventGuest, syscall: &str) -> HappensBeforeProgram {
+        HappensBeforeSpec::from_json(&format!(
+            r#"{{"version": 1, "events": {{"p": {{"thread": "{}", "syscall": "{syscall}",
+                                                 "phase": "posthook"}}}}}}"#,
+            guest.thread.dettid.as_raw()
+        ))
+        .unwrap()
+        .normalize()
+        .unwrap()
     }
 
     /// Collects the INFO messages that contain the second field.
@@ -1855,6 +1891,80 @@ mod event_tests {
         assert_extent(&messages[0], RETRY_DEST, PIPE_BYTES);
     }
 
+    /// An ordinary readv whose observation fails after the call returns that
+    /// errno to the guest as the call's final result, so a posthook anchor on
+    /// the call fires, as it does for the same readv observed successfully
+    /// (the Codex review of https://github.com/rrnewton/hermit/pull/4048).
+    /// Both observers are covered: the I/O-buffer digest, and the memory-map
+    /// digest (`--detlog-stack`) that runs before it. Only a terminal tool
+    /// failure publishes nothing
+    /// (`rng_readv_event_digest_failure_is_terminal_after_bytes_and_cursor_commit`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_posthook_anchor_fires_on_an_observer_errno_like_a_success() {
+        for (fault, memory_maps) in [
+            (None, false),
+            (Some(Errno::EFAULT), false),
+            (None, true),
+            (Some(Errno::EFAULT), true),
+        ] {
+            // The observers run only while their INFO records are collected.
+            let logs = BufferLog::default();
+            let _subscriber = tracing::subscriber::set_default(logs.clone());
+            let (parked_tx, parked_rx) = oneshot::channel();
+            let (resume_tx, resume_rx) = oneshot::channel();
+            let (mut tool, mut guest) = event_guest(FdType::Pipe, Some((parked_tx, resume_rx)));
+            guest.config.happens_before = Some(posthook_program(&guest, "readv"));
+            if memory_maps {
+                // The stack region is FIRST_DEST..+8, the readv's destination.
+                guest.config.detlog_stack = true;
+                guest.config.detlog_io_buffers = false;
+                guest.report_memory_regions = true;
+                tool.cfg = guest.config.clone();
+            }
+            let memory = guest.memory.clone();
+            memory.put_iovec(0, FIRST_DEST, 8);
+            if let Some(fault) = fault {
+                let mut reads = memory.1.lock().unwrap();
+                reads.digest_error = Some(fault);
+                reads.exact_error = Some(fault);
+            }
+            let event = tool.handle_syscall_event(&mut guest, readv(1));
+            let resume = async {
+                parked_rx.await.unwrap();
+                resume_tx.send(()).unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                tokio::join!(event, resume)
+            })
+            .await
+            .expect("readv did not cross its retry resource wait");
+            let case = format!("fault {fault:?}, memory maps {memory_maps}");
+            match fault {
+                None => assert_eq!(result.unwrap(), 4, "{case}"),
+                Some(fault) => assert!(
+                    matches!(result, Err(Error::Errno(error)) if error == fault),
+                    "{case}: {result:?}"
+                ),
+            }
+            assert_eq!(
+                memory.bytes(FIRST_DEST, 4).as_slice(),
+                PIPE_BYTES.as_slice()
+            );
+            assert!(
+                !memory.1.lock().unwrap().observer_reads.is_empty(),
+                "{case}: the observer never ran"
+            );
+            assert_eq!(
+                *guest.hb_requests.lock().unwrap(),
+                [ResourceID::HappensBeforeSyscallCheckpoint {
+                    count: 1,
+                    anchors: vec!["p".to_owned()],
+                }],
+                "{case}"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn rng_readv_event_observes_imported_array_after_output_overwrites_it() {
         for (name, call, advances) in rng_vector_calls(2) {
@@ -1910,6 +2020,10 @@ mod event_tests {
                 let logs = BufferLog::default();
                 let _subscriber = tracing::subscriber::set_default(logs.clone());
                 let (tool, mut guest) = event_guest(FdType::Rng, None);
+                // A posthook anchor on the call must not fire: the result the
+                // guest would get is replaced by the terminal observer error
+                // (https://github.com/rrnewton/hermit/issues/3929).
+                guest.config.happens_before = Some(posthook_program(&guest, name));
                 let memory = guest.memory.clone();
                 memory.put_iovec(0, RETRY_DEST, 3);
                 memory.put_iovec(1, FIRST_DEST, 5);
@@ -1961,6 +2075,10 @@ mod event_tests {
                 let messages = logs.0.lock().unwrap();
                 assert_eq!(messages.len(), 1);
                 assert_named_extent(&messages[0], name, RETRY_DEST, &expected[..3]);
+                assert!(
+                    guest.hb_requests.lock().unwrap().is_empty(),
+                    "{name}: a posthook anchor fired on a terminal observer failure"
+                );
             }
         }
     }
@@ -1976,6 +2094,10 @@ mod event_tests {
             let logs = BufferLog::default();
             let _subscriber = tracing::subscriber::set_default(logs.clone());
             let (tool, mut guest) = event_guest(FdType::Rng, None);
+            // The control for the terminal-observer case: a call whose
+            // observers succeed fires its posthook anchor once
+            // (https://github.com/rrnewton/hermit/issues/3929).
+            guest.config.happens_before = Some(posthook_program(&guest, name));
             let memory = guest.memory.clone();
             memory.put_iovec(0, RETRY_DEST, 3);
             memory.put_iovec(1, FIRST_DEST, 5);
@@ -1983,6 +2105,14 @@ mod event_tests {
 
             let result = tool.handle_syscall_event(&mut guest, call).await;
             assert_eq!(result.unwrap(), 8, "{name}");
+            assert_eq!(
+                *guest.hb_requests.lock().unwrap(),
+                [ResourceID::HappensBeforeSyscallCheckpoint {
+                    count: 1,
+                    anchors: vec!["p".to_owned()],
+                }],
+                "{name}"
+            );
             let expected = if advances {
                 [41, 114, 187, 4, 77, 150, 223, 40]
             } else {

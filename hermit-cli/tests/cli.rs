@@ -115,9 +115,12 @@ static HB_TWO_THREADS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_SOURCE_THEN_FUTEX_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_SIGNAL_WHILE_HELD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_SPAWN_DUP2_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static HB_SPAWN_ECHO_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_RELATIVE_ANCHOR_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_CHILD_WAIT_CYCLE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_KILL_HELD_CHILD_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static HB_POSTHOOK_FUTEX_INTERRUPT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static HB_PIPE_READ_HELD_WRITER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_TIMEOUT_VS_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_PARENT_KILLED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_KILL_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -713,6 +716,83 @@ fn hb_child_wait_cycle_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "hb-child-wait-cycle guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn hb_posthook_futex_interrupt_guest() -> &'static Path {
+    HB_POSTHOOK_FUTEX_INTERRUPT_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("hb-posthook-futex-interrupt");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create hb-posthook-futex-interrupt directory");
+        let guest = build_root.join("hb_posthook_futex_interrupt");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/hb_posthook_futex_interrupt.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile hb-posthook-futex-interrupt guest");
+        assert!(
+            output.status.success(),
+            "hb-posthook-futex-interrupt guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn hb_pipe_read_held_writer_guest() -> &'static Path {
+    HB_PIPE_READ_HELD_WRITER_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("hb-pipe-read-held-writer");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create hb-pipe-read-held-writer directory");
+        let guest = build_root.join("hb_pipe_read_held_writer");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/hb_pipe_read_held_writer.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile hb-pipe-read-held-writer guest");
+        assert!(
+            output.status.success(),
+            "hb-pipe-read-held-writer guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn hb_spawn_echo_guest() -> &'static Path {
+    HB_SPAWN_ECHO_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("hb-spawn-echo");
+        fs::create_dir_all(&build_root).expect("failed to create hb-spawn-echo directory");
+        let guest = build_root.join("hb_spawn_echo");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/hb_spawn_echo.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile hb-spawn-echo guest");
+        assert!(
+            output.status.success(),
+            "hb-spawn-echo guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -10369,6 +10449,56 @@ fn happens_before_cycle_through_a_child_wait_is_refused_by_name() {
     }
 }
 
+/// A BEFORE anchor at the posthook orders the BEFORE syscall's completed
+/// effect (https://github.com/rrnewton/hermit/issues/3929). The parent
+/// posix_spawns `/bin/echo child`, then writes `parent`; an edge orders the
+/// parent's write before the child's. Fired at the prehook, the edge only
+/// orders the parent *reaching* its write: the held child is re-admitted
+/// before the parent's write commits, so stdout is `child` then `parent`.
+/// Fired at the posthook, the child is held until the parent's write has
+/// completed, so stdout is `parent` then `child`.
+#[test]
+fn happens_before_posthook_before_anchor_orders_the_completed_write() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = hb_spawn_echo_guest().to_str().unwrap().to_owned();
+    for (name, phase, expected) in [
+        ("prehook.json", "prehook", "child\nparent\n"),
+        ("posthook.json", "posthook", "parent\nchild\n"),
+    ] {
+        let spec = directory.path().join(name);
+        fs::write(
+            &spec,
+            format!(
+                r#"{{"version": 1,
+                    "threads": {{"child": {{"spawn_ordinal": 1}}}},
+                    "events": {{"parent_writes": {{"thread": "3", "syscall": "write", "fd": 1,
+                                                   "phase": "{phase}"}},
+                               "child_writes": {{"thread": "child", "syscall": "write", "fd": 1}}}},
+                    "edges": [{{"before": "parent_writes", "after": "child_writes", "strength": "hard"}}]}}"#
+            ),
+        )
+        .unwrap();
+        let args = [
+            "--log",
+            "info",
+            "run",
+            "--strict",
+            "--happens-before",
+            spec.to_str().unwrap(),
+            "--",
+            guest.as_str(),
+        ];
+        let output = hermit(&args);
+        let log = stderr(&output);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{name}");
+        assert!(
+            log.contains("held at happens-before anchor(s) [\"child_writes\"]"),
+            "{name}: the child was never held at its gate"
+        );
+    }
+}
+
 /// The spec of the child-wait tests: the first spawned process's first write
 /// to fd 1 is held until the root's first write to fd 1.
 const HB_CHILD_WRITE_AFTER_PARENT_WRITE: &str = r#"{"version": 1,
@@ -10480,6 +10610,516 @@ fn happens_before_held_child_killed_by_another_process_is_not_a_deadlock() {
                 log.contains("anchor 'child_writes' on thread child: write(fd=1)#1 never fired"),
                 "{mode} run {run}:\n{log}"
             );
+        }
+    }
+}
+
+/// An AFTER anchor at the posthook holds its thread after the anchored call
+/// has completed (https://github.com/rrnewton/hermit/issues/3929). In the
+/// two-thread guest, an edge from the main thread's completed write (a
+/// posthook BEFORE anchor) to the worker's write holds the worker *before*
+/// its write when the AFTER anchor is at the prehook, so `main!` comes first;
+/// at the posthook the worker's write has already happened when it is held,
+/// so `worker` comes first, and the worker is held all the same. The worker
+/// writes `returned` as soon as its write returns ("marker" mode): at the
+/// posthook that marker comes only after `main!`, so the worker was held
+/// between its write's effect and its return to user code.
+#[test]
+fn happens_before_posthook_after_anchor_holds_the_thread_after_its_call() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = hb_two_threads_guest().to_str().unwrap().to_owned();
+    for (name, phase, expected) in [
+        ("after-prehook.json", "prehook", "main!\nworker\nreturned\n"),
+        (
+            "after-posthook.json",
+            "posthook",
+            "worker\nmain!\nreturned\n",
+        ),
+    ] {
+        let spec = directory.path().join(name);
+        fs::write(
+            &spec,
+            format!(
+                r#"{{"version": 1,
+                    "events": {{"main_writes": {{"thread": "3", "syscall": "write", "fd": 1,
+                                                "phase": "posthook"}},
+                               "worker_writes": {{"thread": "5", "syscall": "write", "fd": 1,
+                                                  "phase": "{phase}"}}}},
+                    "edges": [{{"before": "main_writes", "after": "worker_writes", "strength": "hard"}}]}}"#
+            ),
+        )
+        .unwrap();
+        let args = [
+            "--log",
+            "info",
+            "run",
+            "--strict",
+            "--happens-before",
+            spec.to_str().unwrap(),
+            "--",
+            guest.as_str(),
+            "marker",
+        ];
+        let output = hermit(&args);
+        let log = stderr(&output);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{name}");
+        assert!(
+            log.contains("SKIP dettid 5 held at happens-before anchor(s) [\"worker_writes\"]"),
+            "{name}: the worker was never held at its gate"
+        );
+        // Which write completed first: at the posthook the worker's write
+        // returns before the main thread's although the worker is held after
+        // it, which only a hold after the call allows.
+        let finished = |dtid: u32| {
+            let prefix = format!("[syscall][detcore, dtid {dtid}] finish syscall #");
+            log.lines()
+                .position(|line| line.contains(&prefix) && line.contains(": write(1,"))
+                .unwrap_or_else(|| panic!("{name}: no write(1, ...) finished by dtid {dtid}"))
+        };
+        assert_eq!(
+            finished(5) < finished(3),
+            phase == "posthook",
+            "{name}: the worker's write completed on the wrong side of the main thread's"
+        );
+    }
+}
+
+/// The posix_spawn echo case with the posthook edge passes at L2 on ptrace:
+/// `--verify --verify-strict` gives a canonical matched report with nonzero
+/// INFO counts on both sides (https://github.com/rrnewton/hermit/issues/3929).
+#[test]
+fn happens_before_posthook_edge_passes_strict_verify() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = hb_spawn_echo_guest().to_str().unwrap().to_owned();
+    let spec = directory.path().join("posthook.json");
+    fs::write(
+        &spec,
+        r#"{"version": 1,
+            "threads": {"child": {"spawn_ordinal": 1}},
+            "events": {"parent_writes": {"thread": "3", "syscall": "write", "fd": 1,
+                                         "phase": "posthook"},
+                       "child_writes": {"thread": "child", "syscall": "write", "fd": 1}},
+            "edges": [{"before": "parent_writes", "after": "child_writes", "strength": "hard"}]}"#,
+    )
+    .unwrap();
+    let report_path = directory.path().join("verify.json");
+    let args = [
+        "--log",
+        "info",
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        report_path.to_str().unwrap(),
+        "--happens-before",
+        spec.to_str().unwrap(),
+        "--",
+        guest.as_str(),
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "parent\nchild\n");
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report_path).expect("no verify report")).unwrap();
+    let left = report["compared_log_messages"]["left"]
+        .as_u64()
+        .unwrap_or(0);
+    let right = report["compared_log_messages"]["right"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(
+        report["verified"] == true
+            && report["bitwise_parity"] == true
+            && report["verdict"] == "matched"
+            && report["comparison"]["strictness"] == "canonical"
+            && report["comparison"]["log_scope"] == "info"
+            && left > 0
+            && left == right,
+        "the posthook edge did not pass strict verification:\n{report}"
+    );
+}
+
+/// A posthook anchor on a call interrupted by a caught signal is refused by
+/// name (https://github.com/rrnewton/hermit/issues/3929). Detcore's untimed
+/// futex wait returns the internal restart code; with `SA_RESTART` the kernel
+/// would restart the entry, which then never returns, and without it the
+/// entry returns `EINTR`. That is decided after Hermit's checkpoint, so both
+/// end in `HERMIT_HB_POSTHOOK_INTERRUPTED` rather than a guessed firing. The
+/// wait is the guest's one shared `FUTEX_WAIT` (operation 0); glibc's own
+/// waits are private.
+#[test]
+fn happens_before_posthook_anchor_on_an_interrupted_call_is_refused_by_name() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = hb_posthook_futex_interrupt_guest()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let spec = directory.path().join("interrupted.json");
+    fs::write(
+        &spec,
+        r#"{"version": 2,
+            "threads": {"helper": {"spawn_ordinal": 1}},
+            "events": {"main_wait": {"thread": "3", "syscall": "futex", "futex_op": 0,
+                                     "phase": "posthook"},
+                       "helper_writes": {"thread": "helper", "syscall": "write", "fd": 1}},
+            "edges": [{"before": "main_wait", "after": "helper_writes", "strength": "hard"}]}"#,
+    )
+    .unwrap();
+    for mode in ["restart", "eintr"] {
+        let args = ["run", "--strict", "--", guest.as_str(), mode];
+        let ungated = hermit(&args);
+        assert_success(&ungated, &args);
+        assert_eq!(stdout(&ungated), "helper\nmain\n", "{mode}");
+
+        let args = [
+            "--log",
+            "info",
+            "run",
+            "--strict",
+            "--happens-before",
+            spec.to_str().unwrap(),
+            "--",
+            guest.as_str(),
+            mode,
+        ];
+        let output = hermit(&args);
+        let log = stderr(&output);
+        assert!(
+            log.contains("futex(") && log.contains("= Err(Errno(ERESTARTSYS))"),
+            "{mode}: the wait was never interrupted, so the test exercised nothing:\n{log}"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{mode}:\n{log}"
+        );
+        assert!(
+            log.contains(
+                "HERMIT_HB_POSTHOOK_INTERRUPTED: dtid 3 reached posthook happens-before \
+                 anchor(s) [\"main_wait\"]"
+            ) && log.contains("interrupted (ERESTARTSYS)"),
+            "{mode}: no refusal naming the interrupted anchor:\n{log}"
+        );
+        assert!(stdout(&output).is_empty(), "{mode}: the held helper wrote");
+    }
+
+    // A spawn-ordinal posthook anchor on the helper's own wait: the guest
+    // names it at every thread's matching call, the main thread's interrupted
+    // wait included, and only the helper's wait may decide it. The run
+    // completes (the Claude review of https://github.com/rrnewton/hermit/pull/4048).
+    let other = directory.path().join("other-thread.json");
+    fs::write(
+        &other,
+        r#"{"version": 2,
+            "threads": {"helper": {"spawn_ordinal": 1}},
+            "events": {"helper_wait": {"thread": "helper", "syscall": "futex", "futex_op": 0,
+                                       "phase": "posthook"},
+                       "main_writes": {"thread": "3", "syscall": "write", "fd": 1}},
+            "edges": [{"before": "helper_wait", "after": "main_writes", "strength": "hard"}]}"#,
+    )
+    .unwrap();
+    let args = [
+        "--log",
+        "info",
+        "run",
+        "--strict",
+        "--happens-before",
+        other.to_str().unwrap(),
+        "--",
+        guest.as_str(),
+        "other-thread",
+    ];
+    let output = hermit(&args);
+    let log = stderr(&output);
+    assert!(
+        log.contains("[syscall][detcore, dtid 3] finish syscall #")
+            && log.contains("= Err(Errno(ERESTARTSYS))"),
+        "the main thread's wait was never interrupted, so the case exercised nothing:\n{log}"
+    );
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "helper\nmain\n");
+    assert!(!log.contains("HERMIT_HB_POSTHOOK_INTERRUPTED"), "{log}");
+}
+
+/// A thread that leaves without completing its posthook-anchored call
+/// publishes nothing: a worker blocks reading a pipe the process keeps open,
+/// and the main thread exits the group. The anchor never fired, so the run
+/// ends with the end-of-run report naming it, after the guest's own output
+/// (https://github.com/rrnewton/hermit/issues/3929, design revision 2; the
+/// Claude review of https://github.com/rrnewton/hermit/pull/4048).
+#[test]
+fn happens_before_posthook_anchor_of_a_thread_that_exits_mid_call_never_fires() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = hb_pipe_read_held_writer_guest()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let spec = directory.path().join("mid-call.json");
+    fs::write(
+        &spec,
+        r#"{"version": 1,
+            "events": {"worker_read": {"thread": "5", "syscall": "read", "fd": 40,
+                                       "phase": "posthook"}}}"#,
+    )
+    .unwrap();
+    let args = [
+        "run",
+        "--strict",
+        "--happens-before",
+        spec.to_str().unwrap(),
+        "--",
+        guest.as_str(),
+        "exit-mid-read",
+    ];
+    let output = hermit(&args);
+    let log = stderr(&output);
+    assert_eq!(stdout(&output), "main\n", "{log}");
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{log}"
+    );
+    assert!(
+        log.contains("anchor 'worker_read' on thread 5: read(fd=40)@Posthook#1 never fired"),
+        "{log}"
+    );
+}
+
+/// A posthook BEFORE anchor on a child wait whose child is held behind it
+/// can never fire, and the run is refused by name within a bound
+/// (https://github.com/rrnewton/hermit/issues/3929, through the child-wait
+/// rule of https://github.com/rrnewton/hermit/issues/3904). The control, a
+/// posthook wait gating the parent's own later write, completes: a wait for
+/// a child that can still run is not refused.
+#[test]
+fn happens_before_posthook_child_wait_cycle_is_refused_by_name() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = hb_child_wait_cycle_guest().to_str().unwrap().to_owned();
+    let spec = |name: &str, after: &str| {
+        let path = directory.path().join(name);
+        fs::write(
+            &path,
+            format!(
+                r#"{{"version": 1,
+                    "threads": {{"child": {{"spawn_ordinal": 1}}}},
+                    "events": {{"parent_reaps": {{"thread": "3", "syscall": "wait4",
+                                                 "phase": "posthook"}},
+                               "gated": {{"thread": "{after}", "syscall": "write", "fd": 1}}}},
+                    "edges": [{{"before": "parent_reaps", "after": "gated", "strength": "hard"}}]}}"#
+            ),
+        )
+        .unwrap();
+        path
+    };
+    let control = spec("control.json", "3");
+    let args = [
+        "run",
+        "--strict",
+        "--happens-before",
+        control.to_str().unwrap(),
+        "--",
+        guest.as_str(),
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "child\nparent\n");
+
+    // The review's three-process case: in "nested" mode the root waits for
+    // the cycle's parent, an ordinary wait above the cycle that must not hide
+    // it (the Codex re-check of the design).
+    let nested = directory.path().join("nested.json");
+    fs::write(
+        &nested,
+        r#"{"version": 1,
+            "threads": {"parent": {"spawn_ordinal": 1}, "child": {"spawn_ordinal": 2}},
+            "events": {"parent_reaps": {"thread": "parent", "syscall": "wait4",
+                                        "phase": "posthook"},
+                       "gated": {"thread": "child", "syscall": "write", "fd": 1}},
+            "edges": [{"before": "parent_reaps", "after": "gated", "strength": "hard"}]}"#,
+    )
+    .unwrap();
+    let cycle = spec("cycle.json", "child");
+    for (spec, mode, parent) in [(&cycle, "plain", "3"), (&nested, "nested", "parent")] {
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "run",
+                "--strict",
+                "--happens-before",
+                spec.to_str().unwrap(),
+                "--",
+                guest.as_str(),
+                mode,
+            ]),
+            directory.path(),
+            Duration::from_secs(60),
+            false,
+        );
+        let status = status.unwrap_or_else(|| {
+            panic!("{mode}: a posthook child-wait cycle spun instead of being refused: no exit within 60s\n{log}")
+        });
+        assert_eq!(
+            status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{mode}: {log}"
+        );
+        assert!(
+            log.contains("HERMIT_HB_ANCHOR_NEVER_FIRED: happens-before BEFORE anchor(s) never fired")
+                && log.contains(&format!(
+                    "anchor 'parent_reaps' on thread {parent}: wait4@Posthook#1 never fired; it holds dtid"
+                )),
+            "{mode}: no refusal naming the posthook BEFORE anchor:\n{log}"
+        );
+    }
+}
+
+/// The design's stated limitation (https://github.com/rrnewton/hermit/issues/3929):
+/// a posthook BEFORE anchor on a pipe read whose only writer is held behind
+/// it can never fire, but the read is external input to the scheduler, so
+/// the run is not refused and ends at `--timeout` (exit 124,
+/// `HERMIT_RUN_TIMEOUT`). Pinned so that a later fix shows up as a change.
+#[test]
+fn happens_before_posthook_read_with_a_held_writer_ends_at_the_timeout() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = hb_pipe_read_held_writer_guest()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let spec = directory.path().join("pipe.json");
+    fs::write(
+        &spec,
+        r#"{"version": 1,
+            "threads": {"child": {"spawn_ordinal": 1}},
+            "events": {"parent_reads": {"thread": "3", "syscall": "read", "fd": 40,
+                                        "phase": "posthook"},
+                       "child_writes": {"thread": "child", "syscall": "write", "fd": 41}},
+            "edges": [{"before": "parent_reads", "after": "child_writes", "strength": "hard"}]}"#,
+    )
+    .unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--log",
+            "info",
+            "run",
+            "--strict",
+            "--timeout",
+            "5",
+            "--happens-before",
+            spec.to_str().unwrap(),
+            "--",
+            guest.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(60),
+        false,
+    );
+    let status = status.unwrap_or_else(|| panic!("--timeout 5 did not end the run in 60s\n{log}"));
+    assert!(
+        log.contains("SKIP dettid 5 held at happens-before anchor(s) [\"child_writes\"]"),
+        "the writer was never held, so the test exercised nothing:\n{log}"
+    );
+    assert_eq!(status.code(), Some(124), "{log}");
+    assert!(
+        log.contains("HERMIT_RUN_TIMEOUT class=run-timeout"),
+        "{log}"
+    );
+}
+
+/// An alarm that fires at a thread held at a posthook gate leaves it held,
+/// its request intact, and the run ends in the deadlock report, as for a
+/// prehook gate (https://github.com/rrnewton/hermit/issues/3929). The gate is
+/// the posthook of `alarm(1)` itself.
+#[test]
+fn happens_before_alarm_at_a_thread_held_at_a_posthook_gate_leaves_it_held() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = hb_signal_while_held_guest().to_str().unwrap().to_owned();
+    let spec = directory.path().join("posthook-gate.json");
+    fs::write(
+        &spec,
+        r#"{"version": 1,
+            "events": {"never": {"thread": "3", "syscalls": 1000000000},
+                       "gate": {"thread": "3", "syscall": "alarm", "phase": "posthook"}},
+            "edges": [{"before": "never", "after": "gate", "strength": "hard"}]}"#,
+    )
+    .unwrap();
+    let args = [
+        "--log",
+        "info",
+        "run",
+        "--strict",
+        "--happens-before",
+        spec.to_str().unwrap(),
+        "--",
+        guest.as_str(),
+        "alarm",
+    ];
+    let output = hermit(&args);
+    let log = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{log}"
+    );
+    assert!(
+        log.contains("[dtid 3] held at a happens-before gate; leaving it held, its signal pending"),
+        "the alarm never reached the held thread, so the test exercised nothing:\n{log}"
+    );
+    assert!(
+        log.contains("held at a happens-before gate whose BEFORE anchor cannot fire")
+            && log.contains("HappensBeforeSyscallCheckpoint"),
+        "no deadlock report naming the posthook gate:\n{log}"
+    );
+    assert!(stdout(&output).is_empty());
+}
+
+/// A posthook anchor is refused at launch with `--replay-schedule-from`,
+/// whose recorded schedule has no event for the gate's turn
+/// (https://github.com/rrnewton/hermit/issues/3929). The refusal comes before
+/// the schedule file is read, so a missing file shows it is this refusal; a
+/// prehook spec on the same run gets past it.
+#[test]
+fn happens_before_posthook_anchor_with_replay_schedule_is_refused() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = hb_spawn_echo_guest().to_str().unwrap().to_owned();
+    let missing = directory.path().join("missing.schedule");
+    for phase in ["posthook", "prehook"] {
+        let spec = directory.path().join(format!("{phase}.json"));
+        fs::write(
+            &spec,
+            format!(
+                r#"{{"version": 1,
+                    "events": {{"parent_writes": {{"thread": "3", "syscall": "write", "fd": 1,
+                                                  "phase": "{phase}"}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let args = [
+            "run",
+            "--strict",
+            "--replay-schedule-from",
+            missing.to_str().unwrap(),
+            "--happens-before",
+            spec.to_str().unwrap(),
+            "--",
+            guest.as_str(),
+        ];
+        let output = hermit(&args);
+        let log = stderr(&output);
+        let refused = log.contains(
+            "anchor 'parent_writes' (write(fd=1)@Posthook#1) fires at the posthook, which is \
+             not supported with --replay-schedule-from",
+        );
+        assert!(!output.status.success(), "{phase}: {log}");
+        if phase == "posthook" {
+            assert!(refused, "{phase}: {log}");
+            assert_eq!(
+                output.status.code(),
+                Some(HERMIT_POLICY_REFUSAL_EXIT),
+                "{log}"
+            );
+        } else {
+            assert!(!refused, "{phase}: {log}");
         }
     }
 }
