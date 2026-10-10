@@ -9,6 +9,8 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::fs::OpenOptions;
+use std::io::Read as _;
+use std::io::Seek as _;
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
@@ -2555,13 +2557,7 @@ fn record_poll_and_ppoll_ready_pipe() {
     record_select_mode("poll");
 }
 
-/// A child forked after its parent redirected its own stdout into a pipe, as
-/// flex does for each stage of its filter chain, writes 128 KiB into that pipe.
-/// The recorder took each process's descriptor 1 at its creation as captured
-/// output, so replay wrote the child's bytes into the live pipe while serving
-/// the parent's reads from the recording, and the child waited forever once the
-/// pipe was full (https://github.com/rrnewton/hermit/issues/3964).
-/// The same fork, with the child writing 128 KiB to the container's real stdout
+/// The fork of `record_forked_child_writes_into_a_redirected_stdout_pipe`, with the child writing 128 KiB to the container's real stdout
 /// through a descriptor its parent saved before redirecting its own stdout, as
 /// `exec 3>&1; { head -c 131072 /dev/zero >&3; echo x; } | cat` does. Replay
 /// emitted that captured output into the child's own copy of descriptor 1,
@@ -2577,6 +2573,12 @@ fn record_forked_child_writes_to_a_saved_stdout_after_its_parent_redirected_it()
     );
 }
 
+/// A child forked after its parent redirected its own stdout into a pipe, as
+/// flex does for each stage of its filter chain, writes 128 KiB into that pipe.
+/// The recorder took each process's descriptor 1 at its creation as captured
+/// output, so replay wrote the child's bytes into the live pipe while serving
+/// the parent's reads from the recording, and the child waited forever once the
+/// pipe was full (https://github.com/rrnewton/hermit/issues/3964).
 #[test]
 fn record_forked_child_writes_into_a_redirected_stdout_pipe() {
     let _guard = hermit_record_lock();
@@ -2585,6 +2587,78 @@ fn record_forked_child_writes_into_a_redirected_stdout_pipe() {
         &workload("c_record_replay_forked_stdout_pipe").path,
         &[],
     );
+}
+
+/// Records, then replays, the guest with a regular-file stdout that the test
+/// opened, and writes `TAIL` through the test's own copy of that description
+/// after each run, so the file shows where the run left the description's
+/// offset. Returns the recorded and the replayed file.
+fn record_and_replay_into_a_shared_stdout_file(mode: &str) -> (Vec<u8>, Vec<u8>) {
+    let guest = workload("c_record_replay_forked_stdout_pipe");
+    let data_dir = tempfile::tempdir().expect("failed to create recording directory");
+    let run = |subcommand: &[&str], what: &str| {
+        let mut stdout = tempfile::tempfile().expect("failed to create regular stdout");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        command
+            .arg("--log=off")
+            .args(subcommand)
+            .arg("--data-dir")
+            .arg(data_dir.path());
+        if subcommand[0] == "record" {
+            command.arg("--").arg(&guest.path).arg(mode);
+        }
+        command.stdout(Stdio::from(
+            stdout.try_clone().expect("failed to clone regular stdout"),
+        ));
+        command_output(command, what);
+        stdout
+            .write_all(b"TAIL")
+            .expect("failed to write after the run");
+        stdout.rewind().expect("failed to rewind regular stdout");
+        let mut contents = Vec::new();
+        stdout
+            .read_to_end(&mut contents)
+            .expect("failed to read regular stdout");
+        contents
+    };
+    let recorded = run(&["record", "--strict"], &format!("record {mode}"));
+    let replayed = run(&["replay", "--autopilot"], &format!("replay {mode}"));
+    (recorded, replayed)
+}
+
+/// A captured write moves the offset of the root guest's stdout description
+/// in replay exactly when it moved it in the recording, whichever process
+/// wrote. Replay emits every captured write into the root's description, but
+/// the recorder decided whether the write moved it against the writing
+/// process's own creation-time descriptor 1 (review of
+/// https://github.com/rrnewton/hermit/pull/4037):
+/// - `last-writer`: a child forked after its parent redirected stdout into a
+///   pipe writes `AAAA` through a saved copy of the root's description. Linux
+///   leaves the offset at 4, so the file reads `AAAATAIL`; replay left it at 0
+///   and the file read `TAIL`.
+/// - `reopen`: the root opens its stdout file again, a second description of
+///   the same file, as descriptor 1 and forks; the child writes `BBBBBBBB`
+///   through it. The root's description stays at 0, so the file reads
+///   `TAILBBBB`; replay moved it to 8 and the file read `BBBBBBBBTAIL`.
+#[test]
+fn record_forked_child_moves_the_root_stdout_offset_as_in_the_recording() {
+    let _guard = hermit_record_lock();
+    for (mode, expected) in [
+        ("last-writer", b"AAAATAIL".as_slice()),
+        ("reopen", b"TAILBBBB".as_slice()),
+    ] {
+        let (recorded, replayed) = record_and_replay_into_a_shared_stdout_file(mode);
+        assert_eq!(
+            String::from_utf8_lossy(&recorded),
+            String::from_utf8_lossy(expected),
+            "{mode}: the recording left the root's stdout offset where Linux does not"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&replayed),
+            String::from_utf8_lossy(&recorded),
+            "{mode}: replay left the root's stdout offset where the recording did not"
+        );
+    }
 }
 
 #[test]

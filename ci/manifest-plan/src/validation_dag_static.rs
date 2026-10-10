@@ -2067,9 +2067,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/3963 and its review) add five
     // and retain all 141 (`cargo nextest list` lists 146).
     // record_forked_child_writes_to_a_saved_stdout_after_its_parent_redirected_it
-    // (https://github.com/rrnewton/hermit/issues/4006) adds one and retains all
-    // 146 (`cargo nextest list` lists 147).
-    ("test.record_replay", 147),
+    // and record_forked_child_moves_the_root_stdout_offset_as_in_the_recording
+    // (https://github.com/rrnewton/hermit/issues/4006 and its review) add two
+    // and retain all 146 (`cargo nextest list` lists 148).
+    ("test.record_replay", 148),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.

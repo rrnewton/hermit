@@ -563,11 +563,11 @@ impl Recorder {
                 .flatten();
             let stdout_shares = stdout_matches
                 && candidate.as_ref().is_some_and(|candidate| {
-                    self.output_ofd_matches(libc::STDOUT_FILENO, candidate)
+                    Self::output_ofd_matches(&*guest, libc::STDOUT_FILENO, candidate)
                 });
             let stderr_shares = stderr_matches
                 && candidate.as_ref().is_some_and(|candidate| {
-                    self.output_ofd_matches(libc::STDERR_FILENO, candidate)
+                    Self::output_ofd_matches(&*guest, libc::STDERR_FILENO, candidate)
                 });
 
             if stdout_shares {

@@ -29,10 +29,21 @@
  * The write is captured output, and replay used to emit it into the child's
  * own copy of descriptor 1, which is the pipe
  * (https://github.com/rrnewton/hermit/issues/4006).
+ *
+ * Two modes write little, for a regular-file stdout whose final offset the
+ * test reads (review of https://github.com/rrnewton/hermit/pull/4037):
+ *   last-writer  the saved-stdout fork, with the child writing only AAAA
+ *                through the saved copy of the root's description, the last
+ *                write to move its offset;
+ *   reopen       the root opens /proc/self/fd/1 again, a second description
+ *                of the same file, as descriptor 1 and forks; the child
+ *                writes BBBBBBBB through it, and nothing moves the root's
+ *                original description.
  */
 
 #define _GNU_SOURCE
 
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -121,9 +132,85 @@ static int saved_stdout_mode(void) {
   return 0;
 }
 
+static int last_writer_mode(void) {
+  int pipe_fds[2];
+  if (pipe(pipe_fds) != 0) {
+    perror("pipe");
+    return 1;
+  }
+  int saved_stdout = dup(STDOUT_FILENO);
+  if (saved_stdout < 0 || dup2(pipe_fds[1], STDOUT_FILENO) < 0) {
+    perror("redirect stdout");
+    return 1;
+  }
+  pid_t child = fork();
+  if (child < 0) {
+    perror("fork");
+    return 1;
+  }
+  if (child == 0) {
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+    _exit(write_all(saved_stdout, (const unsigned char*)"AAAA", 4) == 0 ? 0 : 2);
+  }
+  if (dup2(saved_stdout, STDOUT_FILENO) < 0) {
+    perror("restore stdout");
+    return 1;
+  }
+  close(saved_stdout);
+  close(pipe_fds[1]);
+  char drain[16];
+  while (read(pipe_fds[0], drain, sizeof drain) > 0) {
+  }
+  close(pipe_fds[0]);
+  int status = 0;
+  if (waitpid(child, &status, 0) != child) {
+    perror("waitpid");
+    return 1;
+  }
+  return status == 0 ? 0 : 1;
+}
+
+static int reopen_mode(void) {
+  int saved_stdout = dup(STDOUT_FILENO);
+  int reopened = open("/proc/self/fd/1", O_WRONLY);
+  if (saved_stdout < 0 || reopened < 0 || dup2(reopened, STDOUT_FILENO) < 0) {
+    perror("reopen stdout");
+    return 1;
+  }
+  close(reopened);
+  pid_t child = fork();
+  if (child < 0) {
+    perror("fork");
+    return 1;
+  }
+  if (child == 0) {
+    _exit(
+        write_all(STDOUT_FILENO, (const unsigned char*)"BBBBBBBB", 8) == 0 ? 0
+                                                                          : 2);
+  }
+  int status = 0;
+  if (waitpid(child, &status, 0) != child) {
+    perror("waitpid");
+    return 1;
+  }
+  if (dup2(saved_stdout, STDOUT_FILENO) < 0) {
+    perror("restore stdout");
+    return 1;
+  }
+  close(saved_stdout);
+  return status == 0 ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
   if (argc == 2 && strcmp(argv[1], "saved-stdout") == 0) {
     return saved_stdout_mode();
+  }
+  if (argc == 2 && strcmp(argv[1], "last-writer") == 0) {
+    return last_writer_mode();
+  }
+  if (argc == 2 && strcmp(argv[1], "reopen") == 0) {
+    return reopen_mode();
   }
   int pipe_fds[2];
   if (pipe(pipe_fds) != 0) {

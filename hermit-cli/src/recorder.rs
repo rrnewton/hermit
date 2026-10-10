@@ -81,6 +81,87 @@ pub struct RecorderThreadState {
     /// The physical output endpoints the root guest inherited, which every
     /// thread inherits from the thread that created it (`ContainerOutputs`).
     outputs: ContainerOutputs,
+    /// The root guest's regular-file output descriptions, which every thread
+    /// shares with the thread that created it (`OutputDescriptions`).
+    #[serde(skip)]
+    output_descriptions: std::sync::Arc<OutputDescriptions>,
+}
+
+/// Duplicates of the stdout and stderr open file descriptions the root guest
+/// inherited, when they are regular files, against which a captured write is
+/// classified as moving the description's offset
+/// (`SyscallEvent::Write::advances_output_offset`). Replay applies that flag
+/// to its duplicate of the root's description (`ReplayOutputs`), so the flag
+/// must describe the root's description too, whichever process wrote. Each
+/// process used its own creation-time descriptors 1 and 2 before: a child
+/// forked after its parent redirected stdout into a pipe wrote through a saved
+/// copy of the root's description with no advance recorded, and a child whose
+/// descriptor 1 was a second description of the same file recorded an advance
+/// that replay applied to the root's (review of
+/// https://github.com/rrnewton/hermit/pull/4037).
+#[derive(Default)]
+struct OutputDescriptions {
+    stdout: Mutex<Option<OwnedFd>>,
+    stderr: Mutex<Option<OwnedFd>>,
+    /// Every guest thread the recorder has seen, any of which may still hold
+    /// a descriptor for these descriptions (`release_unreferenced`).
+    threads: Mutex<std::collections::BTreeSet<i32>>,
+}
+
+impl OutputDescriptions {
+    fn capture(pid: Pid) -> Self {
+        Self {
+            stdout: Mutex::new(duplicate_regular_output(pid, libc::STDOUT_FILENO)),
+            stderr: Mutex::new(duplicate_regular_output(pid, libc::STDERR_FILENO)),
+            threads: Mutex::new(std::collections::BTreeSet::from([pid.as_raw()])),
+        }
+    }
+
+    /// Whether `candidate` is the root guest's `output_fd` description.
+    fn matches(&self, output_fd: libc::c_int, candidate: &OwnedFd) -> bool {
+        let output = match output_fd {
+            libc::STDOUT_FILENO => &self.stdout,
+            libc::STDERR_FILENO => &self.stderr,
+            _ => return false,
+        };
+        let output = output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        output.as_ref().is_some_and(|target| {
+            crate::fd::same_open_file_description(candidate.as_raw_fd(), target.as_raw_fd())
+                .unwrap_or(false)
+        })
+    }
+
+    /// Drops a duplicate once no guest thread holds its description, so the
+    /// recorder does not keep a description alive (a lock on it, say) after
+    /// the guest closed it. `caller` has just changed its descriptor table;
+    /// the description stays while `caller` or any other live guest thread
+    /// still holds it, as one process's table says nothing of another's.
+    fn release_unreferenced(&self, caller: Pid) {
+        for output in [&self.stdout, &self.stderr] {
+            let mut output = output
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(target) = output.as_ref() else {
+                continue;
+            };
+            if guest_has_open_file_description(caller, target) {
+                continue;
+            }
+            let mut threads = self
+                .threads
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            threads.retain(|thread| Path::new(&format!("/proc/{thread}")).exists());
+            if !threads
+                .iter()
+                .any(|thread| guest_has_open_file_description(Pid::from_raw(*thread), target))
+            {
+                output.take();
+            }
+        }
+    }
 }
 
 /// The identities of the stdout and stderr the root guest inherited: the only
@@ -354,11 +435,6 @@ pub struct Recorder {
     /// takes them (`RecorderThreadState::outputs`).
     stdout: Option<OutputIdentity>,
     stderr: Option<OutputIdentity>,
-    /// Stable regular-file OFDs used for offset aliasing checks.
-    #[serde(skip)]
-    stdout_ofd: Mutex<Option<std::os::fd::OwnedFd>>,
-    #[serde(skip)]
-    stderr_ofd: Mutex<Option<std::os::fd::OwnedFd>>,
 }
 
 impl Default for Recorder {
@@ -367,8 +443,6 @@ impl Default for Recorder {
             data: PathBuf::new(),
             stdout: None,
             stderr: None,
-            stdout_ofd: Mutex::new(None),
-            stderr_ofd: Mutex::new(None),
         }
     }
 }
@@ -383,8 +457,6 @@ impl Tool for Recorder {
             data: cfg.replay_data.as_ref().unwrap().clone(),
             stdout: OutputIdentity::for_fd(pid, libc::STDOUT_FILENO),
             stderr: OutputIdentity::for_fd(pid, libc::STDERR_FILENO),
-            stdout_ofd: Mutex::new(duplicate_regular_output(pid, libc::STDOUT_FILENO)),
-            stderr_ofd: Mutex::new(duplicate_regular_output(pid, libc::STDERR_FILENO)),
         }
     }
 
@@ -415,6 +487,20 @@ impl Tool for Recorder {
                     stderr: self.stderr,
                 },
                 Some((_, state)) => state.outputs,
+            },
+            output_descriptions: match parent {
+                None => {
+                    std::sync::Arc::new(OutputDescriptions::capture(Pid::from_raw(child.as_raw())))
+                }
+                Some((_, state)) => {
+                    state
+                        .output_descriptions
+                        .threads
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(child.as_raw());
+                    state.output_descriptions.clone()
+                }
             },
         }
     }
@@ -767,7 +853,11 @@ impl Tool for Recorder {
             None => Ok(()),
         };
         guest.thread_state_mut().bootstrapped = true;
-        self.release_unreferenced_outputs(guest.pid());
+        guest
+            .thread_state()
+            .output_descriptions
+            .clone()
+            .release_unreferenced(guest.pid());
         result
     }
 
@@ -946,40 +1036,17 @@ impl Recorder {
         saw_target
     }
 
-    pub(super) fn output_ofd_matches(
-        &self,
+    /// Whether `candidate` is the root guest's `output_fd` description, which
+    /// `guest`'s thread shares (`OutputDescriptions`).
+    pub(super) fn output_ofd_matches<G: Guest<Self>>(
+        guest: &G,
         output_fd: libc::c_int,
         candidate: &std::os::fd::OwnedFd,
     ) -> bool {
-        let output = match output_fd {
-            libc::STDOUT_FILENO => &self.stdout_ofd,
-            libc::STDERR_FILENO => &self.stderr_ofd,
-            _ => return false,
-        };
-        let output = output
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        output.as_ref().is_some_and(|target| {
-            crate::fd::same_open_file_description(candidate.as_raw_fd(), target.as_raw_fd())
-                .unwrap_or(false)
-        })
-    }
-
-    fn release_unreferenced_output(output: &Mutex<Option<std::os::fd::OwnedFd>>, pid: Pid) {
-        let mut output = output
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if output
-            .as_ref()
-            .is_some_and(|target| !guest_has_open_file_description(pid, target))
-        {
-            output.take();
-        }
-    }
-
-    fn release_unreferenced_outputs(&self, pid: Pid) {
-        Self::release_unreferenced_output(&self.stdout_ofd, pid);
-        Self::release_unreferenced_output(&self.stderr_ofd, pid);
+        guest
+            .thread_state()
+            .output_descriptions
+            .matches(output_fd, candidate)
     }
 
     async fn handle_fd_table_mutation<G: Guest<Self>>(
@@ -988,7 +1055,11 @@ impl Recorder {
         syscall: Syscall,
     ) -> Result<i64, Errno> {
         let result = guest.inject(syscall).await;
-        self.release_unreferenced_outputs(guest.pid());
+        guest
+            .thread_state()
+            .output_descriptions
+            .clone()
+            .release_unreferenced(guest.pid());
         self.record_event(guest, result.map(SyscallEvent::Return));
         result
     }
