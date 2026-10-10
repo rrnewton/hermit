@@ -52,6 +52,7 @@ use crate::syscalls::helpers::refuse_held_signal_loss;
 use crate::syscalls::helpers::result_after_restore;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::syscalls::network_trace::received_descriptors;
+use crate::syscalls::signal::STACK_RED_ZONE;
 use crate::syscalls::signal::kernel_installed_signal_mask;
 use crate::syscalls::signal::read_kernel_sigset;
 use crate::syscalls::threads::KernelSigset;
@@ -166,21 +167,30 @@ impl<Guard> StagedMask<Guard> {
 /// writable. A thread may run with no writable memory there, on a stack it
 /// placed near the start of a page, and a pselect6 on such a stack is valid
 /// (Codex re-check of https://github.com/rrnewton/hermit/pull/4053). Then the
-/// copy goes in the top 24 bytes of the red zone, whose bytes are saved here
-/// and written back by `StagedMask::release` when the call returns. The guest
+/// copy goes in 24 bytes of the red zone, whose bytes are saved here and
+/// written back by `StagedMask::release` when the call returns. The red zone
+/// may hold the call's own buffers, which Linux reads and writes, so the copy
+/// takes the highest 8-aligned window that overlaps none of `live` (Codex
+/// re-check #3). The guest's own wrapper and mask may be overwritten: Linux
+/// reads neither, as the call is redirected to the copy, and both are
+/// restored. When no window is free and writable, this returns `None`, and
+/// the call keeps the guest's wrapper, as before the copy existed: Linux's
+/// result then, but a sibling rewriting the mask before the call enters the
+/// kernel makes the entry barrier wait for a mask the kernel never installs,
+/// until its valve ends the run by name. The guest
 /// runs no code in between: the call holds the thread in the kernel, a signal
 /// frame is built below the red zone, and a call the kernel restarts comes
 /// back as a new syscall with the guest's own arguments, which is staged
 /// again. Nothing is mapped, so the guest's address space is unchanged (Codex
-/// re-check of the earlier per-thread page). Only a stack pointer within 24
-/// bytes of unwritable memory still gets EFAULT.
+/// re-check of the earlier per-thread page).
 ///
 /// Whether the scratch faults is a function of the guest's own stack, so the
 /// choice is deterministic.
 async fn stage_pselect6_mask_copy<G, T>(
     guest: &mut G,
     mask: KernelSigset,
-) -> Result<StagedMask<<G::Stack as Stack>::StackGuard>, Errno>
+    live: &[std::ops::Range<usize>],
+) -> Result<Option<StagedMask<<G::Stack as Stack>::StackGuard>>, Errno>
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -193,21 +203,40 @@ where
     });
     match stack.commit() {
         Ok(guard) => {
-            return Ok(StagedMask {
+            return Ok(Some(StagedMask {
                 wrapper: wrapper.as_raw(),
                 storage: StagedMaskStorage::Stack(guard),
-            });
+            }));
         }
         Err(Errno::EFAULT) => {}
         Err(errno) => return Err(errno),
     }
-    let at = (guest.regs().await.rsp as usize)
-        .checked_sub(STAGED_MASK_LEN)
-        .ok_or(Errno::EFAULT)?
-        & !7;
-    let bytes = AddrMut::<u8>::from_raw(at).ok_or(Errno::EFAULT)?;
+    let rsp = guest.regs().await.rsp as usize;
+    let Some(top) = rsp.checked_sub(STAGED_MASK_LEN).map(|top| top & !7) else {
+        return Ok(None);
+    };
+    let bottom = rsp.saturating_sub(STACK_RED_ZONE);
     let mut saved = [0u8; STAGED_MASK_LEN];
-    guest.memory().read_exact(bytes, &mut saved)?;
+    let mut found = None;
+    for at in (bottom..=top).rev().step_by(8) {
+        let window = at..at + STAGED_MASK_LEN;
+        if live
+            .iter()
+            .any(|range| range.start < window.end && window.start < range.end)
+        {
+            continue;
+        }
+        let Some(bytes) = AddrMut::<u8>::from_raw(at) else {
+            continue;
+        };
+        if guest.memory().read_exact(bytes, &mut saved).is_ok() {
+            found = Some((at, bytes));
+            break;
+        }
+    }
+    let Some((at, bytes)) = found else {
+        return Ok(None);
+    };
     let mut cells = [0u8; STAGED_MASK_LEN];
     let mask_len = std::mem::size_of::<KernelSigset>();
     cells[..mask_len].copy_from_slice(&mask.to_ne_bytes());
@@ -217,12 +246,13 @@ where
         wrapper: at + mask_len,
         storage: StagedMaskStorage::RedZone { at, saved },
     };
-    if let Err(errno) = guest.memory().write_exact(bytes, &cells) {
-        // A write that failed partway may have changed some bytes.
+    if guest.memory().write_exact(bytes, &cells).is_err() {
+        // A read-only stack page. A write that failed partway may have changed
+        // some bytes, so put them back.
         staged.release(guest);
-        return Err(errno);
+        return Ok(None);
     }
-    Ok(staged)
+    Ok(Some(staged))
 }
 
 pub(super) fn pselect6_fd_set_len(nfds: i32) -> Result<usize, Errno> {
@@ -698,15 +728,36 @@ impl<T: RecordOrReplay> Detcore<T> {
             // Codex review of https://github.com/rrnewton/hermit/pull/4053). The
             // wrapper and the mask were validated above, in Linux's order. The
             // copy stays readable until the call has rejoined.
-            let staged = stage_pselect6_mask_copy(guest, mask).await?;
+            // The buffers Linux reads and writes, which the copy must not
+            // overlap. The fd sets span at most their nominal length; Linux
+            // may copy less.
+            let set_len = pselect6_fd_set_len(call.nfds())?;
+            let live: Vec<std::ops::Range<usize>> = [
+                call.readfds().map(|set| (set.as_raw(), set_len)),
+                call.writefds().map(|set| (set.as_raw(), set_len)),
+                call.exceptfds().map(|set| (set.as_raw(), set_len)),
+                call.timeout()
+                    .map(|timeout| (timeout.as_raw(), std::mem::size_of::<Timespec>())),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|(start, len)| start..start.saturating_add(len))
+            .collect();
+            let staged = stage_pselect6_mask_copy(guest, mask, &live).await?;
+            let staged_call = match &staged {
+                Some(staged) => call.with_sigmask(Addr::from_raw(staged.wrapper)),
+                None => call,
+            };
             let result = self
                 .record_or_replay_blocking_with_mask(
                     guest,
-                    Syscall::Pselect6(call.with_sigmask(Addr::from_raw(staged.wrapper))),
+                    Syscall::Pselect6(staged_call),
                     Some(kernel_installed_signal_mask(mask)),
                 )
                 .await;
-            staged.release(guest);
+            if let Some(staged) = staged {
+                staged.release(guest);
+            }
             return result;
         }
 

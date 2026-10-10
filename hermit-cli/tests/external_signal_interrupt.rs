@@ -2159,14 +2159,17 @@ fn ptrace_large_pselect6_sleeps_under_its_entry_mask_while_a_sibling_rewrites_it
 /// private copy of the mask (`stage_pselect6_mask_copy`) somewhere else there.
 /// tests/c/pselect_tight_stack.c makes a ready call, a call ended by a SIGALRM
 /// that only the temporary mask unblocks, a call the kernel restarts for an
-/// ignored SIGCONT (re-reading its mask), and a ready call again, on a stack
+/// ignored SIGCONT (re-reading its mask), a ready call again, and a ready call
+/// whose fd set and timeout sit in the red zone, and one whose fd set fills
+/// it, on a stack
 /// 144, 160 and 1024 bytes into its page, then two batches of four threads
 /// make the ready call on stacks of their own, and the bytes mapped must not
 /// change; a pattern in the red zone below each call's stack must survive it.
 /// It must print what Linux prints. Staging the copy on the stack
 /// returned EFAULT in the tight mode; unmapping a transient page after the
 /// call restarted the signal-ended call forever; a per-thread page left a
-/// mapping behind for every thread that used it (Codex re-checks of
+/// mapping behind for every thread that used it; staging at the top of the
+/// red zone corrupted an fd set the guest kept there (Codex re-checks of
 /// https://github.com/rrnewton/hermit/pull/4053).
 #[test]
 fn ptrace_large_pselect6_on_a_stack_with_no_scratch_behaves_as_natively() {
@@ -2211,7 +2214,7 @@ fn ptrace_large_pselect6_on_a_stack_with_no_scratch_behaves_as_natively() {
             .expect("failed to run hermit");
         let stdout = String::from_utf8_lossy(&output.stdout);
         let expected = format!(
-            "mode={mode} ready=1 signal=-4 alarms=1 restart=0 again=1 maps=1 threads=1 red_zone=1 oracle=1"
+            "mode={mode} ready=1 signal=-4 alarms=1 restart=0 again=1 aliased=1 crowded=1 maps=1 threads=1 red_zone=1 oracle=1"
         );
         assert!(
             output.status.success() && stdout.contains(&expected),

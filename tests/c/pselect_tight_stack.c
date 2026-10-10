@@ -18,6 +18,12 @@
  *            handler and restarts the call, which reads its temporary mask
  *            again, then times out after 50 ms and returns 0.
  *   again    the ready call once more.
+ *   aliased  the ready call with its fd set and timeout in the top 32 bytes
+ *            of the red zone, which a leaf function may use: Linux reads and
+ *            writes them, so Hermit must stage nothing there, and the rest of
+ *            the red zone must survive too.
+ *   crowded  the ready call with nfds 1024 and its 128-byte fd set filling
+ *            the whole red zone, so there is no room to stage anything.
  *
  * Then two batches of four threads each make the ready call on a stack of
  * their own at the same depth. The bytes mapped, summed over /proc/self/maps,
@@ -29,7 +35,7 @@
  * may stage there only if it puts the guest's bytes back.
  *
  * Natively every mode prints
- *   mode=<mode> ready=1 signal=-4 alarms=1 restart=0 again=1 maps=1 threads=1 red_zone=1 oracle=1
+ *   mode=<mode> ready=1 signal=-4 alarms=1 restart=0 again=1 aliased=1 crowded=1 maps=1 threads=1 red_zone=1 oracle=1
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -113,6 +119,44 @@ static long select_on(unsigned char *stack, int fd, long seconds, long nanos) {
         changed += stack[i] != (unsigned char)(0xa5 ^ (i & 0xff));
     atomic_fetch_add(&red_zone_changed, changed);
     return result;
+}
+
+/* The ready call with its fd set at stack - 16 (two words cover NFDS) and its
+ * timeout at stack - 32, inside the red zone, and a pattern in the other 96
+ * red-zone bytes. Returns the result if the fd set came back with only `fd`
+ * set, and -1000 otherwise; counts changed pattern bytes. */
+static long select_aliased(unsigned char *stack, int fd) {
+    uint64_t *readable = (uint64_t *)(void *)(stack - 16);
+    struct timespec *timeout = (struct timespec *)(void *)(stack - 32);
+    for (int i = -128; i < -32; i++)
+        stack[i] = (unsigned char)(0xa5 ^ (i & 0xff));
+    readable[0] = UINT64_C(1) << fd;
+    readable[1] = 0;
+    timeout->tv_sec = 2;
+    timeout->tv_nsec = 0;
+    long result = pselect_on_stack(stack, NFDS, (fd_set *)(void *)readable, timeout, &wrapper);
+    int changed = 0;
+    for (int i = -128; i < -32; i++)
+        changed += stack[i] != (unsigned char)(0xa5 ^ (i & 0xff));
+    atomic_fetch_add(&red_zone_changed, changed);
+    return readable[0] == (UINT64_C(1) << fd) && readable[1] == 0 ? result : -1000;
+}
+
+/* The ready call with nfds 1024 and its fd set occupying all 128 red-zone
+ * bytes. Returns the result if the fd set came back with only `fd` set, and
+ * -1000 otherwise. */
+static long select_crowded(unsigned char *stack, int fd) {
+    uint64_t *readable = (uint64_t *)(void *)(stack - 128);
+    static struct timespec timeout;
+    memset(readable, 0, 128);
+    readable[0] = UINT64_C(1) << fd;
+    timeout.tv_sec = 2;
+    timeout.tv_nsec = 0;
+    long result = pselect_on_stack(stack, 1024, (fd_set *)(void *)readable, &timeout, &wrapper);
+    int only_fd = readable[0] == (UINT64_C(1) << fd);
+    for (int i = 1; i < 16; i++)
+        only_fd = only_fd && readable[i] == 0;
+    return only_fd ? result : -1000;
 }
 
 /* The bytes mapped in this address space, summed over /proc/self/maps.
@@ -242,6 +286,8 @@ int main(int argc, char **argv) {
     long restart = select_on(stack, idle_pipe[0], 0, 50000000);
 
     long again = select_on(stack, ready_pipe[0], 2, 0);
+    long aliased = select_aliased(stack, ready_pipe[0]);
+    long crowded = select_crowded(stack, ready_pipe[0]);
     long maps_after = mapped_bytes();
 
     int first_batch = run_batch(workers);
@@ -254,11 +300,11 @@ int main(int argc, char **argv) {
                   maps_second == maps_first;
     int red_zone = atomic_load(&red_zone_changed) == 0;
     int oracle = ready == 1 && signal == -EINTR && alarms_seen == 1 && restart == 0 &&
-                 again == 1 && maps && threads && red_zone;
-    printf("mode=%s ready=%ld signal=%ld alarms=%d restart=%ld again=%ld maps=%d "
-           "threads=%d red_zone=%d oracle=%d\n",
-           argv[1], ready, signal, alarms_seen, restart, again, maps, threads, red_zone,
-           oracle);
+                 again == 1 && aliased == 1 && crowded == 1 && maps && threads && red_zone;
+    printf("mode=%s ready=%ld signal=%ld alarms=%d restart=%ld again=%ld aliased=%ld "
+           "crowded=%ld maps=%d threads=%d red_zone=%d oracle=%d\n",
+           argv[1], ready, signal, alarms_seen, restart, again, aliased, crowded, maps,
+           threads, red_zone, oracle);
     if (!oracle)
         fprintf(stderr, "maps before=%ld after=%ld first=%ld second=%ld batches=%d,%d\n",
                 maps_before, maps_after, maps_first, maps_second, first_batch,
