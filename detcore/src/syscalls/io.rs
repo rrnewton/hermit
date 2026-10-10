@@ -564,25 +564,42 @@ impl<T: RecordOrReplay> Detcore<T> {
             // A mask the kernel would reject (wrong size, or a pointer it cannot
             // read) fails the real call before it sleeps or installs anything, so
             // the thread's own mask is the right record there (`None`).
-            let blocked_signal_mask = match sigmask_argument {
+            let snapshot = match sigmask_argument {
                 Some(argument)
                     if argument.sigmask != 0 && argument.sigsetsize == KERNEL_SIGSET_SIZE =>
                 {
                     match Addr::<libc::sigset_t>::from_raw(argument.sigmask) {
-                        Some(mask_addr) => read_kernel_sigset(guest, mask_addr)
-                            .await
-                            .ok()
-                            .map(kernel_installed_signal_mask),
+                        Some(mask_addr) => read_kernel_sigset(guest, mask_addr).await.ok(),
                         None => None,
                     }
                 }
                 _ => None,
             };
+            let Some(mask) = snapshot else {
+                return self
+                    .record_or_replay_blocking_with_mask(guest, Syscall::Pselect6(call), None)
+                    .await;
+            };
+            // The call sleeps under a scratch copy of the mask read here, not the
+            // guest's wrapper: a sibling may rewrite the guest's buffer before the
+            // released call reaches the kernel, and the scheduler waits for the
+            // kernel to install exactly this mask (`background_entry_barriers`,
+            // Codex review of https://github.com/rrnewton/hermit/pull/4053). The
+            // wrapper and the mask were validated above, in Linux's order.
+            let mut stack = guest.stack().await;
+            let mask_copy = stack.push(mask);
+            let wrapper = stack
+                .push(Pselect6SigmaskArg {
+                    sigmask: mask_copy.as_raw(),
+                    sigsetsize: KERNEL_SIGSET_SIZE,
+                })
+                .cast();
+            let _guard = stack.commit()?;
             return self
                 .record_or_replay_blocking_with_mask(
                     guest,
-                    Syscall::Pselect6(call),
-                    blocked_signal_mask,
+                    Syscall::Pselect6(call.with_sigmask(Some(wrapper))),
+                    Some(kernel_installed_signal_mask(mask)),
                 )
                 .await;
         }
