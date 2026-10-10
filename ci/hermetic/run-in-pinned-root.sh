@@ -251,6 +251,34 @@ if [[ -f "$src/.git" ]]; then
     # A submodule root's core.worktree points back to its host parent. Override
     # only private config copies, never shared metadata or a global Git env var:
     # nested git -C commands must continue to discover their own repositories.
+    #
+    # The common config of a linked worktree is the shared checkout's config,
+    # which every agent on the host rewrites by lock-and-rename. A rename over a
+    # bind-mount destination detaches that mount in every mount namespace, so a
+    # copy bound over it vanishes mid-run: the container's mount table changes
+    # and its Git silently reads the host file again
+    # (https://github.com/rrnewton/hermit/issues/3920). A linked worktree needs
+    # that copy only when the common config sets core.worktree and
+    # extensions.worktreeConfig applies it to every worktree; without the
+    # extension Git applies it to the main worktree alone. Otherwise the common
+    # config is left as it is and nothing is bound over it.
+    common_override=true
+    if [[ $root_git_dir != "$git_common_dir" ]]; then
+        common_worktree_status=0
+        src_git config --includes --file "$git_common_dir/config" --get core.worktree \
+            >/dev/null || common_worktree_status=$?
+        worktree_config_status=0
+        worktree_config=$(src_git config --includes --file "$git_common_dir/config" \
+            --type=bool --get extensions.worktreeConfig) || worktree_config_status=$?
+        # --includes reads the config as Git does, following include.path.
+        # Any status other than found (0) or absent (1), such as a malformed
+        # boolean (exit 128, which also stops every other Git command in the
+        # repository), keeps the private copy, as before this check.
+        case "$common_worktree_status:$worktree_config_status" in
+            1:0 | 1:1 | 0:1) common_override=false ;;
+            0:0) [[ $worktree_config == true ]] || common_override=false ;;
+        esac
+    fi
     root_config_dir=$(mktemp -d "$out/git-root-configs.XXXXXX")
     for config_name in config config.worktree; do
         config_source="$git_common_dir/config"
@@ -258,6 +286,8 @@ if [[ -f "$src/.git" ]]; then
         if [[ $config_name == config.worktree ]]; then
             config_source="$root_git_dir/config.worktree"
             config_destination="$guest_root_git_dir/config.worktree"
+        elif [[ $common_override == false ]]; then
+            continue
         fi
         [[ -f $config_source ]] || continue
         config_copy="$root_config_dir/$config_name"

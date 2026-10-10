@@ -1052,10 +1052,19 @@ class CargoCacheMounts(unittest.TestCase):
                 )
                 self.assertEqual(destinations[guest_common]["source"], str(common))
                 self.assertEqual(destinations[guest_common]["ro"], "true")
-                for actual, destination in (
-                    (common / "config", guest_common + "/config"),
-                    (directory / "config.worktree", guest_dir + "/config.worktree"),
-                ):
+                # The linked topologies share their common config with the
+                # repository they were added from, which sets no core.worktree:
+                # nothing may be bound over it, because a lock-and-rename write
+                # to it would detach the bind mid-run
+                # (https://github.com/rrnewton/hermit/issues/3920). Only the
+                # submodule root, a repository of its own, needs its copy.
+                overlays = [(directory / "config.worktree", guest_dir + "/config.worktree")]
+                if topology == "parent-submodule":
+                    overlays.append((common / "config", guest_common + "/config"))
+                else:
+                    self.assertNotIn(guest_common + "/config", destinations)
+                    self.assertNotIn(str(common / "config"), destinations)
+                for actual, destination in overlays:
                     overlay = destinations[destination]
                     self.assertEqual(overlay["ro"], "true")
                     copied = Path(overlay["source"])
@@ -1137,6 +1146,132 @@ class CargoCacheMounts(unittest.TestCase):
                         identities[str(repo)],
                     )
 
+    def test_a_shared_config_rewrite_renames_over_no_mount_destination(self):
+        """A Git config write in the shared checkout replaces no mounted file.
+
+        Git writes config by lock-and-rename, and a rename over a bind-mount
+        destination detaches the bind in every mount namespace, mid-run
+        (https://github.com/rrnewton/hermit/issues/3920). This performs that
+        write while the wrapper's mounts would be live: it maps every file
+        mount destination back to the host file it covers, rewrites the shared
+        common config the way any agent's `git config` does, and requires
+        every covered file to keep its identity. A common config that sets
+        core.worktree for every worktree, directly or through include.path,
+        still gets its private copy; a core.worktree that the extension does
+        not apply does not.
+        """
+        git_bin = shutil.which("git")
+        self.assertIsNotNone(git_bin)
+        git_env = repository_neutral_env()
+        git_env.update(
+            GIT_CONFIG_GLOBAL=os.devnull,
+            GIT_CONFIG_NOSYSTEM="1",
+            GIT_OPTIONAL_LOCKS="0",
+        )
+
+        def git(root, *args):
+            result = subprocess.run(
+                [git_bin, "-c", "protocol.file.allow=always", "-c", "user.name=fixture",
+                 "-c", "user.email=fixture@example.invalid", "-C", str(root), *args],
+                env=git_env, capture_output=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            return result.stdout.decode().strip()
+
+        leaf = self.root / "rewrite-leaf"
+        leaf.mkdir()
+        git(leaf, "init", "-q")
+        (leaf / "payload").write_text("leaf\n")
+        git(leaf, "add", "payload")
+        git(leaf, "commit", "-qm", "leaf")
+        shared = self.root / "rewrite-shared"
+        shared.mkdir()
+        git(shared, "init", "-q")
+        (shared / "payload").write_text("shared\n")
+        git(shared, "add", "payload")
+        git(shared, "commit", "-qm", "shared")
+        git(shared, "submodule", "add", "-q", str(leaf), "nested")
+        git(shared, "commit", "-qam", "nested")
+        # The production shared checkout: the worktree extension on, and no
+        # core.worktree in its common config.
+        git(shared, "config", "extensions.worktreeConfig", "true")
+
+        # Each case: how the shared config is set for the run, and whether its
+        # common config must still get a private copy.
+        included = self.root / "rewrite-included.config"
+        cases = {
+            # Production: the extension on, no core.worktree.
+            "no-common-worktree": ({}, False),
+            # With the extension on, a common core.worktree applies to every
+            # worktree. It points at the checkout so the wrapper's own
+            # submodule walk still finds its working tree.
+            "common-worktree": ({"core.worktree": "checkout"}, True),
+            # Read as Git reads it, through include.path.
+            "included-worktree": ({"include.path": str(included)}, True),
+            # With the extension off, Git applies a common core.worktree to
+            # the main worktree alone.
+            "extension-off": (
+                {"core.worktree": "checkout", "extensions.worktreeConfig": "false"},
+                False,
+            ),
+        }
+        for case, (settings, copied) in cases.items():
+            with self.subTest(case=case):
+                checkout = self.root / f"rewrite-{case}"
+                git(shared, "worktree", "add", "--detach", str(checkout))
+                git(checkout, "submodule", "update", "--init", "--recursive")
+                common = Path(git(checkout, "rev-parse", "--path-format=absolute",
+                                  "--git-common-dir"))
+                included.write_text(f"[core]\n\tworktree = {checkout}\n")
+                for key, value in settings.items():
+                    value = str(checkout) if value == "checkout" else value
+                    git(shared, "config", key, value)
+                self.capture.unlink(missing_ok=True)
+                result, calls = self.invoke(source=checkout)
+                for key in settings:
+                    git(shared, "config", "--unset", key)
+                git(shared, "config", "extensions.worktreeConfig", "true")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                argv = calls[1]
+                mounts = [
+                    dict(field.split("=", 1) for field in argv[i + 1].split(","))
+                    for i, arg in enumerate(argv)
+                    if arg == "--mount"
+                ]
+                directories = sorted(
+                    ((m["destination"], m["source"]) for m in mounts
+                     if Path(m["source"]).is_dir()),
+                    key=lambda pair: len(pair[0]),
+                    reverse=True,
+                )
+
+                def covered(destination):
+                    # The host file a file-mount destination sits on: the
+                    # destination as seen through the deepest directory mount
+                    # that contains it, or the host path itself.
+                    for guest, host in directories:
+                        if destination.startswith(guest + "/"):
+                            return Path(host) / destination[len(guest) + 1:]
+                    return Path(destination)
+
+                files = {
+                    m["destination"]: covered(m["destination"])
+                    for m in mounts
+                    if Path(m["source"]).is_file() and covered(m["destination"]).exists()
+                }
+                bound_common = [d for d, f in files.items() if f == common / "config"]
+                if copied:
+                    self.assertEqual(len(bound_common), 1, files)
+                    continue
+                self.assertEqual(bound_common, [], "the shared common config is bound over")
+                before = {d: f.stat().st_ino for d, f in files.items()}
+                common_before = (common / "config").stat().st_ino
+                git(shared, "config", "fixture.rewritten", "yes")
+                self.assertNotEqual((common / "config").stat().st_ino, common_before,
+                                    "git config no longer renames; the reproducer is void")
+                after = {d: f.stat().st_ino for d, f in files.items()}
+                self.assertEqual(after, before, "a mount destination was renamed over")
+
     def test_inherited_git_location_variables_leave_the_mounts_unchanged(self):
         # https://github.com/rrnewton/hermit/issues/3362: a `git rebase --exec`
         # step or a hook runs this wrapper with GIT_DIR, GIT_WORK_TREE or
@@ -1196,6 +1331,13 @@ class CargoCacheMounts(unittest.TestCase):
         source = self.root / "location-source"
         git(product, "worktree", "add", "-q", "--detach", str(source))
         git(source, "submodule", "update", "--init", "--recursive")
+        # A worktree-specific core.worktree gives the root a private config
+        # copy to relocate. A linked root's common config is no longer copied
+        # unless it sets core.worktree for every worktree
+        # (https://github.com/rrnewton/hermit/issues/3920), and the root copy
+        # is what an inherited GIT_DIR once redirected.
+        git(source, "config", "extensions.worktreeConfig", "true")
+        git(source, "config", "--worktree", "core.worktree", str(source))
         metadata = [
             Path(
                 git(repo, "rev-parse", "--path-format=absolute", option)
