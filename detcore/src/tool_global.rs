@@ -2671,6 +2671,18 @@ impl GlobalTool for GlobalState {
                     .thread_tree
                     .create_session(process),
             ),
+            GlobalRequest::RegisteredProcessOf(dettid) => R::RegisteredProcessOf(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .thread_tree
+                    .process_of(dettid),
+            ),
+            GlobalRequest::SetChildSubreaper(process, on) => R::SetChildSubreaper(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .thread_tree
+                    .set_child_subreaper(process, on),
+            ),
             GlobalRequest::UnrecoverableShutdown => {
                 self.force_shutdown_with_error();
                 R::UnrecoverableShutdown(())
@@ -3074,6 +3086,11 @@ impl GlobalState {
                     flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_PARENT)),
                     exit_signal,
                 );
+                if is_group_leader
+                    && flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_NEWPID))
+                {
+                    sched.thread_tree.enter_new_pid_namespace(child_dettid);
+                }
             }
 
             if let Some((physical_pid, physical_tid)) = physical_ids {
@@ -4302,6 +4319,15 @@ pub enum GlobalRequest {
     /// Answered before any clock or scheduler accounting. Appended after
     /// `ChildExitSigchld`, for the same reason.
     RecordDeterminismLoss(String),
+    /// Mirror a successful `prctl(PR_SET_CHILD_SUBREAPER)` by this process,
+    /// in the caller's turn (`set_child_subreaper`). Appended after
+    /// `RecordDeterminismLoss`, for the same reason.
+    SetChildSubreaper(DetPid, bool),
+    /// The process Detcore registered `DetTid` in: its own thread group's
+    /// leader in the thread tree. Unlike the backend's `Guest::pid`, it names
+    /// a raw clone child with a non-SIGCHLD exit signal as its own process.
+    /// Appended after `SetChildSubreaper`, for the same reason.
+    RegisteredProcessOf(DetTid),
 }
 
 /// Responses from the global object
@@ -4398,6 +4424,10 @@ pub enum GlobalResponse {
     ChildExitSigchld(crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer),
     /// Appended after `ChildExitSigchld`, for the same reason.
     RecordDeterminismLoss(()),
+    /// Appended after `RecordDeterminismLoss`, for the same reason.
+    SetChildSubreaper(()),
+    /// Appended after `SetChildSubreaper`, for the same reason.
+    RegisteredProcessOf(Option<DetPid>),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -5753,6 +5783,34 @@ where
         send_and_update_time(guest, GlobalRequest::SetProcessGroup(process, group)).await;
     match response.1 {
         GlobalResponse::SetProcessGroup(updated) => updated,
+        _ => unreachable!(),
+    }
+}
+
+/// The process Detcore registered `dettid` in (`ThreadTree::process_of`), in
+/// the calling thread's turn.
+pub async fn registered_process_of<G, T>(guest: &mut G, dettid: DetTid) -> Option<DetPid>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::RegisteredProcessOf(dettid)).await;
+    match response.1 {
+        GlobalResponse::RegisteredProcessOf(process) => process,
+        _ => unreachable!(),
+    }
+}
+
+/// Mirror a successful `prctl(PR_SET_CHILD_SUBREAPER, on)` by `process` in
+/// the scheduler's thread tree, in the calling thread's turn.
+pub async fn set_child_subreaper<G, T>(guest: &mut G, process: DetPid, on: bool)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::SetChildSubreaper(process, on)).await;
+    match response.1 {
+        GlobalResponse::SetChildSubreaper(()) => {}
         _ => unreachable!(),
     }
 }

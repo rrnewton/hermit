@@ -1307,7 +1307,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/3984) retains all 1017: 1018.
     // run::a_version_2_spec_is_refused_when_validation_turns_the_timer_off
     // (relative happens-before anchors) retains all 1018: 1019.
-    ("test.hermit_unit", 1019),
+    // metadata::tests::record_version_rejects_pre_child_subreaper_streams
+    // (https://github.com/rrnewton/hermit/issues/3997) retains all 1019: 1020.
+    ("test.hermit_unit", 1020),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1789,7 +1791,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // scheduler::tests::{a_futex_wake_count_of_zero_or_below_wakes_one_waiter,
     // a_futex_wake_bitset_count_of_zero_wakes_the_first_matching_waiter}
     // (https://github.com/rrnewton/hermit/issues/3957) retain all 1304: 1306.
-    ("test.detcore_unit", 1306),
+    // The fourteen child-subreaper re-parenting scheduler tests and the
+    // subreaper prctl backend and mode gate
+    // (https://github.com/rrnewton/hermit/issues/3997) retain all 1306: 1321.
+    ("test.detcore_unit", 1321),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1868,7 +1873,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // whatever names it) retain all 104 (measured 106).
     // readdir_order's twelve procfs descriptor-entry identity tests (the
     // review cases of https://github.com/rrnewton/hermit/pull/3972): 118.
-    ("test.detcore_misc", 118),
+    // subreaper's eleven child-subreaper guest tests
+    // (https://github.com/rrnewton/hermit/issues/3997): 129.
+    ("test.detcore_misc", 129),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -2559,7 +2566,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same futex wake-order guest test: 89.
     // And the same procfs inode guest tests: 106.
     // And the same twelve descriptor-entry identity tests: 118.
-    ("test.detcore_misc_on_host", 118),
+    // And the same eleven child-subreaper guest tests: 129.
+    ("test.detcore_misc_on_host", 129),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -2671,7 +2679,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the eight relative-anchor scheduler tests: 1301.
     // And the three vfork barrier valve tests: 1304.
     // And the two FUTEX_WAKE count tests: 1306.
-    ("test.detcore_unit_on_host", 1306),
+    // And the fifteen child-subreaper tests: 1321.
+    ("test.detcore_unit_on_host", 1321),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -2777,7 +2786,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the futex-wake CLI test: 1017.
     // And the vfork release-edge record-version test: 1018.
     // And the version-2 preemption refusal test: 1019.
-    ("test.hermit_unit_on_host", 1019),
+    // And the child-subreaper record-version test: 1020.
+    ("test.hermit_unit_on_host", 1020),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

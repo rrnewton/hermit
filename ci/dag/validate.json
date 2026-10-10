@@ -1575,14 +1575,14 @@
           "category": "c-programs",
           "test": "c-programs/child-subreaper-refusal",
           "mode": "verify",
-          "backend": "ptrace"
+          "backend": "sabre"
         },
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/child-subreaper-refusal",
+          "test": "c-programs/child-subreaper-support",
           "mode": "verify",
-          "backend": "sabre"
+          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -20749,7 +20749,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1019",
+        "NEXTEST_EXPECTED_EXECUTED": "1020",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -20798,7 +20798,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1306",
+        "NEXTEST_EXPECTED_EXECUTED": "1321",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -20847,7 +20847,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "118",
+        "NEXTEST_EXPECTED_EXECUTED": "129",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--test\",\"tests_misc\"]"
       },
       "networkonly": false,
@@ -22720,7 +22720,7 @@
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/child-subreaper-refusal",
+          "test": "c-programs/child-subreaper-support",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -27981,14 +27981,14 @@
           "category": "c-programs",
           "test": "c-programs/child-subreaper-refusal",
           "mode": "verify",
-          "backend": "ptrace"
+          "backend": "sabre"
         },
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/child-subreaper-refusal",
+          "test": "c-programs/child-subreaper-support",
           "mode": "verify",
-          "backend": "sabre"
+          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -42799,7 +42799,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1019",
+        "NEXTEST_EXPECTED_EXECUTED": "1020",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -42845,7 +42845,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1306",
+        "NEXTEST_EXPECTED_EXECUTED": "1321",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -42891,7 +42891,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "118",
+        "NEXTEST_EXPECTED_EXECUTED": "129",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--test\",\"tests_misc\"]"
       },
       "networkonly": false,
@@ -44135,14 +44135,14 @@
           "category": "c-programs",
           "test": "c-programs/child-subreaper-refusal",
           "mode": "verify",
-          "backend": "ptrace"
+          "backend": "sabre"
         },
         {
           "lane": "portable",
           "category": "c-programs",
-          "test": "c-programs/child-subreaper-refusal",
+          "test": "c-programs/child-subreaper-support",
           "mode": "verify",
-          "backend": "sabre"
+          "backend": "ptrace"
         },
         {
           "lane": "portable",

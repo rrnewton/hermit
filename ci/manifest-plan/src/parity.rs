@@ -5877,7 +5877,9 @@ mod tests {
         // but ptrace: 3940.
         // c-programs/pause-cross-task-signal adds one line per backend but
         // ptrace: 3945.
-        assert_eq!(parsed.cells.len(), 3945);
+        // c-programs/child-subreaper-support adds one line per backend but
+        // ptrace: 3950.
+        assert_eq!(parsed.cells.len(), 3950);
         assert_eq!(parsed.schema, PARITY_CELLS_SCHEMA);
         // The repository's limit for a text file is 2 MiB. This bound was
         // 1 MiB until fold 5 of https://github.com/rrnewton/hermit/issues/3448

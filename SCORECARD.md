@@ -2,29 +2,29 @@
 
 This table is derived from the manifest, not from a separately maintained parent-workspace CSV. `./ci/compat-envelope/scorecard.rs check` verifies it.
 
-The count table includes all **14991** cells in the manifest; no row is omitted. A cell is **Selected by full** exactly when it appears in `ci/expected-e2e-plan.json`. A cell is **Not selected by full** when it is in the manifest but absent from that plan. Selection is not a test result: a cell not selected by full may have passed, failed, produced no verdict, or never run. Of these cells, **1978** are selected by full, **774** are not selected by full, and **12239** are **Not applicable**.
+The count table includes all **15010** cells in the manifest; no row is omitted. A cell is **Selected by full** exactly when it appears in `ci/expected-e2e-plan.json`. A cell is **Not selected by full** when it is in the manifest but absent from that plan. Selection is not a test result: a cell not selected by full may have passed, failed, produced no verdict, or never run. Of these cells, **1978** are selected by full, **774** are not selected by full, and **12258** are **Not applicable**.
 
 Every selected `verify` cell that does not declare the stripped comparator, and every seed in a selected `chaos` cell, runs the same backend twice. The manifest runner adds `--verify-strict` when the selected Hermit binary supports it, and accepts a result only when the typed report says `verified=true`, `verdict=matched`, `bitwise_parity=true`, `strictness=canonical`, `compare_logs=true`, a named canonical `record_envelope`, and both INFO-message counts are nonzero. Bare `--verify` remains a Stripped comparison when invoked directly and does not satisfy this regression plan. None of the **1968** selected `verify` cells declares the stripped comparator. These same-backend results do not establish cross-backend parity.
 
 | Backend | Selected by full | Not selected by full | Not applicable | In the manifest |
 | --- | ---: | ---: | ---: | ---: |
-| `ptrace` | 564 | 448 | 1355 | 2367 |
-| `dbt` | 205 | 47 | 2115 | 2367 |
-| `kvm` | 330 | 7 | 2030 | 2367 |
-| `sabre` | 240 | 239 | 1888 | 2367 |
-| `liteinst` | 319 | 0 | 2048 | 2367 |
-| `in-guest-trap` | 320 | 0 | 2047 | 2367 |
-| `native` | 0 | 33 | 756 | 789 |
-| **Total** | **1978** | **774** | **12239** | **14991** |
+| `ptrace` | 564 | 448 | 1358 | 2370 |
+| `dbt` | 205 | 47 | 2118 | 2370 |
+| `kvm` | 330 | 7 | 2033 | 2370 |
+| `sabre` | 240 | 239 | 1891 | 2370 |
+| `liteinst` | 319 | 0 | 2051 | 2370 |
+| `in-guest-trap` | 320 | 0 | 2050 | 2370 |
+| `native` | 0 | 33 | 757 | 790 |
+| **Total** | **1978** | **774** | **12258** | **15010** |
 
 ## Denominator, and why the percentage is not comparable across changes to it
 
-Selected by full is **1978 of 14991**, which is **13.19%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
+Selected by full is **1978 of 15010**, which is **13.18%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
 
 - backends: `ptrace`, `dbt`, `kvm`, `sabre`, `liteinst`, `in-guest-trap`, `native`
 - modes: `chaos`, `naked`, `replay`, `verify`
 
-⚠️ **12239 of those 14991 cells are NOT APPLICABLE** — their backend is not applicable for their mode, so they were never asked to run and cannot pass or fail. Over the 2752 cells that CAN run, selected by full is **71.88%**.
+⚠️ **12258 of those 15010 cells are NOT APPLICABLE** — their backend is not applicable for their mode, so they were never asked to run and cannot pass or fail. Over the 2752 cells that CAN run, selected by full is **71.88%**.
 
 ⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same 1978 cells selected by full measured against a smaller denominator. Nothing was fixed to produce it; it is what the first figure always meant once the cells that cannot run are excluded. Quote both or neither, and never compare one against the other as though something moved.
 
@@ -34,11 +34,11 @@ The mode view makes the current order of work explicit: expand `verify` first, t
 
 | Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `in-guest-trap` | `native` | Selected by full | Not selected by full | Not applicable | In the manifest |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `verify` | 554 / 789 | 205 / 789 | 330 / 789 | 240 / 789 | 319 / 789 | 320 / 789 | — | 1968 | 525 | 2241 | 4734 |
-| `replay` | 4 / 789 | 0 / 789 | 0 / 789 | 0 / 789 | 0 / 789 | 0 / 789 | — | 4 | 215 | 4515 | 4734 |
-| `chaos` | 6 / 789 | 0 / 789 | 0 / 789 | 0 / 789 | 0 / 789 | 0 / 789 | — | 6 | 1 | 4727 | 4734 |
-| `naked` | — | — | — | — | — | — | 0 / 789 | 0 | 33 | 756 | 789 |
-| **Total** | | | | | | | | **1978** | **774** | **12239** | **14991** |
+| `verify` | 554 / 790 | 205 / 790 | 330 / 790 | 240 / 790 | 319 / 790 | 320 / 790 | — | 1968 | 525 | 2247 | 4740 |
+| `replay` | 4 / 790 | 0 / 790 | 0 / 790 | 0 / 790 | 0 / 790 | 0 / 790 | — | 4 | 215 | 4521 | 4740 |
+| `chaos` | 6 / 790 | 0 / 790 | 0 / 790 | 0 / 790 | 0 / 790 | 0 / 790 | — | 6 | 1 | 4733 | 4740 |
+| `naked` | — | — | — | — | — | — | 0 / 790 | 0 | 33 | 757 | 790 |
+| **Total** | | | | | | | | **1978** | **774** | **12258** | **15010** |
 
 ## Ptrace by manifest category
 
@@ -48,7 +48,7 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 | --- | ---: | ---: | ---: | ---: | ---: |
 | `applications` | 3 / 6 | 0 / 6 | 0 / 6 | 3 | 18 |
 | `bin-c` | 2 / 2 | 0 / 2 | 0 / 2 | 2 | 6 |
-| `c-programs` | 276 / 281 | 3 / 281 | 3 / 281 | 282 | 843 |
+| `c-programs` | 276 / 282 | 3 / 282 | 3 / 282 | 282 | 846 |
 | `chaos-c` | 1 / 1 | 0 / 1 | 1 / 1 | 2 | 3 |
 | `compat` | 189 / 412 | 0 / 412 | 0 / 412 | 189 | 1236 |
 | `data-handling` | 6 / 6 | 0 / 6 | 0 / 6 | 6 | 18 |

@@ -2,7 +2,8 @@
   "schema": 1,
   "asymmetric_manifest_tests": [
     "applications/kvm-python-examples",
-    "applications/kvm-shell-environment"
+    "applications/kvm-shell-environment",
+    "c-programs/child-subreaper-refusal"
   ],
   "backend_private_guest_files": [
     "tests/c/kvm_exact_child_waits.c",

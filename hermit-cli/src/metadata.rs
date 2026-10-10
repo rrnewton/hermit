@@ -222,7 +222,14 @@ impl RecordVersion {
 // Turn selection is not recorded; replay recomputes it, so an older recording
 // containing a vfork replayed under the new rule could run a different
 // schedule, although no event shape changed.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x127);
+// 0x127 -> 0x128: on ptrace, `prctl(PR_SET_CHILD_SUBREAPER)` and
+// `PR_GET_CHILD_SUBREAPER` run live in record and replay alike instead of
+// failing with ENOSYS, and the scheduler re-parents orphans to a child
+// subreaper (https://github.com/rrnewton/hermit/issues/3997). An older
+// recording saw ENOSYS for both calls; this replayer would run them and could
+// take another branch and a different schedule, although no event shape
+// changed.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x128);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -247,7 +254,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x127);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x127;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x128;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -812,6 +819,14 @@ mod tests {
     #[test]
     fn record_version_rejects_pre_vfork_release_edge_streams() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x126)));
+    }
+
+    /// A 0x127 recording saw ENOSYS for the subreaper prctls, which this
+    /// replayer runs live; replaying it could take another branch. The
+    /// version gate must refuse it.
+    #[test]
+    fn record_version_rejects_pre_child_subreaper_streams() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x127)));
     }
 
     #[test]

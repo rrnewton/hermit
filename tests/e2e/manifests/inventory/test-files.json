@@ -121,6 +121,12 @@
       "why": "tests/c/child_subreaper_refusal.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "manifest-test",
+      "path": "tests/c/child_subreaper_support.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace; ci=true)",
+      "why": "tests/c/child_subreaper_support.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace; ci=true): Direct C guest asserting that a child subreaper reaps its child and then a re-parented orphan, both a live orphan and a zombie one, then sees ECHILD (https://github.com/rrnewton/hermit/issues/3997); the backends that still refuse the prctls are covered by tests/c/child_subreaper_refusal.c"
+    },
+    {
       "disposition": "guest-fixture",
       "path": "tests/c/chown_virtual_root_identity.c",
       "runner": "hermit-cli/tests/chown_virtual_root_identity.rs",

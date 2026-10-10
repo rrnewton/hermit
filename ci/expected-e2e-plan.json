@@ -9632,23 +9632,6 @@
       "timeout_seconds": 57
     },
     {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "test": "c-programs/child-subreaper-refusal",
-      "timeout_seconds": 57
-    },
-    {
       "backend": "kvm",
       "category": "c-programs",
       "classification": "required",
@@ -36233,6 +36216,23 @@
         "cc"
       ],
       "test": "c-programs/pause-cross-task-signal",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "ptrace",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/child-subreaper-support",
       "timeout_seconds": 57
     }
   ],

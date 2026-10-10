@@ -1169,6 +1169,10 @@ pub struct Scheduler {
     /// process (`sigalrm`).
     sigalrm: sigalrm::SigalrmLedger,
 
+    /// The determinism losses this scheduler recorded (`note_determinism_loss`).
+    #[cfg(test)]
+    determinism_losses: Vec<String>,
+
     /// Raw TIDs removed by logical teardown. Tombstones are permanent for the life of this
     /// scheduler: accepting Linux TID reuse would let delayed backend RPCs bind to a new thread.
     logically_killed_threads: BTreeSet<DetTid>,
@@ -1368,6 +1372,34 @@ pub struct ThreadTree {
     /// `self_exec_id`), for the exit-signal rule a parent's exec applies
     /// (`ProcessWaitMetadata::parent_exec_generation`).
     exec_generations: HashMap<DetPid, u64>,
+
+    /// Processes that made themselves child subreapers with
+    /// `prctl(PR_SET_CHILD_SUBREAPER)` (Linux's
+    /// `signal_struct::is_child_subreaper`). The flag survives exec, because
+    /// the process keeps its pid, and a forked child does not inherit it.
+    child_subreapers: HashSet<DetPid>,
+
+    /// Processes whose parent exited with no live child subreaper above it,
+    /// so Linux gave them to the container's init (`reparent_orphans`). Their
+    /// `process_parent` and wait metadata still name the dead parent, as
+    /// before subreapers were modeled (exit classification reads that link),
+    /// but a subreaper search must not climb past them: their real parent is
+    /// init.
+    init_orphans: HashSet<DetPid>,
+
+    /// Processes whose exit the scheduler granted (`ResourceID::Exit` for the
+    /// whole group, or for its last live thread), so that their logical exit
+    /// is fixed between committed turns. A process that dies without one is
+    /// recorded only at its host-timed deregistration (`reparent_orphans`).
+    granted_exits: HashSet<DetPid>,
+
+    /// How many PID namespaces below the container's each process lives in;
+    /// absent means zero. A child inherits its creator's depth and adds one
+    /// for `CLONE_NEWPID` (`enter_new_pid_namespace`); `unshare` and `setns`
+    /// are refused, so `clone` is the only way in. Linux's `find_new_reaper`
+    /// looks for a subreaper only among ancestors at the exited process's
+    /// own depth (`find_child_reaper`).
+    pid_ns_depth: HashMap<DetPid, u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1534,6 +1566,23 @@ impl ThreadTree {
         if is_group_leader {
             self.thread_group_leaders.insert(child_dettid);
             self.thread_to_leader.insert(child_dettid, child_dettid);
+            // A reused pid starts with neither Linux attribute: the flag is
+            // not inherited, and the new process has its own live parent.
+            self.child_subreapers.remove(&child_dettid);
+            self.init_orphans.remove(&child_dettid);
+            self.granted_exits.remove(&child_dettid);
+            // The child lives in its creator's PID namespace until
+            // `enter_new_pid_namespace` says otherwise.
+            let creator_depth = self
+                .thread_to_leader
+                .get(&parent_dettid)
+                .filter(|_| parent_dettid != child_dettid)
+                .map_or(0, |creator| self.pid_ns_depth(*creator));
+            if creator_depth == 0 {
+                self.pid_ns_depth.remove(&child_dettid);
+            } else {
+                self.pid_ns_depth.insert(child_dettid, creator_depth);
+            }
             if parent_dettid == child_dettid {
                 self.process_wait.insert(
                     child_dettid,
@@ -1676,6 +1725,81 @@ impl ThreadTree {
         };
         metadata.process_group = process_group;
         true
+    }
+
+    /// Mirror a successful `prctl(PR_SET_CHILD_SUBREAPER, on)` by `pid`.
+    pub fn set_child_subreaper(&mut self, pid: DetPid, on: bool) {
+        if on {
+            self.child_subreapers.insert(pid);
+        } else {
+            self.child_subreapers.remove(&pid);
+        }
+    }
+
+    /// Whether `pid` is a child subreaper (`set_child_subreaper`).
+    pub fn is_child_subreaper(&self, pid: DetPid) -> bool {
+        self.child_subreapers.contains(&pid)
+    }
+
+    /// Give `child` a new wait parent after its parent's process exited, as
+    /// Linux's `reparent_leader` does: `reaper` and its thread `owner`. The
+    /// exit signal becomes SIGCHLD, and the reaper's exec count is taken so
+    /// that the notification is SIGCHLD too.
+    fn reparent_child(&mut self, child: DetPid, reaper: DetPid, owner: DetTid) {
+        let reaper_exec_generation = self.exec_generation(reaper);
+        let Some(metadata) = self.process_wait.get_mut(&child) else {
+            return;
+        };
+        metadata.exit_signal = libc::SIGCHLD;
+        metadata.wait_parent = Some(reaper);
+        metadata.wait_owner = owner;
+        metadata.parent_exec_generation = reaper_exec_generation;
+        self.process_parent.insert(child, reaper);
+    }
+
+    /// The children of `exited` whose new parent is still undecided: those
+    /// whose wait parent is `exited` and that did not already go to init. In
+    /// ascending pid order, because `process_wait` is a hash map and the
+    /// order decides the order of the re-parenting records and wakes.
+    fn undecided_orphans_of(&self, exited: DetPid) -> Vec<DetPid> {
+        let mut orphans: Vec<DetPid> = self
+            .process_wait
+            .iter()
+            .filter(|(child, metadata)| {
+                metadata.wait_parent == Some(exited) && !self.is_init_orphan(**child)
+            })
+            .map(|(child, _)| *child)
+            .collect();
+        orphans.sort();
+        orphans
+    }
+
+    /// The process `tid` belongs to in the thread tree: its thread group's
+    /// leader, or `None` for an unregistered thread.
+    pub fn process_of(&self, tid: DetTid) -> Option<DetPid> {
+        self.thread_to_leader.get(&tid).copied()
+    }
+
+    /// `pid` was created with `CLONE_NEWPID`: it is the init of a PID
+    /// namespace one level below its creator's (`pid_ns_depth`).
+    pub fn enter_new_pid_namespace(&mut self, pid: DetPid) {
+        let depth = self.pid_ns_depth(pid) + 1;
+        self.pid_ns_depth.insert(pid, depth);
+    }
+
+    /// `pid_ns_depth` of `pid`.
+    pub fn pid_ns_depth(&self, pid: DetPid) -> u32 {
+        self.pid_ns_depth.get(&pid).copied().unwrap_or(0)
+    }
+
+    /// Record that `child` went to the container's init (`init_orphans`).
+    fn orphan_to_init(&mut self, child: DetPid) {
+        self.init_orphans.insert(child);
+    }
+
+    /// Whether `pid` went to the container's init (`init_orphans`).
+    fn is_init_orphan(&self, pid: DetPid) -> bool {
+        self.init_orphans.contains(&pid)
     }
 
     pub fn create_session(&mut self, pid: DetPid) -> bool {
@@ -2686,6 +2810,8 @@ impl Scheduler {
             real_timers: Default::default(),
             parked: Default::default(),
             sigalrm: Default::default(),
+            #[cfg(test)]
+            determinism_losses: Vec::new(),
             logically_killed_threads: Default::default(),
             exec_incarnations: Default::default(),
             retired_transferred_exec_callers: Default::default(),
@@ -3334,8 +3460,23 @@ impl Scheduler {
             .my_thread_group(detpid)
             .into_iter()
             .any(|tid| self.next_turns.contains_key(&tid));
+        // A raw clone child with a non-SIGCHLD exit signal is its own process
+        // in the thread tree, although the backend reports its creator's pid
+        // (`ResourceID::Exit` below makes the same distinction). Its exit
+        // still decides its orphans, when its last thread leaves.
+        if let Some(registered) = self.registered_process(*dtid)
+            && registered != *detpid
+            && !self
+                .thread_tree
+                .my_thread_group(&registered)
+                .into_iter()
+                .any(|tid| self.next_turns.contains_key(&tid))
+        {
+            self.reparent_orphans(registered);
+        }
         if !live_process_thread {
             let _ = self.begin_physical_process_exit(*detpid);
+            self.reparent_orphans(*detpid);
             self.logically_exited_processes.insert(*detpid);
             if let Some(parent) = self.thread_tree.parent_process(detpid) {
                 self.wake_child_waiters(parent, *detpid);
@@ -3343,6 +3484,128 @@ impl Scheduler {
             self.blocked.timed_waiters.remove_process_timers(*detpid);
             self.real_timers.retire_process(*detpid);
         }
+    }
+
+    // TODO-HUMAN-REVIEW(PR-4000): orphan re-parenting to a child subreaper.
+    /// Re-parent the children of `exited`, whose last thread just left the run
+    /// set, as Linux's `forget_original_parent` does in `exit_notify`.
+    ///
+    /// The new parent is the nearest process on `exited`'s parent chain that
+    /// is a child subreaper and still has a live thread (`find_new_reaper`).
+    /// A child that has already exited becomes waitable by its new parent
+    /// here. Without such a subreaper the child goes to the container's init,
+    /// which no guest can wait for; its record is left as it was before
+    /// subreapers were modeled, naming the dead parent, so a program that
+    /// never sets the flag sees no change.
+    ///
+    /// This runs in the same scheduler critical section that makes `exited`
+    /// itself waitable, so it is exactly as deterministic as that moment and
+    /// never opens a window of its own. For an `exit` or `exit_group` with
+    /// sequentialized threads (strict mode), that moment follows the
+    /// scheduler-ordered `ResourceID::Exit` grant and precedes the next
+    /// committed turn: the exiting thread goes back into the run queue with an
+    /// empty request, and the quiesce wait (`are_all_quiesced`) selects no
+    /// turn until its deregistration fills it. For a process killed by a
+    /// signal it is the host-timed
+    /// deregistration (https://github.com/rrnewton/hermit/issues/3994), and the
+    /// re-parent moves with it. On ptrace the kernel has already re-parented by
+    /// then: the deregistration carries the final exit status, which the tracer
+    /// sees only after `exit_notify`.
+    ///
+    /// The decision is made once per exit. `logically_kill_thread` can run
+    /// again for the same dead process, from a thread's late exit hook at a
+    /// moment the host chooses; by then every child has either moved to its
+    /// subreaper or is an init orphan, and neither is collected again. A
+    /// process that died without an Exit grant records a determinism loss
+    /// when a subreaper adopts its orphans.
+    ///
+    /// Children are visited in pid order, so the waiters they wake join the
+    /// run queue in an order that does not depend on hashing.
+    fn reparent_orphans(&mut self, exited: DetPid) {
+        let orphans = self.thread_tree.undecided_orphans_of(exited);
+        if orphans.is_empty() {
+            return;
+        }
+        let reaper = self.find_child_reaper(exited);
+        if let Some((reaper, _)) = reaper
+            && !self.thread_tree.granted_exits.contains(&exited)
+        {
+            // Without an Exit grant (SIGKILL, another fatal signal, a fault)
+            // the parent's exit is recorded at its host-timed deregistration,
+            // and so is this adoption
+            // (https://github.com/rrnewton/hermit/issues/3994). Say so rather
+            // than let verification compare a schedule that host timing chose.
+            self.note_determinism_loss(format!(
+                "subreaper {reaper} adopted the orphans of process {exited}, which died without an Exit grant, at its host-timed deregistration (https://github.com/rrnewton/hermit/issues/3994)"
+            ));
+        }
+        for child in orphans {
+            let Some((reaper, owner)) = reaper else {
+                debug!(
+                    "[scheduler] orphan {} of exited process {} goes to the container init",
+                    child, exited
+                );
+                self.thread_tree.orphan_to_init(child);
+                continue;
+            };
+            self.thread_tree.reparent_child(child, reaper, owner);
+            info!(
+                "[scheduler] re-parenting orphan {} of exited process {} to subreaper {}",
+                child, exited, reaper
+            );
+            if self.logically_exited_processes.contains(&child) {
+                self.wake_child_waiters(reaper, child);
+            }
+        }
+    }
+
+    /// Record a determinism loss for the run (`detlog::write_loss_notice`).
+    /// Tests read the reasons this scheduler recorded, rather than the
+    /// process-wide latch, which keeps whichever reason any test wrote first.
+    fn note_determinism_loss(&mut self, reason: String) {
+        #[cfg(test)]
+        self.determinism_losses.push(reason.clone());
+        crate::detlog::write_loss_notice(&reason);
+    }
+
+    /// The process and thread that inherit `exited`'s orphans
+    /// (`reparent_orphans`): the nearest live child subreaper among its
+    /// ancestors, and that process's first live thread, its leader if the
+    /// leader is live (Linux's `find_alive_thread`). The search stops at a
+    /// process that already went to the container's init: Linux's parent
+    /// chain from there leads to init, whatever the stale record names. It
+    /// also stops at a PID namespace boundary, as Linux's `find_new_reaper`
+    /// does: an ancestor in an outer namespace never adopts. (Linux then gives
+    /// the orphan to its own namespace's init; that adoption is not modeled,
+    /// so such an orphan is left as before subreapers were.)
+    fn find_child_reaper(&self, exited: DetPid) -> Option<(DetPid, DetTid)> {
+        if self.thread_tree.is_init_orphan(exited) {
+            return None;
+        }
+        let depth = self.thread_tree.pid_ns_depth(exited);
+        let mut ancestor = self.thread_tree.parent_process(&exited);
+        while let Some(candidate) = ancestor {
+            if self.thread_tree.pid_ns_depth(candidate) != depth {
+                return None;
+            }
+            if self.thread_tree.is_child_subreaper(candidate) {
+                let mut live: Vec<DetTid> = self
+                    .thread_tree
+                    .my_thread_group(&candidate)
+                    .into_iter()
+                    .filter(|tid| self.next_turns.contains_key(tid))
+                    .collect();
+                live.sort_by_key(|tid| (*tid != candidate, *tid));
+                if let Some(owner) = live.first() {
+                    return Some((candidate, *owner));
+                }
+            }
+            if self.thread_tree.is_init_orphan(candidate) {
+                return None;
+            }
+            ancestor = self.thread_tree.parent_process(&candidate);
+        }
+        None
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -5025,6 +5288,9 @@ impl Scheduler {
         self.completed_physical_process_exits.remove(&child);
         self.thread_tree.process_parent.remove(&child);
         self.thread_tree.process_wait.remove(&child);
+        self.thread_tree.child_subreapers.remove(&child);
+        self.thread_tree.init_orphans.remove(&child);
+        self.thread_tree.granted_exits.remove(&child);
         self.logically_exited_processes.remove(&child)
     }
 
@@ -7211,6 +7477,21 @@ impl Scheduler {
                         return Err(SkipTurn);
                     }
                 };
+                // A grant that ends its process fixes the process's logical
+                // exit between committed turns (`reparent_orphans`). The
+                // process is the one the thread tree registered the exiting
+                // thread in: for a raw clone child with a non-SIGCHLD exit
+                // signal, the backend's `process` names its creator instead.
+                if let Some(exiting) = self.registered_process(dettid)
+                    && (*group
+                        || !self
+                            .thread_tree
+                            .my_thread_group(&exiting)
+                            .into_iter()
+                            .any(|tid| tid != dettid && self.next_turns.contains_key(&tid)))
+                {
+                    self.thread_tree.granted_exits.insert(exiting);
+                }
                 // The grant is a vfork child's release edge: a barrier whose
                 // parent has died ends here, inside this committed turn.
                 self.release_vfork_child(dettid);
@@ -8909,6 +9190,423 @@ mod test {
             .take_terminal_deadlock()
             .expect("terminal failure");
         assert!(report.contains("without its host thread pidfd"));
+    }
+
+    /// A four-generation chain of single-threaded processes, each live in the
+    /// run set: root 1, its child 2, grandchild 3 and great-grandchild 4.
+    /// Process 4 is a clone child with a non-SIGCHLD exit signal.
+    fn process_chain() -> Scheduler {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let [root, inner, middle, orphan] = [1, 2, 3, 4].map(DetPid::from_raw);
+        scheduler.thread_tree.add_child(root, root, true);
+        scheduler.thread_tree.add_child(root, inner, true);
+        scheduler.thread_tree.add_child(inner, middle, true);
+        scheduler.thread_tree.add_child_with_wait_metadata(
+            middle,
+            orphan,
+            true,
+            false,
+            libc::SIGUSR1,
+        );
+        for pid in [root, inner, middle, orphan] {
+            register_known_thread(&mut scheduler, pid);
+        }
+        scheduler
+    }
+
+    /// The exit of single-threaded `pid` after its Exit grant: what an
+    /// `exit_group` does.
+    fn exit_process(scheduler: &mut Scheduler, pid: DetPid) {
+        scheduler.thread_tree.granted_exits.insert(pid);
+        scheduler.logically_kill_thread(&pid, &pid, MmId::initial(pid));
+    }
+
+    /// `logically_kill_thread` runs again for a process that is already dead,
+    /// from a thread's late exit hook at a moment the host chooses. An orphan
+    /// already given to init is not searched for a subreaper again, even if a
+    /// subreaper has appeared since, so the outcome is the first decision's.
+    #[test]
+    fn a_late_second_exit_record_does_not_re_decide_an_init_orphan() {
+        let mut scheduler = process_chain();
+        let [root, _, middle, orphan] = [1, 2, 3, 4].map(DetPid::from_raw);
+        exit_process(&mut scheduler, middle);
+        assert!(scheduler.thread_tree.is_init_orphan(orphan));
+
+        scheduler.thread_tree.set_child_subreaper(root, true);
+        scheduler.logically_kill_thread(&middle, &middle, MmId::initial(middle));
+
+        assert!(scheduler.thread_tree.is_init_orphan(orphan));
+        assert_eq!(
+            scheduler.thread_tree.process_wait[&orphan].wait_parent,
+            Some(middle)
+        );
+        assert!(
+            !scheduler.has_child_wait_target(root, normal_wait(ChildWaitSelector::Exact(orphan)))
+        );
+    }
+
+    /// A parent that died without an Exit grant (killed) is recorded at its
+    /// host-timed deregistration, and so is a subreaper's adoption of its
+    /// orphans (https://github.com/rrnewton/hermit/issues/3994). The adoption
+    /// records a determinism loss instead of passing as deterministic.
+    #[test]
+    fn adopting_the_orphans_of_a_killed_parent_records_a_determinism_loss() {
+        let mut scheduler = process_chain();
+        let [_, inner, middle, orphan] = [1, 2, 3, 4].map(DetPid::from_raw);
+        scheduler.thread_tree.set_child_subreaper(inner, true);
+        assert!(!scheduler.thread_tree.granted_exits.contains(&middle));
+
+        scheduler.logically_kill_thread(&middle, &middle, MmId::initial(middle));
+
+        assert_eq!(
+            scheduler.thread_tree.process_wait[&orphan].wait_parent,
+            Some(inner)
+        );
+        assert_eq!(scheduler.determinism_losses.len(), 1);
+        assert!(
+            scheduler.determinism_losses[0].contains("without an Exit grant"),
+            "{:?}",
+            scheduler.determinism_losses
+        );
+    }
+
+    /// A subreaper outside a PID namespace never adopts from inside it: the
+    /// search stops where the depth changes. An inner process's orphan, and
+    /// the orphan of the namespace's own init, are left to init.
+    #[test]
+    fn a_subreaper_does_not_adopt_across_a_pid_namespace_boundary() {
+        let mut scheduler = process_chain();
+        let [root, inner, middle, orphan] = [1, 2, 3, 4].map(DetPid::from_raw);
+        scheduler.thread_tree.set_child_subreaper(root, true);
+        // `inner` is a namespace init; `middle` and `orphan` live inside it.
+        scheduler.thread_tree.enter_new_pid_namespace(inner);
+        let mut tree = ThreadTree::default();
+        tree.add_child(root, root, true);
+        tree.add_child(root, inner, true);
+        tree.enter_new_pid_namespace(inner);
+        tree.add_child(inner, middle, true);
+        assert_eq!(tree.pid_ns_depth(inner), 1);
+        assert_eq!(
+            tree.pid_ns_depth(middle),
+            1,
+            "a child inherits its creator's depth"
+        );
+        assert_eq!(tree.pid_ns_depth(root), 0);
+        scheduler.thread_tree.pid_ns_depth.insert(middle, 1);
+        scheduler.thread_tree.pid_ns_depth.insert(orphan, 1);
+
+        exit_process(&mut scheduler, middle);
+        assert!(scheduler.thread_tree.is_init_orphan(orphan));
+        assert!(
+            !scheduler.has_child_wait_target(root, normal_wait(ChildWaitSelector::Exact(orphan)))
+        );
+
+        // The namespace init itself dies: its children are not adopted by the
+        // outer subreaper either.
+        let mut scheduler = process_chain();
+        scheduler.thread_tree.set_child_subreaper(root, true);
+        scheduler.thread_tree.pid_ns_depth.insert(middle, 1);
+        scheduler.thread_tree.pid_ns_depth.insert(orphan, 1);
+        exit_process(&mut scheduler, middle);
+        assert!(scheduler.thread_tree.is_init_orphan(orphan));
+    }
+
+    /// Orphans are decided in ascending pid order whatever order the hash map
+    /// holds them in: 64 children, so a hash order that happens to be sorted
+    /// is out of the question.
+    #[test]
+    fn orphans_are_decided_in_pid_order() {
+        let mut tree = ThreadTree::default();
+        let parent = DetPid::from_raw(1);
+        tree.add_child(parent, parent, true);
+        let children: Vec<DetPid> = (0..64).map(|i| DetPid::from_raw(1000 - 7 * i)).collect();
+        for child in &children {
+            tree.add_child(parent, *child, true);
+        }
+        let mut expected = children.clone();
+        expected.sort();
+        assert_eq!(tree.undecided_orphans_of(parent), expected);
+        tree.orphan_to_init(expected[0]);
+        assert_eq!(tree.undecided_orphans_of(parent), expected[1..]);
+    }
+
+    /// A normal exit records no loss: its Exit grant fixed it between turns.
+    #[test]
+    fn adopting_the_orphans_of_an_exited_parent_records_no_determinism_loss() {
+        let mut scheduler = process_chain();
+        let [_, inner, middle, _] = [1, 2, 3, 4].map(DetPid::from_raw);
+        scheduler.thread_tree.set_child_subreaper(inner, true);
+        exit_process(&mut scheduler, middle);
+        assert!(scheduler.determinism_losses.is_empty());
+    }
+
+    /// A raw clone child with a non-SIGCHLD exit signal is its own process in
+    /// the thread tree, but the backend reports its exit with its creator's
+    /// pid. Its orphans are still decided when its last thread leaves.
+    #[test]
+    fn a_raw_clone_processs_exit_re_parents_its_orphans() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let [root, creator, raw, orphan] = [1, 2, 3, 4].map(DetPid::from_raw);
+        scheduler.thread_tree.add_child(root, root, true);
+        scheduler.thread_tree.add_child(root, creator, true);
+        scheduler.thread_tree.add_child_with_wait_metadata(
+            creator,
+            raw,
+            true,
+            false,
+            libc::SIGUSR1,
+        );
+        scheduler.thread_tree.add_child(raw, orphan, true);
+        for pid in [root, creator, raw, orphan] {
+            register_known_thread(&mut scheduler, pid);
+        }
+        scheduler.thread_tree.set_child_subreaper(creator, true);
+        scheduler.thread_tree.granted_exits.insert(raw);
+
+        // The backend names the creator, which is still live.
+        scheduler.logically_kill_thread(&raw, &creator, MmId::initial(creator));
+
+        assert_eq!(
+            scheduler.thread_tree.process_wait[&orphan].wait_parent,
+            Some(creator)
+        );
+        assert!(scheduler.determinism_losses.is_empty());
+    }
+
+    /// The Exit grant records the granted exit under the process the thread
+    /// tree registered the exiting thread in: the raw clone child itself, not
+    /// the creator the backend names.
+    #[test]
+    fn an_exit_grant_marks_the_registered_process_as_granted() {
+        let mut scheduler = process_chain();
+        let middle = DetPid::from_raw(3);
+        grant_group_exit(&mut scheduler, middle);
+        assert!(scheduler.thread_tree.granted_exits.contains(&middle));
+
+        let mut scheduler = Scheduler::new(&Config::default());
+        let [root, creator, raw] = [1, 2, 3].map(DetPid::from_raw);
+        scheduler.thread_tree.add_child(root, root, true);
+        scheduler.thread_tree.add_child(root, creator, true);
+        scheduler.thread_tree.add_child_with_wait_metadata(
+            creator,
+            raw,
+            true,
+            false,
+            libc::SIGUSR1,
+        );
+        for pid in [root, creator, raw] {
+            register_known_thread(&mut scheduler, pid);
+        }
+        grant_group_exit_from(&mut scheduler, raw, creator);
+        assert!(scheduler.thread_tree.granted_exits.contains(&raw));
+        assert!(!scheduler.thread_tree.granted_exits.contains(&creator));
+    }
+
+    /// A reused pid starts without the old process's subreaper flag, init
+    /// orphan mark or granted exit.
+    #[test]
+    fn a_reused_pid_starts_without_the_old_processes_subreaper_state() {
+        let mut tree = ThreadTree::default();
+        let [root, child] = [1, 2].map(DetPid::from_raw);
+        tree.add_child(root, root, true);
+        tree.add_child(root, child, true);
+        tree.set_child_subreaper(child, true);
+        tree.orphan_to_init(child);
+        tree.granted_exits.insert(child);
+        tree.enter_new_pid_namespace(child);
+
+        tree.add_child(root, child, true);
+
+        assert!(!tree.is_child_subreaper(child));
+        assert!(!tree.is_init_orphan(child));
+        assert!(!tree.granted_exits.contains(&child));
+        assert_eq!(tree.pid_ns_depth(child), 0);
+    }
+
+    /// When its parent's process exits, an orphan's wait parent becomes the
+    /// nearest live child subreaper, as Linux's `forget_original_parent`
+    /// does, with SIGCHLD as its exit signal (`reparent_leader`)
+    /// (https://github.com/rrnewton/hermit/issues/3997).
+    #[test]
+    fn an_orphan_goes_to_its_nearest_live_child_subreaper() {
+        let mut scheduler = process_chain();
+        let [root, inner, middle, orphan] = [1, 2, 3, 4].map(DetPid::from_raw);
+        scheduler.thread_tree.set_child_subreaper(root, true);
+        scheduler.thread_tree.set_child_subreaper(inner, true);
+        let orphan_wait = normal_wait(ChildWaitSelector::Exact(orphan));
+        assert!(!scheduler.has_child_wait_target(inner, orphan_wait));
+
+        exit_process(&mut scheduler, middle);
+
+        assert!(scheduler.has_child_wait_target(inner, orphan_wait));
+
+        let metadata = scheduler.thread_tree.process_wait[&orphan];
+        assert_eq!(metadata.wait_parent, Some(inner));
+        assert_eq!(metadata.wait_owner, inner);
+        assert_eq!(metadata.exit_signal, libc::SIGCHLD);
+        assert_eq!(scheduler.thread_tree.parent_process(&orphan), Some(inner));
+        assert_eq!(
+            scheduler.thread_tree.notification_signal(orphan),
+            Some(libc::SIGCHLD)
+        );
+        assert_eq!(
+            scheduler.exact_child_wait_state(inner, orphan),
+            ExactChildWaitState::Running
+        );
+        assert_eq!(
+            scheduler.exact_child_wait_state(middle, orphan),
+            ExactChildWaitState::Unknown
+        );
+
+        // The orphan exits: its new parent can wait for it.
+        exit_process(&mut scheduler, orphan);
+        assert_eq!(
+            scheduler.ready_child_wait(inner, normal_wait(ChildWaitSelector::Any)),
+            Some(middle),
+            "the exited child, the lower pid, is selected first"
+        );
+        assert!(scheduler.consume_child_wait(inner, middle));
+        assert_eq!(
+            scheduler.ready_child_wait(inner, normal_wait(ChildWaitSelector::Any)),
+            Some(orphan)
+        );
+        assert!(scheduler.consume_child_wait(inner, orphan));
+        assert!(!scheduler.has_child_wait_target(inner, normal_wait(ChildWaitSelector::Any)));
+    }
+
+    /// An orphan that has already exited when its parent does becomes
+    /// waitable by the subreaper at that moment.
+    #[test]
+    fn an_exited_orphan_becomes_waitable_by_the_subreaper() {
+        let mut scheduler = process_chain();
+        let [_, inner, middle, orphan] = [1, 2, 3, 4].map(DetPid::from_raw);
+        scheduler.thread_tree.set_child_subreaper(inner, true);
+        exit_process(&mut scheduler, orphan);
+        assert_eq!(
+            scheduler.ready_child_wait(middle, normal_wait(ChildWaitSelector::Exact(orphan))),
+            None,
+            "a clone child does not match a SIGCHLD-class wait"
+        );
+
+        exit_process(&mut scheduler, middle);
+
+        assert_eq!(
+            scheduler.ready_child_wait(inner, normal_wait(ChildWaitSelector::Exact(orphan))),
+            Some(orphan),
+            "re-parenting made it a SIGCHLD child of the subreaper"
+        );
+    }
+
+    /// Without a live subreaper among its ancestors an orphan has no guest
+    /// parent (the container's init). A subreaper with no live thread is
+    /// skipped, and clearing the flag takes a process out of the search.
+    #[test]
+    fn an_orphan_without_a_live_subreaper_has_no_guest_parent() {
+        let mut scheduler = process_chain();
+        let [root, inner, middle, orphan] = [1, 2, 3, 4].map(DetPid::from_raw);
+        scheduler.thread_tree.set_child_subreaper(inner, true);
+        scheduler.thread_tree.set_child_subreaper(inner, false);
+        exit_process(&mut scheduler, middle);
+        // The record still names the dead parent, as before subreapers were
+        // modeled, and no live process can wait for the orphan.
+        assert_eq!(
+            scheduler.thread_tree.process_wait[&orphan].wait_parent,
+            Some(middle)
+        );
+        assert_eq!(
+            scheduler.thread_tree.process_wait[&orphan].exit_signal,
+            libc::SIGUSR1
+        );
+        assert!(scheduler.thread_tree.is_init_orphan(orphan));
+        for parent in [root, inner] {
+            assert!(
+                !scheduler
+                    .has_child_wait_target(parent, normal_wait(ChildWaitSelector::Exact(orphan)))
+            );
+        }
+
+        let mut scheduler = process_chain();
+        scheduler.thread_tree.set_child_subreaper(root, true);
+        scheduler.thread_tree.set_child_subreaper(inner, true);
+        // The inner subreaper has left the run set but is still its parent
+        // in the record.
+        scheduler.next_turns.remove(&inner);
+        exit_process(&mut scheduler, middle);
+        assert_eq!(
+            scheduler.thread_tree.process_wait[&orphan].wait_parent,
+            Some(root)
+        );
+    }
+
+    /// An orphan that went to the container's init keeps naming its dead
+    /// parent, but its real parent is init. So when it exits in turn, its own
+    /// children go to init too, even if a process above the dead parent has
+    /// become a subreaper since.
+    #[test]
+    fn an_init_orphans_children_do_not_climb_the_stale_parent_chain() {
+        let mut scheduler = process_chain();
+        let [root, _, middle, orphan] = [1, 2, 3, 4].map(DetPid::from_raw);
+        let grandchild = DetPid::from_raw(5);
+        scheduler.thread_tree.add_child(orphan, grandchild, true);
+        register_known_thread(&mut scheduler, grandchild);
+        exit_process(&mut scheduler, middle);
+        assert!(scheduler.thread_tree.is_init_orphan(orphan));
+
+        scheduler.thread_tree.set_child_subreaper(root, true);
+        exit_process(&mut scheduler, orphan);
+
+        assert_eq!(
+            scheduler.thread_tree.process_wait[&grandchild].wait_parent,
+            Some(orphan)
+        );
+        assert!(scheduler.thread_tree.is_init_orphan(grandchild));
+        assert!(
+            !scheduler
+                .has_child_wait_target(root, normal_wait(ChildWaitSelector::Exact(grandchild)))
+        );
+    }
+
+    /// When a subreaper itself exits, the orphans it had inherited move on to
+    /// the next subreaper up the chain, through the edges already moved.
+    #[test]
+    fn a_subreapers_inherited_orphans_move_on_when_it_exits() {
+        let mut scheduler = process_chain();
+        let [root, inner, middle, orphan] = [1, 2, 3, 4].map(DetPid::from_raw);
+        scheduler.thread_tree.set_child_subreaper(root, true);
+        scheduler.thread_tree.set_child_subreaper(inner, true);
+        exit_process(&mut scheduler, middle);
+        assert!(scheduler.consume_child_wait(inner, middle));
+
+        exit_process(&mut scheduler, inner);
+
+        assert_eq!(
+            scheduler.thread_tree.process_wait[&orphan].wait_parent,
+            Some(root)
+        );
+        assert_eq!(
+            scheduler.thread_tree.process_wait[&inner].wait_parent,
+            Some(root)
+        );
+        assert!(scheduler.consume_child_wait(root, inner));
+        assert!(!scheduler.thread_tree.is_child_subreaper(inner));
+    }
+
+    /// A parked waiter of the subreaper wakes when an exited orphan is
+    /// re-parented to it.
+    #[test]
+    fn re_parenting_an_exited_orphan_wakes_the_subreapers_waiter() {
+        let mut scheduler = process_chain();
+        let [_, inner, middle, orphan] = [1, 2, 3, 4].map(DetPid::from_raw);
+        scheduler.thread_tree.set_child_subreaper(inner, true);
+        let spec = normal_wait(ChildWaitSelector::Exact(orphan));
+        scheduler.blocked.child_waiters.insert(inner, (inner, spec));
+        exit_process(&mut scheduler, orphan);
+        assert!(scheduler.blocked.child_waiters.contains_key(&inner));
+
+        exit_process(&mut scheduler, middle);
+
+        assert!(!scheduler.blocked.child_waiters.contains_key(&inner));
+        assert!(scheduler.pending_run_queue_admissions.contains_key(&inner));
     }
 
     #[test]

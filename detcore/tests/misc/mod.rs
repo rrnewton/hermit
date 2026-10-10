@@ -13,6 +13,7 @@ mod notification_fds;
 mod procfs_caller_buffer;
 mod procfs_inode;
 mod readdir_order;
+mod subreaper;
 mod tight_stack_openat;
 mod vfork;
 

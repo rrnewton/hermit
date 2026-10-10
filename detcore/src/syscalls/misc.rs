@@ -12,6 +12,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
 
+use reverie::BackendCapabilities;
 use reverie::Error;
 use reverie::Guest;
 use reverie::syscalls;
@@ -36,6 +37,8 @@ use crate::tool_global::SigalrmControl;
 use crate::tool_global::create_session;
 use crate::tool_global::record_host_timed_signals;
 use crate::tool_global::refuse_sigalrm;
+use crate::tool_global::registered_process_of;
+use crate::tool_global::set_child_subreaper;
 use crate::tool_global::set_process_group;
 use crate::tool_local::Detcore;
 use crate::types::DetPid;
@@ -138,6 +141,25 @@ fn is_supported_prctl_option(option: libc::c_int) -> bool {
 // TODO-HUMAN-REVIEW(PR-1125): Review KVM capability-control prctl forwarding.
 fn is_backend_virtualized_capability_prctl(option: libc::c_int) -> bool {
     matches!(option, libc::PR_CAPBSET_DROP | libc::PR_CAP_AMBIENT)
+}
+
+/// Whether Detcore can admit `PR_SET_CHILD_SUBREAPER`: threads are
+/// sequentialized, so every exit reaches the scheduler through
+/// `deregister_thread` and re-parents there (`Scheduler::reparent_orphans`);
+/// without that, Detcore's record never learns the orphan moved while it still
+/// decides ECHILD. And on `backend`, its own record of children decides waits
+/// (`tracks_process_children`), the kernel rather than the backend performs
+/// them (`!emulates_child_waits`), and a process's exit reaches Detcore only
+/// after the kernel's `exit_notify` has re-parented its children (neither
+/// asynchronous nor separately reported physical exits), so the record agrees
+/// with the kernel. Today that is ptrace, and e9patch preprocessing run under
+/// ptrace, in a sequentialized run.
+fn models_child_subreapers(sequentialize_threads: bool, backend: &BackendCapabilities) -> bool {
+    sequentialize_threads
+        && backend.tracks_process_children
+        && !backend.emulates_child_waits
+        && !backend.process_exits_complete_asynchronously
+        && !backend.reports_physical_process_exits
 }
 
 /// Is `which` one of the Linux `PRIO_*` target selectors for get/setpriority?
@@ -424,6 +446,46 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .await;
                 }
                 self.passthrough(guest, call.into()).await
+            }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-4000)
+            //
+            // The subreaper flag is per-process state only the guest sets, so
+            // the kernel call is deterministic. It is injected in replay too,
+            // like setpgid, rather than replayed from the log: the kernel must
+            // hold the flag for orphans to become this process's children, so
+            // that the waits Detcore injects for them succeed. On success
+            // Detcore mirrors it in its thread tree, in this turn, so that an
+            // orphan re-parented to this process becomes its child for
+            // Detcore's waits too (`Scheduler::reparent_orphans`). The process
+            // is the one Detcore registered the calling thread in, resolved
+            // before the call: a raw clone child with a non-SIGCHLD exit
+            // signal is its own process there, although the backend reports
+            // its creator's pid. A thread with no registered process is
+            // refused before any effect. Linux treats any nonzero argument as
+            // "on". PR_GET_CHILD_SUBREAPER reads the caller's own flag back
+            // from the kernel.
+            libc::PR_SET_CHILD_SUBREAPER
+                if models_child_subreapers(
+                    guest.config().sequentialize_threads,
+                    &guest.config().backend,
+                ) =>
+            {
+                let dettid = guest.thread_state().dettid;
+                let Some(process) = registered_process_of(guest, dettid).await else {
+                    return Err(Errno::ENOSYS.into());
+                };
+                let result = guest.inject(call).await?;
+                set_child_subreaper(guest, process, call.arg2() != 0).await;
+                Ok(result)
+            }
+            libc::PR_GET_CHILD_SUBREAPER
+                if models_child_subreapers(
+                    guest.config().sequentialize_threads,
+                    &guest.config().backend,
+                ) =>
+            {
+                Ok(guest.inject(call).await?)
             }
             option
                 if guest.config().backend.virtualizes_capability_prctls
@@ -1001,6 +1063,31 @@ mod tests {
         assert!(!is_supported_prctl_option(libc::PR_SET_NO_NEW_PRIVS));
         assert!(!is_supported_prctl_option(libc::PR_SET_TIMERSLACK));
         assert!(!is_supported_prctl_option(libc::PR_GET_TIMERSLACK));
+    }
+
+    /// The subreaper prctls are admitted only where Detcore's record of
+    /// children decides waits and the kernel has re-parented by the time an
+    /// exit reaches Detcore: ptrace, and e9patch preprocessing under ptrace,
+    /// with threads sequentialized. Without sequentialization no exit reaches
+    /// the scheduler, nothing re-parents, and a subreaper's wait would see
+    /// ECHILD while its orphan lives, so the call keeps failing with ENOSYS.
+    #[test]
+    fn child_subreaper_prctls_are_admitted_only_where_detcore_models_them() {
+        for backend in [BackendCapabilities::PTRACE, BackendCapabilities::E9PATCH] {
+            assert!(models_child_subreapers(true, &backend), "{backend:?}");
+            assert!(!models_child_subreapers(false, &backend), "{backend:?}");
+        }
+        for backend in [
+            BackendCapabilities::LITEINST_IN_GUEST,
+            BackendCapabilities::SABRE,
+            BackendCapabilities::DBT,
+            BackendCapabilities::KVM,
+        ] {
+            assert!(!models_child_subreapers(true, &backend), "{backend:?}");
+            assert!(!models_child_subreapers(false, &backend), "{backend:?}");
+        }
+        assert!(!is_supported_prctl_option(libc::PR_SET_CHILD_SUBREAPER));
+        assert!(!is_supported_prctl_option(libc::PR_GET_CHILD_SUBREAPER));
     }
 
     #[test]
