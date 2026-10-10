@@ -13,7 +13,8 @@
  * Hermit's PID namespace too.
  *   - rt_sigqueueinfo has no process groups: Linux finds no process for pid
  *     0, a negative pid or -1 and returns ESRCH, natively and under Hermit.
- *   - kill(INT_MIN, sig) is ESRCH: Linux rejects INT_MIN before anything else.
+ *   - kill(INT_MIN, sig) is ESRCH, for SIGKILL too: Linux rejects INT_MIN
+ *     before anything else.
  *   - kill(0, sig), kill(-pgrp, sig) and kill(-1, sig) signal every process
  *     in a set; Detcore does not model that and refuses them by name. A
  *     fail-closed run stops with the policy-refusal status at kill(0);
@@ -72,6 +73,7 @@ int main(int argc, char** argv) {
   report("rt_sigqueueinfo(-pgrp)", queue(-getpgrp()));
   report("rt_sigqueueinfo(-1)", queue(-1));
   report("kill(INT_MIN)", kill(INT_MIN, SIGUSR1));
+  report("kill(INT_MIN, SIGKILL)", kill(INT_MIN, SIGKILL));
   report("kill(0)", kill(0, SIGUSR1));
   report("kill(-pgrp)", kill(-getpgrp(), SIGUSR1));
   if (broadcast) {

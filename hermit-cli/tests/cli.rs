@@ -21197,7 +21197,8 @@ fn a_process_directed_signal_to_several_threads_is_refused_by_name() {
 /// real ones. `rt_sigqueueinfo` has no process groups: for pid 0, `-pgrp` or -1
 /// Linux returns ESRCH and sends nothing, and Hermit forwards the call and gets
 /// the same answer (it returned ENOSYS before). `kill(INT_MIN, sig)` is ESRCH
-/// in Linux, and Hermit forwards it rather than overflowing on its negation.
+/// in Linux, SIGKILL included, and Hermit forwards it rather than overflowing
+/// on its negation (the process-group SIGKILL arm negates the pid too).
 /// `kill(0, sig)`, `kill(-pgrp, sig)` and `kill(-1, sig)` signal every process
 /// in a set, which Detcore does not model:
 /// - a fail-closed run stops with the policy-refusal status at `kill(0)` and
@@ -21211,7 +21212,8 @@ fn a_signal_to_a_process_group_is_refused_by_name() {
                     rt_sigqueueinfo(0): -1 ESRCH, handled 0\n\
                     rt_sigqueueinfo(-pgrp): -1 ESRCH, handled 0\n\
                     rt_sigqueueinfo(-1): -1 ESRCH, handled 0\n\
-                    kill(INT_MIN): -1 ESRCH, handled 0\n";
+                    kill(INT_MIN): -1 ESRCH, handled 0\n\
+                    kill(INT_MIN, SIGKILL): -1 ESRCH, handled 0\n";
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let (status, log) = run_with_deadline(
         hermit_command(&[

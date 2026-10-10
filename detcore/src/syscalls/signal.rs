@@ -1051,7 +1051,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// run stops with the policy-refusal status and
     /// `--allow-unsupported-syscalls` returns ENOSYS, as the call did before.
     /// A SIGKILL to another group is forwarded before this point
-    /// (`can_forward_process_group_signal`).
+    /// (`can_forward_process_group_signal`), except on a backend that needs
+    /// thread-directed process signals (DBT), where it is refused here too.
     async fn refuse_group_signal<G: Guest<Self>>(
         &self,
         guest: &mut G,
