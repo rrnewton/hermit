@@ -2435,7 +2435,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_killed_verify_leaves_its_logs_in_verify_tmpdir_not_tmpdir and
     // an_unusable_verify_tmpdir_is_a_clean_error_naming_the_variable
     // (https://github.com/rrnewton/dev-hermit/issues/553) retain all 294: 297.
-    ("test.cli", 297),
+    // group_kills_never_reach_the_host_without_sequentialized_threads
+    // (https://github.com/rrnewton/hermit/issues/4057) retains all 297: 298.
+    ("test.cli", 298),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2658,7 +2660,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // key/access and file-backed WAKE_OP tests: 230.
     // Nor do the three HERMIT_VERIFY_TMPDIR tests, which start ptrace guests or
     // none: 233.
-    ("test.cli_on_host", 233),
+    // Nor does the unsequentialized group-kill test: 234.
+    ("test.cli_on_host", 234),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 55),
