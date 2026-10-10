@@ -523,6 +523,12 @@
       "why": "tests/c/futex_requeue_wake_op.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test futex_requeue_and_wake_op_match_linux compiles this guest, which exercises FUTEX_REQUEUE, FUTEX_CMP_REQUEUE, FUTEX_WAKE_OP and the futex commands Linux answers with an errno and requires Linux's native output (https://github.com/rrnewton/hermit/issues/3958); it remains a guest fixture because a generic manifest cannot assert this exact output or refusal status."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/futex_wait_unreadable_word.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/futex_wait_unreadable_word.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_futex_wait_on_an_unreadable_word_is_efault compiles this guest, which calls FUTEX_WAIT and FUTEX_WAIT_BITSET on unmapped and PROT_NONE words, private and shared, and requires Linux's EFAULT for each (EAGAIN for the readable control) under run --strict (https://github.com/rrnewton/hermit/issues/4030); it remains a guest fixture because a generic manifest cannot assert this exact output."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/futex_waitv_enosys.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
