@@ -10,6 +10,8 @@ use std::process::Command;
 use goblin::elf::Elf;
 use goblin::elf::header;
 use goblin::elf::section_header;
+use goblin::elf::sym;
+use serde_json::Value;
 
 mod artifact;
 
@@ -27,6 +29,12 @@ fn has_preload_constructor(path: &Path) -> io::Result<bool> {
     else {
         return Ok(false);
     };
+    if initializer.st_value == 0
+        || initializer.st_shndx == section_header::SHN_UNDEF as usize
+        || initializer.st_type() != sym::STT_FUNC
+    {
+        return Ok(false);
+    }
     let Some(init_array) = elf
         .section_headers
         .iter()
@@ -79,6 +87,7 @@ fn copy_into_protected_stage(source: &Path, destination: &Path) -> io::Result<()
 
 fn main() {
     println!("cargo:rerun-if-env-changed=HERMIT_LITEINST_STAGE");
+    println!("cargo:rerun-if-env-changed=HERMIT_LITEINST_REVERIE_PIN");
     println!("cargo:rerun-if-env-changed=PROFILE");
     println!("cargo:rerun-if-changed=Cargo.lock");
     println!("cargo:rerun-if-changed=artifact.rs");
@@ -108,14 +117,80 @@ fn main() {
         env::var_os("CARGO_MANIFEST_DIR").expect("Cargo did not set CARGO_MANIFEST_DIR"),
     );
     let nested_target = out_dir.join("runtime-target");
-    let output = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let metadata_output = Command::new(&cargo)
+        .args(["metadata", "--locked", "--format-version", "1"])
+        .current_dir(&manifest_dir)
+        .env_remove("HERMIT_LITEINST_STAGE")
+        .output()
+        .expect("failed to resolve the locked standalone preload package");
+    assert!(
+        metadata_output.status.success(),
+        "standalone preload metadata failed: {}",
+        String::from_utf8_lossy(&metadata_output.stderr)
+    );
+    let metadata: Value = serde_json::from_slice(&metadata_output.stdout)
+        .expect("standalone preload metadata was not Cargo JSON");
+    let packages: Vec<_> = metadata["packages"]
+        .as_array()
+        .expect("Cargo metadata has no packages")
+        .iter()
+        .filter(|package| package["name"] == "reverie-liteinst-preload")
+        .collect();
+    assert_eq!(
+        packages.len(),
+        1,
+        "expected one resolved standalone preload leaf"
+    );
+    let package = packages[0];
+    let source = package["source"]
+        .as_str()
+        .expect("preload leaf must have a Git source");
+    let revision = source
+        .strip_prefix("git+https://github.com/rrnewton/reverie.git?rev=")
+        .and_then(|suffix| suffix.split_once('#'))
+        .filter(|(pin, commit)| {
+            pin == commit
+                && pin.len() == 40
+                && pin
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+        .map(|(pin, _)| pin)
+        .expect("preload leaf must resolve the exact full Reverie revision");
+    if let Some(requested) = env::var_os("HERMIT_LITEINST_REVERIE_PIN") {
+        assert_eq!(
+            requested.to_str(),
+            Some(revision),
+            "staged revision differs from the resolved leaf"
+        );
+    }
+    let package_id = package["id"]
+        .as_str()
+        .expect("preload leaf has no package ID");
+    let version = package["version"]
+        .as_str()
+        .expect("preload leaf has no version");
+    assert_eq!(
+        package_id,
+        format!(
+            "git+https://github.com/rrnewton/reverie.git?rev={revision}#reverie-liteinst-preload@{version}"
+        )
+    );
+    let package_manifest = PathBuf::from(
+        package["manifest_path"]
+            .as_str()
+            .expect("preload leaf has no manifest"),
+    );
+    let output = Command::new(&cargo)
         .args([
             "build",
             "--locked",
             "--manifest-path",
             "Cargo.toml",
             "-p",
-            "hermit-liteinst-runtime-artifact",
+            "reverie-liteinst-preload",
+            "--lib",
             "--profile",
             profile,
             "--target-dir",
@@ -136,25 +211,25 @@ fn main() {
     }
     let messages = String::from_utf8(output.stdout)
         .expect("isolated LiteInst runtime Cargo output was not UTF-8");
-    let candidates = artifact::liteinst_cdylibs_from_cargo_messages(&messages)
-        .unwrap_or_else(|error| panic!("failed to parse isolated Cargo output: {error}"));
-    assert_eq!(
-        candidates.len(),
-        1,
-        "expected exactly one LiteInst cdylib in current isolated Cargo output, found {candidates:?}",
+    let candidate =
+        artifact::liteinst_cdylib_from_cargo_messages(&messages, package_id, &package_manifest)
+            .unwrap_or_else(|error| panic!("failed to parse isolated Cargo output: {error}"));
+    assert!(
+        candidate.starts_with(&nested_target),
+        "current preload output is outside the isolated target root"
     );
     assert!(
-        has_preload_constructor(&candidates[0]).unwrap_or_else(|error| panic!(
+        has_preload_constructor(&candidate).unwrap_or_else(|error| panic!(
             "failed to validate current LiteInst artifact {}: {error}",
-            candidates[0].display()
+            candidate.display()
         )),
         "current LiteInst artifact lacks the preload constructor: {}",
-        candidates[0].display()
+        candidate.display()
     );
-    copy_into_protected_stage(&candidates[0], &destination).unwrap_or_else(|error| {
+    copy_into_protected_stage(&candidate, &destination).unwrap_or_else(|error| {
         panic!(
             "failed to stage {} as {}: {error}",
-            candidates[0].display(),
+            candidate.display(),
             destination.display()
         )
     });

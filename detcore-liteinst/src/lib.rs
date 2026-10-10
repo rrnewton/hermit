@@ -23,6 +23,13 @@ mod glibc_compat;
 
 use std::path::Path;
 
+// The preload leaf owns all Rust allocations, including constructor work
+// outside installation and dispatch scopes. The shared LiteInst rlib remains
+// allocator neutral.
+#[global_allocator]
+static TOOL_ALLOCATOR: reverie_liteinst::PrivateToolAllocator =
+    reverie_liteinst::PrivateToolAllocator;
+
 // Errors are printed without the C library's errno messages: strerror_r can
 // allocate through the guest's malloc (see describe_io_error).
 use reverie_inguest::guest::support::describe_io_error;
@@ -81,18 +88,9 @@ static TOOL_OUTPUT_IDENTITY: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLo
 /// is still single-threaded and before any seccomp filter is active.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn detcore_liteinst_initialize() {
-    // Outside a Tool callback this library's Rust allocations would come from
-    // the guest's own malloc (the runtime's allocator forwards there), so what
-    // this constructor reads and builds (environment values, the
-    // /proc/self/fd listing and its links, the Tool installed below and the
-    // configuration it receives, the open file channel) would stay in the
-    // guest's heap, where the guest's own allocations find it before `main`.
-    // Its sizes follow host state (the configuration lists every mount the
-    // guest's namespace holds), so the guest's heap layout would differ
-    // between two runs of one program. Allocate everything from the runtime's
-    // private Tool heap instead, as a Tool callback does, until the
-    // constructor returns: the guest's heap is then exactly what the program
-    // itself made.
+    // Retain the constructor's dispatch lifetime. The preload's allocator
+    // owns Rust allocations unconditionally; this guard does not choose
+    // between Tool storage and the guest's malloc.
     let _private_allocations = reverie_inguest::guest::alloc::enter_dispatch();
     let Some(socket) = std::env::var_os(reverie_liteinst::COORDINATOR_ENV) else {
         fail("the coordinator socket environment variable is missing");

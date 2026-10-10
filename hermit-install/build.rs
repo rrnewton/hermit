@@ -380,7 +380,11 @@ fn main() {
     // pin.
     println!("cargo:rerun-if-changed=../detcore/Cargo.toml");
     println!("cargo:rerun-if-changed=../liteinst-runtime-build/Cargo.lock");
+    println!("cargo:rerun-if-changed=../liteinst-runtime-build/Cargo.toml");
+    println!("cargo:rerun-if-changed=../liteinst-runtime-build/build.rs");
+    println!("cargo:rerun-if-changed=../liteinst-runtime-build/artifact.rs");
     println!("cargo:rerun-if-changed=../liteinst-runtime-build/runtime/Cargo.toml");
+    println!("cargo:rerun-if-changed=../liteinst-runtime-build/runtime/src/lib.rs");
 
     // Cargo sets PROFILE to "release" for `release` and for every custom
     // profile that inherits from it, such as the validation profile

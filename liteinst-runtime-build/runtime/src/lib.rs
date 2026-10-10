@@ -1,1 +1,1 @@
-//! Dependency-only target for the constructor-enabled LiteInst runtime.
+//! Dependency-only target for the owned standalone LiteInst preload.

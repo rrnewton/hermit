@@ -1317,7 +1317,16 @@ fi
 # third-party, root Cargo.toml and rust-toolchain.toml are byte-identical
 # by Git object, including all seven recorded SDK inputs. Carry the existing
 # budget and job clamp; this is not a new timing calibration.
-expected_pin=630259bfb5006c3b2b820aae3ddcf5b20a53eaef
+# CARRY TO 0352d5da9b9422fe690bbc87511479e80b0080fe (2026-10-10): from
+# 630259bfb5006c3b2b820aae3ddcf5b20a53eaef. The allocator-owned preload leaf
+# and checked pinned mounts change no native DynamoRIO SDK recipe input:
+# reverie-dbt/Cargo.toml, build.rs, native/CMakeLists.txt, vendor/dynamorio,
+# third-party and rust-toolchain.toml are byte-identical by Git object.
+# Root Cargo.toml adds the preload workspace member; it is not hashed by
+# source_recipe_key (vendor, build.rs, CMAKE, CMAKE_GENERATOR,
+# SOURCE_DATE_EPOCH). With the same tooling and epoch, carry the existing
+# budget and sixteen-job clamp; this is not a new timing calibration.
+expected_pin=0352d5da9b9422fe690bbc87511479e80b0080fe
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
