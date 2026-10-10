@@ -1619,12 +1619,13 @@ pub struct ThreadStats {
     /// A simple count of how many syscalls have been handled on this thread.
     pub syscall_count: u64,
 
-    /// This thread's happens-before syscall-occurrence counters: per (syscall,
-    /// fd) a syscall-occurrence anchor names, how many of this thread's
-    /// syscall entries matched (`HappensBeforeProgram::count_syscall_occurrences`).
-    /// Empty unless the run has such an anchor; zero for every new thread, like
-    /// `syscall_count`.
-    pub hb_occurrences: detcore_model::happens_before::OccurrenceCounters,
+    /// This thread's happens-before counting state: per (syscall, fd, futex
+    /// operation) a syscall-occurrence anchor names, how many of this thread's
+    /// syscall entries matched, and the origin of each relative anchor whose
+    /// base this thread reached (`HappensBeforeProgram::count_syscall_occurrences`).
+    /// Empty unless the run has such an anchor; empty for every new thread,
+    /// like `syscall_count`.
+    pub hb_occurrences: detcore_model::happens_before::HbThreadCounters,
 
     /// How many register-file samples this thread has CONSIDERED for `--detlog-regs`.
     ///

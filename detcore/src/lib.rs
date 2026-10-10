@@ -2651,7 +2651,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 .expect("checked above");
             let reached = if program.has_syscall_occurrence_anchors() {
                 let (sysno, args) = call.into_parts();
-                program.count_syscall_occurrences(&mut counters, dettid, sysno, args.arg0)
+                program.count_syscall_occurrences(
+                    &mut counters,
+                    dettid,
+                    sysno,
+                    [args.arg0, args.arg1],
+                    new_count,
+                )
             } else {
                 Vec::new()
             };
