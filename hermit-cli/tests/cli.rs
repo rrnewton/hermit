@@ -5214,24 +5214,37 @@ fn run_dbt_recovers_after_failed_exec() {
     let program = dbt_exec_failure_guest()
         .to_str()
         .expect("DBT exec-failure guest path should be UTF-8");
-    let args = [
-        "--backend",
-        "dbt",
-        "run",
-        "--strict",
-        "--verify",
-        "--",
-        program,
-    ];
-    let output = hermit(&args);
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create DBT exec lifecycle test directory");
+    for exec_self in [false, true] {
+        let verdict_path = directory.path().join(format!("exec-{exec_self}.json"));
+        let mut args = vec![
+            "--backend",
+            "dbt",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            verdict_path.to_str().expect("verdict path should be UTF-8"),
+            "--",
+            program,
+        ];
+        if exec_self {
+            args.push("--exec-self");
+        }
+        let output = hermit(&args);
 
-    assert_success(&output, &args);
-    assert_eq!(stdout(&output), "recovered after failed exec\n");
-    assert!(
-        stderr(&output).contains(":: Success: deterministic. Determinism verified."),
-        "DBT determinism confirmation missing:\n{}",
-        stderr(&output),
-    );
+        assert_success(&output, &args);
+        let expected = if exec_self {
+            "recovered after failed exec\nsuccessful exec after failed exec\n"
+        } else {
+            "recovered after failed exec\n"
+        };
+        assert_eq!(stdout(&output), expected);
+        let report = read_terminal_dbt_verdict(&verdict_path);
+        assert_eq!(report["verdict"], "matched", "{report}");
+    }
 }
 /// The reference behavior for the guest the DBT backend-failure tests use:
 /// ptrace reads the guest's unreadable timeval word through the tracer, so

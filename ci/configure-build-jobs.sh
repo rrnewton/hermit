@@ -1426,8 +1426,15 @@ fi
 # Actual tracked DBT inventory remains 939. Keep the 16-job clamp, 1050
 # effective-job-second wrapper budget and 572-job-second cold-build fallback.
 # This SDK recipe carry is not native/runtime identity or a fresh timing sample.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != bb656c7bf3f008af11d12866b3156f2905246f9f ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie bb656c7bf3f008af11d12866b3156f2905246f9f (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# PUBLISHED EXEC-HELPER CARRY TO 6f7c2617e933cc4a9107e4a5d67aec1f146b5528 (2026-10-10):
+# From bb656c7bf3f008af11d12866b3156f2905246f9f, helper retirement and clone
+# classification change. SDK recipe inputs, native CMake topology, third-party
+# trees and rust-toolchain.toml remain Git-object identical. Preserve CMAKE,
+# CMAKE_GENERATOR and normalized SOURCE_DATE_EPOCH for the existing calibration.
+# Two regression fixtures raise the tracked DBT inventory from 939 to 941.
+# Keep the existing job clamp and timing budgets; this is not a new timing sample.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 6f7c2617e933cc4a9107e4a5d67aec1f146b5528 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 6f7c2617e933cc4a9107e4a5d67aec1f146b5528 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
