@@ -970,7 +970,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (hermit-manifest-plan, https://github.com/rrnewton/hermit/issues/4029)
     // retains all 1039: 1040.
     // The required allocator prerequisite mutation test retains all 1039 prior identities: 1040.
-    ("test.regular_crates", 1046),
+    // happens_before::tests::{a_posthook_anchor_is_counted_at_entry_and_refused_on_no_return_syscalls,
+    // a_posthook_anchor_shares_its_counter_and_starts_windows_at_its_entry}
+    // (https://github.com/rrnewton/hermit/issues/3929) retain all 1046: 1048.
+    ("test.regular_crates", 1048),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1818,7 +1821,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tool_global::test::sigkill_notifications_record_the_doomed_process
     // (https://github.com/rrnewton/hermit/issues/3904) retain all 1324: 1328.
     // And a_committed_sigchld_ends_a_gated_wait_unless_a_host_timed_source_can_post_it and a_precise_futex_wait_holds_a_committed_signal_only_if_a_host_timed_source_can_post_it (https://github.com/rrnewton/hermit/issues/4005): 1330.
-    ("test.detcore_unit", 1330),
+    // a_posthook_checkpoint_fires_only_on_a_final_result,
+    // io_buffers::event_tests::a_posthook_anchor_fires_on_an_observer_errno_like_a_success
+    // and scheduler::test::{an_interrupted_posthook_anchor_is_refused_and_does_not_fire,
+    // an_interrupted_posthook_refusal_grants_no_turn}
+    // (https://github.com/rrnewton/hermit/issues/3929) retain all 1330: 1334.
+    ("test.detcore_unit", 1334),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2392,7 +2400,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4034) retains all 279: 280.
     // a_signal_to_a_process_group_is_refused_by_name
     // (https://github.com/rrnewton/hermit/issues/4046) retains all 280: 281.
-    ("test.cli", 281),
+    // happens_before_posthook_{before_anchor_orders_the_completed_write,
+    // after_anchor_holds_the_thread_after_its_call, edge_passes_strict_verify,
+    // anchor_on_an_interrupted_call_is_refused_by_name,
+    // child_wait_cycle_is_refused_by_name,
+    // read_with_a_held_writer_ends_at_the_timeout,
+    // anchor_with_replay_schedule_is_refused,
+    // anchor_of_a_thread_that_exits_mid_call_never_fires} and
+    // happens_before_alarm_at_a_thread_held_at_a_posthook_gate_leaves_it_held
+    // (https://github.com/rrnewton/hermit/issues/3929) retain all 281: 290.
+    ("test.cli", 290),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2610,7 +2627,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 215.
     // Nor does the multithreaded process-directed signal test: 216.
     // Nor does the process-group signal test: 217.
-    ("test.cli_on_host", 217),
+    // And the nine posthook-anchor CLI tests: 226.
+    ("test.cli_on_host", 226),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 55),
@@ -2741,7 +2759,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same unknown-sleeping-mask test: 1324.
     // And the four child-wait deadlock tests: 1328.
     // And a_committed_sigchld_ends_a_gated_wait_unless_a_host_timed_source_can_post_it and a_precise_futex_wait_holds_a_committed_signal_only_if_a_host_timed_source_can_post_it (https://github.com/rrnewton/hermit/issues/4005): 1330.
-    ("test.detcore_unit_on_host", 1330),
+    // And the four posthook-anchor tests: 1334.
+    ("test.detcore_unit_on_host", 1334),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -2966,7 +2985,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the duplicated-field model test: 1039.
     // And the guest permission-denied first-run-rejection test: 1040.
     // And the same allocator prerequisite mutation test: 1040.
-    ("test.regular_crates_on_host", 1046),
+    // And the two posthook-anchor model tests: 1048.
+    ("test.regular_crates_on_host", 1048),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
