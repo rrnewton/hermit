@@ -2120,7 +2120,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     },
                     // A new thread has made no syscall yet.
                     restart_block: None,
-                    scratch_page: None,
                     // A fork child inherits its parent's signal dispositions.
                     sigalrm_handled: pts.1.sigalrm_handled,
                     sigalrm_blocked_published: pts.1.sigalrm_blocked_published,
@@ -2307,8 +2306,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 .add_syscall_with_cost(syscall_time::cost_ns(Sysno::execve));
         }
         guest.thread_state_mut().past_global_first_execve = true;
-        // The new image has none of the old one's mappings.
-        guest.thread_state_mut().scratch_page = None;
         // exec resets a handled signal to its default action.
         guest.thread_state_mut().sigalrm_handled = false;
         guest.thread_state_mut().sigalrm_blocked_published = false;

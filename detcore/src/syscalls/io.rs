@@ -51,7 +51,6 @@ use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::refuse_held_signal_loss;
 use crate::syscalls::helpers::result_after_restore;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
-use crate::syscalls::helpers::stage_in_thread_scratch_page;
 use crate::syscalls::network_trace::received_descriptors;
 use crate::syscalls::signal::kernel_installed_signal_mask;
 use crate::syscalls::signal::read_kernel_sigset;
@@ -115,12 +114,49 @@ pub(super) struct Pselect6SigmaskArg {
     pub(super) sigsetsize: usize,
 }
 
+/// Where a private copy of a pselect6 temporary mask lives while the kernel
+/// reads it (`stage_pselect6_mask_copy`).
+enum StagedMaskStorage<Guard> {
+    /// The guest stack scratch below the red zone, checked out by the guard.
+    Stack(Guard),
+    /// The top of the guest's red zone, whose bytes `saved` holds until
+    /// `StagedMask::release` writes them back.
+    RedZone {
+        at: usize,
+        saved: [u8; STAGED_MASK_LEN],
+    },
+}
+
 /// A private, kernel-readable copy of a pselect6 temporary mask, as the
-/// `{ sigmask, sigsetsize }` wrapper a pselect6 passes (`wrapper`). Holds the
-/// stack scratch while the copy lives there.
+/// `{ sigmask, sigsetsize }` wrapper a pselect6 passes (`wrapper`).
 struct StagedMask<Guard> {
     wrapper: usize,
-    _stack: Option<Guard>,
+    storage: StagedMaskStorage<Guard>,
+}
+
+/// The mask and its `{ sigmask, sigsetsize }` wrapper, in that order.
+const STAGED_MASK_LEN: usize =
+    std::mem::size_of::<KernelSigset>() + std::mem::size_of::<Pselect6SigmaskArg>();
+
+impl<Guard> StagedMask<Guard> {
+    /// Gives the storage back once the call has returned: drops the stack
+    /// guard, or writes the guest's red-zone bytes back. That is a write to
+    /// guest memory, not an injected syscall, so a call that ended with a
+    /// restart code goes back to the kernel untouched.
+    fn release<G, T>(self, guest: &mut G)
+    where
+        G: Guest<Detcore<T>>,
+        T: RecordOrReplay,
+    {
+        if let StagedMaskStorage::RedZone { at, saved } = self.storage
+            && let Err(errno) = AddrMut::<u8>::from_raw(at)
+                .ok_or(Errno::EFAULT)
+                .and_then(|bytes| guest.memory().write_exact(bytes, &saved))
+        {
+            // Not expected: the same bytes were written before the call.
+            tracing::warn!("[detcore] could not restore the red zone after a pselect6: {errno}");
+        }
+    }
 }
 
 /// Stages a private copy of `mask` that the kernel can read as a pselect6
@@ -128,11 +164,19 @@ struct StagedMask<Guard> {
 ///
 /// The copy goes in the guest stack scratch below the red zone when that is
 /// writable. A thread may run with no writable memory there, on a stack it
-/// placed near the start of a page, and a pselect6 on such a stack is valid,
-/// so a scratch commit that faults stages the copy in the thread's read-only
-/// scratch page instead (`stage_in_thread_scratch_page`; Codex re-check of
-/// https://github.com/rrnewton/hermit/pull/4053). Whether the scratch faults is
-/// a function of the guest's own stack, so the choice is deterministic.
+/// placed near the start of a page, and a pselect6 on such a stack is valid
+/// (Codex re-check of https://github.com/rrnewton/hermit/pull/4053). Then the
+/// copy goes in the top 24 bytes of the red zone, whose bytes are saved here
+/// and written back by `StagedMask::release` when the call returns. The guest
+/// runs no code in between: the call holds the thread in the kernel, a signal
+/// frame is built below the red zone, and a call the kernel restarts comes
+/// back as a new syscall with the guest's own arguments, which is staged
+/// again. Nothing is mapped, so the guest's address space is unchanged (Codex
+/// re-check of the earlier per-thread page). Only a stack pointer within 24
+/// bytes of unwritable memory still gets EFAULT.
+///
+/// Whether the scratch faults is a function of the guest's own stack, so the
+/// choice is deterministic.
 async fn stage_pselect6_mask_copy<G, T>(
     guest: &mut G,
     mask: KernelSigset,
@@ -151,24 +195,34 @@ where
         Ok(guard) => {
             return Ok(StagedMask {
                 wrapper: wrapper.as_raw(),
-                _stack: Some(guard),
+                storage: StagedMaskStorage::Stack(guard),
             });
         }
         Err(Errno::EFAULT) => {}
         Err(errno) => return Err(errno),
     }
-    // The mask, then the wrapper that points at it.
-    let mask_copy = stage_in_thread_scratch_page(guest, |at| {
-        let mut bytes = mask.to_ne_bytes().to_vec();
-        bytes.extend_from_slice(&at.to_ne_bytes());
-        bytes.extend_from_slice(&KERNEL_SIGSET_SIZE.to_ne_bytes());
-        bytes
-    })
-    .await?;
-    Ok(StagedMask {
-        wrapper: mask_copy + std::mem::size_of::<KernelSigset>(),
-        _stack: None,
-    })
+    let at = (guest.regs().await.rsp as usize)
+        .checked_sub(STAGED_MASK_LEN)
+        .ok_or(Errno::EFAULT)?
+        & !7;
+    let bytes = AddrMut::<u8>::from_raw(at).ok_or(Errno::EFAULT)?;
+    let mut saved = [0u8; STAGED_MASK_LEN];
+    guest.memory().read_exact(bytes, &mut saved)?;
+    let mut cells = [0u8; STAGED_MASK_LEN];
+    let mask_len = std::mem::size_of::<KernelSigset>();
+    cells[..mask_len].copy_from_slice(&mask.to_ne_bytes());
+    cells[mask_len..mask_len + 8].copy_from_slice(&at.to_ne_bytes());
+    cells[mask_len + 8..].copy_from_slice(&KERNEL_SIGSET_SIZE.to_ne_bytes());
+    let staged = StagedMask {
+        wrapper: at + mask_len,
+        storage: StagedMaskStorage::RedZone { at, saved },
+    };
+    if let Err(errno) = guest.memory().write_exact(bytes, &cells) {
+        // A write that failed partway may have changed some bytes.
+        staged.release(guest);
+        return Err(errno);
+    }
+    Ok(staged)
 }
 
 pub(super) fn pselect6_fd_set_len(nfds: i32) -> Result<usize, Errno> {
@@ -652,7 +706,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Some(kernel_installed_signal_mask(mask)),
                 )
                 .await;
-            drop(staged);
+            staged.release(guest);
             return result;
         }
 

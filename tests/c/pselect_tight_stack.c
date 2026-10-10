@@ -19,11 +19,19 @@
  *            again, then times out after 50 ms and returns 0.
  *   again    the ready call once more.
  *
+ * Then two batches of four threads each make the ready call on a stack of
+ * their own at the same depth. The bytes mapped, summed over /proc/self/maps,
+ * must be the same before the main thread's calls and after them (maps), and
+ * after each batch (threads; glibc reuses the first batch's thread stacks for
+ * the second): Hermit must leave no mapping of its own behind, per call or per
+ * thread.
+ *
  * Natively every mode prints
- *   mode=<mode> ready=1 signal=-4 alarms=1 restart=0 again=1 oracle=1
+ *   mode=<mode> ready=1 signal=-4 alarms=1 restart=0 again=1 maps=1 threads=1 oracle=1
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -91,6 +99,59 @@ static long select_on(unsigned char *stack, int fd, long seconds, long nanos) {
     return pselect_on_stack(stack, NFDS, &readable, &timeout, &wrapper);
 }
 
+/* The bytes mapped in this address space, summed over /proc/self/maps.
+ * Adjacent anonymous pages with the same protection merge into one line, so a
+ * line count could hide a new page; the total cannot. */
+static long mapped_bytes(void) {
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps)
+        return -1;
+    long total = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), maps)) {
+        unsigned long start, end;
+        if (sscanf(line, "%lx-%lx", &start, &end) != 2) {
+            fclose(maps);
+            return -1;
+        }
+        total += (long)(end - start);
+        /* Skip the rest of an overlong line. */
+        while (!strchr(line, '\n') && fgets(line, sizeof(line), maps))
+            ;
+    }
+    fclose(maps);
+    return total;
+}
+
+#define WORKERS 4
+
+struct worker {
+    unsigned char *stack;
+    int fd;
+    long result;
+};
+
+static void *work(void *arg) {
+    struct worker *worker = arg;
+    worker->result = select_on(worker->stack, worker->fd, 2, 0);
+    return NULL;
+}
+
+/* Runs one batch of workers; returns how many saw their pipe ready. */
+static int run_batch(struct worker *workers) {
+    pthread_t threads[WORKERS];
+    for (int i = 0; i < WORKERS; i++)
+        if (pthread_create(&threads[i], NULL, work, &workers[i]) != 0)
+            return -1;
+    int ready = 0;
+    for (int i = 0; i < WORKERS; i++) {
+        if (pthread_join(threads[i], NULL) != 0)
+            return -1;
+        ready += workers[i].result == 1;
+    }
+    return ready;
+}
+
 int main(int argc, char **argv) {
     size_t offset;
     if (argc != 2)
@@ -139,6 +200,19 @@ int main(int argc, char **argv) {
     if (write(ready_pipe[1], "x", 1) != 1)
         return 10;
 
+    /* Every mapping the run needs is made before the first count. */
+    struct worker workers[WORKERS];
+    for (int i = 0; i < WORKERS; i++) {
+        unsigned char *worker_area =
+            mmap(NULL, page * 2, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (worker_area == MAP_FAILED ||
+            mprotect(worker_area + page, page, PROT_READ | PROT_WRITE) != 0)
+            return 13;
+        workers[i].stack = worker_area + page + offset;
+        workers[i].fd = ready_pipe[0];
+    }
+    long maps_before = mapped_bytes();
+
     long ready = select_on(stack, ready_pipe[0], 2, 0);
 
     struct itimerval timer = {{0, 0}, {0, 100000}};
@@ -152,10 +226,24 @@ int main(int argc, char **argv) {
     long restart = select_on(stack, idle_pipe[0], 0, 50000000);
 
     long again = select_on(stack, ready_pipe[0], 2, 0);
+    long maps_after = mapped_bytes();
 
+    int first_batch = run_batch(workers);
+    long maps_first = mapped_bytes();
+    int second_batch = run_batch(workers);
+    long maps_second = mapped_bytes();
+
+    int maps = maps_before > 0 && maps_after == maps_before;
+    int threads = first_batch == WORKERS && second_batch == WORKERS && maps_first > 0 &&
+                  maps_second == maps_first;
     int oracle = ready == 1 && signal == -EINTR && alarms_seen == 1 && restart == 0 &&
-                 again == 1;
-    printf("mode=%s ready=%ld signal=%ld alarms=%d restart=%ld again=%ld oracle=%d\n",
-           argv[1], ready, signal, alarms_seen, restart, again, oracle);
+                 again == 1 && maps && threads;
+    printf("mode=%s ready=%ld signal=%ld alarms=%d restart=%ld again=%ld maps=%d "
+           "threads=%d oracle=%d\n",
+           argv[1], ready, signal, alarms_seen, restart, again, maps, threads, oracle);
+    if (!oracle)
+        fprintf(stderr, "maps before=%ld after=%ld first=%ld second=%ld batches=%d,%d\n",
+                maps_before, maps_after, maps_first, maps_second, first_batch,
+                second_batch);
     return oracle ? 0 : 42;
 }

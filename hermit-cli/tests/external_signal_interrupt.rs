@@ -2160,10 +2160,13 @@ fn ptrace_large_pselect6_sleeps_under_its_entry_mask_while_a_sibling_rewrites_it
 /// tests/c/pselect_tight_stack.c makes a ready call, a call ended by a SIGALRM
 /// that only the temporary mask unblocks, a call the kernel restarts for an
 /// ignored SIGCONT (re-reading its mask), and a ready call again, on a stack
-/// 144, 160 and 1024 bytes into its page, and must print what Linux prints.
-/// Staging the copy on the stack returned EFAULT in the tight mode; unmapping
-/// a transient page after the call restarted the signal-ended call forever
-/// (Codex re-check of https://github.com/rrnewton/hermit/pull/4053).
+/// 144, 160 and 1024 bytes into its page, then two batches of four threads
+/// make the ready call on stacks of their own, and the bytes mapped must not
+/// change. It must print what Linux prints. Staging the copy on the stack
+/// returned EFAULT in the tight mode; unmapping a transient page after the
+/// call restarted the signal-ended call forever; a per-thread page left a
+/// mapping behind for every thread that used it (Codex re-checks of
+/// https://github.com/rrnewton/hermit/pull/4053).
 #[test]
 fn ptrace_large_pselect6_on_a_stack_with_no_scratch_behaves_as_natively() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2173,7 +2176,7 @@ fn ptrace_large_pselect6_on_a_stack_with_no_scratch_behaves_as_natively() {
     fs::create_dir_all(&root).expect("failed to create guest build directory");
     let witness = root.join(format!("pselect_tight_stack.{}", std::process::id()));
     let compiled = Command::new("cc")
-        .args(["-O2", "-Wall", "-Wextra", "-Werror"])
+        .args(["-O2", "-Wall", "-Wextra", "-Werror", "-pthread"])
         .arg(repository.join("tests/c/pselect_tight_stack.c"))
         .arg("-o")
         .arg(&witness)
@@ -2206,7 +2209,9 @@ fn ptrace_large_pselect6_on_a_stack_with_no_scratch_behaves_as_natively() {
             .output()
             .expect("failed to run hermit");
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let expected = format!("mode={mode} ready=1 signal=-4 alarms=1 restart=0 again=1 oracle=1");
+        let expected = format!(
+            "mode={mode} ready=1 signal=-4 alarms=1 restart=0 again=1 maps=1 threads=1 oracle=1"
+        );
         assert!(
             output.status.success() && stdout.contains(&expected),
             "{mode}: expected `{expected}`, as natively, with exit 0; got {}\nstdout:\n{stdout}\nstderr:\n{}",
