@@ -959,7 +959,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // happens_before::tests::a_duplicated_field_is_refused (detcore-model,
     // Codex review of https://github.com/rrnewton/hermit/pull/4004) retains
     // all 1038: 1039.
-    ("test.regular_crates", 1039),
+    // runner::tests::a_guest_permission_denied_under_a_first_run_rejection_is_a_product_crash
+    // (hermit-manifest-plan, https://github.com/rrnewton/hermit/issues/4029)
+    // retains all 1039: 1040.
+    ("test.regular_crates", 1040),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2912,7 +2915,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The native per-physical-network namespace regression: 1023, listed.
     // And the five relative-anchor model tests: 1038.
     // And the duplicated-field model test: 1039.
-    ("test.regular_crates_on_host", 1039),
+    // And the guest permission-denied first-run-rejection test: 1040.
+    ("test.regular_crates_on_host", 1040),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
