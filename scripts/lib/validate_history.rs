@@ -107,39 +107,43 @@ pub(crate) fn canonical_ledger_reader(adapter: &Path) -> Command {
 }
 
 /// The adapter flags that cut each row to what these readers use: of
-/// `cell_results`, only its distinct `cell_verdict.state` values and its
-/// `run_id`; of each gate, only [`HISTORY_GATE_FIELDS`]; and no
-/// `raw_result_input_census_v1`. [`history_projection`] applies the same cut
-/// here, so an adapter that predates the flags gives the same rows.
-const HISTORY_PROJECTION_ARGS: [&str; 15] = [
-    "--cell-verdict-states",
-    "--omit-field",
-    "raw_result_input_census_v1",
-    "--keep-gate-field",
-    HISTORY_GATE_FIELDS[5],
-    "--keep-gate-field",
-    HISTORY_GATE_FIELDS[0],
-    "--keep-gate-field",
-    HISTORY_GATE_FIELDS[1],
-    "--keep-gate-field",
-    HISTORY_GATE_FIELDS[2],
-    "--keep-gate-field",
-    HISTORY_GATE_FIELDS[3],
-    "--keep-gate-field",
-    HISTORY_GATE_FIELDS[4],
-];
+/// `cell_results`, only its distinct `cell_verdict.state` values, its `run_id`
+/// and its `binding_contract`; of each gate, only [`HISTORY_GATE_FIELDS`]; and
+/// no `raw_result_input_census_v1`. A row that carries an
+/// `admission_floor_evidence` claim is printed whole (`--whole-admission-rows`):
+/// [`admission_cache_row`] decodes such a row as a complete `HistoryRow` before
+/// trusting the claim, and that decode refuses malformed or duplicated fields
+/// a cut would delete, which would turn a refused row into a cache hit.
+/// [`history_projection`] applies the same cut here after that check, so an
+/// adapter that predates any of these flags gives the same rows.
+pub(crate) fn history_projection_args() -> Vec<&'static str> {
+    let mut args = vec![
+        "--whole-admission-rows",
+        "--cell-verdict-states",
+        "--omit-field",
+        "raw_result_input_census_v1",
+    ];
+    for field in HISTORY_GATE_FIELDS {
+        args.extend(["--keep-gate-field", field]);
+    }
+    args
+}
 
-/// The fields of a `gates` entry that [`failure_row_blocks_pass_cache`] reads,
-/// and `name`, which a `HistoryRow` requires of every gate: without it the
-/// admission check on a projected row fails, and a pass row could never be a
-/// cache hit. No other reader here looks inside a gate.
-const HISTORY_GATE_FIELDS: [&str; 6] = [
+/// Every field `GateHistoryRow` types (`ci/manifest-plan/src/ledger.rs`). Its
+/// decoder refuses one of these that is malformed or duplicated, and
+/// `pass_row_qualifies` decodes the kept row again, so none may be cut. Of
+/// them, [`failure_row_blocks_pass_cache`] reads `result`, `exit_code`,
+/// `real_seconds`, `failure_origin` and `failed_substeps`; no other reader here
+/// looks inside a gate.
+const HISTORY_GATE_FIELDS: [&str; 8] = [
+    "name",
     "result",
+    "kind",
     "exit_code",
     "real_seconds",
+    "source_node",
     "failure_origin",
     "failed_substeps",
-    "name",
 ];
 
 /// Read the one logical ledger into rows, skipping unparseable lines.
@@ -160,7 +164,10 @@ const HISTORY_GATE_FIELDS: [&str; 6] = [
 /// capped at 8 GiB the kernel killed the driver, systemd then stopped the
 /// unit, and every Hermit validation from 05:07Z on was abandoned as
 /// "supervisor received signal 15". What is held now is one line plus the
-/// projected rows, and the projected rows are 137 MB as text.
+/// projected rows: 296,392 KiB peak on that ledger, with 43 MB of projected
+/// rows as text. Rows that carry an admission claim still cross the pipe
+/// whole (402 rows, 658 MB of the 979 MB) but are cut here, one at a time,
+/// after their claim is checked.
 pub fn read_rows(ledger: &Path) -> Vec<serde_json::Value> {
     let explicit = std::env::var("HERMIT_VALIDATE_LEDGER")
         .ok()
@@ -203,7 +210,7 @@ fn read_adapter_rows(adapter: &Path, project: bool) -> AdapterRead {
     use std::process::Stdio;
     let mut command = canonical_ledger_reader(adapter);
     if project {
-        command.args(HISTORY_PROJECTION_ARGS);
+        command.args(history_projection_args());
     }
     let Ok(mut child) = command
         .stdin(Stdio::null())
@@ -283,14 +290,17 @@ fn projected_rows(mut input: impl std::io::BufRead) -> std::io::Result<Vec<serde
 
 /// Cut a row to what this module's readers use: of `cell_results`, one cell per
 /// distinct `cell_verdict.state`, in first-seen order (a cell without one
-/// stands for itself as `{}`), and the `run_id` that the admission check
-/// compares; of each gate, only [`HISTORY_GATE_FIELDS`]; and no
-/// `raw_result_input_census_v1`. The readers ask only whether
-/// any cell has a given state, so the cell count and which cell had which
-/// state are not kept. Kept per cell, the 666,101 cells of the 2026-10-10
-/// ledger cost this process 1.7 GB as parsed values. A `cell_results` without a `cells` list is
-/// left as written. It runs after [`admission_cache_row`], which checks the
-/// admission claim on the complete line.
+/// stands for itself as `{}`), the `run_id` that the admission check compares
+/// and the `binding_contract` the decoder checks; of each gate, only
+/// [`HISTORY_GATE_FIELDS`]; and no `raw_result_input_census_v1`. The readers
+/// ask only whether any cell has a given state, so the cell count and which
+/// cell had which state are not kept. Kept per cell, the 666,101 cells of the
+/// 2026-10-10 ledger cost this process 1.7 GB as parsed values. A
+/// `cell_results` without a `cells` list is left as written. It runs after
+/// [`admission_cache_row`]. A row with an admission claim reaches that check as
+/// its complete line, whichever adapter printed it: one that knows
+/// `--whole-admission-rows` prints such rows whole, and one that does not
+/// refuses the flags and prints every row whole.
 pub(crate) fn history_projection(mut row: serde_json::Value) -> serde_json::Value {
     let Some(object) = row.as_object_mut() else {
         return row;
@@ -326,9 +336,12 @@ pub(crate) fn history_projection(mut row: serde_json::Value) -> serde_json::Valu
         if let Some(cells) = cells {
             let mut kept = serde_json::Map::new();
             kept.insert("cells".into(), serde_json::Value::Array(cells));
-            // The admission check compares it with the claimed run.
-            if let Some(run_id) = cell_results.get("run_id") {
-                kept.insert("run_id".into(), run_id.clone());
+            // The admission check compares `run_id` with the claimed run, and
+            // the decoder checks `binding_contract`.
+            for key in ["run_id", "binding_contract"] {
+                if let Some(value) = cell_results.get(key) {
+                    kept.insert(key.into(), value.clone());
+                }
             }
             *cell_results = serde_json::Value::Object(kept);
         }

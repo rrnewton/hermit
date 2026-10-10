@@ -1787,6 +1787,63 @@ for entry in Path('/proc/self/fd').iterdir():
             "cell_results":{"run_id":v2.context.run_id}});
         let raw = serde_json::to_string(&row).unwrap();
         assert!(crate::validate_history::admission_cache_row(&raw).is_some());
+        // A claimed row is decoded as a complete HistoryRow before its claim is
+        // trusted, and the reader's cut must never delete a field that decode
+        // refuses: a refused row would become a cache hit. Every typed gate
+        // field, malformed, is refused both whole and after the cut.
+        let gated = |gate: serde_json::Value| {
+            let mut value = row.clone();
+            value["gates"] = serde_json::json!([gate]);
+            value
+        };
+        let accepted = gated(serde_json::json!({"name": "check.example", "kind": "k",
+            "source_node": "n", "attempts": [{"log": "dropped"}]}));
+        let cut = |value: &serde_json::Value| {
+            serde_json::to_string(&crate::validate_history::history_projection(value.clone()))
+                .unwrap()
+        };
+        assert!(crate::validate_history::admission_cache_row(&accepted.to_string()).is_some());
+        assert!(crate::validate_history::admission_cache_row(&cut(&accepted)).is_some());
+        for (field, bad) in [
+            ("name", serde_json::json!(3)),
+            ("result", serde_json::json!(1)),
+            ("kind", serde_json::json!(5)),
+            ("exit_code", serde_json::json!("1")),
+            ("real_seconds", serde_json::json!("1.0")),
+            ("source_node", serde_json::json!(7)),
+            ("failure_origin", serde_json::json!(2)),
+            ("failed_substeps", serde_json::Value::Null),
+        ] {
+            let mut gate = serde_json::json!({"name": "check.example"});
+            gate[field] = bad;
+            let malformed = gated(gate);
+            assert!(
+                crate::validate_history::admission_cache_row(&malformed.to_string()).is_none(),
+                "{field}: the whole malformed row must be refused"
+            );
+            assert!(
+                crate::validate_history::admission_cache_row(&cut(&malformed)).is_none(),
+                "{field}: the cut deleted a field the decoder refuses"
+            );
+        }
+        // A duplicate cannot survive the reader's own cut, which works on a
+        // parsed value, so a claimed row must reach the check as its complete
+        // line: the reader asks the adapter to print claimed rows whole.
+        let accepted_raw = accepted.to_string();
+        for duplicate in [
+            accepted_raw.replacen("\"kind\":\"k\"", "\"kind\":\"k\",\"kind\":\"k\"", 1),
+            accepted_raw.replacen(
+                "\"cell_results\":{",
+                "\"cell_results\":{\"binding_contract\":1,\"binding_contract\":1,",
+                1,
+            ),
+        ] {
+            assert_ne!(duplicate, accepted_raw);
+            assert!(crate::validate_history::admission_cache_row(&duplicate).is_none());
+        }
+        assert!(
+            crate::validate_history::history_projection_args().contains(&"--whole-admission-rows")
+        );
         let duplicate = raw.replacen(
             "\"cell_results\":{\"run_id\":",
             "\"cell_results\":{\"run_id\":\"wrong\",\"run_id\":",
