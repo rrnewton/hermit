@@ -149,17 +149,18 @@ impl std::fmt::Display for ParentCleanupUnconfirmed {
 }
 impl std::error::Error for ParentCleanupUnconfirmed {}
 
-/// Only the CLI init owns this fallback. Reverie drops it after flushing and
-/// closing the serialized error. _exit is a process/group exit; a raw clone
-/// callback's ordinary return would exit only its current thread.
-struct PublishedFailureExit {
+/// Only the CLI's container child owns this completion tail. On normal drop,
+/// Reverie has flushed and closed either the success or error result envelope.
+/// _exit ends the process/thread group; an ordinary raw-clone callback return
+/// would exit only its current thread and leave detached workers alive.
+struct PublishedCompletionExit {
     unresolved: bool,
     _alarm: Option<super::run_timeout::RunTimeoutFallback>,
 }
-impl Drop for PublishedFailureExit {
+impl Drop for PublishedCompletionExit {
     fn drop(&mut self) {
-        // Reverie drops this only after the result is flushed and closed, so a
-        // stall here is a stall after publication.
+        // On normal completion this follows the flushed and closed result, so
+        // a stall here exercises the parent's publication-to-exit budget.
         if let Some(millis) = std::env::var(STALL_AFTER_PUBLICATION_ENV)
             .ok()
             .and_then(|text| text.parse::<u64>().ok())
@@ -168,6 +169,11 @@ impl Drop for PublishedFailureExit {
         }
         if self.unresolved {
             unsafe { libc::_exit(125) }
+        }
+        // A serialization or flush panic also drops this guard while unwinding.
+        // Preserve that failure path instead of publishing a successful wait.
+        if !std::thread::panicking() {
+            unsafe { libc::_exit(0) }
         }
     }
 }
@@ -288,7 +294,7 @@ where
             }
             (
                 result,
-                PublishedFailureExit {
+                PublishedCompletionExit {
                     unresolved,
                     _alarm: alarm,
                 },
