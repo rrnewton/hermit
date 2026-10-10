@@ -2727,6 +2727,41 @@ fn record_pselect_whose_mask_blocks_a_signal_a_sibling_takes() {
     record_select_mode("pselect-mask-shared-alarm");
 }
 
+/// The opposite idiom: the thread blocks SIGALRM and waits in pselect6 under a
+/// temporary mask that unblocks it, so the timer's SIGALRM ends the wait with
+/// EINTR and its handler runs before the call returns. Replay serves the call
+/// from the recording and never installed the temporary mask, so the kernel
+/// found the signal blocked, restarted the call, and replay stopped at the
+/// repeated pselect6 where the recording has the guest's next call
+/// (https://github.com/rrnewton/hermit/issues/3992).
+#[test]
+fn record_pselect_whose_mask_unblocks_the_scheduler_timer_signal() {
+    record_select_mode("pselect-mask-unblocks-alarm");
+}
+
+/// The same wait, with a sibling adding SIGALRM to the call's mask buffer
+/// while the call sleeps. Linux copied the mask at entry; replay read the
+/// buffer again at the end of the served call, found SIGALRM blocked, and
+/// stopped at the restarted pselect6 (review of
+/// https://github.com/rrnewton/hermit/pull/4052).
+#[test]
+fn record_pselect_whose_mask_a_sibling_rewrites_while_it_sleeps() {
+    record_select_mode("pselect-mask-unblocks-rewritten");
+}
+
+/// The unblocks wait on a stack with no writable memory below its red zone.
+/// Replay delivers the signal through an injected pselect6 whose mask it must
+/// stage somewhere: the stack scratch did not commit, replay skipped the
+/// delivery, and the guest's restarted pselect6 no longer matched the
+/// recording (follow-up to https://github.com/rrnewton/hermit/pull/4052).
+/// Replay now stages it in the red zone, so the guest also checks that a
+/// pattern it wrote to the 128 bytes below its stack pointer is intact after
+/// the call (re-check of that follow-up).
+#[test]
+fn record_pselect_whose_mask_unblocks_the_timer_signal_on_a_tight_stack() {
+    record_select_mode("pselect-mask-unblocks-tight-stack");
+}
+
 /// Replayer substitutes an eventfd for this proc descriptor. The Detcore
 /// procfs layer must bind the live task incarnation named by an absolute or
 /// AT_FDCWD-relative path rather than the placeholder inode. Zero-length
