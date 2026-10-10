@@ -1849,6 +1849,12 @@
       "why": "tests/c/sigtimedwait-timeout-1s.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/sigtimedwait_queued_signal_before_child_exit.c",
+      "runner": "hermit-cli/tests/external_signal_interrupt.rs",
+      "why": "tests/c/sigtimedwait_queued_signal_before_child_exit.c is owned by hermit-cli/tests/external_signal_interrupt.rs: The integration suite compiles this guest and checks that rt_sigtimedwait returns a queued SIGUSR1 from the wait set, with the child's siginfo, before EINTR for the SIGCHLD of the child's exit, as on Linux."
+    },
+    {
       "disposition": "buck-fixture",
       "path": "tests/c/simple/BUCK",
       "runner": "Meta Buck test targets",

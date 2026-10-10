@@ -1977,8 +1977,13 @@ where
     rsrc.poll_deadline = poll_deadline_for(guest, maybe_timeout.map(|(deadline, _)| deadline));
     let (mut call, mut guard) = call0.into_nonblocking(guest).await;
     let mut first_turn = true;
+    // Set when only a signal the scheduler committed in this turn ends the
+    // wait: the turn's probe runs first, and the wait ends with the restart
+    // errno only if the call has nothing to report.
+    let mut interrupt_after_probe;
 
     let result = loop {
+        interrupt_after_probe = false;
         // A scheduler `Signaled` answer only says a signal may be pending. The kernel's
         // state below decides whether it ends the wait.
         let resumed = resource_request(guest, rsrc.clone()).await;
@@ -2001,6 +2006,17 @@ where
         } else {
             let state = match signals.interrupted_with_state() {
                 Ok((false, state)) => state,
+                // Linux takes a completion before it returns EINTR: a queued
+                // signal of rt_sigtimedwait's set (`do_sigtimedwait` dequeues
+                // first, and again after it sleeps), a ready descriptor of poll
+                // or epoll_wait. A signal the scheduler committed in this turn
+                // was sent at the same fixed point as any completion this turn
+                // can see, so the completion wins, as on Linux (Codex review of
+                // https://github.com/rrnewton/hermit/pull/4039).
+                Ok((true, state)) if signals.interrupts_only_by_committed(&state) => {
+                    interrupt_after_probe = true;
+                    state
+                }
                 Ok((true, _)) => {
                     let errno = call0.kernel_restart_errno();
                     tracing::trace!(
@@ -2036,6 +2052,15 @@ where
                 res
             );
             break res;
+        }
+        if interrupt_after_probe {
+            let errno = call0.kernel_restart_errno();
+            tracing::trace!(
+                "retry_nonblocking_syscall: a committed signal interrupts {}: {:?}",
+                call.display(&guest.memory()),
+                errno
+            );
+            break Err(errno.into());
         }
         if first {
             // The first turn's check, after its probe found nothing to report.
@@ -2519,6 +2544,15 @@ impl KernelSignalWait {
     /// (https://github.com/rrnewton/hermit/issues/4005).
     pub(crate) fn admit_committed(&mut self, signals: KernelSigset) {
         self.committed = signals & !self.host_timed;
+    }
+
+    /// Whether, of the signals that end the wait per `state`, only signals the
+    /// scheduler committed in this turn do (`admit_committed`): without them
+    /// the wait would go on.
+    pub(crate) fn interrupts_only_by_committed(&self, state: &KernelSignalState) -> bool {
+        let held = self.held.map_or(0, |held| kernel_sigset_bit(held.signal));
+        let interrupting = (state.pending | held) & self.could_interrupt(state);
+        self.committed != 0 && interrupting & !self.held_until_return == 0
     }
 
     /// Whether the caller should still call `block`: it has neither blocked the

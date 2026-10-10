@@ -635,8 +635,9 @@ mod tests {
             // container_init_deadline, plus the two robust-futex exec tests
             // (https://github.com/rrnewton/hermit/issues/2082), plus the
             // run-mode rt_sigtimedwait SIGCHLD test
-            // (https://github.com/rrnewton/hermit/issues/4005).
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "274");
+            // (https://github.com/rrnewton/hermit/issues/4005), plus its
+            // queued-signal counterpart.
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "275");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

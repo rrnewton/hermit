@@ -240,7 +240,14 @@ impl RecordVersion {
 // here, which the kernel itself ends.) Replay recomputes all of these, so an
 // older recording replayed here could run a different schedule, although no
 // event shape changed.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x129);
+// 0x129 -> 0x12a: a SIGCHLD the scheduler sends at a commit point (a child's
+// child-exit timer, or a POSIX timer) ends a precise FUTEX_WAIT that catches
+// it, as on Linux, where it was held until the call returned
+// (https://github.com/rrnewton/hermit/issues/4005). Replay recomputes precise
+// futex results, so an older recording replayed here could take the other
+// branch, although no event shape changed (Codex review of
+// https://github.com/rrnewton/hermit/pull/4039).
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x12a);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -265,7 +272,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x129);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x129;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x12a;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -860,6 +867,16 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_without_signal_target_modelling() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x128)));
+    }
+
+    /// A 0x129 recording held a committed SIGCHLD in a precise FUTEX_WAIT
+    /// until the call returned; replay recomputes that wait and now ends it
+    /// with EINTR, so it would take the other branch with no desync. The
+    /// version gate must refuse it (Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4039).
+    #[test]
+    fn record_version_rejects_streams_that_held_a_committed_sigchld_in_a_futex_wait() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x129)));
     }
 
     /// Record and replay run under ptrace with serialized threads, so their

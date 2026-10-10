@@ -1321,7 +1321,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // metadata::tests::record_version_rejects_pre_child_subreaper_streams
     // (https://github.com/rrnewton/hermit/issues/3997) retains all 1019: 1020.
     // And the two signal-target metadata tests (https://github.com/rrnewton/hermit/issues/3963): 1022.
-    ("test.hermit_unit", 1022),
+    // And metadata::tests::record_version_rejects_streams_that_held_a_committed_sigchld_in_a_futex_wait
+    // (review of https://github.com/rrnewton/hermit/pull/4039): 1023.
+    ("test.hermit_unit", 1023),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1993,7 +1995,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 273.
     // And external_signal_interrupt::ptrace_rt_sigtimedwait_is_ended_by_the_sigchld_of_an_exiting_child
     // (https://github.com/rrnewton/hermit/issues/4005): 274.
-    ("test.hermit_integration", 274),
+    // And external_signal_interrupt::ptrace_rt_sigtimedwait_takes_a_queued_signal_before_the_sigchld_of_an_exiting_child
+    // (review of https://github.com/rrnewton/hermit/pull/4039): 275.
+    ("test.hermit_integration", 275),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -2764,7 +2768,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the robust-futex exec owner-death test: 272.
     // And the robust-futex exec no-wake test: 273.
     // And the run-mode rt_sigtimedwait SIGCHLD test: 274.
-    ("test.hermit_integration_on_host", 274),
+    // And the queued-signal rt_sigtimedwait test: 275.
+    ("test.hermit_integration_on_host", 275),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -2845,7 +2850,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the version-2 preemption refusal test: 1019.
     // And the child-subreaper record-version test: 1020.
     // And the same two signal-target metadata tests: 1022.
-    ("test.hermit_unit_on_host", 1022),
+    // And the 0x129 record-version refusal test: 1023.
+    ("test.hermit_unit_on_host", 1023),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
