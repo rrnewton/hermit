@@ -837,7 +837,9 @@ pub enum HappensBeforeError {
         /// The offending event name.
         event: String,
     },
-    /// A relative event's base is on another thread.
+    /// A relative event's base cannot be shown to be on the same thread: it
+    /// names another dettid or spawn ordinal, or a dettid where the relative
+    /// event names a spawn ordinal (or the reverse).
     FromOtherThread {
         /// The relative event.
         event: String,
