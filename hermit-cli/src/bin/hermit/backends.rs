@@ -99,6 +99,8 @@ use super::verify::compare_two_runs;
 #[cfg(feature = "dbt")]
 use super::verify::publish_run_failure;
 #[cfg(feature = "dbt")]
+use super::verify::record_terminal_deadlock;
+#[cfg(feature = "dbt")]
 use super::verify::retain_verification_logs;
 #[cfg(feature = "dbt")]
 use super::verify::temp_log_files_in;
@@ -1187,6 +1189,7 @@ pub(super) fn run_dbt(
     });
 
     eprintln!(":: DBT Run1...");
+    let deadlock_recording = record_terminal_deadlock(verify_json, VerificationRun::Run1);
     let first_raw = if terminal_stdin {
         run_once_with_terminal_input(&execution, &runner1, &guest, &drrun, config, run1_evidence)
     } else {
@@ -1214,6 +1217,7 @@ pub(super) fn run_dbt(
             ),
         }
     };
+    drop(deadlock_recording);
     let first_raw = match first_raw {
         Ok(output) => output,
         Err(error) => {
@@ -1310,6 +1314,7 @@ pub(super) fn run_dbt(
 
     replay.seek(SeekFrom::Start(0))?;
     eprintln!(":: DBT Run2...");
+    let deadlock_recording = record_terminal_deadlock(verify_json, VerificationRun::Run2);
     let second_raw = match if terminal_stdin {
         run_once_with_terminal_input(&execution, &runner2, &guest, &drrun, config, run2_evidence)
     } else {
@@ -1323,7 +1328,10 @@ pub(super) fn run_dbt(
             replay.try_clone()?,
         )
     } {
-        Ok(output) => output,
+        Ok(output) => {
+            drop(deadlock_recording);
+            output
+        }
         Err(error) => {
             let error = publish_run_failure(verify_json, VerificationRun::Run2, error);
             if keep_logs {

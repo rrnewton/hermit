@@ -968,7 +968,17 @@ pub(crate) fn publish_run_failure(
     let (Some(path), Some(failure)) = (path, run_failure_of(&error)) else {
         return error;
     };
-    let mut detail = format!("{error:#}");
+    match write_report_json(path, &run_failed_report(run, failure, format!("{error:#}"))) {
+        Ok(()) => error,
+        Err(secondary) => retain_verification_error(error, "publishing run failure", secondary),
+    }
+}
+
+fn run_failed_report(
+    run: VerificationRun,
+    failure: RunFailure,
+    mut detail: String,
+) -> VerificationReport {
     if detail.len() > RUN_FAILED_DETAIL_MAX_BYTES {
         let mut end = RUN_FAILED_DETAIL_MAX_BYTES;
         while !detail.is_char_boundary(end) {
@@ -982,10 +992,38 @@ pub(crate) fn publish_run_failure(
         failure,
         detail,
     });
-    match write_report_json(path, &report) {
-        Ok(()) => error,
-        Err(secondary) => retain_verification_error(error, "publishing run failure", secondary),
+    report
+}
+
+/// While alive, Detcore's terminal deadlock exit during verification run `run`
+/// first records the run at `path` as `run_failed` with `deadlock`.
+///
+/// That exit ends the process from the scheduler (`immediate_fatal_exit`), so
+/// no error ever returns to verify and the pending stamp would remain. Only a
+/// backend whose scheduler runs in this process (DBT) installs it; a backend
+/// whose scheduler runs in a container child reports the same exit as a
+/// container failure.
+pub(crate) struct TerminalDeadlockRecording;
+
+impl Drop for TerminalDeadlockRecording {
+    fn drop(&mut self) {
+        detcore::set_terminal_deadlock_hook(None);
     }
+}
+
+pub(crate) fn record_terminal_deadlock(
+    path: Option<&Path>,
+    run: VerificationRun,
+) -> Option<TerminalDeadlockRecording> {
+    let path = path?.to_owned();
+    detcore::set_terminal_deadlock_hook(Some(Box::new(move |deadlock: &str| {
+        // Best effort: the process exits next whatever this returns.
+        let _ = write_report_json(
+            &path,
+            &run_failed_report(run, RunFailure::Deadlock, deadlock.trim_end().to_owned()),
+        );
+    })));
+    Some(TerminalDeadlockRecording)
 }
 
 /// Keep the original typed error as anyhow's cause and the actual secondary
