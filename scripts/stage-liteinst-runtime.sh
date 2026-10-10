@@ -6,8 +6,8 @@
 
 set -euo pipefail
 
-if (( $# != 3 )); then
-    echo "Usage: $0 <cargo-profile> <stable-runtime-path> <runtime-target-root>" >&2
+if (( $# != 3 && $# != 4 )) || { (( $# == 4 )) && [[ $4 != --allocator-fixture ]]; }; then
+    echo "Usage: $0 <cargo-profile> <stable-runtime-path> <runtime-target-root> [--allocator-fixture]" >&2
     exit 2
 fi
 
@@ -80,11 +80,16 @@ cleanup_liteinst_temp_stage() {
 }
 trap cleanup_liteinst_temp_stage EXIT
 
-HERMIT_LITEINST_STAGE=$liteinst_temp_stage "${CARGO:-cargo}" build \
+liteinst_features=()
+if [[ ${4:-} == --allocator-fixture ]]; then
+    liteinst_features=(--features allocator-fixture)
+fi
+HERMIT_LITEINST_STAGE=$liteinst_temp_stage HERMIT_LITEINST_REVERIE_PIN=$reverie_pin "${CARGO:-cargo}" build \
     --locked \
     --manifest-path liteinst-runtime-build/Cargo.toml \
     --profile "$liteinst_profile" \
-    --target-dir "$liteinst_target_dir"
+    --target-dir "$liteinst_target_dir" \
+    "${liteinst_features[@]}"
 
 if [[ ! -s $liteinst_temp_stage || ! -f $liteinst_temp_stage || -L $liteinst_temp_stage ]]; then
     echo "LiteInst runtime build did not stage a non-empty regular file: $liteinst_temp_stage" >&2

@@ -1403,8 +1403,13 @@ fi
 # source_recipe_key (vendor, build.rs, CMAKE, CMAKE_GENERATOR,
 # SOURCE_DATE_EPOCH). With the same tooling and epoch, carry the existing
 # budget and sixteen-job clamp; this is not a new timing calibration.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 0352d5da9b9422fe690bbc87511479e80b0080fe ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 0352d5da9b9422fe690bbc87511479e80b0080fe (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# NATIVE-RW REGRESSION CARRY TO 4203a25399da4e01fab49c0b85f8ee503c8869bc (2026-10-10):
+# From 0352d5da9b9422fe690bbc87511479e80b0080fe, build.rs, Cargo.toml,
+# vendor/dynamorio, third-party and rust-toolchain.toml are unchanged Git
+# objects. The tracked reverie-dbt file population remains939. This carries
+# the same SDK recipe budget, not an earlier runtime validation receipt.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 4203a25399da4e01fab49c0b85f8ee503c8869bc ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 4203a25399da4e01fab49c0b85f8ee503c8869bc (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

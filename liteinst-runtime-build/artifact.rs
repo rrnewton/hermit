@@ -7,6 +7,7 @@ pub(crate) fn liteinst_cdylib_from_cargo_messages(
     messages: &str,
     package_id: &str,
     manifest: &Path,
+    allocator_fixture: bool,
 ) -> Result<PathBuf, String> {
     let mut artifacts = Vec::new();
     for (index, line) in messages.lines().filter(|line| !line.is_empty()).enumerate() {
@@ -28,7 +29,12 @@ pub(crate) fn liteinst_cdylib_from_cargo_messages(
                 index + 1
             ));
         }
-        if message["features"] != serde_json::json!([]) {
+        let expected_features = if allocator_fixture {
+            serde_json::json!(["allocator-fixture"])
+        } else {
+            serde_json::json!([])
+        };
+        if message["features"] != expected_features {
             return Err(format!(
                 "LiteInst preload artifact on line {} has unexpected features",
                 index + 1
@@ -79,7 +85,7 @@ mod tests {
     }
 
     fn select(messages: &str) -> Result<PathBuf, String> {
-        liteinst_cdylib_from_cargo_messages(messages, PACKAGE, Path::new(MANIFEST))
+        liteinst_cdylib_from_cargo_messages(messages, PACKAGE, Path::new(MANIFEST), false)
     }
 
     #[test]
@@ -168,6 +174,67 @@ mod tests {
             let mut message = artifact();
             message["filenames"] = value;
             assert!(select(&message.to_string()).is_err());
+        }
+    }
+
+    #[test]
+    fn selects_only_the_explicit_allocator_fixture_feature_mode() {
+        let select_fixture = |message: &str| {
+            liteinst_cdylib_from_cargo_messages(message, PACKAGE, Path::new(MANIFEST), true)
+        };
+        assert!(select_fixture(&artifact().to_string()).is_err());
+        let mut message = artifact();
+        message["features"] = serde_json::json!(["allocator-fixture"]);
+        assert!(select(&message.to_string()).is_err());
+        assert_eq!(
+            select_fixture(&message.to_string()).unwrap(),
+            PathBuf::from("/isolated/libreverie_liteinst_preload.so")
+        );
+        assert!(select_fixture("").is_err());
+        assert!(select_fixture(&format!("{message}\n{message}\n")).is_err());
+        for features in [
+            Value::Null,
+            serde_json::json!([]),
+            serde_json::json!(["other"]),
+            serde_json::json!(["allocator-fixture", "other"]),
+            serde_json::json!(["allocator-fixture", "allocator-fixture"]),
+        ] {
+            let mut wrong = message.clone();
+            wrong["features"] = features;
+            assert!(select_fixture(&wrong.to_string()).is_err());
+        }
+        for (field, value) in [
+            ("package_id", serde_json::json!("wrong source")),
+            ("manifest_path", serde_json::json!("/lookalike/Cargo.toml")),
+            ("filenames", Value::Null),
+            ("filenames", serde_json::json!([])),
+            ("filenames", serde_json::json!([42])),
+            (
+                "filenames",
+                serde_json::json!(["/warm/libreverie_liteinst.so"]),
+            ),
+            (
+                "filenames",
+                serde_json::json!([
+                    "/isolated/libreverie_liteinst_preload.so",
+                    "/warm/libreverie_liteinst_preload.so"
+                ]),
+            ),
+        ] {
+            let mut wrong = message.clone();
+            wrong[field] = value;
+            assert!(
+                select_fixture(&wrong.to_string()).is_err(),
+                "accepted wrong {field}"
+            );
+        }
+        for field in ["kind", "crate_types"] {
+            let mut wrong = message.clone();
+            wrong["target"][field] = serde_json::json!(["rlib", "cdylib"]);
+            assert!(
+                select_fixture(&wrong.to_string()).is_err(),
+                "accepted wrong {field}"
+            );
         }
     }
 }

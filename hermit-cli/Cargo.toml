@@ -64,13 +64,13 @@ rand_pcg = { version = "0.10.2", features = ["serde"] }
 regex = "1.13.1"
 # Reverie is pinned to a specific commit for reproducibility. Keep this rev in
 # sync across all crates and bump it via docs/updating-reverie.md.
-reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "0352d5da9b9422fe690bbc87511479e80b0080fe" }
-reverie-dbt = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "0352d5da9b9422fe690bbc87511479e80b0080fe", default-features = false, optional = true }
-reverie-kvm = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "0352d5da9b9422fe690bbc87511479e80b0080fe" }
-reverie-ptrace = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "0352d5da9b9422fe690bbc87511479e80b0080fe" }
-reverie-liteinst = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "0352d5da9b9422fe690bbc87511479e80b0080fe", default-features = false, optional = true }
-reverie-rpc-transport = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "0352d5da9b9422fe690bbc87511479e80b0080fe", optional = true }
-reverie-sabre-stats = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "0352d5da9b9422fe690bbc87511479e80b0080fe", optional = true }
+reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "4203a25399da4e01fab49c0b85f8ee503c8869bc" }
+reverie-dbt = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "4203a25399da4e01fab49c0b85f8ee503c8869bc", default-features = false, optional = true }
+reverie-kvm = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "4203a25399da4e01fab49c0b85f8ee503c8869bc" }
+reverie-ptrace = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "4203a25399da4e01fab49c0b85f8ee503c8869bc" }
+reverie-liteinst = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "4203a25399da4e01fab49c0b85f8ee503c8869bc", default-features = false, optional = true }
+reverie-rpc-transport = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "4203a25399da4e01fab49c0b85f8ee503c8869bc", optional = true }
+reverie-sabre-stats = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "4203a25399da4e01fab49c0b85f8ee503c8869bc", optional = true }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 serde_yaml = "0.9.34"
@@ -91,3 +91,9 @@ ruzstd = "0.9.0"
 sha2 = "0.10.9"
 # Parse actual container call arguments, including conditional local labels.
 syn = { version = "2.0.119", features = ["full", "visit"] }
+
+# Always selected with the existing backend feature; fixture exports are a
+# separate producer input, never an exemption from required execution.
+[[test]]
+name = "liteinst_allocator"
+required-features = ["liteinst"]

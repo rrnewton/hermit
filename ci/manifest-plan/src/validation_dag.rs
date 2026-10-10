@@ -428,6 +428,7 @@ const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
     "setup.manifest_plan",
     "build.workspace",
     "build.e2e_artifact",
+    "build.liteinst_allocator_fixtures",
     "build.manifest_guests",
     "compatprep.hermit_release",
 ];
@@ -449,6 +450,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "test.arbitrary_binaries",
     "test.record_replay",
     "test.cli",
+    "test.liteinst_allocator",
     "test.isolated_dbt_workdir",
     "test.isolated_detcore_workdir",
     "test.sabre_examples",
@@ -576,13 +578,13 @@ const PROFILES: [Profile; 12] = [
     // unchanged because the node carries only the full label.
     Profile {
         label: "full",
-        direct_steps: 90,
-        selected_steps: 91,
+        direct_steps: 92,
+        selected_steps: 93,
     },
     Profile {
         label: "portable",
-        direct_steps: 75,
-        selected_steps: 76,
+        direct_steps: 77,
+        selected_steps: 78,
     },
     Profile {
         label: "quick",
@@ -1082,7 +1084,7 @@ fn route_host_consumers_to_pinned_build(cfg: &mut DagConfig) -> Result<(), Strin
 fn builds_hermit(step: &Step) -> bool {
     matches!(
         step.tag().as_str(),
-        "build.workspace" | "build.e2e_artifact"
+        "build.workspace" | "build.e2e_artifact" | "build.liteinst_allocator_fixtures"
     ) || step.job == "privileged_tests"
 }
 
@@ -2562,9 +2564,10 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // test.record_replay joined the Nextest producers. 135 since
     // test.pmu_integration_cases took the 25 external_signal_interrupt
     // ptrace cases that need the PMU timer.
-    if expected.len() != 135 {
+    // One required local M1 target adds one Nextest result producer.
+    if expected.len() != 136 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 135",
+            "structured result producer registry has {} entries, expected 136",
             expected.len()
         ));
     }
@@ -2579,9 +2582,10 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // the LiteInst host hybrid (https://github.com/rrnewton/hermit/issues/3520);
     // 42 since test.record_replay joined it; 43 since
     // test.pmu_integration_cases joined it.
-    if expected_counts.len() != 43 {
+    // The new seven-identity target does not alter existing CLI counts.
+    if expected_counts.len() != 44 {
         return Err(format!(
-            "Nextest expected-count registry has {} entries, expected 43",
+            "Nextest expected-count registry has {} entries, expected 44",
             expected_counts.len()
         ));
     }
@@ -2718,7 +2722,8 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // were retired with the LiteInst host hybrid
     // (https://github.com/rrnewton/hermit/issues/3520), and 69 with
     // test.record_replay, and 70 with test.pmu_integration_cases.
-    if actual_group_counts != [70, 56, 7, 2] {
+    // The local required allocator consumer adds one Nextest writer.
+    if actual_group_counts != [71, 56, 7, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -3670,6 +3675,68 @@ fn assert_declared_caps(cfg: &DagConfig) -> Result<(), String> {
     }
 }
 
+fn assert_m1_allocator_gate(cfg: &DagConfig) -> Result<(), String> {
+    let find = |tag: &str| {
+        cfg.steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .ok_or_else(|| format!("required M1 node missing: {tag}"))
+    };
+    let producer = find("build.liteinst_allocator_fixtures_in_pinned_root")?;
+    let consumer = find("test.liteinst_allocator")?;
+    for step in [producer, consumer] {
+        if step.labels != ["full", "portable"]
+            || !step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ")
+        {
+            return Err(format!(
+                "{} lost required local pinned placement",
+                step.tag()
+            ));
+        }
+    }
+    if !producer
+        .cmd
+        .contains("./ci/build-liteinst-allocator-fixtures.rs")
+        || producer
+            .deps
+            .iter()
+            .any(|tag| tag == "build.workspace_in_pinned_root")
+    {
+        return Err("M1 diagnostic producer lost its independent explicit leaf closure".into());
+    }
+    for required in [
+        "build.e2e_artifact_in_pinned_root",
+        "build.liteinst_allocator_fixtures_in_pinned_root",
+        "pre.reverie_pin",
+    ] {
+        if !consumer.deps.iter().any(|tag| tag == required) {
+            return Err(format!("M1 consumer lost prerequisite {required}"));
+        }
+    }
+    if consumer
+        .env
+        .get("NEXTEST_EXPECTED_EXECUTED")
+        .map(String::as_str)
+        != Some("7")
+        || consumer.integration_test_binaries.as_deref()
+            != Some(&["liteinst_allocator".to_owned()][..])
+    {
+        return Err("M1 consumer lost its seven-test target population".into());
+    }
+    crate::nextest_build_selections::assert_command_selection(consumer)?;
+    let command = crate::nextest_build_selections::execution_command(consumer)?;
+    for required in [
+        "HERMIT_M1_ALLOCATOR_FIXTURE_BUNDLE",
+        "--print-standalone",
+        "--test liteinst_allocator -j 1",
+    ] {
+        if !command.contains(required) {
+            return Err(format!("M1 consumer lost {required}"));
+        }
+    }
+    Ok(())
+}
+
 fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String> {
     // Backend parity is a scored comparison, not a gate
     // (https://github.com/rrnewton/hermit/issues/3301): the parity post-pass
@@ -3686,6 +3753,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
             step.tag()
         ));
     }
+    assert_m1_allocator_gate(cfg)?;
     assert_declared_caps(cfg)?;
     assert_structured_result_producers(cfg)?;
     crate::nextest_build_selections::assert_preparation_dependencies(cfg)?;
@@ -3749,9 +3817,10 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // check.script_unit_tests that carries the longer hosted wall (433 + 1).
     // 435 with test.pmu_integration_cases, which runs the 25
     // external_signal_interrupt ptrace cases that need the PMU timer (434 + 1).
-    if cfg.steps.len() != 435 {
+    // M1 adds one diagnostic pinned producer and one required local consumer.
+    if cfg.steps.len() != 437 {
         return Err(format!(
-            "superset has {} steps, expected 435",
+            "superset has {} steps, expected 437",
             cfg.steps.len()
         ));
     }
@@ -4895,6 +4964,56 @@ sys.exit(37)
     }
 
     #[test]
+    fn required_allocator_gate_refuses_each_missing_prerequisite() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        assert_m1_allocator_gate(&committed).unwrap();
+        for mutation in [
+            "producer",
+            "label",
+            "dependency",
+            "count",
+            "selection",
+            "fixture",
+        ] {
+            let mut changed = committed.clone();
+            if mutation == "producer" {
+                changed.steps.retain(|step| {
+                    step.tag() != "build.liteinst_allocator_fixtures_in_pinned_root"
+                });
+            } else {
+                let step = changed
+                    .steps
+                    .iter_mut()
+                    .find(|step| step.tag() == "test.liteinst_allocator")
+                    .unwrap();
+                match mutation {
+                    "label" => step.labels = vec!["super".into()],
+                    "dependency" => step
+                        .deps
+                        .retain(|tag| tag != "build.liteinst_allocator_fixtures_in_pinned_root"),
+                    "count" => {
+                        step.env
+                            .insert("NEXTEST_EXPECTED_EXECUTED".into(), "0".into());
+                    }
+                    "selection" => {
+                        step.env.remove(crate::nextest_binaries::SELECTION_ENV);
+                    }
+                    "fixture" => {
+                        step.cmd = step
+                            .cmd
+                            .replace("HERMIT_M1_ALLOCATOR_FIXTURE_BUNDLE", "MISSING_FIXTURE")
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            assert!(
+                assert_m1_allocator_gate(&changed).is_err(),
+                "accepted {mutation}"
+            );
+        }
+    }
+
+    #[test]
     fn pinned_root_wrapper_preserves_cache_and_run_state_boundaries() {
         let steps = crate::validation_dag_static::config().steps;
         for step in &steps {
@@ -6029,8 +6148,9 @@ sys.exit(37)
         // privileged-test.pmu_detcore_time_cases did) - 22 replaced + 19
         // full-buck-e2e nodes (18, and 86 in all, before e2e.buck_stage).
         // 88 since test.pmu_integration_cases joined full (91 full
-        // nodes).
-        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 88);
+        // nodes). 90 since build.liteinst_allocator_fixtures and
+        // test.liteinst_allocator joined full (93 full nodes).
+        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 90);
 
         fn twin(cfg: &mut DagConfig) -> &mut Step {
             cfg.steps

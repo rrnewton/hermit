@@ -17,9 +17,13 @@ crate-type = ["cdylib"]
 test = false
 doctest = false
 
+[features]
+# Real-runtime allocation regression; never selects a different allocator.
+allocator-fixture = ["reverie-liteinst/allocator-fixture"]
+
 [dependencies]
 detcore = { package = "hermit-detcore", version = "0.4.0", path = "../detcore" }
 libc = "0.2.186"
-reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "0352d5da9b9422fe690bbc87511479e80b0080fe" }
-reverie-inguest = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "0352d5da9b9422fe690bbc87511479e80b0080fe", default-features = false }
-reverie-liteinst = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "0352d5da9b9422fe690bbc87511479e80b0080fe", default-features = false }
+reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "4203a25399da4e01fab49c0b85f8ee503c8869bc" }
+reverie-inguest = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "4203a25399da4e01fab49c0b85f8ee503c8869bc", default-features = false }
+reverie-liteinst = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "4203a25399da4e01fab49c0b85f8ee503c8869bc", default-features = false }

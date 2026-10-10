@@ -1326,7 +1326,12 @@ fi
 # source_recipe_key (vendor, build.rs, CMAKE, CMAKE_GENERATOR,
 # SOURCE_DATE_EPOCH). With the same tooling and epoch, carry the existing
 # budget and sixteen-job clamp; this is not a new timing calibration.
-expected_pin=0352d5da9b9422fe690bbc87511479e80b0080fe
+# NATIVE-RW REGRESSION CARRY TO 4203a25399da4e01fab49c0b85f8ee503c8869bc (2026-10-10):
+# From 0352d5da9b9422fe690bbc87511479e80b0080fe, build.rs, Cargo.toml,
+# vendor/dynamorio, third-party and rust-toolchain.toml are unchanged Git
+# objects. The tracked reverie-dbt file population remains939. This carries
+# the same SDK recipe budget, not an earlier runtime validation receipt.
+expected_pin=4203a25399da4e01fab49c0b85f8ee503c8869bc
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

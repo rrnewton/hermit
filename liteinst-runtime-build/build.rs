@@ -88,11 +88,13 @@ fn copy_into_protected_stage(source: &Path, destination: &Path) -> io::Result<()
 fn main() {
     println!("cargo:rerun-if-env-changed=HERMIT_LITEINST_STAGE");
     println!("cargo:rerun-if-env-changed=HERMIT_LITEINST_REVERIE_PIN");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_ALLOCATOR_FIXTURE");
     println!("cargo:rerun-if-env-changed=PROFILE");
     println!("cargo:rerun-if-changed=Cargo.lock");
     println!("cargo:rerun-if-changed=artifact.rs");
     println!("cargo:rerun-if-changed=runtime/Cargo.toml");
     println!("cargo:rerun-if-changed=runtime/src/lib.rs");
+    let allocator_fixture = env::var_os("CARGO_FEATURE_ALLOCATOR_FIXTURE").is_some();
     let destination = PathBuf::from(
         env::var_os("HERMIT_LITEINST_STAGE")
             .expect("HERMIT_LITEINST_STAGE must name a unique runtime output path"),
@@ -182,7 +184,8 @@ fn main() {
             .as_str()
             .expect("preload leaf has no manifest"),
     );
-    let output = Command::new(&cargo)
+    let mut command = Command::new(&cargo);
+    command
         .args([
             "build",
             "--locked",
@@ -198,7 +201,18 @@ fn main() {
         .arg(&nested_target)
         .arg("--message-format=json-render-diagnostics")
         .current_dir(&manifest_dir)
-        .env_remove("HERMIT_LITEINST_STAGE")
+        .env_remove("HERMIT_LITEINST_STAGE");
+    if allocator_fixture {
+        // Enable the exact leaf feature through the selected workspace member.
+        // Keep the leaf selected too so current artifact qualification applies.
+        command.args([
+            "-p",
+            "hermit-liteinst-runtime-artifact",
+            "--features",
+            "allocator-fixture",
+        ]);
+    }
+    let output = command
         .output()
         .expect("failed to invoke Cargo for the isolated LiteInst runtime build");
     if !output.status.success() {
@@ -211,9 +225,13 @@ fn main() {
     }
     let messages = String::from_utf8(output.stdout)
         .expect("isolated LiteInst runtime Cargo output was not UTF-8");
-    let candidate =
-        artifact::liteinst_cdylib_from_cargo_messages(&messages, package_id, &package_manifest)
-            .unwrap_or_else(|error| panic!("failed to parse isolated Cargo output: {error}"));
+    let candidate = artifact::liteinst_cdylib_from_cargo_messages(
+        &messages,
+        package_id,
+        &package_manifest,
+        allocator_fixture,
+    )
+    .unwrap_or_else(|error| panic!("failed to parse isolated Cargo output: {error}"));
     assert!(
         candidate.starts_with(&nested_target),
         "current preload output is outside the isolated target root"
