@@ -21176,6 +21176,7 @@
       "integration_test_binaries": [
         "aio_nr_determinism",
         "arch_status_determinism",
+        "backend_isolation_launch",
         "chaos_sched_yield_progress",
         "chaos_stress_pmu_detection",
         "child_time_rpc",
@@ -43319,6 +43320,7 @@
       "integration_test_binaries": [
         "aio_nr_determinism",
         "arch_status_determinism",
+        "backend_isolation_launch",
         "chaos_sched_yield_progress",
         "chaos_stress_pmu_detection",
         "child_time_rpc",
