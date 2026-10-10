@@ -969,8 +969,8 @@ impl fmt::Display for HappensBeforeError {
             ),
             HappensBeforeError::FromOtherThread { event, base } => write!(
                 f,
-                "event '{}' counts from '{}', which is on another thread; a base must be on the \
-                 same thread",
+                "event '{}' counts from '{}', which cannot be shown to be on the same thread; a \
+                 base must name the same dettid, or the same spawn ordinal",
                 event, base
             ),
             HappensBeforeError::FromUnenforcedPosition { event, base } => write!(

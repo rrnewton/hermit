@@ -9575,8 +9575,11 @@ fn happens_before_relative_anchor_holds_the_first_call_after_its_base() {
 /// thread's first write also reaches the worker anchor's base on the guest
 /// side. The worker reaches its own base only at its final write, after all
 /// its sched_yield calls, so "its first sched_yield after its first write"
-/// never happens and must be refused by name. A worker that inherited the
-/// main thread's origin would fire it at its first yield and exit 0.
+/// never happens and must be refused by name, naming 'wy'. A worker that
+/// inherited the main thread's origins alone would fire 'wy' at its first
+/// yield and exit 0; one that inherited its counters as well would never reach
+/// its own 'wb' (its write count would already be past 1), so the report would
+/// name 'wb' instead. The exact report text catches both.
 #[test]
 fn happens_before_relative_anchor_state_is_not_inherited_by_a_new_thread() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -9765,7 +9768,7 @@ fn happens_before_version_2_load_refusals_name_the_event_and_run_nothing() {
             r#"{"version": 2, "events": {
                 "a": {"thread": "5", "syscall": "write", "fd": 1},
                 "r": {"thread": "3", "syscall": "getppid", "from": "a"}}}"#,
-            "event 'r' counts from 'a', which is on another thread",
+            "event 'r' counts from 'a', which cannot be shown to be on the same thread",
         ),
         (
             "futex-op-on-write.json",
