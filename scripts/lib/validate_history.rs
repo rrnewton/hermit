@@ -164,10 +164,10 @@ const HISTORY_GATE_FIELDS: [&str; 8] = [
 /// capped at 8 GiB the kernel killed the driver, systemd then stopped the
 /// unit, and every Hermit validation from 05:07Z on was abandoned as
 /// "supervisor received signal 15". What is held now is one line plus the
-/// projected rows: 296,392 KiB peak on that ledger, with 43 MB of projected
-/// rows as text. Rows that carry an admission claim still cross the pipe
-/// whole (402 rows, 658 MB of the 979 MB) but are cut here, one at a time,
-/// after their claim is checked.
+/// projected rows: 346,288 KiB peak on the 3,212-row ledger, with 43,588,449
+/// bytes of projected rows as text. Rows that carry an admission claim still
+/// cross the pipe whole (829 of those 3,212 rows, 898 MB of the 990 MB) but are
+/// cut here, one at a time, after their claim is checked.
 pub fn read_rows(ledger: &Path) -> Vec<serde_json::Value> {
     let explicit = std::env::var("HERMIT_VALIDATE_LEDGER")
         .ok()
