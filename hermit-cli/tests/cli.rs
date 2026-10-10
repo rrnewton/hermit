@@ -9521,6 +9521,14 @@ fn happens_before_relative_anchor_holds_the_first_call_after_its_base() {
     let entered = first("dtid 3's getppid entry", second_write, &|l| {
         l.contains("dtid 3] inbound syscall: getppid()")
     });
+    // The hold is at the FIRST getppid after the base: no getppid of dtid 3
+    // completes between its second write and the hold.
+    assert!(
+        !lines[second_write..held]
+            .iter()
+            .any(|l| l.contains("dtid 3] finish syscall #") && l.contains(": getppid()")),
+        "a getppid of dtid 3 completed before the hold, so the anchor held a later call"
+    );
     let b_write = first("dtid 5's write", held, &|l| {
         l.contains("dtid 5] inbound syscall: write(1, ")
     });
@@ -9532,6 +9540,53 @@ fn happens_before_relative_anchor_holds_the_first_call_after_its_base() {
         "expected dtid 3's first getppid after its second write to be held until dtid 5's \
          write: entry {entered}, hold {held}, write {b_write}, completion {granted}"
     );
+}
+
+/// A new thread starts with no relative-anchor state, whatever its parent
+/// reached. In "late" mode the main thread writes both markers before it
+/// creates the worker. The spec names the worker by spawn ordinal, so the main
+/// thread's first write also reaches the worker anchor's base on the guest
+/// side. The worker reaches its own base only at its final write, after all
+/// its sched_yield calls, so "its first sched_yield after its first write"
+/// never happens and must be refused by name. A worker that inherited the
+/// main thread's origin would fire it at its first yield and exit 0.
+#[test]
+fn happens_before_relative_anchor_state_is_not_inherited_by_a_new_thread() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = hb_relative_anchor_guest().to_str().unwrap().to_owned();
+    let spec = directory.path().join("fresh-child.json");
+    fs::write(
+        &spec,
+        r#"{"version": 2, "threads": {"w": {"spawn_ordinal": 1}},
+            "events": {"wb": {"thread": "w", "syscall": "write", "fd": 1, "nth": 1},
+                       "wy": {"thread": "w", "syscall": "sched_yield", "from": "wb", "nth": 1}}}"#,
+    )
+    .unwrap();
+    let args = [
+        "run",
+        "--strict",
+        "--happens-before",
+        spec.to_str().unwrap(),
+        "--",
+        guest.as_str(),
+        "late",
+    ];
+    let output = hermit(&args);
+    let log = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "the worker's relative anchor must not fire from its parent's state:\n{log}"
+    );
+    assert!(
+        log.contains(
+            "HERMIT_HB_ANCHOR_NEVER_FIRED: 1 happens-before syscall-occurrence anchor(s)"
+        ) && log.contains(
+            "anchor 'wy' on thread w: sched_yield#1 never fired (counted from 'wb'; edges: none)"
+        ),
+        "{log}"
+    );
+    assert_eq!(stdout(&output), "a1\na2\nA-after\nB\n");
 }
 
 /// An unfired relative anchor is refused by name after the guest finishes:
@@ -9831,46 +9886,63 @@ fn run_with_deadline(
 fn happens_before_hold_in_a_vfork_child_is_refused_by_name() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let guest = hb_spawn_dup2_guest().to_str().unwrap().to_owned();
-    let spec = directory.path().join("vfork-hold.json");
-    fs::write(
-        &spec,
-        r#"{"version": 1,
+    // The same hold through an absolute anchor and through a version-2
+    // relative anchor (the child's first dup2 after its first syscall).
+    for (name, json) in [
+        (
+            "vfork-hold.json",
+            r#"{"version": 1,
             "threads": {"child": {"spawn_ordinal": 1}},
             "events": {"parent_writes": {"thread": "3", "syscall": "write", "fd": 1, "nth": 1},
                        "child_dup2": {"thread": "child", "syscall": "dup2", "fd": 5, "nth": 1}},
             "edges": [{"before": "parent_writes", "after": "child_dup2", "strength": "hard"}]}"#,
-    )
-    .unwrap();
-    let spec = spec.to_str().unwrap().to_owned();
-    // A deadline, so a regression to the old spin fails with a message instead
-    // of hanging the suite.
-    let (status, log) = run_with_deadline(
-        hermit_command(&[
-            "run",
-            "--strict",
-            "--happens-before",
-            spec.as_str(),
-            "--",
-            guest.as_str(),
-        ]),
-        directory.path(),
-        Duration::from_secs(60),
-        false,
-    );
-    let status = status.unwrap_or_else(|| {
+        ),
+        (
+            "vfork-hold-relative.json",
+            r#"{"version": 2,
+            "threads": {"child": {"spawn_ordinal": 1}},
+            "events": {"parent_writes": {"thread": "3", "syscall": "write", "fd": 1, "nth": 1},
+                       "child_first": {"thread": "child", "syscall": "rt_sigprocmask", "nth": 1},
+                       "child_dup2": {"thread": "child", "syscall": "dup2", "fd": 5,
+                                      "from": "child_first", "nth": 1}},
+            "edges": [{"before": "parent_writes", "after": "child_dup2", "strength": "hard"}]}"#,
+        ),
+    ] {
+        let spec = directory.path().join(name);
+        fs::write(&spec, json).unwrap();
+        let spec = spec.to_str().unwrap().to_owned();
+        // A deadline, so a regression to the old spin fails with a message instead
+        // of hanging the suite.
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "run",
+                "--strict",
+                "--happens-before",
+                spec.as_str(),
+                "--",
+                guest.as_str(),
+            ]),
+            directory.path(),
+            Duration::from_secs(60),
+            false,
+        );
+        let status = status.unwrap_or_else(|| {
         panic!(
             "a hold inside a vfork child spun instead of being refused: no exit within 60s\n{log}"
         )
     });
-    assert_eq!(
-        status.code(),
-        Some(HERMIT_POLICY_REFUSAL_EXIT),
-        "a hold inside a vfork child must be refused with the policy-refusal status:\n{log}"
-    );
-    assert!(
-        log.contains("HERMIT_HB_HOLD_IN_VFORK_CHILD: happens-before anchor(s) [\"child_dup2\"]"),
-        "no refusal naming the anchor that would hold the vfork child:\n{log}"
-    );
+        assert_eq!(
+            status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "a hold inside a vfork child must be refused with the policy-refusal status:\n{log}"
+        );
+        assert!(
+            log.contains(
+                "HERMIT_HB_HOLD_IN_VFORK_CHILD: happens-before anchor(s) [\"child_dup2\"]"
+            ),
+            "{name}: no refusal naming the anchor that would hold the vfork child:\n{log}"
+        );
+    }
 }
 
 /// A syscall-occurrence anchor on a launch that bypasses interception is

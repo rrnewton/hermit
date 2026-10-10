@@ -1288,7 +1288,7 @@ fn check_relative_bases(anchors: &BTreeMap<String, Anchor>) -> Result<(), Happen
         if !anchor.is_syscall_occurrence() {
             return Err(HappensBeforeError::FromOnNonOccurrence { event });
         }
-        if base_anchor.thread != anchor.thread {
+        if !same_thread(&base_anchor.thread, &anchor.thread) {
             return Err(HappensBeforeError::FromOtherThread { event, base });
         }
         if base_anchor.from.is_some() {
@@ -1301,6 +1301,18 @@ fn check_relative_bases(anchors: &BTreeMap<String, Anchor>) -> Result<(), Happen
         }
     }
     Ok(())
+}
+
+/// True when two thread references resolve to the same thread whatever they
+/// are called: the same `dettid`, or, with no `dettid` on either, the same
+/// `spawn_ordinal`. A `dettid` and a `spawn_ordinal` cannot be shown equal
+/// before the run, so they are not.
+fn same_thread(a: &ThreadRef, b: &ThreadRef) -> bool {
+    match (a.dettid, b.dettid) {
+        (Some(x), Some(y)) => x == y,
+        (None, None) => a.spawn_ordinal.is_some() && a.spawn_ordinal == b.spawn_ordinal,
+        _ => false,
+    }
 }
 
 /// Refuse a field a version-2 spec does not define. The field lists mirror
@@ -2370,6 +2382,26 @@ mod tests {
                 r#"{"before": "r", "after": "a"}"#
             ),
             HappensBeforeError::FromCycle(vec!["a".to_owned(), "r".to_owned(), "a".to_owned()])
+        );
+        // One thread named two ways (a label for dettid 3, and "3") is the
+        // same thread; a dettid and a spawn ordinal cannot be shown equal.
+        normalize_json(
+            r#"{"version": 2, "threads": {"main": {"dettid": 3}, "s1": {"spawn_ordinal": 1}},
+                "events": {"a": {"thread": "main", "syscall": "write", "fd": 1},
+                           "r": {"thread": "3", "syscall": "getppid", "from": "a"},
+                           "b": {"thread": "s1", "syscalls": 4},
+                           "q": {"thread": "s1", "syscall": "getppid", "from": "b"}}}"#,
+        )
+        .unwrap();
+        let (event, base) = names("r", "a");
+        assert_eq!(
+            normalize_json(
+                r#"{"version": 2, "threads": {"s1": {"spawn_ordinal": 1}},
+                    "events": {"a": {"thread": "7", "syscall": "write", "fd": 1},
+                               "r": {"thread": "s1", "syscall": "getppid", "from": "a"}}}"#,
+            )
+            .unwrap_err(),
+            HappensBeforeError::FromOtherThread { event, base }
         );
         // A soft edge does not hold a thread, so it closes no cycle.
         normalize_json(

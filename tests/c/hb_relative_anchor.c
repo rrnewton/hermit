@@ -18,6 +18,8 @@
  *   after "a2", then writes. Holding A there until B's write can never be
  *   satisfied, and B never ends its turn by itself; only the preemption timer
  *   lets virtual time run, so the hold budget ends the run.
+ * - "late": as "order", but A writes "a1" and "a2" before it creates B, so
+ *   anything B inherited from A would already include A's markers.
  */
 #define _GNU_SOURCE
 #include <pthread.h>
@@ -29,6 +31,7 @@
 
 static atomic_int a_passed;
 static int spin;
+static int late;
 
 static void say(const char *line) {
   size_t length = strlen(line);
@@ -53,12 +56,19 @@ static void *worker(void *arg) {
 
 int main(int argc, char **argv) {
   spin = argc > 1 && strcmp(argv[1], "spin") == 0;
+  late = argc > 1 && strcmp(argv[1], "late") == 0;
+  if (late) {
+    say("a1\n");
+    say("a2\n");
+  }
   pthread_t thread;
   if (pthread_create(&thread, 0, worker, 0) != 0) {
     return 3;
   }
-  say("a1\n");
-  say("a2\n");
+  if (!late) {
+    say("a1\n");
+    say("a2\n");
+  }
   for (int i = 0; i < 3; i++) {
     syscall(SYS_getppid);
     atomic_store_explicit(&a_passed, 1, memory_order_relaxed);

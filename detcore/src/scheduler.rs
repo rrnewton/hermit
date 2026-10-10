@@ -2399,6 +2399,13 @@ pub(crate) async fn finish_selected_turn(
         return Err(SkipTurn);
     }
     mg.abort_turn_if_thread_vanished(next_dtid)?;
+    // A terminal verdict recorded while the lock was released (for example
+    // by the exec reconnect handler) ends the run after this turn: do not
+    // commit or grant it, so no guest runs concurrently with the exit.
+    if mg.terminal_deadlock.is_some() {
+        mg.run_queue.undo_tentative_pop();
+        return Err(SkipTurn);
+    }
 
     // The logical COMMIT point for the turn is during step4:
     mg.step4_resource_block(next_dtid, &rsrcs, &resp)?;
@@ -4241,6 +4248,13 @@ impl Scheduler {
     /// structure maintenance is necessary, i.e. moving timed events from the waiting pool
     /// to the run queue. It manipulates scheduler data structures accordingly.
     fn step2_drain_prefix(&mut self) -> Result<(), SkipTurn> {
+        // A terminal verdict recorded outside a turn (a global-request handler
+        // such as the exec reconnect) ends the run once this turn returns:
+        // select nothing, so no thread is granted a turn that would race the
+        // exit.
+        if self.terminal_deadlock.is_some() {
+            return Err(SkipTurn);
+        }
         // Apply run-queue mutations deferred by asynchronous global-request
         // handlers first, at this fixed deterministic point, before any early
         // return below and before step3 opens a tentative-pop window. Removals
@@ -15917,6 +15931,130 @@ mod test {
         );
         // An absolute anchor alone on either thread is not affected.
         assert_eq!(hb.relative_identity_refusal(tid(8), tid(9)), None);
+    }
+
+    /// A version-2 spec with a relative anchor (and its base) on dettid 17.
+    const HB_RELATIVE_ON_17: &str = r#"{"version": 2, "events": {
+        "m": {"thread": "17", "syscall": "write", "fd": 1, "nth": 1},
+        "r": {"thread": "17", "syscall": "getppid", "from": "m"}}}"#;
+
+    /// The refusal goes through the real exec-reconnect handlers: a non-leader
+    /// exec on the relative anchor's identity is recorded as a policy refusal
+    /// on both the ordinary and the transferred path, while a same-identity
+    /// exec (the leader itself execs) keeps the anchor and is not refused.
+    #[test]
+    fn exec_reconnect_refuses_a_relative_anchor_only_across_a_non_leader_exec() {
+        let leader = DetTid::from_raw(17);
+        let caller = DetTid::from_raw(18);
+        for transferred in [false, true] {
+            let mut sched = Scheduler::new(&Config::default());
+            sched.happens_before = Some(hb_runtime(HB_RELATIVE_ON_17));
+            let (detpid, pre_exec_mm, _) = install_runnable_exec_group(&mut sched, leader, caller);
+            if transferred {
+                reconnect_transferred_exec(&mut sched, leader, caller, detpid, pre_exec_mm);
+            } else {
+                reconnect_nonleader_exec(&mut sched, leader, caller, detpid, pre_exec_mm);
+            }
+            assert!(sched.terminal_is_refusal, "transferred: {transferred}");
+            let report = sched.take_terminal_deadlock().unwrap();
+            assert!(
+                report.starts_with(
+                    "HERMIT_HB_RELATIVE_ACROSS_IDENTITY_REPLACEMENT: dtid 18 execs and takes over \
+                     the identity of dtid 17, but relative happens-before anchor(s) 'r' (from 'm')"
+                ),
+                "transferred: {transferred}: {report}"
+            );
+        }
+
+        let mut sched = Scheduler::new(&Config::default());
+        sched.happens_before = Some(hb_runtime(HB_RELATIVE_ON_17));
+        let (detpid, pre_exec_mm, _) = install_runnable_exec_group(&mut sched, leader, caller);
+        reconnect_nonleader_exec(&mut sched, leader, leader, detpid, pre_exec_mm);
+        assert!(sched.take_terminal_deadlock().is_none());
+        assert!(!sched.terminal_is_refusal);
+    }
+
+    /// Once the exec reconnect has recorded the identity refusal, the next
+    /// turn grants nothing: an unrelated thread waiting at an ordinary request
+    /// gets no response, so no guest runs concurrently with the policy exit.
+    /// (Adopted from the review of https://github.com/rrnewton/hermit/pull/4004.)
+    #[tokio::test]
+    async fn the_identity_refusal_grants_no_further_turn() {
+        let config = Config::default();
+        let mut sched = Scheduler::new(&config);
+        sched.happens_before = Some(hb_runtime(HB_RELATIVE_ON_17));
+        let leader = DetTid::from_raw(17);
+        let caller = DetTid::from_raw(18);
+        let other = DetTid::from_raw(31);
+        let (detpid, pre_exec_mm, _) = install_runnable_exec_group(&mut sched, leader, caller);
+        register_known_thread(&mut sched, other);
+        sched.runqueue_push_back(other);
+        let mut pending = Resources::new(other);
+        pending.insert(ResourceID::MemAddrSpace(other), Permission::RW);
+        sched.next_turns[&other].req.put(Ok(pending));
+        let other_response = sched.next_turns[&other].resp.clone();
+
+        reconnect_nonleader_exec(&mut sched, leader, caller, detpid, pre_exec_mm);
+        assert!(sched.terminal_deadlock.is_some() && sched.terminal_is_refusal);
+        sched.next_turns[&leader]
+            .req
+            .put(Ok(Resources::new(leader)));
+
+        let sched = Arc::new(Mutex::new(sched));
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            do_a_turn_blocking(sched.clone(), global_time, &Err(SkipTurn)),
+        )
+        .await
+        .expect("the turn must not stall");
+        assert!(outcome.is_err(), "a turn was committed: {outcome:?}");
+        assert!(
+            other_response.try_read().is_none(),
+            "dtid 31 was granted a turn after the identity refusal was recorded"
+        );
+        let s = sched.lock().unwrap();
+        assert_eq!(s.turn, 0);
+        assert!(s.terminal_deadlock.is_some());
+    }
+
+    /// A held thread that is removed (killed) leaves no hold behind, so a
+    /// later committed time cannot refuse the run for it.
+    #[test]
+    fn a_removed_held_thread_leaves_no_hold_behind() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.happens_before = Some(hb_runtime(HB_BUDGET_SPEC));
+        let held = DetTid::from_raw(5);
+        assert!(!hb_reach(&mut scheduler, held, 43, 5000));
+        scheduler.remove_blocking_entries(&held);
+        assert!(scheduler.happens_before.as_ref().unwrap().holds.is_empty());
+        scheduler.committed_time = LogicalTime::from_nanos(1_000_000_000);
+        assert!(scheduler.step2_drain_prefix().is_ok());
+        assert!(scheduler.take_terminal_deadlock().is_none());
+    }
+
+    /// A hold whose gate has opened is not refused while the re-admitted
+    /// thread waits to be selected again, however late that is.
+    #[test]
+    fn an_opened_gate_is_not_refused_before_its_thread_runs_again() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.happens_before = Some(hb_runtime(HB_BUDGET_SPEC));
+        let held = DetTid::from_raw(5);
+        assert!(!hb_reach(&mut scheduler, held, 43, 5000));
+        assert!(hb_reach(&mut scheduler, DetTid::from_raw(3), 42, 5100));
+        assert!(hb_reach(&mut scheduler, DetTid::from_raw(4), 42, 5200));
+        // The hold record stays until the thread passes its checkpoint.
+        assert!(
+            scheduler
+                .happens_before
+                .as_ref()
+                .unwrap()
+                .holds
+                .contains_key(&held)
+        );
+        scheduler.committed_time = LogicalTime::from_nanos(1_000_000_000);
+        assert!(scheduler.step2_drain_prefix().is_ok());
+        assert!(scheduler.take_terminal_deadlock().is_none());
     }
 
     /// A relative anchor that never fired is reported with its base, and the
