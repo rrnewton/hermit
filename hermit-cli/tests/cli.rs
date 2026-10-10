@@ -122,6 +122,7 @@ static POLL_TIMEOUT_VS_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_PARENT_KILLED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_KILL_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_WAKE_COUNT_ZERO_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static KILL_MULTITHREADED_PROCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_CREATE_RT_SIGNAL_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_LSEEK_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_INODE_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -840,6 +841,32 @@ fn futex_wake_count_zero_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "futex-wake-count-zero guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn kill_multithreaded_process_guest() -> &'static Path {
+    KILL_MULTITHREADED_PROCESS_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("kill-multithreaded-process");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create kill-multithreaded-process guest directory");
+        let guest = build_root.join("kill_multithreaded_process");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/kill_multithreaded_process.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile kill-multithreaded-process guest");
+        assert!(
+            output.status.success(),
+            "kill-multithreaded-process guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -20385,6 +20412,85 @@ fn a_futex_wake_count_of_zero_or_negative_wakes_one_waiter() {
     assert_eq!(
         stdout, "count 0 woke 1\ncount 0xffffffff woke 1\ncount 0 with no waiter woke 0\n",
         "stderr:\n{log}"
+    );
+}
+
+/// A process-directed signal to a process with two live threads is refused by
+/// name (https://github.com/rrnewton/hermit/issues/4034): Linux's
+/// `complete_signal` would give it to any thread that wants it, and Detcore
+/// does not model that choice. Before the change `kill` and `rt_sigqueueinfo`
+/// returned ENOSYS as an ordinary errno, so a fail-closed run went on with a
+/// failure Linux never returns. A fail-closed run now stops with the
+/// policy-refusal status after the one-thread block, which still delivers; with
+/// `--allow-unsupported-syscalls` both calls return ENOSYS, as before.
+#[test]
+fn a_process_directed_signal_to_several_threads_is_refused_by_name() {
+    let guest = kill_multithreaded_process_guest()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let one_thread =
+        "one thread, kill: 0\none thread, rt_sigqueueinfo: 0\none thread, handled: 2\n";
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--log=error",
+            "run",
+            "--strict",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "a fail-closed run must stop with the policy-refusal status:\nstdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert!(
+        log.contains("process-directed signal 10 to process")
+            && log.contains("by kill is not supported: the process has 2 live threads"),
+        "the refusal must name the call and the reason:\nstderr:\n{log}"
+    );
+    assert_eq!(stdout, one_thread, "stderr:\n{log}");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        // `--strict` refuses the opt-out, so the compatibility run is not strict.
+        hermit_command(&[
+            "run",
+            "--allow-unsupported-syscalls",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(
+        stdout,
+        format!(
+            "{one_thread}two threads, kill: -1 ENOSYS\ntwo threads, rt_sigqueueinfo: -1 ENOSYS\n"
+        ),
+        "stderr:\n{log}"
+    );
+    assert!(
+        log.contains("by rt_sigqueueinfo is not supported"),
+        "the compatibility run must still name each refusal:\nstderr:\n{log}"
     );
 }
 

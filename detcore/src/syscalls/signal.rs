@@ -20,6 +20,7 @@ use reverie::syscalls;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::Sysno;
 use reverie::syscalls::Timespec;
 use tracing::info;
 
@@ -1012,8 +1013,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Ok(self.record_or_replay(guest, call).await?);
         }
-        let targets = resolve_kill_targets(guest, DetPid::from_raw(tgid)).await;
-        let tid = deterministic_kill_target(&targets, call.sig())?;
+        let tid = self
+            .process_signal_target(guest, Sysno::kill, DetPid::from_raw(tgid), call.sig())
+            .await?;
         let value = if !guest
             .config()
             .backend
@@ -1030,6 +1032,46 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.notify_cross_task_signal(guest, tid, call.sig(), Some(DetPid::from_raw(tgid)))
             .await;
         Ok(value)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/4034)
+    /// The thread that a process-directed signal `sig` to `tgid` is routed to.
+    ///
+    /// With several live threads the call is refused by name: Linux's
+    /// `complete_signal` (kernel/signal.c) gives the signal to any thread that
+    /// `wants_signal` (one that does not block it, is not exiting and is not
+    /// stopped), which depends on the threads' masks and run states, and Detcore
+    /// does not model that choice. The refusal goes through the
+    /// unsupported-operation policy, so a fail-closed run stops with the
+    /// policy-refusal status and `--allow-unsupported-syscalls` returns ENOSYS.
+    async fn process_signal_target<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        tgid: DetPid,
+        sig: libc::c_int,
+    ) -> Result<DetTid, Error> {
+        let targets = resolve_kill_targets(guest, tgid).await;
+        match deterministic_kill_target(&targets, sig) {
+            Err(Errno::ENOSYS) => {
+                tracing::error!(
+                    "[detcore, dtid {}] process-directed signal {} to process {} by {} is not supported: \
+                     the process has {} live threads, and Detcore does not choose the receiving \
+                     thread as Linux's complete_signal does \
+                     (https://github.com/rrnewton/hermit/issues/4034)",
+                    guest.thread_state().dettid,
+                    sig,
+                    tgid,
+                    sysno,
+                    targets.len(),
+                );
+                self.refuse_unserviceable_operation(guest, sysno, Errno::ENOSYS)
+                    .await
+                    .and(Err(Errno::ENOSYS.into()))
+            }
+            target => Ok(target?),
+        }
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1171,8 +1213,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         if call.sig() == libc::SIGALRM {
             refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(tgid))).await?;
         }
-        let targets = resolve_kill_targets(guest, DetPid::from_raw(tgid)).await;
-        let tid = deterministic_kill_target(&targets, call.sig())?;
+        let tid = self
+            .process_signal_target(
+                guest,
+                Sysno::rt_sigqueueinfo,
+                DetPid::from_raw(tgid),
+                call.sig(),
+            )
+            .await?;
         let value = if !guest
             .config()
             .backend

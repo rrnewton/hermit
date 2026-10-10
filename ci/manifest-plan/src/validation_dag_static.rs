@@ -2381,7 +2381,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/3904) retain all 276: 278.
     // a_real_time_signal_timer_is_refused_by_name_when_it_expires
     // (https://github.com/rrnewton/hermit/issues/3893) retains all 278: 279.
-    ("test.cli", 279),
+    // a_process_directed_signal_to_several_threads_is_refused_by_name
+    // (https://github.com/rrnewton/hermit/issues/4034) retains all 279: 280.
+    ("test.cli", 280),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2597,7 +2599,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two child-wait CLI tests: 214.
     // Nor does the real-time timer expiry refusal test start a LiteInst guest:
     // 215.
-    ("test.cli_on_host", 215),
+    // Nor does the multithreaded process-directed signal test: 216.
+    ("test.cli_on_host", 216),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 55),
