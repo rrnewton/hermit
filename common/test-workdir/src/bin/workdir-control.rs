@@ -6,11 +6,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Actual mount-namespace controls, run explicitly inside the pinned root.
+//! Actual filesystem and network namespace controls, run in a fresh native process.
 
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io;
+use std::io::Read;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
@@ -102,6 +103,7 @@ fn check_binds() -> io::Result<()> {
     std::fs::write(keep.join("records"), b"preserved")?;
     let parent_tmp = statfs_type("/tmp");
     let isolation = Isolation {
+        local_networking: false,
         test_workdir: false,
         binds: vec![
             BindMount {
@@ -177,6 +179,189 @@ fn check_binds() -> io::Result<()> {
     );
     println!(
         "two runs with binds have private fresh tmpfs /tmp holding only the binds and the preserved path; sources below the original /tmp are reachable; writes reach the source; a missing source fails before launch"
+    );
+    Ok(())
+}
+
+fn network_namespace() -> io::Result<File> {
+    File::open("/proc/thread-self/ns/net")
+}
+
+fn sysfs_interfaces() -> io::Result<Vec<String>> {
+    let mut names = std::fs::read_dir("/sys/class/net")?
+        .map(|entry| {
+            entry.map(|entry| {
+                entry
+                    .file_name()
+                    .into_string()
+                    .expect("interface name is UTF-8")
+            })
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    names.sort();
+    Ok(names)
+}
+
+fn kernel_interfaces() -> io::Result<Vec<String>> {
+    let mut names = std::fs::read_to_string("/proc/thread-self/net/dev")?
+        .lines()
+        .skip(2)
+        .map(|line| {
+            line.split_once(':')
+                .expect("kernel interface row")
+                .0
+                .trim()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    Ok(names)
+}
+
+fn check_network_entry(credentials: (libc::uid_t, libc::gid_t)) -> io::Result<File> {
+    assert_eq!(
+        unsafe { (libc::geteuid(), libc::getegid()) },
+        credentials,
+        "Local changed callback credentials"
+    );
+    let current = network_namespace()?;
+    let expected = vec!["lo".to_string()];
+    assert_eq!(
+        kernel_interfaces()?,
+        expected,
+        "kernel network must contain only loopback"
+    );
+    assert_eq!(
+        sysfs_interfaces()?,
+        expected,
+        "fresh sysfs must match the isolated network"
+    );
+    assert_eq!(statfs_type("/sys"), libc::SYSFS_MAGIC);
+
+    // Real traffic demonstrates that loopback is up, rather than merely named lo.
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+    let mut sender = std::net::TcpStream::connect(listener.local_addr()?)?;
+    let (mut receiver, _) = listener.accept()?;
+    sender.write_all(b"local network")?;
+    let mut bytes = [0_u8; 13];
+    receiver.read_exact(&mut bytes)?;
+    assert_eq!(&bytes, b"local network");
+    let inherited = std::thread::spawn(|| network_namespace().map(|file| inode(&file)))
+        .join()
+        .expect("namespace worker panicked")?;
+    assert_eq!(
+        inherited,
+        inode(&current),
+        "workers must inherit the run's netns"
+    );
+    // Holding the descriptor after return prevents sequential inode reuse.
+    Ok(current)
+}
+
+fn check_networking() -> io::Result<()> {
+    // This command runs in a freshly exec'd child, never in the threaded Rust
+    // test harness. User namespace setup must precede the first worker.
+    assert_eq!(std::fs::read_dir("/proc/self/task")?.count(), 1);
+    if !hermit_test_workdir::has_cap_sys_admin()? {
+        hermit_test_workdir::enter_root_user_namespace()?;
+    }
+    let caller = network_namespace()?;
+    let caller_mount = namespace();
+    let caller_sysfs = std::fs::metadata("/sys/class/net")?;
+    let caller_sysfs_identity = (caller_sysfs.dev(), caller_sysfs.ino());
+    let credentials = unsafe { (libc::geteuid(), libc::getegid()) };
+    let unchanged = || -> io::Result<()> {
+        assert_eq!(
+            inode(&network_namespace()?),
+            inode(&caller),
+            "caller netns changed"
+        );
+        assert_eq!(
+            inode(&namespace()),
+            inode(&caller_mount),
+            "caller mount namespace changed"
+        );
+        let sysfs = std::fs::metadata("/sys/class/net")?;
+        assert_eq!(
+            (sysfs.dev(), sysfs.ino()),
+            caller_sysfs_identity,
+            "caller sysfs changed"
+        );
+        assert_eq!(
+            unsafe { (libc::geteuid(), libc::getegid()) },
+            credentials,
+            "caller credentials changed"
+        );
+        Ok(())
+    };
+    let host = Isolation::default();
+    assert!(host.is_empty(), "Host without mounts needs no isolation");
+    let host_before = with_isolation(&host, || -> io::Result<File> {
+        let current = network_namespace()?;
+        assert_eq!(inode(&current), inode(&caller), "Host netns was replaced");
+        let sysfs = std::fs::metadata("/sys/class/net")?;
+        assert_eq!(
+            (sysfs.dev(), sysfs.ino()),
+            caller_sysfs_identity,
+            "Host sysfs was replaced"
+        );
+        Ok(current)
+    })??;
+    unchanged()?;
+
+    let local = Isolation {
+        local_networking: true,
+        ..Isolation::default()
+    };
+    assert!(
+        !local.is_empty(),
+        "Local needs isolation even without filesystem mounts"
+    );
+    let first = with_isolation(&local, || check_network_entry(credentials))??;
+    unchanged()?;
+    let second = with_isolation(&local, || check_network_entry(credentials))??;
+    unchanged()?;
+    assert_ne!(
+        inode(&first),
+        inode(&caller),
+        "first Local run shares caller netns"
+    );
+    assert_ne!(
+        inode(&second),
+        inode(&caller),
+        "second Local run shares caller netns"
+    );
+    assert_ne!(inode(&first), inode(&second), "physical runs share netns");
+
+    // The kernel's descriptor directory can never contain a descriptor -1.
+    // This valid bind request fails after Local netns/sysfs/loopback setup.
+    let missing_source = Isolation {
+        local_networking: true,
+        binds: vec![BindMount {
+            source: "/proc/thread-self/fd/-1".into(),
+            target: "/tmp/network-control-missing".into(),
+        }],
+        ..Isolation::default()
+    };
+    let launched = AtomicBool::new(false);
+    let error =
+        with_isolation(&missing_source, || launched.store(true, Ordering::SeqCst)).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
+    assert!(
+        !launched.load(Ordering::SeqCst),
+        "Local setup failure launched the callback"
+    );
+    unchanged()?;
+
+    let host_after = with_isolation(&host, network_namespace)??;
+    assert_eq!(
+        inode(&host_before),
+        inode(&host_after),
+        "Local changed later Host networking"
+    );
+    unchanged()?;
+    println!(
+        "networking: two physical Local runs use distinct netns with working loopback and matching fresh sysfs; caller and Host netns, sysfs, mounts and credentials remain unchanged"
     );
     Ok(())
 }
@@ -285,6 +470,7 @@ fn main() -> io::Result<()> {
             );
         }
         [command] if command == "binds" => check_binds()?,
+        [command] if command == "networking" => check_networking()?,
         [command, kind] if command == "expect-setup-error" => {
             let expected = match kind.as_str() {
                 "permission-denied" => io::ErrorKind::PermissionDenied,
@@ -309,7 +495,7 @@ fn main() -> io::Result<()> {
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "usage: workdir-control check | binds | expect-setup-error permission-denied|not-found",
+                "usage: workdir-control check | binds | networking | expect-setup-error permission-denied|not-found",
             ));
         }
     }

@@ -2606,6 +2606,166 @@ fn run_dbt_executes_integrated_backend() {
     assert_success(&output, &args);
 }
 
+/// Default DBT networking must isolate the same port-zero/listen workload as
+/// the common container path, even when its caller holds that assigned port.
+/// The native helper creates its own outer user/net namespace, so this neither
+/// depends on ambient host listeners nor occupies a port another lane can use.
+#[test]
+fn dbt_network_modes_preserve_the_outer_listener_and_isolate_local_runs() {
+    if dbt_unavailable("dbt_network_modes_preserve_the_outer_listener_and_isolate_local_runs") {
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create DBT network collision evidence directory")
+        .keep();
+    println!("DBT network collision evidence: {}", directory.display());
+    let guest = directory.join("network_namespace_collision");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/dbt/network_namespace_collision.c");
+    let compile = Command::new("cc")
+        .args(["-std=c11", "-O2", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("compile DBT network collision fixture");
+    fs::write(directory.join("compiler.stdout"), &compile.stdout).unwrap();
+    fs::write(directory.join("compiler.stderr"), &compile.stderr).unwrap();
+    assert!(
+        compile.status.success(),
+        "network collision fixture did not compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = |label: &str, options: &[&str], mode: &str| {
+        let mut command = Command::new(&guest);
+        command
+            .arg("outer")
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args([
+                "--log",
+                "info",
+                "--backend",
+                "dbt",
+                "run",
+                "--base-env=minimal",
+                "--epoch=2026-10-09T00:00:00Z",
+            ])
+            .args(options)
+            .arg("--")
+            .arg(&guest)
+            .arg(mode)
+            // Each command explicitly chooses its bound or unbound execution
+            // path. In particular the plain local control must not acquire the
+            // pinned root's /test marker and accidentally test only mounts.
+            .env_remove(ISOLATED_WORKDIR_ENV);
+        let argv = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        fs::write(
+            directory.join(format!("{label}.argv.json")),
+            serde_json::to_vec_pretty(&argv).unwrap(),
+        )
+        .unwrap();
+        let output = command.output().expect("run native outer network helper");
+        fs::write(directory.join(format!("{label}.stdout")), &output.stdout).unwrap();
+        fs::write(directory.join(format!("{label}.stderr")), &output.stderr).unwrap();
+        fs::write(
+            directory.join(format!("{label}.status")),
+            format!("{}\n", output.status),
+        )
+        .unwrap();
+        assert!(
+            stderr(&output).contains("native exclusive outer holder ready at 127.0.0.1:32768")
+                && stderr(&output)
+                    .contains("native exclusive outer holder verified after CLI exit"),
+            "{label}: outer setup or held-listener check failed: {}",
+            stderr(&output)
+        );
+        output
+    };
+
+    // Deliberately shared networking is a separate negative control. Do not
+    // classify its expected collision as the local isolation success oracle.
+    let host = run("host-collision", &["--network=host"], "guest-host");
+    assert!(host.status.success(), "host control: {}", stderr(&host));
+    assert_eq!(stdout(&host), "dbt-host-collision-observed\n");
+
+    let bound = directory.join("bound-workdir");
+    fs::create_dir(&bound).unwrap();
+    let bind = format!("{}:/tmp/dbt-netns-regression", bound.display());
+    let logs = directory.join("verify-logs");
+    fs::create_dir(&logs).unwrap();
+    let verdict = directory.join("default.verify.json");
+    let verified = run(
+        "default-verify",
+        &[
+            "--strict",
+            "--verify-strict",
+            "--verify",
+            "--keep-logs",
+            "--verify-log-dir",
+            logs.to_str().unwrap(),
+            "--verify-json",
+            verdict.to_str().unwrap(),
+            "--bind",
+            &bind,
+            "--workdir=/tmp/dbt-netns-regression",
+        ],
+        "guest-local",
+    );
+    assert!(
+        verified.status.success(),
+        "default strict verification: {}",
+        stderr(&verified)
+    );
+    assert_eq!(stdout(&verified), "dbt-local-port-zero-listeners-ok\n");
+    let report = read_terminal_dbt_verdict(&verdict);
+    assert_eq!(report["verdict"], "matched", "{report}");
+    assert_eq!(report["comparison"]["compare_io_buffers"], true, "{report}");
+    assert_eq!(report["comparison"]["compare_logs"], true, "{report}");
+    assert_eq!(
+        report["compared_log_messages"]["left"], report["compared_log_messages"]["right"],
+        "{report}"
+    );
+
+    // The unbound path previously created a shared runtime without any scoped
+    // isolation. A bound verification passing does not exercise this path.
+    let local = run(
+        "unbound-local",
+        &["--strict", "--network=local"],
+        "guest-local",
+    );
+    assert!(local.status.success(), "unbound local: {}", stderr(&local));
+    assert_eq!(stdout(&local), "dbt-local-port-zero-listeners-ok\n");
+
+    let strict_host = run(
+        "strict-host-refusal",
+        &["--strict", "--network=host"],
+        "guest-local",
+    );
+    assert!(!strict_host.status.success());
+    assert!(stdout(&strict_host).is_empty());
+    assert!(
+        stderr(&strict_host).contains("--strict is fail-closed deterministic mode")
+            && stderr(&strict_host).contains("--network=host"),
+        "strict host refusal: {}",
+        stderr(&strict_host)
+    );
+
+    // `none` is the pinned outer container's policy, not a Hermit CLI mode.
+    let none = run("unsupported-none", &["--network=none"], "guest-local");
+    assert_eq!(none.status.code(), Some(2), "{}", stderr(&none));
+    assert!(stdout(&none).is_empty());
+    assert!(
+        stderr(&none).contains("Could not parse"),
+        "{}",
+        stderr(&none)
+    );
+}
+
 #[test]
 fn run_dbt_uses_the_requested_guest_environment() {
     if dbt_unavailable("run_dbt_uses_the_requested_guest_environment") {

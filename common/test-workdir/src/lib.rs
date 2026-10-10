@@ -6,7 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Host-side per-physical-run filesystem isolation inside the pinned root.
+//! Host-side per-physical-run filesystem and network isolation.
 //!
 //! Callers must create their tracer runtime inside the callback and finish its
 //! cleanup before returning. A pre-existing executor could spawn the guest in
@@ -20,6 +20,8 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Component;
@@ -42,9 +44,12 @@ pub struct BindMount {
     pub target: PathBuf,
 }
 
-/// The mounts one physical run gets in its own mount namespace.
+/// The filesystem and network isolation one physical run gets.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Isolation {
+    /// Create a fresh network namespace with loopback up and a fresh /sys.
+    /// False leaves the caller's network namespace in place.
+    pub local_networking: bool,
     /// Mount a fresh tmpfs on the pre-existing [`WORKDIR`].
     pub test_workdir: bool,
     /// Mount a fresh tmpfs on /tmp and bind each source at its target there,
@@ -57,9 +62,9 @@ pub struct Isolation {
 }
 
 impl Isolation {
-    /// Whether the run needs no mount namespace at all.
+    /// Whether the run needs neither filesystem nor network isolation.
     pub fn is_empty(&self) -> bool {
-        !self.test_workdir && self.binds.is_empty()
+        !self.local_networking && !self.test_workdir && self.binds.is_empty()
     }
 }
 
@@ -97,14 +102,16 @@ where
     )
 }
 
-/// Run on a new host thread in a new mount namespace that has `isolation`'s
-/// mounts.
+/// Run on a new host thread in a new mount namespace with the requested mounts
+/// and, for local networking, a new network namespace with only loopback.
 ///
 /// The same contract as [`with_isolated_workdir`]: CAP_SYS_ADMIN is required,
 /// every setup error returns before the callback can launch a guest, and the
-/// mounts disappear with the namespace. A bind target must be a normal
-/// absolute path strictly below /tmp; a bind source and a preserved path are
-/// resolved before /tmp is replaced, so they may lie below the original /tmp.
+/// mounts disappear with the namespace. Local networking also needs
+/// CAP_NET_ADMIN to bring loopback up; failure never falls back to host networking.
+/// A bind target must be a normal absolute path strictly below /tmp; a bind
+/// source and a preserved path are resolved before /tmp is replaced, so they
+/// may lie below the original /tmp.
 pub fn with_isolation<F, T>(isolation: &Isolation, run: F) -> io::Result<T>
 where
     F: FnOnce() -> T + Send,
@@ -296,6 +303,42 @@ fn bind_opened(source: &OpenedSource) -> io::Result<()> {
     )
 }
 
+/// Open the setup socket only after unsharing, so its ioctls address the new
+/// network namespace. CLOEXEC and OwnedFd keep it out of the launched guest.
+fn bring_loopback_up() -> io::Result<()> {
+    let socket = unsafe {
+        libc::socket(
+            libc::AF_INET,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+            libc::IPPROTO_IP,
+        )
+    };
+    if socket < 0 {
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            format!("open loopback setup socket: {error}"),
+        ));
+    }
+    // SAFETY: socket is a newly opened descriptor owned by this function.
+    let socket = unsafe { OwnedFd::from_raw_fd(socket) };
+    // SAFETY: an all-zero ifreq is valid; the short interface name stays NUL-terminated.
+    let mut interface: libc::ifreq = unsafe { std::mem::zeroed() };
+    interface.ifr_name[0] = b'l' as libc::c_char;
+    interface.ifr_name[1] = b'o' as libc::c_char;
+    syscall_result(
+        unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCGIFFLAGS, &mut interface) },
+        "read loopback interface flags",
+    )?;
+    // SAFETY: SIOCGIFFLAGS initialized this union member on success.
+    interface.ifr_ifru.ifru_flags =
+        unsafe { interface.ifr_ifru.ifru_flags } | libc::IFF_UP as libc::c_short;
+    syscall_result(
+        unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCSIFFLAGS, &interface) },
+        "bring loopback interface up",
+    )
+}
+
 fn enter_namespace(isolation: &Isolation) -> io::Result<()> {
     // A new thread is essential: unshare also separates its fs_struct, which
     // setns could not restore to the caller's original CLONE_FS sharing.
@@ -303,6 +346,12 @@ fn enter_namespace(isolation: &Isolation) -> io::Result<()> {
         unsafe { libc::unshare(libc::CLONE_NEWNS) },
         "unshare mount namespace",
     )?;
+    if isolation.local_networking {
+        syscall_result(
+            unsafe { libc::unshare(libc::CLONE_NEWNET) },
+            "unshare network namespace",
+        )?;
+    }
     syscall_result(
         unsafe {
             libc::mount(
@@ -315,6 +364,21 @@ fn enter_namespace(isolation: &Isolation) -> io::Result<()> {
         },
         "make mount propagation private",
     )?;
+    if isolation.local_networking {
+        syscall_result(
+            unsafe {
+                libc::mount(
+                    std::ptr::null(),
+                    c"/sys".as_ptr(),
+                    c"sysfs".as_ptr(),
+                    0,
+                    std::ptr::null(),
+                )
+            },
+            "mount per-run network sysfs",
+        )?;
+        bring_loopback_up()?;
+    }
     if isolation.test_workdir {
         mount_tmpfs(c"/test", "mount per-run /test tmpfs")?;
     }
@@ -400,6 +464,11 @@ mod tests {
             ..Isolation::default()
         };
         assert!(!workdir.is_empty());
+        let local_networking = Isolation {
+            local_networking: true,
+            ..Isolation::default()
+        };
+        assert!(!local_networking.is_empty());
     }
 
     #[test]

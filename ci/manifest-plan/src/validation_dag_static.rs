@@ -949,7 +949,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // config::tests::a_config_fingerprint_mismatch_names_both_fingerprints
     // (lane qemu-rcb, https://github.com/rrnewton/hermit/issues/3986) retains
     // all 1031: 1032.
-    ("test.regular_crates", 1032),
+    // The native per-physical-network namespace regression: 1023, listed.
+    ("test.regular_crates", 1033),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2289,7 +2290,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (lane qemu-rcb, https://github.com/rrnewton/hermit/issues/3986) retain
     // all 265: 267, measured with `cargo nextest list --profile ci` and this
     // node's arguments.
-    ("test.cli", 267),
+    // The DBT network namespace collision regression: 266, listed.
+    ("test.cli", 268),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2498,7 +2500,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the LiteInst runtime's fingerprint refusal test, which runs no guest
     // under Hermit and needs no CPUID faulting: 203, measured the same way. The
     // config-fingerprint guest test is excluded with the CPUID-faulting cases.
-    ("test.cli_on_host", 203),
+    // The DBT network namespace collision regression: 203, listed.
+    ("test.cli_on_host", 204),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 55),
@@ -2832,7 +2835,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the probed in-guest timeslice test: 1022.
     // And the same nine glibc_compat unwind tests: 1031.
     // And the config-fingerprint mismatch test: 1032.
-    ("test.regular_crates_on_host", 1032),
+    // The native per-physical-network namespace regression: 1023, listed.
+    ("test.regular_crates_on_host", 1033),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

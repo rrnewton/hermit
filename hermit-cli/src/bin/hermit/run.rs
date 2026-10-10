@@ -1495,15 +1495,14 @@ impl NetworkingMode {
     /// sees the same network as the run it records. `analyze_networking`
     /// forces an isolated namespace even under `host`.
     pub(crate) fn configure(self, container: &mut Container, analyze_networking: bool) {
-        match self {
-            NetworkingMode::Local => {
-                container.local_networking_only();
-            }
-            NetworkingMode::Host if analyze_networking => {
-                container.local_networking_only();
-            }
-            NetworkingMode::Host => {}
+        if self.uses_local_namespace(analyze_networking) {
+            container.local_networking_only();
         }
+    }
+
+    /// The dedicated DBT launcher must use the same resolved network policy.
+    pub(super) fn uses_local_namespace(self, analyze_networking: bool) -> bool {
+        self == Self::Local || analyze_networking
     }
 }
 
@@ -5550,6 +5549,7 @@ impl RunOpts {
                     environment,
                     self.workdir.as_deref().map(Path::new),
                     self.dbt_binds(),
+                    self.network.uses_local_namespace(self.analyze_networking),
                     dbt_verification_stdin,
                 );
             }

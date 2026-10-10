@@ -976,6 +976,7 @@ pub(super) fn run_dbt(
     mut environment: BTreeMap<OsString, OsString>,
     workdir: Option<&Path>,
     binds: Vec<(PathBuf, PathBuf)>,
+    local_networking: bool,
     verification_stdin: Option<std::fs::File>,
 ) -> Result<ExitStatus, Error> {
     if let Some(path) = verify_json.filter(|_| verify) {
@@ -1027,6 +1028,7 @@ pub(super) fn run_dbt(
     }
     let isolation = hermit_test_workdir::Isolation {
         test_workdir: isolated_workdir.is_some() && workdir == isolated_workdir,
+        local_networking,
         binds,
         preserve: Vec::new(),
     };
@@ -1110,6 +1112,7 @@ pub(super) fn run_dbt(
             &guest,
             &drrun,
             config,
+            None,
             std::io::stdin(),
         )?;
         write_output(&output)?;
@@ -1154,26 +1157,20 @@ pub(super) fn run_dbt(
     let evidence_level = dbt_evidence_log_level(log, verify_verbose);
     let mut evidence1 = tempfile::tempfile()?;
     let stats1 = execution.stats_capture()?;
-    let runner1 = stats1
-        .configure(runner.clone())
-        .evidence_file(&evidence1)
-        .map_err(|error| {
-            Error::msg(format!(
-                "failed to configure protected DBT run-1 evidence: {error}"
-            ))
-        })?
-        .evidence_log_level(evidence_level);
+    let runner1 = stats1.configure(runner.clone());
+    let run1_evidence = Some(DbtRunEvidence {
+        file: &evidence1,
+        log_level: evidence_level,
+        label: "run-1",
+    });
     let mut evidence2 = tempfile::tempfile()?;
     let stats2 = execution.stats_capture()?;
-    let runner2 = stats2
-        .configure(runner)
-        .evidence_file(&evidence2)
-        .map_err(|error| {
-            Error::msg(format!(
-                "failed to configure protected DBT run-2 evidence: {error}"
-            ))
-        })?
-        .evidence_log_level(evidence_level);
+    let runner2 = stats2.configure(runner);
+    let run2_evidence = Some(DbtRunEvidence {
+        file: &evidence2,
+        log_level: evidence_level,
+        label: "run-2",
+    });
 
     let mut replay = tempfile::tempfile()?;
     let terminal_stdin = verification_stdin.as_ref().is_some_and(|file| {
@@ -1187,7 +1184,7 @@ pub(super) fn run_dbt(
 
     eprintln!(":: DBT Run1...");
     let first_raw = if terminal_stdin {
-        run_once_with_terminal_input(&execution, &runner1, &guest, &drrun, config)
+        run_once_with_terminal_input(&execution, &runner1, &guest, &drrun, config, run1_evidence)
     } else {
         match replayable_stdin {
             Some(input) => run_once(
@@ -1196,6 +1193,7 @@ pub(super) fn run_dbt(
                 &guest,
                 &drrun,
                 config,
+                run1_evidence,
                 TeeReader {
                     input,
                     replay: replay.try_clone()?,
@@ -1207,6 +1205,7 @@ pub(super) fn run_dbt(
                 &guest,
                 &drrun,
                 config,
+                run1_evidence,
                 std::io::empty(),
             ),
         }
@@ -1306,7 +1305,7 @@ pub(super) fn run_dbt(
     replay.seek(SeekFrom::Start(0))?;
     eprintln!(":: DBT Run2...");
     let second_raw = match if terminal_stdin {
-        run_once_with_terminal_input(&execution, &runner2, &guest, &drrun, config)
+        run_once_with_terminal_input(&execution, &runner2, &guest, &drrun, config, run2_evidence)
     } else {
         run_once(
             &execution,
@@ -1314,6 +1313,7 @@ pub(super) fn run_dbt(
             &guest,
             &drrun,
             config,
+            run2_evidence,
             replay.try_clone()?,
         )
     } {
@@ -1474,14 +1474,15 @@ pub(super) fn run_dbt(
     _environment: BTreeMap<OsString, OsString>,
     _workdir: Option<&Path>,
     _binds: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+    _local_networking: bool,
     _verification_stdin: Option<std::fs::File>,
 ) -> Result<ExitStatus, Error> {
     Err(Error::msg("DBT support was not included in this build"))
 }
 
-/// Ordinary runs share the existing coordinator runtime. Marked runs, and runs
-/// with binds, create all coordinator workers inside a new mount namespace for
-/// each physical run.
+/// Local networking, marked workdirs, and binds create coordinator workers in
+/// fresh namespaces for each physical run. Only host-network runs without mount
+/// isolation share the calling thread's coordinator runtime.
 #[cfg(feature = "dbt")]
 struct DbtExecution {
     runtime: Option<tokio::runtime::Runtime>,
@@ -1497,7 +1498,7 @@ impl DbtExecution {
                 isolation: None,
             }
         } else {
-            // The run's mount namespace needs CAP_SYS_ADMIN. A caller without it
+            // The run's mount/network namespaces need CAP_SYS_ADMIN. A caller without it
             // takes it the way every other backend's container does (root mapped
             // to the caller), so a bound DBT run needs no privileged host; such a
             // caller has no capability to lose, and its file access is unchanged.
@@ -1507,8 +1508,8 @@ impl DbtExecution {
             if !hermit_test_workdir::has_cap_sys_admin()? {
                 hermit_test_workdir::enter_root_user_namespace().map_err(|error| {
                     Error::msg(format!(
-                        "failed to give the DBT run the user namespace its --bind and \
-                         HERMIT_E2E_EMPTY_WORKDIR mounts need: {error}"
+                        "failed to give the DBT run the user namespace its local networking \
+                         or private mounts need: {error}"
                     ))
                 })?;
             }
@@ -1569,10 +1570,40 @@ impl DbtExecution {
         })
         .map_err(|error| {
             Error::msg(format!(
-                "failed to set up the DBT run's private mount namespace, which --bind and \
-                 HERMIT_E2E_EMPTY_WORKDIR need: {error}"
+                "failed to set up the DBT run's private namespaces for local networking \
+                 or private mounts: {error}"
             ))
         })?
+    }
+}
+
+/// Create the abstract Unix evidence listener only after entering this physical
+/// run's network namespace. A listener created by the caller would be invisible
+/// to the guest. The completed artifact is an ordinary file read by the caller.
+#[cfg(feature = "dbt")]
+struct DbtRunEvidence<'a> {
+    file: &'a std::fs::File,
+    log_level: DbtEvidenceLogLevel,
+    label: &'static str,
+}
+
+#[cfg(feature = "dbt")]
+fn configure_dbt_run_evidence(
+    runner: &DbtRunner,
+    evidence: Option<DbtRunEvidence<'_>>,
+) -> Result<DbtRunner, Error> {
+    let runner = runner.clone();
+    match evidence {
+        Some(evidence) => runner
+            .evidence_file(evidence.file)
+            .map(|runner| runner.evidence_log_level(evidence.log_level))
+            .map_err(|error| {
+                Error::msg(format!(
+                    "failed to configure protected DBT {} evidence: {error}",
+                    evidence.label
+                ))
+            }),
+        None => Ok(runner),
     }
 }
 
@@ -1583,9 +1614,11 @@ fn run_once<R: Read + Send + 'static>(
     guest: &StdCommand,
     drrun: &Path,
     config: &Config,
+    evidence: Option<DbtRunEvidence<'_>>,
     input: R,
 ) -> Result<Output, Error> {
     execution.run(move |runtime| {
+        let runner = configure_dbt_run_evidence(runner, evidence)?;
         let guest = prepare_dbt_physical_command(guest)?;
         let (output, global) = runtime
             .block_on(
@@ -1608,8 +1641,10 @@ fn run_once_with_terminal_input(
     guest: &StdCommand,
     drrun: &Path,
     config: &Config,
+    evidence: Option<DbtRunEvidence<'_>>,
 ) -> Result<Output, Error> {
     execution.run(move |runtime| {
+        let runner = configure_dbt_run_evidence(runner, evidence)?;
         let guest = prepare_dbt_physical_command(guest)?;
         let (output, global) = runtime
             .block_on(

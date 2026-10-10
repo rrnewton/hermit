@@ -321,6 +321,13 @@ cargo build --release --workspace --features hermit/third-party-backends
 ./target/install_pkg/hermit --backend=dbt run -- /bin/echo hello
 ```
 
+For DBT, the default `--network=local` gives each physical execution a fresh
+network namespace with active loopback, including both executions of
+`--verify`. Each guest and its verification channel share that namespace.
+Newly created guest sockets are isolated from unrelated outer listeners; a
+namespace setup failure stops before the guest runs. Explicit `--network=host`
+shares the caller's network and remains incompatible with `--strict`.
+
 The same executable accepts `--backend=sabre` and `--backend=e9patch`.
 A default `cargo install` does not enable these selections. KVM requires
 read-write `/dev/kvm` access plus a guest-kernel ABI.
