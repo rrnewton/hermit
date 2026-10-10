@@ -1331,10 +1331,10 @@ fi
 # vendor/dynamorio, third-party and rust-toolchain.toml are unchanged Git
 # objects. The tracked reverie-dbt file population remains939. This carries
 # the same SDK recipe budget, not an earlier runtime validation receipt.
-# FIXED-STACK CARRY TO f2cb0dc267f6d502a3d27b95b01121d584de2265:
+# FIXED-STACK CARRY TO 78d5cbe51e848d988b5c006ea211e62a220d2c85:
 # reverie-dbt, third-party and rust-toolchain.toml are identical to 4203a253;
 # the tracked DBT inventory remains 939. No timing budget was changed.
-expected_pin=f2cb0dc267f6d502a3d27b95b01121d584de2265
+expected_pin=78d5cbe51e848d988b5c006ea211e62a220d2c85
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
