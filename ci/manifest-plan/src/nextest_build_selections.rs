@@ -637,8 +637,9 @@ mod tests {
             // runs, plus the eight fatal_core_capture tests, plus the
             // scheduler-turn-cost clock-exhaustion test in
             // container_init_deadline, plus the two robust-futex exec tests
-            // (https://github.com/rrnewton/hermit/issues/2082).
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "273");
+            // (https://github.com/rrnewton/hermit/issues/2082). The limited
+            // backend-isolation target adds its 22 retained controls.
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "295");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
@@ -902,7 +903,25 @@ mod tests {
         let hardware_key = crate::nextest_binaries::selection_key(&hardware);
         assert_eq!(full.get(&hardware_key), Some(&hardware));
         assert!(!portable.contains_key(&hardware_key));
-        assert_eq!(full.len(), portable.len() + 1);
+        // Ordinary integration also builds the limited isolation target. The
+        // PMU node retains its original target set, so it is now a distinct
+        // full-profile selection alongside the hardware CLI selection.
+        let pmu = graph
+            .steps
+            .iter()
+            .find(|step| step.tag() == "test.pmu_integration_cases")
+            .unwrap();
+        let pmu_selection: Vec<String> = serde_json::from_str(&pmu.env[SELECTION_ENV]).unwrap();
+        let pmu_key = crate::nextest_binaries::selection_key(&pmu_selection);
+        assert_eq!(full.get(&pmu_key), Some(&pmu_selection));
+        assert_eq!(pmu.env["NEXTEST_EXPECTED_EXECUTED"], "25");
+        assert_eq!(
+            full.keys()
+                .filter(|key| !portable.contains_key(*key))
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([hardware_key, pmu_key])
+        );
         for (key, selection) in &portable {
             assert_eq!(full.get(key), Some(selection));
         }

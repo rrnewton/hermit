@@ -1319,9 +1319,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/3997) retains all 1019: 1020.
     // And the two signal-target metadata tests (https://github.com/rrnewton/hermit/issues/3963): 1022.
     // Common container/input and requested-mount controls retain all 1022:
-    // the prior measured selection contained 1034 cases.
-    // Two native IPC/cgroup setup controls bring the current selection to 1036.
-    ("test.hermit_unit", 1036),
+    // The prior measured common/IPC selection contained 1036 cases.
+    // One declared-mount-parent regression control brings the current selection to 1037.
+    ("test.hermit_unit", 1037),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2824,8 +2824,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the version-2 preemption refusal test: 1019.
     // And the child-subreaper record-version test: 1020.
     // And the same two signal-target metadata tests: 1022.
-    // The same prior measured selection of 1034 plus two native IPC/cgroup controls: 1036.
-    ("test.hermit_unit_on_host", 1036),
+    // The same prior measured common/IPC selection plus one mount-parent control: 1037.
+    ("test.hermit_unit_on_host", 1037),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

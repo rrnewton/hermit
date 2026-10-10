@@ -2780,6 +2780,100 @@ fn scratch_input_keeps_a_real_link_and_cancelled_directory() {
 }
 
 #[test]
+fn scratch_input_prepares_only_missing_declared_mount_parents() {
+    let root = tempfile::TempDir::new_in(TMP_DIR).unwrap();
+    let source = root.path().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("guest"), b"#!/bin/sh\nexit 0\n").unwrap();
+    let actual = root.path().join("actual");
+    fs::create_dir_all(actual.join("nested")).unwrap();
+    let alias = root.path().join("alias");
+    std::os::unix::fs::symlink("actual/nested/..", &alias).unwrap();
+    let future = actual.join("future/e2e");
+    let target = future.join("tools");
+    let mount = format!(
+        "--mount=type=bind,source={},target={}",
+        source.display(),
+        target.display()
+    );
+    let program = alias.join("future/e2e/tools/guest");
+    let options = run_opts_for(&[
+        "hermit",
+        "run",
+        "--workdir=/",
+        &mount,
+        program.to_str().unwrap(),
+    ]);
+    let (resolved, graph) = options.scratch_input_path(&program).unwrap();
+    assert_eq!(resolved, target.join("guest"));
+    assert_eq!(graph.links.get(&alias), Some(&alias));
+    assert!(graph.directories.contains(&actual.join("nested")));
+    assert!(graph.directories.contains(&future));
+    assert_eq!(
+        options.guest_command().unwrap().get_program(),
+        program.as_os_str()
+    );
+    let backing = tempfile::tempdir().unwrap();
+    let prepared = options.mounts(backing.path()).unwrap();
+    assert!(prepared.mounts.iter().any(|mount| {
+        mount.get_source() == Some(source.as_path())
+            && mount.get_target() == backing.path().join(target.strip_prefix(TMP_DIR).unwrap())
+    }));
+    assert!(
+        backing
+            .path()
+            .join(future.strip_prefix(TMP_DIR).unwrap())
+            .is_dir()
+    );
+    assert!(!actual.join("future").exists());
+    assert_eq!(
+        fs::read_link(&alias).unwrap(),
+        Path::new("actual/nested/..")
+    );
+    assert_eq!(
+        fs::read(source.join("guest")).unwrap(),
+        b"#!/bin/sh\nexit 0\n"
+    );
+
+    // A missing object inside the declared bind source is still an input
+    // error. So is an unrelated missing cwd/input, with no declared target.
+    let error = options
+        .scratch_input_path(&target.join("missing/guest"))
+        .err()
+        .expect("a missing declared source must refuse");
+    assert!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    );
+    assert!(!source.join("missing").exists());
+    assert!(
+        options
+            .scratch_input_path(&root.path().join("undeclared/guest"))
+            .is_err()
+    );
+    fs::write(root.path().join("file"), b"not a directory").unwrap();
+    let file_mount = format!(
+        "--mount=type=bind,source={},target={}",
+        source.display(),
+        root.path().join("file/child").display()
+    );
+    let invalid = run_opts_for(&["hermit", "run", "--workdir=/", &file_mount, "/bin/true"]);
+    assert!(
+        invalid
+            .scratch_input_path(&root.path().join("file/child/guest"))
+            .err()
+            .expect("an existing file cannot supply traversal glue")
+            .to_string()
+            .contains("not a directory")
+    );
+    assert_eq!(
+        fs::read(root.path().join("file")).unwrap(),
+        b"not a directory"
+    );
+}
+
+#[test]
 fn requested_mount_preserves_the_public_parser_and_filesystem_intent() {
     for (request, filesystem) in [
         ("source=/source,target=/tmp/target", false),
@@ -3602,8 +3696,24 @@ fn dbt_accepts_common_mount_bind_and_workdir_policy() {
         !prepared
             .mounts
             .iter()
-            .any(|mount| mount.get_target() == Path::new("/test"))
+            .any(|mount| mount.get_target() == Path::new("/test")
+                && mount.get_source() == Some(Path::new("/tmp")))
     );
+    // The pinned runner may independently require a fresh /test. It is not
+    // the ignored --bind=/tmp:/test request above.
+    let test_mounts = prepared
+        .mounts
+        .iter()
+        .filter(|mount| mount.get_target() == Path::new("/test"))
+        .map(|mount| format!("{mount:?}"))
+        .collect::<Vec<_>>();
+    let expected_test_mounts =
+        if std::env::var_os("HERMIT_E2E_EMPTY_WORKDIR").as_deref() == Some(OsStr::new("/test")) {
+            vec![format!("{:?}", Mount::tmpfs("/test"))]
+        } else {
+            Vec::new()
+        };
+    assert_eq!(test_mounts, expected_test_mounts);
 
     let mut with_workdir = run_opts_for(&[
         "hermit",
@@ -7791,6 +7901,20 @@ impl RunOpts {
             };
             let metadata = match fs::symlink_metadata(&host) {
                 Ok(metadata) => metadata,
+                Err(error)
+                    if matches!(purpose, ScratchPathPurpose::Executable)
+                        && error.kind() == std::io::ErrorKind::NotFound
+                        && self.pins_scratch_input(&resolved)
+                        && self.prepared_mount_directory(&resolved) =>
+                {
+                    // This is uncovered traversal glue for a declared guest
+                    // mount destination. The automatic scratch source candidate
+                    // need not exist on the host. A covered source, ordinary
+                    // missing input, or existing non-directory still refuses.
+                    graph.directories.insert(resolved.clone());
+                    directory = true;
+                    continue;
+                }
                 Err(error)
                     if matches!(purpose, ScratchPathPurpose::MountTarget(_))
                         && error.kind() == std::io::ErrorKind::NotFound =>

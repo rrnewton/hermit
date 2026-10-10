@@ -2173,6 +2173,9 @@ fn readonly_proc_command(args: &[&str]) -> Command {
     // The inherited validation workdir is sufficient for these read-only guests.
     // A fresh /test tmpfs mount would also be denied by the flags-zero filter.
     append_hermit_args_using_outer_mount(&mut command, args);
+    // This helper deliberately uses the already mounted outer /test. Do not
+    // ask common setup to mount that runner-owned workdir a second time.
+    command.env_remove(ISOLATED_WORKDIR_ENV);
     // SAFETY: The helper installs the filter using only async-signal-safe
     // syscalls, in the child before exec, without affecting the test process.
     unsafe {
@@ -3233,6 +3236,11 @@ fn dbt_verify_without_json_rejects_io_buffer_content_divergence() {
             "--verify-log-dir",
         ])
         .arg(&log_dir);
+    command.arg(format!(
+        "--mount=type=bind,source={},target={}",
+        state.display(),
+        state.display()
+    ));
     append_hermit_args_using_outer_mount(&mut command, &["--"]);
     let output = command
         .arg(&guest)
@@ -3832,7 +3840,12 @@ fn run_dbt_strict_returns_with_blocked_stdin_source() {
         .expect("failed to run strict DBT blocked-input regression");
     let _ = source.kill();
     let _ = source.wait();
-    assert_ne!(output.status.code(), Some(124), "strict DBT hung on stdin");
+    assert_ne!(
+        output.status.code(),
+        Some(124),
+        "strict DBT hung on stdin:\n{}",
+        stderr(&output)
+    );
     assert!(
         !output.status.success(),
         "strict DBT unexpectedly succeeded"
