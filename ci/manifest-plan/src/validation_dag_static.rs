@@ -2423,7 +2423,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // futex_requeue_and_wake_op_key_and_access_their_words_as_linux and
     // a_wake_op_on_a_file_backed_shared_word_is_refused_by_name
     // (https://github.com/rrnewton/hermit/pull/4020) retain all 290: 294.
-    ("test.cli", 294),
+    // verify_tmpdir_does_not_reach_the_guest_environment,
+    // a_killed_verify_leaves_its_logs_in_verify_tmpdir_not_tmpdir and
+    // an_unusable_verify_tmpdir_is_a_clean_error_naming_the_variable
+    // (https://github.com/rrnewton/dev-hermit/issues/553) retain all 294: 297.
+    ("test.cli", 297),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2644,7 +2648,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the nine posthook-anchor CLI tests: 226.
     // Nor do the four FUTEX_REQUEUE/FUTEX_WAKE_OP, FUTEX_LOCK_PI, futex
     // key/access and file-backed WAKE_OP tests: 230.
-    ("test.cli_on_host", 230),
+    // Nor do the three HERMIT_VERIFY_TMPDIR tests, which start ptrace guests or
+    // none: 233.
+    ("test.cli_on_host", 233),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 55),

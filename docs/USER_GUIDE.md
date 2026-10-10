@@ -454,6 +454,16 @@ destination is `$XDG_STATE_HOME/hermit/verify-logs`, normally
 durable directory. `--print-verify-logs` instead copies the first run's captured
 log to stderr; it does not retain either file.
 
+Without `--keep-logs`, the two logs are temporary files in the system temporary
+directory, or in `$HERMIT_VERIFY_TMPDIR` when that is set and not empty. The same
+applies to the record and replay logs of `hermit record start --verify`. A verify
+that is killed before it finishes leaves both logs there. A caller that kills
+verify runs at a deadline can set `HERMIT_VERIFY_TMPDIR` to a directory it
+removes afterwards. A directory that cannot hold the logs is reported as an
+error naming `HERMIT_VERIFY_TMPDIR`. Hermit does not pass that variable on to the
+guest unless it is named with `--env`, so unlike changing `TMPDIR` it does not
+change what the guest sees.
+
 `hermit log-diff LOG` prints the canonical INFO stream from one retained log.
 The default `--record-envelope=all-records-v1` preserves every parsed record.
 For a DBT evidence log, select

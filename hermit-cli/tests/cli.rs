@@ -21643,3 +21643,121 @@ fn a_wake_op_on_a_file_backed_shared_word_is_refused_by_name() {
         "stderr:\n{log}"
     );
 }
+
+/// `HERMIT_VERIFY_TMPDIR` is Hermit's setting, not the guest's: a guest that
+/// inherits Hermit's environment (`--base-env=host`) prints the same TMPDIR
+/// and the same environment whether or not it is set.
+#[test]
+fn verify_tmpdir_does_not_reach_the_guest_environment() {
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let script = "printf 'TMPDIR=[%s]\\n' \"${TMPDIR-unset}\"; env | grep -c '^HERMIT_VERIFY_TMPDIR=' || true";
+    let run = |verify_tmpdir: Option<&Path>| {
+        let mut command =
+            hermit_command(&["run", "--base-env=host", "--", "/bin/sh", "-c", script]);
+        command.env("TMPDIR", directory.path());
+        match verify_tmpdir {
+            Some(path) => command.env("HERMIT_VERIFY_TMPDIR", path),
+            None => command.env_remove("HERMIT_VERIFY_TMPDIR"),
+        };
+        let output = command.output().expect("run hermit");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let without = run(None);
+    let with = run(Some(directory.path()));
+    assert_eq!(with, without);
+    assert_eq!(
+        without,
+        format!("TMPDIR=[{}]\n0\n", directory.path().display())
+    );
+}
+
+/// A verify killed mid-run leaves its two temporary logs behind. With
+/// `HERMIT_VERIFY_TMPDIR` set they are created there, not in TMPDIR, so a
+/// caller that kills runs can clean them up.
+#[test]
+fn a_killed_verify_leaves_its_logs_in_verify_tmpdir_not_tmpdir() {
+    let _guard = hermit_run_guard();
+    let tmpdir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let verify_tmpdir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    // A guest that never finishes on its own: `sleep` runs in virtual time and
+    // would let the verify finish, and delete both logs, within about a second.
+    let mut child = hermit_command(&[
+        "run",
+        "--verify",
+        "--",
+        "/bin/sh",
+        "-c",
+        "while :; do :; done",
+    ])
+    .env("TMPDIR", tmpdir.path())
+    .env("HERMIT_VERIFY_TMPDIR", verify_tmpdir.path())
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(fs::File::create(tmpdir.path().join("hermit.stderr")).unwrap())
+    .process_group(0)
+    .spawn()
+    .expect("spawn hermit");
+    let logs = |directory: &Path| {
+        let mut names = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("run1_log_") || name.starts_with("run2_log_"))
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while logs(verify_tmpdir.path()).len() < 2 && std::time::Instant::now() < deadline {
+        thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let group = child.id() as libc::pid_t;
+    assert_eq!(unsafe { libc::kill(-group, libc::SIGKILL) }, 0);
+    child.wait().unwrap();
+    let kept = logs(verify_tmpdir.path());
+    let stderr = fs::read_to_string(tmpdir.path().join("hermit.stderr")).unwrap_or_default();
+    assert_eq!(
+        kept.len(),
+        2,
+        "logs in HERMIT_VERIFY_TMPDIR: {kept:?}; hermit stderr:\n{stderr}"
+    );
+    assert!(kept[0].starts_with("run1_log_") && kept[1].starts_with("run2_log_"));
+    assert_eq!(logs(tmpdir.path()), Vec::<String>::new());
+}
+
+/// A HERMIT_VERIFY_TMPDIR that cannot hold the logs is a clean error naming
+/// the variable, for `run --verify` and `record start --verify` alike, not a
+/// panic.
+#[test]
+fn an_unusable_verify_tmpdir_is_a_clean_error_naming_the_variable() {
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let missing = directory.path().join("missing");
+    let data_dir = format!("--data-dir={}", directory.path().join("data").display());
+    for args in [
+        &["run", "--verify", "--", "/bin/true"][..],
+        &["record", "start", "--verify", &data_dir, "--", "/bin/true"][..],
+    ] {
+        let output = hermit_command(args)
+            .env("HERMIT_VERIFY_TMPDIR", &missing)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run hermit");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{args:?} succeeded: {stderr}");
+        assert_ne!(
+            output.status.code(),
+            Some(101),
+            "{args:?} panicked: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("HERMIT_VERIFY_TMPDIR={}", missing.display())),
+            "{args:?}: {stderr}"
+        );
+    }
+}

@@ -1100,18 +1100,39 @@ pub fn temp_log_files(name1: &str, name2: &str) -> io::Result<(NamedTempFile, Na
     temp_log_files_in(name1, name2, None)
 }
 
+/// The directory for the temporary run logs of a verify that names no
+/// directory of its own, instead of the system temporary directory.
+///
+/// A verify that is killed leaves its two logs where they were created: the
+/// first cut off, the second often empty. A caller that kills runs at a
+/// deadline sets this to a directory it removes afterwards, so the host's
+/// temporary directory is not filled. Setting TMPDIR instead would also
+/// change the guest's environment; this variable is removed from the
+/// environment a guest inherits from Hermit (`--base-env=host`).
+pub const VERIFY_TMPDIR_ENV: &str = "HERMIT_VERIFY_TMPDIR";
+
 pub fn temp_log_files_in(
     name1: &str,
     name2: &str,
     directory: Option<&Path>,
 ) -> io::Result<(NamedTempFile, NamedTempFile)> {
+    let fallback = std::env::var_os(VERIFY_TMPDIR_ENV).filter(|value| !value.is_empty());
     let create = |name: &str| {
         let prefix = format!("{}_log_", name);
         let mut builder = tempfile::Builder::new();
         builder.prefix(&prefix).rand_bytes(5);
-        match directory {
-            Some(directory) => builder.tempfile_in(directory),
-            None => builder.tempfile(),
+        match (directory, fallback.as_deref()) {
+            (Some(directory), _) => builder.tempfile_in(directory),
+            (None, Some(fallback)) => builder.tempfile_in(fallback).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "cannot create a verify log in {VERIFY_TMPDIR_ENV}={}: {error}",
+                        Path::new(fallback).display()
+                    ),
+                )
+            }),
+            (None, None) => builder.tempfile(),
         }
     };
     let file1 = create(name1)?;
@@ -1125,8 +1146,8 @@ pub fn setup_double_run(
     name1: &str,
     name2: &str,
     strictness: LogCompareStrictness,
-) -> ((GlobalOpts, NamedTempFile), (GlobalOpts, NamedTempFile)) {
-    let (file1, file2) = temp_log_files(name1, name2).unwrap();
+) -> io::Result<((GlobalOpts, NamedTempFile), (GlobalOpts, NamedTempFile))> {
+    let (file1, file2) = temp_log_files(name1, name2)?;
 
     let path1 = PathBuf::from(file1.path());
     let path2 = PathBuf::from(file2.path());
@@ -1139,7 +1160,7 @@ pub fn setup_double_run(
 
     let mut global2 = global.clone();
     global2.log_file = Some(path2);
-    ((global, file1), (global2, file2))
+    Ok(((global, file1), (global2, file2)))
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED

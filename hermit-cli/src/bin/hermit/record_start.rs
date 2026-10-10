@@ -598,7 +598,8 @@ impl StartOpts {
             LogCompareStrictness::Stripped
         };
         let ((global1, log1), (global2, log2)) =
-            setup_double_run(global, "record", "replay", strictness);
+            setup_double_run(global, "record", "replay", strictness)
+                .context("Failed to create verification log files")?;
 
         let (mut recording_container, record_identity_guard) = self.recording_container(global)?;
 

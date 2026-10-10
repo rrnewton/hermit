@@ -1231,6 +1231,12 @@ pub struct RunOpts {
     /// Logs are written under --verify-log-dir when provided; otherwise under
     /// $XDG_STATE_HOME/hermit/verify-logs (normally
     /// ~/.local/state/hermit/verify-logs). The final paths are printed.
+    /// Without --keep-logs the logs are temporary files in $HERMIT_VERIFY_TMPDIR
+    /// when it is set and not empty (also for `record start --verify`), otherwise
+    /// in the system temporary directory; a verify that is killed leaves them
+    /// there, and a HERMIT_VERIFY_TMPDIR that cannot hold them is an error that
+    /// names it. Hermit does not pass HERMIT_VERIFY_TMPDIR on to the guest unless
+    /// it is given with --env.
     #[clap(long, requires = "verify")]
     keep_logs: bool,
 
@@ -1463,7 +1469,10 @@ fn apply_base_and_explicit_environment(
             );
             command.env("HOME", "/root");
         }
-        BaseEnv::Host => {}
+        BaseEnv::Host => {
+            // Hermit's own setting for where its verify logs go, not the guest's.
+            command.env_remove(super::verify::VERIFY_TMPDIR_ENV);
+        }
     }
     for (name, value) in env {
         if let Some(value) = value {
