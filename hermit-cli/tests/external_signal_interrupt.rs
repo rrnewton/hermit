@@ -2084,6 +2084,76 @@ fn ptrace_rt_sigtimedwait_takes_a_queued_signal_before_the_sigchld_of_an_exiting
     let _ = fs::remove_file(&witness);
 }
 
+/// A pselect6 with nfds=65 sleeps outside the scheduler, and a sibling
+/// rewrites its mask buffer before the call reaches the kernel
+/// (tests/c/pselect_large_mutating_mask.c). The call must sleep under the mask
+/// it was entered with and return 1 when the sibling writes the pipe after its
+/// 20 ms sleep, as natively. The scheduler waited for a mask the kernel never
+/// installed, withheld the sibling's timer, and the call returned 0 at its 2 s
+/// timeout (Codex review of https://github.com/rrnewton/hermit/pull/4053).
+#[test]
+fn ptrace_large_pselect6_sleeps_under_its_entry_mask_while_a_sibling_rewrites_it() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let root = build_root();
+    fs::create_dir_all(&root).expect("failed to create guest build directory");
+    let witness = root.join(format!(
+        "pselect_large_mutating_mask.{}",
+        std::process::id()
+    ));
+    let compiled = Command::new("cc")
+        .args(["-O2", "-Wall", "-Wextra", "-Werror", "-pthread"])
+        .arg(repository.join("tests/c/pselect_large_mutating_mask.c"))
+        .arg("-o")
+        .arg(&witness)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to start the witness's compiler");
+    assert!(
+        compiled.status.success(),
+        "failed to compile the witness: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    for mode in ["stable", "mutable"] {
+        let trial = tempfile::Builder::new()
+            .prefix("trial-")
+            .tempdir_in(&root)
+            .expect("failed to create trial directory");
+        let report = trial.path().join("verify.json");
+        let output = Command::new("timeout")
+            .args(["--kill-after=5s", "120s"])
+            .arg(hermit_binary::hermit_binary())
+            .env_remove("LD_LIBRARY_PATH")
+            .arg("--log=info")
+            .args(cell_run_args("ptrace"))
+            .args(["--verify", "--verify-strict", "--verify-json"])
+            .arg(&report)
+            .arg("--")
+            .arg(&witness)
+            .arg(mode)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run hermit");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let expected = format!("mode={mode} result=1 errno=0 ready=1 writer_ok=1 oracle=1");
+        assert!(
+            output.status.success() && stdout.contains(&expected),
+            "{mode}: expected `{expected}`, as natively, with exit 0; got {}\nstdout:\n{stdout}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let verdict: serde_json::Value = serde_json::from_slice(
+            &fs::read(&report).expect("strict verification wrote no verdict"),
+        )
+        .expect("strict verification verdict is valid JSON");
+        if let Some(gap) = strict_verification_gap(&verdict) {
+            panic!("{mode}: strict verification is not determinism evidence: {gap}");
+        }
+    }
+    let _ = fs::remove_file(&witness);
+}
+
 #[test]
 fn ptrace_poll_and_epoll_are_ended_by_the_sigchld_of_an_exiting_child() {
     assert_child_exit_sigchld_ends_readiness_waits("ptrace");
