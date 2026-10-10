@@ -2926,7 +2926,7 @@ impl GlobalState {
 
                 let endtime_update = match schedval {
                     // Only syscalls timeout, and they don't need to update guest timeslice end.
-                    SchedValue::TimeOut | SchedValue::Signaled => None,
+                    SchedValue::TimeOut | SchedValue::Signaled(_) => None,
                     SchedValue::Value(timeslice) => Some(LogicalTime::from_nanos(timeslice)),
                 };
                 (
@@ -3548,7 +3548,11 @@ impl GlobalState {
                 );
                 answer
             }
-            SchedResponse::Signaled(_) => Some(SchedValue::Signaled),
+            SchedResponse::Signaled(signals) => Some(SchedValue::Signaled(
+                signals.iter().flatten().fold(0, |set, signal| {
+                    set | (1_u64 << ((signal.0 as u32).wrapping_sub(1) & 63))
+                }),
+            )),
             SchedResponse::ObserveSignal(_) | SchedResponse::InGuestFatalAlarm => {
                 self.sched
                     .lock()

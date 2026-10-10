@@ -176,8 +176,11 @@ pub enum SchedValue {
     TimeOut,
     /// A signal ended a futex wait (`SchedResponse::Signaled`), as distinct from a
     /// wakeup or from the `EINTR` value some non-signal early returns carry
-    /// (<https://github.com/rrnewton/hermit/issues/3146>).
-    Signaled,
+    /// (<https://github.com/rrnewton/hermit/issues/3146>). It carries the
+    /// signals the scheduler committed to the waiter at the wake, as a kernel
+    /// signal set, which the waiter's own check may then count although it
+    /// holds them (<https://github.com/rrnewton/hermit/issues/4005>).
+    Signaled(u64),
     // TODO(T137799529) make this more strongly typed, an enum for different scenarios:
     Value(u64),
 }
@@ -5829,7 +5832,9 @@ impl Scheduler {
                 // the waiter parks again with its original absolute deadline,
                 // as a Linux waiter that the signal never reached would still be
                 // waiting.
-                if let Some(interrupting) = self.parked_futex_interrupting_signals(dettid) {
+                if let Some(interrupting) =
+                    self.parked_futex_interrupting_signals(dettid, kernel_signal_bit(signal as i32))
+                {
                     if interrupting & kernel_signal_bit(signal as i32) == 0 {
                         // Blocked, ignored, or default-ignored for this waiter now,
                         // or a signal the wait holds until the call returns
@@ -6004,9 +6009,16 @@ impl Scheduler {
     /// nothing observes, and otherwise the run ends with a diagnostic, never an
     /// errno the futex call cannot return. Leaving a waiter parked for a signal
     /// that does interrupt it could instead deadlock it.
-    fn parked_futex_interrupting_signals(&self, dettid: DetTid) -> Option<u64> {
+    ///
+    /// `committed` names a signal the scheduler sends at this commit point
+    /// (`wake_signaled_guest`, from `signal_guest`), such as a child's exit
+    /// `SIGCHLD` from its child-exit timer: the wait does not hold it unless a
+    /// host-timed source can post it too
+    /// (https://github.com/rrnewton/hermit/issues/4005).
+    fn parked_futex_interrupting_signals(&self, dettid: DetTid, committed: u64) -> Option<u64> {
         let watch = self.parked_futex_waiter(dettid)?.signal_watch?;
-        let held = self.futex_wait_held_signals(dettid);
+        let held =
+            self.futex_wait_held_signals(dettid) & !(committed & !self.host_timed_signals(dettid));
         #[cfg(test)]
         if let Some(state) = self.test_kernel_signal_states.get(&dettid) {
             return Some(
@@ -6034,7 +6046,10 @@ impl Scheduler {
     /// The signals a parked precise-mode futex waiter holds until its call
     /// returns, whatever its mask and dispositions: `SIGCHLD`, whoever sent it,
     /// and every signal a host-timed source armed by a guest can post to its
-    /// process (`host_timed_signals`). The kernel posts these at a moment set
+    /// process (`host_timed_signals`). A `SIGCHLD` the scheduler itself sends to
+    /// the waiter at a commit point is the exception
+    /// (`parked_futex_interrupting_signals`' `committed`,
+    /// https://github.com/rrnewton/hermit/issues/4005). The kernel posts these at a moment set
     /// by host timing (`SIGCHLD` for a child's exit, stop or continue), and the
     /// waiter cannot tell that copy from one sent at a deterministic point. The
     /// guest side holds the same signals in its own checks (`KernelSignalWait`,
@@ -6096,7 +6111,7 @@ impl Scheduler {
     // `/proc`: the precise futex pre-check and the parked waiter's wake
     // (`parked_futex_interrupting_signals`), and the polling waits that read
     // the kernel's signal state each turn (`KernelSignalWait`). None of them
-    // ends for a `SIGCHLD`, whoever sent it. The kernel posts `SIGCHLD` to a
+    // ends for a `SIGCHLD` that only `/proc` reports. The kernel posts `SIGCHLD` to a
     // parent for a child's exit, stop or continue at a moment set by host
     // timing (under ptrace, when the tracer releases the dying child), and
     // `/proc` cannot tell that copy from one a guest or the scheduler sent at
@@ -6104,6 +6119,14 @@ impl Scheduler {
     // delivered when the call returns for another reason. Linux would end the
     // wait; that part of the issue is given up until Reverie reports every
     // delivery it holds.
+    //
+    // The exception is a `SIGCHLD` the scheduler itself sends to the thread at
+    // a commit point, the one a child's `ChildExit` timer sends through
+    // `signal_guest`: the resume that names it lifts the hold for that turn
+    // alone, so the wait ends at a point the schedule fixes
+    // (https://github.com/rrnewton/hermit/issues/4005). A death without that
+    // timer (a child killed by a signal, or leaving through `exit` in its last
+    // thread) still leaves the signal held.
     //
     // The waits of `select`, and of `pselect6` without a temporary mask, read
     // the same state but hold nothing (`KernelSignalWait::for_select`), so a
@@ -6131,9 +6154,10 @@ impl Scheduler {
     /// thread-ID order, which stands in for the kernel's round-robin
     /// `curr_target`. Only a chosen thread that sleeps outside the runnable
     /// set is woken (`arm_signaled_background`). A chosen parked futex waiter
-    /// is not: its wait holds `SIGCHLD` until the call returns
-    /// (`futex_wait_held_signals`). A running thread counts as much as a
-    /// parked one.
+    /// is not woken by the drain: its wait holds `SIGCHLD` until the call
+    /// returns (`futex_wait_held_signals`), unless the `ChildExit` timer's own
+    /// send names it (`wake_signaled_guest`). A running thread counts as much
+    /// as a parked one.
     ///
     /// Every mask this uses is a function of the schedule, so the choice is
     /// too. Call this only at the step2 drain or a step2b timed pop, where no
@@ -8639,7 +8663,9 @@ impl Scheduler {
                     };
                     next_turn.req = Ivar::full(Ok(resources));
                 }
-                None if let Some(interrupting) = self.parked_futex_interrupting_signals(dettid) => {
+                None if let Some(interrupting) =
+                    self.parked_futex_interrupting_signals(dettid, 0) =>
+                {
                     // A precise-mode futex waiter sleeps in `futex_waiters`, outside
                     // the run queue, so nothing else would ever let the physically
                     // pending signal interrupt it
@@ -12907,24 +12933,29 @@ mod test {
         scheduler
     }
 
-    /// A `SIGCHLD` never ends a precise-mode futex wait, whether it reaches the
-    /// waiter through the drain of a cross-task signal or through a scheduler
-    /// send (a `ChildExit` timer), and although the waiter catches it: the
-    /// waiter stays parked with its original deadline, and the signal stays
-    /// pending in the kernel until the call returns for another reason. `/proc`
-    /// cannot tell a `SIGCHLD` sent at a deterministic point from the one the
-    /// kernel posts for a child event at a moment set by host timing. This gives
-    /// up the `SIGCHLD` part of https://github.com/rrnewton/hermit/issues/3146
-    /// until Reverie reports every held delivery. A caught `SIGUSR1` still ends
-    /// the same wait.
+    /// A caught `SIGCHLD` ends a parked precise-mode futex wait only when the
+    /// scheduler sends it to the waiter at a commit point (`wake_signaled_guest`,
+    /// as a `ChildExit` timer does): the waiter is woken with the signal, as
+    /// Linux ends the wait (https://github.com/rrnewton/hermit/issues/4005).
+    /// Through the drain of a cross-task signal, which only says a `SIGCHLD` is
+    /// pending, or when a host-timed source a guest armed can post `SIGCHLD`
+    /// too, the waiter stays parked with its original deadline, and the signal
+    /// stays pending in the kernel until the call returns for another reason:
+    /// `/proc` cannot tell a `SIGCHLD` sent at a deterministic point from the
+    /// one the kernel posts for a child event at a moment set by host timing
+    /// (https://github.com/rrnewton/hermit/issues/3146). A caught `SIGUSR1`
+    /// still ends the same wait.
     #[test]
-    fn a_sigchld_never_ends_a_parked_futex_wait() {
+    fn a_sigchld_ends_a_parked_futex_wait_only_when_the_scheduler_sends_it() {
         let chld = kernel_signal_bit(libc::SIGCHLD);
         let usr1 = kernel_signal_bit(libc::SIGUSR1);
         let deadline = LogicalTime::from_nanos(300_000_000);
-        for scheduler_send in [false, true] {
+        for (scheduler_send, host_timed) in [(false, false), (true, false), (true, true)] {
             let mut scheduler = gated_scheduler();
             let (target, futex) = parked_futex_target(&mut scheduler);
+            if host_timed {
+                scheduler.record_host_timed_signals(target, HostTimedSignalScope::Caller, chld);
+            }
             scheduler.sleep_futex_waiter(
                 &target,
                 futex,
@@ -12936,7 +12967,7 @@ mod test {
                 .test_kernel_signal_states
                 .insert(target, signal_state(chld | usr1, 0));
             assert_eq!(
-                scheduler.parked_futex_interrupting_signals(target),
+                scheduler.parked_futex_interrupting_signals(target, 0),
                 Some(usr1),
                 "a caught SIGCHLD is not among the signals that end the wait"
             );
@@ -12947,7 +12978,16 @@ mod test {
                 scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGCHLD));
                 scheduler.drain_pending_cross_task_signals();
             }
-            let case = format!("scheduler_send={scheduler_send}");
+            let case = format!("scheduler_send={scheduler_send} host_timed={host_timed}");
+            if scheduler_send && !host_timed {
+                assert!(!scheduler.is_parked_futex_waiter(target), "{case}");
+                assert_eq!(
+                    scheduler.inbound_signals(target),
+                    vec![SigWrapper::from(Signal::SIGCHLD)],
+                    "{case}"
+                );
+                continue;
+            }
             assert!(scheduler.is_parked_futex_waiter(target), "{case}");
             assert!(!scheduler.run_queue.contains_tid(target), "{case}");
             assert!(scheduler.inbound_signals(target).is_empty(), "{case}");
@@ -13033,11 +13073,11 @@ mod test {
                 .insert(thread, signal_state(usr1 | usr2 | term, 0));
         }
         assert_eq!(
-            scheduler.parked_futex_interrupting_signals(parent),
+            scheduler.parked_futex_interrupting_signals(parent, 0),
             Some(term)
         );
         assert_eq!(
-            scheduler.parked_futex_interrupting_signals(child),
+            scheduler.parked_futex_interrupting_signals(child, 0),
             Some(usr1 | term)
         );
     }
@@ -13109,7 +13149,7 @@ mod test {
                 .test_kernel_signal_states
                 .insert(thread, signal_state(terminal | usr1, 0));
             assert_eq!(
-                scheduler.parked_futex_interrupting_signals(thread),
+                scheduler.parked_futex_interrupting_signals(thread, 0),
                 Some(usr1),
                 "only SIGUSR1 ends the wait of {thread:?}"
             );
@@ -13155,17 +13195,19 @@ mod test {
             .insert(thread, signal_state(kernel_signal_bit(libc::SIGCHLD), 0));
     }
 
-    /// A child's death wakes no parked futex waiter of its parent, although the
-    /// waiter catches `SIGCHLD`: neither the death itself (a child killed by a
-    /// signal, or leaving through `exit` in its last thread, has no `ChildExit`
-    /// timer) nor the `SIGCHLD` a `ChildExit` timer sends. The kernel posts its
-    /// own `SIGCHLD` at a moment set by host timing, so the signal stays pending
-    /// until the waiter's call returns for another reason. The scheduler still
-    /// names the thread Linux would give it to (`kernel_sigchld_target`), the
-    /// child's creator first. Before, the death made the signal eligible and
-    /// the drain woke that waiter (https://github.com/rrnewton/hermit/issues/3146).
+    /// A child's death itself wakes no parked futex waiter of its parent,
+    /// although the waiter catches `SIGCHLD`: a child killed by a signal, or
+    /// leaving through `exit` in its last thread, has no `ChildExit` timer, and
+    /// the kernel posts its own `SIGCHLD` at a moment set by host timing, so the
+    /// signal stays pending until the waiter's call returns for another reason.
+    /// Before, the death made the signal eligible and the drain woke that
+    /// waiter (https://github.com/rrnewton/hermit/issues/3146). The scheduler
+    /// still names the thread Linux would give it to (`kernel_sigchld_target`),
+    /// the child's creator first, and the `SIGCHLD` a `ChildExit` timer sends to
+    /// that thread wakes it, and only it
+    /// (https://github.com/rrnewton/hermit/issues/4005).
     #[test]
-    fn a_child_exit_wakes_no_parked_futex_waiter() {
+    fn a_child_exit_wakes_only_the_parked_futex_waiter_its_timer_signals() {
         let chld = kernel_signal_bit(libc::SIGCHLD);
         let (mut scheduler, parent, creator, child) = sigchld_family(libc::SIGCHLD);
         park_for_sigchld(&mut scheduler, parent, chld);
@@ -13183,12 +13225,16 @@ mod test {
         assert!(scheduler.inbound_signals(parent).is_empty());
         assert!(scheduler.inbound_signals(creator).is_empty());
 
-        // The SIGCHLD a `ChildExit` timer sends to the creator leaves it parked
-        // too.
+        // The SIGCHLD a `ChildExit` timer sends to the creator wakes it, and
+        // leaves the leader parked.
         scheduler.wake_signaled_guest(creator, Signal::SIGCHLD);
-        assert!(scheduler.is_parked_futex_waiter(creator));
-        assert!(!scheduler.run_queue.contains_tid(creator));
-        assert!(scheduler.inbound_signals(creator).is_empty());
+        assert!(!scheduler.is_parked_futex_waiter(creator));
+        assert_eq!(
+            scheduler.inbound_signals(creator),
+            vec![SigWrapper::from(Signal::SIGCHLD)]
+        );
+        assert!(scheduler.is_parked_futex_waiter(parent));
+        assert!(scheduler.inbound_signals(parent).is_empty());
     }
 
     /// The kernel gives a shared-queue `SIGCHLD` to the first thread that does

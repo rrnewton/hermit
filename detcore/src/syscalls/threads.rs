@@ -1887,7 +1887,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 {
                     SchedValue::Value(num) => num,
                     SchedValue::TimeOut => panic!("impossible, futex wake doesn't have a timeout"),
-                    SchedValue::Signaled => panic!("impossible, futex wake is never signaled"),
+                    SchedValue::Signaled(_) => panic!("impossible, futex wake is never signaled"),
                 };
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#845): Review exited-thread futex diagnostics.
@@ -1932,6 +1932,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .backend_supports_blocked_wait_signal_interruption;
                     // Whether this wait was woken for a signal and is checking again.
                     let mut rewait = false;
+                    // The signals the scheduler committed to this waiter at that wake
+                    // (`SchedValue::Signaled`), which this turn's check counts although
+                    // the wait holds them (https://github.com/rrnewton/hermit/issues/4005).
+                    let mut committed_wake: KernelSigset = 0;
                     // Whether a wait request reached the scheduler. A wait that
                     // ends before its first one, on a pending signal or a failed
                     // read, sends no `WaitFinished`, as before.
@@ -1964,10 +1968,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                         // parked until its wakeup or its original deadline. As in
                         // Linux, one already pending when the value matches ends the
                         // wait at once with the futex's restart errno. A `SIGCHLD`
-                        // never ends it: it stays pending until the call returns,
-                        // because the kernel also posts one for a child event at a
-                        // moment set by host timing
-                        // (https://github.com/rrnewton/hermit/issues/3146). Nor does
+                        // ends it only when the scheduler committed it to this
+                        // waiter at its wake (a child's exit, through its
+                        // child-exit timer: `committed_wake`,
+                        // https://github.com/rrnewton/hermit/issues/4005); any other
+                        // stays pending until the call returns, because the kernel
+                        // also posts one for a child event at a moment set by host
+                        // timing (https://github.com/rrnewton/hermit/issues/3146). Nor does
                         // a signal that a host-timed source armed by a guest can
                         // post to this process, such as a parent-death signal
                         // (`host_timed_signals`, read here in this thread's turn).
@@ -2002,8 +2009,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                             // A timed futex wait lets a default job-control stop
                             // wait for its deadline (`KernelSignalState::interrupting_wait`).
                             let defers_default_stops = call.restart_keeps_deadline();
-                            let held =
-                                kernel_sigset_bit(libc::SIGCHLD) | host_timed_signals(guest).await;
+                            let host_timed = host_timed_signals(guest).await;
+                            let held = (kernel_sigset_bit(libc::SIGCHLD) | host_timed)
+                                & !(std::mem::take(&mut committed_wake) & !host_timed);
                             let pending = state
                                 .pending_interrupting(state.blocked, defers_default_stops)
                                 & !held;
@@ -2040,7 +2048,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                             bitset,
                         )
                         .await;
-                        if signal_interruption && ans == Some(SchedValue::Signaled) {
+                        if signal_interruption && let Some(SchedValue::Signaled(committed)) = ans {
+                            committed_wake = committed;
                             // The scheduler ended the wait for a signal that
                             // interrupted it under the dispositions the kernel held
                             // when the wake was committed. The check at the top of the
@@ -3347,7 +3356,7 @@ where
         {
             Some(SchedValue::Value(count)) => count,
             // A wake never carries a timeout, and a cancelled RPC wakes nobody.
-            Some(SchedValue::TimeOut) | Some(SchedValue::Signaled) | None => 0,
+            Some(SchedValue::TimeOut) | Some(SchedValue::Signaled(_)) | None => 0,
         };
         // Guest-level identities only: dettid, the modeled futex key, and a
         // count. No host pointers and no iteration order leak into this line,

@@ -1985,16 +1985,11 @@ where
         // Read in this turn, before the probe: another thread may have armed a
         // host-timed source since the last turn, and none can until this turn ends.
         signals.hold_until_return(host_timed_signals(guest).await);
-        // In record and replay, a `SIGCHLD` the scheduler committed to this thread
-        // in this turn (a child's exit, through its child-exit timer) ends the wait
-        // as it did before they modelled signal targets
-        // (`KernelSignalWait::admit_committed`; review of
-        // https://github.com/rrnewton/hermit/pull/3989).
-        signals.admit_committed(if guest.config().recordreplay_modes {
-            committed_signals(&resumed) & kernel_sigset_bit(libc::SIGCHLD)
-        } else {
-            0
-        });
+        // A `SIGCHLD` the scheduler committed to this thread in this turn (a
+        // child's exit, through its child-exit timer) ends the wait, as on Linux
+        // (`KernelSignalWait::admit_committed`,
+        // https://github.com/rrnewton/hermit/issues/4005).
+        signals.admit_committed(committed_signals(&resumed) & kernel_sigset_bit(libc::SIGCHLD));
         let first = std::mem::take(&mut first_turn);
         // Never `inject_with_retry`: see `KernelSignalWait`.
         let injected = if first {
@@ -2250,7 +2245,10 @@ pub(crate) struct KernelSignalWait {
     /// `SIGCHLD`, whichever process sent it: the kernel also posts one for a
     /// child's exit, stop or continue at a moment set by host timing, and
     /// `/proc` shows no siginfo that would tell the two apart
-    /// (https://github.com/rrnewton/hermit/issues/3146). The gated loop adds,
+    /// (https://github.com/rrnewton/hermit/issues/3146). The scheduler's own
+    /// commit of a child's exit `SIGCHLD` to this thread lifts the hold for the
+    /// turn whose resume names it (`admit_committed`,
+    /// https://github.com/rrnewton/hermit/issues/4005). The gated loop adds,
     /// in each of its turns, every signal a host-timed source armed by a guest
     /// can post to this process (`hold_until_return`).
     held_until_return: KernelSigset,
@@ -2483,7 +2481,8 @@ impl KernelSignalWait {
     /// was: the `SIGCHLD` the kernel posts for a child's exit, stop or continue
     /// ends the wait at the first turn whose read sees it, and host timing
     /// decides which turn that is (https://github.com/rrnewton/hermit/issues/3146).
-    /// Every other wait holds `SIGCHLD` until it returns.
+    /// Every other wait holds `SIGCHLD` until it returns, unless the scheduler
+    /// commits it to the thread in that turn (`admit_committed`).
     pub(crate) fn for_select<T, G>(guest: &G) -> Self
     where
         T: RecordOrReplay,
@@ -2511,11 +2510,11 @@ impl KernelSignalWait {
     /// (`committed`): its resume named them (`ResumeStatus::Signaled`). Such a
     /// signal was sent at a fixed point of the schedule, so a wait may end for
     /// it although the wait holds it, unless a host-timed source can post it
-    /// too (`host_timed`). Only record and replay pass `SIGCHLD` here: their
-    /// polling waits returned EINTR for the `SIGCHLD` of a child's exit, which
-    /// the scheduler commits through its child-exit timer, before they took
-    /// this machinery; `hermit run` holds it until the call returns, a tested
-    /// decision of https://github.com/rrnewton/hermit/pull/3361.
+    /// too (`host_timed`). The loop passes the `SIGCHLD` of a child's exit,
+    /// which the scheduler commits through its child-exit timer; the kernel's
+    /// own copy of it, posted at a host-timed moment, decides nothing, since
+    /// only the resume that names it lifts the hold, for that turn alone
+    /// (https://github.com/rrnewton/hermit/issues/4005).
     pub(crate) fn admit_committed(&mut self, signals: KernelSigset) {
         self.committed = signals & !self.host_timed;
     }
@@ -4993,7 +4992,8 @@ mod kernel_signal_wait_failures {
         (guest, kernel)
     }
 
-    /// A caught `SIGCHLD` pending outside the guest's mask never ends a gated
+    /// A caught `SIGCHLD` pending outside the guest's mask, which the scheduler
+    /// did not commit in this turn (`admit_committed`), never ends a gated
     /// wait, on any backend and whoever sent it: `/proc` cannot tell a
     /// `SIGCHLD` a guest or the scheduler sent at a deterministic point from the
     /// one the kernel posts for a child event at a moment set by host timing
