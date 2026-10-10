@@ -584,6 +584,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/hb_relative_anchor.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/hb_relative_anchor.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests of version-2 happens-before specs compile this guest, whose main thread writes two markers, makes three getppid calls and writes 'A-after' while a worker writes 'B', and check that a relative anchor holds the first getppid after the second marker until the worker's write, that unfired relative anchors and bases are refused by name, and that the hold budget ends a hold a spinning worker never releases; it remains a guest fixture because a generic manifest cannot compare the gated and ungated orders, the scheduler's hold records or the named refusals."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/hb_signal_while_held.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/hb_signal_while_held.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests happens_before_alarm_at_a_held_thread_ends_in_a_deadlock_report and happens_before_process_exit_with_a_held_worker_exits_zero compile this guest and run one mode each (alarm, exit) with a --happens-before spec that holds a thread at a gate that can never open while an alarm is sent to it or while its process exits; it remains a guest fixture because a generic manifest cannot express a calibration run followed by a spec authored from its log and a check of the held thread in the second run's log."

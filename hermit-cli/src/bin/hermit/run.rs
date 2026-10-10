@@ -869,7 +869,14 @@ pub struct RunOpts {
     /// debug info. The scheduler enforces anchors that name "the thread's Nth
     /// syscall" and anchors that name a syscall, optionally on one file
     /// descriptor ({"syscall": "writev", "fd": 9, "nth": 3}); a syscall anchor
-    /// that never fires ends the run with HERMIT_HB_ANCHOR_NEVER_FIRED. Both
+    /// that never fires ends the run with HERMIT_HB_ANCHOR_NEVER_FIRED. A
+    /// version-2 spec ("version": 2) adds `futex_op` (one futex operation,
+    /// {"syscall": "futex", "futex_op": 393}), `from` (count a syscall anchor
+    /// strictly after another event on the same thread, so no calibration run
+    /// is needed) and `max_hold_ns` (how long, in virtual time, a thread may be
+    /// held, default 10 s; past it the run ends with
+    /// HERMIT_HB_HOLD_BUDGET_EXCEEDED). A version-2 spec needs the preemption
+    /// timer and is refused without it. Both
     /// kinds are enforced only when the guest runs under the ptrace runtime
     /// (the default, or `--backend=e9patch`): with `--namespace-only` or
     /// another backend, the run is refused before the guest starts (exit 122)

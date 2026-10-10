@@ -115,6 +115,7 @@ static HB_TWO_THREADS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_SOURCE_THEN_FUTEX_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_SIGNAL_WHILE_HELD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_SPAWN_DUP2_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static HB_RELATIVE_ANCHOR_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_TIMEOUT_VS_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_PARENT_KILLED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_KILL_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -631,6 +632,31 @@ fn hb_source_then_futex_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "hb-source-then-futex guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn hb_relative_anchor_guest() -> &'static Path {
+    HB_RELATIVE_ANCHOR_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("hb-relative-anchor");
+        fs::create_dir_all(&build_root).expect("failed to create hb-relative-anchor directory");
+        let guest = build_root.join("hb_relative_anchor");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/hb_relative_anchor.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile hb-relative-anchor guest");
+        assert!(
+            output.status.success(),
+            "hb-relative-anchor guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -9423,6 +9449,337 @@ fn happens_before_before_anchor_that_never_fires_is_refused_by_name() {
             ),
         "no refusal naming the BEFORE anchor that never fired:\n{log}"
     );
+}
+
+/// A version-2 spec for `tests/c/hb_relative_anchor.c`: hold the main
+/// thread (dettid 3) at its `nth` getppid after its second write to fd 1,
+/// whose own `fd` is `base_fd`, until the worker's (dettid 5) first write to
+/// fd 1. `extra` is spliced into the top level (for `max_hold_ns`).
+fn hb_relative_spec(directory: &Path, name: &str, base_fd: i32, nth: u64, extra: &str) -> String {
+    let spec = directory.join(name);
+    fs::write(
+        &spec,
+        format!(
+            r#"{{"version": 2, {extra}
+                "events": {{"a2": {{"thread": "3", "syscall": "write", "fd": {base_fd}, "nth": 2}},
+                           "a_hold": {{"thread": "3", "syscall": "getppid", "from": "a2", "nth": {nth}}},
+                           "b_write": {{"thread": "5", "syscall": "write", "fd": 1, "nth": 1}}}},
+                "edges": [{{"before": "b_write", "after": "a_hold"}}]}}"#
+        ),
+    )
+    .unwrap();
+    spec.to_str().unwrap().to_owned()
+}
+
+/// A relative anchor, end to end. Ungated, the main thread writes `A-after`
+/// before the worker's `B` (the worker first yields 200 times). Held at "the
+/// first getppid after its second write" until the worker's write, the order
+/// reverses, and the INFO log shows the hold at that getppid, then the
+/// worker's write, then that getppid completing. A spec silently ignored
+/// would leave the ungated order; a gate at a later getppid would still let
+/// the first two through before the hold.
+#[test]
+fn happens_before_relative_anchor_holds_the_first_call_after_its_base() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = hb_relative_anchor_guest().to_str().unwrap().to_owned();
+    let args = ["run", "--strict", "--", guest.as_str()];
+    let ungated = hermit(&args);
+    assert_success(&ungated, &args);
+    assert_eq!(stdout(&ungated), "a1\na2\nA-after\nB\n");
+
+    let spec = hb_relative_spec(directory.path(), "first-after-a2.json", 1, 1, "");
+    let args = [
+        "--log",
+        "info",
+        "run",
+        "--strict",
+        "--happens-before",
+        spec.as_str(),
+        "--",
+        guest.as_str(),
+    ];
+    let gated = hermit(&args);
+    assert_success(&gated, &args);
+    assert_eq!(stdout(&gated), "a1\na2\nB\nA-after\n");
+    let log = stderr(&gated);
+    let lines: Vec<&str> = log.lines().collect();
+    let first = |what: &str, from: usize, matches: &dyn Fn(&str) -> bool| {
+        from + lines[from..]
+            .iter()
+            .position(|line| matches(line))
+            .unwrap_or_else(|| panic!("no {what} after line {from} in the INFO log:\n{log}"))
+    };
+    let second_write = first("second write by dtid 3", 0, &|l| {
+        l.contains("dtid 3] finish syscall #") && l.contains(": write(1, ") && l.contains("Ok(3)")
+    });
+    let second_write = first("second write by dtid 3", second_write + 1, &|l| {
+        l.contains("dtid 3] finish syscall #") && l.contains(": write(1, ")
+    });
+    let held = first("the hold", second_write, &|l| {
+        l.contains("SKIP dettid 3 held at happens-before anchor(s) [\"a_hold\"]")
+    });
+    let entered = first("dtid 3's getppid entry", second_write, &|l| {
+        l.contains("dtid 3] inbound syscall: getppid()")
+    });
+    let b_write = first("dtid 5's write", held, &|l| {
+        l.contains("dtid 5] inbound syscall: write(1, ")
+    });
+    let granted = first("dtid 3's getppid completing", held, &|l| {
+        l.contains("dtid 3] finish syscall #") && l.contains(": getppid()")
+    });
+    assert!(
+        entered < held && held < b_write && b_write < granted,
+        "expected dtid 3's first getppid after its second write to be held until dtid 5's \
+         write: entry {entered}, hold {held}, write {b_write}, completion {granted}"
+    );
+}
+
+/// An unfired relative anchor is refused by name after the guest finishes:
+/// one that points past the last getppid (the 4th of 3), and one whose base
+/// (a write to fd 77) never happens, which names the missing base as well.
+#[test]
+fn happens_before_unfired_relative_anchor_is_refused_with_its_base() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = hb_relative_anchor_guest().to_str().unwrap().to_owned();
+    for (name, base_fd, nth, expected) in [
+        (
+            "fourth.json",
+            1,
+            4,
+            "anchor 'a_hold' on thread 3: getppid#4 never fired (counted from 'a2'; edges: \
+             b_write -> a_hold)",
+        ),
+        (
+            "no-base.json",
+            77,
+            1,
+            "anchor 'a_hold' on thread 3: getppid#1 never fired (counted from 'a2', which never \
+             fired either; edges: b_write -> a_hold)",
+        ),
+    ] {
+        let spec = hb_relative_spec(directory.path(), name, base_fd, nth, "");
+        let args = [
+            "run",
+            "--strict",
+            "--happens-before",
+            spec.as_str(),
+            "--",
+            guest.as_str(),
+        ];
+        let output = hermit(&args);
+        let log = stderr(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{name}: an unfired relative anchor must be refused:\n{log}"
+        );
+        assert!(
+            log.contains("HERMIT_HB_ANCHOR_NEVER_FIRED: ") && log.contains(expected),
+            "{name}: no refusal naming the relative anchor:\n{log}"
+        );
+        assert_eq!(
+            stdout(&output),
+            "a1\na2\nA-after\nB\n",
+            "{name}: the guest did not run to completion before the refusal"
+        );
+    }
+}
+
+/// A hold the spinning worker can never release ends at the version-2 hold
+/// budget, by name, instead of spinning until an outside deadline. With a
+/// budget too large to reach, the same run does spin until `--timeout`, so it
+/// is the budget that ends the first run.
+#[test]
+fn happens_before_hold_budget_ends_a_hold_a_spinner_never_releases() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = hb_relative_anchor_guest().to_str().unwrap().to_owned();
+    let budget = hb_relative_spec(
+        directory.path(),
+        "budget.json",
+        1,
+        1,
+        r#""max_hold_ns": 50000000,"#,
+    );
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "run",
+            "--strict",
+            "--happens-before",
+            budget.as_str(),
+            "--",
+            guest.as_str(),
+            "spin",
+        ]),
+        directory.path(),
+        Duration::from_secs(60),
+        false,
+    );
+    assert_eq!(
+        status.and_then(|s| s.code()),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "an exhausted hold budget must be a policy refusal:\n{log}"
+    );
+    assert!(
+        log.contains(
+            "HERMIT_HB_HOLD_BUDGET_EXCEEDED: dtid 3 has been held at happens-before anchor(s) \
+             [\"a_hold\"] for more than max_hold_ns = 50000000 virtual ns, waiting on:\n  anchor \
+             'b_write' on thread 5: write(fd=1)#1 never fired (edge b_write -> a_hold)"
+        ),
+        "no refusal naming the held thread and its missing BEFORE anchor:\n{log}"
+    );
+
+    let unreachable = hb_relative_spec(
+        directory.path(),
+        "unreachable.json",
+        1,
+        1,
+        r#""max_hold_ns": 1000000000000000,"#,
+    );
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "run",
+            "--strict",
+            "--timeout",
+            "5",
+            "--happens-before",
+            unreachable.as_str(),
+            "--",
+            guest.as_str(),
+            "spin",
+        ]),
+        directory.path(),
+        Duration::from_secs(60),
+        false,
+    );
+    assert_eq!(
+        status.and_then(|s| s.code()),
+        Some(124),
+        "the control without a reachable budget should spin until --timeout:\n{log}"
+    );
+    assert!(!log.contains("HERMIT_HB_HOLD_BUDGET_EXCEEDED"), "{log}");
+}
+
+/// Version-2 load refusals end the run with the policy-refusal status, name
+/// the event and run nothing.
+#[test]
+fn happens_before_version_2_load_refusals_name_the_event_and_run_nothing() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = hb_relative_anchor_guest().to_str().unwrap().to_owned();
+    for (name, json, expected) in [
+        (
+            "v1-from.json",
+            r#"{"version": 1, "events": {
+                "a": {"thread": "3", "syscall": "write", "fd": 1},
+                "r": {"thread": "3", "syscall": "getppid", "from": "a"}}}"#,
+            "event 'r' sets 'from', which needs \"version\": 2",
+        ),
+        (
+            "unknown-field.json",
+            r#"{"version": 2, "events": {"r": {"thread": "3", "syscall": "getppid", "form": "a"}}}"#,
+            "event 'r' has unknown field 'form'",
+        ),
+        (
+            "other-thread.json",
+            r#"{"version": 2, "events": {
+                "a": {"thread": "5", "syscall": "write", "fd": 1},
+                "r": {"thread": "3", "syscall": "getppid", "from": "a"}}}"#,
+            "event 'r' counts from 'a', which is on another thread",
+        ),
+        (
+            "futex-op-on-write.json",
+            r#"{"version": 2, "events": {"w": {"thread": "3", "syscall": "write", "futex_op": 0}}}"#,
+            "event 'w' sets 'futex_op', which applies only to \"syscall\": \"futex\"",
+        ),
+        (
+            "from-cycle.json",
+            r#"{"version": 2, "events": {
+                "a": {"thread": "3", "syscall": "write", "fd": 1},
+                "r": {"thread": "3", "syscall": "getppid", "from": "a"}},
+                "edges": [{"before": "r", "after": "a"}]}"#,
+            "relative bases and hard edges together contain a cycle: a -> r -> a",
+        ),
+    ] {
+        let spec = directory.path().join(name);
+        fs::write(&spec, json).unwrap();
+        let args = [
+            "run",
+            "--strict",
+            "--happens-before",
+            spec.to_str().unwrap(),
+            "--",
+            guest.as_str(),
+        ];
+        let output = hermit(&args);
+        let log = stderr(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{name}: a spec that does not load must be a policy refusal:\n{log}"
+        );
+        assert!(log.contains(expected), "{name}: {log}");
+        assert_eq!(stdout(&output), "", "{name}: the guest ran");
+    }
+}
+
+/// A version-2 spec on a host whose perf counters are unavailable: argument
+/// validation turns the default preemption timer off with a warning, and the
+/// check right after it must refuse the run, naming the reason, before stdin
+/// is read or the guest starts. `--verify` reads stdin to its end and the
+/// test holds stdin open, so a check after the read would block until the
+/// deadline; the guest's first action creates a marker file, which a control
+/// run (no spec) shows is visible from here.
+#[test]
+fn happens_before_version_2_without_perf_counters_is_refused_before_stdin() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let marker = directory.path().join("guest-ran");
+    let marker_str = marker.to_str().unwrap().to_owned();
+    let script = format!("touch {marker_str}; echo ran");
+    let guest = ["/bin/sh", "-c", script.as_str()];
+
+    let mut control =
+        hermit_command_under_host_filter(&["run", "--", guest[0], guest[1], guest[2]]);
+    deny_syscall(&mut control, libc::SYS_perf_event_open);
+    let (status, log) =
+        run_with_deadline(control, directory.path(), Duration::from_secs(60), false);
+    assert_eq!(
+        status.and_then(|s| s.code()),
+        Some(0),
+        "control run failed:\n{log}"
+    );
+    assert!(
+        marker.exists(),
+        "the control run's guest did not create {marker_str}, so its absence below would prove \
+         nothing"
+    );
+    fs::remove_file(&marker).unwrap();
+
+    let spec = hb_relative_spec(directory.path(), "v2.json", 1, 1, "");
+    let mut refused = hermit_command_under_host_filter(&[
+        "run",
+        "--verify",
+        "--happens-before",
+        spec.as_str(),
+        "--",
+        guest[0],
+        guest[1],
+        guest[2],
+    ]);
+    deny_syscall(&mut refused, libc::SYS_perf_event_open);
+    let (status, log) = run_with_deadline(refused, directory.path(), Duration::from_secs(30), true);
+    assert_eq!(
+        status.and_then(|s| s.code()),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "a version-2 spec without the preemption timer must be refused promptly (a kill at the \
+         deadline is a failure):\n{log}"
+    );
+    assert!(
+        log.contains("--max-timeslice requires user-space perf counters")
+            && log.contains("HERMIT_HB_HOLD_WITHOUT_PREEMPTION: happens-before spec ")
+            && log.contains("is version 2")
+            && log.contains("this host cannot arm it: perf_event_open is unavailable"),
+        "{log}"
+    );
+    assert!(!marker.exists(), "the guest ran before the refusal");
 }
 
 /// Run `command` with stdout and stderr redirected to files in `directory`,
