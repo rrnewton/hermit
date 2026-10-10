@@ -8,17 +8,23 @@
 
 /*
  * Signals addressed to a process group
- * (https://github.com/rrnewton/hermit/issues/4046). rt_sigqueueinfo has no
- * process groups: Linux finds no process for pid 0 or
- * a negative pid and returns ESRCH, natively and under Hermit. kill(0, sig)
- * and kill(-pgrp, sig) signal every process in the group; Detcore does not
- * model that, so it refuses them by name: a fail-closed run stops with the
- * policy-refusal status after the rt_sigqueueinfo lines, and
- * --allow-unsupported-syscalls returns ENOSYS.
+ * (https://github.com/rrnewton/hermit/issues/4046). The guest first makes
+ * itself a process group leader, so -getpgrp() is a real negative pid inside
+ * Hermit's PID namespace too.
+ *   - rt_sigqueueinfo has no process groups: Linux finds no process for pid
+ *     0, a negative pid or -1 and returns ESRCH, natively and under Hermit.
+ *   - kill(INT_MIN, sig) is ESRCH: Linux rejects INT_MIN before anything else.
+ *   - kill(0, sig), kill(-pgrp, sig) and kill(-1, sig) signal every process
+ *     in a set; Detcore does not model that and refuses them by name. A
+ *     fail-closed run stops with the policy-refusal status at kill(0);
+ *     --allow-unsupported-syscalls returns ENOSYS for each.
+ * kill(-1, sig) runs only with the argument "broadcast": natively it would
+ * signal every process the user may signal.
  */
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -50,16 +56,26 @@ static long queue(pid_t pid) {
   return syscall(SYS_rt_sigqueueinfo, pid, SIGUSR1, &info);
 }
 
-int main(void) {
+int main(int argc, char** argv) {
+  int broadcast = argc > 1 && strcmp(argv[1], "broadcast") == 0;
   setvbuf(stdout, NULL, _IONBF, 0);
   struct sigaction action;
   memset(&action, 0, sizeof(action));
   action.sa_handler = on_usr1;
   sigaction(SIGUSR1, &action, NULL);
 
+  /* EPERM when the caller already leads a session, which is fine: it then
+   * already leads its own group. */
+  (void)setpgid(0, 0);
+  printf("own group: %s\n", getpgrp() == getpid() ? "yes" : "no");
   report("rt_sigqueueinfo(0)", queue(0));
   report("rt_sigqueueinfo(-pgrp)", queue(-getpgrp()));
+  report("rt_sigqueueinfo(-1)", queue(-1));
+  report("kill(INT_MIN)", kill(INT_MIN, SIGUSR1));
   report("kill(0)", kill(0, SIGUSR1));
   report("kill(-pgrp)", kill(-getpgrp(), SIGUSR1));
+  if (broadcast) {
+    report("kill(-1)", kill(-1, SIGUSR1));
+  }
   return 0;
 }

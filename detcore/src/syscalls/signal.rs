@@ -968,7 +968,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(self.record_or_replay(guest, call).await?);
         }
 
-        if call.sig() == 0 {
+        // Linux's `kill_something_info` answers ESRCH for pid INT_MIN before
+        // anything else ("-INT_MIN is undefined"), so the kernel's answer is
+        // deterministic and sends nothing; negating it here would overflow
+        // (https://github.com/rrnewton/hermit/issues/4046).
+        if call.sig() == 0 || call.pid() == libc::pid_t::MIN {
             return Ok(self.record_or_replay(guest, call).await?);
         }
 
@@ -1057,7 +1061,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let target = match pid {
             0 => "its own process group".to_owned(),
             -1 => "every process it may signal".to_owned(),
-            pid => format!("process group {}", -pid),
+            pid => format!("process group {}", pid.unsigned_abs()),
         };
         tracing::error!(
             "[detcore, dtid {}] signal {} to {} by kill is not supported: Detcore does not \
@@ -1248,7 +1252,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             // POSIX.1b has no process groups: Linux's `do_rt_sigqueueinfo` looks
             // the pid up with `find_vpid`, which finds no process for 0 or a
             // negative pid, so the call fails (EFAULT for an unreadable
-            // `siginfo_t`, EPERM for a forged `si_code`, otherwise ESRCH) and
+            // `siginfo_t`, EPERM for a forged `si_code`, E2BIG for an unknown
+            // `si_code` with nonzero expansion bytes, otherwise ESRCH) and
             // sends nothing. The kernel's own answer is therefore deterministic
             // (https://github.com/rrnewton/hermit/issues/4046).
             return Ok(self.record_or_replay(guest, call).await?);

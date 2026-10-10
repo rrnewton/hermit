@@ -20522,18 +20522,26 @@ fn a_process_directed_signal_to_several_threads_is_refused_by_name() {
 }
 
 /// A signal addressed to a process group
-/// (https://github.com/rrnewton/hermit/issues/4046). `rt_sigqueueinfo` has no
-/// process groups, so for pid 0 or a negative pid Linux returns ESRCH and sends
-/// nothing; Hermit forwards it and gets the same answer (it returned ENOSYS
-/// before). `kill(0, sig)` and `kill(-pgrp, sig)` signal every process in the
-/// group, which Detcore does not model: a fail-closed run stops with the
-/// policy-refusal status and names the call (it returned ENOSYS as a plain errno
-/// before), and `--allow-unsupported-syscalls` still returns ENOSYS.
+/// (https://github.com/rrnewton/hermit/issues/4046). The guest first leads its
+/// own process group (3 in Hermit's PID namespace), so its negative pids are
+/// real ones. `rt_sigqueueinfo` has no process groups: for pid 0, `-pgrp` or -1
+/// Linux returns ESRCH and sends nothing, and Hermit forwards the call and gets
+/// the same answer (it returned ENOSYS before). `kill(INT_MIN, sig)` is ESRCH
+/// in Linux, and Hermit forwards it rather than overflowing on its negation.
+/// `kill(0, sig)`, `kill(-pgrp, sig)` and `kill(-1, sig)` signal every process
+/// in a set, which Detcore does not model:
+/// - a fail-closed run stops with the policy-refusal status at `kill(0)` and
+///   names it (it returned ENOSYS as a plain errno before);
+/// - `--allow-unsupported-syscalls` returns ENOSYS for each and names each
+///   refusal with its target.
 #[test]
 fn a_signal_to_a_process_group_is_refused_by_name() {
     let guest = kill_process_group_guest().to_str().unwrap().to_owned();
-    let queued = "rt_sigqueueinfo(0): -1 ESRCH, handled 0\n\
-                  rt_sigqueueinfo(-pgrp): -1 ESRCH, handled 0\n";
+    let answered = "own group: yes\n\
+                    rt_sigqueueinfo(0): -1 ESRCH, handled 0\n\
+                    rt_sigqueueinfo(-pgrp): -1 ESRCH, handled 0\n\
+                    rt_sigqueueinfo(-1): -1 ESRCH, handled 0\n\
+                    kill(INT_MIN): -1 ESRCH, handled 0\n";
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let (status, log) = run_with_deadline(
         hermit_command(&[
@@ -20544,6 +20552,7 @@ fn a_signal_to_a_process_group_is_refused_by_name() {
             "60",
             "--",
             guest.as_str(),
+            "broadcast",
         ]),
         directory.path(),
         Duration::from_secs(120),
@@ -20560,7 +20569,7 @@ fn a_signal_to_a_process_group_is_refused_by_name() {
         log.contains("signal 10 to its own process group by kill is not supported"),
         "the refusal must name the call and its target:\nstderr:\n{log}"
     );
-    assert_eq!(stdout, queued, "stderr:\n{log}");
+    assert_eq!(stdout, answered, "stderr:\n{log}");
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let (status, log) = run_with_deadline(
         // `--strict` refuses the opt-out, so the compatibility run is not strict.
@@ -20571,6 +20580,7 @@ fn a_signal_to_a_process_group_is_refused_by_name() {
             "60",
             "--",
             guest.as_str(),
+            "broadcast",
         ]),
         directory.path(),
         Duration::from_secs(120),
@@ -20585,18 +20595,25 @@ fn a_signal_to_a_process_group_is_refused_by_name() {
     );
     assert_eq!(
         stdout,
-        format!("{queued}kill(0): -1 ENOSYS, handled 0\nkill(-pgrp): -1 ENOSYS, handled 0\n"),
+        format!(
+            "{answered}kill(0): -1 ENOSYS, handled 0\n\
+             kill(-pgrp): -1 ENOSYS, handled 0\n\
+             kill(-1): -1 ENOSYS, handled 0\n"
+        ),
         "stderr:\n{log}"
     );
-    // Hermit's guest is in a fresh PID namespace whose process group leader
-    // lies outside it, so getpgrp() is 0 there and `kill(-getpgrp(), ...)` is a
-    // second `kill(0, ...)`: both refusals name the caller's own group.
-    assert_eq!(
-        log.matches("to its own process group by kill is not supported")
-            .count(),
-        2,
-        "the compatibility run must still name each refusal:\nstderr:\n{log}"
-    );
+    for target in [
+        "its own process group",
+        "process group 3",
+        "every process it may signal",
+    ] {
+        assert_eq!(
+            log.matches(&format!("signal 10 to {target} by kill is not supported"))
+                .count(),
+            1,
+            "the compatibility run must name the refusal for {target}:\nstderr:\n{log}"
+        );
+    }
 }
 
 /// A POSIX timer that notifies with a real-time signal
