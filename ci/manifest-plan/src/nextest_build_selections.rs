@@ -637,8 +637,8 @@ mod tests {
             // run-mode rt_sigtimedwait SIGCHLD test
             // (https://github.com/rrnewton/hermit/issues/4005), plus its
             // queued-signal counterpart, plus the large-pselect6 mutable-mask
-            // test (https://github.com/rrnewton/hermit/pull/4053).
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "276");
+            // and tight-stack tests (https://github.com/rrnewton/hermit/pull/4053).
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "277");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

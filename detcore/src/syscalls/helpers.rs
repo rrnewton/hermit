@@ -1732,6 +1732,107 @@ impl RestartBlock {
     }
 }
 
+/// The length of a thread's scratch page (`stage_in_thread_scratch_page`).
+const THREAD_SCRATCH_PAGE_LEN: usize = 4096;
+
+/// Mixed into a scratch page's address to form the page's first word, so a
+/// page the guest has since unmapped or replaced is not taken for this one.
+const THREAD_SCRATCH_PAGE_MARK: u64 = 0x4845_524d_4954_5047;
+
+/// Where the payload starts in a scratch page, after its mark.
+const THREAD_SCRATCH_PAYLOAD_OFFSET: usize = 16;
+
+/// Stages `payload`, built for the address it will have, in a page of this
+/// thread's own that is read-only to the guest, and returns that address.
+///
+/// This is for an argument the kernel must read when the guest stack has no
+/// writable scratch below its red zone: a thread may run a valid call on a
+/// stack it placed near the start of a page. The page is mapped by the
+/// thread's first such call and kept for the thread
+/// (`ThreadState::scratch_page`); a later call makes it writable, rewrites
+/// it and makes it read-only again, all before the call it serves.
+///
+/// Nothing is injected after the served call. A call that ends with a
+/// restart code (`ERESTARTNOHAND` and the like) must return to the kernel
+/// untouched: an injected syscall at that point restores the thread's own
+/// signal mask without delivering the signal that interrupted the call, and
+/// the kernel then restarts the call into the same signal, forever. The
+/// kernel's restart also reads the argument again, so it must stay in place.
+///
+/// The page's first word is its address mixed with a mark, and a page whose
+/// word does not match (the guest unmapped it, mapped over it, or exec'd) is
+/// left alone and a new one mapped. The page is mapped in this thread's turn,
+/// at an address the kernel chooses from the guest's own deterministic
+/// mappings.
+pub(crate) async fn stage_in_thread_scratch_page<T, G>(
+    guest: &mut G,
+    payload: impl FnOnce(usize) -> Vec<u8>,
+) -> Result<usize, Errno>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let mark = |page: usize| page as u64 ^ THREAD_SCRATCH_PAGE_MARK;
+    let kept = guest.thread_state().scratch_page.filter(|&page| {
+        Addr::<u64>::from_raw(page).and_then(|word| guest.memory().read_value(word).ok())
+            == Some(mark(page))
+    });
+    let protect = |page: usize, prot: ProtFlags| {
+        Syscall::Mprotect(
+            syscalls::Mprotect::new()
+                .with_addr(AddrMut::from_raw(page))
+                .with_len(THREAD_SCRATCH_PAGE_LEN)
+                .with_protection(prot),
+        )
+    };
+    let page = match kept {
+        Some(page) => {
+            guest
+                .inject_with_retry(protect(page, ProtFlags::PROT_READ | ProtFlags::PROT_WRITE))
+                .await?;
+            page
+        }
+        None => {
+            let mapped = guest
+                .inject_with_retry(Syscall::Mmap(
+                    syscalls::Mmap::new()
+                        .with_addr(None)
+                        .with_len(THREAD_SCRATCH_PAGE_LEN)
+                        .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+                        .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
+                        .with_fd(-1)
+                        .with_offset(0),
+                ))
+                .await?;
+            let page = usize::try_from(mapped).map_err(|_| Errno::EFAULT)?;
+            guest.thread_state_mut().scratch_page = Some(page);
+            page
+        }
+    };
+    let staged = page + THREAD_SCRATCH_PAYLOAD_OFFSET;
+    let bytes = payload(staged);
+    assert!(
+        THREAD_SCRATCH_PAYLOAD_OFFSET + bytes.len() <= THREAD_SCRATCH_PAGE_LEN,
+        "a {}-byte payload does not fit a thread scratch page",
+        bytes.len()
+    );
+    {
+        let mut memory = guest.memory();
+        memory.write_value(
+            AddrMut::<u64>::from_raw(page).ok_or(Errno::EFAULT)?,
+            &mark(page),
+        )?;
+        memory.write_exact(
+            AddrMut::<u8>::from_raw(staged).ok_or(Errno::EFAULT)?,
+            &bytes,
+        )?;
+    }
+    guest
+        .inject_with_retry(protect(page, ProtFlags::PROT_READ))
+        .await?;
+    Ok(staged)
+}
+
 /// Keeps `deadline` for the kernel's restart of `call` when the wait ended with
 /// `ERESTART_RESTARTBLOCK` (`RestartBlock`).
 pub(crate) async fn keep_restart_block<T, G>(

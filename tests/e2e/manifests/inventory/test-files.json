@@ -1315,6 +1315,12 @@
       "why": "tests/c/pselect_large_mutating_mask.c is owned by hermit-cli/tests/external_signal_interrupt.rs: The integration suite compiles this guest and checks that a pselect6 with nfds=65, whose mask buffer a sibling rewrites before the call reaches the kernel, sleeps under its entry mask and returns 1 when the sibling writes the pipe, as on Linux."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/pselect_tight_stack.c",
+      "runner": "hermit-cli/tests/external_signal_interrupt.rs",
+      "why": "tests/c/pselect_tight_stack.c is owned by hermit-cli/tests/external_signal_interrupt.rs: The integration suite compiles this guest and checks that pselect6 calls with nfds=65 and a temporary mask, made on a stack with no writable memory below its red zone, return what Linux returns: ready, ended by a signal only the temporary mask unblocks, restarted by the kernel for an ignored signal, and ready again."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/pthread_lifecycle.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

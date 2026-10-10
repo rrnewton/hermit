@@ -2004,7 +2004,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (review of https://github.com/rrnewton/hermit/pull/4039): 275.
     // And external_signal_interrupt::ptrace_large_pselect6_sleeps_under_its_entry_mask_while_a_sibling_rewrites_it
     // (Codex review of https://github.com/rrnewton/hermit/pull/4053): 276.
-    ("test.hermit_integration", 276),
+    // And external_signal_interrupt::ptrace_large_pselect6_on_a_stack_with_no_scratch_behaves_as_natively
+    // (Codex re-check of https://github.com/rrnewton/hermit/pull/4053): 277.
+    ("test.hermit_integration", 277),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -2782,7 +2784,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the run-mode rt_sigtimedwait SIGCHLD test: 274.
     // And the queued-signal rt_sigtimedwait test: 275.
     // And the large-pselect6 mutable-mask test: 276.
-    ("test.hermit_integration_on_host", 276),
+    // And the large-pselect6 tight-stack test: 277.
+    ("test.hermit_integration_on_host", 277),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

@@ -51,6 +51,7 @@ use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::refuse_held_signal_loss;
 use crate::syscalls::helpers::result_after_restore;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
+use crate::syscalls::helpers::stage_in_thread_scratch_page;
 use crate::syscalls::network_trace::received_descriptors;
 use crate::syscalls::signal::kernel_installed_signal_mask;
 use crate::syscalls::signal::read_kernel_sigset;
@@ -112,6 +113,62 @@ pub(super) const PSELECT6_INTERNAL_MAX_NFDS: i32 =
 pub(super) struct Pselect6SigmaskArg {
     pub(super) sigmask: usize,
     pub(super) sigsetsize: usize,
+}
+
+/// A private, kernel-readable copy of a pselect6 temporary mask, as the
+/// `{ sigmask, sigsetsize }` wrapper a pselect6 passes (`wrapper`). Holds the
+/// stack scratch while the copy lives there.
+struct StagedMask<Guard> {
+    wrapper: usize,
+    _stack: Option<Guard>,
+}
+
+/// Stages a private copy of `mask` that the kernel can read as a pselect6
+/// `{ sigmask, sigsetsize }` wrapper.
+///
+/// The copy goes in the guest stack scratch below the red zone when that is
+/// writable. A thread may run with no writable memory there, on a stack it
+/// placed near the start of a page, and a pselect6 on such a stack is valid,
+/// so a scratch commit that faults stages the copy in the thread's read-only
+/// scratch page instead (`stage_in_thread_scratch_page`; Codex re-check of
+/// https://github.com/rrnewton/hermit/pull/4053). Whether the scratch faults is
+/// a function of the guest's own stack, so the choice is deterministic.
+async fn stage_pselect6_mask_copy<G, T>(
+    guest: &mut G,
+    mask: KernelSigset,
+) -> Result<StagedMask<<G::Stack as Stack>::StackGuard>, Errno>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let mut stack = guest.stack().await;
+    let mask_copy = stack.push(mask);
+    let wrapper = stack.push(Pselect6SigmaskArg {
+        sigmask: mask_copy.as_raw(),
+        sigsetsize: KERNEL_SIGSET_SIZE,
+    });
+    match stack.commit() {
+        Ok(guard) => {
+            return Ok(StagedMask {
+                wrapper: wrapper.as_raw(),
+                _stack: Some(guard),
+            });
+        }
+        Err(Errno::EFAULT) => {}
+        Err(errno) => return Err(errno),
+    }
+    // The mask, then the wrapper that points at it.
+    let mask_copy = stage_in_thread_scratch_page(guest, |at| {
+        let mut bytes = mask.to_ne_bytes().to_vec();
+        bytes.extend_from_slice(&at.to_ne_bytes());
+        bytes.extend_from_slice(&KERNEL_SIGSET_SIZE.to_ne_bytes());
+        bytes
+    })
+    .await?;
+    Ok(StagedMask {
+        wrapper: mask_copy + std::mem::size_of::<KernelSigset>(),
+        _stack: None,
+    })
 }
 
 pub(super) fn pselect6_fd_set_len(nfds: i32) -> Result<usize, Errno> {
@@ -580,28 +637,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .record_or_replay_blocking_with_mask(guest, Syscall::Pselect6(call), None)
                     .await;
             };
-            // The call sleeps under a scratch copy of the mask read here, not the
+            // The call sleeps under a private copy of the mask read here, not the
             // guest's wrapper: a sibling may rewrite the guest's buffer before the
             // released call reaches the kernel, and the scheduler waits for the
             // kernel to install exactly this mask (`background_entry_barriers`,
             // Codex review of https://github.com/rrnewton/hermit/pull/4053). The
-            // wrapper and the mask were validated above, in Linux's order.
-            let mut stack = guest.stack().await;
-            let mask_copy = stack.push(mask);
-            let wrapper = stack
-                .push(Pselect6SigmaskArg {
-                    sigmask: mask_copy.as_raw(),
-                    sigsetsize: KERNEL_SIGSET_SIZE,
-                })
-                .cast();
-            let _guard = stack.commit()?;
-            return self
+            // wrapper and the mask were validated above, in Linux's order. The
+            // copy stays readable until the call has rejoined.
+            let staged = stage_pselect6_mask_copy(guest, mask).await?;
+            let result = self
                 .record_or_replay_blocking_with_mask(
                     guest,
-                    Syscall::Pselect6(call.with_sigmask(Some(wrapper))),
+                    Syscall::Pselect6(call.with_sigmask(Addr::from_raw(staged.wrapper))),
                     Some(kernel_installed_signal_mask(mask)),
                 )
                 .await;
+            drop(staged);
+            return result;
         }
 
         // Linux wraps pselect6's temporary mask in { pointer, size }. Glibc supplies

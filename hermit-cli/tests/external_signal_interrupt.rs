@@ -2154,6 +2154,76 @@ fn ptrace_large_pselect6_sleeps_under_its_entry_mask_while_a_sibling_rewrites_it
     let _ = fs::remove_file(&witness);
 }
 
+/// A pselect6 with more than 64 descriptors and a temporary mask is valid on a
+/// stack with no writable memory below its red zone, and Hermit stages its
+/// private copy of the mask (`stage_pselect6_mask_copy`) somewhere else there.
+/// tests/c/pselect_tight_stack.c makes a ready call, a call ended by a SIGALRM
+/// that only the temporary mask unblocks, a call the kernel restarts for an
+/// ignored SIGCONT (re-reading its mask), and a ready call again, on a stack
+/// 144, 160 and 1024 bytes into its page, and must print what Linux prints.
+/// Staging the copy on the stack returned EFAULT in the tight mode; unmapping
+/// a transient page after the call restarted the signal-ended call forever
+/// (Codex re-check of https://github.com/rrnewton/hermit/pull/4053).
+#[test]
+fn ptrace_large_pselect6_on_a_stack_with_no_scratch_behaves_as_natively() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let root = build_root();
+    fs::create_dir_all(&root).expect("failed to create guest build directory");
+    let witness = root.join(format!("pselect_tight_stack.{}", std::process::id()));
+    let compiled = Command::new("cc")
+        .args(["-O2", "-Wall", "-Wextra", "-Werror"])
+        .arg(repository.join("tests/c/pselect_tight_stack.c"))
+        .arg("-o")
+        .arg(&witness)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to start the witness's compiler");
+    assert!(
+        compiled.status.success(),
+        "failed to compile the witness: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    for mode in ["tight", "adjacent", "ample"] {
+        let trial = tempfile::Builder::new()
+            .prefix("trial-")
+            .tempdir_in(&root)
+            .expect("failed to create trial directory");
+        let report = trial.path().join("verify.json");
+        let output = Command::new("timeout")
+            .args(["--kill-after=5s", "120s"])
+            .arg(hermit_binary::hermit_binary())
+            .env_remove("LD_LIBRARY_PATH")
+            .arg("--log=info")
+            .args(cell_run_args("ptrace"))
+            .args(["--verify", "--verify-strict", "--verify-json"])
+            .arg(&report)
+            .arg("--")
+            .arg(&witness)
+            .arg(mode)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run hermit");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let expected = format!("mode={mode} ready=1 signal=-4 alarms=1 restart=0 again=1 oracle=1");
+        assert!(
+            output.status.success() && stdout.contains(&expected),
+            "{mode}: expected `{expected}`, as natively, with exit 0; got {}\nstdout:\n{stdout}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let verdict: serde_json::Value = serde_json::from_slice(
+            &fs::read(&report).expect("strict verification wrote no verdict"),
+        )
+        .expect("strict verification verdict is valid JSON");
+        if let Some(gap) = strict_verification_gap(&verdict) {
+            panic!("{mode}: strict verification is not determinism evidence: {gap}");
+        }
+    }
+    let _ = fs::remove_file(&witness);
+}
+
 #[test]
 fn ptrace_poll_and_epoll_are_ended_by_the_sigchld_of_an_exiting_child() {
     assert_child_exit_sigchld_ends_readiness_waits("ptrace");

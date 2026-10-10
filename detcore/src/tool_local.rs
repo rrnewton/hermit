@@ -2027,6 +2027,12 @@ pub struct ThreadState<T> {
     #[serde(skip)]
     pub(crate) restart_block: Option<crate::syscalls::helpers::RestartBlock>,
 
+    /// The page this thread stages kernel-read arguments in when its stack
+    /// has no writable scratch (`syscalls::helpers::stage_in_thread_scratch_page`),
+    /// once mapped. Kept for the thread; exec discards it.
+    #[serde(skip)]
+    pub(crate) scratch_page: Option<usize>,
+
     /// Whether this thread's process has a guest handler for SIGALRM, so that
     /// signal phase 1's table (`sigalrm_phase1`) gates its syscalls. Set by the
     /// runtime's handler admission (phase 1 step I3), in the same turn it
@@ -2601,6 +2607,7 @@ impl<T> ThreadState<T> {
             parent_process_cpu_time: None,
             parent_cpu_publication: None,
             restart_block: None,
+            scratch_page: None,
             sigalrm_handled: false,
             sigalrm_blocked_published: false,
             signal_register_projection: None,
