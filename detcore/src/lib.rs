@@ -139,6 +139,7 @@ pub use tool_global::BackendFailureCleanup;
 pub use tool_global::GlobalState;
 use tool_global::ThreadDeregistration;
 use tool_global::acknowledge_robust_list_exit_time;
+pub use tool_global::cancel_exec;
 use tool_global::create_child_thread;
 use tool_global::create_vfork_child_thread;
 use tool_global::deregister_thread;

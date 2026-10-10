@@ -41,6 +41,7 @@ use detcore::DetTid;
 use detcore::Detcore;
 use detcore::GlobalState;
 use detcore::UnsupportedSyscallError;
+use detcore::cancel_exec;
 use detcore::prepare_exec;
 use rand::RngExt as _;
 use reverie::Error;
@@ -513,7 +514,7 @@ fn send_dbt_prepare_exec(
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
     write_registers: RegisterWriter,
-) {
+) -> PreparedExec {
     let runtime = current_runtime();
     let mm = thread_state.mm_id;
     let (tid, pid) = prepare_exec_guest_identity(scheduler_tid, physical_pid);
@@ -535,6 +536,13 @@ fn send_dbt_prepare_exec(
         mm,
         std::collections::BTreeSet::new(),
     ));
+    PreparedExec {
+        context: context as usize,
+        branches,
+        invoke_syscall,
+        read_registers,
+        write_registers,
+    }
 }
 
 fn prepare_exec_guest_identity(scheduler_tid: Pid, physical_pid: i32) -> (Pid, Pid) {
@@ -606,6 +614,19 @@ struct ThreadRuntime {
     state: DetcoreThreadState,
     initialized: bool,
     post_exec_pending: bool,
+    prepared_exec: Option<PreparedExec>,
+}
+
+// A failed native exec returns on this same DynamoRIO thread and leaves its
+// context and client callbacks alive. Retain them only across that syscall so
+// the existing failure callback can cancel Detcore's exec before any old-image
+// code resumes, without changing the native callback ABI.
+struct PreparedExec {
+    context: usize,
+    branches: u64,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+    write_registers: RegisterWriter,
 }
 
 struct PendingThreadParent {
@@ -1461,6 +1482,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
         state,
         initialized: false,
         post_exec_pending: host_tid == pid && inherited_parent.is_none(),
+        prepared_exec: None,
     });
     if reverie_dbt::run_tool_thread_start(
         tool,
@@ -1834,23 +1856,44 @@ fn resume_paused_runtime() {
     READY_IMAGE.store(IMAGE_GENERATION.load(Ordering::Acquire), Ordering::Release);
 }
 
-/// Restarts the existing scheduler after the kernel rejects a native exec.
+/// Cancels the prepared exec after the kernel rejects the native syscall.
 ///
 /// # Safety
 ///
-/// `_scratch` must be the pointer supplied by the native DBT callback. It is not
-/// dereferenced because a failed exec preserves the current Detcore thread state.
+/// `scratch` must be the pointer supplied by the native DBT callback. The
+/// failed syscall preserves its thread state and the context retained by
+/// [`reverie_dbt_runtime_pre_syscall`]; `pid` must identify that same process.
 #[unsafe(no_mangle)]
 // TODO-HUMAN-REVIEW(PR-587): Confirm failed-exec preserves Runtime and thread state.
-pub unsafe extern "C" fn reverie_dbt_runtime_exec_failed(_scratch: *mut c_void, _pid: i32) {
-    assert!(
-        RUNTIME
-            .read()
-            .expect("Detcore DBT runtime lock poisoned")
-            .is_some(),
-        "failed exec had no Detcore runtime"
-    );
+pub unsafe extern "C" fn reverie_dbt_runtime_exec_failed(scratch: *mut c_void, pid: i32) {
+    // The in-process RPC path needs its scheduler polled while cancelling.
+    // Readiness alone grants no guest turn: this caller still owns its turn,
+    // and PrepareExec keeps its sibling cohort frozen until CancelExec.
     resume_paused_runtime();
+    let runtime = current_runtime();
+    let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
+    if scratch.runtime_state.is_null() {
+        return;
+    }
+    let thread = unsafe { &mut *scratch.runtime_state };
+    let Some(prepared) = thread.prepared_exec.take() else {
+        return;
+    };
+    let (tid, pid) = prepare_exec_guest_identity(thread.tid, pid);
+    let mut guest = DbtGuest::<Detcore>::new(
+        prepared.context,
+        tid,
+        pid,
+        None,
+        prepared.branches,
+        &mut thread.state,
+        &runtime.global,
+        &runtime.config,
+        prepared.invoke_syscall,
+        prepared.read_registers,
+        prepared.write_registers,
+    );
+    run_ready(cancel_exec(&mut guest));
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2059,6 +2102,7 @@ unsafe fn start_thread_runtime(
             state,
             initialized: false,
             post_exec_pending: true,
+            prepared_exec: None,
         }));
     }
     let thread = unsafe { &mut *scratch.runtime_state };
@@ -2388,7 +2432,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
             if !scratch.runtime_state.is_null() {
                 let thread = unsafe { &mut *scratch.runtime_state };
                 if should_send_dbt_prepare_exec(thread.initialized, tid, pid) {
-                    send_dbt_prepare_exec(
+                    let prepared = send_dbt_prepare_exec(
                         context,
                         thread.tid,
                         pid,
@@ -2398,6 +2442,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
                         read_registers,
                         write_registers,
                     );
+                    thread.prepared_exec = Some(prepared);
                 }
             }
             if RUNTIME_BACKGROUND_OWNER_PID.load(Ordering::Acquire) == pid {

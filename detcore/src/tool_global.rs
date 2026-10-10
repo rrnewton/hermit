@@ -4521,6 +4521,9 @@ where
     assert_eq!(response, GlobalResponse::PrepareExec(()));
 }
 
+/// Cancels a matching [`prepare_exec`] after a native exec fails. Call this
+/// before returning to the old image, preserving its thread state and address
+/// space identity so frozen siblings can resume without an exec transition.
 pub async fn cancel_exec<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
