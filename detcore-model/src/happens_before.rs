@@ -1004,7 +1004,12 @@ impl HappensBeforeSpec {
     /// Parse a JSON specification. A version-2 spec is also checked for
     /// fields this build does not know ([`HappensBeforeError::UnknownField`]),
     /// so a misspelled field is refused instead of silently ignored; version 1
-    /// keeps its old, lenient parsing.
+    /// keeps its old, lenient handling of unknown fields.
+    ///
+    /// The spec itself is deserialized from the original text, not from the
+    /// `Value` used for that check: a `Value` keeps only the last of two equal
+    /// keys, which would accept `"nth": 1, "nth": 2` as `nth` 2. Deserializing
+    /// the text refuses a duplicated field, in either version.
     pub fn from_json(s: &str) -> anyhow::Result<HappensBeforeSpec> {
         let value: serde_json::Value = serde_json::from_str(s)?;
         if value.get("version").and_then(serde_json::Value::as_u64)
@@ -1012,7 +1017,7 @@ impl HappensBeforeSpec {
         {
             check_known_fields(&value)?;
         }
-        Ok(serde_json::from_value(value)?)
+        Ok(serde_json::from_str(s)?)
     }
 
     /// Serialize to pretty JSON.
@@ -2249,6 +2254,21 @@ mod tests {
         normalize_json(r#"{"version": 2, "events": {"r": {"thread": "7", "rcb": 5}}}"#).unwrap();
         // Version 1 ignores an unknown field, as it always has.
         normalize_json(r#"{"version": 1, "events": {}, "evnets": {}}"#).unwrap();
+    }
+
+    /// A field given twice is refused in both versions, rather than the last
+    /// value silently winning (the Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4004).
+    #[test]
+    fn a_duplicated_field_is_refused() {
+        for json in [
+            r#"{"version": 1, "events": {"w": {"thread": "7", "syscall": "write", "nth": 1, "nth": 2}}}"#,
+            r#"{"version": 2, "events": {"w": {"thread": "7", "syscall": "write", "nth": 1, "nth": 2}}}"#,
+            r#"{"version": 2, "max_hold_ns": 5, "max_hold_ns": 6, "events": {}}"#,
+        ] {
+            let error = HappensBeforeSpec::from_json(json).unwrap_err().to_string();
+            assert!(error.contains("duplicate field"), "{json}: {error}");
+        }
     }
 
     /// `futex_op` restricts `futex` to one operation, compared on the low 32
