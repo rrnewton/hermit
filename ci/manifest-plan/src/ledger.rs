@@ -1135,6 +1135,13 @@ impl CellResultsEvidenceV8 {
 pub enum CellResultsValue {
     Typed(CellResultsEvidence),
     Other(Value),
+    /// An untyped shape decoded from history, held as its canonical compact
+    /// JSON text instead of a `Value` tree. A `Value` costs about 7 bytes of
+    /// heap per byte of JSON: on the 2026-10-10 ledger the 616 rows with cell
+    /// results held 728 MB of JSON as 4.9 GB of `Value`
+    /// (<https://github.com/rrnewton/dev-hermit/issues/552>). It reads,
+    /// compares and serializes exactly as `Other` holding the same value.
+    Retained(RetainedJson),
     /// Decode-only duplicate identity state. Historical serialization and typed
     /// access delegate to `value`; admission checks must inspect the original IDs.
     #[doc(hidden)]
@@ -1142,6 +1149,48 @@ pub enum CellResultsValue {
         value: Box<Self>,
         run_ids: Value,
     },
+}
+
+/// The canonical compact serialization of a JSON value that contains no
+/// floating-point number, plus its top-level `run_id`.
+///
+/// Without floats, parsing the text gives back a value equal to the original:
+/// integers and strings round-trip exactly and object keys are already in
+/// `Value`'s sorted order. A value with a float stays a `Value`, because the
+/// text of a float need not parse back to the same bits.
+#[derive(Clone, Debug)]
+pub struct RetainedJson {
+    text: Box<str>,
+    run_id: Option<Value>,
+}
+
+impl RetainedJson {
+    fn new(value: Value) -> Result<Self, Value> {
+        if contains_float(&value) {
+            return Err(value);
+        }
+        let text = serde_json::to_string(&value)
+            .expect("a serde_json::Value is always serializable")
+            .into_boxed_str();
+        Ok(Self {
+            text,
+            run_id: value.get("run_id").cloned(),
+        })
+    }
+
+    /// The value this text was made from.
+    pub fn value(&self) -> Value {
+        serde_json::from_str(&self.text).expect("retained text is the serialization of a Value")
+    }
+}
+
+fn contains_float(value: &Value) -> bool {
+    match value {
+        Value::Number(number) => number.is_f64(),
+        Value::Array(values) => values.iter().any(contains_float),
+        Value::Object(fields) => fields.values().any(contains_float),
+        Value::Null | Value::Bool(_) | Value::String(_) => false,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1239,7 +1288,10 @@ impl<'de> Deserialize<'de> for CellResultsValue {
         let raw = deserialize_result_value(deserializer, true)?;
         let value = match serde_json::from_value(raw.value.clone()) {
             Ok(value) => Self::Typed(value),
-            Err(_) => Self::Other(raw.value),
+            Err(_) => match RetainedJson::new(raw.value) {
+                Ok(retained) => Self::Retained(retained),
+                Err(value) => Self::Other(value),
+            },
         };
         Ok(match raw.duplicate_run_ids {
             Some(run_ids) => Self::WithDuplicateRunIds {
@@ -1256,6 +1308,7 @@ impl Serialize for CellResultsValue {
         match self {
             Self::Typed(value) => value.serialize(serializer),
             Self::Other(value) => value.serialize(serializer),
+            Self::Retained(retained) => retained.value().serialize(serializer),
             Self::WithDuplicateRunIds { value, .. } => value.serialize(serializer),
         }
     }
@@ -1270,6 +1323,10 @@ impl PartialEq for CellResultsValue {
             (value, Self::WithDuplicateRunIds { value: other, .. }) => value == other.as_ref(),
             (Self::Typed(value), Self::Typed(other)) => value == other,
             (Self::Other(value), Self::Other(other)) => value == other,
+            // Canonical text is equal exactly when the float-free values are.
+            (Self::Retained(value), Self::Retained(other)) => value.text == other.text,
+            (Self::Retained(retained), Self::Other(value))
+            | (Self::Other(value), Self::Retained(retained)) => retained.value() == *value,
             _ => false,
         }
     }
@@ -1279,7 +1336,7 @@ impl CellResultsValue {
     pub fn typed(&self) -> Option<&CellResultsEvidence> {
         match self {
             Self::Typed(evidence) => Some(evidence),
-            Self::Other(_) => None,
+            Self::Other(_) | Self::Retained(_) => None,
             Self::WithDuplicateRunIds { value, .. } => value.typed(),
         }
     }
@@ -1287,7 +1344,7 @@ impl CellResultsValue {
     pub fn typed_mut(&mut self) -> Option<&mut CellResultsEvidence> {
         match self {
             Self::Typed(evidence) => Some(evidence),
-            Self::Other(_) => None,
+            Self::Other(_) | Self::Retained(_) => None,
             Self::WithDuplicateRunIds { value, .. } => value.typed_mut(),
         }
     }
@@ -1295,6 +1352,7 @@ impl CellResultsValue {
     fn schema8(&self) -> Option<CellResultsEvidenceV8> {
         match self {
             Self::Other(value) => serde_json::from_value(value.clone()).ok(),
+            Self::Retained(retained) => serde_json::from_value(retained.value()).ok(),
             Self::Typed(_) => None,
             Self::WithDuplicateRunIds { value, .. } => value.schema8(),
         }
@@ -1307,6 +1365,7 @@ impl CellResultsValue {
         match self {
             Self::Typed(value) => Some(Value::String(value.run_id.clone())),
             Self::Other(value) => value.get("run_id").cloned(),
+            Self::Retained(retained) => retained.run_id.clone(),
             Self::WithDuplicateRunIds { run_ids, .. } => Some(run_ids.clone()),
         }
     }
@@ -2392,8 +2451,125 @@ mod tests {
         let mut newer = json;
         newer["future_field"] = serde_json::json!(true);
         let value: CellResultsValue = serde_json::from_value(newer.clone()).unwrap();
-        assert!(matches!(value, CellResultsValue::Other(_)));
+        assert!(matches!(value, CellResultsValue::Retained(_)));
         assert_eq!(serde_json::to_value(value).unwrap(), newer);
+    }
+
+    /// An untyped shape is kept as compact text, and every reader sees exactly
+    /// what it saw when the shape was a `Value`
+    /// (<https://github.com/rrnewton/dev-hermit/issues/552>).
+    #[test]
+    fn untyped_cell_results_are_retained_as_text_and_read_exactly_as_a_value() {
+        let json = serde_json::json!({
+            "run_id": "run-552",
+            "zeta": [1, -2, {"b": "\u{e9}\"\n", "a": null}],
+            "alpha": {"nested": [true, false], "count": 18446744073709551615u64},
+            "cells": [{"cell_verdict": {"state": "compared-and-matched"}}],
+        });
+        let retained: CellResultsValue = serde_json::from_value(json.clone()).unwrap();
+        let CellResultsValue::Retained(text) = &retained else {
+            panic!("an untyped float-free shape must be retained as text: {retained:?}");
+        };
+        assert_eq!(text.value(), json);
+        let other = CellResultsValue::Other(json.clone());
+
+        assert_eq!(
+            serde_json::to_vec(&retained).unwrap(),
+            serde_json::to_vec(&other).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec_pretty(&retained).unwrap(),
+            serde_json::to_vec_pretty(&other).unwrap()
+        );
+        assert_eq!(retained, other);
+        assert_eq!(other, retained);
+        assert_eq!(retained, retained.clone());
+        let mut changed = json.clone();
+        changed["zeta"][0] = 2.into();
+        assert_ne!(retained, CellResultsValue::Other(changed.clone()));
+        assert_ne!(
+            retained,
+            serde_json::from_value::<CellResultsValue>(changed).unwrap()
+        );
+        assert_eq!(retained.admission_run_id(), other.admission_run_id());
+        assert_eq!(
+            retained.admission_run_id(),
+            Some(Value::String("run-552".into()))
+        );
+        assert!(retained.typed().is_none());
+    }
+
+    #[test]
+    fn retained_cell_results_decode_schema8_exactly_as_a_value() {
+        let shape: Value = serde_json::from_str(
+            r#"{"path":"quick","run_id":"run-8","hermit_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+               "source_tree_dirty":false,"selected_count":0,"recorded_count":0,
+               "population_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+               "artifact":{"path":"ignored/validate/artifacts/run-8/cell-results.jsonl",
+                           "sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","row_count":0},
+               "selected":[],"cells":[]}"#,
+        )
+        .unwrap();
+        let retained: CellResultsValue = serde_json::from_value(shape.clone()).unwrap();
+        assert!(matches!(retained, CellResultsValue::Retained(_)));
+        let other = CellResultsValue::Other(shape);
+        assert_eq!(
+            serde_json::to_value(retained.schema8().unwrap()).unwrap(),
+            serde_json::to_value(other.schema8().unwrap()).unwrap()
+        );
+        let row = |cell_results: CellResultsValue| {
+            let mut row: HistoryRow =
+                serde_json::from_value(serde_json::json!({"schema_version": 8})).unwrap();
+            row.cell_results = Some(cell_results);
+            row
+        };
+        let (retained_row, other_row) = (row(retained), row(other));
+        assert_eq!(
+            retained_row.cell_results_validate_path(),
+            Some(ValidatePath::Quick)
+        );
+        assert_eq!(
+            retained_row.cell_results_validate_path(),
+            other_row.cell_results_validate_path()
+        );
+        assert_eq!(
+            retained_row.cell_results_evidence(),
+            other_row.cell_results_evidence()
+        );
+    }
+
+    /// A float's text need not parse back to the same bits, so a shape that
+    /// holds one stays a `Value`.
+    #[test]
+    fn untyped_cell_results_with_a_float_stay_a_value() {
+        let json = serde_json::json!({"run_id": "run-f", "ratio": 0.1, "cells": []});
+        let value: CellResultsValue = serde_json::from_value(json.clone()).unwrap();
+        assert!(matches!(value, CellResultsValue::Other(_)));
+        assert_eq!(serde_json::to_value(value).unwrap(), json);
+    }
+
+    /// The memory bound behind dev-hermit issue 552: a large untyped shape
+    /// keeps no `Value` tree, only text no longer than its own JSON. The
+    /// 2026-10-10 ledger held 728 MB of cell-results JSON as 4.9 GB of `Value`.
+    #[test]
+    fn a_large_untyped_shape_is_held_as_text_no_longer_than_its_json() {
+        let cells: Vec<Value> = (0..20_000)
+            .map(|index| {
+                serde_json::json!({
+                    "lane": "portable", "category": "c", "test": format!("t{index}"),
+                    "mode": "strict", "backend": "ptrace",
+                    "cell_verdict": {"state": "unavailable-with-reason", "reason": "r"},
+                })
+            })
+            .collect();
+        let text =
+            serde_json::to_string(&serde_json::json!({"run_id": "big", "cells": cells})).unwrap();
+        let value: CellResultsValue = serde_json::from_str(&text).unwrap();
+        let CellResultsValue::Retained(retained) = &value else {
+            panic!("a large untyped shape must be retained as text");
+        };
+        assert!(retained.text.len() <= text.len());
+        assert_eq!(serde_json::to_string(&value).unwrap(), text);
     }
 
     #[test]
@@ -2436,7 +2612,7 @@ mod tests {
             }
         }
         let value: CellResultsValue = serde_json::from_value(json.clone()).unwrap();
-        assert!(matches!(value, CellResultsValue::Other(_)));
+        assert!(matches!(value, CellResultsValue::Retained(_)));
         assert_eq!(serde_json::to_value(value).unwrap(), json);
 
         let row: HistoryRow = serde_json::from_value(serde_json::json!({

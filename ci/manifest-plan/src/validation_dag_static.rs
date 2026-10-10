@@ -970,7 +970,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (hermit-manifest-plan, https://github.com/rrnewton/hermit/issues/4029)
     // retains all 1039: 1040.
     // The required allocator prerequisite mutation test retains all 1039 prior identities: 1040.
-    ("test.regular_crates", 1042),
+    ("test.regular_crates", 1046),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2963,7 +2963,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the duplicated-field model test: 1039.
     // And the guest permission-denied first-run-rejection test: 1040.
     // And the same allocator prerequisite mutation test: 1040.
-    ("test.regular_crates_on_host", 1042),
+    ("test.regular_crates_on_host", 1046),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
