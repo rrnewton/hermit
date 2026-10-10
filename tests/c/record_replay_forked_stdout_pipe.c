@@ -21,6 +21,14 @@
  * Replay then wrote them into the live pipe while it served the parent's
  * reads from the recording, so nothing drained the pipe and the child's
  * write waited forever once the pipe was full.
+ *
+ * With the argument `saved-stdout`, the parent first saves its stdout as
+ * another descriptor, and the child writes its 128 KiB through that saved
+ * descriptor to the container's real stdout, then one line into the pipe, as
+ * `exec 3>&1; { head -c 131072 /dev/zero >&3; echo x; } | cat` does in bash.
+ * The write is captured output, and replay used to emit it into the child's
+ * own copy of descriptor 1, which is the pipe
+ * (https://github.com/rrnewton/hermit/issues/4006).
  */
 
 #define _GNU_SOURCE
@@ -46,7 +54,77 @@ static int write_all(int fd, const unsigned char* buffer, size_t length) {
   return 0;
 }
 
-int main(void) {
+static int saved_stdout_mode(void) {
+  int pipe_fds[2];
+  if (pipe(pipe_fds) != 0) {
+    perror("pipe");
+    return 1;
+  }
+  int saved_stdout = dup(STDOUT_FILENO);
+  if (saved_stdout < 0 || dup2(pipe_fds[1], STDOUT_FILENO) < 0) {
+    perror("redirect stdout");
+    return 1;
+  }
+  pid_t child = fork();
+  if (child < 0) {
+    perror("fork");
+    return 1;
+  }
+  if (child == 0) {
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+    unsigned char chunk[CHUNK];
+    memset(chunk, 'x', sizeof chunk);
+    for (int i = 0; i < CHUNKS; i++) {
+      if (write_all(saved_stdout, chunk, sizeof chunk) != 0) {
+        _exit(2);
+      }
+    }
+    if (write_all(saved_stdout, (const unsigned char*)"\n", 1) != 0 ||
+        write_all(
+            STDOUT_FILENO, (const unsigned char*)"through-pipe\n", 13) != 0) {
+      _exit(3);
+    }
+    _exit(0);
+  }
+  if (dup2(saved_stdout, STDOUT_FILENO) < 0) {
+    perror("restore stdout");
+    return 1;
+  }
+  close(saved_stdout);
+  close(pipe_fds[1]);
+  char line[64];
+  size_t total = 0;
+  for (;;) {
+    ssize_t got = read(pipe_fds[0], line + total, sizeof line - 1 - total);
+    if (got < 0) {
+      perror("read");
+      return 1;
+    }
+    if (got == 0) {
+      break;
+    }
+    total += (size_t)got;
+  }
+  line[total] = '\0';
+  close(pipe_fds[0]);
+  int status = 0;
+  if (waitpid(child, &status, 0) != child) {
+    perror("waitpid");
+    return 1;
+  }
+  printf("saved-stdout pipe=%s child_status=%d\n", line, status);
+  if (strcmp(line, "through-pipe\n") != 0 || status != 0) {
+    fprintf(stderr, "saved-stdout mismatch\n");
+    return 1;
+  }
+  return 0;
+}
+
+int main(int argc, char** argv) {
+  if (argc == 2 && strcmp(argv[1], "saved-stdout") == 0) {
+    return saved_stdout_mode();
+  }
   int pipe_fds[2];
   if (pipe(pipe_fds) != 0) {
     perror("pipe");

@@ -2561,6 +2561,22 @@ fn record_poll_and_ppoll_ready_pipe() {
 /// output, so replay wrote the child's bytes into the live pipe while serving
 /// the parent's reads from the recording, and the child waited forever once the
 /// pipe was full (https://github.com/rrnewton/hermit/issues/3964).
+/// The same fork, with the child writing 128 KiB to the container's real stdout
+/// through a descriptor its parent saved before redirecting its own stdout, as
+/// `exec 3>&1; { head -c 131072 /dev/zero >&3; echo x; } | cat` does. Replay
+/// emitted that captured output into the child's own copy of descriptor 1,
+/// which is the pipe, and waited forever once the pipe was full
+/// (https://github.com/rrnewton/hermit/issues/4006).
+#[test]
+fn record_forked_child_writes_to_a_saved_stdout_after_its_parent_redirected_it() {
+    let _guard = hermit_record_lock();
+    canonical_record_replay_command(
+        "forked saved stdout",
+        &workload("c_record_replay_forked_stdout_pipe").path,
+        &[OsStr::new("saved-stdout")],
+    );
+}
+
 #[test]
 fn record_forked_child_writes_into_a_redirected_stdout_pipe() {
     let _guard = hermit_record_lock();

@@ -360,6 +360,49 @@ pub struct ReplayerThreadState {
     stream_id: EventStreamId,
     child_stream_ids: ChildEventStreamIds,
     bootstrapped: bool,
+    /// The root guest's captured output endpoints (`ReplayOutputs`), which
+    /// every thread inherits from the thread that created it.
+    #[serde(skip)]
+    outputs: std::sync::Arc<ReplayOutputs>,
+}
+
+/// Duplicates of the stdout and stderr the root guest inherited, the only
+/// endpoints whose writes the recorder captures as output (`ContainerOutputs`
+/// in recorder.rs), with the locks that order replayed writes to each.
+///
+/// Every process's `Replayer::new` duplicates that process's own descriptors 1
+/// and 2 when it is created, which in a child forked after its parent
+/// redirected its stdout are a pipe inside the container. Replay used to emit a
+/// captured write into the writing process's own duplicate, so a child that
+/// wrote to the container's stdout through a descriptor its parent saved had
+/// its bytes written into that pipe instead, whose reader replay serves from
+/// the recording; once the pipe was full, the replayed write waited forever
+/// (https://github.com/rrnewton/hermit/issues/4006). Only the root thread's
+/// copy is used now, and every other thread shares it.
+#[derive(Default)]
+pub(crate) struct ReplayOutputs {
+    pub(crate) stdout: Option<std::os::fd::OwnedFd>,
+    pub(crate) stderr: Option<std::os::fd::OwnedFd>,
+    /// Preserve replayed write ordering independently for each captured stream.
+    pub(crate) stdout_output_lock: tokio::sync::Mutex<()>,
+    pub(crate) stderr_output_lock: tokio::sync::Mutex<()>,
+    pub(crate) stdout_error: Option<String>,
+    pub(crate) stderr_error: Option<String>,
+}
+
+impl ReplayOutputs {
+    fn capture(pid: Pid) -> Self {
+        let (stdout, stdout_error) = capture_guest_fd(pid, libc::STDOUT_FILENO);
+        let (stderr, stderr_error) = capture_guest_fd(pid, libc::STDERR_FILENO);
+        Self {
+            stdout,
+            stderr,
+            stdout_output_lock: tokio::sync::Mutex::new(()),
+            stderr_output_lock: tokio::sync::Mutex::new(()),
+            stdout_error,
+            stderr_error,
+        }
+    }
 }
 
 impl Deref for ReplayerThreadState {
@@ -389,32 +432,18 @@ pub struct Replayer {
     // Keep track of the data directory. Each thread uses this path to open its
     // event stream.
     data: PathBuf,
-    /// Duplicates of this guest process's captured output endpoints.
+    /// Duplicates of this process's descriptors 1 and 2 when it was created.
+    /// Only the root guest's are the captured output endpoints, so only the
+    /// root thread takes them (`ReplayerThreadState::outputs`).
     #[serde(skip)]
-    stdout: Option<std::os::fd::OwnedFd>,
-    #[serde(skip)]
-    stderr: Option<std::os::fd::OwnedFd>,
-    /// Preserve replayed write ordering independently for each captured stream.
-    #[serde(skip)]
-    stdout_output_lock: tokio::sync::Mutex<()>,
-    #[serde(skip)]
-    stderr_output_lock: tokio::sync::Mutex<()>,
-    #[serde(skip)]
-    stdout_error: Option<String>,
-    #[serde(skip)]
-    stderr_error: Option<String>,
+    outputs: std::sync::Arc<ReplayOutputs>,
 }
 
 impl Default for Replayer {
     fn default() -> Self {
         Self {
             data: PathBuf::new(),
-            stdout: None,
-            stderr: None,
-            stdout_output_lock: tokio::sync::Mutex::new(()),
-            stderr_output_lock: tokio::sync::Mutex::new(()),
-            stdout_error: None,
-            stderr_error: None,
+            outputs: Default::default(),
         }
     }
 }
@@ -425,16 +454,9 @@ impl Tool for Replayer {
     type ThreadState = ReplayerThreadState;
 
     fn new(pid: Pid, cfg: &<Self::GlobalState as GlobalTool>::Config) -> Self {
-        let (stdout, stdout_error) = capture_guest_fd(pid, libc::STDOUT_FILENO);
-        let (stderr, stderr_error) = capture_guest_fd(pid, libc::STDERR_FILENO);
         Self {
             data: cfg.replay_data.as_ref().unwrap().clone(),
-            stdout,
-            stderr,
-            stdout_output_lock: tokio::sync::Mutex::new(()),
-            stderr_output_lock: tokio::sync::Mutex::new(()),
-            stdout_error,
-            stderr_error,
+            outputs: std::sync::Arc::new(ReplayOutputs::capture(pid)),
         }
     }
 
@@ -458,6 +480,10 @@ impl Tool for Replayer {
             stream_id,
             child_stream_ids: ChildEventStreamIds::default(),
             bootstrapped: parent.is_some_and(|(_, state)| state.bootstrapped),
+            outputs: match parent {
+                None => self.outputs.clone(),
+                Some((_, state)) => state.outputs.clone(),
+            },
         }
     }
 

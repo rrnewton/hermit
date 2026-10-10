@@ -39,6 +39,7 @@ use reverie::syscalls::family::StatFamily;
 use reverie::syscalls::family::WriteFamily;
 use reverie::syscalls::ioctl;
 
+use super::ReplayOutputs;
 use super::Replayer;
 use crate::event::FileCloneImage;
 use crate::event::ReplayFdKind;
@@ -883,7 +884,9 @@ impl Replayer {
         );
         Ok(())
     }
+}
 
+impl ReplayOutputs {
     fn output_endpoint(
         &self,
         output_fd: libc::c_int,
@@ -905,7 +908,9 @@ impl Replayer {
         })?;
         Ok((lock, output.as_raw_fd()))
     }
+}
 
+impl Replayer {
     async fn replay_output<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -919,7 +924,10 @@ impl Replayer {
         // syscall errors. Failures after that boundary are failures of Replay's
         // host-side output machinery and must abort the tool instead.
         let bytes = read_write_bytes(&guest.memory(), syscall, count)?;
-        let (output_lock, output) = self.output_endpoint(output_fd)?;
+        // The root guest's endpoints, whichever process wrote
+        // (`ReplayerThreadState::outputs`).
+        let outputs = guest.thread_state().outputs.clone();
+        let (output_lock, output) = outputs.output_endpoint(output_fd)?;
         let _guard = output_lock.lock().await;
         emit_replay_output(output, &bytes, output_offset, advances_output_offset)
             .await
@@ -991,7 +999,8 @@ impl Replayer {
                 )));
             }
             if let Some(output_fd) = event.output_fd {
-                let (output_lock, output) = self.output_endpoint(output_fd)?;
+                let outputs = guest.thread_state().outputs.clone();
+                let (output_lock, output) = outputs.output_endpoint(output_fd)?;
                 let _guard = output_lock.lock().await;
                 truncate_replay_output(output, event.length)?;
             }
@@ -1324,12 +1333,12 @@ mod tests {
 
     #[test]
     fn missing_or_invalid_output_endpoint_is_an_outer_tool_error() {
-        let replayer = Replayer {
+        let outputs = ReplayOutputs {
             stdout_error: Some("Too many open files".to_owned()),
-            ..Replayer::default()
+            ..ReplayOutputs::default()
         };
         for output_fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO, 9] {
-            let failure = match replayer.output_endpoint(output_fd) {
+            let failure = match outputs.output_endpoint(output_fd) {
                 Ok(_) => panic!("unavailable replay output fd {output_fd} unexpectedly resolved"),
                 Err(error) => error,
             };

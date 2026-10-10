@@ -2066,7 +2066,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // record_sigtimedwait_ends_for_a_caught_sigchld_from_a_child_exit
     // (https://github.com/rrnewton/hermit/issues/3963 and its review) add five
     // and retain all 141 (`cargo nextest list` lists 146).
-    ("test.record_replay", 146),
+    // record_forked_child_writes_to_a_saved_stdout_after_its_parent_redirected_it
+    // (https://github.com/rrnewton/hermit/issues/4006) adds one and retains all
+    // 146 (`cargo nextest list` lists 147).
+    ("test.record_replay", 147),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
