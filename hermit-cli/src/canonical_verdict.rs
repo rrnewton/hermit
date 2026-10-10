@@ -41,6 +41,9 @@ impl std::fmt::Display for Verdict {
 /// pre-run stamp left when the invocation died before recording a more specific
 /// result. Collapsing both into `no_result` made a completed guest refusal and a
 /// container or launcher failure indistinguishable to the result reader.
+/// `RunFailed` means Hermit started a verification run and a typed failure of
+/// that run stopped it: before it existed, such a run left the `NotRun` stamp,
+/// so a guest that ran (often to a clean exit) was recorded as never run.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum NoResultReason {
@@ -59,6 +62,42 @@ pub enum NoResultReason {
     /// A sandbox exited before returning its guest Output. This is an
     /// attempted execution failure, with no guest disposition or comparison.
     ContainerFailed(ContainerFailure),
+    /// Hermit started verification run `run`, and a typed failure of that run
+    /// stopped it before any comparison. `detail` is the failure's message.
+    RunFailed {
+        run: VerificationRun,
+        failure: RunFailure,
+        detail: String,
+    },
+}
+
+/// What stopped a verification run that Hermit had started.
+///
+/// Each is a property of Hermit or its backend running this guest, so a
+/// result reader counts it as a failure of the cell on that backend, with the
+/// detail as its reason. An error that is none of these (a bad flag, an
+/// unreadable path) is not typed here and leaves the `NotRun` stamp.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunFailure {
+    /// The backend failed while running the guest: the DBT evidence check, a
+    /// KVM execution failure, a SaBRe guest that never reached Detcore.
+    BackendFailure,
+    /// The run recorded a determinism loss, so its records are not compared.
+    DeterminismLoss,
+    /// A fail-closed policy refused this guest during the run: an unsupported
+    /// system call, or a guest the backend cannot instrument.
+    PolicyRefusal,
+}
+
+impl RunFailure {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BackendFailure => "backend_failure",
+            Self::DeterminismLoss => "determinism_loss",
+            Self::PolicyRefusal => "policy_refusal",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -469,6 +508,35 @@ impl VerificationReport {
     /// compare. A null comparison beside a product verdict is contradictory
     /// and stays refused at parse.
     fn require_consistent_outcome_fields(self) -> Result<Self, String> {
+        if let Some(NoResultReason::RunFailed { detail, .. }) = &self.no_result_reason {
+            if detail.trim().is_empty() {
+                return Err("incomplete verification report: run_failed omitted its detail".into());
+            }
+            // The failed run returned no Output and was not compared; like
+            // container_failed, it names no guest disposition.
+            if self.verdict != Verdict::NoResult
+                || self.verified
+                || self.bitwise_parity
+                || self.infrastructure_error.is_some()
+                || self.comparison.is_some()
+                || self.compared_log_messages.is_some()
+                || self.compared_outputs.is_some()
+                || self.dbt_counted_branches.is_some()
+                || self.runtime.is_some()
+                || self.guest_exit_code.is_some()
+                || self.guest_signal.is_some()
+                || self.first_divergent_scheduler_turn.is_some()
+                || self.first_divergent_virtual_nanoseconds.is_some()
+                || self.first_divergent_record.is_some()
+                || self.first_divergent_syscall.is_some()
+                || self.first_divergent_left_message.is_some()
+                || self.first_divergent_right_message.is_some()
+            {
+                return Err(
+                    "run_failed contradicts its no-comparison, unknown-guest outcome".into(),
+                );
+            }
+        }
         if let Some(NoResultReason::ContainerFailed(failure)) = &self.no_result_reason {
             let valid_status = match failure.disposition {
                 // classify_container_result reserves these normal exit codes
@@ -841,6 +909,47 @@ mod tests {
             disposition,
         }));
         report
+    }
+
+    #[test]
+    fn run_failure_round_trips_and_names_no_guest_disposition() {
+        for run in [VerificationRun::Run1, VerificationRun::Run2] {
+            for failure in [
+                RunFailure::BackendFailure,
+                RunFailure::DeterminismLoss,
+                RunFailure::PolicyRefusal,
+            ] {
+                let mut report = VerificationReport::no_result();
+                report.no_result_reason = Some(NoResultReason::RunFailed {
+                    run,
+                    failure,
+                    detail: "drrun started and the DBT run then failed".into(),
+                });
+                let bytes = serde_json::to_vec(&report).unwrap();
+                let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value["no_result_reason"]["kind"], "run_failed");
+                assert_eq!(value["no_result_reason"]["failure"], failure.as_str());
+                assert_eq!(
+                    VerificationReport::from_current_json_slice(&bytes).unwrap(),
+                    report
+                );
+                assert!(report.require_canonical_comparison().is_err());
+
+                let mut guest = report.clone();
+                guest.guest_exit_code = Some(0);
+                let bytes = serde_json::to_vec(&guest).unwrap();
+                assert!(VerificationReport::from_current_json_slice(&bytes).is_err());
+
+                let mut blank = report.clone();
+                blank.no_result_reason = Some(NoResultReason::RunFailed {
+                    run,
+                    failure,
+                    detail: " ".into(),
+                });
+                let bytes = serde_json::to_vec(&blank).unwrap();
+                assert!(VerificationReport::from_current_json_slice(&bytes).is_err());
+            }
+        }
     }
 
     #[test]

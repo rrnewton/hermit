@@ -5258,10 +5258,18 @@ fn execute_spec_until(
                             first_divergent_right_message =
                                 report.first_divergent_right_message.clone();
                         }
-                        if producer_failure_classified {
+                        let typed_run_failure = matches!(
+                            report.no_result_reason,
+                            Some(crate::canonical_verdict::NoResultReason::RunFailed { .. })
+                        );
+                        if producer_failure_classified
+                            && !(unclassified_internal_failure && typed_run_failure)
+                        {
                             // The producer's classified failure, or a
                             // contradiction in that evidence, cannot be
                             // superseded by a pre-stamped or unrelated report.
+                            // A `run_failed` report is neither: it is the
+                            // class an unclassified `cli-error` line lacks.
                         } else if let Some(
                             crate::canonical_verdict::NoResultReason::ContainerFailed(failure),
                         ) = &report.no_result_reason
@@ -5284,6 +5292,37 @@ fn execute_spec_until(
                                     error_kind = Some("incomplete-verification-evidence".into());
                                     reason = Some(error);
                                 }
+                            }
+                        } else if let Some(crate::canonical_verdict::NoResultReason::RunFailed {
+                            run,
+                            failure,
+                            detail,
+                        }) = &report.no_result_reason
+                        {
+                            // Hermit started the run and a typed failure of it
+                            // stopped the run: a backend failure, a recorded
+                            // determinism loss or a policy refusal of this
+                            // guest. That is this cell's result on this
+                            // backend, a crash-error red with Hermit's reason,
+                            // not a run that never happened. Hermit exits
+                            // nonzero for each; anything else contradicts it.
+                            if output.timeout.is_none()
+                                && output.status.code().is_some_and(|code| code != 0)
+                            {
+                                outcome = "FAIL".into();
+                                error_kind = None;
+                                reason = Some(format!(
+                                    "{run:?} failed ({}): {detail}",
+                                    failure.as_str()
+                                ));
+                            } else {
+                                outcome = "ERROR".into();
+                                error_kind = Some("incomplete-verification-evidence".into());
+                                reason = Some(format!(
+                                    "run_failed contradicts the Hermit process disposition: status={:?} timed_out={}",
+                                    output.status.code(),
+                                    output.timeout.is_some()
+                                ));
                             }
                         } else if report.verdict == Verdict::InfrastructureError {
                             let comparison_error = report.comparison.as_ref().and_then(|_| {
@@ -6800,7 +6839,9 @@ pub(crate) fn verification_matched_canonically(attempt: &AttemptResult) -> bool 
 
 /// Whether `attempt` retains a current verification report in which Hermit
 /// rejected the guest's first verify run (`first_run_rejected`): the guest ran
-/// and failed, so no comparison was made.
+/// and failed, so no comparison was made. A typed failure of a run Hermit had
+/// started (`run_failed`) is the same kind of evidence: Hermit named what
+/// stopped the run, so its output is Hermit's report of it, not a host block.
 fn first_run_rejected(attempt: &AttemptResult) -> bool {
     attempt
         .verification_report
@@ -6809,7 +6850,10 @@ fn first_run_rejected(attempt: &AttemptResult) -> bool {
         .is_some_and(|report| {
             matches!(
                 report.no_result_reason,
-                Some(crate::canonical_verdict::NoResultReason::FirstRunRejected { .. })
+                Some(
+                    crate::canonical_verdict::NoResultReason::FirstRunRejected { .. }
+                        | crate::canonical_verdict::NoResultReason::RunFailed { .. }
+                )
             )
         })
 }
@@ -21943,6 +21987,59 @@ cp "{}" "$verdict"
                         .reason
                         .unwrap()
                         .contains("contradicts Hermit process")
+                );
+            }
+        }
+    }
+
+    /// A run Hermit started and a typed failure stopped (`run_failed`) is a
+    /// product crash with Hermit's reason, for each failure kind and either
+    /// run; a zero Hermit exit contradicts it. Before the reason existed such
+    /// a run left the `not_run` stamp and was counted as no result.
+    #[test]
+    fn a_typed_run_failure_is_a_product_crash_with_its_reason() {
+        use crate::canonical_verdict::NoResultReason;
+        use crate::canonical_verdict::RunFailure;
+        use crate::canonical_verdict::VerificationRun;
+        for (status, failure) in [
+            (125, RunFailure::BackendFailure),
+            (125, RunFailure::DeterminismLoss),
+            (122, RunFailure::PolicyRefusal),
+        ] {
+            for run in [VerificationRun::Run1, VerificationRun::Run2] {
+                let reason = NoResultReason::RunFailed {
+                    run,
+                    failure,
+                    detail: "KVM guest execution failed: guest exception vector 14".into(),
+                };
+                let failed = no_result_with_exit_status(status, reason.clone());
+                assert_eq!(failed.outcome, "FAIL");
+                assert_eq!(failed.error_kind, None);
+                let text = failed.reason.clone().unwrap();
+                assert!(text.contains(failure.as_str()), "{text}");
+                assert!(text.contains("guest exception vector 14"), "{text}");
+                assert_eq!(
+                    observed_result(
+                        "verify",
+                        &failed.outcome,
+                        std::slice::from_ref(&failed),
+                        failed.error_kind.as_deref()
+                    ),
+                    Some(ObservedResult::CrashError)
+                );
+                assert_eq!(
+                    failure_class(
+                        &failed.outcome,
+                        Some(ObservedResult::CrashError),
+                        failed.error_kind.as_deref()
+                    ),
+                    Some(FailureClass::ProductFailure)
+                );
+                let contradicted = no_result_with_exit_status(0, reason);
+                assert_eq!(contradicted.outcome, "ERROR");
+                assert_eq!(
+                    contradicted.error_kind.as_deref(),
+                    Some("incomplete-verification-evidence")
                 );
             }
         }

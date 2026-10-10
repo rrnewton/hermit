@@ -38,6 +38,7 @@ use hermit::canonical_verdict::InfrastructureError;
 pub(crate) use hermit::canonical_verdict::LogCompareStrictness;
 pub(crate) use hermit::canonical_verdict::NoResultReason;
 use hermit::canonical_verdict::RecordEnvelopeReport;
+use hermit::canonical_verdict::RunFailure;
 use hermit::canonical_verdict::RuntimeStats;
 pub(crate) use hermit::canonical_verdict::Verdict;
 pub(crate) use hermit::canonical_verdict::VerificationReport;
@@ -923,6 +924,68 @@ pub(crate) fn run_verification_execution<T>(
             }
         }
     })
+}
+
+/// The typed failure, if any, of a verification run Hermit had started.
+///
+/// A skid overshoot is not one: it already published its infrastructure
+/// error. Neither is an untyped error (a bad flag, an unreadable path), which
+/// leaves the pending stamp.
+fn run_failure_of(error: &Error) -> Option<RunFailure> {
+    if error.downcast_ref::<hermit::SkidOvershootError>().is_some() {
+        None
+    } else if error
+        .downcast_ref::<super::run::DeterminismLossRecorded>()
+        .is_some()
+    {
+        Some(RunFailure::DeterminismLoss)
+    } else if error.downcast_ref::<hermit::BackendRunFailure>().is_some() {
+        Some(RunFailure::BackendFailure)
+    } else if error
+        .downcast_ref::<super::container::PolicyRefusal>()
+        .is_some()
+    {
+        Some(RunFailure::PolicyRefusal)
+    } else {
+        None
+    }
+}
+
+/// The run_failed detail keeps the failure's message chain, bounded so one
+/// pathological message cannot grow the report without limit.
+const RUN_FAILED_DETAIL_MAX_BYTES: usize = 4096;
+
+/// Replace the pending stamp with `run_failed` when `error` is a typed failure
+/// of verification run `run` ([`RunFailure`]), and return `error` unchanged.
+/// Call it only where `run` had been started: a refusal before any run (the
+/// host's seccomp filter, an inexact branch counter) is a host condition, not
+/// a result of this guest on this backend.
+pub(crate) fn publish_run_failure(
+    path: Option<&Path>,
+    run: VerificationRun,
+    error: Error,
+) -> Error {
+    let (Some(path), Some(failure)) = (path, run_failure_of(&error)) else {
+        return error;
+    };
+    let mut detail = format!("{error:#}");
+    if detail.len() > RUN_FAILED_DETAIL_MAX_BYTES {
+        let mut end = RUN_FAILED_DETAIL_MAX_BYTES;
+        while !detail.is_char_boundary(end) {
+            end -= 1;
+        }
+        detail.truncate(end);
+    }
+    let mut report = VerificationReport::no_result();
+    report.no_result_reason = Some(NoResultReason::RunFailed {
+        run,
+        failure,
+        detail,
+    });
+    match write_report_json(path, &report) {
+        Ok(()) => error,
+        Err(secondary) => retain_verification_error(error, "publishing run failure", secondary),
+    }
 }
 
 /// Keep the original typed error as anyhow's cause and the actual secondary
@@ -2603,6 +2666,72 @@ mod tests {
                     );
                     assert_eq!(report, VerificationReport::no_result());
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn a_typed_run_failure_replaces_the_stamp_and_an_untyped_error_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("verify.json");
+        let cases: Vec<(Error, Option<RunFailure>)> = vec![
+            (
+                Error::new(hermit::BackendRunFailure)
+                    .context("drrun started and the DBT run then failed: missing FINAL frames"),
+                Some(RunFailure::BackendFailure),
+            ),
+            (
+                Error::new(super::super::run::DeterminismLossRecorded::new(
+                    "run 1",
+                    "process 3 exited without deregistering",
+                )),
+                Some(RunFailure::DeterminismLoss),
+            ),
+            (
+                Error::msg("the guest program is statically linked")
+                    .context(super::super::container::PolicyRefusal),
+                Some(RunFailure::PolicyRefusal),
+            ),
+            // Already published as its infrastructure error.
+            (
+                Error::new(hermit::SkidOvershootError::new(2))
+                    .context(super::super::container::PolicyRefusal),
+                None,
+            ),
+            (Error::msg("unknown flag --frobnicate"), None),
+        ];
+        // The type decides, never the text: the same message without its type
+        // leaves the stamp.
+        for (error, _) in &cases {
+            write_pending_verification_json(&path).unwrap();
+            drop(publish_run_failure(
+                Some(&path),
+                VerificationRun::Run1,
+                Error::msg(format!("{error:#}")),
+            ));
+            assert_eq!(
+                VerificationReport::from_current_json_slice(&fs::read(&path).unwrap()).unwrap(),
+                VerificationReport::no_result()
+            );
+        }
+        for (error, expected) in cases {
+            write_pending_verification_json(&path).unwrap();
+            let message = format!("{error:#}");
+            let returned = publish_run_failure(Some(&path), VerificationRun::Run2, error);
+            // The caller's error comes back unchanged, typed as it was.
+            assert_eq!(format!("{returned:#}"), message);
+            let report =
+                VerificationReport::from_current_json_slice(&fs::read(&path).unwrap()).unwrap();
+            match expected {
+                Some(failure) => assert_eq!(
+                    report.no_result_reason,
+                    Some(NoResultReason::RunFailed {
+                        run: VerificationRun::Run2,
+                        failure,
+                        detail: message,
+                    })
+                ),
+                None => assert_eq!(report, VerificationReport::no_result()),
             }
         }
     }
