@@ -1318,7 +1318,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // metadata::tests::record_version_rejects_pre_child_subreaper_streams
     // (https://github.com/rrnewton/hermit/issues/3997) retains all 1019: 1020.
     // And the two signal-target metadata tests (https://github.com/rrnewton/hermit/issues/3963): 1022.
-    ("test.hermit_unit", 1022),
+    // Common container/input and requested-mount controls retain all 1022:
+    // the actual current selection contains 1034 cases.
+    ("test.hermit_unit", 1034),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1982,7 +1984,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/2082) retains all 271: 272.
     // And robust_futex_owner_death::ptrace_wakes_nobody_when_an_exec_leaves_the_owner_word_alone:
     // 273.
-    ("test.hermit_integration", 273),
+    // backend_isolation_launch adds two scoped launch regressions and twenty
+    // assertion/admission/capture controls, retaining all 273 prior identities;
+    // the additive declaration is 295.
+    ("test.hermit_integration", 295),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -2735,7 +2740,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same scheduler-turn-cost clock-exhaustion test: 271.
     // And the robust-futex exec owner-death test: 272.
     // And the robust-futex exec no-wake test: 273.
-    ("test.hermit_integration_on_host", 273),
+    // The same backend_isolation_launch regressions and controls retain all
+    // 273 prior identities; the additive declaration is 295.
+    ("test.hermit_integration_on_host", 295),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -2816,7 +2823,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the version-2 preemption refusal test: 1019.
     // And the child-subreaper record-version test: 1020.
     // And the same two signal-target metadata tests: 1022.
-    ("test.hermit_unit_on_host", 1022),
+    // The same measured common container/input and mount selection: 1034.
+    ("test.hermit_unit_on_host", 1034),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -5435,12 +5443,13 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test child_time_rpc --test chown_virtual_root_identity --test cli_owned_lifecycle --test clock_determinism --test clock_discipline_determinism --test clock_passthrough --test container_init_deadline --test cpufreq_avg_determinism --test dispatch_stats --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test external_signal_interrupt --test fatal_core_capture --test file_nr_determinism --test first_seen_mtime --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test reopened_pipe_progress --test robust_futex_owner_death --test run_evidence --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test utimensat_mtime --test verification_report_cli --test verification_report_consumers --test verify_claim_names_its_limit --test writev_determinism --test zero_copy_pipe_fallback -j 1 -E 'not (test(=ptrace_a_handlers_first_restart_syscall_resumes_the_interrupted_timed_futex_wait) | test(=ptrace_child_waits_restart_under_sa_restart) | test(=ptrace_futex_wait_is_ended_by_a_caught_signal_pending_with_a_default_ignored_sigchld) | test(=ptrace_futex_wait_is_ended_by_a_signal_caught_after_it_parked) | test(=ptrace_futex_wait_is_not_ended_by_a_signal_ignored_after_it_parked) | test(=ptrace_futex_wait_of_the_thread_that_forked_the_child_holds_its_sigchld_until_it_returns) | test(=ptrace_other_waits_take_a_discarded_default_stop_as_on_linux) | test(=ptrace_poll_and_epoll_hold_the_sigchld_of_an_exiting_child_until_they_return) | test(=ptrace_polling_futex_wait_holds_a_sigchld_caught_after_it_parked_until_it_returns) | test(=ptrace_polling_futex_wait_holds_the_sigchld_of_an_exiting_child_until_it_returns) | test(=ptrace_polling_timed_futex_wait_keeps_its_deadline_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_polling_untimed_futex_wait_keeps_waiting_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_precise_futex_wait_holds_a_sigchld_caught_after_it_parked_until_it_returns) | test(=ptrace_precise_futex_wait_holds_the_sigchld_of_an_exiting_child_until_it_returns) | test(=ptrace_precise_futex_wait_leaves_its_childs_sigchld_to_a_running_sibling) | test(=ptrace_precise_timed_futex_wait_keeps_its_deadline_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_precise_timed_futex_wait_leaves_its_childs_sigchld_to_a_running_sibling) | test(=ptrace_precise_untimed_futex_wait_keeps_waiting_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_readiness_waits_are_not_ended_by_non_interrupting_process_signals) | test(=ptrace_readiness_waits_are_not_ended_by_non_interrupting_thread_signals) | test(=ptrace_selects_are_ended_by_a_caught_sigchld_from_an_exiting_child) | test(=ptrace_selects_are_not_ended_by_non_interrupting_process_signals) | test(=ptrace_selects_are_not_ended_by_non_interrupting_thread_signals) | test(=ptrace_timed_futex_wait_and_poll_keep_their_deadline_through_a_discarded_default_stop) | test(=ptrace_timed_futex_wait_is_not_ended_by_non_interrupting_signals))'"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test child_time_rpc --test chown_virtual_root_identity --test cli_owned_lifecycle --test clock_determinism --test clock_discipline_determinism --test clock_passthrough --test container_init_deadline --test cpufreq_avg_determinism --test dispatch_stats --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test external_signal_interrupt --test fatal_core_capture --test file_nr_determinism --test first_seen_mtime --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test reopened_pipe_progress --test robust_futex_owner_death --test run_evidence --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test utimensat_mtime --test verification_report_cli --test verification_report_consumers --test verify_claim_names_its_limit --test writev_determinism --test zero_copy_pipe_fallback --test backend_isolation_launch -j 1 -E 'not (test(=ptrace_a_handlers_first_restart_syscall_resumes_the_interrupted_timed_futex_wait) | test(=ptrace_child_waits_restart_under_sa_restart) | test(=ptrace_futex_wait_is_ended_by_a_caught_signal_pending_with_a_default_ignored_sigchld) | test(=ptrace_futex_wait_is_ended_by_a_signal_caught_after_it_parked) | test(=ptrace_futex_wait_is_not_ended_by_a_signal_ignored_after_it_parked) | test(=ptrace_futex_wait_of_the_thread_that_forked_the_child_holds_its_sigchld_until_it_returns) | test(=ptrace_other_waits_take_a_discarded_default_stop_as_on_linux) | test(=ptrace_poll_and_epoll_hold_the_sigchld_of_an_exiting_child_until_they_return) | test(=ptrace_polling_futex_wait_holds_a_sigchld_caught_after_it_parked_until_it_returns) | test(=ptrace_polling_futex_wait_holds_the_sigchld_of_an_exiting_child_until_it_returns) | test(=ptrace_polling_timed_futex_wait_keeps_its_deadline_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_polling_untimed_futex_wait_keeps_waiting_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_precise_futex_wait_holds_a_sigchld_caught_after_it_parked_until_it_returns) | test(=ptrace_precise_futex_wait_holds_the_sigchld_of_an_exiting_child_until_it_returns) | test(=ptrace_precise_futex_wait_leaves_its_childs_sigchld_to_a_running_sibling) | test(=ptrace_precise_timed_futex_wait_keeps_its_deadline_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_precise_timed_futex_wait_leaves_its_childs_sigchld_to_a_running_sibling) | test(=ptrace_precise_untimed_futex_wait_keeps_waiting_when_a_runnable_sibling_takes_the_sigchld) | test(=ptrace_readiness_waits_are_not_ended_by_non_interrupting_process_signals) | test(=ptrace_readiness_waits_are_not_ended_by_non_interrupting_thread_signals) | test(=ptrace_selects_are_ended_by_a_caught_sigchld_from_an_exiting_child) | test(=ptrace_selects_are_not_ended_by_non_interrupting_process_signals) | test(=ptrace_selects_are_not_ended_by_non_interrupting_thread_signals) | test(=ptrace_timed_futex_wait_and_poll_keep_their_deadline_through_a_discarded_default_stop) | test(=ptrace_timed_futex_wait_is_not_ended_by_non_interrupting_signals))'"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[
             r########"aio_nr_determinism"########,
             r########"arch_status_determinism"########,
+            r########"backend_isolation_launch"########,
             r########"chaos_sched_yield_progress"########,
             r########"chaos_stress_pmu_detection"########,
             r########"child_time_rpc"########,

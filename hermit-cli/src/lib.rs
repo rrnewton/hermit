@@ -425,6 +425,7 @@ use goblin::elf::Elf;
 use goblin::elf::header;
 use goblin::elf::section_header;
 pub use id::Id;
+pub use interp::elf_get_interp;
 use metadata::Metadata;
 pub use ptrace_completion::HermitCleanupStage;
 pub use ptrace_completion::HermitCleanupUnconfirmed;
