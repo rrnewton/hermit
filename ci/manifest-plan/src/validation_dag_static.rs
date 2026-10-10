@@ -978,7 +978,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The four retained-census, transcoding, depth and key-order tests in
     // ledger::tests (https://github.com/rrnewton/dev-hermit/issues/552)
     // retain all 1048: 1052.
-    ("test.regular_crates", 1052),
+    // The DBT startup-authority refusal regression retains all 1048 prior identities.
+    ("test.regular_crates", 1053),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3018,7 +3019,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same four retained cell-results tests: 1046.
     // And the two posthook-anchor model tests: 1048.
     // And the same four retained-census, transcoding, depth and key-order tests: 1052.
-    ("test.regular_crates_on_host", 1052),
+    // The DBT startup-authority refusal regression retains all 1048 prior identities.
+    ("test.regular_crates_on_host", 1053),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

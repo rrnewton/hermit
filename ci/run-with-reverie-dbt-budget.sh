@@ -1339,7 +1339,17 @@ fi
 # third-party trees and rust-toolchain.toml are Git-object identical.
 # The tracked DBT inventory remains 939; timing budgets are unchanged.
 # This is source identity, not a new runtime receipt or timing calibration.
-expected_pin=b7ac1604f2c969f6e96dc3978c0df60b051fb0c1
+# PUBLISHED ALLOCATOR/DBT-STARTUP CARRY TO bb656c7bf3f008af11d12866b3156f2905246f9f (2026-10-10):
+# From b7ac1604f2c969f6e96dc3978c0df60b051fb0c1, the native DBT client and Rust
+# startup protocol change; the complete reverie-dbt tree is NOT identical.
+# The SDK source_recipe_key repository inputs, vendor/dynamorio and build.rs,
+# are Git-object identical. Preserve CMAKE, CMAKE_GENERATOR and normalized
+# SOURCE_DATE_EPOCH, the remaining key inputs, for the existing calibration.
+# Native CMake topology, third-party trees and rust-toolchain.toml also match.
+# Actual tracked DBT inventory remains 939. Keep the 16-job clamp, 1050
+# effective-job-second wrapper budget and 572-job-second cold-build fallback.
+# This SDK recipe carry is not native/runtime identity or a fresh timing sample.
+expected_pin=bb656c7bf3f008af11d12866b3156f2905246f9f
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

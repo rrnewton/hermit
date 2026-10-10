@@ -401,6 +401,9 @@ pub use detcore::RecordOrReplay;
 pub use detcore_dbt::reverie_dbt_runtime_background_init_v2;
 #[doc(hidden)]
 #[cfg(feature = "dbt")]
+pub use detcore_dbt::reverie_dbt_runtime_background_init_v3;
+#[doc(hidden)]
+#[cfg(feature = "dbt")]
 pub use detcore_dbt::reverie_dbt_runtime_name;
 #[doc(hidden)]
 #[cfg(feature = "dbt")]

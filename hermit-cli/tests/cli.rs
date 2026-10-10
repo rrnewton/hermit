@@ -4702,8 +4702,13 @@ fn run_dbt_uses_the_normalized_backend_config() {
     assert_success(&output, &args);
     let stderr = stderr(&output);
     assert!(
-        stderr.contains("detcore-dbt: using CLI-provided Detcore Config"),
-        "DBT did not consume the CLI-provided config:\n{stderr}",
+        stderr.contains("detcore-dbt: using coordinator-provided Detcore Config"),
+        "DBT did not consume the coordinator-provided config:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains("detcore-dbt: using CLI-provided Detcore Config")
+            && !stderr.contains("using strict default"),
+        "DBT fell back from coordinator authority:\n{stderr}",
     );
     assert!(
         stderr.contains("requires_thread_directed_process_signals: true"),

@@ -14,6 +14,7 @@
 #![deny(missing_docs)]
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::ffi::c_void;
 use std::fs;
 use std::future::Future;
@@ -75,8 +76,9 @@ const MAX_OBSERVED_BUFFER: usize = 1024 * 1024;
 const RANDOM_FILL_CHUNK_BYTES: usize = 4096;
 const GETRANDOM_MAX_BYTES: usize = (i32::MAX as usize) & !4095;
 const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | libc::GRND_INSECURE;
-/// Version 5 adds `reverie_dbt_runtime_rdtsc`, which this runtime implements.
-const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 5;
+/// Version 6 adds the initialized native mode and returned startup status.
+/// The 48-byte callback layout and version-5 RDTSC entry remain unchanged.
+const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 6;
 const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 48;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -335,17 +337,17 @@ fn protected_evidence_capture_ready(protected_level: i32, tracing_active: bool) 
     protected_level == 0 || tracing_active
 }
 
-/// Environment variable through which `hermit --backend dbt run` hands the
-/// CLI-derived Detcore [`Config`] (JSON) to this in-guest runtime.
+/// Stable CLI-derived Detcore [`Config`] JSON for standalone initialization.
 ///
-/// The guest process inherits it from `drrun` (see the DBT launcher), so it is
-/// the cross-process channel that lets flags like `--strict`, `--seed`, and the
-/// time/CPUID virtualization switches reach the DBT Detcore Tool the same way
-/// they reach the ptrace backend.
+/// The admitted native startup mode selects this existing fallback only when
+/// no coordinator control is present. Coordinated initialization receives the
+/// complete physical Config from the existing first RPC frame instead.
 pub const DETCONFIG_ENV: &str = "HERMIT_DBT_DETCONFIG";
 
 /// Where the effective Detcore [`Config`] came from, for native diagnostics.
 enum ConfigSource {
+    /// Received from the coordinator through its existing first Config frame.
+    RpcHandshake,
     /// Deserialized from [`DETCONFIG_ENV`] provided by `hermit run`.
     Cli,
     /// [`DETCONFIG_ENV`] was set but could not be parsed; strict default used.
@@ -366,9 +368,9 @@ fn default_dbt_config() -> Config {
 
 /// What the DBT backend can do, in the form Detcore reads.
 ///
-/// `hermit run --backend=dbt` copies the same value into its configuration and
-/// encodes it into [`DETCONFIG_ENV`]; the DBT runtime decodes exactly this
-/// value back from that encoding when it loads its configuration.
+/// `hermit run --backend=dbt` copies the same value into its configuration.
+/// The coordinator frame retains that value; the stable [`DETCONFIG_ENV`]
+/// producer also encodes it for the existing standalone fallback.
 pub const fn backend_capabilities() -> reverie::BackendCapabilities {
     reverie_dbt::DbtRunner::capabilities()
 }
@@ -403,6 +405,27 @@ fn dbt_config_from(value: Option<&str>) -> (Config, ConfigSource) {
     };
     assert_dbt_execution_model(&mut config);
     (config, source)
+}
+
+/// Selects the complete coordinator frame or the admitted standalone fallback.
+/// A present control remains authoritative even in native Standalone mode.
+fn initial_dbt_config(
+    mode: reverie_dbt::DbtStartupMode,
+    control: Option<&OsStr>,
+) -> Result<(Config, ConfigSource), String> {
+    let (mut config, source) = match control {
+        Some(path) => (
+            reverie_dbt::sync_rpc::read_initial_config::<Config>(Path::new(path))
+                .map_err(|error| error.to_string())?,
+            ConfigSource::RpcHandshake,
+        ),
+        None if mode == reverie_dbt::DbtStartupMode::Coordinated => {
+            return Err("coordinated startup requires a coordinator socket".into());
+        }
+        None => load_dbt_config(),
+    };
+    assert_dbt_execution_model(&mut config);
+    Ok((config, source))
 }
 
 /// Re-asserts the DBT execution model on a configuration from any source. The
@@ -1143,7 +1166,11 @@ pub extern "C" fn reverie_dbt_runtime_image_init() -> u64 {
     IMAGE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
 }
 
-unsafe fn runtime_background_init(callbacks: &reverie_dbt::DbtRuntimeCallbacks, abi: RuntimeAbi) {
+unsafe fn runtime_background_init(
+    callbacks: &reverie_dbt::DbtRuntimeCallbacks,
+    abi: RuntimeAbi,
+    mode: reverie_dbt::DbtStartupMode,
+) -> Result<(), String> {
     let image_generation = IMAGE_GENERATION.load(Ordering::SeqCst);
     let (emit_diagnostic, emit_evidence, protected_level) = runtime_callback_channels(callbacks);
     let _ = DBT_DIAGNOSTIC_EMITTER.set(emit_diagnostic);
@@ -1182,8 +1209,15 @@ unsafe fn runtime_background_init(callbacks: &reverie_dbt::DbtRuntimeCallbacks, 
                 emit_diagnostic,
                 b"detcore-dbt: constructing Detcore Config\n",
             );
-            let (mut config, source) = load_dbt_config();
+            let control = std::env::var_os(reverie_dbt::sync_rpc::RPC_SOCKET_ENV);
+            // The reader consumes its temporary owner before returning here,
+            // before GlobalState/Runtime/READY. Application RPC is unchanged.
+            let (mut config, source) = initial_dbt_config(mode, control.as_deref())?;
             match source {
+                ConfigSource::RpcHandshake => emit_lifecycle_marker(
+                    emit_diagnostic,
+                    b"detcore-dbt: using coordinator-provided Detcore Config\n",
+                ),
                 ConfigSource::Cli => {
                     emit_lifecycle_marker(emit_diagnostic, b"detcore-dbt: using CLI-provided Detcore Config\n")
                 }
@@ -1196,8 +1230,8 @@ unsafe fn runtime_background_init(callbacks: &reverie_dbt::DbtRuntimeCallbacks, 
                 }
             }
             // Fail-closed unsupported-syscall handling (PR #644): the rest of the
-            // Config arrives via the CLI env above, but the panic flag comes from
-            // the DBT callback (the `-panic-on-unsupported-syscalls` client
+            // Config arrives via the selected startup source, but the panic
+            // flag comes from the DBT callback (the `-panic-on-unsupported-syscalls` client
             // argument), because DynamoRIO re-injects the client across execve
             // while an empty-env exec would drop the serialized config. Set up
             // the protected report descriptor the guest children write aggregated
@@ -1270,33 +1304,91 @@ unsafe fn runtime_background_init(callbacks: &reverie_dbt::DbtRuntimeCallbacks, 
         emit_diagnostic,
         b"detcore-dbt: background scheduler completed\n",
     );
+    Ok(())
 }
 
-/// Runs Detcore's async global scheduler on a DynamoRIO-managed client thread.
+/// Runs Detcore's global scheduler through the admitted native startup bridge.
 ///
-/// The native client starts this entry point before registering guest events
-/// and waits for [`reverie_dbt_runtime_ready`] before allowing callbacks.
+/// The native client supplies its initialized per-image mode and handles a
+/// nonzero startup status through its existing tree-failure owner. The complete
+/// coordinator Config is read and its temporary socket closed before state or
+/// READY publication. Only admitted Standalone without control uses legacy JSON.
 ///
 /// # Safety
 ///
-/// `argument` must point to a valid [`reverie_dbt::DbtRuntimeCallbacks`] value.
+/// `argument` must be null or point to valid [`reverie_dbt::DbtRuntimeCallbacks`]
+/// for the call. `native_mode` must be the initialized state admitted by ABI 6.
 #[unsafe(no_mangle)]
 // TODO-HUMAN-REVIEW(PR-587): Confirm external scheduler callback and restart semantics.
-pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v2(argument: *mut c_void) {
+pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v3(
+    argument: *mut c_void,
+    native_mode: u32,
+) -> i32 {
+    if argument.is_null() {
+        return 1;
+    }
     let callbacks = unsafe { &*argument.cast::<reverie_dbt::DbtRuntimeCallbacks>() };
-    unsafe { runtime_background_init(callbacks, RuntimeAbi::Current) };
+    let startup = reverie_dbt::DbtStartupMode::try_from(native_mode)
+        .map_err(|error| error.to_string())
+        .and_then(|mode| unsafe { runtime_background_init(callbacks, RuntimeAbi::Current, mode) });
+    if let Err(error) = startup {
+        let message = format!("detcore-dbt: startup refused: {error}\n");
+        unsafe { (callbacks.emit)(message.as_ptr(), message.len()) };
+        return 1;
+    }
+    0
 }
 
-/// Compatibility entry point for native clients using callback ABI version 1.
+/// Retained version-2 entry, unadmitted without native mode and startup status.
+///
+/// A direct no-mode call fatally refuses before Config or Runtime construction.
+/// This process-local refusal is not a certificate of DynamoRIO tree cleanup.
 ///
 /// # Safety
 ///
-/// `argument` must point to a valid version-1 callback structure.
+/// `argument` must be null or point to valid [`reverie_dbt::DbtRuntimeCallbacks`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v2(argument: *mut c_void) {
+    let emitter = if argument.is_null() {
+        None
+    } else {
+        Some(unsafe { &*argument.cast::<reverie_dbt::DbtRuntimeCallbacks>() }.emit)
+    };
+    refuse_legacy_background_init(emitter, RuntimeAbi::Current);
+}
+
+/// Retained version-1 entry with its original callback layout conversion.
+///
+/// Initialization without the native mode/status bridge fatally refuses before
+/// state. This process-local refusal is not proof of native tree cleanup.
+///
+/// # Safety
+///
+/// `argument` must be null or point to a valid version-1 callback structure.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reverie_dbt_runtime_background_init(argument: *mut c_void) {
-    let callbacks = unsafe { &*argument.cast::<DbtRuntimeCallbacksV1>() };
-    let current = upgrade_runtime_callbacks_v1(callbacks);
-    unsafe { runtime_background_init(&current, RuntimeAbi::V1) };
+    let emitter = if argument.is_null() {
+        None
+    } else {
+        let callbacks = unsafe { &*argument.cast::<DbtRuntimeCallbacksV1>() };
+        Some(upgrade_runtime_callbacks_v1(callbacks).emit)
+    };
+    refuse_legacy_background_init(emitter, RuntimeAbi::V1);
+}
+
+fn refuse_legacy_background_init(emitter: Option<Emitter>, abi: RuntimeAbi) -> ! {
+    let message: &[u8] = match abi {
+        RuntimeAbi::V1 => {
+            b"detcore-dbt: ABI-1 initialization requires the ABI-6 native mode/status bridge\n"
+        }
+        RuntimeAbi::Current => {
+            b"detcore-dbt: ABI-2 initialization requires the ABI-6 native mode/status bridge\n"
+        }
+    };
+    if let Some(emit) = emitter {
+        unsafe { emit(message.as_ptr(), message.len()) };
+    }
+    std::process::abort()
 }
 
 /// Requests shutdown of the backend-owned scheduler at process exit.
@@ -2827,8 +2919,20 @@ mod tests {
     }
 
     #[test]
+    fn startup_authority_refuses_missing_or_invalid_control_without_fallback() {
+        use reverie_dbt::DbtStartupMode;
+
+        assert!(initial_dbt_config(DbtStartupMode::Coordinated, None).is_err());
+        for mode in [DbtStartupMode::Standalone, DbtStartupMode::Coordinated] {
+            // A present control is authoritative even in standalone mode.
+            // An invalid address must not become a successful JSON/default path.
+            assert!(initial_dbt_config(mode, Some(OsStr::new(""))).is_err());
+        }
+    }
+
+    #[test]
     fn exported_runtime_identity_matches_the_pinned_reverie_abi() {
-        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 5);
+        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 6);
         assert_eq!(
             reverie_dbt::DBT_RUNTIME_ABI_VERSION,
             IMPLEMENTED_DBT_RUNTIME_ABI_VERSION
