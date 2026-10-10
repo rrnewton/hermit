@@ -769,6 +769,34 @@ fn poll_timeout_vs_spinner_guest() -> &'static Path {
     })
 }
 
+static SIGKILL_CROSS_PROCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+fn sigkill_cross_process_guest() -> &'static Path {
+    SIGKILL_CROSS_PROCESS_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("sigkill-cross-process");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create sigkill-cross-process guest directory");
+        let guest = build_root.join("sigkill_cross_process");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/sigkill_cross_process.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile sigkill-cross-process guest");
+        assert!(
+            output.status.success(),
+            "sigkill-cross-process guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
 fn vfork_parent_killed_guest() -> &'static Path {
     VFORK_PARENT_KILLED_GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -20329,6 +20357,132 @@ fn a_killed_vfork_parent_does_not_stop_the_schedule() {
         "the run must finish and exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
     );
     assert_eq!(stdout, "A killed by signal 9\n", "stderr:\n{log}");
+}
+
+/// A SIGKILL from one guest process to another retires its target at the
+/// sending turn (https://github.com/rrnewton/hermit/issues/3994), so the
+/// committed schedule and the INFO log no longer depend on when the host
+/// reports the target's death. Each mode must reach canonical bitwise parity
+/// in five consecutive verified runs. Before the fix the retirement landed at
+/// a host-chosen position: these controls matched in 2 and 6 of 10 runs.
+#[test]
+fn a_cross_process_sigkill_verifies_at_bitwise_parity() {
+    let _guard = hermit_run_guard();
+    let program = sigkill_cross_process_guest()
+        .to_str()
+        .expect("sigkill guest path should be UTF-8");
+    for (mode, expected, attempts) in [
+        ("parent", "A killed by signal 9\n", 5),
+        ("bystander", "A killed by signal 9\nB exited 0\n", 5),
+        (
+            "sigchld",
+            "A killed by signal 9\nfirst SIGCHLD: CLD_KILLED, status 9, from A: 1\nB exited 0\n",
+            5,
+        ),
+        ("pgroup", "A killed by signal 9\nB exited 0\n", 5),
+        ("selfgroup", "A killed by signal 9\nB exited 0\n", 5),
+        ("pgself", "A killed by signal 9\n", 5),
+        // The sender is the victim's parent, so the kernel's own SIGCHLD is
+        // what the parent receives, with Linux's siginfo.
+        (
+            "parentkill",
+            "kill: 0, second kill: 0 errno 0\nchild killed by signal 9\nSIGCHLD: CLD_KILLED, status 9, from child: 1\n",
+            5,
+        ),
+        (
+            "twice",
+            "kill: 0, second kill: 0 errno 0\nchild killed by signal 9\nSIGCHLD: CLD_KILLED, status 9, from child: 1\n",
+            5,
+        ),
+        (
+            "zombie",
+            "kill of the zombie: 0\nchild exited 7\nSIGCHLD: CLD_EXITED, status 7, from child: 1\n",
+            5,
+        ),
+        (
+            "pipeeof",
+            "read after the kill: 0\nwriter killed by signal 9\n",
+            5,
+        ),
+        ("cleartid", "futex word: 0\nchild killed by signal 9\n", 2),
+        ("sigign", "kill: 0, waitpid: -1 errno ECHILD\n", 2),
+        ("nocldwait", "kill: 0, waitpid: -1 errno ECHILD\n", 2),
+        (
+            "failsend",
+            "kill(32000): -1 ESRCH, kill(-32000): -1 ESRCH\n",
+            2,
+        ),
+        // Sends Linux rejects before anything happens.
+        (
+            "badtgkill",
+            "tgkill(parent, self): -1 ESRCH; still running\nB exited 0\n",
+            2,
+        ),
+        (
+            "badtgkill_sibling",
+            "tgkill(parent, self): -1 ESRCH; still running\nB exited 0\n",
+            2,
+        ),
+        ("intmin", "kill(INT_MIN): -1 ESRCH; still running\n", 2),
+        // A non-SIGKILL signal to an exited child: a zombie is signalled, an
+        // auto-reaped child is gone.
+        ("zombie_term", "kill(child, SIGTERM): 0 ok\n", 3),
+        ("autoreap_term", "kill(child, SIGTERM): -1 ESRCH\n", 3),
+        ("nocldwait_term", "kill(child, SIGTERM): -1 ESRCH\n", 3),
+    ] {
+        for attempt in 1..=attempts {
+            let args = [
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                "--",
+                program,
+                mode,
+            ];
+            let output = hermit(&args);
+            let log = stderr(&output);
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), expected, "{mode} attempt {attempt}");
+            assert!(
+                log.contains(":: comparison=BitwiseInfoV1 relaxations=none"),
+                "{mode} attempt {attempt}: comparison was not canonical:\n{log}"
+            );
+            assert!(
+                log.contains(":: Success: deterministic. Determinism verified."),
+                "{mode} attempt {attempt}: verification failed:\n{log}"
+            );
+        }
+    }
+}
+
+/// A SIGKILL whose victim is blocked in a background operation (a read of an
+/// accepted TCP socket) during record keeps its host-timed retirement, so the
+/// recording persists a replay refusal, and replay refuses it by name before
+/// starting the guest (https://github.com/rrnewton/hermit/issues/3994).
+#[test]
+fn a_recorded_kill_of_a_victim_in_a_background_read_is_refused_at_replay() {
+    let _guard = hermit_run_guard();
+    let data = tempfile::tempdir().unwrap();
+    let directory = data.path().to_str().unwrap();
+    let program = sigkill_cross_process_guest()
+        .to_str()
+        .expect("sigkill guest path should be UTF-8");
+    let record_args = ["record", "--data-dir", directory, "--", program, "bgrecord"];
+    let record = hermit(&record_args);
+    assert_success(&record, &record_args);
+    assert_eq!(stdout(&record), "victim killed by signal 9\n");
+    let replay_args = ["replay", "--autopilot", "--data-dir", directory];
+    let replay = hermit(&replay_args);
+    assert!(
+        !replay.status.success(),
+        "replay must be refused: {replay:?}"
+    );
+    assert!(
+        stderr(&replay).contains("This recording cannot be replayed faithfully: a SIGKILL victim"),
+        "replay must name the persisted refusal: {replay:?}"
+    );
+    assert_eq!(stdout(&replay), "", "the guest must not start");
 }
 
 /// A vfork child that kills its parent and then execs into a program that

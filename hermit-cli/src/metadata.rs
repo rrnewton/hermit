@@ -240,7 +240,13 @@ impl RecordVersion {
 // here, which the kernel itself ends.) Replay recomputes all of these, so an
 // older recording replayed here could run a different schedule, although no
 // event shape changed.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x129);
+// 0x129 -> 0x12a: on ptrace, a guest-sent SIGKILL retires its victims at the
+// sending turn instead of at their host-timed deregistration
+// (https://github.com/rrnewton/hermit/issues/3994). Turn and wait selection
+// are not recorded; replay recomputes them, so an older recording replayed
+// under the new rule could run a different schedule. The metadata also gains
+// `replay_refused`, which an older replayer would not check.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x12a);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -265,7 +271,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x129);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x129;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x12a;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -295,6 +301,11 @@ pub struct Metadata {
     pub envs: BTreeMap<String, String>,
     /// Hermit record/replay version.
     pub version: RecordVersion,
+    /// Why this recording cannot be replayed faithfully, when the recording
+    /// run said so (`detcore::detlog::replay_refusal`): replay refuses before
+    /// starting the guest (<https://github.com/rrnewton/hermit/issues/3994>).
+    #[serde(default)]
+    pub replay_refused: Option<String>,
     /// Actual guest proc mount mode after setup. Missing in older recordings or
     /// when the guest's proc mount could not be inspected; diagnostic only.
     #[serde(default)]
@@ -373,6 +384,7 @@ impl Metadata {
             hostname,
             domainname,
             envs,
+            replay_refused: None,
             version: RECORD_VERSION,
             proc_readonly: None,
             mountinfo_root_rewrites: Vec::new(),
@@ -882,6 +894,15 @@ mod tests {
             run.backend_supports_blocked_wait_signal_interruption
         );
         assert!(!record.guest_may_inherit_a_terminal);
+    }
+
+    /// A 0x129 recording retired a SIGKILLed victim at its host-timed
+    /// deregistration; replay recomputes turn selection, so under retirement
+    /// at the kill turn it could run another schedule. The version gate must
+    /// refuse it.
+    #[test]
+    fn record_version_rejects_pre_sigkill_retirement_streams() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x129)));
     }
 
     #[test]
