@@ -1,0 +1,56 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="`test-harness run` import mode: re-publish cell rows another runner wrote."><title>hermit_manifest_plan::imported_results - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="hermit_manifest_plan" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module imported_results</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../hermit_manifest_plan/index.html">hermit_<wbr>manifest_<wbr>plan</a><span class="version">0.4.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module imported_<wbr>results</a></h2><h3><a href="#structs">Module Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li><li><a href="#constants" title="Constants">Constants</a></li><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate hermit_<wbr>manifest_<wbr>plan</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">hermit_manifest_plan</a></div><h1>Module <span>imported_<wbr>results</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/hermit_manifest_plan/imported_results.rs.html#1-444">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p><code>test-harness run</code> import mode: re-publish cell rows another runner wrote.</p>
+<p>With <code>E2E_IMPORT_RESULTS=&lt;root&gt;</code> the harness executes no cell. It reads the
+rows that a Buck run of the same plan left under
+<code>&lt;root&gt;/&lt;lane&gt;/manifest_&lt;category&gt;/results.jsonl</code> (the layout
+<code>ci/buck-e2e/ingest.py</code> writes) and emits them through the normal
+publication path, so <code>results.jsonl</code>, JUnit, <code>summary.json</code>, the retry
+history and the dagrun test counts are produced exactly as for an executed
+bucket. Every selected cell must be accounted for: a cell with no row and no
+host inapplicability this machine confirms becomes an ERROR row. That is the
+executed-equals-plan gate for an imported run, and nothing here may relax it.</p>
+<p>An imported cell may not end better than the same rows would have ended in
+an executed run:</p>
+<ul>
+<li>Every row must describe this commit’s clean source, this checkout’s test
+source, the current timeout policy, and (when the binary was stamped) a
+binary built from this commit. Otherwise the cell is one <code>import-stale</code>
+ERROR.</li>
+<li>The cell’s rows, in file order, must be a history a producer writes:
+attempts 1, 2, … within the shared attempt cap, nothing after a PASS,
+and no HOST-INAPPLICABLE row (a producer reports host inapplicability
+only in <code>summary.json</code>). Otherwise the cell is one <code>import-history</code>
+ERROR. This is checked on the whole history, before anything is dropped.</li>
+<li>The producer retries every failure; this run’s retry policy decides which
+of those retries it would have made. History after a failed attempt (a
+FAIL or an ERROR) that does not earn a retry here is dropped, so that
+attempt is the cell’s verdict.</li>
+<li>The policy is the decision an executed run applies to its own attempt
+(<code>attempt_retry_cause</code> in <code>test-harness</code>), applied to the imported row.
+For an ERROR that is the skid-overshoot retry
+(<code>skid_overshoot_only_reports</code>,
+<a href="https://github.com/rrnewton/hermit/issues/1845">https://github.com/rrnewton/hermit/issues/1845</a>) or the host-input
+retry (<code>host_input_change_only</code>). Neither trusts the row’s labels: each
+re-decides the attempt from the report bytes the row retains, which must
+match the row’s <code>verification_report_sha256</code>, and the row must record
+the exit, stdout and relaxation declarations of this checkout’s cell. So
+an imported skid-overshoot ERROR whose retained evidence decides it
+continues to its producer’s next attempt, as an executed one would, and
+any other ERROR (an untyped one, a report that does not match its digest,
+another declaration) ends the history.</li>
+<li>A PASS counts only if the producer recorded complete evidence for the
+execution that passed: that row’s run id in <code>evidence_complete_executions</code>
+in the bucket’s <code>summary.json</code>. Evidence from another execution of the
+same cell does not count.</li>
+<li>A producer’s host-inapplicable claim counts only if this machine lacks a
+capability the cell requires, and the row carries this machine’s reason.</li>
+</ul>
+<p>An imported row is rebound to this run before publication: its <code>run_id</code>
+(and the run id its CPU observations are bound to) becomes this run’s, and
+the observations’ outer attempt follows the row’s attempt, which the ingest
+assigned from Tpx’s execution order. Its <code>source_tree_dirty</code> is set when this
+checkout is dirty, as an executed row’s would be. The rows’ original run ids
+are kept and reported.</p>
+</div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.ImportPolicy.html" title="struct hermit_manifest_plan::imported_results::ImportPolicy">Import<wbr>Policy</a></dt><dd>The decisions an executed run makes for itself, applied to imported rows.</dd><dt><a class="struct" href="struct.ImportedCell.html" title="struct hermit_manifest_plan::imported_results::ImportedCell">Imported<wbr>Cell</a></dt><dd>What the import root says about one selected cell, already turned into the
+rows the harness emits: every attempt in order, or one terminal row.</dd><dt><a class="struct" href="struct.ImportedRun.html" title="struct hermit_manifest_plan::imported_results::ImportedRun">Imported<wbr>Run</a></dt><dd>The import of one <code>run</code>: one entry per selected cell, in selection order.</dd></dl><h2 id="constants" class="section-header">Constants<a href="#constants" class="anchor">§</a></h2><dl class="item-table"><dt><a class="constant" href="constant.IMPORT_RESULTS_ENV.html" title="constant hermit_manifest_plan::imported_results::IMPORT_RESULTS_ENV">IMPORT_<wbr>RESULTS_<wbr>ENV</a></dt></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.bucket_dir.html" title="fn hermit_manifest_plan::imported_results::bucket_dir">bucket_<wbr>dir</a></dt><dd>The bucket directory of <code>(lane, category)</code> below an import root.</dd><dt><a class="fn" href="fn.load.html" title="fn hermit_manifest_plan::imported_results::load">load</a></dt><dd>Read the import root for <code>cells</code>. <code>results_path</code> is where this run
+publishes; an import file that is the same file is refused, because the
+harness appends to it.</dd></dl></section></div></main></body></html>

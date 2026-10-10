@@ -1,0 +1,131 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="The number of `HERMIT_SKID_OVERSHOOT` reports behind `result`, when, and only when, the cell is a verify cell and its failure is a precise-timer overshoot and nothing else (https://github.com/rrnewton/hermit/issues/1845)."><title>skid_overshoot_only_reports in hermit_manifest_plan::runner - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="hermit_manifest_plan" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">skid_overshoot_only_reports</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../hermit_manifest_plan/index.html">hermit_<wbr>manifest_<wbr>plan</a><span class="version">0.4.0</span></h2></div><div class="sidebar-elems"><div id="rustdoc-modnav"><h2><a href="index.html">In hermit_<wbr>manifest_<wbr>plan::<wbr>runner</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">hermit_manifest_plan</a>::<wbr><a href="index.html">runner</a></div><h1>Function <span class="fn">skid_<wbr>overshoot_<wbr>only_<wbr>reports</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/hermit_manifest_plan/runner.rs.html#3516-3549">Source</a> </span></div><pre class="rust item-decl"><code>pub fn skid_overshoot_only_reports(result: &amp;<a class="struct" href="struct.CellResult.html" title="struct hermit_manifest_plan::runner::CellResult">CellResult</a>) -&gt; <a class="enum" href="https://doc.rust-lang.org/nightly/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/nightly/std/primitive.u64.html">u64</a>&gt;</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>The number of <code>HERMIT_SKID_OVERSHOOT</code> reports behind <code>result</code>, when, and
+only when, the cell is a verify cell and its failure is a precise-timer
+overshoot and nothing else
+(<a href="https://github.com/rrnewton/hermit/issues/1845">https://github.com/rrnewton/hermit/issues/1845</a>).</p>
+<p>A precise timer is armed <code>skid_margin</code> retired conditional branches before
+its target and then single-stepped to it. When the counter’s overflow
+interrupt lands more than <code>skid_margin</code> branches late, the guest has
+already run past the target and the preemption point cannot be moved back.
+Hermit then refuses the comparison with the typed verdict
+<code>infrastructure_error</code> / <code>skid_overshoot</code> and exit status 122, taking the
+count from its own in-process counter rather than from guest-visible text.
+Such an attempt measured the host’s interrupt latency, not the guest’s
+determinism, so a fresh attempt of the same cell is a new measurement.</p>
+<p>Every condition below must hold; a single unmet one returns <code>None</code>, which
+leaves the attempt to the ordinary rules:</p>
+<ul>
+<li>
+<p>the cell is a <code>verify</code> cell whose row is an <code>ERROR</code> with no typed
+product result, failure class <code>understood_infrastructure_failure</code>, error
+kind <code>infrastructure</code>, and the reason of its first attempt (so a later
+cell-level override, such as the Hermit binary changing during the cell,
+is not mistaken for a skid);</p>
+</li>
+<li>
+<p>it has at least one inner attempt, the inner attempts’ indices are
+nonempty and distinct (as the runner writes them, and as the pressure
+test’s and the stress series’ history readers require), and every inner
+attempt is a skid
+attempt: an <code>ERROR</code> with error kind <code>infrastructure</code> that did not time
+out, exited with Hermit’s policy-refusal status
+(<code>HERMIT_POLICY_REFUSAL_EXIT</code>, 122) and no signal, whose retained
+verification report is the exact bytes its recorded
+<code>verification_report_sha256</code> names and parses as a current report with verdict
+<code>infrastructure_error</code> and <code>skid_overshoot</code> count greater than zero and
+no <code>no_result_reason</code>, whose reason is <a href="fn.skid_overshoot_reason.html" title="fn hermit_manifest_plan::runner::skid_overshoot_reason"><code>skid_overshoot_reason</code></a> of that
+count, and whose stderr carries at least one <code>HERMIT_SKID_OVERSHOOT </code>
+line and the line <code>HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=&lt;that count&gt;</code>, no other Hermit classification
+line (<a href="constant.HERMIT_CLASSIFICATION_PREFIXES.html" title="constant hermit_manifest_plan::runner::HERMIT_CLASSIFICATION_PREFIXES"><code>HERMIT_CLASSIFICATION_PREFIXES</code></a>), and no comparator refusal line
+(<code>REFUSING to compare:</code>);</p>
+</li>
+<li>
+<p>every such report records a completed comparison of both runs (its
+<code>comparison</code> and <code>compared_outputs</code> are present) that meets the
+requirements of the comparator the row records (<a href="fn.row_comparator.html" title="fn hermit_manifest_plan::runner::row_comparator"><code>row_comparator</code></a>),
+the same requirements the classifier applies before it accepts a skid
+report: for <code>strict</code>, a canonical comparison
+(<a href="../canonical_verdict/struct.VerificationReport.html#method.require_canonical_comparison" title="method hermit_manifest_plan::canonical_verdict::VerificationReport::require_canonical_comparison"><code>VerificationReport::require_canonical_comparison</code></a>); for <code>stripped</code>,
+the stripped comparison (<a href="fn.require_stripped_comparison.html" title="fn hermit_manifest_plan::runner::require_stripped_comparison"><code>require_stripped_comparison</code></a>); and its guest
+disposition and both compared runs’ dispositions are the one the cell
+accepts (<a href="fn.accepted_guest_disposition.html" title="fn hermit_manifest_plan::runner::accepted_guest_disposition"><code>accepted_guest_disposition</code></a> of the row’s
+<code>expected_guest_exit</code>);</p>
+</li>
+<li>
+<p>every such report satisfies the backend evidence a passing attempt of
+the row’s backend must carry (<code>dispatch_record_error</code> finds nothing in
+its <code>runtime</code>), and the row’s execution-path evidence is the one its own
+retained attempts decide (<a href="fn.retained_execution_path_error.html" title="fn hermit_manifest_plan::runner::retained_execution_path_error"><code>retained_execution_path_error</code></a> finds
+nothing: SaBRe evidence bytes that match their digests, summarized to
+the row’s recorded <code>execution_path</code>, eligible). Both are checked only on
+a <code>PASS</code> elsewhere, so an <code>ERROR</code> attempt would otherwise reach a retry
+without them.</p>
+</li>
+<li>
+<p>every inner attempt’s retained runtime and divergence coordinates are
+the ones the runner copies onto it from its report, and the row’s are
+the ones the runner gives a row from its attempts
+(<code>attempt_copies_its_report</code>, <code>row_copies_its_attempts</code>), so no retained
+copy carries evidence, such as another backend’s dispatch record, that
+the report the checks above read does not;</p>
+</li>
+<li>
+<p>every inner attempt’s command line, and the row’s copies of the first
+attempt’s, are the verify invocation the executor writes for the row’s
+backend, relaxations, expected guest exit and comparator
+(<a href="fn.retained_verify_invocation_error.html" title="fn hermit_manifest_plan::runner::retained_verify_invocation_error"><code>retained_verify_invocation_error</code></a> finds nothing), so a row whose
+command line selects another backend, carries a run flag its
+relaxations do not record, or ran another guest is not judged by labels
+that do not describe it;</p>
+</li>
+<li>
+<p>the row records the stdout assertions its cell declares
+(<a href="struct.CellResult.html#structfield.declared_stdout" title="field hermit_manifest_plan::runner::CellResult::declared_stdout"><code>CellResult::declared_stdout</code></a>), and every attempt’s own evidence
+satisfies them: the exact <code>expected_stdout</code> is checked against both
+compared runs’ stdout digests in the attempt’s report
+(<code>check_expected_stdout</code>), and the <code>expected_stdout_contains</code> text is
+searched in the attempt’s captured stdout, which must be the bytes of
+both compared runs (<code>check_expected_stdout_contains</code>). An assertion
+that fails or cannot be decided, or a row that records no declaration
+(one written before the record existed), disqualifies the row.</p>
+</li>
+</ul>
+<p>The classifier decides the same assertions first: a skid attempt whose
+compared runs violate one, or whose assertion cannot be checked, keeps the
+plain skid attempt’s infrastructure classification, but its reason names
+the assertion as well as the overshoot count, so it is not
+<a href="fn.skid_overshoot_reason.html" title="fn hermit_manifest_plan::runner::skid_overshoot_reason"><code>skid_overshoot_reason</code></a> of the count. The re-decision above is what
+makes a row the classifier did not produce (an imported row, or one from
+an older producer) unable to claim a skid-only history by its labels
+alone, and the report digest is what ties the re-decided report to the
+bytes the runner read.</p>
+<p>The last condition is positive evidence that both guests ran to an
+accepted end. Hermit also writes a <code>skid_overshoot</code> report, exits 122 and
+prints only the skid refusal line when the overshoot sits beside a second
+failure:</p>
+<ul>
+<li>run 1 ended with a status the verify policy rejects (a crash, a signal,
+an unexpected exit code): no second run or comparison happened, and the
+report carries that rejected disposition;</li>
+<li>run 1 or run 2 failed for another reason (a tracer error, a run timeout,
+a container death) while also overshooting: Hermit attaches the
+overshoot to that error, and the report has no comparison;</li>
+<li>both runs completed but one ended differently (run 2 crashed): the
+comparison’s divergence becomes the skid verdict, and
+<code>compared_outputs</code> carries the crash.</li>
+</ul>
+<p>None of these is skid-only, and a passing fresh attempt must not replace
+them.</p>
+<p>A <code>diverged</code> or <code>no_result</code> report, a timeout, a missing or unreadable
+report, an environmental block, any other exit status, a stderr marker
+without the typed report, or a typed report without the stderr markers
+never qualifies. Neither does an overshoot whose comparison the comparator
+refused (a log cut at its size bound): Hermit then writes the refusal as
+the report (verdict <code>no_result</code>, reason <code>comparison_refused</code>) and prints
+the <code>REFUSING to compare:</code> line, and that refusal is a second failure a
+fresh attempt must not hide. The <code>no_result_reason</code> guard below repeats
+the report parser’s own refusal of a reason beside any other verdict, so
+the predicate does not depend on that parser alone. The
+skid report’s own first-divergence fields are not a second class: Hermit
+decides the verdict’s precedence, and an overshoot moves the preemption
+point, so its two runs are expected to differ there.</p>
+</div></details></section></div></main></body></html>

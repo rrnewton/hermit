@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["READONLY_WARNING"],"fn":["warn_if_readonly_proc"]};

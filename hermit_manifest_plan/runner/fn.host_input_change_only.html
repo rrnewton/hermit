@@ -1,0 +1,35 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Whether `result` is a verify attempt whose only failure is a divergence that a host file changing during one run explains: Hermit’s typed `host_input_changed` report (see `detcore_model::host_input`)."><title>host_input_change_only in hermit_manifest_plan::runner - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="hermit_manifest_plan" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">host_input_change_only</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../hermit_manifest_plan/index.html">hermit_<wbr>manifest_<wbr>plan</a><span class="version">0.4.0</span></h2></div><div class="sidebar-elems"><div id="rustdoc-modnav"><h2><a href="index.html">In hermit_<wbr>manifest_<wbr>plan::<wbr>runner</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">hermit_manifest_plan</a>::<wbr><a href="index.html">runner</a></div><h1>Function <span class="fn">host_<wbr>input_<wbr>change_<wbr>only</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/hermit_manifest_plan/runner.rs.html#3315-3392">Source</a> </span></div><pre class="rust item-decl"><code>pub fn host_input_change_only(result: &amp;<a class="struct" href="struct.CellResult.html" title="struct hermit_manifest_plan::runner::CellResult">CellResult</a>) -&gt; <a class="primitive" href="https://doc.rust-lang.org/nightly/std/primitive.bool.html">bool</a></code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Whether <code>result</code> is a verify attempt whose only failure is a divergence
+that a host file changing during one run explains: Hermit’s typed
+<code>host_input_changed</code> report (see <code>detcore_model::host_input</code>).</p>
+<p>Such an attempt measured a change of the host’s files, not the guest’s
+determinism, so the runner gives the cell one fresh attempt, even a cell
+that declares <code>no_retry_reason</code>: that declaration keeps a PRODUCT
+failure final, and this is not one. The fresh attempt decides the cell by
+the ordinary rules: a second divergence fails it, and a divergence for
+any other reason was never this. Nothing here turns a divergence green.</p>
+<p>Every condition must hold, from the row and from each inner attempt’s own
+retained evidence, so that a label alone cannot claim it: the row is a
+verify <code>ERROR</code> of failure class <code>understood_infrastructure_failure</code> and
+error kind <code>infrastructure</code> whose reason is its first attempt’s, and whose
+retained SaBRe path evidence is the evidence the executor summarized into
+its recorded execution path (<code>retained_path_evidence_error</code>; the executor
+makes a row whose evidence does not summarize an
+<code>invalid-backend-evidence</code> <code>ERROR</code>, and judges the path’s eligibility only
+on a <code>PASS</code>, so an ineligible path does not disqualify); each inner
+attempt is an <code>ERROR</code> of error kind <code>infrastructure</code> that did not time
+out, whose retained exit status, stdout and stderr carry no failure its
+producer classified (<code>producer_failure</code>, which the executor decides
+before it reads any report), whose retained verification report is the
+bytes its recorded
+<code>verification_report_sha256</code> names and parses as a current report with
+verdict <code>infrastructure_error</code>, a <code>host_input_changed</code> error, a comparison
+that is complete under the comparator the row records (<a href="fn.row_comparator.html" title="fn hermit_manifest_plan::runner::row_comparator"><code>row_comparator</code></a>;
+the check the classifier makes before it labels a host-input attempt, so a
+row it did not classify, such as an imported one, cannot skip it) and no
+<code>no_result_reason</code>, whose reason is <a href="fn.host_input_changed_reason.html" title="fn hermit_manifest_plan::runner::host_input_changed_reason"><code>host_input_changed_reason</code></a>
+of that error, and whose report and captured stdout meet the cell’s
+declared stdout assertions, which the row records
+(<a href="struct.CellResult.html#structfield.declared_stdout" title="field hermit_manifest_plan::runner::CellResult::declared_stdout"><code>CellResult::declared_stdout</code></a>; a row without that record never
+qualifies). A host change explains the divergence, not a declared output
+either run got wrong.</p>
+</div></details></section></div></main></body></html>

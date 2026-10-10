@@ -1,0 +1,61 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Parses JSON written by `to_legacy_backend_json`, or any JSON in the form a serialized `Config` had before `Config::backend` existed, and recovers `Config::backend` from the fifteen legacy backend keys."><title>from_legacy_backend_json in detcore_model::config - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="detcore_model" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">from_legacy_backend_json</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../detcore_model/index.html">detcore_<wbr>model</a><span class="version">0.4.1</span></h2></div><div class="sidebar-elems"><div id="rustdoc-modnav"><h2><a href="index.html">In detcore_<wbr>model::<wbr>config</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">detcore_model</a>::<wbr><a href="index.html">config</a></div><h1>Function <span class="fn">from_<wbr>legacy_<wbr>backend_<wbr>json</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/detcore_model/config.rs.html#1917-1939">Source</a> </span></div><pre class="rust item-decl"><code>pub fn from_legacy_backend_json(json: &amp;<a class="primitive" href="https://doc.rust-lang.org/nightly/std/primitive.str.html">str</a>) -&gt; <a class="type" href="https://docs.rs/serde_json/1.0.151/serde_json/error/type.Result.html" title="type serde_json::error::Result">Result</a>&lt;<a class="struct" href="struct.Config.html" title="struct detcore_model::config::Config">Config</a>&gt;</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Parses JSON written by <a href="fn.to_legacy_backend_json.html" title="fn detcore_model::config::to_legacy_backend_json"><code>to_legacy_backend_json</code></a>, or any JSON in the form
+a serialized <a href="struct.Config.html" title="struct detcore_model::config::Config"><code>Config</code></a> had before <a href="struct.Config.html#structfield.backend" title="field detcore_model::config::Config::backend"><code>Config::backend</code></a> existed, and recovers
+<a href="struct.Config.html#structfield.backend" title="field detcore_model::config::Config::backend"><code>Config::backend</code></a> from the fifteen legacy backend keys.</p>
+<p>The keys are read exactly as they were read while each was a <code>Config</code>
+field: a key that is absent takes the default that field had, and a key of
+the wrong type fails the parse. Each key then supplies every capability that
+replaced a read of it, so a decoded configuration behaves as the same JSON
+did before:</p>
+<ul>
+<li><code>discover_live_file_metadata</code> supplies the four descriptor and loopback
+facts that were each a read of it;</li>
+<li><code>backend_reports_physical_process_exits</code> supplies
+<code>reports_physical_process_exits</code> and
+<code>signal_interrupts_external_syscalls</code>;</li>
+<li><code>backend_is_kvm</code> supplies the two behaviours it selected that remain
+capabilities, <code>provides_process_signal_control</code> and
+<code>emulates_child_waits</code> (the other three are now answered by the backend
+itself: refusing a non-leader exec is a typed refusal it reports per
+exec, the <code>gettimeofday</code> repair runs on every backend through its
+<code>time(2)</code> probe and <code>Guest::storable_memory_ranges</code>, and the user
+address limit is each guest’s own <code>Guest::user_address_limit</code> report);</li>
+<li>every other key supplies the one capability of the same meaning.</li>
+</ul>
+<p>This inverts <a href="fn.to_legacy_backend_json.html" title="fn detcore_model::config::to_legacy_backend_json"><code>to_legacy_backend_json</code></a> for every capability value the keys
+can express, which includes every backend’s own constant except for
+capabilities added after the legacy form froze: those never enter it, as
+<code>record_host_inputs</code> does not, and read back as their default. There are
+two, <code>process_exits_complete_asynchronously</code> and
+<code>virtualizes_guest_sigalrm</code>, both true only for in-guest LiteInst, which
+never travels through this DBT-only form.</p>
+<p><code>kvm_shared_dequeue_timers</code> supplies no capability. It was read into a
+<code>Config</code> field that chose the controlled signal path, and that choice is
+now made from the capabilities, <a href="struct.Config.html#structfield.sequentialize_threads" title="field detcore_model::config::Config::sequentialize_threads"><code>Config::sequentialize_threads</code></a> and the
+control the backend offers. It is read as it was, a boolean that is false
+when absent, and the parse then fails unless it equals <code>backend_is_kvm &amp;&amp; sequentialize_threads</code>, the value the production launcher always wrote. An
+accepted input whose capabilities are those of the backend that runs it
+selects the path it selected before. An input that would select another,
+such as <code>true</code> without <code>backend_is_kvm</code>, or absent beside <code>backend_is_kvm</code>
+and sequentialized threads, fails the parse rather than being silently
+reinterpreted. (<code>backend_is_kvm</code> given to a backend that offers no control,
+such as DBT, already misdescribed that backend and stays outside this
+guarantee; the production launcher never writes it.) A failed parse is
+handled like any malformed value: the DBT runtime, the only production
+reader, falls back to its strict default configuration and emits its
+<code>could not parse HERMIT_DBT_DETCONFIG</code> warning.</p>
+<p>Everything else is read as the legacy form was read, by <code>Config</code>’s own
+derived deserializer with the legacy keys taken out before it sees them:</p>
+<ul>
+<li>In an object, a key the legacy form did not name is ignored, whatever its
+value. <code>backend</code> is such a key, so it is ignored rather than read as the
+field it is now; no production writer emits it. A key the legacy form
+named fails the parse when it appears twice or holds the wrong type.</li>
+<li>A JSON array lists the fields by position, as serde reads any derived
+struct. The positions are those of the legacy form, which are the key
+order of <a href="fn.to_legacy_backend_json.html" title="fn detcore_model::config::to_legacy_backend_json"><code>to_legacy_backend_json</code></a>: the fifteen legacy keys stand where
+<a href="struct.Config.html#structfield.backend" title="field detcore_model::config::Config::backend"><code>Config::backend</code></a> stands. Too many elements fail the parse; too few
+leave the fields
+after them missing, each taking its default or failing the parse as the
+derived deserializer decides for that field.</li>
+</ul>
+</div></details></section></div></main></body></html>

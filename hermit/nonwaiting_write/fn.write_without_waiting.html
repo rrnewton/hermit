@@ -1,0 +1,29 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Put `bytes` on `fd` once, without waiting for the other end and without letting the attempt raise a signal. A diagnostic that cannot be delivered that way is omitted: the exit status still says why the run ended."><title>write_without_waiting in hermit::nonwaiting_write - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="hermit" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">write_without_waiting</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../hermit/index.html">hermit</a><span class="version">0.4.1</span></h2></div><div class="sidebar-elems"><div id="rustdoc-modnav"><h2><a href="index.html">In hermit::<wbr>nonwaiting_<wbr>write</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">hermit</a>::<wbr><a href="index.html">nonwaiting_write</a></div><h1>Function <span class="fn">write_<wbr>without_<wbr>waiting</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"></span></div><pre class="rust item-decl"><code>pub fn write_without_waiting(fd: <a class="primitive" href="https://doc.rust-lang.org/nightly/std/primitive.i32.html">i32</a>, bytes: &amp;[<a class="primitive" href="https://doc.rust-lang.org/nightly/std/primitive.u8.html">u8</a>])</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Put <code>bytes</code> on <code>fd</code> once, without waiting for the other end and without
+letting the attempt raise a signal. A diagnostic that cannot be delivered
+that way is omitted: the exit status still says why the run ended.</p>
+<p>THE DESCRIPTOR ITSELF IS NEVER MADE NON-BLOCKING. An inherited descriptor’s
+open file description is shared with the parent, the guest or a terminal,
+and <code>fcntl(O_NONBLOCK)</code> on it would leak into all of them. Each kind of file
+instead gets a primitive that is non-blocking on its own:</p>
+<ul>
+<li>a regular file: <code>pwritev2(RWF_NOWAIT)</code> at offset -1, so the file position
+and <code>O_APPEND</code> are honoured. <code>EAGAIN</code> or <code>EOPNOTSUPP</code> omit the line.
+Buffered <code>RWF_NOWAIT</code> writes fail with <code>EAGAIN</code> on btrfs and with
+<code>EOPNOTSUPP</code> on tmpfs, so a log file there does not get the line.</li>
+<li>a socket: <code>send(MSG_DONTWAIT | MSG_NOSIGNAL)</code>.</li>
+<li>a pipe, FIFO or terminal: a NEW open file description for the same
+object, opened through <code>/proc/self/fd/&lt;fd&gt;</code> with <code>O_NONBLOCK</code>, and one
+write of at most <code>PIPE_BUF</code> bytes, which a pipe either takes whole or
+refuses with <code>EAGAIN</code>. Opening a pipe that has no reader fails with
+<code>ENXIO</code> rather than raising <code>SIGPIPE</code>.</li>
+<li>anything else, including a descriptor whose type cannot be learned:
+omitted.</li>
+</ul>
+<p>The file type comes from <code>file_type</code> in this module.</p>
+<p>No signal escapes; see <a href="fn.suppressing_diagnostic_signals.html" title="fn hermit::nonwaiting_write::suppressing_diagnostic_signals"><code>suppressing_diagnostic_signals</code></a>.</p>
+<p>What this cannot avoid are short kernel locks that sleep uninterruptibly,
+which no handled signal or timer could break either: the file-position lock
+of an open file description another process is writing through at that
+moment, a terminal’s termios and output locks, a socket’s lock. None of
+them waits for a reader to drain anything.</p>
+</div></details></section></div></main></body></html>

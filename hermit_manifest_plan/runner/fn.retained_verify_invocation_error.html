@@ -1,0 +1,35 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Why `result`’s retained command lines are not the verify invocation the executor writes for a row with its recorded backend, relaxations, expected guest exit and comparator, or `None` when they are."><title>retained_verify_invocation_error in hermit_manifest_plan::runner - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="hermit_manifest_plan" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">retained_verify_invocation_error</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../hermit_manifest_plan/index.html">hermit_<wbr>manifest_<wbr>plan</a><span class="version">0.4.0</span></h2></div><div class="sidebar-elems"><div id="rustdoc-modnav"><h2><a href="index.html">In hermit_<wbr>manifest_<wbr>plan::<wbr>runner</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">hermit_manifest_plan</a>::<wbr><a href="index.html">runner</a></div><h1>Function <span class="fn">retained_<wbr>verify_<wbr>invocation_<wbr>error</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/hermit_manifest_plan/runner.rs.html#3984-4036">Source</a> </span></div><pre class="rust item-decl"><code>pub fn retained_verify_invocation_error(result: &amp;<a class="struct" href="struct.CellResult.html" title="struct hermit_manifest_plan::runner::CellResult">CellResult</a>) -&gt; <a class="enum" href="https://doc.rust-lang.org/nightly/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/nightly/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Why <code>result</code>’s retained command lines are not the verify invocation the
+executor writes for a row with its recorded backend, relaxations, expected
+guest exit and comparator, or <code>None</code> when they are.</p>
+<p>The executor builds every verify attempt’s argv in one place
+(<code>verified_invocation_argv</code>) from the cell the row records: <code>&lt;hermit&gt; --log info --backend &lt;backend&gt; run</code>, the runner’s own flags, the run flags the
+row’s relaxations record, <code>--verify</code> with the expected-exit allowance
+exactly when the row records an expected guest exit, the report path, the
+optional retained-log directory, the guest’s execution root and
+environment, and <code>--</code> before the attempt’s guest argv. It records that argv
+on the attempt beside the shell command rendered from it
+(<a href="fn.shell_command.html" title="fn hermit_manifest_plan::runner::shell_command"><code>shell_command</code></a>), and copies the first attempt’s command fields onto the
+row, with the argv after the Hermit path as <code>effective_args</code> and log level
+<code>info</code>. A reader re-deciding a retained row from what it retains
+(<a href="fn.skid_overshoot_only_reports.html" title="fn hermit_manifest_plan::runner::skid_overshoot_only_reports"><code>skid_overshoot_only_reports</code></a>, <a href="fn.retained_verify_pass_error.html" title="fn hermit_manifest_plan::runner::retained_verify_pass_error"><code>retained_verify_pass_error</code></a>) judges it
+by its recorded backend, relaxations and expected exit, so those must
+describe the command that ran
+(<a href="https://github.com/rrnewton/hermit/issues/1845">https://github.com/rrnewton/hermit/issues/1845</a>):</p>
+<ul>
+<li>each attempt’s argv selects the row’s backend (<code>native</code> when the row
+records none, as the executor does) once, before <code>run</code>, and no token
+before <code>--</code> selects a backend again;</li>
+<li>every token between <code>run</code> and <code>--</code> is one the executor writes, in the
+order it writes them, and every valued flag carries a value that does
+not start with <code>-</code> (a token Hermit’s parser would not take as the value);</li>
+<li>the run flags in the argv are exactly the ones the row’s relaxations
+record, <code>--verify-allow=failure</code> is present exactly when the row records
+an expected guest exit, and <code>--verify-strict</code> is absent under the
+stripped comparator (<a href="fn.row_comparator.html" title="fn hermit_manifest_plan::runner::row_comparator"><code>row_comparator</code></a>);</li>
+<li>the tokens after <code>--</code> are the attempt’s guest argv, and its shell command
+is the one rendered from its cwd, env and argv;</li>
+<li>the row’s argv, guest argv, env, cwd and shell command are its first
+attempt’s, its effective args are that argv after the Hermit path, and
+its log level is <code>info</code>.</li>
+</ul>
+</div></details></section></div></main></body></html>

@@ -1,0 +1,48 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Why a retained verify `PASS` row is not one the executor would have written from its own retained evidence, or `None` when it is."><title>retained_verify_pass_error in hermit_manifest_plan::runner - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="hermit_manifest_plan" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">retained_verify_pass_error</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../hermit_manifest_plan/index.html">hermit_<wbr>manifest_<wbr>plan</a><span class="version">0.4.0</span></h2></div><div class="sidebar-elems"><div id="rustdoc-modnav"><h2><a href="index.html">In hermit_<wbr>manifest_<wbr>plan::<wbr>runner</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">hermit_manifest_plan</a>::<wbr><a href="index.html">runner</a></div><h1>Function <span class="fn">retained_<wbr>verify_<wbr>pass_<wbr>error</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/hermit_manifest_plan/runner.rs.html#3738-3907">Source</a> </span></div><pre class="rust item-decl"><code>pub fn retained_verify_pass_error(
+    result: &amp;<a class="struct" href="struct.CellResult.html" title="struct hermit_manifest_plan::runner::CellResult">CellResult</a>,
+    declared: &amp;<a class="struct" href="struct.DeclaredStdout.html" title="struct hermit_manifest_plan::runner::DeclaredStdout">DeclaredStdout</a>,
+) -&gt; <a class="enum" href="https://doc.rust-lang.org/nightly/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/nightly/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Why a retained verify <code>PASS</code> row is not one the executor would have
+written from its own retained evidence, or <code>None</code> when it is.</p>
+<p>A reader that has the row but not the cell (the pressure test re-reading a
+result history) re-decides the pass from what the row itself retains,
+with the checks the executor applies before it writes <code>PASS</code>:</p>
+<ul>
+<li>the row is a verify <code>PASS</code> labelled as the executor labels one (typed
+result <code>pass</code>, and no failure class, error kind or reason), and its
+execution path is the eligible one its own retained attempts decide
+(<a href="fn.retained_execution_path_error.html" title="fn hermit_manifest_plan::runner::retained_execution_path_error"><code>retained_execution_path_error</code></a>);</li>
+<li>every inner attempt’s command line, and the row’s copies of the first
+attempt’s, are the verify invocation the executor writes for the row’s
+backend, relaxations, expected guest exit and comparator
+(<a href="fn.retained_verify_invocation_error.html" title="fn hermit_manifest_plan::runner::retained_verify_invocation_error"><code>retained_verify_invocation_error</code></a>);</li>
+<li>it has at least one inner attempt, and every inner attempt has a
+nonblank index no other attempt shares and is a <code>PASS</code> with no error
+kind, reason or timeout, whose first stderr line carries no Hermit
+internal-failure class (the executor keeps four such classes as an
+<code>ERROR</code> after a failed exit; this refuses every one of them, after any
+exit, so it never admits a row the executor would not);</li>
+<li>every inner attempt’s retained verification report is the exact bytes
+its <code>verification_report_sha256</code> names and parses as a current report
+that passes the comparator the row’s relaxations record
+(<a href="fn.row_comparator.html" title="fn hermit_manifest_plan::runner::row_comparator"><code>row_comparator</code></a>): for <code>strict</code>, a canonical comparison with a
+canonical match; for <code>stripped</code>, the stripped comparison
+(<a href="fn.require_stripped_comparison.html" title="fn hermit_manifest_plan::runner::require_stripped_comparison"><code>require_stripped_comparison</code></a>), a verified <code>matched</code> verdict and
+matching exact outputs;</li>
+<li>every inner attempt’s retained runtime and divergence coordinates are
+its report’s, which the runner copies onto it, and the row’s are the
+first runtime and the divergence position its attempts give, so no
+retained copy carries evidence that only a copy, not the report, holds;</li>
+<li>the report satisfies the stdout assertions <code>declared</code> (the exact bytes
+against both compared runs’ digests, and the contained text in the
+attempt’s captured stdout, which must be both runs’ stdout);</li>
+<li>the attempt ended as the row’s recorded <code>expected_guest_exit</code> requires
+(that guest disposition and the Hermit status reporting it), or with
+Hermit exit status 0 when the row records none;</li>
+<li>the report carries the dispatch record a passing attempt of the row’s
+backend must carry (<code>dispatch_record_error</code>).</li>
+</ul>
+<p>The row records its comparator, backend and expected exit. It records its
+declared stdout only on an infrastructure row, so the caller passes the
+declaration an earlier skid row of the same cell recorded
+(<a href="https://github.com/rrnewton/hermit/issues/1845">https://github.com/rrnewton/hermit/issues/1845</a>).</p>
+</div></details></section></div></main></body></html>

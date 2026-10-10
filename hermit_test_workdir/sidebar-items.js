@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["REQUEST_ENV","TMP_DIR","WORKDIR"],"fn":["check_bind_target","enter_root_user_namespace","has_cap_sys_admin","requested_workdir","with_isolated_workdir","with_isolation"],"struct":["BindMount","Isolation"]};

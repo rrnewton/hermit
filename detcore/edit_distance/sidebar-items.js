@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["NeedlemanWunschError","Trace"],"fn":["bubble_sort_distance","damerau_lev","generate_expanded_permutation","generate_permutation","iterable_bubble_sort","iterable_bubble_sort_from_perm","kendall_tau"],"struct":["BubbleSortIter","ExpandedPermResult","NeedlemanWunsch","Perm","PermutationResult"]};

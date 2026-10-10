@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["DETLOG_FORWARD_ENV","DETLOG_FORWARD_POLICY_ENV"],"fn":["detcore_liteinst_initialize"]};

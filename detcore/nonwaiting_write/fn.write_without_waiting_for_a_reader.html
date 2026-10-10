@@ -1,0 +1,45 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="One write of `bytes` to `fd` that cannot wait for a reader to drain the file, for a writer that then waits itself, within its own bound, when it is told the file is full (`crate::util::RetryingStderr` while `diagnostics_must_not_wait`). Returns the bytes written, which may be fewer than `bytes.len()`, or the error; `WouldBlock` means full."><title>write_without_waiting_for_a_reader in detcore::nonwaiting_write - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="detcore" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">write_without_waiting_for_a_reader</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../detcore/index.html">detcore</a><span class="version">0.4.1</span></h2></div><div class="sidebar-elems"><div id="rustdoc-modnav"><h2><a href="index.html">In detcore::<wbr>nonwaiting_<wbr>write</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">detcore</a>::<wbr><a href="index.html">nonwaiting_write</a></div><h1>Function <span class="fn">write_<wbr>without_<wbr>waiting_<wbr>for_<wbr>a_<wbr>reader</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/detcore/nonwaiting_write.rs.html#158-229">Source</a> </span></div><pre class="rust item-decl"><code>pub fn write_without_waiting_for_a_reader(
+    fd: <a class="type" href="https://doc.rust-lang.org/nightly/std/os/fd/raw/type.RawFd.html" title="type std::os::fd::raw::RawFd">RawFd</a>,
+    bytes: &amp;[<a class="primitive" href="https://doc.rust-lang.org/nightly/std/primitive.u8.html">u8</a>],
+) -&gt; <a class="type" href="https://doc.rust-lang.org/nightly/core/io/error/type.Result.html" title="type core::io::error::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/nightly/std/primitive.usize.html">usize</a>&gt;</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>One write of <code>bytes</code> to <code>fd</code> that cannot wait for a reader to drain the
+file, for a writer that then waits itself, within its own bound, when it
+is told the file is full (<a href="../util/struct.RetryingStderr.html" title="struct detcore::util::RetryingStderr"><code>crate::util::RetryingStderr</code></a> while
+<a href="fn.diagnostics_must_not_wait.html" title="fn detcore::nonwaiting_write::diagnostics_must_not_wait"><code>diagnostics_must_not_wait</code></a>). Returns the bytes written, which may be
+fewer than <code>bytes.len()</code>, or the error; <code>WouldBlock</code> means full.</p>
+<p>THE DESCRIPTOR ITSELF IS NEVER MADE NON-BLOCKING, as in
+<a href="fn.write_without_waiting.html" title="fn detcore::nonwaiting_write::write_without_waiting"><code>write_without_waiting</code></a>:</p>
+<ul>
+<li>
+<p>a pipe, a FIFO or any character device, a terminal or <code>/dev/null</code>: one
+write through a new <code>O_NONBLOCK</code> open file description for the same
+object (see <a href="fn.write_without_waiting.html" title="fn detcore::nonwaiting_write::write_without_waiting"><code>write_without_waiting</code></a>). Opening a pipe that has no reader
+fails with <code>ENXIO</code>, reported here as <code>EPIPE</code>, what a write to it would
+have returned. If the new description cannot be opened, nothing is
+written and the error is returned.</p>
+<p>⚠️ NO CHARACTER DEVICE GETS A PLAIN WRITE, not even one the terminal
+query says is not a terminal. Nothing the process asks can tell a
+terminal from <code>/dev/null</code> in a way a seccomp policy cannot forge: a
+policy that answers the query with <code>ENOTTY</code> makes a terminal look like
+<code>/dev/null</code>, and a plain write to a full terminal waits for a reader
+forever.</p>
+</li>
+<li>
+<p>a socket: <code>send(MSG_DONTWAIT | MSG_NOSIGNAL)</code>.</p>
+</li>
+<li>
+<p>anything else, a regular file included: a plain <code>write(2)</code>. Nothing
+reads a regular file, so the write cannot wait for a reader to drain it;
+and <code>RWF_NOWAIT</code> would refuse buffered writes on btrfs and tmpfs, which
+would lose every line of a log written there. A regular file on a
+network or FUSE file system whose server has stopped answering can
+still hold this write.</p>
+</li>
+<li>
+<p>a descriptor whose type cannot be learned (see <code>file_type</code> in this
+module): nothing is written, and the error is returned, so the caller
+gives up on the bytes.</p>
+</li>
+</ul>
+<p>No <code>SIGPIPE</code>, <code>SIGXFSZ</code> or <code>SIGTTOU</code> escapes; see
+<a href="fn.suppressing_diagnostic_signals.html" title="fn detcore::nonwaiting_write::suppressing_diagnostic_signals"><code>suppressing_diagnostic_signals</code></a>.</p>
+</div></details></section></div></main></body></html>

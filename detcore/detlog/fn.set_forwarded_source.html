@@ -1,0 +1,52 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Registers the receiving end of the socket an in-guest Tool sends its records on (`send_forwarded_record`) and the sink that writes them to the run’s log."><title>set_forwarded_source in detcore::detlog - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="detcore" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">set_forwarded_source</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../detcore/index.html">detcore</a><span class="version">0.4.1</span></h2></div><div class="sidebar-elems"><div id="rustdoc-modnav"><h2><a href="index.html">In detcore::<wbr>detlog</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">detcore</a>::<wbr><a href="index.html">detlog</a></div><h1>Function <span class="fn">set_<wbr>forwarded_<wbr>source</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/detcore/detlog.rs.html#830-839">Source</a> </span></div><pre class="rust item-decl"><code>pub fn set_forwarded_source(socket: <a class="struct" href="https://doc.rust-lang.org/nightly/std/os/fd/owned/struct.OwnedFd.html" title="struct std::os::fd::owned::OwnedFd">OwnedFd</a>, sink: <a class="type" href="type.ForwardedRecordSink.html" title="type detcore::detlog::ForwardedRecordSink">ForwardedRecordSink</a>)</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Registers the receiving end of the socket an in-guest Tool sends its records on
+(<a href="fn.send_forwarded_record.html" title="fn detcore::detlog::send_forwarded_record"><code>send_forwarded_record</code></a>) and the sink that writes them to the run’s log.</p>
+<p>THE ORDER RULE, one for every backend whose Tool runs in the guest. Each record
+carries its sending thread (<a href="fn.tagged_forwarded_message.html" title="fn detcore::detlog::tagged_forwarded_message"><code>tagged_forwarded_message</code></a>). Before it handles any
+guest request the coordinator takes the records waiting on the socket into a
+queue per sending thread (<a href="fn.drain_forwarded_at_request.html" title="fn detcore::detlog::drain_forwarded_at_request"><code>drain_forwarded_at_request</code></a> at the top of the
+request handler). A thread’s queued records are written into the log:</p>
+<ul>
+<li>when that thread’s own request arrives, if it is the thread the scheduler last
+committed an ordinary turn to, or, before any turn, the thread whose request
+arrives first (the root; every other thread is created during some turn). That
+thread’s request is the event that ends the turn the schedule gave it, so the
+request arrives at a point the schedule fixes, and its records land where a
+single-process (ptrace) run writes them, ahead of everything handling that
+request writes. (A thread still in background IO from an earlier BACKGROUND
+turn may run at the same time; its records wait for its own COMMIT, by the next
+rule. Coordinator lines its continuation writes below INFO verbosity, such as
+TRACE, are not ordered by this rule; the INFO DETLOG and COMMIT lines that
+verification compares are.)</li>
+<li>otherwise immediately before the scheduler commits that thread’s next turn
+(<a href="fn.write_forwarded_for.html" title="fn detcore::detlog::write_forwarded_for"><code>write_forwarded_for</code></a>, at both kinds of COMMIT): a thread that runs without
+holding the turn (a forked child doing its setup, a thread in background IO)
+sends its records while other threads’ turns are being handled, so only its
+own next COMMIT is a point the schedule fixes;</li>
+<li>and, for any still queued when the run ends, then, thread by thread in
+thread-id order.</li>
+</ul>
+<p>If a second thread sends a request before the first turn, there is more than one
+root (a preload constructor that forked before the runtime was installed, say),
+and which root’s records come first would be the host’s choice. The coordinator
+then writes <a href="constant.FORWARDING_AMBIGUOUS_ORDER_NOTICE.html" title="constant detcore::detlog::FORWARDING_AMBIGUOUS_ORDER_NOTICE"><code>FORWARDING_AMBIGUOUS_ORDER_NOTICE</code></a>, so verification refuses to
+compare the records rather than compare a host-timed order.</p>
+<p>A <code>send</code> on a message socket queues the record on the receiver before it returns,
+so a guest thread’s records sent before a request are queued by the time that
+request is handled, and so before the turn it leads to is committed. Writing every
+thread’s records at any request’s arrival instead put a record wherever the host
+happened to deliver it: a forked child’s records, sent while its parent’s next
+request was being handled, landed before or after the scheduler’s records for that
+request depending on timing.</p>
+<p>The records are TAKEN off the socket continuously, by a receiver task that
+queues each one for its thread as soon as it arrives, so a guest never
+blocks on a full socket buffer waiting for a request the coordinator would
+drain at: a single <code>writev</code> of 1024 buffers sends 1024 records before its
+thread’s next request. Taking a record only queues it; where it is written
+is still decided by the rule above. (A message without a sender tag is
+written as it is taken, which verification refuses to compare anyway: see
+<code>ForwardedOrder::untagged</code>.) The receiver is a task on the coordinator’s
+tokio runtime, started at the first request (<code>start_forwarded_receiver</code>),
+not a thread of its own: inside Hermit’s PID namespace a coordinator thread
+takes an ID from the same allocator as the guest’s tasks, and one more
+thread shifted every guest ID by one (the root became DetPid 4).</p>
+</div></details></section></div></main></body></html>
