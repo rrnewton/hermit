@@ -950,7 +950,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (lane qemu-rcb, https://github.com/rrnewton/hermit/issues/3986) retains
     // all 1031: 1032.
     // The native per-physical-network namespace regression: 1023, listed.
-    ("test.regular_crates", 1033),
+    // happens_before::tests::{version_2_fields_need_version_2,
+    // version_2_refuses_unknown_fields,
+    // futex_op_matches_the_low_32_bits_of_the_operation,
+    // from_refusals_name_the_event,
+    // relative_anchors_count_strictly_after_their_base} (detcore-model,
+    // relative happens-before anchors) retain all 1033: 1038.
+    ("test.regular_crates", 1038),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1296,7 +1302,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1016: 1017.
     // metadata::tests::record_version_rejects_pre_vfork_release_edge_streams
     // (https://github.com/rrnewton/hermit/issues/3984) retains all 1017: 1018.
-    ("test.hermit_unit", 1018),
+    // run::a_version_2_spec_is_refused_when_validation_turns_the_timer_off
+    // (relative happens-before anchors) retains all 1018: 1019.
+    ("test.hermit_unit", 1019),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1762,7 +1770,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_new_vfork_by_a_reused_tid_replaces_a_kept_barrier
     // (https://github.com/rrnewton/hermit/issues/3984) retain all 1275: 1283.
     // Ten SIGALRM sleep boundary/resource tests retain all 1283: 1293.
-    ("test.detcore_unit", 1293),
+    // scheduler::test::{a_hold_is_charged_from_its_first_park_and_refused_past_its_budget,
+    // a_released_hold_and_a_version_1_hold_are_never_refused,
+    // a_non_leader_exec_on_a_relative_anchors_thread_is_refused,
+    // an_unfired_relative_anchor_names_its_base,
+    // exec_reconnect_refuses_a_relative_anchor_only_across_a_non_leader_exec,
+    // the_identity_refusal_grants_no_further_turn,
+    // a_removed_held_thread_leaves_no_hold_behind,
+    // an_opened_gate_is_not_refused_before_its_thread_runs_again} (relative
+    // happens-before anchors) retain all 1293: 1301.
+    ("test.detcore_unit", 1301),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2294,7 +2311,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // all 265: 267, measured with `cargo nextest list --profile ci` and this
     // node's arguments.
     // The DBT network namespace collision regression: 266, listed.
-    ("test.cli", 268),
+    // happens_before_{relative_anchor_holds_the_first_call_after_its_base,
+    // unfired_relative_anchor_is_refused_with_its_base,
+    // hold_budget_ends_a_hold_a_spinner_never_releases,
+    // version_2_load_refusals_name_the_event_and_run_nothing,
+    // version_2_without_perf_counters_is_refused_before_stdin,
+    // relative_anchor_state_is_not_inherited_by_a_new_thread} retain all
+    // 268: 274. None starts a LiteInst guest or needs CPUID faulting.
+    ("test.cli", 274),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2504,7 +2528,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // under Hermit and needs no CPUID faulting: 203, measured the same way. The
     // config-fingerprint guest test is excluded with the CPUID-faulting cases.
     // The DBT network namespace collision regression: 203, listed.
-    ("test.cli_on_host", 204),
+    // And the six relative-anchor CLI tests: 210.
+    ("test.cli_on_host", 210),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 55),
@@ -2626,7 +2651,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two /proc/cgroups tests: 1275.
     // And the eight vfork-parent barrier tests: 1283.
     // The same ten SIGALRM sleep boundary/resource tests retain all 1283: 1293.
-    ("test.detcore_unit_on_host", 1293),
+    // And the eight relative-anchor scheduler tests: 1301.
+    ("test.detcore_unit_on_host", 1301),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -2731,7 +2757,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same futex record-version test: 1016.
     // And the futex-wake CLI test: 1017.
     // And the vfork release-edge record-version test: 1018.
-    ("test.hermit_unit_on_host", 1018),
+    // And the version-2 preemption refusal test: 1019.
+    ("test.hermit_unit_on_host", 1019),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -2839,7 +2866,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same nine glibc_compat unwind tests: 1031.
     // And the config-fingerprint mismatch test: 1032.
     // The native per-physical-network namespace regression: 1023, listed.
-    ("test.regular_crates_on_host", 1033),
+    // And the five relative-anchor model tests: 1038.
+    ("test.regular_crates_on_host", 1038),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
