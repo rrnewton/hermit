@@ -1387,8 +1387,15 @@ fi
 # third-party, the root Cargo.toml and rust-toolchain.toml are
 # byte-identical), so the DynamoRIO SDK recipe key is unchanged. Carry, not
 # recalibration: no new timing sample or >=5-sample replacement claim is made.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 255d2e0b8f5ba017bcc7233711c63583e4fe419e ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 255d2e0b8f5ba017bcc7233711c63583e4fe419e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 630259bfb5006c3b2b820aae3ddcf5b20a53eaef (2026-10-09): from
+# 255d2e0b8f5ba017bcc7233711c63583e4fe419e. The owned-callback pkey_alloc repair
+# changes reverie-inguest and LiteInst tests/docs; the two new main
+# commits change only syscall-display and capability documentation. reverie-dbt,
+# third-party, root Cargo.toml and rust-toolchain.toml are byte-identical
+# by Git object, including all seven recorded SDK inputs. Carry the existing
+# budget and job clamp; this is not a new timing calibration.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 630259bfb5006c3b2b820aae3ddcf5b20a53eaef ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 630259bfb5006c3b2b820aae3ddcf5b20a53eaef (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
