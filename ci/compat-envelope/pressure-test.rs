@@ -8232,34 +8232,51 @@ fn retained_pressure_attempt(
 }
 
 fn retained_typed_no_comparison(cell: &CellId, artifact_dir: &Path, rows: &[CellResult]) -> bool {
+    retained_typed_no_comparison_attempt(cell, artifact_dir, rows).is_some()
+}
+
+/// The retained attempt behind [`retained_typed_no_comparison`], when there is
+/// one.
+fn retained_typed_no_comparison_attempt(
+    cell: &CellId,
+    artifact_dir: &Path,
+    rows: &[CellResult],
+) -> Option<SeriesPressureAttempt> {
     if !matches!(cell.mode.as_str(), "verify" | "replay") {
-        return false;
+        return None;
     }
-    let Ok(row) = cell_result_after_retries(rows) else {
-        return false;
-    };
-    let Some(attempt) = row.attempts.first() else {
-        return false;
-    };
-    let Ok(retained) =
-        retained_pressure_attempt(&cell.mode, row.expected_guest_exit.as_ref(), attempt)
-    else {
-        return false;
-    };
+    let row = cell_result_after_retries(rows).ok()?;
+    let attempt = row.attempts.first()?;
+    let retained =
+        retained_pressure_attempt(&cell.mode, row.expected_guest_exit.as_ref(), attempt).ok()?;
     if !retained
         .comparison
         .as_ref()
         .is_some_and(|comparison| comparison.verdict == Verdict::NoResult)
     {
-        return false;
+        return None;
     }
-    let Ok(bytes) = fs::read(verification_report_path(artifact_dir)) else {
-        return false;
-    };
+    let bytes = fs::read(verification_report_path(artifact_dir)).ok()?;
     attempt
         .verification_report
         .as_ref()
         .is_some_and(|report| bytes == report.as_bytes())
+        .then_some(retained)
+}
+
+/// The typed refusal of [`retained_typed_no_comparison`] is Hermit's
+/// `first_run_rejected` verify, and its attempt is a terminal product
+/// failure: the guest failed its first run, so verify started no second run
+/// and retained run 1's log alone.
+fn retained_first_run_rejected(cell: &CellId, artifact_dir: &Path, rows: &[CellResult]) -> bool {
+    retained_typed_no_comparison_attempt(cell, artifact_dir, rows).is_some_and(|attempt| {
+        attempt.comparison.as_ref().is_some_and(|comparison| {
+            matches!(
+                comparison.no_result_kind,
+                Some(SeriesNoVerdictKind::FirstRunRejected)
+            )
+        }) && inner_pressure_category(&attempt) == Some(RepetitionClassification::ProductFailure)
+    })
 }
 
 fn inner_pressure_category(attempt: &SeriesPressureAttempt) -> Option<RepetitionClassification> {
@@ -9219,9 +9236,18 @@ impl RetainedVerificationLogs {
 /// empty, not a regular file, or duplicated.
 ///
 /// A lone capture is refused too, except run 1's golden log under a `matched`
-/// `verdict`, which is exactly what `--keep-logs` retains after a match.
+/// `verdict`, which is exactly what `--keep-logs` retains after a match, and
+/// run 1's log under [`FIRST_RUN_REJECTED_LOGS`], which the caller passes only
+/// for a retained `first_run_rejected` refusal that is a terminal product
+/// failure ([`retained_first_run_rejected`]): Hermit's verify starts no second
+/// run after it. A `no_result` verdict still needs both captures.
 /// Whether the set is complete for its verdict is the caller's check
 /// ([`RetainedVerificationLogs::complete_for`]).
+/// The `verdict` [`retained_verification_logs`] takes for a retained
+/// `first_run_rejected` refusal ([`retained_first_run_rejected`]). It is no
+/// verify report's verdict, so no report can select it.
+const FIRST_RUN_REJECTED_LOGS: &str = "first_run_rejected";
+
 fn retained_verification_logs(
     cell: &CellId,
     artifact_dir: &Path,
@@ -9287,7 +9313,10 @@ fn retained_verification_logs(
         }
     }
     let golden_only = verdict == Some("matched") && run1.is_some() && run2.is_none();
-    if run1.is_some() != run2.is_some() && !golden_only {
+    // A verify whose guest failed its first run keeps run 1's log alone.
+    let first_run_only =
+        verdict == Some(FIRST_RUN_REJECTED_LOGS) && run1.is_some() && run2.is_none();
+    if run1.is_some() != run2.is_some() && !golden_only && !first_run_only {
         return Err(format!(
             "retained verify-log directory {} must contain exactly one nonempty run1 capture and one nonempty run2 capture",
             directory.display()
@@ -9736,6 +9765,7 @@ fn summarize(
             // refused parity operand ([`parity_rejection`]).
             let mut log_errors = 0usize;
             let mut typed_no_comparison_refusal = false;
+            let mut first_run_rejected = false;
             let verification = match artifact_dir.as_deref() {
                 Some(artifact_dir) => match read_verification_report(cell, artifact_dir) {
                     Ok(Some(report)) => Some(report),
@@ -9757,6 +9787,12 @@ fn summarize(
                             artifact_dir,
                             &result_rows_for_history,
                         );
+                        first_run_rejected = typed_no_comparison_refusal
+                            && retained_first_run_rejected(
+                                cell,
+                                artifact_dir,
+                                &result_rows_for_history,
+                            );
                         evidence_errors.push(error);
                         None
                     }
@@ -9767,9 +9803,16 @@ fn summarize(
                 .as_ref()
                 .and_then(|report| report.get("verdict"))
                 .and_then(JsonValue::as_str);
+            // A retained first_run_rejected refusal (see
+            // `retained_first_run_rejected`) keeps run 1's log alone.
+            let log_verdict = if first_run_rejected {
+                Some(FIRST_RUN_REJECTED_LOGS)
+            } else {
+                verification_verdict
+            };
             let verification_logs = match artifact_dir.as_deref() {
                 Some(artifact_dir) => {
-                    match retained_verification_logs(cell, artifact_dir, verification_verdict) {
+                    match retained_verification_logs(cell, artifact_dir, log_verdict) {
                         Ok(logs) => logs,
                         Err(error) => {
                             log_errors += 1;
@@ -23221,6 +23264,36 @@ mod pressure_sample_tests {
         row
     }
 
+    /// Run 1's capture alone is the complete retained record of a verify
+    /// whose guest failed its first run ([`FIRST_RUN_REJECTED_LOGS`], which
+    /// the caller passes only for a retained `first_run_rejected` refusal).
+    /// Under a `no_result` verdict, no verdict, or a divergence, a lone run 1
+    /// capture is still refused.
+    #[test]
+    fn run1_alone_is_complete_only_after_a_first_run_rejected_refusal() {
+        let cell = CellId {
+            lane: "portable".into(),
+            category: "fixture".into(),
+            test: "fixture/cell".into(),
+            mode: "verify".into(),
+            backend: "liteinst".into(),
+        };
+        let dir = env::temp_dir().join(format!("pressure-run1-alone-{}", std::process::id()));
+        let logs = dir.join("verify-logs").join("verify-1");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(logs.join("run1_log_fixture.log"), "INFO first\n").unwrap();
+        let alone = retained_verification_logs(&cell, &dir, Some(FIRST_RUN_REJECTED_LOGS)).unwrap();
+        assert!(alone.run1.is_some() && alone.run2.is_none());
+        for verdict in [None, Some("diverged"), Some("no_result")] {
+            let error = retained_verification_logs(&cell, &dir, verdict).unwrap_err();
+            assert!(
+                error.contains("exactly one nonempty run1 capture"),
+                "{error}"
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     fn no_result_attempt(kind: &str, error: Option<&str>) -> AttemptResult {
         let rejected = kind == "first_run_rejected";
         let mut attempt = fixture_attempt(if rejected { "FAIL" } else { "ERROR" }, 125);
@@ -24212,6 +24285,31 @@ mod pressure_sample_tests {
             rejected_summary["rows"][0]["result"],
             "infrastructure-error"
         );
+        // Hermit's verify starts no second run after a typed refusal of the
+        // first, so the retained logs hold run 1's capture alone. That is the
+        // complete record of the attempt: the refusal stays a terminal product
+        // failure, not an attempt with missing evidence.
+        let run2_capture =
+            Path::new(&rejected_row.artifact_dir).join("verify-logs/verify-1/run2_log_fixture.log");
+        let run2_bytes = fs::read(&run2_capture).unwrap();
+        fs::remove_file(&run2_capture).unwrap();
+        let error = summarize(&root, &results, false, Some(&evidence), true).unwrap_err();
+        assert!(error.contains("no trustworthy result"));
+        let first_run_only = read();
+        assert_eq!(
+            first_run_only["repeated_cells"][0]["classification"], "confirmed-failing",
+            "{}",
+            first_run_only["rows"][0]["evidence_errors"]
+        );
+        assert_eq!(
+            first_run_only["repeated_cells"][0]["terminal_product_failures"],
+            10
+        );
+        assert_eq!(
+            first_run_only["repeated_cells"][0]["unknown_history_repetitions"],
+            0
+        );
+        fs::write(&run2_capture, run2_bytes).unwrap();
         // A different valid NoResult stamp cannot explain this row's selected artifact error.
         fs::write(
             &retained_report_path,
