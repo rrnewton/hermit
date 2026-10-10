@@ -1379,6 +1379,11 @@ pub fn classify_container_result<T>(
                 // operator sees the bound; only the machine-readable class is
                 // reconstructed here.
                 FailureKind::RunTimeout => error.context(RunTimeoutMarker),
+                // The marker goes UNDER the child's message, as it was in the
+                // child: the first `Error:` line keeps naming the failure.
+                FailureKind::BackendRunFailure => {
+                    Error::new(hermit::BackendRunFailure).context(format!("{error:#}"))
+                }
                 FailureKind::Error => error,
             })
         }

@@ -177,6 +177,11 @@ pub enum SeriesNoVerdictKind {
     NotRun,
     FirstRunRejected,
     ContainerFailed,
+    /// Hermit started a verification run and a typed failure of it stopped the
+    /// run (`run_failed`: a backend failure, a recorded determinism loss or a
+    /// policy refusal of the guest). The runner types the attempt FAIL, a
+    /// crash-error red, exactly as for `first_run_rejected`.
+    RunFailed,
     InfrastructureError,
     MissingReportTimeout,
     NoncanonicalMatch,
@@ -487,6 +492,13 @@ impl SeriesPressureAttempt {
                         && !self.timed_out
                         && self.error_kind.is_none()
                         && self.status == Some(125)
+                        && self.signal.is_none()
+                }
+                Some(SeriesNoVerdictKind::RunFailed) => {
+                    self.outcome == "FAIL"
+                        && !self.timed_out
+                        && self.error_kind.is_none()
+                        && self.status.is_some_and(|status| status > 0)
                         && self.signal.is_none()
                 }
                 _ => false,
@@ -1043,7 +1055,8 @@ impl SeriesRow {
                         let (verdict, no_result_kind) = match kind {
                             SeriesNoVerdictKind::Unspecified | SeriesNoVerdictKind::ComparisonRefused
                             | SeriesNoVerdictKind::NotRun | SeriesNoVerdictKind::FirstRunRejected
-                            | SeriesNoVerdictKind::ContainerFailed =>
+                            | SeriesNoVerdictKind::ContainerFailed
+                            | SeriesNoVerdictKind::RunFailed =>
                                 (Verdict::NoResult, Some(kind)),
                             SeriesNoVerdictKind::InfrastructureError => (Verdict::InfrastructureError, None),
                             SeriesNoVerdictKind::NoncanonicalMatch
@@ -1250,6 +1263,21 @@ impl SeriesRow {
                     {
                         return Err(
                             "first_run_rejected evidence must carry attempt outcome FAIL, no error_kind, a nonzero status without signal, timed_out=false, a verification report, and no_result disposition"
+                                .into(),
+                        );
+                    }
+                }
+                SeriesNoVerdictKind::RunFailed => {
+                    if disposition.attempt_outcome != "FAIL"
+                        || disposition.disposition != SeriesOutcome::NoResult
+                        || disposition.timed_out
+                        || disposition.error_kind.is_some()
+                        || disposition.status.is_none_or(|status| status <= 0)
+                        || disposition.signal.is_some()
+                        || disposition.verification_report_sha256.is_none()
+                    {
+                        return Err(
+                            "run_failed evidence must carry attempt outcome FAIL, no error_kind, a nonzero status without signal, timed_out=false, a verification report, and no_result disposition"
                                 .into(),
                         );
                     }

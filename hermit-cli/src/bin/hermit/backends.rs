@@ -91,9 +91,13 @@ use super::verify::Verdict;
 #[cfg(feature = "dbt")]
 use super::verify::VerificationOutcome;
 #[cfg(feature = "dbt")]
+use super::verify::VerificationRun;
+#[cfg(feature = "dbt")]
 use super::verify::announce_verification_outcome;
 #[cfg(feature = "dbt")]
 use super::verify::compare_two_runs;
+#[cfg(feature = "dbt")]
+use super::verify::publish_run_failure;
 #[cfg(feature = "dbt")]
 use super::verify::retain_verification_logs;
 #[cfg(feature = "dbt")]
@@ -1213,6 +1217,7 @@ pub(super) fn run_dbt(
     let first_raw = match first_raw {
         Ok(output) => output,
         Err(error) => {
+            let error = publish_run_failure(verify_json, VerificationRun::Run1, error);
             if keep_logs {
                 retain_verification_logs([("run 1", log1_path)])?;
             }
@@ -1241,6 +1246,7 @@ pub(super) fn run_dbt(
     // The generic verifier's check, before any comparison: a run that
     // recorded a determinism loss is not compared.
     if let Err(error) = dbt_run_latches(&first_evidence).refuse_comparison("run 1") {
+        let error = publish_run_failure(verify_json, VerificationRun::Run1, error);
         if keep_logs {
             retain_verification_logs([("run 1", log1_path)])?;
         }
@@ -1319,6 +1325,7 @@ pub(super) fn run_dbt(
     } {
         Ok(output) => output,
         Err(error) => {
+            let error = publish_run_failure(verify_json, VerificationRun::Run2, error);
             if keep_logs {
                 retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
             }
@@ -1342,6 +1349,7 @@ pub(super) fn run_dbt(
     }
     signal_reports.prepare("run 2", process_status(second_raw.status), &log2_path);
     if let Err(error) = dbt_run_latches(&second_evidence).refuse_comparison("run 2") {
+        let error = publish_run_failure(verify_json, VerificationRun::Run2, error);
         if keep_logs {
             retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
         }
@@ -1736,7 +1744,9 @@ fn dbt_run_error(drrun: &Path, error: std::io::Error) -> Error {
                 drrun.display()
             ))
         }
-        _ => Error::msg(format!(
+        // Typed under the message: `run --verify` records it as a backend
+        // failure of the run, not as a run that never started.
+        _ => Error::new(hermit::BackendRunFailure).context(format!(
             "drrun started ({}) and the DBT run then failed: {error} \
              -- this is NOT a launch failure; the drrun binary is not implicated. \
              Read the text after the last ':' for the stage that actually failed.",

@@ -1729,6 +1729,25 @@ struct SkidOvershootReport {
     enabled: bool,
 }
 
+/// The backend failed while running the guest, after Hermit launched it: the
+/// DBT evidence check, a KVM execution failure, a SaBRe guest that never
+/// reached Detcore. `run --verify` records it as `run_failed` with
+/// `backend_failure` instead of leaving the `not_run` stamp.
+///
+/// It sits in the chain below the message that names the failure, so the
+/// first `Error:` line is unchanged; it crosses the container error boundary
+/// as [`error::FailureKind::BackendRunFailure`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendRunFailure;
+
+impl std::fmt::Display for BackendRunFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the backend failed while running the guest")
+    }
+}
+
+impl std::error::Error for BackendRunFailure {}
+
 /// A ptrace-backed run observed late precise-timer delivery, so Hermit refuses
 /// to treat the completed execution as deterministic evidence.
 ///
@@ -2507,10 +2526,8 @@ async fn run_sabre(
         "SaBRe ptrace fallback completed",
     );
     if detcore_never_engaged {
-        return Err(anyhow!(
-            "{}",
-            sabre_uninstrumented_guest_message(&output.status)
-        ));
+        return Err(Error::new(BackendRunFailure)
+            .context(sabre_uninstrumented_guest_message(&output.status)));
     }
     Ok(output)
 }
@@ -2977,7 +2994,7 @@ fn kvm_execution_error(
     // The manifest runner retains the first Error line. Keep the cause there,
     // as well as the typed backend and optional scheduler errors in the chain.
     let message = format!("KVM guest execution failed: {primary}");
-    let mut error = Error::new(primary);
+    let mut error = Error::new(primary).context(BackendRunFailure);
     if let Some(cleanup) = cleanup {
         if let Err(recording) = cleanup.preemption_recording {
             error = error.context(format!("partial preemption recording failed: {recording}"));
