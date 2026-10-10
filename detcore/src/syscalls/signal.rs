@@ -965,6 +965,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Kill,
     ) -> Result<i64, Error> {
         if !guest.config().sequentialize_threads {
+            // Without sequentialization every other kill goes to the kernel as
+            // is, but never one to a process group or to every process: the
+            // guest's process group is inherited from Hermit's, so it can hold
+            // Hermit and the user's shell or test runner, which a group kill
+            // would reach (https://github.com/rrnewton/hermit/issues/4057).
+            // Signal 0 sends nothing, and INT_MIN is ESRCH before any lookup.
+            if call.sig() != 0 && call.pid() <= 0 && call.pid() != libc::pid_t::MIN {
+                return self
+                    .refuse_group_signal(guest, call.pid(), call.sig())
+                    .await;
+            }
             return Ok(self.record_or_replay(guest, call).await?);
         }
 
@@ -1051,8 +1062,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// run stops with the policy-refusal status and
     /// `--allow-unsupported-syscalls` returns ENOSYS, as the call did before.
     /// A SIGKILL to another group is forwarded before this point
-    /// (`can_forward_process_group_signal`), except on a backend that needs
-    /// thread-directed process signals (DBT), where it is refused here too.
+    /// (`can_forward_process_group_signal`) when threads are sequentialized,
+    /// except on a backend that needs thread-directed process signals (DBT),
+    /// where it is refused here too. Without sequentialization every such kill
+    /// is refused here, for host safety: the guest's process group is
+    /// inherited from Hermit's (https://github.com/rrnewton/hermit/issues/4057).
     async fn refuse_group_signal<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1064,13 +1078,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             -1 => "every process it may signal".to_owned(),
             pid => format!("process group {}", pid.unsigned_abs()),
         };
+        let reason = if guest.config().sequentialize_threads {
+            "Detcore does not model process-group membership or each process's receiving \
+             thread (https://github.com/rrnewton/hermit/issues/4046)"
+        } else {
+            "with threads not sequentialized (--no-sequentialize-threads, --strace-only) it \
+             would go to the host kernel as is, and the guest's process group is inherited from \
+             Hermit's, so it can reach Hermit and the processes that started it \
+             (https://github.com/rrnewton/hermit/issues/4057)"
+        };
         tracing::error!(
-            "[detcore, dtid {}] signal {} to {} by kill is not supported: Detcore does not \
-             model process-group membership or each process's receiving thread \
-             (https://github.com/rrnewton/hermit/issues/4046)",
+            "[detcore, dtid {}] signal {} to {} by kill is not supported: {}",
             guest.thread_state().dettid,
             sig,
             target,
+            reason,
         );
         self.refuse_unserviceable_operation(guest, Sysno::kill, Errno::ENOSYS)
             .await

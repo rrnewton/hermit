@@ -20,7 +20,11 @@
  *     fail-closed run stops with the policy-refusal status at kill(0);
  *     --allow-unsupported-syscalls returns ENOSYS for each.
  * kill(-1, sig) runs only with the argument "broadcast": natively it would
- * signal every process the user may signal.
+ * signal every process the user may signal. With the argument "inherited" the
+ * guest keeps the process group it started in, which under Hermit is
+ * Hermit's own (https://github.com/rrnewton/hermit/issues/4057), first
+ * checks the group with signal 0, which sends nothing, and last sends
+ * SIGKILL to it; run it only inside setsid.
  */
 
 #define _GNU_SOURCE
@@ -59,6 +63,7 @@ static long queue(pid_t pid) {
 
 int main(int argc, char** argv) {
   int broadcast = argc > 1 && strcmp(argv[1], "broadcast") == 0;
+  int inherited = argc > 1 && strcmp(argv[1], "inherited") == 0;
   setvbuf(stdout, NULL, _IONBF, 0);
   struct sigaction action;
   memset(&action, 0, sizeof(action));
@@ -67,8 +72,13 @@ int main(int argc, char** argv) {
 
   /* EPERM when the caller already leads a session, which is fine: it then
    * already leads its own group. */
-  (void)setpgid(0, 0);
+  if (!inherited) {
+    (void)setpgid(0, 0);
+  }
   printf("own group: %s\n", getpgrp() == getpid() ? "yes" : "no");
+  if (inherited) {
+    report("kill(0, 0)", kill(0, 0));
+  }
   report("rt_sigqueueinfo(0)", queue(0));
   report("rt_sigqueueinfo(-pgrp)", queue(-getpgrp()));
   report("rt_sigqueueinfo(-1)", queue(-1));
@@ -76,6 +86,9 @@ int main(int argc, char** argv) {
   report("kill(INT_MIN, SIGKILL)", kill(INT_MIN, SIGKILL));
   report("kill(0)", kill(0, SIGUSR1));
   report("kill(-pgrp)", kill(-getpgrp(), SIGUSR1));
+  if (inherited) {
+    report("kill(0, SIGKILL)", kill(0, SIGKILL));
+  }
   if (broadcast) {
     report("kill(-1)", kill(-1, SIGUSR1));
   }

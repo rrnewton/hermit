@@ -21293,6 +21293,150 @@ fn a_signal_to_a_process_group_is_refused_by_name() {
     }
 }
 
+/// Under `--no-sequentialize-threads` a `kill` to a process group or to every
+/// process never reaches the host kernel: the guest's process group is
+/// inherited from Hermit's, so `kill(0)` would signal Hermit and the processes
+/// that started it (https://github.com/rrnewton/hermit/issues/4057). Two modes
+/// of the guest:
+/// - "inherited" keeps that group. Signal 0 to it sends nothing and is
+///   forwarded with Linux's answer; then `kill(0)` is refused (inside the PID
+///   namespace the inherited group reads as 0, so `kill(-pgrp)` is `kill(0)`
+///   again), and so is a last `kill(0, SIGKILL)`.
+/// - "broadcast" first leads its own group (3 in the namespace), so
+///   `kill(-pgrp)` sends a real negative pid, and it also sends `kill(-1)`
+///   (the second Claude review of https://github.com/rrnewton/hermit/pull/4062:
+///   a refusal of pid 0 alone passed "inherited").
+///
+/// A fail-closed run stops with the policy-refusal status at the first group
+/// kill and names the reason; `--allow-unsupported-syscalls` returns ENOSYS
+/// for each and names each refusal with its target, and Hermit survives to exit
+/// 0 (before the fix, the forwarded `kill(0, SIGUSR1)` killed Hermit itself,
+/// exit 138). Hermit runs in a session of its own, so even a regression cannot
+/// signal the test runner.
+#[test]
+fn group_kills_never_reach_the_host_without_sequentialized_threads() {
+    use std::os::unix::process::CommandExt;
+    let guest = kill_process_group_guest().to_str().unwrap().to_owned();
+    let answered = |own: &str| {
+        format!(
+            "own group: {own}\n\
+             rt_sigqueueinfo(0): -1 ESRCH, handled 0\n\
+             rt_sigqueueinfo(-pgrp): -1 ESRCH, handled 0\n\
+             rt_sigqueueinfo(-1): -1 ESRCH, handled 0\n\
+             kill(INT_MIN): -1 ESRCH, handled 0\n\
+             kill(INT_MIN, SIGKILL): -1 ESRCH, handled 0\n"
+        )
+    };
+    let inherited = answered("no").replacen(
+        "own group: no\n",
+        "own group: no\nkill(0, 0): 0, handled 0\n",
+        1,
+    );
+    let broadcast = answered("yes");
+    let in_own_session = |args: &[&str]| {
+        let mut command = hermit_command(args);
+        // SAFETY: setsid is async-signal-safe and touches only the child.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command
+    };
+    let refused = |target: &str| {
+        format!(
+            "signal 10 to {target} by kill is not supported: with threads not sequentialized \
+             (--no-sequentialize-threads, --strace-only)"
+        )
+    };
+    let cases = [
+        (
+            "inherited",
+            false,
+            HERMIT_POLICY_REFUSAL_EXIT,
+            inherited.clone(),
+            vec!["its own process group"],
+        ),
+        (
+            "inherited",
+            true,
+            0,
+            format!(
+                "{inherited}kill(0): -1 ENOSYS, handled 0\nkill(-pgrp): -1 ENOSYS, handled 0\n\
+                 kill(0, SIGKILL): -1 ENOSYS, handled 0\n"
+            ),
+            vec!["its own process group", "its own process group"],
+        ),
+        (
+            "broadcast",
+            false,
+            HERMIT_POLICY_REFUSAL_EXIT,
+            broadcast.clone(),
+            vec!["its own process group"],
+        ),
+        (
+            "broadcast",
+            true,
+            0,
+            format!(
+                "{broadcast}kill(0): -1 ENOSYS, handled 0\nkill(-pgrp): -1 ENOSYS, handled 0\n\
+                 kill(-1): -1 ENOSYS, handled 0\n"
+            ),
+            vec![
+                "its own process group",
+                "process group 3",
+                "every process it may signal",
+            ],
+        ),
+    ];
+    for (mode, allow, expected_exit, expected_stdout, targets) in cases {
+        let mut args = vec!["run", "--no-sequentialize-threads", "--timeout", "60"];
+        if allow {
+            args.push("--allow-unsupported-syscalls");
+        }
+        args.extend(["--", guest.as_str(), mode]);
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let (status, log) = run_with_deadline(
+            in_own_session(&args),
+            directory.path(),
+            Duration::from_secs(120),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        let case = format!("{mode} allow={allow}");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(expected_exit),
+            "{case}: {status:?}\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(stdout, expected_stdout, "{case}: stderr:\n{log}");
+        for target in [
+            "its own process group",
+            "process group 3",
+            "every process it may signal",
+        ] {
+            let expected = targets.iter().filter(|t| **t == target).count();
+            assert_eq!(
+                log.matches(&refused(target)).count(),
+                expected,
+                "{case}: refusals naming {target}:\nstderr:\n{log}"
+            );
+        }
+        // "inherited" ends with a SIGKILL to its group, refused like the rest.
+        let sigkill = "signal 9 to its own process group by kill is not supported: with threads \
+                       not sequentialized";
+        assert_eq!(
+            log.matches(sigkill).count(),
+            usize::from(mode == "inherited" && allow),
+            "{case}: the SIGKILL group kill:\nstderr:\n{log}"
+        );
+    }
+}
+
 /// A POSIX timer that notifies with a real-time signal
 /// (https://github.com/rrnewton/hermit/issues/3893). Detcore cannot deliver
 /// real-time signals, and such a timer used to be armed and then silently never
