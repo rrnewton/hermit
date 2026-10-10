@@ -1834,7 +1834,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // memory::tests::a_dontunmap_remap_keeps_both_aliases_of_the_object
     // (https://github.com/rrnewton/hermit/pull/4020) retain all 1334: 1340,
     // listed with `cargo nextest list -p hermit-detcore --lib --bins`.
-    ("test.detcore_unit", 1340),
+    // syscalls::threads::tests::an_interrupted_shared_key_probe_is_retried_and_never_taken_as_an_answer
+    // (https://github.com/rrnewton/hermit/pull/4020) retains all 1340: 1341.
+    ("test.detcore_unit", 1341),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2776,7 +2778,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the four posthook-anchor tests: 1334.
     // And the five FUTEX_REQUEUE/FUTEX_WAKE_OP tests and the DONTUNMAP alias
     // test: 1340.
-    ("test.detcore_unit_on_host", 1340),
+    // And the interrupted shared-key probe test: 1341.
+    ("test.detcore_unit_on_host", 1341),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

@@ -3799,8 +3799,21 @@ async fn probe_shared_futex_key<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     address: usize,
     access: KeyAccess,
 ) -> Result<(), Error> {
+    run_shared_futex_key_probe(
+        guest,
+        shared_futex_key_probe(address, access),
+        access,
+        |guest, probe| guest.inject(probe),
+    )
+    .await
+    .map_err(Error::Errno)
+}
+
+/// The effect-free futex call that asks the kernel whether `address` is a
+/// shared key with `access` (see `probe_shared_futex_key`).
+fn shared_futex_key_probe(address: usize, access: KeyAccess) -> syscalls::Futex {
     let word = AddrMut::<libc::c_int>::from_raw(address);
-    let probe = match access {
+    match access {
         KeyAccess::Read => syscalls::Futex::new()
             .with_uaddr(word)
             .with_futex_op(libc::FUTEX_REQUEUE)
@@ -3812,11 +3825,38 @@ async fn probe_shared_futex_key<G: Guest<Detcore<T>>, T: RecordOrReplay>(
             .with_val(0)
             .with_uaddr2(word)
             .with_val3((7 << 28) | (1 << 12)),
-    };
-    match guest.inject(probe).await {
-        Ok(_) => Ok(()),
-        Err(Errno::ENOSYS) if access == KeyAccess::Write => Ok(()),
-        Err(errno) => Err(Error::Errno(errno)),
+    }
+}
+
+/// The pending answer to one injected shared-key probe.
+type KeyProbeAnswer<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<i64, Errno>> + Send + 'a>>;
+
+/// Run a shared-key `probe` with `inject` until the kernel answers it.
+///
+/// The probe is Detcore's own call, not the guest's: a signal that stops its
+/// instruction before it runs makes `inject` return ERESTARTSYS (Reverie's
+/// `Guest::inject`), and EINTR is never a futex key answer either, since
+/// neither probe sleeps. Such a probe had no effect, so it is injected again,
+/// as `Guest::inject_with_retry` does; it is never taken as an answer, so an
+/// interrupted probe neither admits the key nor becomes the guest's result
+/// (https://github.com/rrnewton/hermit/pull/4020). Only the kernel's answer
+/// decides: 0 admits, ENOSYS admits a WRITE key (the unknown WAKE_OP
+/// operation is rejected after both keys), and any other errno is the
+/// guest's.
+async fn run_shared_futex_key_probe<C>(
+    context: &mut C,
+    probe: syscalls::Futex,
+    access: KeyAccess,
+    inject: for<'a> fn(&'a mut C, syscalls::Futex) -> KeyProbeAnswer<'a>,
+) -> Result<(), Errno> {
+    loop {
+        match inject(context, probe).await {
+            Err(Errno::ERESTARTSYS | Errno::EINTR) => continue,
+            Ok(_) => return Ok(()),
+            Err(Errno::ENOSYS) if access == KeyAccess::Write => return Ok(()),
+            Err(errno) => return Err(errno),
+        }
     }
 }
 
@@ -4647,6 +4687,106 @@ mod tests {
     /// FUTEX_WAKE_OP's encoding, as `futex_atomic_op_inuser` decodes it: 12-bit
     /// signed arguments, the shift flag (with an out-of-range shift masked to
     /// 0..31), and -ENOSYS for an unknown operation or comparison.
+    /// An injected probe's futex op, uaddr, uaddr2, val and val3.
+    type ProbeArgs = (i32, usize, usize, i32, i32);
+
+    /// A guest standing in for the kernel: each injected probe is recorded and
+    /// answered with the next scripted result.
+    struct ScriptedProbes {
+        answers: std::collections::VecDeque<Result<i64, Errno>>,
+        probes: Vec<ProbeArgs>,
+    }
+
+    impl ScriptedProbes {
+        fn inject(&mut self, probe: syscalls::Futex) -> KeyProbeAnswer<'_> {
+            self.probes.push((
+                probe.futex_op(),
+                probe.uaddr().map_or(0, AddrMut::as_raw),
+                probe.uaddr2().map_or(0, AddrMut::as_raw),
+                probe.val(),
+                probe.val3(),
+            ));
+            let answer = self
+                .answers
+                .pop_front()
+                .expect("the probe was injected more often than scripted");
+            Box::pin(async move { answer })
+        }
+    }
+
+    fn run_scripted(
+        access: KeyAccess,
+        answers: &[Result<i64, Errno>],
+    ) -> (Result<(), Errno>, Vec<ProbeArgs>) {
+        let mut guest = ScriptedProbes {
+            answers: answers.iter().copied().collect(),
+            probes: Vec::new(),
+        };
+        let result = futures::executor::block_on(run_shared_futex_key_probe(
+            &mut guest,
+            shared_futex_key_probe(0x1000, access),
+            access,
+            |guest, probe| guest.inject(probe),
+        ));
+        assert!(
+            guest.answers.is_empty(),
+            "every scripted answer is consumed"
+        );
+        (result, guest.probes)
+    }
+
+    /// An admission probe that a signal stops before its instruction runs
+    /// (`Guest::inject` returns ERESTARTSYS, or EINTR) is injected again with
+    /// the same arguments until the kernel answers it, and only that answer
+    /// decides (https://github.com/rrnewton/hermit/pull/4020): the interrupted
+    /// probe neither admits the key nor becomes the guest's errno, a real
+    /// backing-page refusal after a retry is still returned, and ENOSYS admits
+    /// only a WRITE key.
+    #[test]
+    fn an_interrupted_shared_key_probe_is_retried_and_never_taken_as_an_answer() {
+        let read = (libc::FUTEX_REQUEUE, 0x1000, 0x1000, 0, 0);
+        let write = (
+            libc::FUTEX_WAKE_OP,
+            0x1000,
+            0x1000,
+            0,
+            (7 << 28) | (1 << 12),
+        );
+        assert_eq!(
+            run_scripted(KeyAccess::Read, &[Err(Errno::ERESTARTSYS), Ok(0)]),
+            (Ok(()), vec![read, read])
+        );
+        assert_eq!(
+            run_scripted(
+                KeyAccess::Read,
+                &[
+                    Err(Errno::EINTR),
+                    Err(Errno::ERESTARTSYS),
+                    Err(Errno::EFAULT)
+                ]
+            ),
+            (Err(Errno::EFAULT), vec![read, read, read])
+        );
+        assert_eq!(
+            run_scripted(KeyAccess::Read, &[Err(Errno::ENOSYS)]),
+            (Err(Errno::ENOSYS), vec![read])
+        );
+        assert_eq!(
+            run_scripted(
+                KeyAccess::Write,
+                &[Err(Errno::ERESTARTSYS), Err(Errno::ENOSYS)]
+            ),
+            (Ok(()), vec![write, write])
+        );
+        assert_eq!(
+            run_scripted(
+                KeyAccess::Write,
+                &[Err(Errno::ERESTARTSYS), Err(Errno::EFAULT)]
+            ),
+            (Err(Errno::EFAULT), vec![write, write])
+        );
+    }
+
     #[test]
     fn futex_wake_op_decodes_and_applies_as_linux() {
         let encode = |op: u32, cmp: u32, oparg: u32, cmparg: u32| {
