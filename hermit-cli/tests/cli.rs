@@ -21501,8 +21501,10 @@ fn futex_lock_pi_is_refused_by_name() {
 /// before addresses, keys without reading key-only words (NULL is a valid
 /// private key), CMP_REQUEUE's compare with the guest's permissions, and
 /// WAKE_OP's word changed in place as exactly four bytes (end of a page, a
-/// write-only page) or refused with EFAULT (read-only, PROT_NONE). Every line
-/// matches native Linux.
+/// write-only page) or refused with EFAULT (read-only, PROT_NONE), and shared
+/// keys admitted by the page backing the word (a copied-on-write page made
+/// read-only and a page past a truncation are EFAULT). Every line matches
+/// native Linux.
 #[test]
 fn futex_requeue_and_wake_op_key_and_access_their_words_as_linux() {
     let guest = futex_c_guest(&FUTEX_KEYED_ACCESS_GUEST, "futex_keyed_access")
@@ -21536,6 +21538,13 @@ fn futex_requeue_and_wake_op_key_and_access_their_words_as_linux() {
          shared requeue, read-only shmem target: 0, word 17\n\
          shared wake_op, read-only shmem word, unknown op: -1 EFAULT, word 17\n\
          private wake_op, read-only word, unknown op: -1 ENOSYS, word 17\n\
+         shared requeue, untouched read-only private file page: 0, word 42\n\
+         shared requeue, writable copied-on-write page: 0, word 43\n\
+         shared requeue, copied-on-write page made read-only: -1 EFAULT, word 43\n\
+         private requeue, copied-on-write page made read-only: 0, word 43\n\
+         shared requeue, writable shared file page: 0, word 42\n\
+         shared requeue, shared file page past a truncation: -1 EFAULT, word 0\n\
+         private requeue, shared file page past a truncation: 0, word 0\n\
          shared requeue, PROT_NONE target: -1 EFAULT, word 0\n\
          cmp_requeue, PROT_NONE source: -1 EFAULT, word 0\n\
          wake_op, unmapped private first word, set B=7: 0, word 7\n\

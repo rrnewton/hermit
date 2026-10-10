@@ -1984,11 +1984,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                             // below decides, in this thread's own turn, whether one is
                             // still pending for it. While the wait was off the waiter
                             // list a `FUTEX_WAKE` could not reach it, so a changed value
-                            // ends it first as a wakeup, which futex(2) allows; a signal
-                            // still pending is then delivered as the call returns, as
-                            // when a wake and a signal race on Linux. An unreadable word
-                            // goes on to the check: a Linux waiter the signal never
-                            // reached would still be asleep, not rereading the word.
+                            // ends it first, returning 0 as a wakeup; a signal still
+                            // pending is then delivered as the call returns. Linux
+                            // differs here: `__futex_wait` returns -ERESTARTSYS if a
+                            // signal is pending, and otherwise retries
+                            // `futex_wait_setup`, which returns EAGAIN for a changed
+                            // word (https://github.com/rrnewton/hermit/issues/4033). An
+                            // unreadable word goes on to the check.
                             if let Ok(observed) = guest.memory().read_value(ptr)
                                 && observed != call.val()
                             {
@@ -2025,10 +2027,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                         // signal the kernel will deliver to this thread as the call
                         // returns. If another thread took the signal first (a chaos
                         // schedule can run one ahead) or it became ignored, the wait
-                        // parks again with its original absolute deadline, as a Linux
-                        // waiter the signal never reached is still waiting: an expired
-                        // deadline ends it at the scheduler's next timed pop with
-                        // ETIMEDOUT. Returning the restart errno with nothing to
+                        // parks again with its original absolute deadline, as
+                        // `__futex_wait` retries a wait woken with no signal pending:
+                        // an expired deadline ends it at the scheduler's next timed pop
+                        // with ETIMEDOUT. A word that changed meanwhile ends it with 0
+                        // instead of Linux's EAGAIN (see the check above). Returning the restart errno with nothing to
                         // deliver would instead have leaked it to the guest, or
                         // restarted the call with a fresh timeout.
                         //
@@ -2158,7 +2161,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Error::Errno(Errno::EINVAL));
         }
         let private = call.futex_op() & libc::FUTEX_PRIVATE_FLAG != 0;
-        let futexid = futex_key(guest, futex_uaddr(&call), private, KeyAccess::Read)?;
+        let futexid = futex_key(guest, futex_uaddr(&call), private, KeyAccess::Read).await?;
         let num = match futex_action(
             guest,
             FutexAction::WakeRequest(call.val()),
@@ -2207,8 +2210,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let private = call.futex_op() & libc::FUTEX_PRIVATE_FLAG != 0;
         let uaddr = futex_uaddr(&call);
-        let futexid = futex_key(guest, uaddr, private, KeyAccess::Read)?;
-        let futexid2 = futex_key(guest, futex_uaddr2(&call), private, KeyAccess::Read)?;
+        let futexid = futex_key(guest, uaddr, private, KeyAccess::Read).await?;
+        let futexid2 = futex_key(guest, futex_uaddr2(&call), private, KeyAccess::Read).await?;
         let mut current = 0;
         if command == libc::FUTEX_CMP_REQUEUE {
             current = read_futex_word(guest, uaddr)?;
@@ -2281,8 +2284,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         let nr_wake2 = futex_val2(&call) as i32;
         let private = call.futex_op() & libc::FUTEX_PRIVATE_FLAG != 0;
         let uaddr2 = futex_uaddr2(&call);
-        let futexid = futex_key(guest, futex_uaddr(&call), private, KeyAccess::Read)?;
-        let futexid2 = futex_key(guest, uaddr2, private, KeyAccess::Write)?;
+        let futexid = futex_key(guest, futex_uaddr(&call), private, KeyAccess::Read).await?;
+        let futexid2 = futex_key(guest, uaddr2, private, KeyAccess::Write).await?;
         let op = FutexWakeOp::decode(call.val3() as u32);
         if !op.has_known_operation() {
             return Err(Error::Errno(Errno::ENOSYS));
@@ -3755,12 +3758,12 @@ fn user_ptr_max() -> usize {
 /// - `-EINVAL` if it is not 4-aligned;
 /// - `-EFAULT` if `access_ok` refuses it (`user_ptr_max`);
 /// - a private key needs nothing more, so NULL is a valid one;
-/// - a shared key needs its backing page: a writable mapping always works
-///   (`FOLL_WRITE`); a read-only one only for a `FUTEX_READ` key and only if its
-///   page is file or shmem backed, because a read-only anonymous page, whether
-///   a private folio or the zero page, is `-EFAULT`; an inaccessible or
-///   unmapped word is `-EFAULT`.
-fn futex_key<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+/// - a shared key needs its backing page, acquired for reading or writing.
+///   Which pages the kernel can acquire (a copy-on-write page made read-only, a
+///   page past the end of a truncated file, a read-only anonymous page) is not
+///   visible in `/proc` metadata, so the kernel is asked with an effect-free
+///   probe on the guest's own address (`probe_shared_futex_key`).
+async fn futex_key<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     guest: &mut G,
     address: usize,
     private: bool,
@@ -3773,16 +3776,48 @@ fn futex_key<G: Guest<Detcore<T>>, T: RecordOrReplay>(
         return Err(Error::Errno(Errno::EFAULT));
     }
     if !private {
-        let admitted = match guest_mapping(guest.pid().as_raw(), address) {
-            Some(mapping) if mapping.writable => true,
-            Some(mapping) => access == KeyAccess::Read && mapping.readable && mapping.file_backed,
-            None => false,
-        };
-        if !admitted {
-            return Err(Error::Errno(Errno::EFAULT));
-        }
+        probe_shared_futex_key(guest, address, access).await?;
     }
     Ok(guest.thread_state().futex_id(address, private))
+}
+
+/// Whether the kernel admits `address` as a shared futex key with `access`,
+/// asked with a futex call injected into the guest that runs `get_futex_key`
+/// and has no other effect, even on a waiter outside Hermit:
+/// - a READ key: a non-private FUTEX_REQUEUE from the word to itself with both
+///   counts 0. `futex_requeue` acquires both keys for reading, and its loop
+///   then stops before the first waiter (`task_count - nr_wake >= nr_requeue`).
+///   A FUTEX_WAKE with count 0 would not do: it still wakes one waiter;
+/// - a WRITE key: a non-private FUTEX_WAKE_OP from the word to itself with an
+///   unknown operation. `futex_wake_op` acquires the first key for reading and
+///   the second for writing, then `futex_atomic_op_inuser` returns -ENOSYS for
+///   the unknown operation before it touches the word or wakes anyone.
+///
+/// Linux's refusal (-EFAULT, or -EINVAL) is returned as is.
+async fn probe_shared_futex_key<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &mut G,
+    address: usize,
+    access: KeyAccess,
+) -> Result<(), Error> {
+    let word = AddrMut::<libc::c_int>::from_raw(address);
+    let probe = match access {
+        KeyAccess::Read => syscalls::Futex::new()
+            .with_uaddr(word)
+            .with_futex_op(libc::FUTEX_REQUEUE)
+            .with_val(0)
+            .with_uaddr2(word),
+        KeyAccess::Write => syscalls::Futex::new()
+            .with_uaddr(word)
+            .with_futex_op(libc::FUTEX_WAKE_OP)
+            .with_val(0)
+            .with_uaddr2(word)
+            .with_val3((7 << 28) | (1 << 12)),
+    };
+    match guest.inject(probe).await {
+        Ok(_) => Ok(()),
+        Err(Errno::ENOSYS) if access == KeyAccess::Write => Ok(()),
+        Err(errno) => Err(Error::Errno(errno)),
+    }
 }
 
 /// A futex word's value as a user-mode access reads it, which is what Linux's
@@ -3808,7 +3843,7 @@ fn read_futex_word<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     {
         return Ok(i32::from_ne_bytes(bytes));
     }
-    if !guest_mapping(guest.pid().as_raw(), address).is_some_and(|mapping| mapping.writable) {
+    if !mapping_is_writable(guest.pid().as_raw(), address) {
         return Err(Error::Errno(Errno::EFAULT));
     }
     let aligned = address & !(std::mem::size_of::<u64>() - 1);
@@ -3822,33 +3857,28 @@ fn read_futex_word<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     Ok(i32::from_ne_bytes(bytes))
 }
 
-/// The permissions and backing of the guest mapping containing an address.
-#[derive(Clone, Copy, Debug)]
-struct GuestMapping {
-    readable: bool,
-    writable: bool,
-    /// Backed by a file or shmem (a nonzero inode, which includes shared
-    /// anonymous memory) rather than by anonymous pages.
-    file_backed: bool,
-}
-
-/// The guest mapping containing `address`, from `/proc/<pid>/maps`. `None` if
-/// no mapping contains it or the file cannot be read.
-fn guest_mapping(pid: i32, address: usize) -> Option<GuestMapping> {
-    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).ok()?;
-    maps.lines().find_map(|line| {
+/// Whether the guest mapping containing `address` is writable, from
+/// `/proc/<pid>/maps`. False if no mapping contains it or the file cannot be
+/// read.
+fn mapping_is_writable(pid: i32, address: usize) -> bool {
+    let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else {
+        return false;
+    };
+    maps.lines().any(|line| {
         let mut fields = line.split_whitespace();
-        let range = fields.next()?;
-        let perms = fields.next()?.as_bytes();
-        let inode = fields.nth(2)?;
-        let (start, end) = range.split_once('-')?;
-        let start = usize::from_str_radix(start, 16).ok()?;
-        let end = usize::from_str_radix(end, 16).ok()?;
-        (start..end).contains(&address).then(|| GuestMapping {
-            readable: perms.first() == Some(&b'r'),
-            writable: perms.get(1) == Some(&b'w'),
-            file_backed: inode != "0",
-        })
+        let (Some(range), Some(perms)) = (fields.next(), fields.next()) else {
+            return false;
+        };
+        let Some((start, end)) = range.split_once('-') else {
+            return false;
+        };
+        let (Ok(start), Ok(end)) = (
+            usize::from_str_radix(start, 16),
+            usize::from_str_radix(end, 16),
+        ) else {
+            return false;
+        };
+        (start..end).contains(&address) && perms.as_bytes().get(1) == Some(&b'w')
     })
 }
 

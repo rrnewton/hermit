@@ -14,6 +14,11 @@
  *     (get_futex_key: alignment and access_ok for a private key, the backing
  *     page for a shared one), and reads uaddr only to compare it for
  *     CMP_REQUEUE;
+ *   - a shared key is decided by the page backing the word (get_futex_key's
+ *     GUP): a file page copied on write and then made read-only is an
+ *     anonymous read-only page and EFAULT, and so is a shared file page past
+ *     a truncation; the same words as private keys, and the writable or
+ *     untouched neighbours, are accepted;
  *   - futex_wake_op keys both words without reading uaddr, rejects an unknown
  *     operation before touching uaddr2, and changes uaddr2 with a user-mode
  *     atomic, so a word at the end of a page works, a write-only (x86: also
@@ -21,7 +26,11 @@
  *     unchanged;
  *   - NULL is a valid private key: a WAKE_OP whose first word is NULL still
  *     wakes the waiter on its second word.
- * Every line printed is the same natively and under Hermit.
+ * Every line printed is the same natively and under Hermit, except that a
+ * native waiter can wake spuriously and wait again on its original word
+ * (__futex_wait's retry), which in about 3% of native runs leaves the waiter
+ * off the NULL key in the last two blocks. Hermit's waiters do not wake
+ * spuriously.
  */
 
 #define _GNU_SOURCE
@@ -134,6 +143,33 @@ int main(void) {
          futex(&words[0], FUTEX_WAKE_OP, 0, 0, ro_shmem, (7u << 28) | (1 << 12)), ro_shmem);
   report("private wake_op, read-only word, unknown op",
          futex(&words[0], FUTEX_WAKE_OP_PRIVATE, 0, 0, ro_anon, (7u << 28) | (1 << 12)), ro_anon);
+
+  /* The backing page itself decides, not the mapping's permissions or file:
+   * a file page copied on write and made read-only is anonymous, and a page
+   * past the end of a truncated file is gone. A private key needs neither. */
+  int fd = memfd_create("futex-backing-page", 0);
+  ftruncate(fd, pagesize);
+  uint32_t* file_rw = mmap(NULL, pagesize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  *file_rw = 42;
+  uint32_t* file_ro = mmap(NULL, pagesize, PROT_READ, MAP_PRIVATE, fd, 0);
+  report("shared requeue, untouched read-only private file page",
+         futex(&words[0], FUTEX_REQUEUE, 0, 0, file_ro, 0), file_ro);
+  uint32_t* cow = mmap(NULL, pagesize, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+  *cow = 43;
+  report("shared requeue, writable copied-on-write page",
+         futex(&words[0], FUTEX_REQUEUE, 0, 0, cow, 0), cow);
+  mprotect(cow, pagesize, PROT_READ);
+  report("shared requeue, copied-on-write page made read-only",
+         futex(&words[0], FUTEX_REQUEUE, 0, 0, cow, 0), cow);
+  report("private requeue, copied-on-write page made read-only",
+         futex(&words[0], FUTEX_REQUEUE_PRIVATE, 0, 0, cow, 0), cow);
+  report("shared requeue, writable shared file page",
+         futex(&words[0], FUTEX_REQUEUE, 0, 0, file_rw, 0), file_rw);
+  ftruncate(fd, 0);
+  report("shared requeue, shared file page past a truncation",
+         futex(&words[0], FUTEX_REQUEUE, 0, 0, file_rw, 0), B);
+  report("private requeue, shared file page past a truncation",
+         futex(&words[0], FUTEX_REQUEUE_PRIVATE, 0, 0, file_rw, 0), B);
   report("shared requeue, PROT_NONE target",
          futex(&words[0], FUTEX_REQUEUE, 0, 0, none, 0), B);
   report("cmp_requeue, PROT_NONE source",
