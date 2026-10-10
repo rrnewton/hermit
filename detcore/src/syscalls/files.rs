@@ -4232,12 +4232,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         let old_start = call.addr().map(AddrMut::as_raw).unwrap_or(0);
         let old_len = call.old_len();
         let new_len = call.new_len();
+        // MREMAP_DONTUNMAP (Linux 5.7): the old mapping stays in place.
+        let keep_source = call.flags() & 4 != 0;
         let result = self.record_or_replay(guest, call).await?;
         let new_start =
             usize::try_from(result).expect("a successful mremap must return an address");
         guest
             .thread_state()
-            .remap_memory(old_start, old_len, new_start, new_len);
+            .remap_memory(old_start, old_len, new_start, new_len, keep_source);
         Ok(result)
     }
 

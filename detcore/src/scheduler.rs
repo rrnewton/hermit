@@ -183,6 +183,14 @@ pub enum SchedValue {
     Signaled(u64),
     // TODO(T137799529) make this more strongly typed, an enum for different scenarios:
     Value(u64),
+    /// The answer to a futex requeue (`FutexAction::RequeueRequest`): how many
+    /// waiters it woke and how many it moved to the other futex.
+    Requeued {
+        /// Waiters woken.
+        woken: u64,
+        /// Waiters moved onto the target futex.
+        moved: u64,
+    },
 }
 
 /// A single interaction between a guest and the scheduler: first, request resourcees, followed
@@ -4625,7 +4633,9 @@ impl Scheduler {
         // `nr_wake` is the kernel's `int`. So a count of 0, or a `u32` count above
         // INT_MAX that is negative as an `int`, wakes one waiter, like a count of 1.
         // (Only futex2's FLAGS_STRICT returns early for a zero count, and futex2 is
-        // refused before it reaches here.)
+        // refused before it reaches here.) FUTEX_WAKE_OP's two wakes share this
+        // rule; FUTEX_REQUEUE's does not (0 wakes nobody), so
+        // `requeue_futex_waiters` must never route its counts through here.
         let max_to_wake: usize = if max_to_wake <= 0 {
             1
         } else {
@@ -4694,6 +4704,78 @@ impl Scheduler {
             self.wake_futex_waiter(waiter);
         }
         num_woken as u64
+    }
+
+    /// `FUTEX_REQUEUE` and `FUTEX_CMP_REQUEUE` on plain (non-PI) futexes, as
+    /// Linux's `futex_requeue` (kernel/futex/requeue.c) does them: walk the
+    /// waiters of `from` in arrival order, stopping once
+    /// `task_count - nr_wake >= nr_requeue`; wake the first `nr_wake`
+    /// (`if (++task_count <= nr_wake)`) and move the rest onto `to`. Returns the
+    /// numbers woken and moved; the call returns their sum. Bitsets are ignored,
+    /// as `futex_requeue` ignores them. Unlike `futex_wake`, a `nr_wake` of 0
+    /// wakes nobody here.
+    ///
+    /// A moved waiter joins the end of `to`'s waiters, in the order the moved
+    /// waiters arrived, as `requeue_futex` appends it to the target hash chain
+    /// with `plist_add`, so a later wake of `to` takes `to`'s earlier waiters
+    /// first. Requeueing a futex onto itself moves nobody: `requeue_futex` only
+    /// changes the waiter's key there. (When two different futexes share a Linux
+    /// hash bucket the moved waiter keeps its place in the shared chain; that
+    /// order depends on the kernel's hash of the addresses, which no guest can
+    /// rely on, and Detcore uses the separate-bucket order.)
+    ///
+    /// The caller checks `nr_wake` and `nr_requeue` are not negative (`-EINVAL`)
+    /// and, for `FUTEX_CMP_REQUEUE`, the futex word against `val3` (`-EAGAIN`).
+    pub fn requeue_futex_waiters(
+        &mut self,
+        from: FutexID,
+        to: FutexID,
+        nr_wake: usize,
+        nr_requeue: usize,
+    ) -> (u64, u64) {
+        let Some(waiters) = self.blocked.futex_waiters.remove(&from) else {
+            return (0, 0);
+        };
+        let mut woken = Vec::new();
+        let mut moved = Vec::new();
+        let mut kept = Vec::with_capacity(waiters.len());
+        let mut task_count: usize = 0;
+        for waiter in waiters {
+            // `task_count - nr_wake >= nr_requeue`, in Linux's signed `int`s.
+            if task_count as i128 - nr_wake as i128 >= nr_requeue as i128 {
+                kept.push(waiter);
+                continue;
+            }
+            task_count += 1;
+            if task_count <= nr_wake {
+                woken.push(waiter);
+            } else if from == to {
+                // Requeued onto the same key: it keeps its place.
+                kept.push(waiter);
+            } else {
+                moved.push(waiter);
+            }
+        }
+        let num_moved = (task_count - woken.len()) as u64;
+        if !kept.is_empty() {
+            self.blocked.futex_waiters.insert(from, kept);
+        }
+        if !moved.is_empty() {
+            self.blocked
+                .futex_waiters
+                .entry(to)
+                .or_default()
+                .extend(moved);
+        }
+        let num_woken = woken.len() as u64;
+        for waiter in woken {
+            self.wake_futex_waiter(waiter);
+        }
+        trace!(
+            "[detcore] futex requeue {:?} -> {:?}: woke {}, moved {}",
+            from, to, num_woken, num_moved
+        );
+        (num_woken, num_moved)
     }
 
     /// Record futex wakes delivered by a physical-exit callback for the next
@@ -12857,6 +12939,115 @@ mod test {
         );
         let parked = waiters.map(|(waiter, _)| scheduler.is_parked_futex_waiter(waiter));
         assert_eq!(parked, [true, false, true]);
+    }
+
+    /// Helper: `n` waiters (raw tids from `first`) parked on `futex` with `bitset`.
+    fn park_futex_waiters(
+        scheduler: &mut Scheduler,
+        futex: FutexID,
+        first: i32,
+        n: i32,
+        bitset: u32,
+    ) -> Vec<DetTid> {
+        (first..first + n)
+            .map(|raw| {
+                let waiter = DetTid::from_raw(raw);
+                register_known_thread(scheduler, waiter);
+                scheduler.sleep_futex_waiter(&waiter, futex, None, bitset, None);
+                waiter
+            })
+            .collect()
+    }
+
+    fn futex_waiter_order(scheduler: &Scheduler, futex: FutexID) -> Vec<DetTid> {
+        scheduler
+            .blocked
+            .futex_waiters
+            .get(&futex)
+            .map(|waiters| waiters.iter().map(|w| w.dettid).collect())
+            .unwrap_or_default()
+    }
+
+    /// FUTEX_REQUEUE wakes the first `nr_wake` waiters in arrival order and moves
+    /// the next `nr_requeue`, which join the end of the target's waiters in their
+    /// arrival order, as Linux's `futex_requeue` (kernel/futex/requeue.c) with
+    /// `requeue_futex` appending to the target chain
+    /// (https://github.com/rrnewton/hermit/issues/3958).
+    #[test]
+    fn a_futex_requeue_wakes_the_oldest_and_moves_the_next_in_order() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let mm = MmId::initial(DetPid::from_raw(100));
+        let from = FutexID::private(mm, 0x404110);
+        let to = FutexID::private(mm, 0x404120);
+        let on_to = park_futex_waiters(&mut scheduler, to, 100, 1, u32::MAX);
+        let on_from = park_futex_waiters(&mut scheduler, from, 101, 4, u32::MAX);
+        assert_eq!(scheduler.requeue_futex_waiters(from, to, 1, 2), (1, 2));
+        assert!(scheduler.run_queue.contains_tid(on_from[0]));
+        assert_eq!(futex_waiter_order(&scheduler, from), vec![on_from[3]]);
+        assert_eq!(
+            futex_waiter_order(&scheduler, to),
+            vec![on_to[0], on_from[1], on_from[2]]
+        );
+        // A later wake of the target takes its own earlier waiter first.
+        assert_eq!(
+            scheduler.wake_futex_waiters(DetTid::from_raw(99), to, 1, u32::MAX),
+            1
+        );
+        assert!(scheduler.run_queue.contains_tid(on_to[0]));
+    }
+
+    /// `futex_requeue`'s loop: `if (task_count - nr_wake >= nr_requeue) break;`
+    /// before counting, and `if (++task_count <= nr_wake)` to wake. So nothing is
+    /// done for 0 and 0, a `nr_wake` of 0 wakes nobody (unlike `futex_wake`), and
+    /// bitsets do not matter.
+    #[test]
+    fn futex_requeue_counts_follow_linux() {
+        let mm = MmId::initial(DetPid::from_raw(100));
+        let from = FutexID::private(mm, 0x404110);
+        let to = FutexID::private(mm, 0x404120);
+        for (nr_wake, nr_requeue, expected) in [
+            (0, 0, (0, 0)),
+            (0, 1, (0, 1)),
+            (2, 0, (2, 0)),
+            (5, 5, (3, 0)),
+        ] {
+            let mut scheduler = Scheduler::new(&Config::default());
+            let waiters = park_futex_waiters(&mut scheduler, from, 100, 3, 0b01);
+            assert_eq!(
+                scheduler.requeue_futex_waiters(from, to, nr_wake, nr_requeue),
+                expected,
+                "nr_wake {nr_wake} nr_requeue {nr_requeue}"
+            );
+            let (woken, moved) = expected;
+            let (woken, moved) = (woken as usize, moved as usize);
+            for (index, &waiter) in waiters.iter().enumerate() {
+                assert_eq!(
+                    scheduler.run_queue.contains_tid(waiter),
+                    index < woken,
+                    "nr_wake {nr_wake} nr_requeue {nr_requeue} waiter {index}"
+                );
+            }
+            assert_eq!(
+                futex_waiter_order(&scheduler, to),
+                waiters[woken..woken + moved].to_vec()
+            );
+        }
+    }
+
+    /// Requeueing a futex onto itself moves nobody (`requeue_futex` only rewrites
+    /// the key): the counted waiters keep their places, and only the woken leave.
+    #[test]
+    fn a_futex_requeue_onto_itself_keeps_waiters_in_place() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let futex = FutexID::private(MmId::initial(DetPid::from_raw(100)), 0x404110);
+        let waiters = park_futex_waiters(&mut scheduler, futex, 100, 3, u32::MAX);
+        assert_eq!(
+            scheduler.requeue_futex_waiters(futex, futex, 0, i32::MAX as usize),
+            (0, 3)
+        );
+        assert_eq!(futex_waiter_order(&scheduler, futex), waiters);
+        assert_eq!(scheduler.requeue_futex_waiters(futex, futex, 1, 1), (1, 1));
+        assert_eq!(futex_waiter_order(&scheduler, futex), waiters[1..].to_vec());
     }
 
     /// A `FUTEX_WAKE` of several wakes the longest waiters, and they join the

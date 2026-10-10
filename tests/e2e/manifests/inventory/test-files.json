@@ -499,10 +499,28 @@
       "why": "tests/c/ftruncate_sparse.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/futex_keyed_access.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/futex_keyed_access.c is owned by hermit-cli/tests/cli.rs: FUTEX_REQUEUE, FUTEX_CMP_REQUEUE and FUTEX_WAKE_OP key and access their words as Linux does (counts before addresses, key-only words never read, NULL a valid private key, CMP_REQUEUE compared with guest permissions, WAKE_OP changing exactly four bytes or failing with EFAULT); the integration test requires every line to match native under run --strict (https://github.com/rrnewton/hermit/pull/4020)."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/futex_lock_pi_refused.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/futex_lock_pi_refused.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test futex_lock_pi_is_refused_by_name compiles this guest, which takes a priority-inheritance futex with FUTEX_LOCK_PI and requires the policy-refusal status naming the command under a fail-closed run, and ENOSYS with --allow-unsupported-syscalls (https://github.com/rrnewton/hermit/issues/3958); it remains a guest fixture because a generic manifest cannot assert this exact output or refusal status."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/futex_requeue_enosys.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/futex_requeue_enosys.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/futex_requeue_wake_op.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/futex_requeue_wake_op.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test futex_requeue_and_wake_op_match_linux compiles this guest, which exercises FUTEX_REQUEUE, FUTEX_CMP_REQUEUE, FUTEX_WAKE_OP and the futex commands Linux answers with an errno and requires Linux's native output (https://github.com/rrnewton/hermit/issues/3958); it remains a guest fixture because a generic manifest cannot assert this exact output or refusal status."
     },
     {
       "disposition": "manifest-test",
@@ -521,6 +539,12 @@
       "path": "tests/c/futex_wake_enosys.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/futex_wake_enosys.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/futex_wake_op_file_shared.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/futex_wake_op_file_shared.c is owned by hermit-cli/tests/cli.rs: FUTEX_WAKE_OP works on an anonymous shared word and is refused by name on a file-backed shared word, which a process outside Hermit could update concurrently; the integration test checks the strict policy-refusal exit and the permissive ENOSYS (https://github.com/rrnewton/hermit/pull/4020). It stays a fixture because the generic manifest cannot express a refusal exit plus a second permissive run."
     },
     {
       "disposition": "manifest-test",

@@ -203,12 +203,18 @@ impl MemoryMetadata {
     }
 
     /// Move or resize a mapping after a successful `mremap`.
+    /// Record a successful `mremap` from `old_start` to `new_start`. The new
+    /// range keeps the source's backing object and offset. The source range
+    /// is dropped unless `keep_source` (`MREMAP_DONTUNMAP`), with which Linux
+    /// leaves the old mapping in place (mm/mremap.c), so both ranges then
+    /// alias the same object.
     pub(crate) fn remap(
         &mut self,
         old_start: usize,
         old_len: usize,
         new_start: usize,
         new_len: usize,
+        keep_source: bool,
     ) {
         let old_len = page_aligned_len(old_len);
         let new_len = page_aligned_len(new_len);
@@ -224,7 +230,9 @@ impl MemoryMetadata {
                     .then_some((mapping.object, mapping.offset_at(mapping_start, old_start)))
             });
 
-        self.unmap(old_start, old_len);
+        if !keep_source {
+            self.unmap(old_start, old_len);
+        }
         self.unmap(new_start, new_len);
         if let Some((object, object_offset)) = source {
             self.insert_mapping(new_start, new_len, object, object_offset);
@@ -354,12 +362,26 @@ mod tests {
 
         mappings.map_anonymous(mm(10), 0x5000, 0x1000);
         let before_remap = mappings.futex_id(mm(10), 0x5010);
-        mappings.remap(0x5000, 0x1000, 0x9000, 0x1000);
+        mappings.remap(0x5000, 0x1000, 0x9000, 0x1000, false);
         assert_eq!(
             before_remap,
             mappings.futex_id(mm(10), 0x9010),
             "mremap must retain the backing-object offset"
         );
         assert_ne!(original, before_remap);
+    }
+
+    /// `MREMAP_DONTUNMAP` leaves the old mapping in place, so the old and new
+    /// ranges both resolve to the same backing object
+    /// (https://github.com/rrnewton/hermit/pull/4020).
+    #[test]
+    fn a_dontunmap_remap_keeps_both_aliases_of_the_object() {
+        let mut mappings = MemoryMetadata::new();
+        mappings.map_anonymous(mm(10), 0x5000, 0x1000);
+        let before = mappings.futex_id(mm(10), 0x5010);
+        mappings.remap(0x5000, 0x1000, 0x9000, 0x1000, true);
+        assert!(matches!(before, FutexID::Shared { .. }));
+        assert_eq!(mappings.futex_id(mm(10), 0x5010), before);
+        assert_eq!(mappings.futex_id(mm(10), 0x9010), before);
     }
 }

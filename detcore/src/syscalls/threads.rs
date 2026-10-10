@@ -33,6 +33,7 @@ use tracing::debug;
 use tracing::info;
 use tracing::trace;
 
+use crate::SharedMemoryObjectId;
 use crate::config::BlockingMode;
 use crate::memory::MemoryMetadata;
 use crate::record_or_replay::RecordOrReplay;
@@ -79,6 +80,7 @@ use crate::types::ChildWaitSpec;
 use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::ExactChildWaitState;
+use crate::types::FutexID;
 use crate::types::LogicalTime;
 use crate::types::SigWrapper;
 
@@ -1831,6 +1833,65 @@ impl<T: RecordOrReplay> Detcore<T> {
         deadline: FutexDeadline,
     ) -> Result<i64, Error> {
         let dettid = guest.thread_state().dettid;
+        // Detcore emulates the futex commands below, so it also answers, as Linux's
+        // `do_futex` (kernel/futex/syscalls.c) does, for the ones it does not serve:
+        // before the futex address is even looked at.
+        if self.cfg.sequentialize_threads
+            && !matches!(self.cfg.debug_futex_mode, BlockingMode::External)
+        {
+            match classify_futex_command(call.futex_op()) {
+                FutexCommand::Served => {}
+                FutexCommand::NoSys => return Err(Error::Errno(Errno::ENOSYS)),
+                FutexCommand::PriorityInheritance(name) => {
+                    return self
+                        .refuse_futex_command(
+                            guest,
+                            name,
+                            "Detcore does not emulate priority-inheritance futexes",
+                        )
+                        .await;
+                }
+            }
+        }
+        // FUTEX_REQUEUE, FUTEX_CMP_REQUEUE and FUTEX_WAKE_OP key their words
+        // without reading `uaddr` (only CMP_REQUEUE compares it), and NULL is a
+        // valid private key for them, so they take their own path before the
+        // NULL passthrough and the read below.
+        if self.cfg.sequentialize_threads
+            && !matches!(self.cfg.debug_futex_mode, BlockingMode::External)
+        {
+            let command = call.futex_op() & libc::FUTEX_CMD_MASK;
+            // FUTEX_WAKE and FUTEX_WAKE_BITSET only key their word too, and a
+            // requeue can leave a modeled waiter on any admitted private key,
+            // NULL or unmapped included, which a wake must still reach.
+            if matches!(command, libc::FUTEX_WAKE | libc::FUTEX_WAKE_BITSET)
+                && matches!(self.cfg.debug_futex_mode, BlockingMode::Precise)
+            {
+                return self.handle_futex_wake(guest, call, command).await;
+            }
+            let name = match command {
+                libc::FUTEX_REQUEUE => Some("FUTEX_REQUEUE"),
+                libc::FUTEX_CMP_REQUEUE => Some("FUTEX_CMP_REQUEUE"),
+                libc::FUTEX_WAKE_OP => Some("FUTEX_WAKE_OP"),
+                _ => None,
+            };
+            if let Some(name) = name {
+                // Polling waiters are not on a waiter list that a requeue or a
+                // WAKE_OP's second wake could act on.
+                if matches!(self.cfg.debug_futex_mode, BlockingMode::Polling) {
+                    return self
+                        .refuse_futex_command(guest, name, POLLING_REFUSAL)
+                        .await;
+                }
+                return if command == libc::FUTEX_WAKE_OP {
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    self.handle_futex_wake_op(guest, call).await
+                } else {
+                    // AUTONOMOUS-BOT-IMPLEMENTED
+                    self.handle_futex_requeue(guest, call, command).await
+                };
+            }
+        }
         let ptr = match call.uaddr() {
             None => {
                 // null pointer error:
@@ -1838,6 +1899,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             Some(x) => x,
         };
+        if self.cfg.sequentialize_threads
+            && !matches!(self.cfg.debug_futex_mode, BlockingMode::External)
+            && !AddrMut::as_raw(ptr).is_multiple_of(std::mem::size_of::<u32>())
+        {
+            // `get_futex_key` refuses a misaligned futex word before any access.
+            return Err(Error::Errno(Errno::EINVAL));
+        }
         let init_val = guest.memory().read_value(ptr)?;
         trace!(
             "[detcore, dtid {}] futex op with memory address containing value {}",
@@ -1886,48 +1954,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let dettid = guest.thread_state().dettid;
         match futex_op {
-            libc::FUTEX_WAKE | libc::FUTEX_WAKE_BITSET => {
-                let num = match futex_action(
-                    guest,
-                    FutexAction::WakeRequest(call.val()),
-                    &futexid,
-                    init_val,
-                    bitset,
-                )
-                .await
-                .expect("futex wake must return value")
-                {
-                    SchedValue::Value(num) => num,
-                    SchedValue::TimeOut => panic!("impossible, futex wake doesn't have a timeout"),
-                    SchedValue::Signaled(_) => panic!("impossible, futex wake is never signaled"),
-                };
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#845): Review exited-thread futex diagnostics.
-                match guest.memory().read_value(ptr) {
-                    Ok(observed) => trace!(
-                        "[detcore, dtid {}] emulated futex wake committed, memory value is {}, expected {}",
-                        &dettid,
-                        observed,
-                        call.val(),
-                    ),
-                    Err(error) => trace!(
-                        "[detcore, dtid {}] skipped post-wake futex memory diagnostic: {}",
-                        &dettid, error,
-                    ),
-                }
-                let _ = futex_action(
-                    guest,
-                    FutexAction::WakeFinished(0),
-                    &futexid,
-                    init_val,
-                    bitset,
-                )
-                .await;
-                if self.cfg.yields_after_futex_wake(num) {
-                    guest.thread_state_mut().yield_after_futex_wake = true;
-                }
-                Ok(num as i64)
-            }
             libc::FUTEX_WAIT | libc::FUTEX_WAIT_BITSET => {
                 if init_val != call.val() {
                     info!(
@@ -2108,13 +2134,223 @@ impl<T: RecordOrReplay> Detcore<T> {
                     res
                 }
             }
-            libc::FUTEX_FD => {
-                panic!("[detcore] refusing to execute FUTEX_FD, which was removed in Linux 2.6.26.")
-            }
-            other => {
-                panic!("[detcore] futex op not handled yet: {}", other);
+            // `classify_futex_command` already answered every other command.
+            _ => Err(Error::Errno(Errno::ENOSYS)),
+        }
+    }
+
+    /// FUTEX_WAKE and FUTEX_WAKE_BITSET, as Linux's `futex_wake`
+    /// (kernel/futex/waitwake.c): `-EINVAL` for a zero bitset, then the word is
+    /// keyed for reading (`futex_key`) and never read, and up to `val` modeled
+    /// waiters whose bitset matches are woken (a count of 0 or below wakes one).
+    async fn handle_futex_wake<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Futex,
+        command: i32,
+    ) -> Result<i64, Error> {
+        let bitset = if command == libc::FUTEX_WAKE_BITSET {
+            call.val3() as u32
+        } else {
+            u32::MAX
+        };
+        if bitset == 0 {
+            return Err(Error::Errno(Errno::EINVAL));
+        }
+        let private = call.futex_op() & libc::FUTEX_PRIVATE_FLAG != 0;
+        let futexid = futex_key(guest, futex_uaddr(&call), private, KeyAccess::Read)?;
+        let num = match futex_action(
+            guest,
+            FutexAction::WakeRequest(call.val()),
+            &futexid,
+            0,
+            bitset,
+        )
+        .await
+        .expect("futex wake must return value")
+        {
+            SchedValue::Value(num) => num,
+            other => panic!("impossible answer to a futex wake: {:?}", other),
+        };
+        let _ = futex_action(guest, FutexAction::WakeFinished(0), &futexid, 0, bitset).await;
+        if self.cfg.yields_after_futex_wake(num) {
+            guest.thread_state_mut().yield_after_futex_wake = true;
+        }
+        Ok(num as i64)
+    }
+
+    /// FUTEX_REQUEUE and FUTEX_CMP_REQUEUE on plain futexes, as Linux's
+    /// `futex_requeue` (kernel/futex/requeue.c) with `requeue_pi == 0`, in its
+    /// order:
+    /// - `-EINVAL` if `nr_wake` (`val`) or `nr_requeue` (`val2`, passed in the
+    ///   timeout slot) is negative as an `int`, before any address is looked at;
+    /// - both words keyed (`futex_key`): `-EINVAL` if misaligned, `-EFAULT` if
+    ///   outside the user address range or, for a shared key, unmapped;
+    /// - for FUTEX_CMP_REQUEUE only, the `uaddr` word read with the guest's own
+    ///   permissions (`-EFAULT`), then `-EAGAIN` if it differs from `val3`.
+    ///   Plain FUTEX_REQUEUE never reads either word;
+    /// - wake the first `nr_wake` waiters, move up to `nr_requeue` more onto
+    ///   `uaddr2` (`Scheduler::requeue_futex_waiters`), and return how many were
+    ///   woken plus moved.
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/4020): Review the
+    // emulated futex requeue and its waiter ordering.
+    async fn handle_futex_requeue<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Futex,
+        command: i32,
+    ) -> Result<i64, Error> {
+        let nr_wake = call.val();
+        let nr_requeue = futex_val2(&call) as i32;
+        if nr_wake < 0 || nr_requeue < 0 {
+            return Err(Error::Errno(Errno::EINVAL));
+        }
+        let private = call.futex_op() & libc::FUTEX_PRIVATE_FLAG != 0;
+        let uaddr = futex_uaddr(&call);
+        let futexid = futex_key(guest, uaddr, private, KeyAccess::Read)?;
+        let futexid2 = futex_key(guest, futex_uaddr2(&call), private, KeyAccess::Read)?;
+        let mut current = 0;
+        if command == libc::FUTEX_CMP_REQUEUE {
+            current = read_futex_word(guest, uaddr)?;
+            if current != call.val3() {
+                return Err(Error::Errno(Errno::EAGAIN));
             }
         }
+        let woken_and_moved = match futex_action(
+            guest,
+            FutexAction::RequeueRequest(futexid2, nr_wake as u32, nr_requeue as u32),
+            &futexid,
+            current,
+            u32::MAX,
+        )
+        .await
+        {
+            Some(SchedValue::Requeued { woken, moved }) => {
+                if self.cfg.yields_after_futex_wake(woken) {
+                    guest.thread_state_mut().yield_after_futex_wake = true;
+                }
+                woken + moved
+            }
+            // A logically killed or replaced caller is answered with a plain value, as
+            // its wakes are; it never returns to the guest.
+            Some(SchedValue::Value(num)) => num,
+            other => panic!("impossible answer to a futex requeue: {:?}", other),
+        };
+        let _ = futex_action(
+            guest,
+            FutexAction::WakeFinished(0),
+            &futexid,
+            current,
+            u32::MAX,
+        )
+        .await;
+        Ok(woken_and_moved as i64)
+    }
+
+    /// FUTEX_WAKE_OP, as Linux's `futex_wake_op` (kernel/futex/waitwake.c), in
+    /// its order: key both words (`futex_key`; the `uaddr` word is never read);
+    /// apply the operation encoded in `val3` to the word at `uaddr2`
+    /// (`futex_atomic_op_inuser`); wake up to `nr_wake` (`val`) waiters on
+    /// `uaddr` and, if the encoded comparison of the old value holds, up to
+    /// `nr_wake2` (`val2`, in the timeout slot) waiters on `uaddr2`. Returns the
+    /// total woken.
+    /// - An unknown operation is `-ENOSYS` before the word is touched; an
+    ///   unknown comparison is `-ENOSYS` after it was written, and nobody is
+    ///   woken. So a private NULL `uaddr2` (a valid key) with an unknown
+    ///   operation is `-ENOSYS`.
+    /// - The word is read and written as exactly four bytes with the guest's own
+    ///   permissions, so an unreadable or unwritable word is `-EFAULT` and a word
+    ///   at the end of a page next to a hole is fine.
+    ///
+    /// Both wakes count a waiter before comparing, so a count of 0 or below wakes
+    /// one, and neither looks at the waiters' bitsets, as `futex_wake_op` does not.
+    /// The read-modify-write is atomic with respect to the guest because Detcore
+    /// runs one guest thread at a time and this one holds the turn, and only
+    /// guest threads can reach a private or anonymous shared word. A word in a
+    /// file-backed shared mapping can also be written by a process outside
+    /// Hermit, which Linux's locked instruction would not lose, so that case is
+    /// refused by name before any side effect.
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/4020): Review the
+    // emulated FUTEX_WAKE_OP and its read-modify-write of the guest word.
+    async fn handle_futex_wake_op<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Futex,
+    ) -> Result<i64, Error> {
+        let nr_wake = call.val();
+        let nr_wake2 = futex_val2(&call) as i32;
+        let private = call.futex_op() & libc::FUTEX_PRIVATE_FLAG != 0;
+        let uaddr2 = futex_uaddr2(&call);
+        let futexid = futex_key(guest, futex_uaddr(&call), private, KeyAccess::Read)?;
+        let futexid2 = futex_key(guest, uaddr2, private, KeyAccess::Write)?;
+        let op = FutexWakeOp::decode(call.val3() as u32);
+        if !op.has_known_operation() {
+            return Err(Error::Errno(Errno::ENOSYS));
+        }
+        if matches!(
+            guest.thread_state().futex_id(uaddr2, false),
+            FutexID::Shared {
+                object: SharedMemoryObjectId::File { .. } | SharedMemoryObjectId::OpenFile { .. },
+                ..
+            }
+        ) {
+            return self
+                .refuse_futex_command(
+                    guest,
+                    "FUTEX_WAKE_OP",
+                    "its word is in a file-backed shared mapping that a process outside Hermit \
+                     could update concurrently, and Detcore cannot apply the operation atomically",
+                )
+                .await;
+        }
+        let old = read_futex_word(guest, uaddr2)?;
+        let new = op.apply(old).expect("operation was checked to be known");
+        let word2 = AddrMut::<libc::c_int>::from_raw(uaddr2).ok_or(Errno::EFAULT)?;
+        guest
+            .memory()
+            .write_value(word2, &new)
+            .map_err(|_| Error::Errno(Errno::EFAULT))?;
+        let Some(wake2) = op.compare(old) else {
+            return Err(Error::Errno(Errno::ENOSYS));
+        };
+        let mut woken = 0;
+        for (futex, count, wake) in [(futexid, nr_wake, true), (futexid2, nr_wake2, wake2)] {
+            if !wake {
+                continue;
+            }
+            woken += match futex_action(guest, FutexAction::WakeRequest(count), &futex, 0, u32::MAX)
+                .await
+            {
+                Some(SchedValue::Value(num)) => num,
+                other => panic!("impossible answer to a futex wake: {:?}", other),
+            };
+            let _ = futex_action(guest, FutexAction::WakeFinished(0), &futex, 0, u32::MAX).await;
+        }
+        if self.cfg.yields_after_futex_wake(woken) {
+            guest.thread_state_mut().yield_after_futex_wake = true;
+        }
+        Ok(woken as i64)
+    }
+
+    /// Refuse a futex command Detcore cannot serve deterministically, naming it,
+    /// through the unsupported-syscall policy (`refuse_unserviceable_operation`).
+    /// A run that is not fail-closed gets `-ENOSYS`, which is what Linux returns
+    /// for every priority-inheritance command when built without CONFIG_FUTEX_PI
+    /// (kernel/futex/pi.c, kernel/futex/requeue.c).
+    async fn refuse_futex_command<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        name: &'static str,
+        reason: &'static str,
+    ) -> Result<i64, Error> {
+        tracing::error!(
+            "[detcore, dtid {}] futex command {} is not supported: {}",
+            guest.thread_state().dettid,
+            name,
+            reason,
+        );
+        self.refuse_unserviceable_operation(guest, reverie::syscalls::Sysno::futex, Errno::ENOSYS)
+            .await
     }
 
     /// Futex system call, alternative implemenattion where we treat futexes as InternalIOPolling
@@ -2176,12 +2412,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Ok(res)
                 }
             }
-            libc::FUTEX_FD => {
-                panic!("[detcore] refusing to execute FUTEX_FD, which was removed in Linux 2.6.26.")
-            }
-            other => {
-                panic!("[detcore] futex op not handled yet: {}", other);
-            }
+            // `classify_futex_command` already answered every other command.
+            _ => Err(Error::Errno(Errno::ENOSYS)),
         }
     }
 
@@ -3370,7 +3602,10 @@ where
         {
             Some(SchedValue::Value(count)) => count,
             // A wake never carries a timeout, and a cancelled RPC wakes nobody.
-            Some(SchedValue::TimeOut) | Some(SchedValue::Signaled(_)) | None => 0,
+            Some(SchedValue::TimeOut)
+            | Some(SchedValue::Signaled(_))
+            | Some(SchedValue::Requeued { .. })
+            | None => 0,
         };
         // Guest-level identities only: dettid, the modeled futex key, and a
         // count. No host pointers and no iteration order leak into this line,
@@ -3400,6 +3635,302 @@ enum OwnerDeath {
     /// caller's list is walked under the TID it holds after `de_thread`.
     Exec,
 }
+
+/// How precise and polling futex modes answer a futex command, decided as
+/// Linux's `do_futex` (kernel/futex/syscalls.c) decides it, before the futex
+/// address is looked at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FutexCommand {
+    /// Emulated: FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAKE, FUTEX_WAKE_BITSET,
+    /// FUTEX_REQUEUE, FUTEX_CMP_REQUEUE and FUTEX_WAKE_OP.
+    Served,
+    /// `-ENOSYS`, exactly as Linux: FUTEX_CLOCK_REALTIME with any command but
+    /// FUTEX_WAIT_BITSET, FUTEX_WAIT_REQUEUE_PI or FUTEX_LOCK_PI2; the removed
+    /// FUTEX_FD; and any unknown command.
+    NoSys,
+    /// A priority-inheritance command, which Detcore does not emulate; refused
+    /// by name (`Detcore::refuse_futex_command`).
+    PriorityInheritance(&'static str),
+}
+
+/// [`FutexCommand`] for a raw `futex_op`.
+// AUTONOMOUS-BOT-IMPLEMENTED
+pub(crate) fn classify_futex_command(futex_op: i32) -> FutexCommand {
+    let cmd = futex_op & libc::FUTEX_CMD_MASK;
+    if futex_op & libc::FUTEX_CLOCK_REALTIME != 0
+        && !matches!(
+            cmd,
+            libc::FUTEX_WAIT_BITSET | libc::FUTEX_WAIT_REQUEUE_PI | libc::FUTEX_LOCK_PI2
+        )
+    {
+        return FutexCommand::NoSys;
+    }
+    match cmd {
+        libc::FUTEX_WAIT
+        | libc::FUTEX_WAIT_BITSET
+        | libc::FUTEX_WAKE
+        | libc::FUTEX_WAKE_BITSET
+        | libc::FUTEX_REQUEUE
+        | libc::FUTEX_CMP_REQUEUE
+        | libc::FUTEX_WAKE_OP => FutexCommand::Served,
+        libc::FUTEX_LOCK_PI => FutexCommand::PriorityInheritance("FUTEX_LOCK_PI"),
+        libc::FUTEX_LOCK_PI2 => FutexCommand::PriorityInheritance("FUTEX_LOCK_PI2"),
+        libc::FUTEX_UNLOCK_PI => FutexCommand::PriorityInheritance("FUTEX_UNLOCK_PI"),
+        libc::FUTEX_TRYLOCK_PI => FutexCommand::PriorityInheritance("FUTEX_TRYLOCK_PI"),
+        libc::FUTEX_WAIT_REQUEUE_PI => FutexCommand::PriorityInheritance("FUTEX_WAIT_REQUEUE_PI"),
+        libc::FUTEX_CMP_REQUEUE_PI => FutexCommand::PriorityInheritance("FUTEX_CMP_REQUEUE_PI"),
+        _ => FutexCommand::NoSys,
+    }
+}
+
+/// Why `--debug-futex-mode polling` refuses FUTEX_REQUEUE, FUTEX_CMP_REQUEUE and
+/// FUTEX_WAKE_OP.
+const POLLING_REFUSAL: &str = "--debug-futex-mode polling does not model futex waiter lists";
+
+/// The `val2` of FUTEX_REQUEUE, FUTEX_CMP_REQUEUE and FUTEX_WAKE_OP, which the
+/// syscall passes in the timeout argument: `sys_futex` hands
+/// `(unsigned long)utime` to `do_futex` as a `u32`, and the commands read it as
+/// an `int`.
+fn futex_val2(call: &syscalls::Futex) -> u32 {
+    call.timeout().map_or(0, Addr::as_raw) as u32
+}
+
+/// The raw `uaddr2` argument; NULL is address 0, as Linux keys it.
+fn futex_uaddr2(call: &syscalls::Futex) -> usize {
+    call.uaddr2().map_or(0, AddrMut::as_raw)
+}
+
+/// The raw `uaddr` of a futex call; NULL is a valid private key for the
+/// commands that only key their words.
+fn futex_uaddr(call: &syscalls::Futex) -> usize {
+    call.uaddr().map_or(0, AddrMut::as_raw)
+}
+
+/// How a command acquires a futex key: Linux's `enum futex_access`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyAccess {
+    /// `FUTEX_READ`: the word is only compared or woken.
+    Read,
+    /// `FUTEX_WRITE`: the word is changed (WAKE_OP's second word).
+    Write,
+}
+
+/// The highest address `access_ok` accepts for a futex word on this host,
+/// `USER_PTR_MAX` (arch/x86/include/asm/uaccess_64.h). It depends on the
+/// paging mode the kernel booted with, so it is measured once from the host
+/// kernel, which is also the guest's kernel: a private FUTEX_WAKE with count 0
+/// keys the word without touching it and fails with EFAULT exactly when
+/// `access_ok` refuses it.
+fn user_ptr_max() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        let accepted = |address: usize| {
+            // SAFETY: a private FUTEX_WAKE with count 0 never accesses `address`.
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_futex,
+                    address,
+                    libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+            };
+            ret >= 0
+        };
+        // Binary search over 4-aligned addresses: 0 is accepted, and an address
+        // with the top bit set never is.
+        let (mut ok, mut bad) = (0usize, 1usize << 63);
+        while bad - ok > 4 {
+            let mid = (ok + (bad - ok) / 2) & !3;
+            if accepted(mid) { ok = mid } else { bad = mid }
+        }
+        ok
+    })
+}
+
+/// The futex key of a word that a command keys, as Linux's `get_futex_key`
+/// (kernel/futex/core.c) admits it, without reading the word:
+/// - `-EINVAL` if it is not 4-aligned;
+/// - `-EFAULT` if `access_ok` refuses it (`user_ptr_max`);
+/// - a private key needs nothing more, so NULL is a valid one;
+/// - a shared key needs its backing page: a writable mapping always works
+///   (`FOLL_WRITE`); a read-only one only for a `FUTEX_READ` key and only if its
+///   page is file or shmem backed, because a read-only anonymous page, whether
+///   a private folio or the zero page, is `-EFAULT`; an inaccessible or
+///   unmapped word is `-EFAULT`.
+fn futex_key<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &mut G,
+    address: usize,
+    private: bool,
+    access: KeyAccess,
+) -> Result<FutexID, Error> {
+    if !address.is_multiple_of(std::mem::size_of::<u32>()) {
+        return Err(Error::Errno(Errno::EINVAL));
+    }
+    if address > user_ptr_max() {
+        return Err(Error::Errno(Errno::EFAULT));
+    }
+    if !private {
+        let admitted = match guest_mapping(guest.pid().as_raw(), address) {
+            Some(mapping) if mapping.writable => true,
+            Some(mapping) => access == KeyAccess::Read && mapping.readable && mapping.file_backed,
+            None => false,
+        };
+        if !admitted {
+            return Err(Error::Errno(Errno::EFAULT));
+        }
+    }
+    Ok(guest.thread_state().futex_id(address, private))
+}
+
+/// A futex word's value as a user-mode access reads it, which is what Linux's
+/// `futex_get_value_locked`/`get_user` and `futex_atomic_op_inuser` do:
+/// `-EFAULT` if the word cannot be read.
+///
+/// The word is read as exactly four bytes with the guest's own permissions. On
+/// x86 a writable page is also readable from user mode, but that read refuses a
+/// mapping without `PROT_READ`, so for a writable one the 8-byte-aligned word
+/// containing it is read instead. That cannot cross into the next page, unlike a
+/// debugger read at the word's own address. A debugger read alone would also
+/// ignore `PROT_NONE`.
+fn read_futex_word<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &mut G,
+    address: usize,
+) -> Result<i32, Error> {
+    let word = Addr::<u8>::from_raw(address).ok_or(Errno::EFAULT)?;
+    let mut bytes = [0u8; 4];
+    if guest
+        .memory()
+        .read_exact_with_user_access(word, &mut bytes)
+        .is_ok()
+    {
+        return Ok(i32::from_ne_bytes(bytes));
+    }
+    if !guest_mapping(guest.pid().as_raw(), address).is_some_and(|mapping| mapping.writable) {
+        return Err(Error::Errno(Errno::EFAULT));
+    }
+    let aligned = address & !(std::mem::size_of::<u64>() - 1);
+    let pair: u64 = guest
+        .memory()
+        .read_value(Addr::<u64>::from_raw(aligned).ok_or(Errno::EFAULT)?)
+        .map_err(|_| Error::Errno(Errno::EFAULT))?;
+    let offset = address - aligned;
+    let pair = pair.to_ne_bytes();
+    bytes.copy_from_slice(&pair[offset..offset + 4]);
+    Ok(i32::from_ne_bytes(bytes))
+}
+
+/// The permissions and backing of the guest mapping containing an address.
+#[derive(Clone, Copy, Debug)]
+struct GuestMapping {
+    readable: bool,
+    writable: bool,
+    /// Backed by a file or shmem (a nonzero inode, which includes shared
+    /// anonymous memory) rather than by anonymous pages.
+    file_backed: bool,
+}
+
+/// The guest mapping containing `address`, from `/proc/<pid>/maps`. `None` if
+/// no mapping contains it or the file cannot be read.
+fn guest_mapping(pid: i32, address: usize) -> Option<GuestMapping> {
+    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).ok()?;
+    maps.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let range = fields.next()?;
+        let perms = fields.next()?.as_bytes();
+        let inode = fields.nth(2)?;
+        let (start, end) = range.split_once('-')?;
+        let start = usize::from_str_radix(start, 16).ok()?;
+        let end = usize::from_str_radix(end, 16).ok()?;
+        (start..end).contains(&address).then(|| GuestMapping {
+            readable: perms.first() == Some(&b'r'),
+            writable: perms.get(1) == Some(&b'w'),
+            file_backed: inode != "0",
+        })
+    })
+}
+
+// FUTEX_WAKE_OP operations and comparisons (include/uapi/linux/futex.h).
+const FUTEX_OP_SET: u32 = 0;
+const FUTEX_OP_ADD: u32 = 1;
+const FUTEX_OP_OR: u32 = 2;
+const FUTEX_OP_ANDN: u32 = 3;
+const FUTEX_OP_XOR: u32 = 4;
+const FUTEX_OP_OPARG_SHIFT: u32 = 8;
+const FUTEX_OP_CMP_EQ: u32 = 0;
+const FUTEX_OP_CMP_NE: u32 = 1;
+const FUTEX_OP_CMP_LT: u32 = 2;
+const FUTEX_OP_CMP_GE: u32 = 3;
+const FUTEX_OP_CMP_LE: u32 = 4;
+const FUTEX_OP_CMP_GT: u32 = 5;
+
+/// FUTEX_WAKE_OP's encoded operation, decoded as Linux's
+/// `futex_atomic_op_inuser` (kernel/futex/waitwake.c) decodes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FutexWakeOp {
+    op: u32,
+    cmp: u32,
+    oparg: i32,
+    cmparg: i32,
+}
+
+impl FutexWakeOp {
+    pub(crate) fn decode(encoded: u32) -> Self {
+        let sign_extend_12 = |v: u32| ((v << 20) as i32) >> 20;
+        let op = (encoded & 0x7000_0000) >> 28;
+        let cmp = (encoded & 0x0f00_0000) >> 24;
+        let mut oparg = sign_extend_12((encoded & 0x00ff_f000) >> 12);
+        let cmparg = sign_extend_12(encoded & 0x0000_0fff);
+        if encoded & (FUTEX_OP_OPARG_SHIFT << 28) != 0 {
+            // Linux masks an out-of-range shift (and logs "fix this program").
+            if !(0..=31).contains(&oparg) {
+                oparg &= 31;
+            }
+            oparg = 1i32.wrapping_shl(oparg as u32);
+        }
+        FutexWakeOp {
+            op,
+            cmp,
+            oparg,
+            cmparg,
+        }
+    }
+
+    /// Whether the operation is one x86's `arch_futex_atomic_op_inuser` knows;
+    /// it returns `-ENOSYS` for any other before touching the word.
+    pub(crate) fn has_known_operation(&self) -> bool {
+        self.apply(0).is_some()
+    }
+
+    /// The new value of the word, from its old value.
+    pub(crate) fn apply(&self, old: i32) -> Option<i32> {
+        Some(match self.op {
+            FUTEX_OP_SET => self.oparg,
+            FUTEX_OP_ADD => old.wrapping_add(self.oparg),
+            FUTEX_OP_OR => old | self.oparg,
+            FUTEX_OP_ANDN => old & !self.oparg,
+            FUTEX_OP_XOR => old ^ self.oparg,
+            _ => return None,
+        })
+    }
+
+    /// Whether to wake on `uaddr2`, from the word's old value; `None` (`-ENOSYS`)
+    /// for an unknown comparison.
+    pub(crate) fn compare(&self, old: i32) -> Option<bool> {
+        Some(match self.cmp {
+            FUTEX_OP_CMP_EQ => old == self.cmparg,
+            FUTEX_OP_CMP_NE => old != self.cmparg,
+            FUTEX_OP_CMP_LT => old < self.cmparg,
+            FUTEX_OP_CMP_GE => old >= self.cmparg,
+            FUTEX_OP_CMP_LE => old <= self.cmparg,
+            FUTEX_OP_CMP_GT => old > self.cmparg,
+            _ => return None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Read;
@@ -4022,6 +4553,110 @@ mod tests {
         assert!(!waitid_code_is_termination(libc::CLD_STOPPED));
         assert!(!waitid_code_is_termination(libc::CLD_CONTINUED));
         assert!(!waitid_code_is_termination(libc::CLD_TRAPPED));
+    }
+
+    /// `do_futex` (kernel/futex/syscalls.c): FUTEX_CLOCK_REALTIME only with
+    /// FUTEX_WAIT_BITSET, FUTEX_WAIT_REQUEUE_PI or FUTEX_LOCK_PI2, else -ENOSYS;
+    /// the removed FUTEX_FD and unknown commands are -ENOSYS; the PI commands are
+    /// refused by name; the rest are emulated
+    /// (https://github.com/rrnewton/hermit/issues/3958).
+    #[test]
+    fn futex_commands_are_classified_as_linux_dispatches_them() {
+        use FutexCommand::*;
+        let private = libc::FUTEX_PRIVATE_FLAG;
+        let realtime = libc::FUTEX_CLOCK_REALTIME;
+        for cmd in [
+            libc::FUTEX_WAIT,
+            libc::FUTEX_WAIT_BITSET,
+            libc::FUTEX_WAKE,
+            libc::FUTEX_WAKE_BITSET,
+            libc::FUTEX_REQUEUE,
+            libc::FUTEX_CMP_REQUEUE,
+            libc::FUTEX_WAKE_OP,
+        ] {
+            assert_eq!(classify_futex_command(cmd), Served, "cmd {cmd}");
+            assert_eq!(classify_futex_command(cmd | private), Served, "cmd {cmd}");
+        }
+        assert_eq!(
+            classify_futex_command(libc::FUTEX_WAIT_BITSET | realtime),
+            Served
+        );
+        for cmd in [
+            libc::FUTEX_WAIT,
+            libc::FUTEX_WAKE,
+            libc::FUTEX_REQUEUE,
+            libc::FUTEX_WAKE_OP,
+        ] {
+            assert_eq!(classify_futex_command(cmd | realtime), NoSys, "cmd {cmd}");
+        }
+        for cmd in [libc::FUTEX_FD, 14, 99, libc::FUTEX_CMD_MASK] {
+            assert_eq!(classify_futex_command(cmd), NoSys, "cmd {cmd}");
+        }
+        assert_eq!(
+            classify_futex_command(libc::FUTEX_LOCK_PI | private),
+            PriorityInheritance("FUTEX_LOCK_PI")
+        );
+        assert_eq!(
+            classify_futex_command(libc::FUTEX_LOCK_PI2 | realtime),
+            PriorityInheritance("FUTEX_LOCK_PI2")
+        );
+        assert_eq!(
+            classify_futex_command(libc::FUTEX_LOCK_PI | realtime),
+            NoSys
+        );
+        for (cmd, name) in [
+            (libc::FUTEX_UNLOCK_PI, "FUTEX_UNLOCK_PI"),
+            (libc::FUTEX_TRYLOCK_PI, "FUTEX_TRYLOCK_PI"),
+            (libc::FUTEX_WAIT_REQUEUE_PI, "FUTEX_WAIT_REQUEUE_PI"),
+            (libc::FUTEX_CMP_REQUEUE_PI, "FUTEX_CMP_REQUEUE_PI"),
+        ] {
+            assert_eq!(classify_futex_command(cmd), PriorityInheritance(name));
+        }
+    }
+
+    /// FUTEX_WAKE_OP's encoding, as `futex_atomic_op_inuser` decodes it: 12-bit
+    /// signed arguments, the shift flag (with an out-of-range shift masked to
+    /// 0..31), and -ENOSYS for an unknown operation or comparison.
+    #[test]
+    fn futex_wake_op_decodes_and_applies_as_linux() {
+        let encode = |op: u32, cmp: u32, oparg: u32, cmparg: u32| {
+            ((op & 0xf) << 28) | ((cmp & 0xf) << 24) | ((oparg & 0xfff) << 12) | (cmparg & 0xfff)
+        };
+        let set5_eq0 = FutexWakeOp::decode(encode(FUTEX_OP_SET, FUTEX_OP_CMP_EQ, 5, 0));
+        assert_eq!(set5_eq0.apply(0), Some(5));
+        assert_eq!(set5_eq0.compare(0), Some(true));
+        assert_eq!(set5_eq0.compare(1), Some(false));
+        let add_minus1 = FutexWakeOp::decode(encode(FUTEX_OP_ADD, FUTEX_OP_CMP_LT, 0xfff, 0x800));
+        assert_eq!(add_minus1.apply(10), Some(9));
+        assert_eq!(add_minus1.apply(i32::MIN), Some(i32::MAX));
+        assert_eq!(add_minus1.compare(-2048), Some(false));
+        assert_eq!(add_minus1.compare(-2049), Some(true));
+        let or = FutexWakeOp::decode(encode(FUTEX_OP_OR, FUTEX_OP_CMP_NE, 0b100, 7));
+        assert_eq!(or.apply(0b011), Some(0b111));
+        assert_eq!(or.compare(7), Some(false));
+        let andn = FutexWakeOp::decode(encode(FUTEX_OP_ANDN, FUTEX_OP_CMP_GE, 0b110, 3));
+        assert_eq!(andn.apply(0b111), Some(0b001));
+        assert_eq!(andn.compare(3), Some(true));
+        let xor = FutexWakeOp::decode(encode(FUTEX_OP_XOR, FUTEX_OP_CMP_LE, 0xff, 0));
+        assert_eq!(xor.apply(0x0f), Some(0xf0));
+        assert_eq!(xor.compare(1), Some(false));
+        let shift = FutexWakeOp::decode(encode(
+            FUTEX_OP_OPARG_SHIFT | FUTEX_OP_OR,
+            FUTEX_OP_CMP_GT,
+            3,
+            0,
+        ));
+        assert_eq!(shift.apply(0), Some(8));
+        assert_eq!(shift.compare(1), Some(true));
+        // A shift of -1 (0xfff) is masked to 31, as Linux does.
+        let masked = FutexWakeOp::decode(encode(FUTEX_OP_OPARG_SHIFT | FUTEX_OP_SET, 0, 0xfff, 0));
+        assert_eq!(masked.apply(0), Some(i32::MIN));
+        let unknown_op = FutexWakeOp::decode(encode(7, FUTEX_OP_CMP_EQ, 1, 0));
+        assert!(!unknown_op.has_known_operation());
+        assert_eq!(unknown_op.apply(0), None);
+        let unknown_cmp = FutexWakeOp::decode(encode(FUTEX_OP_SET, 6, 1, 0));
+        assert!(unknown_cmp.has_known_operation());
+        assert_eq!(unknown_cmp.compare(0), None);
     }
 
     #[test]

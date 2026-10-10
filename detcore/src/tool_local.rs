@@ -2894,11 +2894,12 @@ impl<T> ThreadState<T> {
         old_len: usize,
         new_start: usize,
         new_len: usize,
+        keep_source: bool,
     ) {
         self.memory_metadata
             .lock()
             .expect("memory metadata mutex poisoned")
-            .remap(old_start, old_len, new_start, new_len);
+            .remap(old_start, old_len, new_start, new_len, keep_source);
     }
 
     /// Build a singleton resource request from the current thread.

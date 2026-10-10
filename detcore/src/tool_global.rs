@@ -2926,7 +2926,10 @@ impl GlobalState {
 
                 let endtime_update = match schedval {
                     // Only syscalls timeout, and they don't need to update guest timeslice end.
-                    SchedValue::TimeOut | SchedValue::Signaled(_) => None,
+                    // Nor does a futex requeue's answer, which a resource grant never carries.
+                    SchedValue::TimeOut | SchedValue::Signaled(_) | SchedValue::Requeued { .. } => {
+                        None
+                    }
                     SchedValue::Value(timeslice) => Some(LogicalTime::from_nanos(timeslice)),
                 };
                 (
@@ -3533,6 +3536,18 @@ impl GlobalState {
                 }
                 FutexAction::WakeFinished(_num_threads) => {
                     return None;
+                }
+                FutexAction::RequeueRequest(to, nr_wake, nr_requeue) => {
+                    let (woken, moved) = sched.requeue_futex_waiters(
+                        futexid,
+                        to,
+                        nr_wake as usize,
+                        nr_requeue as usize,
+                    );
+                    if self.cfg.yields_after_futex_wake(woken) {
+                        sched.requeue_futex_waker(dettid);
+                    }
+                    return Some(SchedValue::Requeued { woken, moved });
                 }
             }
             // Blocking on the FUTEX_WAIT here, remove ourselves:
@@ -5111,6 +5126,13 @@ pub enum FutexAction {
     WakeRequest(i32),
     /// Check in after a FUTEX_WAKE, parameterized by the number of threads woken.
     WakeFinished(i32),
+    /// Check in for a plain FUTEX_REQUEUE or FUTEX_CMP_REQUEUE of the request's
+    /// futex onto the given one, waking up to the first count and moving up to
+    /// the second (`Scheduler::requeue_futex_waiters`). Both counts are already
+    /// checked to be non-negative, and the futex word already compared for
+    /// FUTEX_CMP_REQUEUE. Answers with the number woken plus the number moved,
+    /// and is followed by a `WakeFinished`, as a wake is.
+    RequeueRequest(FutexID, u32, u32),
 }
 
 /// Ask scheduler for permission to proceed before/after futex operation.

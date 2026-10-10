@@ -1826,7 +1826,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and scheduler::test::{an_interrupted_posthook_anchor_is_refused_and_does_not_fire,
     // an_interrupted_posthook_refusal_grants_no_turn}
     // (https://github.com/rrnewton/hermit/issues/3929) retain all 1330: 1334.
-    ("test.detcore_unit", 1334),
+    // scheduler::tests::{a_futex_requeue_wakes_the_oldest_and_moves_the_next_in_order,
+    // futex_requeue_counts_follow_linux,
+    // a_futex_requeue_onto_itself_keeps_waiters_in_place},
+    // syscalls::threads::tests::{futex_commands_are_classified_as_linux_dispatches_them,
+    // futex_wake_op_decodes_and_applies_as_linux} and
+    // memory::tests::a_dontunmap_remap_keeps_both_aliases_of_the_object
+    // (https://github.com/rrnewton/hermit/pull/4020) retain all 1334: 1340,
+    // listed with `cargo nextest list -p hermit-detcore --lib --bins`.
+    ("test.detcore_unit", 1340),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2409,7 +2417,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // anchor_of_a_thread_that_exits_mid_call_never_fires} and
     // happens_before_alarm_at_a_thread_held_at_a_posthook_gate_leaves_it_held
     // (https://github.com/rrnewton/hermit/issues/3929) retain all 281: 290.
-    ("test.cli", 290),
+    // futex_requeue_and_wake_op_match_linux, futex_lock_pi_is_refused_by_name,
+    // futex_requeue_and_wake_op_key_and_access_their_words_as_linux and
+    // a_wake_op_on_a_file_backed_shared_word_is_refused_by_name
+    // (https://github.com/rrnewton/hermit/pull/4020) retain all 290: 294.
+    ("test.cli", 294),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2628,7 +2640,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Nor does the multithreaded process-directed signal test: 216.
     // Nor does the process-group signal test: 217.
     // And the nine posthook-anchor CLI tests: 226.
-    ("test.cli_on_host", 226),
+    // Nor do the four FUTEX_REQUEUE/FUTEX_WAKE_OP, FUTEX_LOCK_PI, futex
+    // key/access and file-backed WAKE_OP tests: 230.
+    ("test.cli_on_host", 230),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 55),
@@ -2760,7 +2774,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the four child-wait deadlock tests: 1328.
     // And a_committed_sigchld_ends_a_gated_wait_unless_a_host_timed_source_can_post_it and a_precise_futex_wait_holds_a_committed_signal_only_if_a_host_timed_source_can_post_it (https://github.com/rrnewton/hermit/issues/4005): 1330.
     // And the four posthook-anchor tests: 1334.
-    ("test.detcore_unit_on_host", 1334),
+    // And the five FUTEX_REQUEUE/FUTEX_WAKE_OP tests and the DONTUNMAP alias
+    // test: 1340.
+    ("test.detcore_unit_on_host", 1340),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

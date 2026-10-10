@@ -125,6 +125,10 @@ static POLL_TIMEOUT_VS_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_PARENT_KILLED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_KILL_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_WAKE_COUNT_ZERO_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static FUTEX_REQUEUE_WAKE_OP_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static FUTEX_LOCK_PI_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static FUTEX_KEYED_ACCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static FUTEX_WAKE_OP_FILE_SHARED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_MULTITHREADED_PROCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_PROCESS_GROUP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_CREATE_RT_SIGNAL_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -870,6 +874,32 @@ fn vfork_parent_killed_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "vfork-parent-killed guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// Compiles a futex guest from `tests/c` once per test process.
+fn futex_c_guest(cell: &'static OnceLock<PathBuf>, name: &str) -> &'static Path {
+    cell.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root(&name.replace('_', "-"));
+        fs::create_dir_all(&build_root).expect("failed to create the futex guest directory");
+        let guest = build_root.join(name);
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join(format!("tests/c/{name}.c")))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the futex guest");
+        assert!(
+            output.status.success(),
+            "{name} guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -21333,5 +21363,274 @@ fn a_real_time_signal_timer_is_refused_by_name_when_it_expires() {
     assert!(
         log.contains("which Detcore cannot deliver; it is armed but will never fire"),
         "the permissive run must say the timer will never fire:\nstderr:\n{log}"
+    );
+}
+
+/// FUTEX_REQUEUE, FUTEX_CMP_REQUEUE and FUTEX_WAKE_OP give Linux's results under
+/// precise futex mode, and so do the commands Linux answers with an errno
+/// (https://github.com/rrnewton/hermit/issues/3958). The expected output is the
+/// guest's native output on Linux; before the fix the first FUTEX_REQUEUE
+/// panicked Detcore ("futex op not handled yet").
+#[test]
+fn futex_requeue_and_wake_op_match_linux() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = futex_c_guest(&FUTEX_REQUEUE_WAKE_OP_GUEST, "futex_requeue_wake_op")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let (status, log) = run_with_deadline(
+        hermit_command(&["run", "--strict", "--timeout", "60", "--", guest.as_str()]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "the run must finish and exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(
+        stdout,
+        "requeue nr_requeue -1: -1 EINVAL\n\
+         requeue nr_wake -1: -1 EINVAL\n\
+         cmp_requeue val3 mismatch: -1 EAGAIN\n\
+         cmp_requeue nr_requeue -1, val3 mismatch: -1 EINVAL\n\
+         requeue to misaligned: -1 EINVAL\n\
+         wake misaligned: -1 EINVAL\n\
+         futex_fd: -1 ENOSYS\n\
+         unknown command 99: -1 ENOSYS\n\
+         wake with clock_realtime: -1 ENOSYS\n\
+         requeue with no waiters: 0\n\
+         cmp_requeue A->B wake 0 move all: 3\n\
+         wake A after the move: 0\n\
+         wake B 1: 1\n\
+         wake B all: 2\n\
+         requeue A->B wake 1 move 1: 2\n\
+         wake B after requeue: 1\n\
+         wake_op set B=5 if old==0: 2\n\
+         B is 5\n\
+         wake_op B+=3 if old>100: 0\n\
+         B is 8\n\
+         wake_op B|=1<<4 if old!=8: 0\n\
+         B is 24\n\
+         wake_op unknown op 7: -1 ENOSYS\n\
+         B is 24\n\
+         wake_op unknown cmp 6: -1 ENOSYS\n\
+         B is 1\n\
+         wake_op uaddr2 NULL: -1 EFAULT\n\
+         wake_op uaddr2 NULL unknown op 7: -1 ENOSYS\n\
+         requeue A->B wake 0 move 0: 0\n\
+         queued on A after it: 2\n\
+         wake_op nr_wake 0: 1\n\
+         wake_op nr_wake -1: 1\n\
+         wake_op nr_wake2 0: 1\n\
+         wake_op nr_wake2 -1: 1\n\
+         cmp_requeue A->B wake 0 move 2: 2\n\
+         requeue A->B wake 0 move 1: 1\n\
+         wake B 1 released waiter 0\n\
+         wake B 1 released waiter 1\n\
+         wake B 1 released waiter 2\n\
+         wake B 1 released waiter 3\n",
+        "stderr:\n{log}"
+    );
+}
+
+/// A priority-inheritance futex command is refused by name, never a panic
+/// (https://github.com/rrnewton/hermit/issues/3958): a fail-closed run stops with
+/// the policy-refusal status, and with `--allow-unsupported-syscalls` the guest
+/// gets ENOSYS, Linux's answer when built without CONFIG_FUTEX_PI.
+#[test]
+fn futex_lock_pi_is_refused_by_name() {
+    let guest = futex_c_guest(&FUTEX_LOCK_PI_REFUSED_GUEST, "futex_lock_pi_refused")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--log=error",
+            "run",
+            "--strict",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "a fail-closed run must stop with the policy-refusal status:\nstderr:\n{log}"
+    );
+    assert!(
+        log.contains("futex command FUTEX_LOCK_PI is not supported"),
+        "the refusal must name the command:\nstderr:\n{log}"
+    );
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        // `--strict` refuses the opt-out, so the compatibility run is not strict.
+        hermit_command(&[
+            "run",
+            "--allow-unsupported-syscalls",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(stdout, "lock_pi: -1 ENOSYS\n", "stderr:\n{log}");
+}
+
+/// FUTEX_REQUEUE, FUTEX_CMP_REQUEUE and FUTEX_WAKE_OP key and access their
+/// words as Linux does (https://github.com/rrnewton/hermit/pull/4020): counts
+/// before addresses, keys without reading key-only words (NULL is a valid
+/// private key), CMP_REQUEUE's compare with the guest's permissions, and
+/// WAKE_OP's word changed in place as exactly four bytes (end of a page, a
+/// write-only page) or refused with EFAULT (read-only, PROT_NONE). Every line
+/// matches native Linux.
+#[test]
+fn futex_requeue_and_wake_op_key_and_access_their_words_as_linux() {
+    let guest = futex_c_guest(&FUTEX_KEYED_ACCESS_GUEST, "futex_keyed_access")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&["run", "--strict", "--timeout", "60", "--", guest.as_str()]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "the run must finish and exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(
+        stdout,
+        "requeue, unmapped private source, counts 0: 0, word 0\n\
+         requeue, negative nr_wake, unmapped source: -1 EINVAL, word 0\n\
+         cmp_requeue, negative nr_requeue, unmapped source: -1 EINVAL, word 0\n\
+         requeue, target at the top of the address space: -1 EFAULT, word 0\n\
+         requeue, target in the kernel half: -1 EFAULT, word 0\n\
+         requeue, private target in the low half above 2^62: -1 EFAULT, word 0\n\
+         requeue, private target just below the 4-level user limit: 0, word 0\n\
+         shared requeue, read-only anonymous target: -1 EFAULT, word 17\n\
+         shared requeue, read-only shmem target: 0, word 17\n\
+         shared wake_op, read-only shmem word, unknown op: -1 EFAULT, word 17\n\
+         private wake_op, read-only word, unknown op: -1 ENOSYS, word 17\n\
+         shared requeue, PROT_NONE target: -1 EFAULT, word 0\n\
+         cmp_requeue, PROT_NONE source: -1 EFAULT, word 0\n\
+         wake_op, unmapped private first word, set B=7: 0, word 7\n\
+         wake_op, NULL second word, unknown op: -1 ENOSYS, word 7\n\
+         wake_op +1, word at the end of a page before a hole: 0, word 43\n\
+         wake_op +1, write-only page: 0, word 43\n\
+         wake_op +1, read-only page: -1 EFAULT, word 42\n\
+         wake_op +1, PROT_NONE page: -1 EFAULT, word 42\n\
+         wake_op, NULL first word, wake 1 on B: 1, word 0\n\
+         waiter on B: woken\n\
+         requeue B->NULL: 1, word 0\n\
+         wake NULL 1: 1, word 0\n\
+         waiter: woken\n\
+         requeue B->NULL: 1, word 0\n\
+         requeue NULL->B: 1, word 0\n\
+         wake B 1: 1, word 0\n\
+         waiter: woken\n",
+        "stderr:\n{log}"
+    );
+}
+
+/// FUTEX_WAKE_OP on a word in a file-backed shared mapping is refused by name
+/// (https://github.com/rrnewton/hermit/pull/4020): a process outside Hermit
+/// could update that word concurrently, and Detcore's read and write would lose
+/// its update where Linux's locked instruction does not. An anonymous shared
+/// word, which only guest processes reach, still works. A fail-closed run stops
+/// with the policy-refusal status; with `--allow-unsupported-syscalls` the
+/// guest gets ENOSYS and the word is unchanged.
+#[test]
+fn a_wake_op_on_a_file_backed_shared_word_is_refused_by_name() {
+    let guest = futex_c_guest(
+        &FUTEX_WAKE_OP_FILE_SHARED_GUEST,
+        "futex_wake_op_file_shared",
+    )
+    .to_str()
+    .unwrap()
+    .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--log=error",
+            "run",
+            "--strict",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "a fail-closed run must stop with the policy-refusal status:\nstdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert!(
+        log.contains("futex command FUTEX_WAKE_OP is not supported: its word is in a file-backed shared mapping"),
+        "the refusal must name the command and the reason:\nstderr:\n{log}"
+    );
+    assert_eq!(
+        stdout, "wake_op +1, anonymous shared word: 0, word 1\n",
+        "stderr:\n{log}"
+    );
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        // `--strict` refuses the opt-out, so the compatibility run is not strict.
+        hermit_command(&[
+            "run",
+            "--allow-unsupported-syscalls",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(
+        stdout,
+        "wake_op +1, anonymous shared word: 0, word 1\n\
+         wake_op +1, file-backed shared word: -1 ENOSYS, word 0\n\
+         wake_op +1, old alias after MREMAP_DONTUNMAP: -1 ENOSYS, word 0\n\
+         wake_op +1, new alias after MREMAP_DONTUNMAP: -1 ENOSYS, word 0\n",
+        "stderr:\n{log}"
     );
 }
