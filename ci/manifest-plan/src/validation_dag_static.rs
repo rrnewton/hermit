@@ -1815,7 +1815,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_process_armed_with_a_parent_death_sigkill_is_not_stuck} and
     // tool_global::test::sigkill_notifications_record_the_doomed_process
     // (https://github.com/rrnewton/hermit/issues/3904) retain all 1324: 1328.
-    ("test.detcore_unit", 1328),
+    // And a_committed_sigchld_ends_a_gated_wait_unless_a_host_timed_source_can_post_it and a_precise_futex_wait_holds_a_committed_signal_only_if_a_host_timed_source_can_post_it (https://github.com/rrnewton/hermit/issues/4005): 1330.
+    ("test.detcore_unit", 1330),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1990,7 +1991,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/2082) retains all 271: 272.
     // And robust_futex_owner_death::ptrace_wakes_nobody_when_an_exec_leaves_the_owner_word_alone:
     // 273.
-    ("test.hermit_integration", 273),
+    // And external_signal_interrupt::ptrace_rt_sigtimedwait_is_ended_by_the_sigchld_of_an_exiting_child
+    // (https://github.com/rrnewton/hermit/issues/4005): 274.
+    ("test.hermit_integration", 274),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -2730,7 +2733,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the valve's consumer and bound tests: 1323.
     // And the same unknown-sleeping-mask test: 1324.
     // And the four child-wait deadlock tests: 1328.
-    ("test.detcore_unit_on_host", 1328),
+    // And a_committed_sigchld_ends_a_gated_wait_unless_a_host_timed_source_can_post_it and a_precise_futex_wait_holds_a_committed_signal_only_if_a_host_timed_source_can_post_it (https://github.com/rrnewton/hermit/issues/4005): 1330.
+    ("test.detcore_unit_on_host", 1330),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -2759,7 +2763,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same scheduler-turn-cost clock-exhaustion test: 271.
     // And the robust-futex exec owner-death test: 272.
     // And the robust-futex exec no-wake test: 273.
-    ("test.hermit_integration_on_host", 273),
+    // And the run-mode rt_sigtimedwait SIGCHLD test: 274.
+    ("test.hermit_integration_on_host", 274),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

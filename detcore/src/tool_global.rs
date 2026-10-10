@@ -3550,7 +3550,7 @@ impl GlobalState {
             }
             SchedResponse::Signaled(signals) => Some(SchedValue::Signaled(
                 signals.iter().flatten().fold(0, |set, signal| {
-                    set | (1_u64 << ((signal.0 as u32).wrapping_sub(1) & 63))
+                    set | crate::scheduler::kernel_signal_bit(signal.0)
                 }),
             )),
             SchedResponse::ObserveSignal(_) | SchedResponse::InGuestFatalAlarm => {

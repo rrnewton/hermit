@@ -32,16 +32,20 @@
 //! caught after the wait parked ends it near the 100 ms send, and one ignored
 //! after the wait parked leaves it running to its original deadline.
 //!
-//! A SIGCHLD never ends a gated wait (a futex wait, `poll` or `epoll_wait`),
-//! whoever sends it: Hermit holds a caught SIGCHLD until the call returns, and
-//! the handler runs then, as on Hermit's main branch. Linux instead returns
-//! EINTR when the SIGCHLD arrives. This gives up the SIGCHLD part of
-//! https://github.com/rrnewton/hermit/issues/3146 until Reverie reports every
-//! delivery it holds. The `held` cells assert it: a child's exit, including a
-//! child that dies by SIGKILL or by its only thread calling `exit`, leaves the
-//! wait running to its 300 ms deadline or its wakeup, and the handler has run
-//! by the `RESULT` line. `select` and the `select` system call are not gated,
-//! so a caught SIGCHLD still ends them with EINTR, as on Linux.
+//! A gated wait (a futex wait, `poll` or `epoll_wait`) holds a caught SIGCHLD
+//! until the call returns, and the handler runs then, unless the scheduler
+//! sent that SIGCHLD to the waiting thread at a commit point: the SIGCHLD of a
+//! child that calls `exit_group`, which its child-exit timer sends, ends the
+//! wait with EINTR, as on Linux (https://github.com/rrnewton/hermit/issues/4005).
+//! The kernel also posts SIGCHLD at host-timed moments, so any other SIGCHLD is
+//! held; this gives up that part of https://github.com/rrnewton/hermit/issues/3146
+//! until Reverie reports every delivery it holds. The `held` cells assert both:
+//! the exit of a child that calls `exit_group` ends the wait near 100 ms, while
+//! a child that dies by SIGKILL or by its only thread calling `exit` has no
+//! child-exit timer and leaves the wait running to its 300 ms deadline or its
+//! wakeup, with the handler run by the `RESULT` line. `select` and the `select`
+//! system call are not gated, so a caught SIGCHLD still ends them with EINTR,
+//! as on Linux.
 //!
 //! A child's SIGCHLD is queued on its parent process and taken by one thread
 //! that does not block it; Linux offers it first to the thread that forked the
@@ -49,7 +53,10 @@
 //! and check both the waiter's result and which thread's handler ran. A
 //! runnable sibling that forks the child takes the signal, and the waiter keeps
 //! waiting to its original deadline or its wakeup. A sibling that forks the
-//! child and then parks in a wait of its own holds it until that wait returns.
+//! child and then parks in a wait of its own takes it: for a child that calls
+//! `exit_group` its wait ends with EINTR
+//! (https://github.com/rrnewton/hermit/issues/4005); for one killed by SIGKILL
+//! or leaving through `exit`, the wait holds it until it returns.
 //! A waiting main thread that forks the child while a sibling spins does not
 //! take it: the sibling does, and the sibling's wake ends the wait, or, for a
 //! timed wait the sibling does not wake, the wait runs to its deadline.
@@ -1942,6 +1949,76 @@ fn assert_child_exit_sigchld_ends_readiness_waits(backend: &str) {
             );
         }
     }
+}
+
+/// `rt_sigtimedwait` for a blocked SIGUSR1 with a 1 s timeout, while a child
+/// exits after 100 ms, under `run --strict --verify --verify-strict`
+/// (tests/c/record_replay_sigtimedwait_child_exit.c). Linux ends the wait with
+/// EINTR when the guest catches SIGCHLD, and lets it time out with EAGAIN when
+/// SIGCHLD is blocked or left at its default. Hermit returned EAGAIN in the
+/// caught case too (https://github.com/rrnewton/hermit/issues/4005).
+#[test]
+fn ptrace_rt_sigtimedwait_is_ended_by_the_sigchld_of_an_exiting_child() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let root = build_root();
+    fs::create_dir_all(&root).expect("failed to create guest build directory");
+    let witness = root.join(format!("sigtimedwait_child_exit.{}", std::process::id()));
+    let compiled = Command::new("cc")
+        .args(["-O2", "-Wall", "-Wextra", "-Werror", "-pthread"])
+        .arg(repository.join("tests/c/record_replay_sigtimedwait_child_exit.c"))
+        .arg("-o")
+        .arg(&witness)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to start the witness's compiler");
+    assert!(
+        compiled.status.success(),
+        "failed to compile the witness: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    for (mode, errno) in [
+        ("caught", libc::EINTR),
+        ("blocked", libc::EAGAIN),
+        ("default", libc::EAGAIN),
+    ] {
+        let trial = tempfile::Builder::new()
+            .prefix("trial-")
+            .tempdir_in(&root)
+            .expect("failed to create trial directory");
+        let report = trial.path().join("verify.json");
+        let output = Command::new("timeout")
+            .args(["--kill-after=5s", "120s"])
+            .arg(hermit_binary::hermit_binary())
+            .env_remove("LD_LIBRARY_PATH")
+            .arg("--log=info")
+            .args(cell_run_args("ptrace"))
+            .args(["--verify", "--verify-strict", "--verify-json"])
+            .arg(&report)
+            .arg("--")
+            .arg(&witness)
+            .arg(mode)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run hermit");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let expected = format!("mode={mode} result=-1 errno={errno} ");
+        assert!(
+            output.status.success() && stdout.contains(&expected),
+            "{mode}: expected `{expected}`, as Linux returns, with exit 0; got {}\nstdout:\n{stdout}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let verdict: serde_json::Value = serde_json::from_slice(
+            &fs::read(&report).expect("strict verification wrote no verdict"),
+        )
+        .expect("strict verification verdict is valid JSON");
+        if let Some(gap) = strict_verification_gap(&verdict) {
+            panic!("{mode}: strict verification is not determinism evidence: {gap}");
+        }
+    }
+    let _ = fs::remove_file(&witness);
 }
 
 #[test]

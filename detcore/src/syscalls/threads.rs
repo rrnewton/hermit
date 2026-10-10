@@ -724,6 +724,18 @@ where
     Ok(None)
 }
 
+/// The signals a precise futex wait holds in its own check after a wake:
+/// `SIGCHLD` and every signal a host-timed source can post (`host_timed`),
+/// except a signal the scheduler committed to it at the wake (`committed`)
+/// that no host-timed source can post too
+/// (https://github.com/rrnewton/hermit/issues/4005).
+pub(crate) fn futex_wait_held_after_wake(
+    host_timed: KernelSigset,
+    committed: KernelSigset,
+) -> KernelSigset {
+    (kernel_sigset_bit(libc::SIGCHLD) | host_timed) & !(committed & !host_timed)
+}
+
 /// The one-bit kernel sigset for `raw_signal` (1-based), or 0 when out of range.
 pub(crate) fn kernel_sigset_bit(raw_signal: i32) -> KernelSigset {
     if (1..=KernelSigset::BITS as i32).contains(&raw_signal) {
@@ -1969,8 +1981,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                         // Linux, one already pending when the value matches ends the
                         // wait at once with the futex's restart errno. A `SIGCHLD`
                         // ends it only when the scheduler committed it to this
-                        // waiter at its wake (a child's exit, through its
-                        // child-exit timer: `committed_wake`,
+                        // waiter at its wake, sent at a commit point (a child's
+                        // child-exit timer, or a POSIX timer: `committed_wake`,
                         // https://github.com/rrnewton/hermit/issues/4005); any other
                         // stays pending until the call returns, because the kernel
                         // also posts one for a child event at a moment set by host
@@ -2010,8 +2022,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                             // wait for its deadline (`KernelSignalState::interrupting_wait`).
                             let defers_default_stops = call.restart_keeps_deadline();
                             let host_timed = host_timed_signals(guest).await;
-                            let held = (kernel_sigset_bit(libc::SIGCHLD) | host_timed)
-                                & !(std::mem::take(&mut committed_wake) & !host_timed);
+                            let held = futex_wait_held_after_wake(
+                                host_timed,
+                                std::mem::take(&mut committed_wake),
+                            );
                             let pending = state
                                 .pending_interrupting(state.blocked, defers_default_stops)
                                 & !held;
@@ -3687,6 +3701,22 @@ mod tests {
         signals
             .iter()
             .fold(0, |set, &signal| set | kernel_sigset_bit(signal))
+    }
+
+    #[test]
+    fn a_precise_futex_wait_holds_a_committed_signal_only_if_a_host_timed_source_can_post_it() {
+        let chld = kernel_sigset_bit(libc::SIGCHLD);
+        let usr1 = kernel_sigset_bit(libc::SIGUSR1);
+        // Nothing committed: SIGCHLD and the host-timed signals are held.
+        assert_eq!(futex_wait_held_after_wake(0, 0), chld);
+        assert_eq!(futex_wait_held_after_wake(usr1, 0), chld | usr1);
+        // A committed SIGCHLD is not held (https://github.com/rrnewton/hermit/issues/4005).
+        assert_eq!(futex_wait_held_after_wake(0, chld), 0);
+        assert_eq!(futex_wait_held_after_wake(usr1, chld), usr1);
+        // Unless a host-timed source can post it too, and a committed
+        // host-timed signal stays held.
+        assert_eq!(futex_wait_held_after_wake(chld, chld), chld);
+        assert_eq!(futex_wait_held_after_wake(usr1, usr1 | chld), usr1);
     }
 
     #[test]

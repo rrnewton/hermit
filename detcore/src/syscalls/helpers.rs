@@ -1985,8 +1985,9 @@ where
         // Read in this turn, before the probe: another thread may have armed a
         // host-timed source since the last turn, and none can until this turn ends.
         signals.hold_until_return(host_timed_signals(guest).await);
-        // A `SIGCHLD` the scheduler committed to this thread in this turn (a
-        // child's exit, through its child-exit timer) ends the wait, as on Linux
+        // A `SIGCHLD` the scheduler committed to this thread in this turn, sent
+        // at a commit point (a child's child-exit timer, or a POSIX timer whose
+        // signal is `SIGCHLD`), ends the wait, as on Linux
         // (`KernelSignalWait::admit_committed`,
         // https://github.com/rrnewton/hermit/issues/4005).
         signals.admit_committed(committed_signals(&resumed) & kernel_sigset_bit(libc::SIGCHLD));
@@ -2246,7 +2247,7 @@ pub(crate) struct KernelSignalWait {
     /// child's exit, stop or continue at a moment set by host timing, and
     /// `/proc` shows no siginfo that would tell the two apart
     /// (https://github.com/rrnewton/hermit/issues/3146). The scheduler's own
-    /// commit of a child's exit `SIGCHLD` to this thread lifts the hold for the
+    /// send of a `SIGCHLD` to this thread at a commit point lifts the hold for the
     /// turn whose resume names it (`admit_committed`,
     /// https://github.com/rrnewton/hermit/issues/4005). The gated loop adds,
     /// in each of its turns, every signal a host-timed source armed by a guest
@@ -2510,8 +2511,9 @@ impl KernelSignalWait {
     /// (`committed`): its resume named them (`ResumeStatus::Signaled`). Such a
     /// signal was sent at a fixed point of the schedule, so a wait may end for
     /// it although the wait holds it, unless a host-timed source can post it
-    /// too (`host_timed`). The loop passes the `SIGCHLD` of a child's exit,
-    /// which the scheduler commits through its child-exit timer; the kernel's
+    /// too (`host_timed`). The loop passes a committed `SIGCHLD`, which the
+    /// scheduler sends at a commit point (a child's child-exit timer, or a
+    /// POSIX timer whose signal is `SIGCHLD`); the kernel's
     /// own copy of it, posted at a host-timed moment, decides nothing, since
     /// only the resume that names it lifts the hold, for that turn alone
     /// (https://github.com/rrnewton/hermit/issues/4005).
@@ -5025,6 +5027,42 @@ mod kernel_signal_wait_failures {
                 "the signal stays queued for the guest's handler"
             );
         }
+    }
+
+    /// A caught `SIGCHLD` the scheduler committed to the thread ends a gated
+    /// wait, but only in the turn whose resume names it
+    /// (`KernelSignalWait::admit_committed`), and never when a host-timed
+    /// source a guest armed can post `SIGCHLD` too: that copy could arrive at a
+    /// moment host timing sets (https://github.com/rrnewton/hermit/issues/4005).
+    #[tokio::test]
+    async fn a_committed_sigchld_ends_a_gated_wait_unless_a_host_timed_source_can_post_it() {
+        let chld = kernel_sigset_bit(libc::SIGCHLD);
+        let (guest, kernel) = caught_sigchld_guest(true);
+        let _proc = scripted_proc(&kernel);
+
+        let mut wait = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTNOHAND);
+        assert!(
+            !wait.interrupted().unwrap(),
+            "an uncommitted SIGCHLD is held"
+        );
+        wait.admit_committed(chld);
+        assert!(
+            wait.interrupted().unwrap(),
+            "a committed SIGCHLD ends the wait"
+        );
+        wait.admit_committed(0);
+        assert!(
+            !wait.interrupted().unwrap(),
+            "the next turn's resume names nothing, so the SIGCHLD is held again"
+        );
+
+        let mut host_timed = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTNOHAND);
+        host_timed.hold_until_return(chld);
+        host_timed.admit_committed(chld);
+        assert!(
+            !host_timed.interrupted().unwrap(),
+            "a SIGCHLD a host-timed source can post stays held although committed"
+        );
     }
 
     /// The same `SIGCHLD` ends a select wait before an injection that is not a

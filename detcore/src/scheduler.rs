@@ -280,7 +280,7 @@ pub enum HostTimedSignalScope {
 }
 
 /// The one-bit kernel sigset for a 1-based signal number, or 0 when out of range.
-fn kernel_signal_bit(raw_signal: i32) -> u64 {
+pub(crate) fn kernel_signal_bit(raw_signal: i32) -> u64 {
     if (1..=64).contains(&raw_signal) {
         1_u64 << (raw_signal - 1)
     } else {
@@ -5969,7 +5969,8 @@ impl Scheduler {
     /// backend reports the kernel's signal state: unblocked by its mask, and caught
     /// or fatal-by-default under the dispositions the kernel holds at this moment
     /// (https://github.com/rrnewton/hermit/issues/3146). Never `SIGCHLD`, which a
-    /// gated wait holds until the call returns (`futex_wait_held_signals`).
+    /// gated wait holds until the call returns (`futex_wait_held_signals`),
+    /// unless the scheduler sends it at this commit point (`committed`).
     ///
     /// ⚠️ CALL THIS ONLY WHERE A WAKE IS COMMITTED: the step2 drain of cross-task
     /// signals and the scheduler-sent signal paths in step2b and the empty-queue
@@ -6011,8 +6012,9 @@ impl Scheduler {
     /// that does interrupt it could instead deadlock it.
     ///
     /// `committed` names a signal the scheduler sends at this commit point
-    /// (`wake_signaled_guest`, from `signal_guest`), such as a child's exit
-    /// `SIGCHLD` from its child-exit timer: the wait does not hold it unless a
+    /// (`wake_signaled_guest`, from `signal_guest`), such as a `SIGCHLD` from a
+    /// child's child-exit timer, or from a POSIX timer whose signal is
+    /// `SIGCHLD`: the wait does not hold it unless a
     /// host-timed source can post it too
     /// (https://github.com/rrnewton/hermit/issues/4005).
     fn parked_futex_interrupting_signals(&self, dettid: DetTid, committed: u64) -> Option<u64> {
@@ -6121,8 +6123,9 @@ impl Scheduler {
     // delivery it holds.
     //
     // The exception is a `SIGCHLD` the scheduler itself sends to the thread at
-    // a commit point, the one a child's `ChildExit` timer sends through
-    // `signal_guest`: the resume that names it lifts the hold for that turn
+    // a commit point through `signal_guest`, the one a child's `ChildExit`
+    // timer sends, or a POSIX timer whose signal is `SIGCHLD`: the resume that
+    // names it lifts the hold for that turn
     // alone, so the wait ends at a point the schedule fixes
     // (https://github.com/rrnewton/hermit/issues/4005). A death without that
     // timer (a child killed by a signal, or leaving through `exit` in its last
@@ -12574,8 +12577,9 @@ mod test {
         );
 
         // Through a scheduler send (a timer), for SIGWINCH, which is ignored by
-        // default until a handler is installed. A SIGCHLD never ends the wait
-        // (`a_sigchld_never_ends_a_parked_futex_wait`).
+        // default until a handler is installed. A SIGCHLD ends the wait only
+        // when the scheduler sends it
+        // (`a_sigchld_ends_a_parked_futex_wait_only_when_the_scheduler_sends_it`).
         let mut scheduler = Scheduler::new(&Config::default());
         let (target, futex) = parked_futex_target(&mut scheduler);
         let winch = kernel_signal_bit(libc::SIGWINCH);
