@@ -2146,4 +2146,61 @@ mod tests {
             );
         }
     }
+
+    const CENSUS: &str = "raw_result_input_census_v1";
+
+    /// A repeated census key keeps its last value whichever store each
+    /// occurrence would land in (a float keeps it a `Value`), as decoding into
+    /// a map does, and is written once.
+    #[test]
+    fn a_repeated_census_key_keeps_the_last_value_in_either_store() {
+        let text = r#"{"version": 1}"#;
+        let float = r#"{"share": 0.5}"#;
+        for (first, last) in [(text, float), (float, text), (text, r#"{"version": 2}"#)] {
+            let raw = format!(r#"{{"{CENSUS}": {first}, "zeta": 1, "{CENSUS}": {last}}}"#);
+            let decoded: HistoryExtensions = serde_json::from_str(&raw).unwrap();
+            let expected: Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(
+                decoded.value(CENSUS).as_deref(),
+                expected.get(CENSUS),
+                "{raw}"
+            );
+            assert_eq!(decoded.merged_len(), 2, "{raw}");
+            assert!(
+                decoded.values.contains_key(CENSUS) != decoded.retained.contains_key(CENSUS),
+                "exactly one store holds the key: {raw}"
+            );
+            assert_eq!(
+                serde_json::to_string(&decoded).unwrap(),
+                serde_json::to_string(&expected).unwrap(),
+                "{raw}"
+            );
+        }
+    }
+
+    /// The entry count a serializer is told is the number of entries it is
+    /// then given, also when a map entry shadows a retained one.
+    #[test]
+    fn the_announced_extension_count_is_the_number_of_entries_written() {
+        let mut extensions: HistoryExtensions = serde_json::from_str(&format!(
+            r#"{{"alpha": 1, "{CENSUS}": {{"version": 1}}, "zeta": 2}}"#
+        ))
+        .unwrap();
+        assert!(extensions.retained.contains_key(CENSUS));
+        assert_eq!(extensions.merged_len(), 3);
+        assert_eq!(extensions.merged().count(), 3);
+
+        extensions.insert(CENSUS.into(), serde_json::json!({"version": 2}));
+        extensions.insert("beta".into(), serde_json::json!(3));
+        assert!(extensions.retained.contains_key(CENSUS));
+        assert_eq!(extensions.merged_len(), 4);
+        assert_eq!(extensions.merged().count(), 4);
+        assert_eq!(
+            serde_json::to_string(&extensions).unwrap(),
+            serde_json::to_string(&serde_json::json!({
+                "alpha": 1, "beta": 3, CENSUS: {"version": 2}, "zeta": 2,
+            }))
+            .unwrap()
+        );
+    }
 }

@@ -2735,6 +2735,39 @@ mod tests {
         assert_eq!(serde_json::to_value(&value).unwrap(), retained.value());
     }
 
+    /// The depth guard is exact: in `{"cells": ...}`, a leaf at
+    /// RETAINED_MAX_DEPTH is retained and one level deeper is not. So is the
+    /// deepest text serde_json reads (127 levels), which serializes unchanged.
+    #[test]
+    fn the_depth_guard_is_exact_up_to_the_deepest_readable_text() {
+        fn nested(arrays: usize) -> Value {
+            let mut value = serde_json::json!("leaf");
+            for _ in 0..arrays {
+                value = serde_json::json!([value]);
+            }
+            value
+        }
+        // The object is depth 0 and its value depth 1, so `arrays` arrays put
+        // the leaf at depth `arrays + 1`; the text nests `arrays + 1` levels.
+        for (arrays, retained) in [
+            (RETAINED_MAX_DEPTH - 1, true),
+            (RETAINED_MAX_DEPTH, false),
+            (126, false),
+        ] {
+            let text =
+                serde_json::to_string(&serde_json::json!({"cells": nested(arrays)})).unwrap();
+            let value: CellResultsValue = serde_json::from_str(&text).unwrap();
+            assert_eq!(
+                matches!(value, CellResultsValue::Retained(_)),
+                retained,
+                "{arrays}"
+            );
+            assert_eq!(serde_json::to_string(&value).unwrap(), text, "{arrays}");
+        }
+        let too_deep = serde_json::to_string(&serde_json::json!({"cells": nested(127)})).unwrap();
+        assert!(serde_json::from_str::<Value>(&too_deep).is_err());
+    }
+
     /// raw_result_input_census_v1 decoded from history is kept as text outside
     /// the map `extra` derefs to, and reads, compares and serializes as before.
     #[test]
