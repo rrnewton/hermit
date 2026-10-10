@@ -9877,6 +9877,257 @@ fn run_with_deadline(
     (status, stderr)
 }
 
+/// The most `hermit run` attempts a PMU-preempted spinner case makes when its
+/// earlier attempts each end in a typed skid-overshoot refusal
+/// ([`skid_overshoot_refusal`]); see [`run_pmu_spinner_retrying_skid`].
+///
+/// Derived from the measured refusal rate, not chosen. On the AMD EPYC
+/// development host recorded in docs/TESTING_ENVIRONMENTS.md, the
+/// `poll_timeout_vs_spinner` guest built by the pinned validation root's
+/// compiler drew the refusal, with correct guest output every time
+/// (https://github.com/rrnewton/reverie/issues/990), in 3 of 13
+/// privileged-test.pmu_cli_cases attempts in local validation, 5 of 15 direct
+/// runs, 8 of 20 runs of this case inside the pinned root and 11 of 28
+/// attempts of this retrying case inside it: 27 of 76, p = 0.36. With
+/// independent attempts the chance that all `n` attempts refuse is p^n: 4.5%
+/// for 3 attempts, 1.6% for 4 and 0.57% for 5 (1.0% for 5 at the highest
+/// measured rate, p = 0.40).
+///
+/// Each attempt costs 8.2-10.7 CPU-s and 8.4-10.9 s of wall time in that
+/// node, so five attempts need up to about 54 CPU-s and 55 s. The node
+/// therefore scales its per-test CPU budget (22 CPU-s by default) by 4 to 88
+/// CPU-s and its per-test wall bound (57 s by default) by 2 to 114 s, about
+/// 1.6 and 2.1 times what five attempts need; at the defaults a third attempt
+/// would be killed by the CPU budget.
+const SKID_RETRY_MAX_ATTEMPTS: u32 = 5;
+
+/// The prefix of the canonical line Hermit prints when it refuses a run for
+/// PMU skid overshoot: `classify_failure` in hermit-cli/src/bin/hermit/main.rs
+/// writes `HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot
+/// count=<n>`, the same line the manifest runner requires of a skid attempt
+/// (`skid_overshoot_only_reports` in ci/manifest-plan/src/runner.rs).
+const SKID_OVERSHOOT_REFUSAL_PREFIX: &str =
+    "HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=";
+
+/// Line prefixes that mark a second outcome beside a skid refusal: Hermit's
+/// other one-line classifications (another policy refusal, an internal
+/// failure, a signal death, a run timeout, a log cap) and a task panic.
+const SKID_RETRY_DISQUALIFYING_PREFIXES: [&str; 6] = [
+    "HERMIT_POLICY_REFUSAL",
+    "HERMIT_INTERNAL_FAILURE",
+    "HERMIT_SIGNAL_DEATH",
+    "HERMIT_RUN_TIMEOUT",
+    "HERMIT_LOG_CAP",
+    "HERMIT_TASK_PANIC",
+];
+
+/// The canonical skid-overshoot refusal line of one finished `hermit run`,
+/// or `None` unless that run is a typed skid-overshoot refusal and nothing
+/// else (https://github.com/rrnewton/hermit/issues/1845). All must hold:
+///
+/// - the run exited with `HERMIT_POLICY_REFUSAL_EXIT` (122); a signal, a
+///   deadline kill (`None`) or any other status never qualifies;
+/// - its stderr carries exactly one refusal line, and it is
+///   [`SKID_OVERSHOOT_REFUSAL_PREFIX`] followed by a decimal count above zero;
+/// - its stderr carries at least one line that starts with
+///   `HERMIT_SKID_OVERSHOOT `, Hermit's own report of the late PMU interrupt;
+/// - no other line starts with a [`SKID_RETRY_DISQUALIFYING_PREFIXES`] entry
+///   and none contains `panicked at`.
+///
+/// A refusal for any other cause, a refusal beside a second failure, or a
+/// marker without the exit status is a result the caller must report as it
+/// is, not a reason to run again.
+fn skid_overshoot_refusal(code: Option<i32>, stderr: &str) -> Option<&str> {
+    if code != Some(HERMIT_POLICY_REFUSAL_EXIT) {
+        return None;
+    }
+    let mut refusal = None;
+    let mut overshoot_reported = false;
+    for line in stderr.lines() {
+        let line = line.trim_end();
+        if line.starts_with("HERMIT_SKID_OVERSHOOT ") {
+            overshoot_reported = true;
+        } else if let Some(count) = line.strip_prefix(SKID_OVERSHOOT_REFUSAL_PREFIX) {
+            let counted = !count.is_empty()
+                && count.bytes().all(|byte| byte.is_ascii_digit())
+                && count.parse::<u64>().is_ok_and(|count| count > 0);
+            if !counted || refusal.is_some() {
+                return None;
+            }
+            refusal = Some(line);
+        } else if line.contains("panicked at")
+            || SKID_RETRY_DISQUALIFYING_PREFIXES
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+        {
+            return None;
+        }
+    }
+    refusal.filter(|_| overshoot_reported)
+}
+
+/// One finished attempt of [`run_pmu_spinner_retrying_skid`].
+struct SpinnerRun {
+    /// The exit status, `None` when the deadline killed the run.
+    status: Option<std::process::ExitStatus>,
+    stdout: String,
+    stderr: String,
+}
+
+/// Runs `hermit <args>` for a case whose guest spins without syscalls and is
+/// preempted only by the PMU timer, and repeats the run only when an attempt
+/// is a typed skid-overshoot refusal ([`skid_overshoot_refusal`]), at most
+/// [`SKID_RETRY_MAX_ATTEMPTS`] times in all
+/// (https://github.com/rrnewton/hermit/issues/1845). Such a refusal measures
+/// the host's PMU interrupt latency, not the guest
+/// (https://github.com/rrnewton/reverie/issues/990), so a fresh attempt is a
+/// new measurement.
+///
+/// Every attempt has its own directory and the `limit` deadline. Before a
+/// retry, the refused attempt's guest stdout must pass `check_stdout`, the
+/// case's own stdout assertions, so a refusal that also shows a wrong result
+/// fails at once. Every retried attempt prints a `SKID-RETRY` line with its
+/// refusal line to the test's stderr, and an attempt that refuses at the cap
+/// prints `SKID-RETRY LIMIT`. Any other outcome, and the last attempt, is
+/// returned unchanged for the caller's assertions.
+fn run_pmu_spinner_retrying_skid(
+    test: &str,
+    args: &[&str],
+    limit: Duration,
+    check_stdout: impl Fn(&str),
+) -> SpinnerRun {
+    for attempt in 1..=SKID_RETRY_MAX_ATTEMPTS {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let (status, stderr) =
+            run_with_deadline(hermit_command(args), directory.path(), limit, false);
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        let code = status.and_then(|status| status.code());
+        let Some(refusal) = skid_overshoot_refusal(code, &stderr) else {
+            return SpinnerRun {
+                status,
+                stdout,
+                stderr,
+            };
+        };
+        if attempt == SKID_RETRY_MAX_ATTEMPTS {
+            eprintln!(
+                "SKID-RETRY LIMIT {test}: attempt {attempt} of at most \
+                 {SKID_RETRY_MAX_ATTEMPTS} exited {HERMIT_POLICY_REFUSAL_EXIT} with `{refusal}`; \
+                 no further retry is made"
+            );
+            return SpinnerRun {
+                status,
+                stdout,
+                stderr,
+            };
+        }
+        eprintln!(
+            "SKID-RETRY {test}: attempt {attempt} of at most {SKID_RETRY_MAX_ATTEMPTS} exited \
+             {HERMIT_POLICY_REFUSAL_EXIT} with `{refusal}`; retrying once its guest stdout passes \
+             the case's checks (https://github.com/rrnewton/hermit/issues/1845)"
+        );
+        check_stdout(&stdout);
+    }
+    unreachable!("the last attempt always returns")
+}
+
+/// [`skid_overshoot_refusal`] admits exactly a typed skid-overshoot refusal:
+/// exit 122 with the canonical refusal line and Hermit's overshoot report,
+/// and nothing beside them. It does not admit 122 for another cause, a skid
+/// refusal beside a second failure, or any other exit status.
+#[test]
+fn skid_retry_admits_only_a_typed_skid_overshoot_refusal() {
+    // The shape of a refused poll_timeout_returns_on_time_while_another_thread_spins
+    // attempt, from the measurement on https://github.com/rrnewton/reverie/issues/990.
+    let skid = "\
+hermit: virtual-time epoch=2026-10-10T00:44:57.378767176+00:00 source=host-now
+HERMIT_SKID_OVERSHOOT rcb_actual=6000317 rcb_target=5999950 skid_margin=1000 overshoot=367
+2026-10-10T00:45:01.159474Z ERROR detcore: HERMIT_SKID_OVERSHOOT prehook: PMU RCB overshoot!
+HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=4
+Error: Hermit refused the run: a fail-closed policy stopped it before completion.
+     > observed 4 HERMIT_SKID_OVERSHOOT report(s); refusing the result
+";
+    let refusal = "HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=4";
+    assert_eq!(
+        skid_overshoot_refusal(Some(HERMIT_POLICY_REFUSAL_EXIT), skid),
+        Some(refusal)
+    );
+    assert_eq!(
+        skid_overshoot_refusal(
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            &skid.replace('\n', "\r\n")
+        ),
+        Some(refusal),
+        "a CRLF line ending is still the canonical line"
+    );
+
+    // 122 for another cause, or for no named cause, is not a skid refusal.
+    let overshoot = "HERMIT_SKID_OVERSHOOT rcb_actual=6000317 rcb_target=5999950 skid_margin=1000 overshoot=367\n";
+    for other in [
+        "HERMIT_POLICY_REFUSAL class=policy-refusal\n",
+        "HERMIT_POLICY_REFUSAL class=policy-refusal cause=unsupported-syscall count=4\n",
+        "HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot-x count=4\n",
+    ] {
+        assert_eq!(
+            skid_overshoot_refusal(
+                Some(HERMIT_POLICY_REFUSAL_EXIT),
+                &format!("{overshoot}{other}")
+            ),
+            None,
+            "{other:?}"
+        );
+    }
+    // The refusal line without Hermit's overshoot report, or with no positive
+    // decimal count, is not one.
+    assert_eq!(
+        skid_overshoot_refusal(Some(HERMIT_POLICY_REFUSAL_EXIT), &format!("{refusal}\n")),
+        None
+    );
+    for count in ["0", "", "x", "+4", "4 extra", "-1"] {
+        let line = format!("{SKID_OVERSHOOT_REFUSAL_PREFIX}{count}\n");
+        assert_eq!(
+            skid_overshoot_refusal(
+                Some(HERMIT_POLICY_REFUSAL_EXIT),
+                &format!("{overshoot}{line}")
+            ),
+            None,
+            "{line:?}"
+        );
+    }
+    // A skid refusal beside a second outcome is not skid-only.
+    for second in [
+        "HERMIT_POLICY_REFUSAL class=policy-refusal\n",
+        &format!("{refusal}\n"),
+        "HERMIT_INTERNAL_FAILURE class=internal-failure\n",
+        "HERMIT_SIGNAL_DEATH class=signal-death signal=9\n",
+        "HERMIT_RUN_TIMEOUT class=run-timeout seconds=30\n",
+        "HERMIT_LOG_CAP class=log-cap\n",
+        "HERMIT_TASK_PANIC detcore\n",
+        "thread 'main' panicked at detcore/src/lib.rs:1:1:\n",
+    ] {
+        assert_eq!(
+            skid_overshoot_refusal(Some(HERMIT_POLICY_REFUSAL_EXIT), &format!("{skid}{second}")),
+            None,
+            "{second:?}"
+        );
+    }
+    // Any other exit status, a signal or a deadline kill (no code) never
+    // qualifies, whatever stderr says.
+    // EXIT-CLASS: arbitrary statuses (guest or hermit) that must never qualify as a skid refusal.
+    for code in [
+        Some(0),
+        Some(1),
+        Some(101),
+        Some(123),
+        Some(124),
+        Some(125),
+        None,
+    ] {
+        assert_eq!(skid_overshoot_refusal(code, skid), None, "{code:?}");
+    }
+}
+
 /// A gate on a vfork child before its exec can never open: while the child
 /// runs, no other thread can (https://github.com/rrnewton/hermit/issues/3930).
 /// The child of `posix_spawn` calls dup2 before execve; a spec holding it there
@@ -19692,51 +19943,63 @@ fn run_kvm_wait4_parked_foreign_waiters_contend_for_one_child() {
 /// timer (`--max-timeslice`), so without a PMU nothing interleaves the two
 /// threads and this case proves nothing. test.cli and test.cli_on_host skip it
 /// by exact name; privileged-test.pmu_cli_cases runs it.
+///
+/// Because the PMU timer is its subject, a run Hermit refuses for skid
+/// overshoot (exit 122 with the typed refusal line) is run again, at most
+/// [`SKID_RETRY_MAX_ATTEMPTS`] times in all, and every retry is printed
+/// (https://github.com/rrnewton/hermit/issues/1845); see
+/// [`run_pmu_spinner_retrying_skid`]. Any other outcome is asserted as before.
 #[test]
 fn poll_timeout_returns_on_time_while_another_thread_spins() {
     let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let guest = poll_timeout_vs_spinner_guest().to_str().unwrap().to_owned();
+    // The guest's five waits, each of which must time out within 50-100 ms of
+    // virtual time.
+    fn check_waits(stdout: &str) {
+        let waits: Vec<(i32, u64)> = stdout
+            .lines()
+            .map(|line| {
+                let (rc, elapsed) = line
+                    .strip_prefix("ppoll rc=")
+                    .and_then(|rest| rest.split_once(" elapsed_ns="))
+                    .unwrap_or_else(|| panic!("unexpected guest output line {line:?}"));
+                (rc.parse().unwrap(), elapsed.parse().unwrap())
+            })
+            .collect();
+        assert_eq!(waits.len(), 5, "five waits expected:\n{stdout}");
+        for (rc, elapsed_ns) in waits {
+            assert_eq!(rc, 0, "every wait must time out:\n{stdout}");
+            assert!(
+                (50_000_000..100_000_000).contains(&elapsed_ns),
+                "a 50 ms ppoll returned after {elapsed_ns} ns of virtual time:\n{stdout}"
+            );
+        }
+    }
     // A deadline, so the old behaviour (about 5 s of virtual time and minutes
     // of wall) fails with a message instead of stalling the suite.
-    let (status, log) = run_with_deadline(
-        hermit_command(&[
+    let SpinnerRun {
+        status,
+        stdout,
+        stderr: log,
+    } = run_pmu_spinner_retrying_skid(
+        "poll_timeout_returns_on_time_while_another_thread_spins",
+        &[
             "run",
             "--strict",
             "--max-timeslice",
             "5000000",
             "--",
             guest.as_str(),
-        ]),
-        directory.path(),
+        ],
         Duration::from_secs(120),
-        false,
+        check_waits,
     );
-    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
-        .expect("failed to read the guest's stdout");
     assert_eq!(
         status.and_then(|status| status.code()),
         Some(0),
         "the run must finish within 120 s and exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
     );
-    let waits: Vec<(i32, u64)> = stdout
-        .lines()
-        .map(|line| {
-            let (rc, elapsed) = line
-                .strip_prefix("ppoll rc=")
-                .and_then(|rest| rest.split_once(" elapsed_ns="))
-                .unwrap_or_else(|| panic!("unexpected guest output line {line:?}"));
-            (rc.parse().unwrap(), elapsed.parse().unwrap())
-        })
-        .collect();
-    assert_eq!(waits.len(), 5, "five waits expected:\n{stdout}");
-    for (rc, elapsed_ns) in waits {
-        assert_eq!(rc, 0, "every wait must time out:\n{stdout}");
-        assert!(
-            (50_000_000..100_000_000).contains(&elapsed_ns),
-            "a 50 ms ppoll returned after {elapsed_ns} ns of virtual time:\n{stdout}"
-        );
-    }
+    check_waits(&stdout);
 }
 
 /// A vfork parent killed while its vfork child runs no longer stops the
