@@ -6798,6 +6798,22 @@ pub(crate) fn verification_matched_canonically(attempt: &AttemptResult) -> bool 
         .is_some_and(|report| report.require_canonical_match().is_ok())
 }
 
+/// Whether `attempt` retains a current verification report in which Hermit
+/// rejected the guest's first verify run (`first_run_rejected`): the guest ran
+/// and failed, so no comparison was made.
+fn first_run_rejected(attempt: &AttemptResult) -> bool {
+    attempt
+        .verification_report
+        .as_deref()
+        .and_then(|report| current_verification_report(report.as_bytes()).ok())
+        .is_some_and(|report| {
+            matches!(
+                report.no_result_reason,
+                Some(crate::canonical_verdict::NoResultReason::FirstRunRejected { .. })
+            )
+        })
+}
+
 fn observed_result(
     mode: &str,
     outcome: &str,
@@ -6817,6 +6833,15 @@ fn observed_result(
                 | ObservedResult::ReplayFailure
         )
     ) {
+        return typed;
+    }
+    // A crash whose terminal attempt retains Hermit's typed rejection of the
+    // guest's first verify run is the guest's own failure, and that attempt's
+    // output is the guest's own output: a guest line such as "lsirq: cannot
+    // open /proc/interrupts: Permission denied" is product behaviour, not the
+    // host blocking a tool (https://github.com/rrnewton/hermit/issues/4029).
+    if typed == Some(ObservedResult::CrashError) && attempts.last().is_some_and(first_run_rejected)
+    {
         return typed;
     }
     if let Some(class) = attempts.iter().find_map(|attempt| {
@@ -21921,6 +21946,55 @@ cp "{}" "$verdict"
                 );
             }
         }
+    }
+
+    /// A guest that prints a refused open in its own stderr, under a typed
+    /// first-run rejection, stays a product crash: the environmental-block
+    /// scan reads that line as a host toolchain denial only when no such
+    /// report says the guest itself failed
+    /// (https://github.com/rrnewton/hermit/issues/4029).
+    #[test]
+    fn a_guest_permission_denied_under_a_first_run_rejection_is_a_product_crash() {
+        let guest_line = "lsirq: cannot open /proc/interrupts: Permission denied\n";
+        let mut rejected = no_result_with_exit_status(
+            1,
+            crate::canonical_verdict::NoResultReason::FirstRunRejected {
+                exit_code: Some(1),
+                signal: None,
+                stdout_bytes: 0,
+                stderr_bytes: guest_line.len() as u64,
+            },
+        );
+        assert_eq!(rejected.outcome, "FAIL");
+        rejected.stderr = format!(
+            "First run errored during --verify, not continuing to a second.\n\
+             Exit status: exited with code 1\nStdout:\nStderr:\n{guest_line}"
+        );
+        let result = observed_result(
+            "verify",
+            &rejected.outcome,
+            std::slice::from_ref(&rejected),
+            rejected.error_kind.as_deref(),
+        );
+        assert_eq!(result, Some(ObservedResult::CrashError));
+        assert_eq!(
+            failure_class(&rejected.outcome, result, rejected.error_kind.as_deref()),
+            Some(FailureClass::ProductFailure)
+        );
+        // Without the typed rejection, the same line is still scanned as an
+        // environmental block, as before.
+        let mut untyped = rejected.clone();
+        untyped.verification_report = None;
+        untyped.verification_report_sha256 = None;
+        assert_eq!(
+            observed_result(
+                "verify",
+                &untyped.outcome,
+                std::slice::from_ref(&untyped),
+                untyped.error_kind.as_deref(),
+            ),
+            Some(ObservedResult::InfrastructureError)
+        );
     }
 
     #[test]
