@@ -1683,16 +1683,46 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         reason: RobustListExit,
     ) {
+        if let Some(staged) = self
+            .read_thread_group_robust_list_wakes(guest, OwnerDeath::Exit)
+            .await
+        {
+            guest.thread_state().stage_robust_list_wakes(reason, staged);
+        }
+    }
+
+    /// The owner-death wakes Linux's `exit_robust_list` would make for every
+    /// registered robust list in the current thread group, read without
+    /// changing guest memory. `None` where Detcore does not model them.
+    ///
+    /// Each list is walked as its owner's, with that owner's TID, except the
+    /// caller's own list in an exec by a thread that is not the group leader.
+    /// `de_thread` gives that caller the leader's TID (`exchange_tids`) before
+    /// `exec_mm_release` walks its list, so `handle_futex_death` compares the
+    /// owner words with the thread group ID and leaves a word the caller owns
+    /// under its old TID alone (fs/exec.c, kernel/futex/core.c).
+    async fn read_thread_group_robust_list_wakes<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        death: OwnerDeath,
+    ) -> Option<Vec<(DetTid, Vec<RobustListWake>)>> {
         if !self.cfg.backend.runs_exit_robust_list
             || !self.cfg.sequentialize_threads
             || self.cfg.debug_futex_mode != BlockingMode::Precise
         {
-            return;
+            return None;
         }
 
+        let caller = guest.thread_state().dettid;
+        let tgid = guest.thread_state().detpid.expect("detpid unset");
         let heads = guest.thread_state().robust_list_heads();
         let mut staged = Vec::with_capacity(heads.len());
         for (owner, head) in heads {
+            let walked_as = if death == OwnerDeath::Exec && owner == caller {
+                tgid.as_raw()
+            } else {
+                owner.as_raw()
+            };
             let mut wakes = Vec::new();
             let mut effects = GuestRobustEffects::<'_, G, T> {
                 guest,
@@ -1700,8 +1730,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 staged_wakes: Some(&mut wakes),
                 tool: PhantomData,
             };
-            let outcome =
-                robust_list::exit_robust_list(&mut effects, head, owner.as_raw() as u32).await;
+            let outcome = robust_list::exit_robust_list(&mut effects, head, walked_as as u32).await;
             if outcome.head_unreadable || outcome.aborted {
                 trace!(
                     "[detcore, dtid {}] could not stage complete robust-list owner-death effects: {:?}",
@@ -1710,7 +1739,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             staged.push((owner, wakes));
         }
-        guest.thread_state().stage_robust_list_wakes(reason, staged);
+        Some(staged)
     }
 
     /// Exit system call
@@ -2179,8 +2208,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         }
 
-        // A successful execve replaces the address space, and Linux clears
-        // `task->robust_list` with it; the new image re-registers its own.
+        // A successful execve walks every robust list in the thread group
+        // before it replaces the address space (see
+        // `ThreadState::stage_robust_list_wakes_for_exec`), then clears
+        // `task->robust_list`; the new image re-registers its own. Read the
+        // lists while the old image is still mapped.
+        let exec_robust_wakes = self
+            .read_thread_group_robust_list_wakes(guest, OwnerDeath::Exec)
+            .await;
         let old_robust_list_head;
 
         {
@@ -2189,6 +2224,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             thread_state.memory_metadata = Arc::new(Mutex::new(MemoryMetadata::new()));
             thread_state.mm_id = old_mm_id.for_exec(detpid);
             old_robust_list_head = thread_state.take_robust_list_for_exec();
+            if let Some(wakes) = exec_robust_wakes {
+                thread_state.stage_robust_list_wakes_for_exec(wakes);
+            }
         }
 
         // execve(2) doesn't return upon success.
@@ -2203,6 +2241,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             thread_state.memory_metadata = old_memory_metadata;
             thread_state.mm_id = old_mm_id;
             thread_state.restore_robust_list_after_failed_exec(old_robust_list_head);
+            // The old image runs on, and so do its robust-mutex owners.
+            thread_state.take_robust_list_wakes_for_exec();
         }
 
         cancel_exec(guest).await;
@@ -3327,6 +3367,16 @@ where
     }
 }
 
+/// How a thread group's robust-mutex owners die, for
+/// `Detcore::read_thread_group_robust_list_wakes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerDeath {
+    /// exit_group or a fatal signal: every thread exits with its own TID.
+    Exit,
+    /// A successful execve: the other threads exit with their own TIDs, and the
+    /// caller's list is walked under the TID it holds after `de_thread`.
+    Exec,
+}
 #[cfg(test)]
 mod tests {
     use std::io::Read;

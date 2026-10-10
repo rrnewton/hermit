@@ -624,8 +624,9 @@ mod tests {
             // that need the PMU timer, which test.pmu_integration_cases
             // runs, plus the eight fatal_core_capture tests, plus the
             // scheduler-turn-cost clock-exhaustion test in
-            // container_init_deadline.
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "271");
+            // container_init_deadline, plus the two robust-futex exec tests
+            // (https://github.com/rrnewton/hermit/issues/2082).
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "273");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

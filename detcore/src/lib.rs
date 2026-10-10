@@ -145,6 +145,7 @@ use tool_global::deregister_thread;
 pub use tool_global::format_unsupported_syscall_warning;
 pub use tool_global::prepare_exec;
 use tool_global::report_unsupported_syscall;
+use tool_global::robust_list_wakes_after_exec;
 use tool_global::robust_list_wakes_after_exit;
 pub use tool_global::shared_open_file_reply;
 pub use tool_global::shared_open_file_request;
@@ -2322,6 +2323,20 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // Mirror that reset before any replacement-image syscall can run.
         if guest.config().sequentialize_threads {
             tool_global::set_child_tid_address(guest, 0).await;
+        }
+        // The exec walked the old thread group's robust lists; wake one waiter
+        // per owner word it marked FUTEX_OWNER_DIED.
+        let robust_wakes = guest.thread_state().take_robust_list_wakes_for_exec();
+        let identities: Vec<_> = robust_wakes
+            .iter()
+            .map(|(owner, wake)| (*owner, wake.futex))
+            .collect();
+        let counts = robust_list_wakes_after_exec(guest, robust_wakes).await;
+        for ((owner, futex), count) in identities.into_iter().zip(counts) {
+            info!(
+                "[detcore, dtid {}] robust-list owner death woke {} waiter(s) on futex {:?} at exec",
+                owner, count, futex,
+            );
         }
 
         tool_global::mark_past_first_execve(guest).await;

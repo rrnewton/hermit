@@ -45,9 +45,10 @@
 //! space. It holds those modeled wakes until the physical-exit callback, after
 //! Linux has performed the atomic owner-word transition. Fatal signals that
 //! terminate an injected blocking syscall do not currently provide that
-//! Guest-bearing callback, and successful exec's `de_thread` path is blocked by
-//! a separate ptrace exec-lifecycle failure. DBT, KVM, and SaBRe also need
-//! backend-specific lifecycle or atomic-memory support.
+//! Guest-bearing callback. A successful exec reads the group's lists at its
+//! entry and delivers their wakes after it returns
+//! (`ThreadState::stage_robust_list_wakes_for_exec`). DBT, KVM, and SaBRe also
+//! need backend-specific lifecycle or atomic-memory support.
 //!
 //! # Structure
 //!

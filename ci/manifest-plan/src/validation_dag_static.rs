@@ -1978,7 +1978,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // container_init_deadline::virtual_clock_exhaustion_under_a_scheduler_turn_cost_ends_the_run
     // (lane qemu-rcb, https://github.com/rrnewton/hermit/pull/3885) retains all
     // 270: 271.
-    ("test.hermit_integration", 271),
+    // robust_futex_owner_death::ptrace_wakes_the_waiter_when_an_exec_ends_the_owner
+    // (https://github.com/rrnewton/hermit/issues/2082) retains all 271: 272.
+    // And robust_futex_owner_death::ptrace_wakes_nobody_when_an_exec_leaves_the_owner_word_alone:
+    // 273.
+    ("test.hermit_integration", 273),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -2729,7 +2733,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin skips the same 25 PMU-timer cases: 262.
     // And the same eight fatal_core_capture tests: 270.
     // And the same scheduler-turn-cost clock-exhaustion test: 271.
-    ("test.hermit_integration_on_host", 271),
+    // And the robust-futex exec owner-death test: 272.
+    // And the robust-futex exec no-wake test: 273.
+    ("test.hermit_integration_on_host", 273),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

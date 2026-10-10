@@ -26,6 +26,7 @@ struct shared_state {
   pthread_mutex_t mutex;
   _Atomic int owner_ready;
   _Atomic int trigger;
+  _Atomic int unlocked;
 };
 
 static struct shared_state* state;
@@ -90,12 +91,44 @@ static void waiter_process(void) {
   _exit(0);
 }
 
-static pid_t spawn_waiter(void) {
+/*
+ * For the modes in which Linux must not wake the waiter, or not before the
+ * owner unlocks: a raw FUTEX_WAIT on the owner word with a 3-second timeout,
+ * which reports how it returned instead of blocking in glibc.
+ */
+static void raw_waiter_process(void) {
+  _Atomic uint32_t* word = (_Atomic uint32_t*)&state->mutex;
+  uint32_t value = atomic_load(word);
+  while (!(value & FUTEX_WAITERS)) {
+    if ((value & FUTEX_TID_MASK) == 0) {
+      fprintf(stderr, "the mutex is not owned: %#x\n", value);
+      _exit(11);
+    }
+    if (atomic_compare_exchange_strong(word, &value, value | FUTEX_WAITERS)) {
+      value |= FUTEX_WAITERS;
+    }
+  }
+  struct timespec timeout = {3, 0};
+  long ret = syscall(SYS_futex, word, FUTEX_WAIT, value, &timeout, NULL, 0);
+  const char* how = ret == 0 ? "woken" : strerrorname_np(errno);
+  printf(
+      "RAW: wait %s, owner unlocked %d, OWNER_DIED %d\n",
+      how,
+      atomic_load(&state->unlocked),
+      (atomic_load(word) & FUTEX_OWNER_DIED) != 0);
+  fflush(stdout);
+  _exit(0);
+}
+
+static pid_t spawn_waiter(int raw) {
   pid_t pid = fork();
   if (pid < 0) {
     die("fork waiter");
   }
   if (pid == 0) {
+    if (raw) {
+      raw_waiter_process();
+    }
     waiter_process();
   }
   wait_for_waiter();
@@ -119,6 +152,37 @@ static void* owner_thread(void* unused) {
   for (;;) {
     pause();
   }
+  return NULL;
+}
+
+static void* exec_owner_thread(void* unused) {
+  (void)unused;
+  lock_as_owner();
+  wait_until(&state->trigger, 1);
+  execl(self_path, self_path, "after-exec", NULL);
+  die("execl");
+  return NULL;
+}
+
+/*
+ * Locks the mutex, then rewrites its owner field to the thread group ID, as no
+ * glibc path does but a hand-written lock may, and execs from a thread that is
+ * not the leader. de_thread gives the caller the thread group ID before
+ * futex_exec_release walks its list, so the word now matches and Linux marks it
+ * FUTEX_OWNER_DIED and wakes the waiter. This pins the TID the caller's own list
+ * is walked with: skipping that list would leave the waiter parked.
+ */
+static void* tgid_exec_owner_thread(void* unused) {
+  (void)unused;
+  lock_as_owner();
+  _Atomic uint32_t* word = (_Atomic uint32_t*)&state->mutex;
+  uint32_t value = atomic_load(word);
+  while (!atomic_compare_exchange_strong(
+      word, &value, (value & ~FUTEX_TID_MASK) | (uint32_t)getpid())) {
+  }
+  wait_until(&state->trigger, 1);
+  execl(self_path, self_path, "after-exec", NULL);
+  die("execl");
   return NULL;
 }
 
@@ -162,6 +226,67 @@ static pid_t spawn_group_owner(const char* mode) {
     _exit(7);
   }
 
+  if (strcmp(mode, "owner-exec") == 0) {
+    /* The owner itself execs: Linux's futex_exec_release walks its list. */
+    lock_as_owner();
+    wait_until(&state->trigger, 1);
+    execl(self_path, self_path, "after-exec", NULL);
+    die("execl");
+  }
+
+  if (strcmp(mode, "leader-exec") == 0) {
+    /* A sibling owns the mutex and the leader execs; de_thread kills it. */
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, owner_thread, NULL) != 0) {
+      die("pthread_create owner");
+    }
+    wait_until(&state->owner_ready, 1);
+    wait_until(&state->trigger, 1);
+    execl(self_path, self_path, "after-exec", NULL);
+    die("execl");
+  }
+
+  if (strcmp(mode, "thread-tgid-exec") == 0) {
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, tgid_exec_owner_thread, NULL) != 0) {
+      die("pthread_create tgid exec owner");
+    }
+    for (;;) {
+      pause();
+    }
+  }
+
+  if (strcmp(mode, "thread-owner-exec") == 0) {
+    /*
+     * A thread that is not the leader owns the mutex and execs. de_thread
+     * gives it the leader's TID before futex_exec_release walks its list, so
+     * Linux leaves the word, owned under the old TID, alone: no OWNER_DIED, no
+     * wake.
+     */
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, exec_owner_thread, NULL) != 0) {
+      die("pthread_create exec owner");
+    }
+    for (;;) {
+      pause();
+    }
+  }
+
+  if (strcmp(mode, "failed-exec") == 0) {
+    /* An exec that fails changes nothing: the owner still unlocks it later. */
+    lock_as_owner();
+    wait_until(&state->trigger, 1);
+    execl("/nonexistent/robust_futex_owner_lifecycle", "x", NULL);
+    for (int i = 0; i < 300; ++i) {
+      sched_yield();
+    }
+    atomic_store(&state->unlocked, 1);
+    if (pthread_mutex_unlock(&state->mutex) != 0) {
+      die("pthread_mutex_unlock owner");
+    }
+    _exit(0);
+  }
+
   if (strcmp(mode, "de-thread") == 0) {
     lock_as_owner();
     pthread_t thread;
@@ -181,7 +306,11 @@ int main(int argc, char** argv) {
     return 0;
   }
   if (argc != 2) {
-    fprintf(stderr, "usage: %s signal|exit-group|de-thread\n", argv[0]);
+    fprintf(
+        stderr,
+        "usage: %s signal|exit-group|de-thread|owner-exec|leader-exec|"
+        "thread-owner-exec|thread-tgid-exec|failed-exec\n",
+        argv[0]);
     return 64;
   }
   self_path = argv[0];
@@ -212,7 +341,9 @@ int main(int argc, char** argv) {
 
   pid_t owner = spawn_group_owner(argv[1]);
   wait_until(&state->owner_ready, 1);
-  pid_t waiter = spawn_waiter();
+  int raw = strcmp(argv[1], "thread-owner-exec") == 0 ||
+      strcmp(argv[1], "failed-exec") == 0;
+  pid_t waiter = spawn_waiter(raw);
 
   atomic_store_explicit(&state->trigger, 1, memory_order_release);
 

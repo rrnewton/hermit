@@ -301,7 +301,14 @@ fn linux_wakes_process_shared_waiters_for_all_three_owner_death_paths() {
     let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-lifecycle-native");
     let guest = build_lifecycle_guest(&build_root);
 
-    for mode in ["signal", "exit-group", "de-thread"] {
+    for mode in [
+        "signal",
+        "exit-group",
+        "de-thread",
+        "owner-exec",
+        "leader-exec",
+        "thread-tgid-exec",
+    ] {
         let mut native = Command::new("timeout");
         native
             .args(["--kill-after", "5s", "30s"])
@@ -404,6 +411,226 @@ fn ptrace_wakes_after_guest_observed_fatal_signal_and_exit_group_cleanup() {
                     && line.contains("after physical exit")
             }),
             "ptrace {mode} did not wake exactly one modeled waiter after physical cleanup\nstderr:\n{}",
+            captured.stderr,
+        );
+    }
+}
+
+/// A successful execve ends robust-mutex owners too. Past exec's point of no
+/// return, `de_thread` kills every other thread, whose exits run
+/// `futex_exit_release`, and `exec_mm_release` runs `futex_exec_release` for
+/// the caller (kernel/fork.c, kernel/futex/core.c); each walks its robust list.
+/// Detcore reads the group's lists at the exec's entry and wakes one modeled
+/// waiter per owner word once the exec has returned
+/// (https://github.com/rrnewton/hermit/issues/2082). The three modes cover a
+/// non-leader exec that kills the owning leader (`de-thread`), the owner's own
+/// exec (`owner-exec`), a leader exec that kills an owning sibling
+/// (`leader-exec`), and a non-leader caller whose own list holds a word owned
+/// by the thread group ID, which its walk under that ID matches
+/// (`thread-tgid-exec`). Before the fix each left the waiter parked for good.
+#[test]
+fn ptrace_wakes_the_waiter_when_an_exec_ends_the_owner() {
+    let build_root =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-lifecycle-ptrace-exec");
+    let guest = build_lifecycle_guest(&build_root);
+
+    for mode in ["de-thread", "owner-exec", "leader-exec", "thread-tgid-exec"] {
+        let verify_json = build_root.join(format!("ptrace-{mode}.verify.json"));
+        let _ = fs::remove_file(&verify_json);
+        let mut verify = Command::new("timeout");
+        verify
+            .args(["--kill-after", "5s", "120s"])
+            .arg(hermit_test::hermit_binary())
+            .args([
+                "--log=info",
+                "--backend=ptrace",
+                "run",
+                "--strict",
+                "--tmp=/tmp",
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+            ])
+            .arg(&verify_json)
+            .args(["--base-env=minimal", "--"])
+            .arg(&guest)
+            .arg(mode);
+        let verified = run_captured(
+            verify,
+            &format!("ptrace robust-futex {mode} strict verification"),
+            &build_root.join(format!("ptrace-{mode}-verify.out")),
+            &build_root.join(format!("ptrace-{mode}-verify.err")),
+            true,
+        );
+        assert!(
+            verified.stdout.contains("PASS: waiter received EOWNERDEAD"),
+            "ptrace {mode} verification did not make progress after owner death\nstdout:\n{}\nstderr:\n{}",
+            verified.stdout,
+            verified.stderr,
+        );
+        assert_nonempty_canonical_l2(&verify_json, &verified.stdout, &verified.stderr);
+
+        let mut run = Command::new("timeout");
+        run.args(["--kill-after", "5s", "120s"])
+            .arg(hermit_test::hermit_binary())
+            .args([
+                "--log=info",
+                "--backend=ptrace",
+                "run",
+                "--strict",
+                "--tmp=/tmp",
+                "--base-env=minimal",
+                "--",
+            ])
+            .arg(&guest)
+            .arg(mode);
+        let captured = run_captured(
+            run,
+            &format!("ptrace robust-futex {mode} run"),
+            &build_root.join(format!("ptrace-{mode}.out")),
+            &build_root.join(format!("ptrace-{mode}.err")),
+            true,
+        );
+        assert!(
+            captured.stdout.contains("PASS: waiter received EOWNERDEAD"),
+            "ptrace {mode} did not make progress after owner death\nstdout:\n{}\nstderr:\n{}",
+            captured.stdout,
+            captured.stderr,
+        );
+        let exec_wakes: Vec<&str> = captured
+            .stderr
+            .lines()
+            .filter(|line| line.contains("robust-list owner death woke"))
+            .collect();
+        assert!(
+            exec_wakes.len() == 1
+                && exec_wakes[0].contains("woke 1 waiter(s) on futex")
+                && exec_wakes[0].ends_with("at exec"),
+            "ptrace {mode} did not wake exactly one modeled waiter, once, at the exec\nstderr:\n{}",
+            captured.stderr,
+        );
+    }
+}
+
+/// The exec neighbours in which Linux wakes nobody, each through a raw
+/// `FUTEX_WAIT` with a 3-second timeout so the guest reports what happened
+/// instead of blocking in glibc:
+///
+/// - `thread-owner-exec`: a thread that is not the leader owns the mutex and
+///   execs. `de_thread` gives it the leader's TID (`exchange_tids`) before
+///   `futex_exec_release` walks its list, so `handle_futex_death` sees a word
+///   owned under the old TID and neither marks nor wakes it: the waiter times
+///   out (https://github.com/rrnewton/hermit/issues/2082).
+/// - `failed-exec`: the owner's exec fails before the point of no return, so
+///   nothing happens until the owner unlocks.
+///
+/// Detcore must make no modeled owner-death wake in either case.
+#[test]
+fn ptrace_wakes_nobody_when_an_exec_leaves_the_owner_word_alone() {
+    let build_root =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-lifecycle-ptrace-exec-nowake");
+    let guest = build_lifecycle_guest(&build_root);
+
+    for (mode, required) in [
+        (
+            "thread-owner-exec",
+            "RAW: wait ETIMEDOUT, owner unlocked 0, OWNER_DIED 0",
+        ),
+        (
+            "failed-exec",
+            "RAW: wait woken, owner unlocked 1, OWNER_DIED 0",
+        ),
+    ] {
+        let mut native = Command::new("timeout");
+        native
+            .args(["--kill-after", "5s", "30s"])
+            .arg(&guest)
+            .arg(mode);
+        let control = run_captured(
+            native,
+            &format!("native robust-futex {mode} control"),
+            &build_root.join(format!("native-{mode}.out")),
+            &build_root.join(format!("native-{mode}.err")),
+            true,
+        );
+        // Natively a failed exec's waiter can also find the word already
+        // unlocked (EAGAIN); either way it never returns before the unlock.
+        let native_holds = if mode == "failed-exec" {
+            control.stdout.contains("owner unlocked 1, OWNER_DIED 0")
+        } else {
+            control.stdout.contains(required)
+        };
+        assert!(
+            native_holds,
+            "native {mode} control did not behave as Linux is expected to\nstdout:\n{}\nstderr:\n{}",
+            control.stdout, control.stderr,
+        );
+
+        let verify_json = build_root.join(format!("ptrace-{mode}.verify.json"));
+        let _ = fs::remove_file(&verify_json);
+        let mut verify = Command::new("timeout");
+        verify
+            .args(["--kill-after", "5s", "120s"])
+            .arg(hermit_test::hermit_binary())
+            .args([
+                "--log=info",
+                "--backend=ptrace",
+                "run",
+                "--strict",
+                "--tmp=/tmp",
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+            ])
+            .arg(&verify_json)
+            .args(["--base-env=minimal", "--"])
+            .arg(&guest)
+            .arg(mode);
+        let verified = run_captured(
+            verify,
+            &format!("ptrace robust-futex {mode} strict verification"),
+            &build_root.join(format!("ptrace-{mode}-verify.out")),
+            &build_root.join(format!("ptrace-{mode}-verify.err")),
+            true,
+        );
+        assert!(
+            verified.stdout.contains(required),
+            "ptrace {mode} verification did not match Linux\nstdout:\n{}\nstderr:\n{}",
+            verified.stdout,
+            verified.stderr,
+        );
+        assert_nonempty_canonical_l2(&verify_json, &verified.stdout, &verified.stderr);
+
+        let mut run = Command::new("timeout");
+        run.args(["--kill-after", "5s", "120s"])
+            .arg(hermit_test::hermit_binary())
+            .args([
+                "--log=info",
+                "--backend=ptrace",
+                "run",
+                "--strict",
+                "--tmp=/tmp",
+                "--base-env=minimal",
+                "--",
+            ])
+            .arg(&guest)
+            .arg(mode);
+        let captured = run_captured(
+            run,
+            &format!("ptrace robust-futex {mode} run"),
+            &build_root.join(format!("ptrace-{mode}.out")),
+            &build_root.join(format!("ptrace-{mode}.err")),
+            true,
+        );
+        assert!(
+            captured.stdout.contains(required),
+            "ptrace {mode} did not match Linux\nstdout:\n{}\nstderr:\n{}",
+            captured.stdout,
+            captured.stderr,
+        );
+        assert!(
+            !captured.stderr.contains("robust-list owner death woke"),
+            "ptrace {mode} made an owner-death wake that Linux does not make\nstderr:\n{}",
             captured.stderr,
         );
     }

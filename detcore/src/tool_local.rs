@@ -1891,6 +1891,8 @@ pub(crate) struct RobustListProcessState {
     heads: BTreeMap<DetTid, usize>,
     pending: BTreeMap<DetTid, PendingRobustListWakes>,
     matched_physical_exits: BTreeMap<DetTid, DetTime>,
+    /// Wakes read at an `execve`'s entry, delivered only if it succeeds.
+    exec_pending: Vec<(DetTid, RobustListWake)>,
 }
 
 impl GuestClock {
@@ -2770,6 +2772,48 @@ impl<T> ThreadState<T> {
             ready.extend(pending.wakes.into_iter().map(|wake| (owner, wake)));
         }
         Some((request_time, ready))
+    }
+
+    /// Hold the owner-death wakes a successful `execve` makes Linux deliver.
+    ///
+    /// Past exec's point of no return, `de_thread` kills every other thread,
+    /// and each one's exit runs `futex_exit_release` with its own TID; then
+    /// `exec_mm_release` runs `futex_exec_release` for the caller itself
+    /// (kernel/fork.c `exit_mm_release`/`exec_mm_release`, kernel/futex/core.c
+    /// `futex_cleanup`, Linux 7.1.3). Both walk the robust list with
+    /// `exit_robust_list` before the old address space goes away. A caller that
+    /// is not the group leader already holds the leader's TID by then
+    /// (`exchange_tids` in `de_thread`), so its own list is walked with the
+    /// thread group ID. The lists can only be read before the exec, and a
+    /// failed exec never reaches that point, so the wakes wait here for
+    /// `take_robust_list_wakes_for_exec`.
+    pub(crate) fn stage_robust_list_wakes_for_exec(
+        &self,
+        wakes: Vec<(DetTid, Vec<RobustListWake>)>,
+    ) {
+        let mut process = self
+            .robust_list_process
+            .lock()
+            .expect("robust-list process state mutex poisoned");
+        process.exec_pending = wakes
+            .into_iter()
+            .flat_map(|(owner, mut wakes)| {
+                wakes.sort_by_key(|wake| format!("{:?}", wake.futex));
+                wakes.into_iter().map(move |wake| (owner, wake))
+            })
+            .collect();
+    }
+
+    /// Take the wakes staged at the exec's entry: to deliver them once it has
+    /// succeeded, or to drop them when it failed and left the old image running.
+    pub(crate) fn take_robust_list_wakes_for_exec(&self) -> Vec<(DetTid, RobustListWake)> {
+        std::mem::take(
+            &mut self
+                .robust_list_process
+                .lock()
+                .expect("robust-list process state mutex poisoned")
+                .exec_pending,
+        )
     }
 
     /// Clear the robust-list head for a candidate `execve` image, returning the

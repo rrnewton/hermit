@@ -5042,6 +5042,36 @@ where
     }
 }
 
+/// Deliver the owner-death wakes staged at a successful exec's entry. The
+/// exec has returned, so Linux has already walked every robust list in the old
+/// thread group and changed each owner word atomically.
+pub(crate) async fn robust_list_wakes_after_exec<G, T>(
+    guest: &mut G,
+    wakes: Vec<(DetTid, RobustListWake)>,
+) -> Vec<u64>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if wakes.is_empty() {
+        return Vec::new();
+    }
+    let (_, response) = send_and_update_time(
+        guest,
+        GlobalRequest::RobustListWakes(
+            wakes
+                .into_iter()
+                .map(|(owner, wake)| (owner, wake.futex))
+                .collect(),
+        ),
+    )
+    .await;
+    match response {
+        GlobalResponse::RobustListWakes(counts) => counts,
+        _ => unreachable!(),
+    }
+}
+
 /// Which actions we can take before/after a futex system call.
 #[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
 pub enum FutexAction {
