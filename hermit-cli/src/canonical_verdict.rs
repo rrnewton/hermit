@@ -88,6 +88,9 @@ pub enum RunFailure {
     /// A fail-closed policy refused this guest during the run: an unsupported
     /// system call, or a guest the backend cannot instrument.
     PolicyRefusal,
+    /// Detcore's scheduler found every remaining thread permanently blocked
+    /// (its "Deadlock detected" report) and ended the run.
+    Deadlock,
 }
 
 impl RunFailure {
@@ -96,6 +99,7 @@ impl RunFailure {
             Self::BackendFailure => "backend_failure",
             Self::DeterminismLoss => "determinism_loss",
             Self::PolicyRefusal => "policy_refusal",
+            Self::Deadlock => "deadlock",
         }
     }
 }
@@ -918,6 +922,7 @@ mod tests {
                 RunFailure::BackendFailure,
                 RunFailure::DeterminismLoss,
                 RunFailure::PolicyRefusal,
+                RunFailure::Deadlock,
             ] {
                 let mut report = VerificationReport::no_result();
                 report.no_result_reason = Some(NoResultReason::RunFailed {

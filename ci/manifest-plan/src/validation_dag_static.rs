@@ -1850,7 +1850,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // listed with `cargo nextest list -p hermit-detcore --lib --bins`.
     // syscalls::threads::tests::an_interrupted_shared_key_probe_is_never_retried_or_taken_as_an_answer
     // (https://github.com/rrnewton/hermit/pull/4020) retains all 1340: 1341.
-    ("test.detcore_unit", 1341),
+    // scheduler::tests::a_terminal_deadlock_report_reaches_the_installed_hook_until_it_is_removed
+    // (run_failed with deadlock) retains all 1341: 1342.
+    ("test.detcore_unit", 1342),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2802,7 +2804,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the five FUTEX_REQUEUE/FUTEX_WAKE_OP tests and the DONTUNMAP alias
     // test: 1340.
     // And the interrupted shared-key probe test: 1341.
-    ("test.detcore_unit_on_host", 1341),
+    // And the terminal-deadlock hook test: 1342.
+    ("test.detcore_unit_on_host", 1342),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
