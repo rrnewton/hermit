@@ -275,8 +275,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Two actual-leaf matrices and the five included shared qualifier controls.
     // Confirm this seven-test population with the exact prepared listing.
     ("test.liteinst_allocator", 7),
-    // Four actual M2 rows, five artifact controls and two shared stack-oracle controls.
-    ("test.liteinst_stacks", 11),
+    // Eleven unchanged M2 cases plus one constructor row and two refusal controls.
+    ("test.liteinst_stacks", 14),
     // run_dbt_binds_in_a_user_namespace_of_its_own retains both prior
     // identities: 2 + 1 = 3.
     ("test.isolated_dbt_workdir", 3),
@@ -5676,9 +5676,9 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"test"########,
         job: r########"liteinst_stacks"########,
         desc: r########"Require literal fixed placement of actual LiteInst signal and callback stacks"########,
-        description: r########"Eleven required identities: four genuine leaf rows, five unchanged artifact qualifier controls and two unchanged shared stack-observation controls. Standalone native Strace SITE1 ALT1 must report the real fixed guarded altstack and absent continuation; ALT0 gets no stack credit; inert loading must reserve nothing. Genuine Detcore trap/site0 ALT1 must reach one actual callback at the exact marker IP/TID/RSP, with one completion and fixed guarded 8-MiB capacity. Separate frozen C guest/receipt and unchanged comparator, current constructor-bearing leaf qualification and independent clean H/RV source guards are mandatory. No consumer compilation, warm artifact search, full-entry/TLS or interior-write-protection claim. Raw observations remain separate from selection."########,
+        description: r########"Fourteen required identities: the original four genuine leaf rows, five artifact qualifier controls and two shared stack-observation controls, plus one actual Detcore constructor-placement row and two constructor-oracle refusal controls. Standalone native Strace SITE1 ALT1 must report the real fixed guarded altstack and absent continuation; ALT0 gets no stack credit; inert loading must reserve nothing. Genuine Detcore trap/site0 ALT1 must reach one actual callback at the exact marker IP/TID/RSP, with one completion and fixed guarded 8-MiB capacity. The additional constructor fixture executes the unchanged M2 workload and requires real bootstrap samples disjoint from both later stack extents including guards. Separate source-bound receipts, unchanged M1/M2 comparators, current constructor-bearing leaf qualification and independent clean H/RV source guards are mandatory. No consumer compilation, warm artifact search, caller-byte equality, full-entry/TLS or interior-write-protection claim. Raw observations remain separate from selection."########,
         labels: &[r########"full"########, r########"portable"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; export HERMIT_M2_STACK_FIXTURE_BUNDLE="$PWD/target/ci/m2-stack-fixtures.path"; REVERIE_LITEINST_PRELOAD=$(./ci/build-liteinst-allocator-fixtures.rs --print-stack-standalone) && export REVERIE_LITEINST_PRELOAD && ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test liteinst_stacks -j 1"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; export HERMIT_M2_STACK_FIXTURE_BUNDLE="$PWD/target/ci/m2-stack-fixtures.path"; export HERMIT_COLD_STACK_FIXTURE_BUNDLE="$PWD/target/ci/cold-stack-fixtures.path"; REVERIE_LITEINST_PRELOAD=$(./ci/build-liteinst-allocator-fixtures.rs --print-stack-standalone) && export REVERIE_LITEINST_PRELOAD && ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test liteinst_stacks -j 1"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"liteinst_stacks"########]),

@@ -235,6 +235,15 @@ rather than letting the guest run unmonitored. The dynamic loader, the C
 library's initialization and the constructors of the program's own shared
 libraries run before that constructor and are not monitored.
 
+Detcore's constructor uses a guarded 8 MiB bootstrap stack in the fixed Tool
+region `[0x600000000000, 0x600100000000)`. That allocation remains reserved
+after initialization and is disjoint from the runtime's signal and callback
+stacks, including their guard pages. A conflicting mapping refuses startup.
+This provides stack placement and boundary guards; guest writes to writable
+Tool interiors, constructor environment changes, and shared libc/TLS state
+remain outside the isolation guarantee. The standalone Reverie preload's
+constructor still uses its caller's stack.
+
 The in-guest runtime cannot deliver Detcore's preemption timer yet, so Hermit
 refuses a LiteInst run unless `--max-timeslice=disabled` is given. It also
 refuses `--verify`, because the in-guest Tool does not forward its records to

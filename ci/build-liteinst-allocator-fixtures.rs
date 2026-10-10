@@ -1,5 +1,5 @@
 #!/usr/bin/env -S rust-script --force
-//! Build both genuine diagnostic leaves and separate frozen M1/M2 C guests.
+//! Build both genuine diagnostic leaves and separate M1/M2/constructor guests.
 //! The official DAG owns CPU/memory/cgroup limits. This producer owns a shared
 //! 900-second child deadline, process groups and 64-MiB command stream caps.
 //! It does not run guests or replace the normal prepared Hermit/resource tree.
@@ -13,6 +13,8 @@
 //! detcore-model = { path = "../detcore-model" }
 //! ```
 
+#[path = "../hermit-cli/tests/common/cold_bundle.rs"]
+mod cold_bundle;
 #[path = "../reverie/scripts/m1_artifact.rs"]
 pub mod m1_artifact;
 #[path = "../hermit-cli/tests/common/m1_bundle.rs"]
@@ -47,6 +49,7 @@ use serde_json::json;
 
 const POINTER: &str = "target/ci/m1-allocator-fixtures.path";
 const STACK_POINTER: &str = "target/ci/m2-stack-fixtures.path";
+const COLD_POINTER: &str = "target/ci/cold-stack-fixtures.path";
 const FEATURES: [&str; 1] = ["allocator-fixture"];
 
 fn require(ok: bool, message: &str) -> Result<()> {
@@ -297,11 +300,15 @@ fn build_leaf(
     })
 }
 
-fn require_stack_exports(leaf: &Leaf) -> Result<()> {
+fn require_stack_exports(leaf: &Leaf, constructor: bool) -> Result<()> {
     let file = FileIdentity::read(&leaf.runtime)?;
     let bytes = fs::read(&file.path).map_err(|e| e.to_string())?;
     let elf = goblin::elf::Elf::parse(&bytes).map_err(|e| e.to_string())?;
-    for name in ["m2_stack_query", "m2_stack_arm"] {
+    let mut names = vec!["m2_stack_query", "m2_stack_arm"];
+    if constructor {
+        names.push("m3_constructor_stack_query");
+    }
+    for name in names {
         let exports: Vec<_> = elf
             .dynsyms
             .iter()
@@ -336,8 +343,28 @@ fn produce_stack_guest(
         source.sha256 == m1_artifact::sha256(SOURCE) && source.sha256 == m2_bundle::FROZEN_C,
         "M2 compiled/current C source differs",
     )?;
-    let binary_path = bundle.join("m2_stack_guest");
-    require(!binary_path.exists(), "M2 C guest output already exists")?;
+    produce_stack_fixture(
+        root,
+        bundle,
+        runner,
+        source,
+        "m2_stack_guest",
+        "stack-guest.json",
+    )
+}
+
+// The existing M2 command and receipt stay unchanged. The additional cold
+// fixture uses the same checked recipe with its own source and output names.
+fn produce_stack_fixture(
+    root: &Path,
+    bundle: &Path,
+    runner: &mut Runner,
+    source: FileIdentity,
+    binary_name: &str,
+    receipt_name: &str,
+) -> Result<(PathBuf, PathBuf)> {
+    let binary_path = bundle.join(binary_name);
+    require(!binary_path.exists(), "stack fixture output already exists")?;
     let compiler = std::env::var("CC").unwrap_or_else(|_| "cc".to_owned());
     let compiler_version = runner.text(&compiler, &["--version"], root)?;
     // Keep the existing source-bound guest recipe unchanged. This additional
@@ -378,11 +405,11 @@ fn produce_stack_guest(
         command: runner
             .commands
             .last()
-            .ok_or("M2 C compiler command missing")?
+            .ok_or("stack fixture compiler command missing")?
             .clone(),
         executed_tests: 0,
     };
-    let receipt_path = bundle.join("stack-guest.json");
+    let receipt_path = bundle.join(receipt_name);
     m1_artifact::write_new(
         &receipt_path,
         &serde_json::to_vec_pretty(&guest).map_err(|e| e.to_string())?,
@@ -391,7 +418,7 @@ fn produce_stack_guest(
         &receipt_path,
         &binary_path,
         &guest.source.path,
-        &m1_artifact::sha256(SOURCE),
+        &guest.source.sha256,
     )?;
     Ok((binary_path, receipt_path))
 }
@@ -435,6 +462,21 @@ fn produce(root: &Path) -> Result<()> {
     let stack_oracle = FileIdentity::read(
         &root.join("reverie/reverie-liteinst/tests/support/stack_observation.rs"),
     )?;
+    let cold_source =
+        FileIdentity::read(&root.join("hermit-cli/tests/fixtures/liteinst_constructor.c"))?;
+    let cold_consumer =
+        FileIdentity::read(&root.join("hermit-cli/tests/common/cold_constructor.rs"))?;
+    require(
+        cold_source.sha256
+            == m1_artifact::sha256(include_bytes!(
+                "../hermit-cli/tests/fixtures/liteinst_constructor.c"
+            ))
+            && cold_consumer.sha256
+                == m1_artifact::sha256(include_bytes!(
+                    "../hermit-cli/tests/common/cold_constructor.rs"
+                )),
+        "compiled/current constructor fixture or consumer differs",
+    )?;
     require(
         stack_source.sha256 == m2_bundle::FROZEN_C
             && stack_oracle.sha256 == m2_bundle::FROZEN_ORACLE,
@@ -473,8 +515,8 @@ fn produce(root: &Path) -> Result<()> {
     )?;
     let standalone = build_leaf(root, &bundle, &oracles, true, deadline)?;
     let detcore = build_leaf(root, &bundle, &oracles, false, deadline)?;
-    require_stack_exports(&standalone)?;
-    require_stack_exports(&detcore)?;
+    require_stack_exports(&standalone, false)?;
+    require_stack_exports(&detcore, true)?;
     let guest = bundle.join("m1_allocator_guest");
     let warning_guest = bundle.join("m1_allocator_guest.warnings");
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
@@ -558,8 +600,18 @@ fn produce(root: &Path) -> Result<()> {
     )?;
     let (stack_guest, stack_guest_receipt) =
         produce_stack_guest(&root.join("reverie"), &bundle, &mut runner)?;
+    let (cold_guest, cold_guest_receipt) = produce_stack_fixture(
+        root,
+        &bundle,
+        &mut runner,
+        cold_source.clone(),
+        "liteinst_constructor",
+        "cold-guest.json",
+    )?;
     stack_source.verify()?;
     stack_oracle.verify()?;
+    cold_source.verify()?;
+    cold_consumer.verify()?;
     let after = source(root, &root.join("Cargo.lock"), &oracles, &mut runner)?;
     let rv_after_head = runner
         .text("git", &["rev-parse", "HEAD"], &root.join("reverie"))?
@@ -619,6 +671,21 @@ fn produce(root: &Path) -> Result<()> {
         &stack_manifest,
         &serde_json::to_vec_pretty(&stack_envelope).map_err(|e| e.to_string())?,
     )?;
+    let cold_manifest = bundle.join("cold-bundle.json");
+    let cold_envelope = cold_bundle::Bundle {
+        schema: 1,
+        stacks: stack_envelope,
+        guest: cold_guest,
+        guest_receipt: cold_guest_receipt,
+        guest_source_sha256: cold_source.sha256,
+        consumer_sha256: cold_consumer.sha256,
+        executed_tests: 0,
+        full_constructor_byte_isolation_claimed: false,
+    };
+    m1_artifact::write_new(
+        &cold_manifest,
+        &serde_json::to_vec_pretty(&cold_envelope).map_err(|e| e.to_string())?,
+    )?;
     // Publish only after both runtime and guest identities are closed. A failed
     // generation keeps its logs but never becomes the selected fixture bundle.
     let pending = root.join(format!("{POINTER}.{}", std::process::id()));
@@ -630,10 +697,16 @@ fn produce(root: &Path) -> Result<()> {
         format!("{}\n", stack_manifest.display()).as_bytes(),
     )?;
     fs::rename(stack_pending, root.join(STACK_POINTER)).map_err(|e| e.to_string())?;
+    let cold_pending = root.join(format!("{COLD_POINTER}.{}", std::process::id()));
+    m1_artifact::write_new(
+        &cold_pending,
+        format!("{}\n", cold_manifest.display()).as_bytes(),
+    )?;
+    fs::rename(cold_pending, root.join(COLD_POINTER)).map_err(|e| e.to_string())?;
 
     println!(
         "{}",
-        json!({"bundle":manifest,"stack_bundle":stack_manifest,"executed_tests":0,"full_m1_pass_claimed":false,"full_stack_isolation_claimed":false})
+        json!({"bundle":manifest,"stack_bundle":stack_manifest,"cold_bundle":cold_manifest,"executed_tests":0,"full_m1_pass_claimed":false,"full_stack_isolation_claimed":false,"full_constructor_byte_isolation_claimed":false})
     );
     Ok(())
 }

@@ -3782,16 +3782,17 @@ fn assert_m2_stack_gate(cfg: &DagConfig) -> Result<(), String> {
         .env
         .get("NEXTEST_EXPECTED_EXECUTED")
         .map(String::as_str)
-        != Some("11")
+        != Some("14")
         || consumer.integration_test_binaries.as_deref()
             != Some(&["liteinst_stacks".to_owned()][..])
     {
-        return Err("M2 consumer lost its eleven-test target population".into());
+        return Err("stack consumer lost its eleven M2 and three constructor tests".into());
     }
     crate::nextest_build_selections::assert_command_selection(consumer)?;
     let command = crate::nextest_build_selections::execution_command(consumer)?;
     for required in [
         "HERMIT_M2_STACK_FIXTURE_BUNDLE",
+        "HERMIT_COLD_STACK_FIXTURE_BUNDLE",
         "--print-stack-standalone",
         "--test liteinst_stacks -j 1",
     ] {
@@ -5091,6 +5092,7 @@ sys.exit(37)
             "count",
             "selection",
             "fixture",
+            "cold-fixture",
         ] {
             let mut changed = committed.clone();
             if mutation == "producer" {
@@ -5119,6 +5121,11 @@ sys.exit(37)
                         step.cmd = step
                             .cmd
                             .replace("HERMIT_M2_STACK_FIXTURE_BUNDLE", "MISSING_FIXTURE")
+                    }
+                    "cold-fixture" => {
+                        step.cmd = step
+                            .cmd
+                            .replace("HERMIT_COLD_STACK_FIXTURE_BUNDLE", "MISSING_COLD_FIXTURE")
                     }
                     _ => unreachable!(),
                 }

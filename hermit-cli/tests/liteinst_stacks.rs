@@ -4,6 +4,10 @@
 #[allow(dead_code)]
 #[path = "../../reverie/scripts/m1_artifact.rs"]
 mod artifact;
+#[path = "common/cold_bundle.rs"]
+mod cold_bundle;
+#[path = "common/cold_constructor.rs"]
+mod cold_constructor;
 #[allow(dead_code)]
 #[path = "../../reverie/scripts/m1_contract.rs"]
 mod contract;

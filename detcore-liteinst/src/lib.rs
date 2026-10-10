@@ -82,12 +82,33 @@ static TOOL_OUTPUT_IDENTITY: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLo
 /// missing or Detcore cannot be installed, so a guest never runs past a failed
 /// installation.
 ///
+/// The native entry establishes a fixed guarded bootstrap stack before any
+/// Rust code runs. It preserves the constructor's existing signal and
+/// environment behavior; placing its stack does not isolate those effects.
+///
 /// # Safety
 ///
 /// Only the dynamic loader may call this, from `.init_array`, while the process
 /// is still single-threaded and before any seccomp filter is active.
 #[unsafe(no_mangle)]
+#[unsafe(naked)]
 pub unsafe extern "C" fn detcore_liteinst_initialize() {
+    core::arch::naked_asm!(
+        "endbr64",
+        "lea rdi, [rip + {body}]",
+        "jmp {entry}",
+        body = sym detcore_liteinst_initialize_body,
+        entry = sym reverie_inguest::guest::tool_region::constructor_entry,
+    );
+}
+
+// The pre-switch RIP-relative address must resolve locally, without an
+// interposable body or a dynamic-loader resolver using the caller's stack.
+core::arch::global_asm!(".hidden detcore_liteinst_initialize_body");
+
+#[inline(never)]
+#[unsafe(no_mangle)]
+unsafe extern "C" fn detcore_liteinst_initialize_body() {
     // Retain the constructor's dispatch lifetime. The preload's allocator
     // owns Rust allocations unconditionally; this guard does not choose
     // between Tool storage and the guest's malloc.
@@ -241,6 +262,28 @@ pub unsafe extern "C" fn detcore_liteinst_initialize() {
     let _ = detcore::install_shared_open_file_channel(Box::new(
         detcore::ChunkedOpenFileChannel::new(CoordinatorOpenFiles),
     ));
+}
+
+/// Observe the real constructor's retained bootstrap in diagnostic builds.
+/// Samples establish placement only, not caller-byte or interior protection.
+///
+/// # Safety
+/// `output` must point to a writable, aligned complete record when `bytes`
+/// names the record's exact size. This call does not allocate or initialize.
+#[cfg(feature = "allocator-fixture")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn m3_constructor_stack_query(
+    output: *mut reverie_inguest::guest::tool_region::ConstructorStackRecord,
+    bytes: usize,
+) -> i32 {
+    use reverie_inguest::guest::tool_region::ConstructorStackRecord;
+    if bytes != core::mem::size_of::<ConstructorStackRecord>()
+        || output.is_null()
+        || !(output as usize).is_multiple_of(core::mem::align_of::<ConstructorStackRecord>())
+    {
+        return -1;
+    }
+    unsafe { reverie_inguest::guest::tool_region::reverie_inguest_constructor_stack_query(output) }
 }
 
 /// Carries shared open file control messages to Detcore's global state from

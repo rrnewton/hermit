@@ -1411,8 +1411,13 @@ fi
 # FIXED-STACK CARRY TO f2cb0dc267f6d502a3d27b95b01121d584de2265:
 # reverie-dbt, third-party and rust-toolchain.toml are identical to 4203a253;
 # the tracked DBT inventory remains 939. No timing budget was changed.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != f2cb0dc267f6d502a3d27b95b01121d584de2265 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie f2cb0dc267f6d502a3d27b95b01121d584de2265 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CONSTRUCTOR-STACK CARRY TO b7ac1604f2c969f6e96dc3978c0df60b051fb0c1 (2026-10-10):
+# From f2cb0dc267f6d502a3d27b95b01121d584de2265, the complete reverie-dbt and
+# third-party trees and rust-toolchain.toml are Git-object identical.
+# The tracked DBT inventory remains 939; timing budgets are unchanged.
+# This is source identity, not a new runtime receipt or timing calibration.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != b7ac1604f2c969f6e96dc3978c0df60b051fb0c1 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie b7ac1604f2c969f6e96dc3978c0df60b051fb0c1 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
