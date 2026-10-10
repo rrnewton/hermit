@@ -1807,7 +1807,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the_vfork_barrier_valve_is_thirty_seconds} (the valve's consumer and
     // bound) retain all 1321: 1323.
     // And a_background_call_with_an_unknown_sleeping_mask_is_never_armed (review of https://github.com/rrnewton/hermit/pull/3989): 1324.
-    ("test.detcore_unit", 1324),
+    // scheduler::test::{a_child_wait_settles_only_on_children_held_or_in_futex_waits,
+    // a_chain_of_child_waits_down_to_a_held_child_settles,
+    // a_process_armed_with_a_parent_death_sigkill_is_not_stuck} and
+    // tool_global::test::sigkill_notifications_record_the_doomed_process
+    // (https://github.com/rrnewton/hermit/issues/3904) retain all 1324: 1328.
+    ("test.detcore_unit", 1328),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2364,7 +2369,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // runs no guest: 268.
     // a_futex_wake_count_of_zero_or_negative_wakes_one_waiter
     // (https://github.com/rrnewton/hermit/issues/3957) retains all 275: 276.
-    ("test.cli", 276),
+    // happens_before_cycle_through_a_child_wait_is_refused_by_name and
+    // happens_before_held_child_killed_by_another_process_is_not_a_deadlock
+    // (https://github.com/rrnewton/hermit/issues/3904) retain all 276: 278.
+    ("test.cli", 278),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2577,7 +2585,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the six relative-anchor CLI tests: 210.
     // And the skid-retry predicate unit test, which runs no guest: 204.
     // The FUTEX_WAKE count test starts no LiteInst guest: 212.
-    ("test.cli_on_host", 212),
+    ("test.cli_on_host", 214),
+    // And the two child-wait CLI tests: 214.
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 55),
@@ -2706,7 +2715,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the fifteen child-subreaper tests: 1321.
     // And the valve's consumer and bound tests: 1323.
     // And the same unknown-sleeping-mask test: 1324.
-    ("test.detcore_unit_on_host", 1324),
+    // And the four child-wait deadlock tests: 1328.
+    ("test.detcore_unit_on_host", 1328),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
