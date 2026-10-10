@@ -170,7 +170,7 @@ enum Notification {
 #[derive(Debug, Default)]
 pub(crate) struct ChildExitSigchldLedger {
     /// The exit status each exiting process reported, until its `Exit` grant.
-    exit_status: BTreeMap<DetPid, ChildExitSiginfo>,
+    pub(super) exit_status: BTreeMap<DetPid, ChildExitSiginfo>,
     /// For each parent process, its owned children's notifications.
     owned: BTreeMap<DetPid, BTreeMap<DetPid, Notification>>,
     /// For each parent process, the owned children whose copy the scheduler
