@@ -4684,3 +4684,144 @@ fn a_deadline_restored_poller_gates_a_finished_background_call_as_while_backed_o
         }
     }
 }
+
+/// Where the child of [`an_expired_vfork_barrier_ends_the_run_through_the_daemon_loop`]
+/// learns which case to run.
+const VFORK_VALVE_CHILD: &str = "HERMIT_VFORK_VALVE_CONSUMER_CHILD";
+
+/// The child side of [`an_expired_vfork_barrier_ends_the_run_through_the_daemon_loop`]:
+/// one runnable thread whose own vfork is still `Pending` (no child has
+/// registered), with or without the KVM-style signal control installed, and
+/// step2a's clock either past the valve or just started. It runs the real
+/// daemon loop. An expired valve must end the process with
+/// `HERMIT_POLICY_REFUSAL_EXIT` from inside the loop; a live one must still be
+/// waiting when the child stops looking.
+fn run_vfork_valve_child(case: &str) {
+    let (controlled, expired) = match case {
+        "ordinary-expired" => (false, true),
+        "controlled-expired" => (true, true),
+        "ordinary-live" => (false, false),
+        other => panic!("unknown vfork valve case {other}"),
+    };
+    let (mut s, _backend) = fixture_with_control(controlled);
+    let (parent, _, _) = add(&mut s, 100, 100);
+    runnable(&mut s, parent);
+    s.vfork_barriers.insert(parent, None);
+    s.vfork_barrier_wait_since = Some(if expired {
+        std::time::Instant::now()
+            .checked_sub(Scheduler::VFORK_BARRIER_VALVE + Duration::from_secs(1))
+            .expect("the monotonic clock has run longer than the valve")
+    } else {
+        std::time::Instant::now()
+    });
+    s.started_up.try_put(());
+    let global = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+    let sched = Arc::new(Mutex::new(s));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let looped = sched.clone();
+    let outcome = runtime.block_on(async move {
+        tokio::time::timeout(Duration::from_secs(3), sched_loop(looped, global)).await
+    });
+    // Only a live wait should reach this point: it must still be waiting, with
+    // the barrier in place, nothing committed and no refusal recorded. An
+    // expired wait reaches it only if nothing consumed its refusal.
+    assert!(
+        outcome.is_err(),
+        "the daemon loop returned instead of waiting"
+    );
+    let s = sched.lock().unwrap();
+    assert_eq!(s.vfork_barriers.get(&parent), Some(&None));
+    assert_eq!(s.turn, 0, "a turn committed behind a pending vfork barrier");
+    assert!(s.vfork_barrier_refusal.is_none());
+    println!("VFORK_VALVE_CHILD still waiting");
+}
+
+/// An expired vfork barrier valve ends the run through the daemon loop's own
+/// consumer, on the ordinary turn function and on the signal-control one:
+/// exit `HERMIT_POLICY_REFUSAL_EXIT` with the named refusal on stderr. The
+/// step2a unit tests stop at the recorded refusal; this is the part they cannot
+/// reach, because the consumer ends the process. A live wait, the control, is
+/// still waiting 3 s later rather than refused. Each case runs in a child that
+/// stops looking after 3 s: without the consumer an expired wait keeps
+/// skipping turns, so the child then finds the refusal recorded but never
+/// acted on and fails instead of exiting with the refusal
+/// (https://github.com/rrnewton/hermit/issues/3999, review of
+/// https://github.com/rrnewton/hermit/pull/4008).
+#[test]
+fn an_expired_vfork_barrier_ends_the_run_through_the_daemon_loop() {
+    if let Ok(case) = std::env::var(VFORK_VALVE_CHILD) {
+        run_vfork_valve_child(&case);
+        return;
+    }
+    const TEST: &str =
+        "scheduler::parked_tests::an_expired_vfork_barrier_ends_the_run_through_the_daemon_loop";
+    for (case, refused) in [
+        ("ordinary-expired", true),
+        ("controlled-expired", true),
+        ("ordinary-live", false),
+    ] {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env(VFORK_VALVE_CHILD, case)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // A hang guard only: an expired child refuses at once, and every
+        // other child stops itself after 3 s.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "{case}: the run did not end within 60 s\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if refused {
+            assert_eq!(
+                output.status.code(),
+                Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+                "{case}: stdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            assert!(
+                stderr.contains("hermit refused to continue the run: vfork barriers waited")
+                    && stderr.contains(
+                        "parent 100 (no child registered) Pending, awaiting the child's registration;"
+                    ),
+                "{case}: stderr:\n{stderr}"
+            );
+            assert!(
+                !stdout.contains("VFORK_VALVE_CHILD still waiting"),
+                "{case}"
+            );
+        } else {
+            assert!(
+                output.status.success() && stdout.contains("VFORK_VALVE_CHILD still waiting"),
+                "{case}: exited with {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                output.status
+            );
+        }
+    }
+}
+
+/// The valve's bound is the release barrier's, 30 s; a change to either is a
+/// deliberate decision, not a drift.
+#[test]
+fn the_vfork_barrier_valve_is_thirty_seconds() {
+    assert_eq!(Scheduler::VFORK_BARRIER_VALVE, Duration::from_secs(30));
+    assert_eq!(
+        Scheduler::VFORK_BARRIER_VALVE,
+        Scheduler::SIGNALED_BACKGROUND_VALVE
+    );
+}

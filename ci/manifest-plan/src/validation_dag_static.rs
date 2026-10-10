@@ -1794,7 +1794,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The fourteen child-subreaper re-parenting scheduler tests and the
     // subreaper prctl backend and mode gate
     // (https://github.com/rrnewton/hermit/issues/3997) retain all 1306: 1321.
-    ("test.detcore_unit", 1321),
+    // scheduler::parked_tests::{an_expired_vfork_barrier_ends_the_run_through_the_daemon_loop,
+    // the_vfork_barrier_valve_is_thirty_seconds} (the valve's consumer and
+    // bound) retain all 1321: 1323.
+    ("test.detcore_unit", 1323),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2680,7 +2683,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the three vfork barrier valve tests: 1304.
     // And the two FUTEX_WAKE count tests: 1306.
     // And the fifteen child-subreaper tests: 1321.
-    ("test.detcore_unit_on_host", 1321),
+    // And the valve's consumer and bound tests: 1323.
+    ("test.detcore_unit_on_host", 1323),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
