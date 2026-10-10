@@ -1,8 +1,8 @@
 # Backend isolation audit
 
 Source baseline: `5a3fdbb3c80a6f1673d8a51f617c660ffa2e6ca3`.
-This audit describes that historical baseline, not later implementations or
-their conformance.
+The baseline sections describe that historical source, not later conformance.
+Separately labeled follow-ups record their own source and evidence scope.
 Reverie dependency: `255d2e0b8f5ba017bcc7233711c63583e4fe419e`, as pinned in
 `hermit-cli/Cargo.toml:67`. Source findings below are not live pass claims.
 Exact-baseline host measurements are summarized below; other required mode/root
@@ -287,3 +287,58 @@ dependency revision above; a newer dependency checkout is not source evidence.
 | PIN | `ci/hermetic/run-in-pinned-root.sh:456`; `:458`; `:459`; `:462`; `:464`; `:465`; `:479`; `ci/hermetic/README.md:124`. |
 | IMG | `hermit-cli/src/bin/hermit/container.rs:475`; `:500`; `:507`; `:537`; `:551`; `:559`; `hermit-cli/src/bin/hermit/run.rs:7685`. |
 | LIB | `hermit-cli/src/lib.rs:4315`; `:3304`; `:3773`; `detcore/tests/testutils/src/lib.rs:557`. |
+
+## Follow-up: native CLI IPC and cgroup setup
+
+The subsequent CLI change starts from Hermit
+`b2f14884189caeb3f3086af2e4f8718fb5130bd6` with published Reverie
+`0352d5da9b9422fe690bbc87511479e80b0080fe`. One private
+`common_namespace_set` helper supplies PID, IPC, and cgroup flags to
+`default_container`, `image_container`, and the separate namespace-only
+direct-exec path. Bare `--no-namespace` retains its inherited namespace policy.
+
+Two native setup tests exercise those actual builders and completion paths:
+`run::namespace_tests::common_and_image_have_private_ipc_and_cgroup_namespaces`
+and `run::namespace_tests::namespace_only_has_private_ipc_and_cgroup_namespaces`.
+The common/image observation used code patch
+`b827dc0ceda69bf764ba5bca382ab5a54e73a3575d36ac75ab487124667fa735`;
+namespace-only used
+`8754c72b9ebc8d0a3202f5ff59c76f1be863a27eb274fc771611bd011d575f83`.
+Production, shared helpers, and the common/image test are byte-identical
+between these versions. Only namespace-only test lifecycle and parent record
+framing differ. Namespace-only explicitly configures INFO logging.
+Each completed with status 0 in its source-bound version, individually boxed at
+one core, 30 CPU seconds, 90 wall seconds, 4 GiB memory, 128 tasks, and a 16 MiB
+log cap. Both resource reports were complete and untruncated, with no limit
+hits, and the exact owned units were retired. The earlier failed test-argument
+and tracing-initialization attempts remain failed evidence. The successful
+common/image test was not repeated after the test-only process correction.
+
+These comparisons use raw kernel namespace objects against each route's
+immediate UID0 parent with effective `CAP_SYS_ADMIN`:
+
+| Native route | IPC | Cgroup | Network |
+| --- | --- | --- | --- |
+| Default Local | Private | Private | Private |
+| Default explicit Host | Private | Private | Inherited |
+| Bare NoNamespace | Inherited | Inherited | Inherited |
+| Prepared image builder, Local | Private | Private | Private |
+| Namespace-only Local | Private | Private | Private |
+| Namespace-only explicit Host | Private | Private | Inherited |
+
+The isolated children observe native PID1 and their newly rooted cgroup
+membership. Their parent's held 4,096-byte SysV segment is unreachable by its
+original ID (actual `EINVAL`); NoNamespace reads its original marker. The tests
+retain all seven namespace objects and complete cgroup/status observations,
+assert original child-wait consumption, and hold each parent's segment through
+that wait. Each namespace-only network invocation has its own physical parent.
+This is native kernel setup evidence, not Detcore SysV syscall support or an
+OCI image execution result.
+
+The earlier seven-selector CLI collection used the pre-IPC source and remains
+failed evidence; these native results do not upgrade it. The namespace-only
+filesystem/network setup remains separate from the common container setup.
+Read-only sysfs/cgroup masks, shared memory mounts, inherited/runtime
+descriptors, closed stdio, complete mode coverage, physical-generation
+admission, cross-backend equality, and KVM guest observations remain open.
+No L1/L2 or full backend conformance is established here.

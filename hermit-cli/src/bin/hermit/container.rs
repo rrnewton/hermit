@@ -509,10 +509,15 @@ pub(super) fn apply_affinity(container: &mut Container, pin_threads: bool) {
     }
 }
 
+/// Kernel namespace policy shared by the CLI's container and direct-exec paths.
+pub(super) fn common_namespace_set() -> Namespace {
+    Namespace::PID | Namespace::IPC | Namespace::CGROUP
+}
+
 pub fn default_container(pin_threads: bool) -> Container {
     let mut container = Container::new();
     container
-        .unshare(Namespace::PID)
+        .unshare(common_namespace_set())
         .map_root()
         .hostname("hermetic-container.local")
         .domainname("local")
@@ -550,7 +555,7 @@ pub(super) fn image_container(
 ) -> Result<(Container, IdentityGuard), Error> {
     let mut container = Container::new();
     container
-        .unshare(Namespace::PID)
+        .unshare(common_namespace_set())
         .map_root()
         .hostname("hermetic-container.local")
         .domainname("local")
