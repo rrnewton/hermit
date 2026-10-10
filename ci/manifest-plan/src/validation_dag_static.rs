@@ -956,7 +956,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // from_refusals_name_the_event,
     // relative_anchors_count_strictly_after_their_base} (detcore-model,
     // relative happens-before anchors) retain all 1033: 1038.
-    ("test.regular_crates", 1038),
+    // happens_before::tests::a_duplicated_field_is_refused (detcore-model,
+    // Codex review of https://github.com/rrnewton/hermit/pull/4004) retains
+    // all 1038: 1039.
+    ("test.regular_crates", 1039),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2883,7 +2886,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the config-fingerprint mismatch test: 1032.
     // The native per-physical-network namespace regression: 1023, listed.
     // And the five relative-anchor model tests: 1038.
-    ("test.regular_crates_on_host", 1038),
+    // And the duplicated-field model test: 1039.
+    ("test.regular_crates_on_host", 1039),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
