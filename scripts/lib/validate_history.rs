@@ -868,9 +868,20 @@ pub fn history_estimate(
 /// (`resolve_selective_baseline`, validate.sh:4364).
 ///
 /// Precedence: explicit `--baseline`, then `$HERMIT_LAST_GREEN_SHA`, then the
-/// most recent passing Cargo ledger row (preferring this slot). Only a commit that
-/// EXISTS locally is returned; anything else yields `None` so selection fails
-/// safe to the full lane. Never fail-open on a stale or missing baseline.
+/// most recent clean full Cargo pass in the ledger (preferring this slot). Only a
+/// commit that EXISTS locally is returned; anything else yields `None` so
+/// selection fails safe to the full lane. Never fail-open on a stale or missing
+/// baseline.
+///
+/// A ledger row is a baseline only when it is a full pass by the bar a reused
+/// pass must meet: profile `full`, selection mode `full`, anchored to its commit
+/// with a clean tree (`commit_anchored`, not `tree_dirty`, as `row_matches_key`
+/// requires), cells run under Cargo, and `pass_row_qualifies` (no failures,
+/// every expected gate run, tests and nodes executed, no planned node absent).
+/// A dirty-tree pass validated something other than its commit. A quick, `--only`, `--selected` or
+/// test-free pass ran less than the nodes `--selective` would skip as unchanged
+/// since it, so it cannot vouch for them
+/// (<https://github.com/rrnewton/hermit/issues/3924>).
 pub fn selective_baseline(
     rows: &[serde_json::Value],
     explicit: Option<&str>,
@@ -906,6 +917,12 @@ fn selective_baseline_from(
                     // invariants, so it is not a last-known-green for Cargo.
                     s(r, "result") == "pass"
                         && row_release_builder(r) == Some("cargo")
+                        && s(r, "profile") == "full"
+                        && s(r, "selection_mode") == "full"
+                        && r.get("commit_anchored").and_then(|v| v.as_bool()) == Some(true)
+                        && r.get("tree_dirty").and_then(|v| v.as_bool()) == Some(false)
+                        && row_cells_ran_under_cargo(r)
+                        && pass_row_qualifies(r)
                         && s(r, "commit") != "unknown"
                         && !s(r, "commit").is_empty()
                         && want_slot.map(|w| s(r, "slot") == w).unwrap_or(true)
@@ -1856,11 +1873,28 @@ pub fn self_test() -> Result<String, String> {
         ));
     }
 
+    // Selective-baseline brackets: every row below is a clean full pass
+    // (`pass_row_qualifies`), so each refusal is attributable to the one
+    // property its bracket spoils.
+    let qualifying = |extra: serde_json::Value| -> serde_json::Value {
+        let mut row = base(serde_json::json!({
+            "executed_tests": 873, "executed_nodes": 47, "gates_expected": 47, "gates_run": 47,
+            "coverage": {"planned_test_nodes": 20, "executed_test_nodes": 20, "absent_nodes": []},
+        }));
+        if let (Some(o), Some(e)) = (row.as_object_mut(), extra.as_object()) {
+            for (k, val) in e {
+                o.insert(k.clone(), val.clone());
+            }
+        }
+        row
+    };
     // Selective-baseline brackets: a nonexistent commit must be REFUSED (so the
     // caller falls back to the full lane) and an existing one ACCEPTED.
     let ledger_rows = vec![
-        base(serde_json::json!({"slot": "other", "commit": "aaa", "producer": "validate.rs"})),
-        base(serde_json::json!({"slot": "mine", "commit": "bbb", "producer": "validate.rs"})),
+        qualifying(
+            serde_json::json!({"slot": "other", "commit": "aaa", "producer": "validate.rs"}),
+        ),
+        qualifying(serde_json::json!({"slot": "mine", "commit": "bbb", "producer": "validate.rs"})),
     ];
     let exists_all = |_: &str| true;
     let exists_none = |_: &str| false;
@@ -1910,7 +1944,7 @@ pub fn self_test() -> Result<String, String> {
             row["e2e_payload"] = payload;
         }
         let mut with_buck = ledger_rows.clone();
-        with_buck.push(base(row));
+        with_buck.push(qualifying(row));
         if selective_baseline(&with_buck, None, "mine", &exists_all).as_deref() != Some("bbb") {
             return Err(format!(
                 "selective: newer green {commit} (Buck or non-string builder) must not become the Cargo baseline"
@@ -1918,19 +1952,19 @@ pub fn self_test() -> Result<String, String> {
         }
     }
     let mut named_cargo = ledger_rows.clone();
-    named_cargo.push(base(serde_json::json!({"slot": "mine", "commit": "eee", "producer": "validate.rs", "release_builder": "cargo", "e2e_payload": crate::e2e_payload_identity("cargo")})));
+    named_cargo.push(qualifying(serde_json::json!({"slot": "mine", "commit": "eee", "producer": "validate.rs", "release_builder": "cargo", "e2e_payload": crate::e2e_payload_identity("cargo")})));
     if selective_baseline(&named_cargo, None, "mine", &exists_all).as_deref() != Some("eee") {
         return Err("selective: an explicitly Cargo green must remain a baseline".into());
     }
     let mut mismatched = ledger_rows.clone();
-    mismatched.push(base(serde_json::json!({"slot": "mine", "commit": "fff", "producer": "validate.rs", "release_builder": "cargo", "e2e_payload": crate::e2e_payload_identity("buck")})));
-    mismatched.push(base(serde_json::json!({"slot": "mine", "commit": "ggg", "producer": "validate.rs", "release_builder": "cargo"})));
+    mismatched.push(qualifying(serde_json::json!({"slot": "mine", "commit": "fff", "producer": "validate.rs", "release_builder": "cargo", "e2e_payload": crate::e2e_payload_identity("buck")})));
+    mismatched.push(qualifying(serde_json::json!({"slot": "mine", "commit": "ggg", "producer": "validate.rs", "release_builder": "cargo"})));
     if selective_baseline(&mismatched, None, "mine", &exists_all).as_deref() != Some("bbb") {
         return Err("selective: a green whose payload is not the Cargo identity must not become the Cargo baseline".into());
     }
     // A contemporary pairless green is not a Cargo baseline either.
     let mut pairless_green = ledger_rows.clone();
-    pairless_green.push(base(serde_json::json!({"slot": "mine", "commit": "hhh", "producer": "validate.rs", "finished_at": "2026-09-26T00:00:00Z"})));
+    pairless_green.push(qualifying(serde_json::json!({"slot": "mine", "commit": "hhh", "producer": "validate.rs", "finished_at": "2026-09-26T00:00:00Z"})));
     if selective_baseline(&pairless_green, None, "mine", &exists_all).as_deref() != Some("bbb") {
         return Err(
             "selective: a pairless green after the writer must not become the Cargo baseline"
@@ -1950,8 +1984,9 @@ pub fn self_test() -> Result<String, String> {
         ("future 11", Some(serde_json::json!(11))),
         ("future 999", Some(serde_json::json!(999))),
     ] {
-        let mut row =
-            base(serde_json::json!({"slot": "mine", "commit": "jjj", "producer": "validate.rs"}));
+        let mut row = qualifying(
+            serde_json::json!({"slot": "mine", "commit": "jjj", "producer": "validate.rs"}),
+        );
         match schema {
             Some(schema) => row["schema_version"] = schema,
             None => {
@@ -1968,16 +2003,79 @@ pub fn self_test() -> Result<String, String> {
         refused += 1;
     }
     let mut historical = ledger_rows.clone();
-    historical.push(base(serde_json::json!({"slot": "mine", "commit": "kkk", "producer": "validate.rs", "schema_version": 10})));
+    historical.push(qualifying(serde_json::json!({"slot": "mine", "commit": "kkk", "producer": "validate.rs", "schema_version": 10})));
     if selective_baseline(&historical, None, "mine", &exists_all).as_deref() != Some("kkk") {
         return Err("selective: a newer pairless schema-10 green before the cutoff must remain a Cargo baseline".into());
+    }
+    // Only a clean full pass is a baseline
+    // (https://github.com/rrnewton/hermit/issues/3924): a newer pass that ran
+    // less, or nothing, is passed over for the older full one.
+    for (why, spoil) in [
+        (
+            "a quick-profile pass",
+            serde_json::json!({"profile": "quick"}),
+        ),
+        (
+            "an envelope-only pass",
+            serde_json::json!({"profile": "envelope-only"}),
+        ),
+        (
+            "an --only pass",
+            serde_json::json!({"selection_mode": "only"}),
+        ),
+        (
+            "a --selected pass",
+            serde_json::json!({"selection_mode": "selected"}),
+        ),
+        (
+            "a pass that executed no test",
+            serde_json::json!({"executed_tests": 0}),
+        ),
+        (
+            "a pass with an absent planned node",
+            serde_json::json!({"coverage": {"planned_test_nodes": 20, "executed_test_nodes": 19, "absent_nodes": ["test.x"]}}),
+        ),
+        (
+            "a pass that recorded a failure",
+            serde_json::json!({"failures": 1}),
+        ),
+        (
+            "a pass whose cells ran under Buck",
+            serde_json::json!({"e2e_runner": "buck-local"}),
+        ),
+        (
+            "a pass of a dirty tree",
+            serde_json::json!({"tree_dirty": true}),
+        ),
+        (
+            "a pass not anchored to its commit",
+            serde_json::json!({"commit_anchored": false}),
+        ),
+    ] {
+        let mut row = qualifying(
+            serde_json::json!({"slot": "mine", "commit": "lll", "producer": "validate.rs"}),
+        );
+        if let (Some(o), Some(e)) = (row.as_object_mut(), spoil.as_object()) {
+            for (k, val) in e {
+                o.insert(k.clone(), val.clone());
+            }
+        }
+        let mut rows = ledger_rows.clone();
+        rows.push(row.clone());
+        if selective_baseline(&rows, None, "mine", &exists_all).as_deref() != Some("bbb") {
+            return Err(format!("selective: {why} must not become the baseline"));
+        }
+        if selective_baseline(std::slice::from_ref(&row), None, "mine", &exists_all).is_some() {
+            return Err(format!("selective: {why} alone must give no baseline"));
+        }
+        refused += 1;
     }
     refused += 5;
     accepted += 4;
     Ok(format!(
         "history: cache bracketed {accepted} accept / {refused} refuse (incl. both \
          cross-producer counter traps), estimate bracketed thin/median/no-ledger/fail-poison, \
-         selective baseline bracketed slot-preference/explicit/missing-commit/builder, \
+         selective baseline bracketed slot-preference/explicit/missing-commit/builder/full-pass-only, \
          streamed rows bracketed projection/divergence/non-UTF-8"
     ))
 }
