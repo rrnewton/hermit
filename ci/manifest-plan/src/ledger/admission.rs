@@ -1,6 +1,7 @@
 //! Retained admission-floor transport. These values preserve a driver's already
 //! authenticated proof; parsing a value or checking its digest grants no authority.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
@@ -11,6 +12,7 @@ use sha2::Digest;
 use sha2::Sha256;
 
 use super::HistoryRow;
+use super::RetainedJson;
 
 pub const ADMISSION_CONTEXT_CONTRACT: &str = "ci-hub-admission-floor/v1";
 pub const ADMISSION_CONTEXT_V2_CONTRACT: &str = "ci-hub-admission-floor/v2";
@@ -184,14 +186,77 @@ struct CapturedValue {
     duplicate: bool,
 }
 
+/// Extensions large enough to keep as compact text when decoded from history.
+/// On the 2026-10-10 ledger `raw_result_input_census_v1` held 134 MB of JSON as
+/// 1.58 GB of `Value` (<https://github.com/rrnewton/dev-hermit/issues/552>).
+const RETAINED_EXTENSIONS: &[&str] = &["raw_result_input_census_v1"];
+
 /// The historical extension map plus private original-input metadata. The
 /// serialized form is exactly the BTreeMap; duplicate refusal state is exposed
 /// only by HistoryRow::admission_log_identity for checked transient delegation.
 /// Ordinary map mutation deliberately does not clear original bad metadata.
+///
+/// A decoded entry named in `RETAINED_EXTENSIONS` (today only
+/// `raw_result_input_census_v1`) that has no float lives in `retained`
+/// as compact text, NOT in the map that `Deref` exposes: read it with
+/// [`HistoryExtensions::value`] and remove it with
+/// [`HistoryExtensions::remove_value`]. Serialization and equality treat both
+/// stores as one map; an entry inserted through `DerefMut` replaces a retained
+/// one with the same key.
 #[derive(Clone, Debug, Default)]
 pub struct HistoryExtensions {
     values: BTreeMap<String, Value>,
+    retained: BTreeMap<String, RetainedJson>,
     duplicate_log_identities: Option<Vec<Value>>,
+}
+
+impl HistoryExtensions {
+    /// The value of `key` from either store.
+    pub fn value(&self, key: &str) -> Option<Cow<'_, Value>> {
+        if let Some(value) = self.values.get(key) {
+            return Some(Cow::Borrowed(value));
+        }
+        self.retained
+            .get(key)
+            .map(|retained| Cow::Owned(retained.value()))
+    }
+
+    /// Remove `key` from both stores, returning its value.
+    pub fn remove_value(&mut self, key: &str) -> Option<Value> {
+        let retained = self.retained.remove(key).map(|retained| retained.value());
+        self.values.remove(key).or(retained)
+    }
+
+    /// Every entry of both stores in key order; the map entry wins a tie.
+    fn merged(&self) -> impl Iterator<Item = (&String, Extension<'_>)> {
+        let mut values = self.values.iter().peekable();
+        let mut retained = self
+            .retained
+            .iter()
+            .filter(|(key, _)| !self.values.contains_key(*key))
+            .peekable();
+        std::iter::from_fn(move || match (values.peek(), retained.peek()) {
+            (Some((left, _)), Some((right, _))) if right < left => retained
+                .next()
+                .map(|(key, value)| (key, Extension::Retained(value))),
+            (Some(_), _) => values
+                .next()
+                .map(|(key, value)| (key, Extension::Value(value))),
+            (None, Some(_)) => retained
+                .next()
+                .map(|(key, value)| (key, Extension::Retained(value))),
+            (None, None) => None,
+        })
+    }
+
+    fn merged_len(&self) -> usize {
+        self.values.len()
+            + self
+                .retained
+                .keys()
+                .filter(|key| !self.values.contains_key(*key))
+                .count()
+    }
 }
 
 impl std::ops::Deref for HistoryExtensions {
@@ -207,16 +272,54 @@ impl std::ops::DerefMut for HistoryExtensions {
     }
 }
 
+/// One entry of either store. A retained entry serializes from its text.
+enum Extension<'a> {
+    Value(&'a Value),
+    Retained(&'a RetainedJson),
+}
+
+impl Extension<'_> {
+    fn value(&self) -> Cow<'_, Value> {
+        match self {
+            Self::Value(value) => Cow::Borrowed(value),
+            Self::Retained(retained) => Cow::Owned(retained.value()),
+        }
+    }
+}
+
+impl Serialize for Extension<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Value(value) => value.serialize(serializer),
+            Self::Retained(retained) => retained.serialize(serializer),
+        }
+    }
+}
+
 impl PartialEq for HistoryExtensions {
     fn eq(&self, other: &Self) -> bool {
-        self.values == other.values
+        self.merged_len() == other.merged_len()
+            && self
+                .merged()
+                .zip(other.merged())
+                .all(|((left_key, left), (right_key, right))| {
+                    left_key == right_key && left.value() == right.value()
+                })
     }
 }
 impl Eq for HistoryExtensions {}
 
 impl Serialize for HistoryExtensions {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.values.serialize(serializer)
+        if self.retained.is_empty() {
+            return self.values.serialize(serializer);
+        }
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.merged_len()))?;
+        for (key, value) in self.merged() {
+            map.serialize_entry(key, &value)?;
+        }
+        map.end()
     }
 }
 
@@ -583,6 +686,7 @@ where
             M: serde::de::MapAccess<'de>,
         {
             let mut result = BTreeMap::new();
+            let mut retained = BTreeMap::new();
             let mut log_identities = Vec::new();
             let mut duplicate_log_identity = false;
             while let Some(key) = map.next_key::<String>()? {
@@ -600,6 +704,19 @@ where
                     duplicate_log_identity |= captured.duplicate || !log_identities.is_empty();
                     log_identities.push(captured.value.clone());
                     captured.value
+                } else if RETAINED_EXTENSIONS.contains(&key.as_str()) {
+                    // A repeated key keeps the last value, as the map does.
+                    match RetainedJson::new(map.next_value()?) {
+                        Ok(text) => {
+                            result.remove(&key);
+                            retained.insert(key, text);
+                            continue;
+                        }
+                        Err(value) => {
+                            retained.remove(&key);
+                            value
+                        }
+                    }
                 } else {
                     map.next_value()?
                 };
@@ -607,6 +724,7 @@ where
             }
             Ok(HistoryExtensions {
                 values: result,
+                retained,
                 duplicate_log_identities: duplicate_log_identity.then_some(log_identities),
             })
         }

@@ -288,13 +288,13 @@ impl HistoryRow {
     /// Preserve absence and the outer extension map's historical serialization.
     /// A present unknown/malformed version refuses, rather than becoming absent.
     pub fn raw_result_input_census_v1(&self) -> Result<Option<RawResultInputCensusV1>, String> {
-        let Some(value) = self.extra.get("raw_result_input_census_v1") else {
+        let Some(value) = self.extra.value("raw_result_input_census_v1") else {
             return Ok(None);
         };
         if self.extra.get("raw_result_input_census_error").is_some() {
             return Err("raw result census cannot carry both proof and publication error".into());
         }
-        let census: RawResultInputCensusV1 = serde_json::from_value(value.clone())
+        let census: RawResultInputCensusV1 = serde_json::from_value(value.into_owned())
             .map_err(|error| format!("invalid raw result census: {error}"))?;
         census.validate_for_row(self)?;
         Ok(Some(census))
