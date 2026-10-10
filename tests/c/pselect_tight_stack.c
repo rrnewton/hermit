@@ -24,15 +24,18 @@
  * must be the same before the main thread's calls and after them (maps), and
  * after each batch (threads; glibc reuses the first batch's thread stacks for
  * the second): Hermit must leave no mapping of its own behind, per call or per
- * thread.
+ * thread. Every call fills the 128-byte red zone below its stack with a
+ * pattern first, and the pattern must be intact after it (red_zone): Hermit
+ * may stage there only if it puts the guest's bytes back.
  *
  * Natively every mode prints
- *   mode=<mode> ready=1 signal=-4 alarms=1 restart=0 again=1 maps=1 threads=1 oracle=1
+ *   mode=<mode> ready=1 signal=-4 alarms=1 restart=0 again=1 maps=1 threads=1 red_zone=1 oracle=1
  */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -91,12 +94,25 @@ static void on_alarm(int signo) {
     alarms++;
 }
 
+/* Red-zone bytes that differed after a call from the pattern written before
+ * it, summed over every call and thread. */
+static atomic_int red_zone_changed;
+
+/* Makes the call on `stack`, with a pattern in the 128-byte red zone below
+ * it, and counts the pattern bytes the call left changed. */
 static long select_on(unsigned char *stack, int fd, long seconds, long nanos) {
     fd_set readable;
     struct timespec timeout = {seconds, nanos};
     FD_ZERO(&readable);
     FD_SET(fd, &readable);
-    return pselect_on_stack(stack, NFDS, &readable, &timeout, &wrapper);
+    for (int i = -128; i < 0; i++)
+        stack[i] = (unsigned char)(0xa5 ^ (i & 0xff));
+    long result = pselect_on_stack(stack, NFDS, &readable, &timeout, &wrapper);
+    int changed = 0;
+    for (int i = -128; i < 0; i++)
+        changed += stack[i] != (unsigned char)(0xa5 ^ (i & 0xff));
+    atomic_fetch_add(&red_zone_changed, changed);
+    return result;
 }
 
 /* The bytes mapped in this address space, summed over /proc/self/maps.
@@ -236,11 +252,13 @@ int main(int argc, char **argv) {
     int maps = maps_before > 0 && maps_after == maps_before;
     int threads = first_batch == WORKERS && second_batch == WORKERS && maps_first > 0 &&
                   maps_second == maps_first;
+    int red_zone = atomic_load(&red_zone_changed) == 0;
     int oracle = ready == 1 && signal == -EINTR && alarms_seen == 1 && restart == 0 &&
-                 again == 1 && maps && threads;
+                 again == 1 && maps && threads && red_zone;
     printf("mode=%s ready=%ld signal=%ld alarms=%d restart=%ld again=%ld maps=%d "
-           "threads=%d oracle=%d\n",
-           argv[1], ready, signal, alarms_seen, restart, again, maps, threads, oracle);
+           "threads=%d red_zone=%d oracle=%d\n",
+           argv[1], ready, signal, alarms_seen, restart, again, maps, threads, red_zone,
+           oracle);
     if (!oracle)
         fprintf(stderr, "maps before=%ld after=%ld first=%ld second=%ld batches=%d,%d\n",
                 maps_before, maps_after, maps_first, maps_second, first_batch,
