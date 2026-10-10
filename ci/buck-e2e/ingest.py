@@ -83,7 +83,13 @@ and appends its truncation marker, and this keeps at most 1 GiB + 1 MiB of a log
 log hermit bounded is kept whole and anything longer is cut there. DIR/index.jsonl has
 one line per execution that did not pass: its cell, run id, outcome (null without a
 row), route keys as above, and for each log the file written (relative to DIR) with its
-size and whether it was cut, or why it was not kept. DIR must be absent, empty, or a
+size and whether it was cut, or why it was not kept. Each entry also keeps what Hermit
+said: the last 64 KiB of the stderr the harness recorded for the execution's last attempt,
+written to DIR/<run id>/hermit-stderr.tail (its "stderr" record gives the file, the full
+size and whether it was cut, or why none was kept), and "internal_failure_class", the class
+of its last HERMIT_INTERNAL_FAILURE line (null without one). Both are kept whether or not
+any log was: a refusal before the guest ran, Hermit's exit 125, leaves none
+(https://github.com/rrnewton/hermit/issues/3922). DIR must be absent, empty, or a
 previous ingest's (it holds index.jsonl), and must neither contain nor lie inside IMPORT_DIR,
 --work or --local-artifacts; it is replaced. The logs are kept before the cells' coverage is
 checked, so a run that ingest refuses for a cell with no row (every attempt died) still
@@ -113,7 +119,17 @@ CELL_ARTIFACT = "cell__"  # cell.sh: <cell dir>/A/B is the artifact cell__A__B
 # plus room for the truncation marker it appends there.
 FAILED_LOG_MAX_BYTES = (1 << 30) + (1 << 20)
 FAILED_LOGS_INDEX = "index.jsonl"
-FAILED_LOGS_SCHEMA = 1
+FAILED_LOGS_SCHEMA = 2  # 2: each entry also carries the stderr tail and the internal failure class
+# The tail of a failed execution's Hermit stderr that the index keeps. Measured 2026-10-10 over
+# the retained cargo-lane results files on the validation host, counted twice over slightly
+# different file sets (2,985 failed attempts in 6,499 files; 2,880 in the 6,372 at
+# e2e/*/*/results.jsonl): their stderr was 629 bytes at the median, 9,477 or 998 at p90, 60,766 or
+# 64,503 at p99 and 95,118 at most, with 23 or 27 attempts over 64 KiB; the text from Hermit's
+# HERMIT_INTERNAL_FAILURE line to the end was at most 1,041 bytes. So 64 KiB keeps all of it for
+# more than 99% of them, and that line and the message after it always.
+STDERR_TAIL = "hermit-stderr.tail"
+STDERR_TAIL_MAX_BYTES = 64 << 10
+INTERNAL_FAILURE = "HERMIT_INTERNAL_FAILURE class="  # runner.rs HERMIT_INTERNAL_FAILURE_CLASS_PREFIX
 
 def try_testx(*args, tries=4):
     """(testx's stdout, None), or (None, why it failed)."""
@@ -225,13 +241,63 @@ def copy_log(path, sha256, target, cap):
             raise ValueError(f"it cannot be decompressed: {stderr[-300:].decode(errors='replace')}")
     return written, cut
 
+def last_attempt_stderr(rows):
+    """The stderr the harness recorded for the last attempt of the execution's last row, or
+    (None, why there is none)."""
+    if not rows:
+        return None, "the execution wrote no row"
+    attempts = rows[-1].get("attempts")
+    if not isinstance(attempts, list) or not attempts or not isinstance(attempts[-1], dict):
+        return None, "the execution's row records no attempt"
+    stderr = attempts[-1].get("stderr")
+    if not isinstance(stderr, str):
+        return None, "the execution's last attempt records no stderr"
+    return stderr, None
+
+def internal_failure_class(stderr):
+    """The class of the last HERMIT_INTERNAL_FAILURE line in STDERR, or None."""
+    for line in reversed(stderr.splitlines()):
+        if line.startswith(INTERNAL_FAILURE):
+            words = line[len(INTERNAL_FAILURE):].split()
+            return words[0] if words else None
+    return None
+
+def keep_stderr(root, run_id, rows):
+    """Write the last STDERR_TAIL_MAX_BYTES of the execution's Hermit stderr to
+    ROOT/RUN_ID/STDERR_TAIL, and return (its FAILED_LOGS_INDEX "stderr" record, the
+    internal failure class its stderr names)."""
+    record = {"file": None, "bytes": None, "truncated": None, "reason": None}
+    stderr, why = last_attempt_stderr(rows)
+    if stderr is None:
+        record["reason"] = why
+        return record, None
+    blob = stderr.encode(errors="replace")
+    kept = os.path.join(run_id, STDERR_TAIL)
+    try:
+        os.makedirs(os.path.join(root, run_id), exist_ok=True)
+        with open(os.path.join(root, kept), "wb") as out:
+            out.write(blob[-STDERR_TAIL_MAX_BYTES:])
+        record.update(file=kept, bytes=len(blob), truncated=len(blob) > STDERR_TAIL_MAX_BYTES)
+    except OSError as error:
+        record["reason"] = str(error)
+    return record, internal_failure_class(stderr)
+
 def keep_failed_logs(root, cell, run_id, rows, result, logs, log_dir, fetch_error, cap):
     """Copy the verify logs LOGS (see run_logs) of an execution that did not pass out of
-    LOG_DIR into ROOT/RUN_ID/<directory below the cell's directory>/ (see copy_log), and
-    return its FAILED_LOGS_INDEX entry."""
+    LOG_DIR into ROOT/RUN_ID/<directory below the cell's directory>/ (see copy_log), keep
+    the tail of its Hermit stderr (see keep_stderr), and return its FAILED_LOGS_INDEX
+    entry."""
     entry = {"schema": FAILED_LOGS_SCHEMA, "cell": cell, "run_id": run_id,
-             "outcome": rows[-1].get("outcome") if rows else None, **route_of(result), "logs": [], "reason": None}
+             "outcome": rows[-1].get("outcome") if rows else None, **route_of(result), "logs": [], "reason": None,
+             "stderr": {"file": None, "bytes": None, "truncated": None, "reason": None},
+             "internal_failure_class": None}
     hashes = (result or {}).get("artifact_sha256")
+    # The stderr is kept whatever happens to the logs: a refusal before the guest ran, the
+    # case it is for, often leaves no log at all.
+    if isinstance(run_id, str) and SAFE.fullmatch(run_id):
+        entry["stderr"], entry["internal_failure_class"] = keep_stderr(root, run_id, rows)
+    else:
+        entry["stderr"]["reason"] = f"the execution's run id {run_id!r} cannot name a directory"
     if not logs:
         entry["reason"] = "the execution's artifacts hold no run1_log_* or run2_log_* log"
     elif fetch_error is not None:

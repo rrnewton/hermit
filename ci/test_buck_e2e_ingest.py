@@ -557,6 +557,46 @@ class IngestTest(unittest.TestCase):
                 self.assertEqual((printed["failed_executions"], printed["failed_verify_logs_kept"],
                                   printed["failed_verify_logs_not_kept"]), (1, 2, 0))
 
+    def test_a_refused_executions_stderr_and_failure_class_are_kept(self):
+        """https://github.com/rrnewton/hermit/issues/3922: a Buck verify row that Hermit refused
+        with exit 125 kept only a 0-byte verify log, so nothing said why. The tail of the
+        attempt's stderr and the class of its HERMIT_INTERNAL_FAILURE line are kept with it,
+        a long stderr is cut to its last 64 KiB, and an execution with no row says why it
+        kept none."""
+        refusal = ("guest stderr before the refusal\n"
+                   "HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=kvm\n"
+                   "Error: the KVM backend is unavailable: /dev/kvm is busy\n")
+        refused_row = dict(row(Y, "ERROR", "ry1"), attempts=[{"status": 125, "stderr": refusal}])
+        refused = with_logs(execution(Y, 150, "ERROR", "ry1", rows=[refused_row]),
+                            {"cell__verify-logs__verify-1__run1_log_detlog": b""})
+        noise = "x" * 99 + "\n"
+        long_stderr = noise * 700 + "HERMIT_INTERNAL_FAILURE class=cli-error\nerror: bad flag\n"
+        long_row = dict(row(X, "FAIL", "rx1"), attempts=[{"status": 125, "stderr": long_stderr}])
+        long = execution(X, 100, "FAIL", "rx1", rows=[long_row])
+        # An execution with neither a row nor a log has nothing kept at all; one that left a
+        # log but no row keeps the log and says why it has no stderr.
+        died = with_logs(execution(X, 200, None, "rx2", complete=False),
+                         {"cell__verify-logs__verify-1__run1_log_detlog": RUN1_LOG})
+        work, process = self.ingest({"RUN": [long, refused, died, execution(X, 300, "PASS", "rx3")]},
+                                    extra=["--failed-verify-logs", str(self.root / "kept")])
+        self.assertEqual(process.returncode, 0, process.stderr)
+        index, files = self.read_kept(self.root / "kept")
+        self.assertEqual(index["ry1"]["internal_failure_class"], "backend-unavailable")
+        self.assertEqual(index["ry1"]["stderr"], {"file": "ry1/hermit-stderr.tail", "bytes": len(refusal),
+                                                  "truncated": False, "reason": None})
+        self.assertEqual(files["ry1/hermit-stderr.tail"], refusal.encode())
+        self.assertEqual(files["ry1/verify-logs/verify-1/run1_log_detlog"], b"")
+        self.assertEqual(index["rx1"]["internal_failure_class"], "cli-error")
+        self.assertEqual(index["rx1"]["stderr"], {"file": "rx1/hermit-stderr.tail", "bytes": len(long_stderr),
+                                                  "truncated": True, "reason": None})
+        self.assertEqual(files["rx1/hermit-stderr.tail"], long_stderr.encode()[-(64 << 10):])
+        self.assertTrue(files["rx1/hermit-stderr.tail"].endswith(b"HERMIT_INTERNAL_FAILURE class=cli-error\nerror: bad flag\n"))
+        self.assertIsNone(index["rx2"]["internal_failure_class"])
+        self.assertEqual(index["rx2"]["stderr"], {"file": None, "bytes": None, "truncated": None,
+                                                  "reason": "the execution wrote no row"})
+        self.assertNotIn("rx3", index)
+        self.assertEqual({entry["schema"] for entry in index.values()}, {2})
+
     def test_an_execution_that_wrote_no_row_keeps_its_logs_too(self):
         died = with_logs(execution(X, 100, None, "rx1", complete=False), DIVERGED_LOGS)
         work, process = self.ingest({"RUN": [died, execution(X, 200, "PASS", "rx2"), Y_PASSES]},
