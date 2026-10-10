@@ -21608,7 +21608,9 @@ fn futex_requeue_and_wake_op_match_linux() {
 /// read every futex word through the tracer: an unmapped word gave EIO, which
 /// futex(2) never returns, and a PROT_NONE word was read anyway and compared,
 /// giving EAGAIN. The timeout and a zero bitset are checked first, without
-/// touching the word, as Linux does. Every line matches native Linux, and a
+/// touching the word, as Linux does; the timeout is copied as `copy_from_user`
+/// copies it (a write-only page is readable on x86, a copy into a PROT_NONE
+/// page is EFAULT) and a huge valid one is clamped, not refused. Every line matches native Linux, and a
 /// record/replay of the guest matches.
 #[test]
 fn a_futex_wait_on_an_unreadable_word_is_efault() {
@@ -21643,7 +21645,10 @@ fn a_futex_wait_on_an_unreadable_word_is_efault() {
          wait_bitset, PROT_NONE private word: -1 EFAULT\n\
          wait_bitset, mask 0, PROT_NONE private word: -1 EINVAL\n\
          wait, tv_nsec 1e9, PROT_NONE private word: -1 EINVAL\n\
-         wait, tv_nsec 1e9, readable word 7, expecting 1: -1 EINVAL\n",
+         wait, tv_nsec 1e9, readable word 7, expecting 1: -1 EINVAL\n\
+         wait, {0,0} timeout in a write-only page, readable word 7, expecting 1: -1 EAGAIN\n\
+         wait, timeout split onto a PROT_NONE page, readable word 7, expecting 1: -1 EFAULT\n\
+         wait, {LONG_MAX,0} timeout, readable word 7, expecting 1: -1 EAGAIN\n",
         "stderr:\n{log}"
     );
     // Record and replay recompute these results (no futex event is recorded),

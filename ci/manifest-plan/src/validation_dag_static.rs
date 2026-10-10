@@ -1341,8 +1341,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and verify::tests::a_typed_run_failure_replaces_the_stamp_and_an_untyped_error_does_not
     // (the run_failed verification reason) retain all 1023: 1025.
     // And metadata::tests::record_version_rejects_streams_that_read_a_futex_wait_word_through_the_tracer
-    // (review of https://github.com/rrnewton/hermit/pull/4061): 1024.
-    ("test.hermit_unit", 1025),
+    // (review of https://github.com/rrnewton/hermit/pull/4061): 1026.
+    ("test.hermit_unit", 1026),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1854,7 +1854,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/4020) retains all 1340: 1341.
     // scheduler::tests::a_terminal_deadlock_report_reaches_the_installed_hook_until_it_is_removed
     // (run_failed with deadlock) retains all 1341: 1342.
-    ("test.detcore_unit", 1342),
+    // syscalls::threads::tests::futex_timeout_clamps_a_huge_valid_timespec_like_ktime
+    // (Codex re-check of https://github.com/rrnewton/hermit/pull/4061) retains
+    // all 1342: 1343.
+    ("test.detcore_unit", 1343),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2810,7 +2813,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test: 1340.
     // And the interrupted shared-key probe test: 1341.
     // And the terminal-deadlock hook test: 1342.
-    ("test.detcore_unit_on_host", 1342),
+    // And the futex timeout clamp test: 1343.
+    ("test.detcore_unit_on_host", 1343),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -2924,8 +2928,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two signal-target metadata tests: 1022.
     // And the 0x129 record-version refusal test: 1023.
     // And the two run_failed tests: 1025.
-    // And the futex-wait record-epoch test: 1024.
-    ("test.hermit_unit_on_host", 1025),
+    // And the futex-wait record-epoch test: 1026.
+    ("test.hermit_unit_on_host", 1026),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
