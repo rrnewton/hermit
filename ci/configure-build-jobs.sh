@@ -1408,11 +1408,11 @@ fi
 # vendor/dynamorio, third-party and rust-toolchain.toml are unchanged Git
 # objects. The tracked reverie-dbt file population remains939. This carries
 # the same SDK recipe budget, not an earlier runtime validation receipt.
-# FIXED-STACK CARRY TO f2cb0dc267f6d502a3d27b95b01121d584de2265:
+# FIXED-STACK CARRY TO 78d5cbe51e848d988b5c006ea211e62a220d2c85:
 # reverie-dbt, third-party and rust-toolchain.toml are identical to 4203a253;
 # the tracked DBT inventory remains 939. No timing budget was changed.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != f2cb0dc267f6d502a3d27b95b01121d584de2265 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie f2cb0dc267f6d502a3d27b95b01121d584de2265 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 78d5cbe51e848d988b5c006ea211e62a220d2c85 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 78d5cbe51e848d988b5c006ea211e62a220d2c85 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

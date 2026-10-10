@@ -240,7 +240,14 @@ impl RecordVersion {
 // here, which the kernel itself ends.) Replay recomputes all of these, so an
 // older recording replayed here could run a different schedule, although no
 // event shape changed.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x129);
+// 0x129 -> 0x12b (0x12a is held by https://github.com/rrnewton/hermit/pull/4031):
+// on ptrace, a clone without CLONE_THREAD and with a non-SIGCHLD exit signal
+// is its own process to the Tool, with its own pid and its kernel parent
+// (https://github.com/rrnewton/hermit/issues/4012). Detcore recomputes calls
+// that name that process (getpid-based prlimit, its exit and its parent's
+// notification) from it, so an older recording replayed here could take
+// another branch, although no event shape changed.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x12b);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -265,7 +272,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x129);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x129;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x12b;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -860,6 +867,15 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_without_signal_target_modelling() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x128)));
+    }
+
+    /// A 0x129 recording gave a raw clone child with a non-SIGCHLD exit
+    /// signal its creator's process identity; replay recomputes calls that
+    /// name the process, so it could take another branch. The version gate
+    /// must refuse it.
+    #[test]
+    fn record_version_rejects_streams_from_before_raw_clone_processes() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x129)));
     }
 
     /// Record and replay run under ptrace with serialized threads, so their
