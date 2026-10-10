@@ -98,6 +98,7 @@ use super::verify::announce_verification_outcome;
 use super::verify::compare_two_runs;
 use super::verify::default_failed_verify_log_retention;
 use super::verify::emit_compared_guest_output;
+use super::verify::publish_run_failure;
 use super::verify::retain_logs_after_verification_error;
 use super::verify::retain_verification_error;
 use super::verify::retain_verification_logs;
@@ -730,11 +731,45 @@ pub(super) struct RunLatches {
     pub(super) log_sink_failure: Option<String>,
 }
 
+/// A verification run recorded a determinism loss ([`RunLatches`]), so it is
+/// not compared. A type rather than a message so `run --verify` records the
+/// run as failed by a determinism loss instead of leaving the `not_run` stamp.
+#[derive(Debug)]
+pub(super) struct DeterminismLossRecorded {
+    run: String,
+    reason: String,
+}
+
+impl DeterminismLossRecorded {
+    #[cfg(test)]
+    pub(super) fn new(run: &str, reason: &str) -> Self {
+        Self {
+            run: run.to_owned(),
+            reason: reason.to_owned(),
+        }
+    }
+}
+
+impl std::fmt::Display for DeterminismLossRecorded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: determinism loss recorded: {}",
+            self.run, self.reason
+        )
+    }
+}
+
+impl std::error::Error for DeterminismLossRecorded {}
+
 impl RunLatches {
     /// Refuses to compare `run` when either latch is set.
     pub(super) fn refuse_comparison(&self, run: &str) -> Result<(), Error> {
         if let Some(reason) = &self.determinism_loss {
-            anyhow::bail!("{run}: determinism loss recorded: {reason}");
+            return Err(Error::new(DeterminismLossRecorded {
+                run: run.to_owned(),
+                reason: reason.clone(),
+            }));
         }
         if let Some(error) = &self.log_sink_failure {
             anyhow::bail!("{run}: log sink failure: {error}");
@@ -7306,6 +7341,8 @@ impl RunOpts {
                         );
                     }
                 }
+                error =
+                    publish_run_failure(self.verify_json.as_deref(), VerificationRun::Run1, error);
                 if self.keep_logs {
                     error = retain_logs_after_verification_error(error, [("run 1", log1_path)]);
                 }
@@ -7316,6 +7353,8 @@ impl RunOpts {
         // The latches first: a determinism loss is named as one, even when its
         // loss notice also reached the forwarded records.
         if let Err(error) = latches1.refuse_comparison("run 1") {
+            let error =
+                publish_run_failure(self.verify_json.as_deref(), VerificationRun::Run1, error);
             if self.keep_logs {
                 retain_verification_logs([("run 1", log1_path)])?;
             }
@@ -7492,6 +7531,8 @@ impl RunOpts {
                         );
                     }
                 }
+                error =
+                    publish_run_failure(self.verify_json.as_deref(), VerificationRun::Run2, error);
                 if self.keep_logs {
                     error = retain_logs_after_verification_error(
                         error,
@@ -7503,6 +7544,8 @@ impl RunOpts {
         };
         let mut out2 = out2;
         if let Err(error) = latches2.refuse_comparison("run 2") {
+            let error =
+                publish_run_failure(self.verify_json.as_deref(), VerificationRun::Run2, error);
             if self.keep_logs {
                 retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
             }

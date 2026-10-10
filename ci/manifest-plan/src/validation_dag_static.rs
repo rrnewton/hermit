@@ -973,7 +973,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // happens_before::tests::{a_posthook_anchor_is_counted_at_entry_and_refused_on_no_return_syscalls,
     // a_posthook_anchor_shares_its_counter_and_starts_windows_at_its_entry}
     // (https://github.com/rrnewton/hermit/issues/3929) retain all 1046: 1048.
-    ("test.regular_crates", 1048),
+    // runner::tests::a_typed_run_failure_is_a_product_crash_with_its_reason
+    // (hermit-manifest-plan, the run_failed verification reason) retains all
+    // 1048: 1049.
+    ("test.regular_crates", 1049),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1326,7 +1329,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two signal-target metadata tests (https://github.com/rrnewton/hermit/issues/3963): 1022.
     // And metadata::tests::record_version_rejects_streams_that_held_a_committed_sigchld_in_a_futex_wait
     // (review of https://github.com/rrnewton/hermit/pull/4039): 1023.
-    ("test.hermit_unit", 1023),
+    // canonical_verdict::tests::run_failure_round_trips_and_names_no_guest_disposition
+    // and verify::tests::a_typed_run_failure_replaces_the_stamp_and_an_untyped_error_does_not
+    // (the run_failed verification reason) retain all 1023: 1025.
+    ("test.hermit_unit", 1025),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2898,7 +2904,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the child-subreaper record-version test: 1020.
     // And the same two signal-target metadata tests: 1022.
     // And the 0x129 record-version refusal test: 1023.
-    ("test.hermit_unit_on_host", 1023),
+    // And the two run_failed tests: 1025.
+    ("test.hermit_unit_on_host", 1025),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -3011,7 +3018,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the guest permission-denied first-run-rejection test: 1040.
     // And the same allocator prerequisite mutation test: 1040.
     // And the two posthook-anchor model tests: 1048.
-    ("test.regular_crates_on_host", 1048),
+    // And the run_failed runner test: 1049.
+    ("test.regular_crates_on_host", 1049),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

@@ -59,6 +59,10 @@ pub enum FailureKind {
     /// than calling `unrecoverable_shutdown`, precisely because the unwind is
     /// the point.
     RunTimeout,
+    /// The backend failed while running the guest ([`crate::BackendRunFailure`]).
+    /// Carried so the parent can record the verification run as failed by its
+    /// backend instead of leaving the pending no-result stamp.
+    BackendRunFailure,
 }
 
 /// ⚠️ THE `kind` FIELD IS THE THIRD AND LAST OF ONE CHAIN OF FLATTENINGS.
@@ -182,6 +186,8 @@ fn classify_unwrapped(error: &Error) -> FailureKind {
         FailureKind::PolicyRefusal
     } else if error.downcast_ref::<crate::GuestTimedOut>().is_some() {
         FailureKind::RunTimeout
+    } else if error.downcast_ref::<crate::BackendRunFailure>().is_some() {
+        FailureKind::BackendRunFailure
     } else {
         FailureKind::Error
     }

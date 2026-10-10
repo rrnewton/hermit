@@ -1978,6 +1978,11 @@ impl ResultRow {
                     )?;
                     report.no_result_reason.as_ref().unwrap()
                 }
+                // Hermit named what stopped the run; the report carries no
+                // guest disposition to cross-check (its parser refuses one).
+                Some(canonical_verdict::NoResultReason::RunFailed { .. }) => {
+                    report.no_result_reason.as_ref().unwrap()
+                }
                 Some(canonical_verdict::NoResultReason::NotRun) => {
                     return Err(format!(
                         "attempt {} did not replace its pre-run stamp",
@@ -3039,6 +3044,24 @@ impl ResultRow {
                             .ok_or("ContainerFailed did not classify as no_result")?;
                         // Preserve an already classified timeout/infrastructure
                         // result from another attempt in this retained history.
+                        no_verdict_result.get_or_insert(ObservedResult::CrashError);
+                        unavailable.get_or_insert(format!("NO_RESULT: {reason}"));
+                    }
+                    // A run Hermit started and a typed failure stopped: a
+                    // crash-error red with Hermit's reason, as for a failed
+                    // container.
+                    Some(canonical_verdict::NoResultReason::RunFailed { .. }) => {
+                        saw_no_result = true;
+                        let mut single = self.clone();
+                        single.outcome = "FAIL".into();
+                        single.first_divergent_scheduler_turn = None;
+                        single.first_divergent_virtual_nanoseconds = None;
+                        single.first_divergent_record = None;
+                        single.first_divergent_syscall = None;
+                        single.attempts = vec![attempt.clone()];
+                        let reason = single
+                            .typed_no_result_reason()?
+                            .ok_or("RunFailed did not classify as no_result")?;
                         no_verdict_result.get_or_insert(ObservedResult::CrashError);
                         unavailable.get_or_insert(format!("NO_RESULT: {reason}"));
                     }
@@ -14990,15 +15013,18 @@ fn series_evidence(row: &SeriesRow, id: &CellId) -> Option<SeriesEvidence> {
     if let Some(evidence) = &row.series.no_verdict_evidence {
         // Callers validate the exact disposition/classification tuple before
         // projection. Retain these typed product crashes, a container failure
-        // or a match the runner failed, without treating any other no-result
-        // kind as a crash or granting comparison credit.
+        // or a match the runner failed, or a run a typed failure stopped,
+        // without treating any other no-result kind as a crash or granting
+        // comparison credit.
         let result = if evidence.attempts.iter().any(|attempt| attempt.timed_out) {
             Some(ObservedResult::Timeout)
         } else if row.series.result == Some(ObservedResult::CrashError)
             && evidence.attempts.iter().any(|attempt| {
                 matches!(
                     attempt.kind,
-                    SeriesNoVerdictKind::ContainerFailed | SeriesNoVerdictKind::FailedMatch
+                    SeriesNoVerdictKind::ContainerFailed
+                        | SeriesNoVerdictKind::FailedMatch
+                        | SeriesNoVerdictKind::RunFailed
                 )
             })
         {

@@ -8195,6 +8195,17 @@ fn retained_pressure_attempt(
                             )?;
                             SeriesNoVerdictKind::ContainerFailed
                         }
+                        // Hermit started the run and named what stopped it;
+                        // like a rejected first run it returned no guest
+                        // disposition to cross-check, only Hermit's exit.
+                        Some(NoResultReason::RunFailed { .. }) => {
+                            if report.guest_exit_code.is_some() || report.guest_signal.is_some() {
+                                return Err(
+                                    "inner RunFailed report invents a guest disposition".into()
+                                );
+                            }
+                            SeriesNoVerdictKind::RunFailed
+                        }
                         // The current reader requires the nullable field. An
                         // explicit null preserves an unspecified cause; a
                         // missing field was already refused above.
@@ -8267,13 +8278,15 @@ fn retained_typed_no_comparison_attempt(
 /// The typed refusal of [`retained_typed_no_comparison`] is Hermit's
 /// `first_run_rejected` verify, and its attempt is a terminal product
 /// failure: the guest failed its first run, so verify started no second run
-/// and retained run 1's log alone.
+/// and retained run 1's log alone. A typed `run_failed` refusal is held to the
+/// same rule: Hermit stopped the verification at the failed run, so a failed
+/// run 1 leaves run 1's log alone.
 fn retained_first_run_rejected(cell: &CellId, artifact_dir: &Path, rows: &[CellResult]) -> bool {
     retained_typed_no_comparison_attempt(cell, artifact_dir, rows).is_some_and(|attempt| {
         attempt.comparison.as_ref().is_some_and(|comparison| {
             matches!(
                 comparison.no_result_kind,
-                Some(SeriesNoVerdictKind::FirstRunRejected)
+                Some(SeriesNoVerdictKind::FirstRunRejected | SeriesNoVerdictKind::RunFailed)
             )
         }) && inner_pressure_category(&attempt) == Some(RepetitionClassification::ProductFailure)
     })
@@ -8310,6 +8323,7 @@ fn inner_pressure_category(attempt: &SeriesPressureAttempt) -> Option<Repetition
                     Some(
                         SeriesNoVerdictKind::FirstRunRejected
                             | SeriesNoVerdictKind::ContainerFailed
+                            | SeriesNoVerdictKind::RunFailed
                     )
                 ) =>
             {
