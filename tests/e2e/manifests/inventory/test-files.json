@@ -1303,6 +1303,12 @@
       "why": "tests/c/pselect6_simulation.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/pselect_temporary_mask.c",
+      "runner": "hermit-cli/tests/pselect6_simulation.rs",
+      "why": "tests/c/pselect_temporary_mask.c is owned by hermit-cli/tests/pselect6_simulation.rs: The integration test compiles this guest and checks, under strict verification, that pselect6 sleeps under its temporary signal mask: a signal the mask blocks does not end the call, and one only the mask unblocks ends it with EINTR after its handler ran."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/pthread_lifecycle.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
