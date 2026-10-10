@@ -1340,8 +1340,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // canonical_verdict::tests::run_failure_round_trips_and_names_no_guest_disposition
     // and verify::tests::a_typed_run_failure_replaces_the_stamp_and_an_untyped_error_does_not
     // (the run_failed verification reason) retain all 1023: 1025.
-    ("test.hermit_unit", 1037),
+    ("test.hermit_unit", 1039),
     // Twelve common launch/input and requested-mount controls retain upstream 1025: 1037.
+    // Two IPC/cgroup setup controls retain the preceding selection: 1039.
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2922,8 +2923,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two signal-target metadata tests: 1022.
     // And the 0x129 record-version refusal test: 1023.
     // And the two run_failed tests: 1025.
-    ("test.hermit_unit_on_host", 1037),
+    ("test.hermit_unit_on_host", 1039),
     // The same twelve common launch/input and mount controls retain upstream 1025: 1037.
+    // Two IPC/cgroup setup controls retain the preceding selection: 1039.
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
