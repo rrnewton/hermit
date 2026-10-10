@@ -41,10 +41,15 @@ use crate::syscalls::threads::read_thread_wait_signal_state;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::SigalrmControl;
 use crate::tool_global::alarm_remaining;
+use crate::tool_global::commit_sigkill;
 use crate::tool_global::host_timed_signals;
 use crate::tool_global::notify_signal_pending;
+use crate::tool_global::process_is_unreaped_zombie;
 use crate::tool_global::refuse_sigalrm;
 use crate::tool_global::register_alarm;
+use crate::tool_global::registered_process_of;
+use crate::tool_global::reserve_sigkill;
+use crate::tool_global::reserve_sigkill_group;
 use crate::tool_global::resolve_kill_targets;
 use crate::tool_global::resource_request;
 use crate::tool_global::sigalrm_refuses;
@@ -898,7 +903,71 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut rsrc = Resources::new(dettid);
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("rt_sigtimedwait");
-        retry_nonblocking_syscall_with_timeout(guest, call, rsrc, maybe_timeout).await
+        loop {
+            let result =
+                retry_nonblocking_syscall_with_timeout(guest, call, rsrc.clone(), maybe_timeout)
+                    .await;
+            // A consumed child-exit copy that the notification ledger drops
+            // is not returned: the wait goes on, to the same deadline.
+            if self.synchronous_sigchld_stands(guest, call, &result).await {
+                return result;
+            }
+        }
+    }
+
+    /// A child-exit SIGCHLD that a synchronous wait consumed goes through the
+    /// same notification ledger as one delivered to a handler
+    /// (`Detcore::child_exit_sigchld_delivers`), on a backend where both the
+    /// kernel and the scheduler send it (`scheduler::child_exit_sigchld`).
+    /// The scheduler's copy is returned with the siginfo Linux gives the
+    /// parent, and a copy for an exit that a SIGCHLD already stood for is
+    /// dropped. Returns whether the consumed signal stands.
+    async fn synchronous_sigchld_stands<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::RtSigtimedwait,
+        result: &Result<i64, Error>,
+    ) -> bool {
+        use crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
+        use crate::scheduler::child_exit_sigchld::OwnCopy;
+        if !self.cfg.backend.reports_child_exit_publication
+            || !matches!(result, Ok(signal) if *signal == libc::SIGCHLD as i64)
+        {
+            return true;
+        }
+        // Without a siginfo buffer the guest sees only the signal number,
+        // which every copy shares.
+        let Some(info) = call.info() else {
+            return true;
+        };
+        let Ok(bytes) = guest.memory().read_value(info.cast::<[u8; 128]>()) else {
+            return true;
+        };
+        let Some(control) =
+            crate::scheduler::child_exit_sigchld::control_for(&bytes, std::process::id())
+        else {
+            return true;
+        };
+        match crate::tool_global::child_exit_sigchld(guest, control).await {
+            ChildExitSigchldAnswer::Claimed(dropped) => !dropped,
+            ChildExitSigchldAnswer::OwnCopy(OwnCopy::Duplicate) => false,
+            ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(own))
+            | ChildExitSigchldAnswer::ClaimedFor(own) => {
+                if let Err(error) = guest
+                    .memory()
+                    .write_value(info.cast::<[u8; 128]>(), &own.to_bytes())
+                {
+                    tracing::warn!(
+                        "[dtid {}] the SIGCHLD for child {} keeps its siginfo: {}",
+                        guest.thread_state().dettid,
+                        own.pid,
+                        error
+                    );
+                }
+                true
+            }
+            _ => true,
+        }
     }
 
     /// Fence an exact self-SIGKILL at the scheduler-selected syscall turn.
@@ -992,8 +1061,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             // the kill, inside this committed turn: the sender may be in the
             // group and die before the call returns. A kill that then fails
             // only suppresses a deadlock report, which is the safe direction.
-            crate::tool_global::notify_unresolved_sigkill(guest, Some(DetPid::from_raw(-tgid)))
-                .await;
+            // `kill(INT_MIN)` names no group; Linux refuses it with ESRCH.
+            let group = tgid.checked_neg().map(DetPid::from_raw);
+            if group.is_some() {
+                crate::tool_global::notify_unresolved_sigkill(guest, group).await;
+            }
+            // Every member is retired at this turn
+            // (https://github.com/rrnewton/hermit/issues/3994).
+            if guest.config().sequentialize_threads
+                && let Some(group) = group
+                && let Some(reservation) = reserve_sigkill_group(guest, group).await
+            {
+                return self.send_reserved_sigkill(guest, reservation, call).await;
+            }
             return Ok(self.record_or_replay(guest, call).await?);
         }
         if tgid <= 0 {
@@ -1013,8 +1093,31 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Ok(self.record_or_replay(guest, call).await?);
         }
+        // A SIGKILL to another process retires every thread of it at this
+        // turn (https://github.com/rrnewton/hermit/issues/3994). It needs no
+        // recipient, so a multithreaded target is accepted.
+        if call.sig() == libc::SIGKILL
+            && let Some(reservation) = reserve_sigkill(guest, DetTid::from_raw(tgid)).await
+        {
+            return self.send_reserved_sigkill(guest, reservation, call).await;
+        }
+        let targets = resolve_kill_targets(guest, DetPid::from_raw(tgid)).await;
+        // An exited process that no wait has consumed has no live thread.
+        // Whether Linux still has it (a zombie, signalled successfully) or
+        // already released it (auto-reaped under SIG_IGN or SA_NOCLDWAIT:
+        // ESRCH) is the kernel's physical state, which the SIGKILL fence has
+        // settled before this turn, so the kernel answers.
+        if targets.is_empty() && process_is_unreaped_zombie(guest, DetPid::from_raw(tgid)).await {
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
         let tid = self
-            .process_signal_target(guest, Sysno::kill, DetPid::from_raw(tgid), call.sig())
+            .process_signal_target(
+                guest,
+                Sysno::kill,
+                DetPid::from_raw(tgid),
+                &targets,
+                call.sig(),
+            )
             .await?;
         let value = if !guest
             .config()
@@ -1036,7 +1139,8 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/4034)
-    /// The thread that a process-directed signal `sig` to `tgid` is routed to.
+    /// The thread, of `tgid`'s live `targets`, that a process-directed signal
+    /// `sig` is routed to.
     ///
     /// With several live threads the call is refused by name: Linux's
     /// `complete_signal` (kernel/signal.c) gives the signal to any thread that
@@ -1050,10 +1154,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         sysno: Sysno,
         tgid: DetPid,
+        targets: &[DetTid],
         sig: libc::c_int,
     ) -> Result<DetTid, Error> {
-        let targets = resolve_kill_targets(guest, tgid).await;
-        match deterministic_kill_target(&targets, sig) {
+        match deterministic_kill_target(targets, sig) {
             Err(Errno::ENOSYS) => {
                 tracing::error!(
                     "[detcore, dtid {}] process-directed signal {} to process {} by {} is not supported: \
@@ -1094,6 +1198,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Some(DetTid::from_raw(call.tid())),
             )
             .await;
+        // A SIGKILL to a thread of another process ends that whole process,
+        // and is retired at this turn, like `kill`'s. Only a valid pair is
+        // reserved: Linux rejects a thread outside the named group (ESRCH) or a
+        // non-positive id (EINVAL) before anything happens, so such a send
+        // takes the ordinary path and gets the kernel's errno.
+        if call.sig() == libc::SIGKILL
+            && guest.config().sequentialize_threads
+            && call.tgid() > 0
+            && call.tid() > 0
+            && registered_process_of(guest, DetTid::from_raw(call.tid())).await
+                == Some(DetPid::from_raw(call.tgid()))
+            && let Some(reservation) = reserve_sigkill(guest, DetTid::from_raw(call.tid())).await
+        {
+            return self.send_reserved_sigkill(guest, reservation, call).await;
+        }
         let value = self.record_or_replay(guest, call).await?;
         // `pthread_kill` lowers to `tgkill`, so this is the ordinary way one
         // guest THREAD signals a sibling. Like `kill`, a successful cross-task
@@ -1126,12 +1245,69 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Some(DetTid::from_raw(call.tid())),
             )
             .await;
+        // A non-positive tid is EINVAL in Linux, before anything happens.
+        if call.sig() == libc::SIGKILL
+            && guest.config().sequentialize_threads
+            && call.tid() > 0
+            && let Some(reservation) = reserve_sigkill(guest, DetTid::from_raw(call.tid())).await
+        {
+            return self.send_reserved_sigkill(guest, reservation, call).await;
+        }
         let value = self.record_or_replay(guest, call).await?;
         // Same wakeup obligation as `tgkill`; `tkill` is the older two-argument
         // spelling of the same thread-directed send.
         self.notify_cross_task_signal(guest, DetTid::from_raw(call.tid()), call.sig(), None)
             .await;
         Ok(value)
+    }
+
+    /// Complete a reserved SIGKILL (https://github.com/rrnewton/hermit/issues/3994).
+    ///
+    /// A send whose victims exclude the caller's own process returns: it is
+    /// sent, and then committed with its real result. One that includes the
+    /// caller's process cannot return, because the kernel ends the caller:
+    /// the caller records its own exit status for its parent (`CLD_KILLED`,
+    /// `SIGKILL`), takes the `exit_group` grant for its own process, as
+    /// `exit_group` does, commits the other victims inside that exit turn, and
+    /// then sends. The commit comes after the grant: it installs the physical
+    /// fence, which waits for victims that only the send itself kills. The
+    /// reservation validated the target against the scheduler's record, so the
+    /// send cannot fail in a way the caller sees.
+    async fn send_reserved_sigkill<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        reservation: crate::scheduler::sigkill_retirement::SigkillReservation,
+        call: impl Into<syscalls::Syscall> + Copy,
+    ) -> Result<i64, Error> {
+        if !reservation.includes_sender {
+            let result = self.record_or_replay(guest, call).await;
+            commit_sigkill(guest, reservation.token, result.is_ok()).await;
+            return Ok(result?);
+        }
+        if self.cfg.backend.reports_child_exit_publication {
+            let uid = crate::syscalls::real_uid(guest.tid().as_raw())
+                .unwrap_or_else(|| unsafe { libc::getuid() });
+            crate::tool_global::child_exit_sigchld(
+                guest,
+                crate::scheduler::child_exit_sigchld::ChildExitSigchldControl::ExitStatus {
+                    code: libc::CLD_KILLED,
+                    status: libc::SIGKILL,
+                    uid,
+                },
+            )
+            .await;
+        }
+        let request = guest.thread_state().mk_request(
+            ResourceID::Exit {
+                group: true,
+                process: guest.thread_state().detpid.expect("detpid unset"),
+                mm: guest.thread_state().mm_id,
+            },
+            Permission::RW,
+        );
+        resource_request(guest, request).await;
+        commit_sigkill(guest, reservation.token, true).await;
+        Ok(self.record_or_replay(guest, call).await?)
     }
 
     /// Tell the scheduler that a successful thread-directed send left a signal
@@ -1213,11 +1389,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         if call.sig() == libc::SIGALRM {
             refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(tgid))).await?;
         }
+        let targets = resolve_kill_targets(guest, DetPid::from_raw(tgid)).await;
+        // An exited process that no wait has consumed has no live thread.
+        // Whether Linux still has it (a zombie, signalled successfully) or
+        // already released it (auto-reaped under SIG_IGN or SA_NOCLDWAIT:
+        // ESRCH) is the kernel's physical state, which the SIGKILL fence has
+        // settled before this turn, so the kernel answers.
+        if targets.is_empty() && process_is_unreaped_zombie(guest, DetPid::from_raw(tgid)).await {
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
         let tid = self
             .process_signal_target(
                 guest,
                 Sysno::rt_sigqueueinfo,
                 DetPid::from_raw(tgid),
+                &targets,
                 call.sig(),
             )
             .await?;

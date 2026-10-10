@@ -1321,7 +1321,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // metadata::tests::record_version_rejects_pre_child_subreaper_streams
     // (https://github.com/rrnewton/hermit/issues/3997) retains all 1019: 1020.
     // And the two signal-target metadata tests (https://github.com/rrnewton/hermit/issues/3963): 1022.
-    ("test.hermit_unit", 1022),
+    // metadata::tests::record_version_rejects_pre_sigkill_retirement_streams
+    // and replay::tests::replay_refuses_a_recording_that_recorded_a_replay_refusal
+    // (https://github.com/rrnewton/hermit/issues/3994) retain all 1022: 1024.
+    ("test.hermit_unit", 1024),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1815,7 +1818,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_process_armed_with_a_parent_death_sigkill_is_not_stuck} and
     // tool_global::test::sigkill_notifications_record_the_doomed_process
     // (https://github.com/rrnewton/hermit/issues/3904) retain all 1324: 1328.
-    ("test.detcore_unit", 1328),
+    // The twenty-two SIGKILL-retirement tests (sigkill_retirement's
+    // reservation, commit, fence, victims-only publication fence, valve,
+    // cohort, record-refusal, non-SIGCHLD notification and deadlock-doom
+    // tests, the early-publication, delivered-publication and dying-cohort
+    // subreaper scheduler tests, the child-exit ledger's group-cohort test,
+    // and tool_global's unanswered-request, granted-across-the-commit,
+    // real-handler cohort, both-receipt-orders and commit-valve tests,
+    // https://github.com/rrnewton/hermit/issues/3994) retain all 1328: 1350.
+    ("test.detcore_unit", 1350),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2383,7 +2394,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/3893) retains all 278: 279.
     // a_process_directed_signal_to_several_threads_is_refused_by_name
     // (https://github.com/rrnewton/hermit/issues/4034) retains all 279: 280.
-    ("test.cli", 280),
+    // a_cross_process_sigkill_verifies_at_bitwise_parity and
+    // a_recorded_kill_of_a_victim_in_a_background_read_is_refused_at_replay
+    // (https://github.com/rrnewton/hermit/issues/3994) retain all 280: 282.
+    ("test.cli", 282),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2600,7 +2614,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Nor does the real-time timer expiry refusal test start a LiteInst guest:
     // 215.
     // Nor does the multithreaded process-directed signal test: 216.
-    ("test.cli_on_host", 216),
+    // Nor do the cross-process SIGKILL parity and record-refusal tests: 218.
+    ("test.cli_on_host", 218),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 55),
@@ -2730,7 +2745,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the valve's consumer and bound tests: 1323.
     // And the same unknown-sleeping-mask test: 1324.
     // And the four child-wait deadlock tests: 1328.
-    ("test.detcore_unit_on_host", 1328),
+    // And the twenty-two SIGKILL-retirement tests: 1350.
+    ("test.detcore_unit_on_host", 1350),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -2840,7 +2856,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the version-2 preemption refusal test: 1019.
     // And the child-subreaper record-version test: 1020.
     // And the same two signal-target metadata tests: 1022.
-    ("test.hermit_unit_on_host", 1022),
+    // And the SIGKILL-retirement record-version and replay-refusal tests: 1024.
+    ("test.hermit_unit_on_host", 1024),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

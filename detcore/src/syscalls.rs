@@ -39,6 +39,7 @@ pub(crate) use threads::FutexDeadline;
 pub(crate) use threads::KernelSignalState;
 pub(crate) use threads::read_kernel_signal_state;
 pub(crate) use threads::read_thread_signal_state;
+pub(crate) use threads::real_uid;
 pub(crate) use threads::thread_is_gone;
 pub(crate) mod time;
 
