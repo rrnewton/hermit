@@ -320,6 +320,9 @@ pub struct HbLaunch<'a> {
     pub namespace_only: bool,
     /// True for `--passthru-opt`: only an allow-list of syscalls is intercepted.
     pub passthru_opt: bool,
+    /// True when the run requests a preemption timer (`--max-timeslice` is not
+    /// `disabled`). A version-2 spec needs one to charge its hold budget.
+    pub preemption: bool,
 }
 
 /// Refuse, before anything is launched or any input is read, a program the run
@@ -333,7 +336,9 @@ pub struct HbLaunch<'a> {
 /// - a syscall-occurrence anchor with `--passthru-opt` (some syscalls are left
 ///   unintercepted; a count anchor still counts the intercepted ones);
 /// - a syscall anchor on a syscall that never reaches Detcore
-///   ([`syscall_never_reaches_tracer`]).
+///   ([`syscall_never_reaches_tracer`]);
+/// - a version-2 spec with `--max-timeslice disabled`
+///   ([`refuse_hold_without_preemption`]).
 ///
 /// Ignoring any of these would let a run pass, or blame the guest, with the
 /// ordering unexercised. Applied on the run path only, so `--hb-list-events`
@@ -394,7 +399,40 @@ pub fn refuse_unenforceable_anchors(
             refusal
         );
     }
+    if !launch.preemption {
+        refuse_hold_without_preemption(
+            program,
+            path,
+            "--max-timeslice disabled turns the preemption timer off",
+        )?;
+    }
     Ok(())
+}
+
+/// Refuse a version-2 program on a run without a preemption timer, saying
+/// why (`reason`). A version-2 spec bounds every hold by `max_hold_ns`,
+/// charged in committed virtual time; without the timer a thread that spins
+/// without syscalls never ends its turn, committed time stops, and a hold
+/// could never be charged, so the run would hang instead of ending in
+/// `HERMIT_HB_HOLD_BUDGET_EXCEEDED`. Called before launch twice: for an
+/// explicit `--max-timeslice disabled`, and after argument validation, when
+/// the timer can also be lost because the host cannot arm it. A version-1
+/// program has no budget and is never refused here.
+pub fn refuse_hold_without_preemption(
+    program: &HappensBeforeProgram,
+    path: &Path,
+    reason: &str,
+) -> anyhow::Result<()> {
+    if !program.is_version_2() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "HERMIT_HB_HOLD_WITHOUT_PREEMPTION: happens-before spec {} is version {}, which bounds \
+         every hold by max_hold_ns and needs the preemption timer to charge it, but {}",
+        path.display(),
+        program.version,
+        reason
+    )
 }
 
 /// Render one anchor for `--list-events`-style introspection, showing the
@@ -569,6 +607,7 @@ mod tests {
             ptrace: true,
             namespace_only: false,
             passthru_opt: false,
+            preemption: true,
         };
         let check = |json: &str, launch: HbLaunch<'_>| -> Result<(), String> {
             std::fs::write(&spec, json).unwrap();
@@ -683,5 +722,22 @@ mod tests {
             .is_ok()
         );
         assert!(check(count_only, ptrace).is_ok());
+
+        // A version-2 spec needs the preemption timer for its hold budget; a
+        // version-1 spec has no budget and runs without it, as before.
+        let v2 = r#"{"version": 2, "events": {"w": {"thread": "3", "syscall": "write", "fd": 1}}}"#;
+        let no_timer = HbLaunch {
+            preemption: false,
+            ..ptrace
+        };
+        let err = check(v2, no_timer).unwrap_err();
+        assert!(
+            err.starts_with("HERMIT_HB_HOLD_WITHOUT_PREEMPTION: happens-before spec ")
+                && err.contains("is version 2")
+                && err.ends_with("but --max-timeslice disabled turns the preemption timer off"),
+            "{err}"
+        );
+        assert!(check(v2, ptrace).is_ok());
+        assert!(check(fd_anchor, no_timer).is_ok());
     }
 }

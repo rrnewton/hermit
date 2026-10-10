@@ -895,6 +895,13 @@ pub struct RunOpts {
     #[clap(skip)]
     resolved_happens_before: Option<HappensBeforeProgram>,
 
+    /// Runtime-only: why argument validation turned `--max-timeslice` off,
+    /// when the host cannot arm the preemption timer. Set by
+    /// `validate_args_with_timer_support`; read by
+    /// `refuse_happens_before_without_preemption`. Never a CLI argument.
+    #[clap(skip)]
+    timer_downgrade: Option<TimerUnavailable>,
+
     /// Runtime-only: where `--verify` has this run record the host files the
     /// guest opens (`DetConfig::host_input_log`). Never a CLI argument and
     /// never serialized, like `resolved_happens_before`.
@@ -2013,6 +2020,80 @@ fn run_opts_for(argv: &[&str]) -> RunOpts {
     };
     run.backend = args.global.backend;
     *run
+}
+
+/// A version-2 happens-before spec needs an effective preemption timer.
+/// Validation can turn a requested timer off when the host cannot arm it; the
+/// check right after validation must then refuse the run, naming the spec and
+/// the reason, while a supported timer and a version-1 spec are not refused.
+#[test]
+fn a_version_2_spec_is_refused_when_validation_turns_the_timer_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let v2 = dir.path().join("v2.json");
+    let v1 = dir.path().join("v1.json");
+    std::fs::write(
+        &v2,
+        r#"{"version": 2, "events": {"w": {"thread": "3", "syscall": "write", "fd": 1}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &v1,
+        r#"{"version": 1, "events": {"w": {"thread": "3", "syscall": "write", "fd": 1}}}"#,
+    )
+    .unwrap();
+    let after_validation = |spec: &Path, timer: Result<(), TimerUnavailable>| {
+        let mut ro = run_opts_for(&[
+            "hermit",
+            "run",
+            "--happens-before",
+            spec.to_str().unwrap(),
+            "fakeprog",
+        ]);
+        assert!(
+            ro.det_opts.det_config.max_timeslice.is_some(),
+            "the default requests a timer"
+        );
+        ro.validate_args_with_timer_support(timer).unwrap();
+        let refusal = ro.refuse_happens_before_without_preemption();
+        (ro.det_opts.det_config.max_timeslice.is_some(), refusal)
+    };
+
+    let (timer, refusal) = after_validation(&v2, Err(TimerUnavailable::NoPerfEvents));
+    assert!(!timer);
+    let error = refusal.expect_err("no perf counters");
+    assert!(
+        error
+            .downcast_ref::<super::container::PolicyRefusal>()
+            .is_some(),
+        "{error:#}"
+    );
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("HERMIT_HB_HOLD_WITHOUT_PREEMPTION: happens-before spec ")
+            && message.contains(v2.to_str().unwrap())
+            && message.contains("is version 2")
+            && message.contains("this host cannot arm it: perf_event_open is unavailable"),
+        "{message}"
+    );
+
+    let profile = "Unsupported CPU family 0x6, model 0x1: Reverie has no performance-counter \
+                   profile for it";
+    let (timer, refusal) =
+        after_validation(&v2, Err(TimerUnavailable::NoPmuProfile(profile.to_owned())));
+    assert!(!timer);
+    let message = format!("{:#}", refusal.expect_err("no PMU profile"));
+    assert!(
+        message.contains(&format!("this host cannot arm it: {profile}")),
+        "{message}"
+    );
+
+    let (timer, refusal) = after_validation(&v2, Ok(()));
+    assert!(timer);
+    refusal.expect("a supported timer is not refused");
+
+    let (timer, refusal) = after_validation(&v1, Err(TimerUnavailable::NoPerfEvents));
+    assert!(!timer);
+    refusal.expect("a version-1 spec has no budget and runs without the timer");
 }
 
 /// The launch-time happens-before refusal keys on the runtime backend:
@@ -5365,6 +5446,9 @@ impl RunOpts {
         // is read: neither needs the input, and a run they refuse must not wait
         // for it.
         self.validate_args()?;
+        // Right after validation, which may have turned the preemption timer
+        // off, and still before stdin is read or anything is launched.
+        self.refuse_happens_before_without_preemption()?;
         self.adopt_replayed_schedule_epoch()?;
         // Once every implicit input it records is resolved, and before the
         // guest starts, so a run that fails or hangs still leaves it.
@@ -5899,6 +5983,7 @@ impl RunOpts {
                 }
             }
             config.max_timeslice = None;
+            self.timer_downgrade = Some(unavailable.clone());
         }
 
         if let Some(sf) = &self.seed_from {
@@ -6478,11 +6563,43 @@ impl RunOpts {
                 ptrace: self.runtime_backend() == Backend::Ptrace,
                 namespace_only: self.namespace_only,
                 passthru_opt: self.det_opts.det_config.passthru_opt,
+                // The requested timer, before validation; an implicit loss is
+                // refused later (`refuse_happens_before_without_preemption`).
+                preemption: self.det_opts.det_config.max_timeslice.is_some(),
             },
         )
         // A spec the launch cannot enforce is a policy refusal (exit 122), not
         // a Hermit failure.
         .map_err(|error| error.context(super::container::PolicyRefusal))
+    }
+
+    /// Refuse a version-2 `--happens-before` spec when argument validation
+    /// left the run without a preemption timer
+    /// (`hermit::happens_before::refuse_hold_without_preemption`). The early
+    /// check (`refuse_unenforceable_happens_before`) sees only the requested
+    /// timer; this one sees the effective timer, which validation turns off
+    /// when the host cannot arm it (`TimerUnavailable`), and names that
+    /// reason. Nothing assigns `max_timeslice` after validation on the run
+    /// path.
+    fn refuse_happens_before_without_preemption(&self) -> Result<(), Error> {
+        let Some(path) = self.happens_before.as_deref() else {
+            return Ok(());
+        };
+        if self.hb_list_events || self.det_opts.det_config.max_timeslice.is_some() {
+            return Ok(());
+        }
+        let program = Self::load_happens_before_spec(path)?;
+        let reason = match &self.timer_downgrade {
+            Some(TimerUnavailable::NoPerfEvents) => {
+                "this host cannot arm it: perf_event_open is unavailable".to_owned()
+            }
+            Some(TimerUnavailable::NoPmuProfile(reason)) => {
+                format!("this host cannot arm it: {reason}")
+            }
+            None => "--max-timeslice disabled turns the preemption timer off".to_owned(),
+        };
+        hermit::happens_before::refuse_hold_without_preemption(&program, path, &reason)
+            .map_err(|error| error.context(super::container::PolicyRefusal))
     }
 
     fn list_happens_before_events(&self) -> Result<ExitStatus, Error> {
