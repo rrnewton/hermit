@@ -123,6 +123,7 @@ static VFORK_PARENT_KILLED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_KILL_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_WAKE_COUNT_ZERO_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_MULTITHREADED_PROCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static KILL_PROCESS_GROUP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_CREATE_RT_SIGNAL_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_LSEEK_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_INODE_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -867,6 +868,32 @@ fn kill_multithreaded_process_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "kill-multithreaded-process guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn kill_process_group_guest() -> &'static Path {
+    KILL_PROCESS_GROUP_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("kill-process-group");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create kill-process-group guest directory");
+        let guest = build_root.join("kill_process_group");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/kill_process_group.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile kill-process-group guest");
+        assert!(
+            output.status.success(),
+            "kill-process-group guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -20490,6 +20517,84 @@ fn a_process_directed_signal_to_several_threads_is_refused_by_name() {
     );
     assert!(
         log.contains("by rt_sigqueueinfo is not supported"),
+        "the compatibility run must still name each refusal:\nstderr:\n{log}"
+    );
+}
+
+/// A signal addressed to a process group
+/// (https://github.com/rrnewton/hermit/issues/4046). `rt_sigqueueinfo` has no
+/// process groups, so for pid 0 or a negative pid Linux returns ESRCH and sends
+/// nothing; Hermit forwards it and gets the same answer (it returned ENOSYS
+/// before). `kill(0, sig)` and `kill(-pgrp, sig)` signal every process in the
+/// group, which Detcore does not model: a fail-closed run stops with the
+/// policy-refusal status and names the call (it returned ENOSYS as a plain errno
+/// before), and `--allow-unsupported-syscalls` still returns ENOSYS.
+#[test]
+fn a_signal_to_a_process_group_is_refused_by_name() {
+    let guest = kill_process_group_guest().to_str().unwrap().to_owned();
+    let queued = "rt_sigqueueinfo(0): -1 ESRCH, handled 0\n\
+                  rt_sigqueueinfo(-pgrp): -1 ESRCH, handled 0\n";
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--log=error",
+            "run",
+            "--strict",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "a fail-closed run must stop with the policy-refusal status:\nstdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert!(
+        log.contains("signal 10 to its own process group by kill is not supported"),
+        "the refusal must name the call and its target:\nstderr:\n{log}"
+    );
+    assert_eq!(stdout, queued, "stderr:\n{log}");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        // `--strict` refuses the opt-out, so the compatibility run is not strict.
+        hermit_command(&[
+            "run",
+            "--allow-unsupported-syscalls",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(
+        stdout,
+        format!("{queued}kill(0): -1 ENOSYS, handled 0\nkill(-pgrp): -1 ENOSYS, handled 0\n"),
+        "stderr:\n{log}"
+    );
+    // Hermit's guest is in a fresh PID namespace whose process group leader
+    // lies outside it, so getpgrp() is 0 there and `kill(-getpgrp(), ...)` is a
+    // second `kill(0, ...)`: both refusals name the caller's own group.
+    assert_eq!(
+        log.matches("to its own process group by kill is not supported")
+            .count(),
+        2,
         "the compatibility run must still name each refusal:\nstderr:\n{log}"
     );
 }

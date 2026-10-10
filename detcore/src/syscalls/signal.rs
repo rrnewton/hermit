@@ -973,7 +973,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let tgid = call.pid();
-        // A process-group or broadcast SIGALRM is refused below (ENOSYS).
+        // A process-group or broadcast SIGALRM is refused by name below.
         if call.sig() == libc::SIGALRM && tgid > 0 {
             refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(tgid))).await?;
         }
@@ -997,7 +997,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(self.record_or_replay(guest, call).await?);
         }
         if tgid <= 0 {
-            return Err(Errno::ENOSYS.into());
+            return self.refuse_group_signal(guest, tgid, call.sig()).await;
         }
         // Exact self-SIGKILL is group-fatal, so it has no recipient-selection
         // ambiguity even when the process has several live threads. Reserve it
@@ -1032,6 +1032,43 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.notify_cross_task_signal(guest, tid, call.sig(), Some(DetPid::from_raw(tgid)))
             .await;
         Ok(value)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/4046)
+    /// Refuse by name a `kill` to a process group (`pid` 0 for the caller's own,
+    /// `-pgid` for another) or to every process it may signal (`pid` -1).
+    ///
+    /// Linux sends the signal to each process in the set
+    /// (`__kill_pgrp_info`, `kill_something_info` in kernel/signal.c), and each
+    /// process then picks its receiving thread as a process-directed signal
+    /// does. Detcore models neither the set's membership nor that choice, so
+    /// the call goes through the unsupported-operation policy: a fail-closed
+    /// run stops with the policy-refusal status and
+    /// `--allow-unsupported-syscalls` returns ENOSYS, as the call did before.
+    /// A SIGKILL to another group is forwarded before this point
+    /// (`can_forward_process_group_signal`).
+    async fn refuse_group_signal<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        pid: libc::pid_t,
+        sig: libc::c_int,
+    ) -> Result<i64, Error> {
+        let target = match pid {
+            0 => "its own process group".to_owned(),
+            -1 => "every process it may signal".to_owned(),
+            pid => format!("process group {}", -pid),
+        };
+        tracing::error!(
+            "[detcore, dtid {}] signal {} to {} by kill is not supported: Detcore does not \
+             model process-group membership or each process's receiving thread \
+             (https://github.com/rrnewton/hermit/issues/4046)",
+            guest.thread_state().dettid,
+            sig,
+            target,
+        );
+        self.refuse_unserviceable_operation(guest, Sysno::kill, Errno::ENOSYS)
+            .await
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1208,7 +1245,13 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let tgid = call.tgid();
         if tgid <= 0 {
-            return Err(Errno::ENOSYS.into());
+            // POSIX.1b has no process groups: Linux's `do_rt_sigqueueinfo` looks
+            // the pid up with `find_vpid`, which finds no process for 0 or a
+            // negative pid, so the call fails (EFAULT for an unreadable
+            // `siginfo_t`, EPERM for a forged `si_code`, otherwise ESRCH) and
+            // sends nothing. The kernel's own answer is therefore deterministic
+            // (https://github.com/rrnewton/hermit/issues/4046).
+            return Ok(self.record_or_replay(guest, call).await?);
         }
         if call.sig() == libc::SIGALRM {
             refuse_sigalrm(guest, SigalrmControl::SendTo(DetTid::from_raw(tgid))).await?;
