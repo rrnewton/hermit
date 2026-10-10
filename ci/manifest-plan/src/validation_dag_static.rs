@@ -1779,7 +1779,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_removed_held_thread_leaves_no_hold_behind,
     // an_opened_gate_is_not_refused_before_its_thread_runs_again} (relative
     // happens-before anchors) retain all 1293: 1301.
-    ("test.detcore_unit", 1301),
+    // scheduler::test::{a_pending_vfork_barrier_past_its_valve_refuses_the_run_and_stays,
+    // a_released_vfork_barrier_past_its_valve_refuses_the_run_and_stays,
+    // a_vfork_barrier_event_inside_the_valve_proceeds_and_stops_the_clock}
+    // (https://github.com/rrnewton/hermit/issues/3999) retain all 1301: 1304.
+    ("test.detcore_unit", 1304),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2652,7 +2656,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the eight vfork-parent barrier tests: 1283.
     // The same ten SIGALRM sleep boundary/resource tests retain all 1283: 1293.
     // And the eight relative-anchor scheduler tests: 1301.
-    ("test.detcore_unit_on_host", 1301),
+    // And the three vfork barrier valve tests: 1304.
+    ("test.detcore_unit_on_host", 1304),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

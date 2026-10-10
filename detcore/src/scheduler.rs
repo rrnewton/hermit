@@ -1133,6 +1133,12 @@ pub struct Scheduler {
     /// Set when the release barrier's watchdog expires; the scheduler loop
     /// ends the run with it (`exit_on_scheduler_refusal`).
     signaled_background_refusal: Option<SignaledBackgroundRefusal>,
+    /// When step2a began skipping turns for vfork barriers that wait for a
+    /// backend event (`Pending` or `Released` ones); `None` while none waits.
+    vfork_barrier_wait_since: Option<std::time::Instant>,
+    /// Set when step2a's valve expires; `sched_loop_inner` ends the run with
+    /// it (`exit_on_scheduler_refusal`).
+    vfork_barrier_refusal: Option<VforkBarrierRefusal>,
     /// `hermit record`: where `step2c_process_io_blockers` logs each
     /// readmission of a backgrounded call (see `rejoin_log`).
     rejoin_writer: Option<RejoinWriter>,
@@ -1916,6 +1922,15 @@ async fn sched_loop_inner(
         // until something blocked is ready to run again.
         last_res = do_a_turn_blocking(sched.clone(), timer.clone(), &last_res).await;
 
+        // A vfork barrier whose backend event never arrived. Taken here, after
+        // either turn function, because both run step2a: the ordinary one
+        // through `step2_process_blocked` and the signal-control one through
+        // `step2_drain_prefix`.
+        let vfork_refusal = sched.lock().unwrap().vfork_barrier_refusal.take();
+        if let Some(refusal) = vfork_refusal {
+            exit_on_scheduler_refusal(&refusal);
+        }
+
         // A terminal deadlock ends the run here, alongside the two
         // `--stop-after-*` exits above, rather than by panicking out of the
         // scheduler task (see `report_terminal_deadlock`).
@@ -2065,11 +2080,81 @@ impl std::fmt::Display for SignaledBackgroundRefusal {
 
 impl std::error::Error for SignaledBackgroundRefusal {}
 
+/// Which of its two waits a vfork barrier was in when step2a's valve expired
+/// (`Scheduler::step2a_wait_for_vfork_barrier`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VforkBarrierState {
+    /// The parent's vfork was granted and its child has not registered.
+    Pending,
+    /// The registered child reached a release edge (its `Exit` grant, its
+    /// successful exec, or its logical kill) while its parent was alive.
+    Released,
+}
+
+/// One vfork barrier that was still waiting for a backend event when step2a's
+/// valve expired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VforkBarrierWait {
+    /// The vfork parent.
+    pub parent: DetTid,
+    /// Its registered child, or `None` while the barrier is `Pending`.
+    pub child: Option<DetTid>,
+    /// Which wait the barrier was in.
+    pub state: VforkBarrierState,
+}
+
+impl VforkBarrierWait {
+    /// The backend event the barrier was waiting for.
+    pub fn awaited(&self) -> &'static str {
+        match self.state {
+            VforkBarrierState::Pending => "the child's registration",
+            VforkBarrierState::Released => "the parent's continuation or retirement",
+        }
+    }
+}
+
+/// Step2a's valve expired (`Scheduler::step2a_wait_for_vfork_barrier`): a vfork
+/// barrier waited, committing nothing, for a backend event that had not
+/// arrived when it fired. Selecting other threads instead would let host
+/// timing decide the schedule, so the run is refused
+/// (<https://github.com/rrnewton/hermit/issues/3999>).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VforkBarrierRefusal {
+    /// The barriers still waiting, in parent `DetTid` order.
+    pub waits: Vec<VforkBarrierWait>,
+    /// How long, in host time, step2a had waited when it refused.
+    pub waited: Duration,
+}
+
+impl std::fmt::Display for VforkBarrierRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "hermit refused to continue the run: vfork barriers waited {:?} for backend \
+             events that never arrived:",
+            self.waited
+        )?;
+        for wait in &self.waits {
+            write!(f, " parent {}", wait.parent.as_raw())?;
+            match wait.child {
+                Some(child) => write!(f, " (child {})", child.as_raw())?,
+                None => write!(f, " (no child registered)")?,
+            }
+            write!(f, " {:?}, awaiting {};", wait.state, wait.awaited())?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for VforkBarrierRefusal {}
+
 /// End the run on a scheduler refusal: write it to stderr and exit with
 /// `HERMIT_POLICY_REFUSAL_EXIT`, the status for "hermit examined the run and
 /// refused it", as the network replay refusal does. Only the ptrace backend
 /// arms the release barrier or runs record/replay, and a ptrace guest does not
-/// outlive this process (Reverie sets `PTRACE_O_EXITKILL`).
+/// outlive this process (Reverie sets `PTRACE_O_EXITKILL`). A vfork barrier
+/// refusal can come from any backend; it ends the run the way a terminal
+/// deadlock refusal does.
 pub(crate) fn exit_on_scheduler_refusal(refusal: &dyn std::fmt::Display) -> ! {
     {
         use std::io::Write;
@@ -2571,6 +2656,8 @@ impl Scheduler {
             backend: cfg.backend,
             signaled_background_since: None,
             signaled_background_refusal: None,
+            vfork_barrier_wait_since: None,
+            vfork_barrier_refusal: None,
             rejoin_writer: match &cfg.replay_data {
                 Some(dir) if cfg.recordreplay_modes && !cfg.replaying => {
                     Some(RejoinWriter::create(dir).unwrap_or_else(|err| {
@@ -4335,6 +4422,12 @@ impl Scheduler {
     /// before it refuses the run (see `step2_release_signaled_background`).
     const SIGNALED_BACKGROUND_VALVE: Duration = Duration::from_secs(30);
 
+    /// How long step2a skips turns for a vfork barrier that waits for a
+    /// backend event before it refuses the run (see
+    /// `step2a_wait_for_vfork_barrier`). The same bound as the release
+    /// barrier's.
+    const VFORK_BARRIER_VALVE: Duration = Duration::from_secs(30);
+
     /// Requeue, at a fixed point, the background-pool threads that a committed
     /// signal armed (`BlockedPool::signaled_background`, set by
     /// `arm_signaled_background`).
@@ -4456,6 +4549,20 @@ impl Scheduler {
     /// that defers the child spawn (see `defers_vfork_child_registration`, e.g. KVM) the
     /// child registers only *after* the parent posts its continuation, so an unfulfilled barrier at
     /// parent continuation means the child is still on its way and the barrier must be kept.
+    ///
+    /// Two states make every pass skip its turn until a backend event arrives:
+    /// a `Pending` barrier waits for its child's registration, and a
+    /// `Released` one for its parent's continuation or retirement. No turn
+    /// commits meanwhile, so the event's host timing decides only how many
+    /// passes skip, never which turn is next. Each skip yields the scheduler
+    /// thread, as the other step2 prefix skips do. The valve
+    /// (`VFORK_BARRIER_VALVE`) bounds the wait without ever deciding a
+    /// selection: if the event has not arrived when it expires, every barrier
+    /// is kept, a `VforkBarrierRefusal` names the waiting barriers, and
+    /// `sched_loop_inner` ends the run with `HERMIT_POLICY_REFUSAL_EXIT`
+    /// (<https://github.com/rrnewton/hermit/issues/3999>). Dropping the
+    /// barriers instead would let other threads be selected at a moment the
+    /// host chose.
     fn step2a_wait_for_vfork_barrier(&mut self) -> Result<(), SkipTurn> {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-1152): Review deferred vfork child registration.
@@ -4498,20 +4605,50 @@ impl Scheduler {
             self.drop_vfork_barrier(parent);
         }
 
-        // A released barrier waits for its parent's continuation or
-        // retirement; no turn commits meanwhile, so when that host-timed event
-        // arrives cannot change the schedule.
-        if self.vfork_barriers.values().all(Option::is_some)
-            && self.released_vfork_barriers.is_empty()
-        {
-            Ok(())
-        } else {
-            trace!(
-                "waiting for vfork child registration from parents {:?}",
-                self.vfork_barriers
-            );
-            Err(SkipTurn)
+        // A pending barrier waits for its child's registration, a released one
+        // for its parent's continuation or retirement; no turn commits
+        // meanwhile, so when that host-timed event arrives cannot change the
+        // schedule. A registered, unreleased barrier does not wait: step 3
+        // admits its child.
+        let waits: Vec<VforkBarrierWait> = self
+            .vfork_barriers
+            .iter()
+            .filter_map(|(parent, child)| {
+                let state = if child.is_none() {
+                    VforkBarrierState::Pending
+                } else if self.released_vfork_barriers.contains(parent) {
+                    VforkBarrierState::Released
+                } else {
+                    return None;
+                };
+                Some(VforkBarrierWait {
+                    parent: *parent,
+                    child: *child,
+                    state,
+                })
+            })
+            .collect();
+        if waits.is_empty() {
+            self.vfork_barrier_wait_since = None;
+            return Ok(());
         }
+        let since = *self
+            .vfork_barrier_wait_since
+            .get_or_insert_with(std::time::Instant::now);
+        let waited = since.elapsed();
+        if waited < Self::VFORK_BARRIER_VALVE {
+            trace!("[step2a] waiting on vfork barriers {:?}", waits);
+            std::thread::yield_now();
+            return Err(SkipTurn);
+        }
+        // Fail closed: keep every barrier, so no other thread is selected at a
+        // host-timed point, and refuse the run.
+        if self.vfork_barrier_refusal.is_none() {
+            let refusal = VforkBarrierRefusal { waits, waited };
+            tracing::error!("[step2a] {}", refusal);
+            self.vfork_barrier_refusal = Some(refusal);
+        }
+        Err(SkipTurn)
     }
 
     /// Record the timeout deadline of a poller that `step4_resource_block` just
@@ -10473,6 +10610,119 @@ mod test {
         assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
         assert!(scheduler.vfork_barriers.is_empty());
         assert!(scheduler.released_vfork_barriers.is_empty());
+    }
+
+    /// Backdates the start of step2a's wait past its valve: an injected clock,
+    /// so the production bound needs no test knob.
+    fn expire_vfork_barrier_valve(scheduler: &mut Scheduler) {
+        scheduler.vfork_barrier_wait_since = Some(
+            std::time::Instant::now()
+                .checked_sub(Scheduler::VFORK_BARRIER_VALVE + Duration::from_secs(1))
+                .expect("the monotonic clock has run longer than the valve"),
+        );
+    }
+
+    /// A pending barrier whose child never registers is refused by name once
+    /// the valve expires, and the barrier stays, so no other thread is
+    /// selected at a moment the host chose
+    /// (https://github.com/rrnewton/hermit/issues/3999).
+    #[test]
+    fn a_pending_vfork_barrier_past_its_valve_refuses_the_run_and_stays() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let parent = DetTid::from_raw(3);
+        scheduler.vfork_barriers.insert(parent, None);
+
+        // Inside the valve, the first pass starts the clock and only waits.
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_err());
+        assert!(scheduler.vfork_barrier_wait_since.is_some());
+        assert!(scheduler.vfork_barrier_refusal.is_none());
+
+        expire_vfork_barrier_valve(&mut scheduler);
+        for _ in 0..2 {
+            assert!(scheduler.step2a_wait_for_vfork_barrier().is_err());
+            assert_eq!(scheduler.vfork_barriers.get(&parent), Some(&None));
+        }
+        let refusal = scheduler
+            .vfork_barrier_refusal
+            .take()
+            .expect("an expired wait records a typed refusal");
+        assert_eq!(
+            refusal.waits,
+            vec![VforkBarrierWait {
+                parent,
+                child: None,
+                state: VforkBarrierState::Pending,
+            }]
+        );
+        assert!(refusal.waited >= Scheduler::VFORK_BARRIER_VALVE);
+        let text = refusal.to_string();
+        assert!(text.starts_with("hermit refused to continue the run"));
+        assert!(text.contains(
+            "parent 3 (no child registered) Pending, awaiting the child's registration;"
+        ));
+    }
+
+    /// A released barrier whose parent never posts its continuation, and is
+    /// never retired, is refused by name once the valve expires, and the
+    /// barrier stays released.
+    #[test]
+    fn a_released_vfork_barrier_past_its_valve_refuses_the_run_and_stays() {
+        let (mut scheduler, parent, child) = live_vfork_pair();
+        scheduler.record_successful_exec(child);
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_err());
+        assert!(scheduler.vfork_barrier_refusal.is_none());
+
+        expire_vfork_barrier_valve(&mut scheduler);
+        for _ in 0..2 {
+            assert!(scheduler.step2a_wait_for_vfork_barrier().is_err());
+            assert_eq!(scheduler.vfork_barriers.get(&parent), Some(&Some(child)));
+            assert!(scheduler.released_vfork_barriers.contains(&parent));
+        }
+        let refusal = scheduler
+            .vfork_barrier_refusal
+            .take()
+            .expect("an expired wait records a typed refusal");
+        assert_eq!(
+            refusal.waits,
+            vec![VforkBarrierWait {
+                parent,
+                child: Some(child),
+                state: VforkBarrierState::Released,
+            }]
+        );
+        assert!(refusal.to_string().contains(
+            "parent 3 (child 5) Released, awaiting the parent's continuation or retirement;"
+        ));
+    }
+
+    /// Control: when the awaited event arrives inside the valve, the barrier
+    /// ends as before, the clock stops and nothing is refused; a later wait
+    /// starts its own clock rather than inheriting the earlier one.
+    #[test]
+    fn a_vfork_barrier_event_inside_the_valve_proceeds_and_stops_the_clock() {
+        let (mut scheduler, parent, child) = live_vfork_pair();
+        scheduler.record_successful_exec(child);
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_err());
+        assert!(scheduler.vfork_barrier_wait_since.is_some());
+
+        let op_id = ExternalOpId::new(parent, 7);
+        let mut continuation = Resources::new(parent);
+        continuation.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
+        scheduler.next_turns.get_mut(&parent).unwrap().req = Ivar::full(Ok(continuation));
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
+        assert!(scheduler.vfork_barriers.is_empty());
+        assert!(scheduler.vfork_barrier_wait_since.is_none());
+        assert!(scheduler.vfork_barrier_refusal.is_none());
+
+        // A new wait, for another parent, starts its own clock.
+        let other_parent = DetTid::from_raw(9);
+        scheduler.vfork_barriers.insert(other_parent, None);
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_err());
+        let since = scheduler
+            .vfork_barrier_wait_since
+            .expect("the new wait starts the clock");
+        assert!(since.elapsed() < Scheduler::VFORK_BARRIER_VALVE);
+        assert!(scheduler.vfork_barrier_refusal.is_none());
     }
 
     /// A barrier kept for a dead parent's still-running child is stale once
