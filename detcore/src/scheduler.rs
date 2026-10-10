@@ -564,7 +564,11 @@ fn blocking_request_is_ready(
 /// ([`HbRuntime::held_gate_refusal`]), and any syscall-occurrence anchor still
 /// unfired when the scheduler finishes ([`HbRuntime::unfired_occurrence_report`]).
 /// A gate that would hold a vfork child before its exec is refused when it
-/// closes (`HERMIT_HB_HOLD_IN_VFORK_CHILD`).
+/// closes (`HERMIT_HB_HOLD_IN_VFORK_CHILD`). A version-2 program also bounds
+/// every hold by its budget (`HERMIT_HB_HOLD_BUDGET_EXCEEDED`,
+/// [`Scheduler::hb_check_hold_budget`]) and refuses a non-leader exec on an
+/// identity a relative anchor names
+/// (`HERMIT_HB_RELATIVE_ACROSS_IDENTITY_REPLACEMENT`).
 #[derive(Debug)]
 struct HbRuntime {
     /// The validated, normalized program (anchors indexed by name, plus edges).
@@ -592,6 +596,23 @@ struct HbRuntime {
     /// closed when it reached them), so a gate that can never open is refused
     /// by naming the BEFORE anchors it waits on. Kept in step with `parked`.
     held_at: BTreeMap<DetTid, Vec<String>>,
+    /// The logical holds a version-2 budget is charged against: for each
+    /// thread whose gate is closed, the committed virtual time (ns) at which
+    /// it was first parked there and the anchors it is held at. Unlike
+    /// `parked` and `held_at`, which `hb_flush_wakes` clears whenever any
+    /// anchor fires, a hold ends only when the thread is granted passage or
+    /// removed, so a wake that leaves its gate closed does not reset the
+    /// budget.
+    holds: BTreeMap<DetTid, HbHold>,
+}
+
+/// One logical hold ([`HbRuntime::holds`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HbHold {
+    /// Committed virtual time, in ns, when the hold began.
+    since_ns: u64,
+    /// The anchors the thread is held at.
+    anchors: Vec<String>,
 }
 
 impl HbRuntime {
@@ -614,6 +635,7 @@ impl HbRuntime {
             spawn_order: Vec::new(),
             wake_pending: false,
             held_at: BTreeMap::new(),
+            holds: BTreeMap::new(),
         }
     }
 
@@ -729,11 +751,21 @@ impl HbRuntime {
                     .filter(|e| e.before == a.name || e.after == a.name)
                     .map(|e| format!("{} -> {}", e.before, e.after))
                     .collect();
+                // A relative anchor whose base never fired could not even
+                // start counting: name the base too.
+                let base = match &a.from {
+                    Some(base) if !self.fired.contains(base) => {
+                        format!("counted from '{}', which never fired either; ", base)
+                    }
+                    Some(base) => format!("counted from '{}'; ", base),
+                    None => String::new(),
+                };
                 format!(
-                    "  anchor '{}' on thread {}: {} never fired (edges: {})",
+                    "  anchor '{}' on thread {}: {} never fired ({}edges: {})",
                     a.name,
                     a.thread.label,
                     a.position,
+                    base,
                     if edges.is_empty() {
                         "none".to_owned()
                     } else {
@@ -750,6 +782,77 @@ impl HbRuntime {
              fired before the guest finished, so the ordering they name was not exercised:\n{}",
             unfired.len(),
             unfired.join("\n")
+        ))
+    }
+
+    /// The unfired BEFORE anchors that hold a thread at `after`, one line each,
+    /// in the form the refusals use. Byte-stable.
+    fn unfired_befores(&self, after: &str) -> Vec<String> {
+        self.program
+            .edges
+            .iter()
+            .filter(|e| e.after == after && e.strength == Strength::Hard)
+            .filter(|e| !self.fired.contains(&e.before))
+            .map(|edge| {
+                let before = &self.program.anchors[&edge.before];
+                format!(
+                    "  anchor '{}' on thread {}: {} never fired (edge {} -> {})",
+                    before.name, before.thread.label, before.position, edge.before, edge.after
+                )
+            })
+            .collect()
+    }
+
+    /// The refusal for a hold that has outlasted the version-2 budget at
+    /// committed time `now_ns`, or `None`. Holds are checked in `DetTid`
+    /// order; the first over budget is named, with the BEFORE anchors it
+    /// waits on. The text carries no time other than the budget, so it is
+    /// byte-identical across runs.
+    fn hold_budget_refusal(&self, now_ns: u64) -> Option<String> {
+        let budget = self.program.max_hold_ns?;
+        let (dettid, hold) = self.holds.iter().find(|(_, hold)| {
+            now_ns.saturating_sub(hold.since_ns) > budget
+                && hold.anchors.iter().any(|a| self.anchor_blocked(a))
+        })?;
+        let lines: Vec<String> = hold
+            .anchors
+            .iter()
+            .flat_map(|after| self.unfired_befores(after))
+            .collect();
+        Some(format!(
+            "HERMIT_HB_HOLD_BUDGET_EXCEEDED: dtid {} has been held at happens-before anchor(s) \
+             {:?} for more than max_hold_ns = {} virtual ns, waiting on:\n{}",
+            dettid,
+            hold.anchors,
+            budget,
+            lines.join("\n")
+        ))
+    }
+
+    /// The refusal for a non-leader exec in which `caller` takes over
+    /// `leader`'s identity while a relative anchor, or the base of one, is on
+    /// either thread, or `None`. Its activation state belongs to one task and
+    /// is not carried across the replacement in this version.
+    fn relative_identity_refusal(&self, caller: DetTid, leader: DetTid) -> Option<String> {
+        let names: Vec<String> = self
+            .program
+            .relative_anchors()
+            .filter(|(relative, _)| {
+                self.thread_matches(&relative.thread, caller)
+                    || self.thread_matches(&relative.thread, leader)
+            })
+            .map(|(relative, base)| format!("'{}' (from '{}')", relative.name, base.name))
+            .collect();
+        if names.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "HERMIT_HB_RELATIVE_ACROSS_IDENTITY_REPLACEMENT: dtid {} execs and takes over the \
+             identity of dtid {}, but relative happens-before anchor(s) {} are on these \
+             threads; relative anchors are not carried across a non-leader exec.",
+            caller,
+            leader,
+            names.join(", ")
         ))
     }
 
@@ -2669,9 +2772,14 @@ impl Scheduler {
                     self.terminal_is_refusal = true;
                 }
             }
+            let now_ns = self.committed_time.as_nanos();
             let hb = self.happens_before.as_mut().unwrap();
             hb.parked.insert(dettid);
             hb.held_at.insert(dettid, reached.clone());
+            hb.holds.entry(dettid).or_insert_with(|| HbHold {
+                since_ns: now_ns,
+                anchors: reached.clone(),
+            });
             return self.skip_turn_blocked(dettid);
         }
 
@@ -2680,6 +2788,8 @@ impl Scheduler {
         let mut newly_fired = false;
         {
             let hb = self.happens_before.as_mut().unwrap();
+            // Passage granted: any hold of this thread is over.
+            hb.holds.remove(&dettid);
             for name in &reached {
                 if hb.fired.insert(name.clone()) {
                     newly_fired = true;
@@ -2734,6 +2844,30 @@ impl Scheduler {
                 );
             }
         }
+    }
+
+    /// Refuse the run when a held thread has outlasted a version-2 program's
+    /// hold budget (`max_hold_ns`), charged in committed virtual time.
+    ///
+    /// Called from `step2_drain_prefix`, so at every step2 pass of both turn
+    /// loops, before selection. It reads only `committed_time` and the
+    /// scheduler's own hold records, and it ends the run rather than releasing
+    /// the thread, so it never decides which thread runs. A run with no
+    /// version-2 program, or no hold, returns at once.
+    fn hb_check_hold_budget(&mut self) -> Result<(), SkipTurn> {
+        let now_ns = self.committed_time.as_nanos();
+        let Some(refusal) = self
+            .happens_before
+            .as_ref()
+            .and_then(|hb| hb.hold_budget_refusal(now_ns))
+        else {
+            return Ok(());
+        };
+        if self.terminal_deadlock.is_none() {
+            self.terminal_deadlock = Some(refusal);
+            self.terminal_is_refusal = true;
+        }
+        Err(SkipTurn)
     }
 
     /// Fill in a resource request, which is exactly what might make the next logical
@@ -3194,6 +3328,16 @@ impl Scheduler {
 
             self.remove_exec_vfork_barriers(&siblings);
             return siblings;
+        }
+
+        if let Some(refusal) = self
+            .happens_before
+            .as_ref()
+            .and_then(|hb| hb.relative_identity_refusal(caller, new_leader))
+            && self.terminal_deadlock.is_none()
+        {
+            self.terminal_deadlock = Some(refusal);
+            self.terminal_is_refusal = true;
         }
 
         self.thread_tree
@@ -3832,6 +3976,7 @@ impl Scheduler {
         if let Some(hb) = self.happens_before.as_mut() {
             hb.parked.remove(dtid);
             hb.held_at.remove(dtid);
+            hb.holds.remove(dtid);
         }
     }
 
@@ -4112,6 +4257,7 @@ impl Scheduler {
         // that blocked right after firing is not reported as a futex deadlock,
         // https://github.com/rrnewton/hermit/issues/3149).
         self.hb_flush_wakes();
+        self.hb_check_hold_budget()?;
         if self.backend.process_exits_complete_asynchronously
             && !self.pending_physical_process_exits.is_empty()
         {
@@ -15634,6 +15780,170 @@ mod test {
         assert!(!report.contains("anchor 'c'"), "{report}");
         hb.fired.insert("w".to_owned());
         assert!(hb.unfired_occurrence_report().is_none());
+    }
+
+    /// A version-2 spec that holds dettid 5 at its 43rd syscall until both
+    /// sources fire, with an unrelated anchor on dettid 7 and a 1000 ns budget.
+    const HB_BUDGET_SPEC: &str = r#"{"version": 2, "max_hold_ns": 1000,
+        "events": {"src1": {"thread": "3", "syscalls": 42},
+                   "src2": {"thread": "4", "syscalls": 42},
+                   "other": {"thread": "7", "syscalls": 9},
+                   "dst": {"thread": "5", "syscalls": 43}},
+        "edges": [{"before": "src1", "after": "dst"},
+                  {"before": "src2", "after": "dst"}]}"#;
+
+    /// Select `dettid` as step3 would and let it reach its checkpoint at
+    /// syscall `count`, at committed time `now_ns`.
+    fn hb_reach(scheduler: &mut Scheduler, dettid: DetTid, count: u64, now_ns: u64) -> bool {
+        scheduler.committed_time = LogicalTime::from_nanos(now_ns);
+        scheduler
+            .priorities
+            .entry(dettid)
+            .or_insert(DEFAULT_PRIORITY);
+        if !scheduler.run_queue.contains_tid(dettid) {
+            scheduler.runqueue_push_back(dettid);
+        }
+        scheduler.run_queue.tentative_pop_tid(dettid).unwrap();
+        let granted = scheduler.hb_checkpoint(dettid, count, &[]).is_ok();
+        if granted {
+            scheduler.run_queue.undo_tentative_pop();
+        }
+        granted
+    }
+
+    /// The hold budget is charged in committed virtual time from the moment
+    /// the thread is first parked. A wake caused by an unrelated anchor, and a
+    /// gate only partly opened, re-park the thread without restarting its
+    /// hold; past the budget the run is refused by name, naming the BEFORE
+    /// anchor still missing. The check runs in `step2_drain_prefix`, which both
+    /// turn loops call before selection.
+    #[test]
+    fn a_hold_is_charged_from_its_first_park_and_refused_past_its_budget() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.happens_before = Some(hb_runtime(HB_BUDGET_SPEC));
+        let held = DetTid::from_raw(5);
+        assert!(!hb_reach(&mut scheduler, held, 43, 5000));
+        let hold = scheduler.happens_before.as_ref().unwrap().holds[&held].clone();
+        assert_eq!(hold.since_ns, 5000);
+
+        // An unrelated anchor fires: the wake re-admits and clears the
+        // physical park, and the thread re-parks; the hold is unchanged.
+        assert!(hb_reach(&mut scheduler, DetTid::from_raw(7), 9, 5200));
+        assert!(scheduler.step2_drain_prefix().is_ok());
+        assert!(scheduler.happens_before.as_ref().unwrap().parked.is_empty());
+        assert!(!hb_reach(&mut scheduler, held, 43, 5500));
+        // One of two sources fires: still held, still the same hold.
+        assert!(hb_reach(&mut scheduler, DetTid::from_raw(3), 42, 5600));
+        assert!(scheduler.step2_drain_prefix().is_ok());
+        assert!(!hb_reach(&mut scheduler, held, 43, 5700));
+        assert_eq!(
+            scheduler.happens_before.as_ref().unwrap().holds[&held],
+            hold
+        );
+
+        // Exactly the budget is not over it.
+        scheduler.committed_time = LogicalTime::from_nanos(6000);
+        assert!(scheduler.step2_drain_prefix().is_ok());
+        assert!(scheduler.take_terminal_deadlock().is_none());
+        scheduler.committed_time = LogicalTime::from_nanos(6001);
+        assert!(scheduler.step2_drain_prefix().is_err());
+        assert!(scheduler.terminal_is_refusal);
+        let report = scheduler.take_terminal_deadlock().unwrap();
+        assert_eq!(
+            report,
+            "HERMIT_HB_HOLD_BUDGET_EXCEEDED: dtid 5 has been held at happens-before anchor(s) \
+             [\"dst\"] for more than max_hold_ns = 1000 virtual ns, waiting on:\n  anchor 'src2' \
+             on thread 4: after 42 syscalls never fired (edge src2 -> dst)"
+        );
+    }
+
+    /// A hold that ends inside its budget is gone: once the gate opens and the
+    /// thread passes, no later committed time can refuse it. A version-1 spec
+    /// has no budget at all.
+    #[test]
+    fn a_released_hold_and_a_version_1_hold_are_never_refused() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.happens_before = Some(hb_runtime(HB_BUDGET_SPEC));
+        let held = DetTid::from_raw(5);
+        assert!(!hb_reach(&mut scheduler, held, 43, 5000));
+        assert!(hb_reach(&mut scheduler, DetTid::from_raw(3), 42, 5100));
+        assert!(hb_reach(&mut scheduler, DetTid::from_raw(4), 42, 5200));
+        assert!(scheduler.step2_drain_prefix().is_ok());
+        assert!(hb_reach(&mut scheduler, held, 43, 5300));
+        assert!(scheduler.happens_before.as_ref().unwrap().holds.is_empty());
+        scheduler.committed_time = LogicalTime::from_nanos(1_000_000_000);
+        assert!(scheduler.step2_drain_prefix().is_ok());
+        assert!(scheduler.take_terminal_deadlock().is_none());
+
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.happens_before = Some(hb_runtime(
+            &HB_BUDGET_SPEC.replace(r#""version": 2, "max_hold_ns": 1000,"#, r#""version": 1,"#),
+        ));
+        assert!(!hb_reach(&mut scheduler, held, 43, 5000));
+        scheduler.committed_time = LogicalTime::from_nanos(u64::MAX / 2);
+        assert!(scheduler.step2_drain_prefix().is_ok());
+        assert!(scheduler.take_terminal_deadlock().is_none());
+    }
+
+    /// A non-leader exec hands the caller's task the leader's identity. When a
+    /// relative anchor (with its base, on the same thread) is on either
+    /// identity, the handoff is refused by name; any other exec is unaffected.
+    #[test]
+    fn a_non_leader_exec_on_a_relative_anchors_thread_is_refused() {
+        let hb = hb_runtime(
+            r#"{"version": 2, "events": {
+                "m": {"thread": "5", "syscall": "write", "fd": 1, "nth": 2},
+                "r": {"thread": "5", "syscall": "getppid", "from": "m"},
+                "x": {"thread": "8", "syscall": "getppid"}}}"#,
+        );
+        let tid = DetTid::from_raw;
+        let expected = |caller: i32, leader: i32| {
+            format!(
+                "HERMIT_HB_RELATIVE_ACROSS_IDENTITY_REPLACEMENT: dtid {caller} execs and takes \
+                 over the identity of dtid {leader}, but relative happens-before anchor(s) 'r' \
+                 (from 'm') are on these threads; relative anchors are not carried across a \
+                 non-leader exec."
+            )
+        };
+        // The relative anchor's thread is the leader that is replaced...
+        assert_eq!(
+            hb.relative_identity_refusal(tid(7), tid(5)),
+            Some(expected(7, 5))
+        );
+        // ...or the worker whose task takes over.
+        assert_eq!(
+            hb.relative_identity_refusal(tid(5), tid(9)),
+            Some(expected(5, 9))
+        );
+        // An absolute anchor alone on either thread is not affected.
+        assert_eq!(hb.relative_identity_refusal(tid(8), tid(9)), None);
+    }
+
+    /// A relative anchor that never fired is reported with its base, and the
+    /// report says when that base never fired either.
+    #[test]
+    fn an_unfired_relative_anchor_names_its_base() {
+        let mut hb = hb_runtime(
+            r#"{"version": 2, "events": {
+                "m": {"thread": "5", "syscall": "write", "fd": 1, "nth": 2},
+                "r": {"thread": "5", "syscall": "getppid", "from": "m", "nth": 4}}}"#,
+        );
+        let report = hb.unfired_occurrence_report().unwrap();
+        assert!(
+            report.contains(
+                "anchor 'r' on thread 5: getppid#4 never fired (counted from 'm', which never \
+                 fired either; edges: none)"
+            ),
+            "{report}"
+        );
+        hb.fired.insert("m".to_owned());
+        let report = hb.unfired_occurrence_report().unwrap();
+        assert!(
+            report.contains(
+                "anchor 'r' on thread 5: getppid#4 never fired (counted from 'm'; edges: none)"
+            ),
+            "{report}"
+        );
     }
 
     /// The enforcement predicates that drive `hb_checkpoint`: an anchor is
