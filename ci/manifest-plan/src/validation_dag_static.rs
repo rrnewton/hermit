@@ -153,6 +153,7 @@ pub(super) const NEXTEST_RESULT_PRODUCERS: &[&str] = &[
     "test.arbitrary_binaries",
     "test.cli",
     "test.liteinst_allocator",
+    "test.liteinst_stacks",
     "test.cli_on_host",
     "test.record_replay",
     "test.command_strict_verify",
@@ -274,6 +275,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Two actual-leaf matrices and the five included shared qualifier controls.
     // Confirm this seven-test population with the exact prepared listing.
     ("test.liteinst_allocator", 7),
+    // Four actual M2 rows, five artifact controls and two shared stack-oracle controls.
+    ("test.liteinst_stacks", 11),
     // run_dbt_binds_in_a_user_namespace_of_its_own retains both prior
     // identities: 2 + 1 = 3.
     ("test.isolated_dbt_workdir", 3),
@@ -967,7 +970,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (hermit-manifest-plan, https://github.com/rrnewton/hermit/issues/4029)
     // retains all 1039: 1040.
     // The required allocator prerequisite mutation test retains all 1039 prior identities: 1040.
-    ("test.regular_crates", 1041),
+    ("test.regular_crates", 1042),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2942,7 +2945,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the duplicated-field model test: 1039.
     // And the guest permission-denied first-run-rejection test: 1040.
     // And the same allocator prerequisite mutation test: 1040.
-    ("test.regular_crates_on_host", 1041),
+    ("test.regular_crates_on_host", 1042),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
@@ -5602,8 +5605,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
     StaticStepSpec {
         group: r########"build"########,
         job: r########"liteinst_allocator_fixtures"########,
-        desc: r########"Qualify both real diagnostic preload leaves and the frozen allocator guest"########,
-        description: r########"M1 diagnostic producer only: exact initialized Reverie Git pin, full locked nested package metadata, current Cargo artifact selection, constructor/local-shim/private call-path and portability qualification for the genuine standalone release leaf and Detcore validate leaf, plus the unchanged C workload. Both builds require allocator-fixture solely for exports. Unique targets/bundle do not change normal resources or prepared test executables. Shared 900-second deadline, 64-MiB command stream caps and process-group cleanup supplement the outer DAG CPU/memory/cgroup backstop. Initial conservative width 4, 4-GiB accounting and 8-GiB hard cap reuse the bounded focused baseline envelope (380.7 seconds, 4.03-GiB peak); two fresh diagnostic trees are not yet a calibrated cost. No guest or test executes in this node."########,
+        desc: r########"Qualify both real diagnostic preload leaves and separate frozen allocator/stack guests"########,
+        description: r########"M1 diagnostic producer only: exact initialized Reverie Git pin, full locked nested package metadata, current Cargo artifact selection, constructor/local-shim/private call-path and portability qualification for the genuine standalone release leaf and Detcore validate leaf, plus the unchanged M1 C workload and a separate frozen M2 stack guest/receipt. Both builds require allocator-fixture solely for exports. Unique targets/bundle do not change normal resources or prepared test executables. Shared 900-second deadline, 64-MiB command stream caps and process-group cleanup supplement the outer DAG CPU/memory/cgroup backstop. Initial conservative width 4, 4-GiB accounting and 8-GiB hard cap reuse the bounded focused baseline envelope (380.7 seconds, 4.03-GiB peak); two fresh diagnostic trees are not yet a calibrated cost. No guest or test executes in this node."########,
         labels: &[r########"full"########, r########"portable"########],
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/build-liteinst-allocator-fixtures.rs"########,
         cmdtype: CmdType::Unknown,
@@ -5641,6 +5644,40 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"liteinst_allocator"########]),
+        deps: &[
+            r########"build.e2e_artifact"########,
+            r########"build.liteinst_allocator_fixtures"########,
+            r########"pre.reverie_pin"########,
+            r########"setup.nextest"########,
+        ],
+        env: &[],
+        hint: HintSpec {
+            resources: &[],
+            est_duration_s: 60.0,
+            rss_baseline_bytes: Some(1073741824),
+            hard_mem_max_bytes: Some(4294967296),
+            classification: StepClass::LatencyBound,
+            preferred_inner_jobs: None,
+            measured_effective_cores: None,
+            measured_cpu_utilization: None,
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 900,
+        cpu_timeout: 900,
+        jobs_flag: None,
+        jobs_env: None,
+    },
+    StaticStepSpec {
+        group: r########"test"########,
+        job: r########"liteinst_stacks"########,
+        desc: r########"Require literal fixed placement of actual LiteInst signal and callback stacks"########,
+        description: r########"Eleven required identities: four genuine leaf rows, five unchanged artifact qualifier controls and two unchanged shared stack-observation controls. Standalone native Strace SITE1 ALT1 must report the real fixed guarded altstack and absent continuation; ALT0 gets no stack credit; inert loading must reserve nothing. Genuine Detcore trap/site0 ALT1 must reach one actual callback at the exact marker IP/TID/RSP, with one completion and fixed guarded 8-MiB capacity. Separate frozen C guest/receipt and unchanged comparator, current constructor-bearing leaf qualification and independent clean H/RV source guards are mandatory. No consumer compilation, warm artifact search, full-entry/TLS or interior-write-protection claim. Raw observations remain separate from selection."########,
+        labels: &[r########"full"########, r########"portable"########],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; export HERMIT_M2_STACK_FIXTURE_BUNDLE="$PWD/target/ci/m2-stack-fixtures.path"; REVERIE_LITEINST_PRELOAD=$(./ci/build-liteinst-allocator-fixtures.rs --print-stack-standalone) && export REVERIE_LITEINST_PRELOAD && ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test liteinst_stacks -j 1"########,
+        cmdtype: CmdType::Unknown,
+        manifest: None,
+        integration_test_binaries: Some(&[r########"liteinst_stacks"########]),
         deps: &[
             r########"build.e2e_artifact"########,
             r########"build.liteinst_allocator_fixtures"########,

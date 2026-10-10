@@ -179,6 +179,14 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "liteinst_allocator",
         ]),
+        "test.liteinst_stacks" => Some(&[
+            "-p",
+            "hermit",
+            "--features",
+            "third-party-backends",
+            "--test",
+            "liteinst_stacks",
+        ]),
         "test.cli"
         | "test.isolated_dbt_workdir"
         | "test.cli_on_host"

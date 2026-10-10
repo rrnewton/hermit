@@ -1,5 +1,5 @@
 #!/usr/bin/env -S rust-script --force
-//! Build both genuine M1 diagnostic leaves and the unchanged C guest.
+//! Build both genuine diagnostic leaves and separate frozen M1/M2 C guests.
 //! The official DAG owns CPU/memory/cgroup limits. This producer owns a shared
 //! 900-second child deadline, process groups and 64-MiB command stream caps.
 //! It does not run guests or replace the normal prepared Hermit/resource tree.
@@ -17,6 +17,8 @@
 pub mod m1_artifact;
 #[path = "../hermit-cli/tests/common/m1_bundle.rs"]
 mod m1_bundle;
+#[path = "../hermit-cli/tests/common/m2_bundle.rs"]
+mod m2_bundle;
 #[path = "../scripts/lib/rust_script_prelude.rs"]
 mod rust_script_prelude;
 
@@ -33,6 +35,7 @@ use std::time::UNIX_EPOCH;
 
 use m1_artifact::ConsumerExpectation;
 use m1_artifact::FileIdentity;
+use m1_artifact::GuestReceipt;
 use m1_artifact::Result;
 use m1_artifact::Runner;
 use m1_artifact::RuntimeReceipt;
@@ -43,6 +46,7 @@ use serde_json::Value;
 use serde_json::json;
 
 const POINTER: &str = "target/ci/m1-allocator-fixtures.path";
+const STACK_POINTER: &str = "target/ci/m2-stack-fixtures.path";
 const FEATURES: [&str; 1] = ["allocator-fixture"];
 
 fn require(ok: bool, message: &str) -> Result<()> {
@@ -293,6 +297,105 @@ fn build_leaf(
     })
 }
 
+fn require_stack_exports(leaf: &Leaf) -> Result<()> {
+    let file = FileIdentity::read(&leaf.runtime)?;
+    let bytes = fs::read(&file.path).map_err(|e| e.to_string())?;
+    let elf = goblin::elf::Elf::parse(&bytes).map_err(|e| e.to_string())?;
+    for name in ["m2_stack_query", "m2_stack_arm"] {
+        let exports: Vec<_> = elf
+            .dynsyms
+            .iter()
+            .filter(|symbol| elf.dynstrtab.get_at(symbol.st_name) == Some(name))
+            .collect();
+        require(
+            exports.len() == 1,
+            "M2 leaf needs one exact query/arm export",
+        )?;
+        let symbol = &exports[0];
+        require(
+            symbol.st_bind() == goblin::elf::sym::STB_GLOBAL
+                && symbol.st_type() == goblin::elf::sym::STT_FUNC
+                && symbol.st_visibility() == goblin::elf::sym::STV_DEFAULT
+                && symbol.st_shndx != goblin::elf::section_header::SHN_UNDEF as usize,
+            "M2 leaf query/arm must be real global default function definitions",
+        )?;
+    }
+    file.verify()
+}
+
+fn produce_stack_guest(
+    root: &std::path::Path,
+    bundle: &std::path::Path,
+    runner: &mut Runner,
+) -> Result<(PathBuf, PathBuf)> {
+    const SOURCE: &[u8] =
+        include_bytes!("../reverie/reverie-liteinst/tests/fixtures/m2_stack_guest.c");
+    let source =
+        FileIdentity::read(&root.join("reverie-liteinst/tests/fixtures/m2_stack_guest.c"))?;
+    require(
+        source.sha256 == m1_artifact::sha256(SOURCE) && source.sha256 == m2_bundle::FROZEN_C,
+        "M2 compiled/current C source differs",
+    )?;
+    let binary_path = bundle.join("m2_stack_guest");
+    require(!binary_path.exists(), "M2 C guest output already exists")?;
+    let compiler = std::env::var("CC").unwrap_or_else(|_| "cc".to_owned());
+    let compiler_version = runner.text(&compiler, &["--version"], root)?;
+    // Keep the existing source-bound guest recipe unchanged. This additional
+    // syntax check makes warnings fatal for the new fixture alone.
+    runner.run(
+        &compiler,
+        &[
+            "-std=c11".to_owned(),
+            "-Wall".to_owned(),
+            "-Wextra".to_owned(),
+            "-Werror".to_owned(),
+            "-fsyntax-only".to_owned(),
+            source.path.to_string_lossy().into_owned(),
+        ],
+        root,
+    )?;
+    runner.run(
+        &compiler,
+        &[
+            "-std=c11".to_owned(),
+            "-O0".to_owned(),
+            "-fno-builtin".to_owned(),
+            "-fno-lto".to_owned(),
+            "-Wl,--export-dynamic".to_owned(),
+            "-Wl,-z,now".to_owned(),
+            source.path.to_string_lossy().into_owned(),
+            "-o".to_owned(),
+            binary_path.to_string_lossy().into_owned(),
+            "-ldl".to_owned(),
+        ],
+        root,
+    )?;
+    let guest = GuestReceipt {
+        schema_version: 1,
+        source,
+        binary: FileIdentity::read(&binary_path)?,
+        compiler_version,
+        command: runner
+            .commands
+            .last()
+            .ok_or("M2 C compiler command missing")?
+            .clone(),
+        executed_tests: 0,
+    };
+    let receipt_path = bundle.join("stack-guest.json");
+    m1_artifact::write_new(
+        &receipt_path,
+        &serde_json::to_vec_pretty(&guest).map_err(|e| e.to_string())?,
+    )?;
+    m1_artifact::verify_guest_receipt(
+        &receipt_path,
+        &binary_path,
+        &guest.source.path,
+        &m1_artifact::sha256(SOURCE),
+    )?;
+    Ok((binary_path, receipt_path))
+}
+
 fn produce(root: &Path) -> Result<()> {
     require(
         std::env::var("CARGO_NET_OFFLINE").as_deref() == Ok("true"),
@@ -327,6 +430,16 @@ fn produce(root: &Path) -> Result<()> {
             root.join("reverie/reverie-liteinst/tests/fixtures/m1_allocator_guest.c"),
         ),
     ]);
+    let stack_source =
+        FileIdentity::read(&root.join("reverie/reverie-liteinst/tests/fixtures/m2_stack_guest.c"))?;
+    let stack_oracle = FileIdentity::read(
+        &root.join("reverie/reverie-liteinst/tests/support/stack_observation.rs"),
+    )?;
+    require(
+        stack_source.sha256 == m2_bundle::FROZEN_C
+            && stack_oracle.sha256 == m2_bundle::FROZEN_ORACLE,
+        "frozen M2 source/comparator changed",
+    )?;
     let before = source(root, &root.join("Cargo.lock"), &oracles, &mut runner)?;
     // H commands resolve through H's root/nested locks. RV's ignored workspace
     // lock is not an input to either H build.
@@ -360,6 +473,8 @@ fn produce(root: &Path) -> Result<()> {
     )?;
     let standalone = build_leaf(root, &bundle, &oracles, true, deadline)?;
     let detcore = build_leaf(root, &bundle, &oracles, false, deadline)?;
+    require_stack_exports(&standalone)?;
+    require_stack_exports(&detcore)?;
     let guest = bundle.join("m1_allocator_guest");
     let warning_guest = bundle.join("m1_allocator_guest.warnings");
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
@@ -441,6 +556,10 @@ fn produce(root: &Path) -> Result<()> {
         &oracles["c_workload"],
         m1_artifact::FROZEN_C_ORACLE,
     )?;
+    let (stack_guest, stack_guest_receipt) =
+        produce_stack_guest(&root.join("reverie"), &bundle, &mut runner)?;
+    stack_source.verify()?;
+    stack_oracle.verify()?;
     let after = source(root, &root.join("Cargo.lock"), &oracles, &mut runner)?;
     let rv_after_head = runner
         .text("git", &["rev-parse", "HEAD"], &root.join("reverie"))?
@@ -485,14 +604,36 @@ fn produce(root: &Path) -> Result<()> {
         &manifest,
         &serde_json::to_vec_pretty(&envelope).map_err(|e| e.to_string())?,
     )?;
+    let stack_manifest = bundle.join("stack-bundle.json");
+    let stack_envelope = m2_bundle::Bundle {
+        schema: 1,
+        allocator: envelope,
+        guest: stack_guest,
+        guest_receipt: stack_guest_receipt,
+        guest_source_sha256: stack_source.sha256,
+        stack_oracle_sha256: stack_oracle.sha256,
+        executed_tests: 0,
+        full_stack_isolation_claimed: false,
+    };
+    m1_artifact::write_new(
+        &stack_manifest,
+        &serde_json::to_vec_pretty(&stack_envelope).map_err(|e| e.to_string())?,
+    )?;
     // Publish only after both runtime and guest identities are closed. A failed
     // generation keeps its logs but never becomes the selected fixture bundle.
     let pending = root.join(format!("{POINTER}.{}", std::process::id()));
     m1_artifact::write_new(&pending, format!("{}\n", manifest.display()).as_bytes())?;
     fs::rename(pending, root.join(POINTER)).map_err(|e| e.to_string())?;
+    let stack_pending = root.join(format!("{STACK_POINTER}.{}", std::process::id()));
+    m1_artifact::write_new(
+        &stack_pending,
+        format!("{}\n", stack_manifest.display()).as_bytes(),
+    )?;
+    fs::rename(stack_pending, root.join(STACK_POINTER)).map_err(|e| e.to_string())?;
+
     println!(
         "{}",
-        json!({"bundle":manifest,"executed_tests":0,"full_m1_pass_claimed":false})
+        json!({"bundle":manifest,"stack_bundle":stack_manifest,"executed_tests":0,"full_m1_pass_claimed":false,"full_stack_isolation_claimed":false})
     );
     Ok(())
 }
@@ -518,7 +659,17 @@ fn run() -> Result<()> {
             );
             Ok(())
         }
-        _ => Err("usage: build-liteinst-allocator-fixtures.rs [--print-standalone]".into()),
+        [option] if option == "--print-stack-standalone" => {
+            let manifest = fs::read_to_string(root.join(STACK_POINTER)).map_err(|e| e.to_string())?;
+            let bundle: m2_bundle::Bundle = serde_json::from_slice(
+                &fs::read(manifest.trim()).map_err(|e| e.to_string())?
+            ).map_err(|e| e.to_string())?;
+            require(bundle.schema == 1 && bundle.executed_tests == 0 && !bundle.full_stack_isolation_claimed,
+                "M2 envelope is not a producer-only receipt")?;
+            println!("{}", m1_artifact::real_file(&bundle.allocator.standalone.runtime)?.display());
+            Ok(())
+        }
+        _ => Err("usage: build-liteinst-allocator-fixtures.rs [--print-standalone | --print-stack-standalone]".into()),
     }
 }
 
