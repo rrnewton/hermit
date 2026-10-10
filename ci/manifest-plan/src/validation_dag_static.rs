@@ -1818,7 +1818,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tool_global::test::sigkill_notifications_record_the_doomed_process
     // (https://github.com/rrnewton/hermit/issues/3904) retain all 1324: 1328.
     // And a_committed_sigchld_ends_a_gated_wait_unless_a_host_timed_source_can_post_it and a_precise_futex_wait_holds_a_committed_signal_only_if_a_host_timed_source_can_post_it (https://github.com/rrnewton/hermit/issues/4005): 1330.
-    ("test.detcore_unit", 1330),
+    // And a_background_call_with_a_temporary_mask_holds_the_schedule_until_the_kernel_installs_it (https://github.com/rrnewton/hermit/issues/3993): 1331.
+    ("test.detcore_unit", 1331),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2077,7 +2078,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and record_forked_child_moves_the_root_stdout_offset_as_in_the_recording
     // (https://github.com/rrnewton/hermit/issues/4006 and its review) add two
     // and retain all 146 (`cargo nextest list` lists 148).
-    ("test.record_replay", 148),
+    // record_sigsuspend_while_a_timer_signal_is_due
+    // (https://github.com/rrnewton/hermit/issues/3993) adds one and retains all
+    // 148 (`cargo nextest list` lists 149).
+    ("test.record_replay", 149),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -2738,7 +2742,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same unknown-sleeping-mask test: 1324.
     // And the four child-wait deadlock tests: 1328.
     // And a_committed_sigchld_ends_a_gated_wait_unless_a_host_timed_source_can_post_it and a_precise_futex_wait_holds_a_committed_signal_only_if_a_host_timed_source_can_post_it (https://github.com/rrnewton/hermit/issues/4005): 1330.
-    ("test.detcore_unit_on_host", 1330),
+    // And a_background_call_with_a_temporary_mask_holds_the_schedule_until_the_kernel_installs_it (https://github.com/rrnewton/hermit/issues/3993): 1331.
+    ("test.detcore_unit_on_host", 1331),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

@@ -1508,6 +1508,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_sigsuspend_timer_signal.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_sigsuspend_timer_signal.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration suite compiles this workload and checks that in each of eight rounds a timer's SIGALRM goes to the waker thread and the waker's SIGUSR1 ends sigsuspend with EINTR, as on Linux, under record and replay."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/record_replay_sigtimedwait_child_exit.c",
       "runner": "hermit-cli/tests/record_replay.rs",
       "why": "tests/c/record_replay_sigtimedwait_child_exit.c is owned by hermit-cli/tests/record_replay.rs: The dedicated integration suite compiles this workload and checks that rt_sigtimedwait ends with EINTR for a caught SIGCHLD from a child's exit, and times out for a blocked or default-ignored one, under record and replay."
