@@ -68,7 +68,6 @@ use reverie::process::Container;
 use reverie::process::ExitStatus;
 use reverie::process::Mount;
 use reverie::process::MountFlags;
-use reverie::process::Namespace;
 use reverie::process::Output;
 
 use super::container::ContainerInputs;
@@ -8414,7 +8413,7 @@ impl RunOpts {
 
         let mut command = self.namespace_only_guest_command()?;
         // `--namespace-only` does NOT go through `with_container`: it unshares
-        // `Namespace::PID` and execs the guest directly, so the guest process
+        // the common PID/IPC/cgroup set and execs the guest directly, so the guest process
         // ITSELF becomes PID 1 of the new namespace and inherits the same
         // undeliverable-signal protection. An adversarial review found this
         // second launch path after the `with_container` guards were in place --
@@ -8446,7 +8445,7 @@ impl RunOpts {
             });
         }
         command
-            .unshare(Namespace::PID)
+            .unshare(super::container::common_namespace_set())
             .map_root()
             .hostname("hermetic-container.local")
             .domainname("local")
@@ -9892,6 +9891,492 @@ impl Tmpfs {
         match self {
             Self::Path(path) => path,
             Self::Temp(temp) => temp.path(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    use super::*;
+
+    const NAMES: [&str; 7] = ["user", "pid", "uts", "mnt", "net", "ipc", "cgroup"];
+    const MARKER: u64 = 0x4845_524d_4954_4950;
+    const REPORT: &str = "HERMIT_TEST_NATIVE_NAMESPACE_REPORT";
+    const EXEC_TEST: &str =
+        "run::namespace_tests::namespace_only_has_private_ipc_and_cgroup_namespaces";
+
+    #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    struct NamespaceObject {
+        name: String,
+        device: u64,
+        inode: u64,
+        link: PathBuf,
+    }
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct IpcLookup {
+        errno: Option<i32>,
+        size: u64,
+        attachments: u64,
+        marker: Option<u64>,
+    }
+
+    fn ipc_lookup(id: i32) -> Result<IpcLookup, Error> {
+        let mut info = std::mem::MaybeUninit::<libc::shmid_ds>::uninit();
+        // SAFETY: IPC_STAT writes this output only on success.
+        if unsafe { libc::shmctl(id, libc::IPC_STAT, info.as_mut_ptr()) } < 0 {
+            return Ok(IpcLookup {
+                errno: std::io::Error::last_os_error().raw_os_error(),
+                size: 0,
+                attachments: 0,
+                marker: None,
+            });
+        }
+        // SAFETY: the successful IPC_STAT initialized info.
+        let info = unsafe { info.assume_init() };
+        anyhow::ensure!(
+            info.shm_segsz >= std::mem::size_of::<u64>(),
+            "held IPC object is too small"
+        );
+        // No child creates a segment before looking up this original ID. A
+        // successful attach must read the held parent's original object.
+        // SAFETY: a successful shmat returns a readable mapping of shm_segsz.
+        let address = unsafe { libc::shmat(id, std::ptr::null(), libc::SHM_RDONLY) };
+        anyhow::ensure!(
+            address != (-1_isize) as *mut libc::c_void,
+            "shmat: {}",
+            std::io::Error::last_os_error()
+        );
+        let marker = unsafe { address.cast::<u64>().read() };
+        // SAFETY: this exact mapping was acquired immediately above.
+        anyhow::ensure!(
+            unsafe { libc::shmdt(address) } == 0,
+            "shmdt: {}",
+            std::io::Error::last_os_error()
+        );
+        Ok(IpcLookup {
+            errno: None,
+            size: info.shm_segsz as u64,
+            attachments: info.shm_nattch,
+            marker: Some(marker),
+        })
+    }
+
+    struct ParentIpc {
+        id: i32,
+        attachment: usize,
+        marked_for_removal: bool,
+    }
+
+    impl ParentIpc {
+        fn new() -> Result<Self, Error> {
+            // SAFETY: shmget has no pointer arguments; IPC_PRIVATE creates an
+            // owned object, never looks up another process's numeric key.
+            let id = unsafe { libc::shmget(libc::IPC_PRIVATE, 4096, 0o600) };
+            anyhow::ensure!(id >= 0, "shmget: {}", std::io::Error::last_os_error());
+            // SAFETY: a successful shmat supplies a new page-aligned mapping.
+            let address = unsafe { libc::shmat(id, std::ptr::null(), 0) };
+            let attach_error =
+                (address == (-1_isize) as *mut libc::c_void).then(std::io::Error::last_os_error);
+            // Mark for removal even if attaching failed. The owned parent
+            // attachment then holds the original object through actual reap;
+            // kernel exit cleanup also covers a killed outer test runner.
+            // SAFETY: IPC_RMID needs no pointer; id was created above.
+            let removed = unsafe { libc::shmctl(id, libc::IPC_RMID, std::ptr::null_mut()) };
+            if let Some(error) = attach_error {
+                anyhow::ensure!(
+                    removed == 0,
+                    "failed to remove unattached SysV object: {}",
+                    std::io::Error::last_os_error()
+                );
+                return Err(error.into());
+            }
+            let guard = Self {
+                id,
+                attachment: address as usize,
+                marked_for_removal: removed == 0,
+            };
+            anyhow::ensure!(
+                removed == 0,
+                "IPC_RMID: {}",
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: the owned mapping is writable and larger than u64.
+            unsafe { address.cast::<u64>().write(MARKER) };
+            guard.assert_live()?;
+            Ok(guard)
+        }
+
+        fn assert_live(&self) -> Result<(), Error> {
+            let observed = ipc_lookup(self.id)?;
+            anyhow::ensure!(
+                observed.errno.is_none()
+                    && observed.size == 4096
+                    && observed.attachments == 1
+                    && observed.marker == Some(MARKER),
+                "parent IPC object changed: {observed:?}"
+            );
+            Ok(())
+        }
+    }
+
+    impl Drop for ParentIpc {
+        fn drop(&mut self) {
+            // If the initial marking failed, still attempt removal of this
+            // exact owned object before detaching. Both cleanup results remain
+            // checked; no unmarked object is silently abandoned on failure.
+            let removed = self.marked_for_removal
+                || unsafe { libc::shmctl(self.id, libc::IPC_RMID, std::ptr::null_mut()) } == 0;
+            // SAFETY: this guard is the sole owner of this parent attachment.
+            let detached = unsafe { libc::shmdt(self.attachment as *const libc::c_void) };
+            assert!(removed, "retiring parent SysV object failed");
+            assert_eq!(
+                detached,
+                0,
+                "retiring parent SysV attachment: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct Observation {
+        namespaces: Vec<NamespaceObject>,
+        init_namespaces: Vec<Result<NamespaceObject, String>>,
+        status: String,
+        cgroup: String,
+        pid: u32,
+        outer_pid: i32,
+        ipc: IpcLookup,
+    }
+
+    fn namespace(process: &str, name: &str) -> Result<NamespaceObject, Error> {
+        let path = format!("/proc/{process}/ns/{name}");
+        let metadata = fs::metadata(&path)?;
+        Ok(NamespaceObject {
+            name: name.to_owned(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            link: fs::read_link(&path)?,
+        })
+    }
+
+    fn observe(
+        id: i32,
+        parent_proc: &File,
+        inherited_attachment: Option<usize>,
+    ) -> Result<Observation, Error> {
+        if let Some(address) = inherited_attachment {
+            // A fork inherits the parent's mapping even across NEWIPC. Retire
+            // that child copy before testing namespace lookup. Exec has already
+            // detached it in the separate namespace-only control.
+            // SAFETY: the parent held this original attachment across clone.
+            anyhow::ensure!(
+                unsafe { libc::shmdt(address as *const libc::c_void) } == 0,
+                "child shmdt: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let outer_status = fs::read_to_string(format!(
+            "/proc/self/fd/{}/self/status",
+            parent_proc.as_raw_fd()
+        ))?;
+        let outer_pid = outer_status
+            .lines()
+            .find_map(|line| line.strip_prefix("Pid:"))
+            .context("outer proc status omitted Pid")?
+            .trim()
+            .parse()?;
+        Ok(Observation {
+            namespaces: NAMES
+                .into_iter()
+                .map(|name| namespace("self", name))
+                .collect::<Result<_, _>>()?,
+            init_namespaces: NAMES
+                .into_iter()
+                .map(|name| namespace("1", name).map_err(|error| error.to_string()))
+                .collect(),
+            status: fs::read_to_string("/proc/self/status")?,
+            cgroup: fs::read_to_string("/proc/self/cgroup")?,
+            pid: std::process::id(),
+            outer_pid,
+            ipc: ipc_lookup(id)?,
+        })
+    }
+
+    fn assert_relation(
+        parent: &Observation,
+        child: &Observation,
+        no_namespace: bool,
+        host_network: bool,
+    ) {
+        for (before, after) in parent.namespaces.iter().zip(&child.namespaces) {
+            let shared = no_namespace || (host_network && before.name == "net");
+            assert_eq!(
+                before == after,
+                shared,
+                "{} namespace relationship",
+                before.name
+            );
+        }
+        assert_eq!(child.namespaces.len(), 7);
+        if no_namespace {
+            assert_eq!(child.cgroup, parent.cgroup);
+            assert!(child.ipc.errno.is_none());
+            assert_eq!(child.ipc.marker, Some(MARKER));
+            assert_ne!(child.pid, 1);
+        } else {
+            assert_eq!(child.pid, 1);
+            for (init, current) in child.init_namespaces.iter().zip(&child.namespaces) {
+                assert_eq!(init.as_ref().unwrap(), current);
+            }
+            assert!(
+                matches!(child.ipc.errno, Some(libc::EINVAL | libc::EIDRM)),
+                "namespace lookup must be unreachable, not a USER permission denial: {:?}",
+                child.ipc
+            );
+            assert!(child.ipc.marker.is_none());
+            let before: Vec<_> = parent.cgroup.lines().collect();
+            let after: Vec<_> = child.cgroup.lines().collect();
+            assert!(!before.is_empty());
+            assert_eq!(before.len(), after.len());
+            for (before, after) in before.iter().zip(after) {
+                let before: Vec<_> = before.splitn(3, ':').collect();
+                let after: Vec<_> = after.splitn(3, ':').collect();
+                assert_eq!(before.len(), 3);
+                assert_eq!(after.len(), 3);
+                assert_eq!(&before[..2], &after[..2]);
+                assert_eq!(
+                    after[2], "/",
+                    "new cgroup namespace must root the current caller membership"
+                );
+            }
+        }
+        assert_ne!(child.outer_pid, parent.outer_pid);
+        // This is the actual child's PID from a held original proc mount,
+        // not PID1 text interpreted in a different namespace.
+        // SAFETY: waitpid accepts a null status with WNOHANG.
+        assert_eq!(
+            unsafe { libc::waitpid(child.outer_pid, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD),
+            "the actual owner must have consumed its original wait"
+        );
+    }
+
+    fn parent_observation(ipc: &ParentIpc, proc: &File) -> Result<Observation, Error> {
+        let parent = observe(ipc.id, proc, None)?;
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let caps = parent
+            .status
+            .lines()
+            .find_map(|line| line.strip_prefix("CapEff:"))
+            .context("parent status omitted CapEff")?
+            .trim();
+        assert_ne!(
+            u64::from_str_radix(caps, 16)? & (1 << 21),
+            0,
+            "the immediate native parent must have CAP_SYS_ADMIN"
+        );
+        Ok(parent)
+    }
+
+    #[test]
+    fn common_and_image_have_private_ipc_and_cgroup_namespaces() {
+        Container::new()
+            .map_root()
+            .run(|| -> Result<(), String> {
+                (|| -> Result<(), Error> {
+                    let ipc = ParentIpc::new()?;
+                    let proc = File::open("/proc")?;
+                    let parent = parent_observation(&ipc, &proc)?;
+                    println!(
+                        "NATIVE_NAMESPACE_PARENT {}",
+                        serde_json::to_string(&parent)?
+                    );
+                    for (label, args, no_namespace, host_network) in [
+                        (
+                            "local",
+                            vec!["hermit", "run", "--workdir=/", "/bin/true"],
+                            false,
+                            false,
+                        ),
+                        (
+                            "host",
+                            vec![
+                                "hermit",
+                                "run",
+                                "--workdir=/",
+                                "--network=host",
+                                "/bin/true",
+                            ],
+                            false,
+                            true,
+                        ),
+                        (
+                            "no-namespace",
+                            vec![
+                                "hermit",
+                                "run",
+                                "--workdir=/",
+                                "--no-namespace",
+                                "/bin/true",
+                            ],
+                            true,
+                            true,
+                        ),
+                    ] {
+                        let options = run_opts_for(&args);
+                        let id = ipc.id;
+                        let attachment = ipc.attachment;
+                        let (child, _) = options.with_container(
+                            proc.try_clone()?,
+                            "native IPC/cgroup control".to_owned(),
+                            Some(Duration::from_secs(10)),
+                            move |proc, _| observe(id, proc, Some(attachment)),
+                        )?;
+                        assert_relation(&parent, &child, no_namespace, host_network);
+                        ipc.assert_live()?;
+                        println!(
+                            "NATIVE_NAMESPACE_{label} {}",
+                            serde_json::to_string(&child)?
+                        );
+                    }
+                    let root = tempfile::tempdir()?;
+                    let scratch = tempfile::tempdir()?;
+                    for directory in ["proc", "tmp", "dev/pts"] {
+                        fs::create_dir_all(root.path().join(directory))?;
+                    }
+                    for node in crate::image::DEV_BIND_TARGETS {
+                        File::create(root.path().join("dev").join(node))?;
+                    }
+                    let (mut container, identity) =
+                        image_container(root.path(), scratch.path(), false, true)?;
+                    NetworkingMode::Local.configure(&mut container, false);
+                    let id = ipc.id;
+                    let attachment = ipc.attachment;
+                    let (child, _) = super::super::owned_container::run(
+                        &mut container,
+                        (identity, proc.try_clone()?),
+                        "native image IPC/cgroup control".to_owned(),
+                        true,
+                        "image namespace control",
+                        Some(Duration::from_secs(10)),
+                        move |(_, proc)| observe(id, proc, Some(attachment)),
+                    )?;
+                    assert_relation(&parent, &child, false, false);
+                    ipc.assert_live()?;
+                    println!("NATIVE_NAMESPACE_image {}", serde_json::to_string(&child)?);
+                    Ok(())
+                })()
+                .map_err(|error| format!("{error:#}"))
+            })
+            .unwrap()
+            .unwrap();
+    }
+
+    fn set_cloexec(file: &File, enabled: bool) -> Result<(), Error> {
+        // SAFETY: fcntl only accesses this owned descriptor's flag word.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+        anyhow::ensure!(flags >= 0, "F_GETFD: {}", std::io::Error::last_os_error());
+        let flags = if enabled {
+            flags | libc::FD_CLOEXEC
+        } else {
+            flags & !libc::FD_CLOEXEC
+        };
+        anyhow::ensure!(
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, flags) } == 0,
+            "F_SETFD: {}",
+            std::io::Error::last_os_error()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn namespace_only_has_private_ipc_and_cgroup_namespaces() {
+        if let Ok(specification) = std::env::var(REPORT) {
+            let parts: Vec<i32> = specification
+                .split(':')
+                .map(|part| part.parse().unwrap())
+                .collect();
+            assert_eq!(parts.len(), 3);
+            assert!(parts[0] >= 3 && parts[1] >= 3 && parts[0] != parts[1] && parts[2] >= 0);
+            // SAFETY: this exact test-only exec receives these two distinct
+            // owned handles by explicit environment arguments. No other role
+            // or product command adopts a numeric descriptor.
+            let (report, proc) =
+                unsafe { (File::from_raw_fd(parts[0]), File::from_raw_fd(parts[1])) };
+            let child = observe(parts[2], &proc, None).unwrap();
+            serde_json::to_writer(report, &child).unwrap();
+            return;
+        }
+        // Each invocation gets its own private outer process: temporary
+        // descriptor flags stay local, and tracing is initialized only once.
+        for (network, host_network) in [("local", false), ("host", true)] {
+            Container::new()
+                .map_root()
+                .run(move || -> Result<(), String> {
+                    (|| -> Result<(), Error> {
+                        let ipc = ParentIpc::new()?;
+                        let proc = File::open("/proc")?;
+                        let parent = parent_observation(&ipc, &proc)?;
+                        println!(
+                            "NATIVE_NAMESPACE_PARENT-namespace-only-{network} {}",
+                            serde_json::to_string(&parent)?
+                        );
+                        let executable = std::env::current_exe()?;
+                        let mut report = tempfile::tempfile()?;
+                        set_cloexec(&report, false)?;
+                        set_cloexec(&proc, false)?;
+                        let report_arg = format!(
+                            "--env={REPORT}={}:{}:{}",
+                            report.as_raw_fd(),
+                            proc.as_raw_fd(),
+                            ipc.id
+                        );
+                        let network_arg = format!("--network={network}");
+                        let options = run_opts_for(&[
+                            "hermit",
+                            "run",
+                            "--namespace-only",
+                            "--workdir=/",
+                            "--base-env=empty",
+                            &network_arg,
+                            &report_arg,
+                            "--",
+                            executable.to_str().unwrap(),
+                            "--exact",
+                            EXEC_TEST,
+                            "--nocapture",
+                            "--test-threads=1",
+                        ]);
+                        let status = options.run_with_namespace_only(&GlobalOpts::parse_from([
+                            "hermit",
+                            "--log=info",
+                        ]))?;
+                        set_cloexec(&report, true)?;
+                        set_cloexec(&proc, true)?;
+                        assert_eq!(status, ExitStatus::Exited(0));
+                        report.rewind()?;
+                        let child: Observation = serde_json::from_reader(report)?;
+                        assert_relation(&parent, &child, false, host_network);
+                        ipc.assert_live()?;
+                        println!(
+                            "NATIVE_NAMESPACE_namespace-only-{network} {}",
+                            serde_json::to_string(&child)?
+                        );
+                        Ok(())
+                    })()
+                    .map_err(|error| format!("{error:#}"))
+                })
+                .unwrap()
+                .unwrap();
         }
     }
 }
