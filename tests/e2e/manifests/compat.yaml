@@ -1606,14 +1606,6 @@ corpus:
         strictcompat.<program> node, and a failure of that one run failed
         the validation; a second attempt would let a nondeterministic
         program pass
-      except:
-        - reason: >-
-            The SaBRe corpus's single-image argv; the strict corpus runs
-            these programs through the rows of the same name without the
-            suffix. They are not redundant (df-direct is the only cell in
-            which df reads Hermit's own mount table), and giving them a
-            strict variant is https://github.com/rrnewton/hermit/issues/4036
-          rows: [lua-direct, perl-direct, df-direct]
   rows:
     - {label: "echo", argv: ["/bin/echo", "hermit-compat"]}
     - {label: "true", argv: ["/usr/bin/true"]}

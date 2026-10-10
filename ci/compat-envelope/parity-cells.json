@@ -8,7 +8,7 @@
   "population_rule": "Every manifest test whose ptrace verify cell full validation selects (Population::Required), crossed with every candidate backend (dbt, in-guest-trap, kvm, liteinst, sabre). A candidate whose verify cell is disabled, enabled but not selected, red, refused or missing is in the population and scores 0. A cell whose ptrace reference left no usable golden log is outside it and is counted apart.",
   "counts": {
     "all": {
-      "cells": 4065,
+      "cells": 4080,
       "applicable": 1700,
       "selectable": 1396,
       "population": 2770,
@@ -18,7 +18,7 @@
     },
     "by_backend": {
       "dbt": {
-        "cells": 813,
+        "cells": 816,
         "applicable": 251,
         "selectable": 204,
         "population": 554,
@@ -27,7 +27,7 @@
         "population_candidate_disabled": 304
       },
       "in-guest-trap": {
-        "cells": 813,
+        "cells": 816,
         "applicable": 319,
         "selectable": 313,
         "population": 554,
@@ -36,7 +36,7 @@
         "population_candidate_disabled": 241
       },
       "kvm": {
-        "cells": 813,
+        "cells": 816,
         "applicable": 334,
         "selectable": 328,
         "population": 554,
@@ -45,7 +45,7 @@
         "population_candidate_disabled": 221
       },
       "liteinst": {
-        "cells": 813,
+        "cells": 816,
         "applicable": 318,
         "selectable": 312,
         "population": 554,
@@ -54,7 +54,7 @@
         "population_candidate_disabled": 242
       },
       "sabre": {
-        "cells": 813,
+        "cells": 816,
         "applicable": 478,
         "selectable": 239,
         "population": 554,
@@ -2620,6 +2620,11 @@
     {"test_id":"compat/strict-df","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/strict-df","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/strict-df","backend":"sabre","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/strict-df-direct","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/strict-df-direct","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/strict-df-direct","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/strict-df-direct","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/strict-df-direct","backend":"sabre","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/strict-diff","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/strict-diff","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/strict-diff","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
@@ -2910,6 +2915,11 @@
     {"test_id":"compat/strict-lua","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/strict-lua","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/strict-lua","backend":"sabre","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/strict-lua-direct","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/strict-lua-direct","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/strict-lua-direct","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/strict-lua-direct","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/strict-lua-direct","backend":"sabre","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/strict-m4","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/strict-m4","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/strict-m4","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
@@ -3065,6 +3075,11 @@
     {"test_id":"compat/strict-perl","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/strict-perl","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/strict-perl","backend":"sabre","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/strict-perl-direct","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/strict-perl-direct","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/strict-perl-direct","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/strict-perl-direct","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"compat/strict-perl-direct","backend":"sabre","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/strict-pgrep","backend":"dbt","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/strict-pgrep","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/strict-pgrep","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the strict-compat-only run type selects this cell, by its manifest label; full validation does not."},

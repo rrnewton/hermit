@@ -5882,7 +5882,8 @@ mod tests {
         // The 23 compat rows whose strict variants were added (compat/strict-
         // timeout through compat/strict-msgunfmt) add one line per candidate
         // backend each, 23 x 5: 4065.
-        assert_eq!(parsed.cells.len(), 4065);
+        // The three `-direct` twins' strict variants add 3 x 5: 4080.
+        assert_eq!(parsed.cells.len(), 4080);
         assert_eq!(parsed.schema, PARITY_CELLS_SCHEMA);
         // The repository's limit for a text file is 2 MiB. This bound was
         // 1 MiB until fold 5 of https://github.com/rrnewton/hermit/issues/3448

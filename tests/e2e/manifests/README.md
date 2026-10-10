@@ -35,7 +35,7 @@ Seven buckets currently contain calibrated blocking workloads:
   runs (`additional`); it also holds the
   `sabre-compat-only` run type's SaBRe cells and its 27 extra rows, the
   `rr-compat-only` run type's 139 replay cells, and the
-  `strict-compat-only` run type's 216 strict variant tests)
+  `strict-compat-only` run type's 219 strict variant tests)
 
 Eight additional `*-c.yaml`/`c-programs.yaml` buckets make 180 more C guests
 centrally discoverable. Eight `c-programs.yaml` entries have calibrated

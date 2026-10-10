@@ -1325,28 +1325,32 @@ mod tests {
     /// under rust-script, where CARGO_MANIFEST_DIR is not ci/manifest-plan.
     const COMPAT_YAML: &str = include_str!("../../../tests/e2e/manifests/compat.yaml");
 
-    /// The 23 corpus rows the strict variant took on 2026-10-10, when the
-    /// compat corpus was given uniform strict treatment. They are labelled
+    /// The 26 corpus rows the strict variant took on 2026-10-10, when the
+    /// compat corpus was given uniform strict treatment: the 23 the strict
+    /// corpus never had, and the lua, perl and df `-direct` twins. They are labelled
     /// sabre-compat-only, so their corpus cells are not the full run's and
     /// ci/compat/corpus-strict.json, which validate.rs binds to the full run's
     /// portable rows, does not hold them.
-    const STRICT_VARIANT_ROWS_BEYOND_THE_STRICT_CORPUS: [&str; 23] = [
+    const STRICT_VARIANT_ROWS_BEYOND_THE_STRICT_CORPUS: [&str; 26] = [
         "basenc",
         "col",
         "colrm",
         "crc32",
         "cscope",
+        "df-direct",
         "diff3",
         "dos2unix",
         "envsubst",
         "fallocate",
         "flex",
         "getconf",
+        "lua-direct",
         "mountpoint",
         "msgfmt",
         "msgunfmt",
         "namei",
         "pathchk",
+        "perl-direct",
         "setfacl",
         "setfattr",
         "shred",
@@ -1409,7 +1413,7 @@ mod tests {
                 "{row} is already in the strict corpus"
             );
         }
-        assert_eq!(expected.len(), 216);
+        assert_eq!(expected.len(), 219);
         assert_eq!(
             variant.symmetric_difference(&expected).collect::<Vec<_>>(),
             Vec::<&String>::new()
