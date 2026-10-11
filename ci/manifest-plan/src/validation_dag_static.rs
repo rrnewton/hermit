@@ -1906,7 +1906,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // without_signal_target_modelling_the_arming_thread_decides_as_before and
     // a_pending_real_time_expiration_is_discarded_by_ignore_and_by_exit;
     // https://github.com/rrnewton/hermit/issues/4089) retain all 1349: 1360.
-    ("test.detcore_unit", 1360),
+    // scheduler::test::a_scheduler_signal_ends_a_sleep_still_on_the_run_queue
+    // (https://github.com/rrnewton/hermit/issues/4126) retains all 1360: 1361.
+    ("test.detcore_unit", 1361),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2563,7 +2565,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4065) retain all 298: 300.
     // a_pending_real_time_timer_expiration_is_refused_only_where_it_is_observed
     // (https://github.com/rrnewton/hermit/issues/4089) retains all 300: 301.
-    ("test.cli", 301),
+    // a_pause_returns_for_a_childs_sigchld
+    // (https://github.com/rrnewton/hermit/issues/4126) retains all 301: 302.
+    ("test.cli", 302),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2806,7 +2810,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Nor do the three tests of signals to Hermit's own tasks: 234.
     // Nor do the two namespace-only kill(0) and terminal tests: 236.
     // Nor does the pending real-time timer expiration test: 237.
-    ("test.cli_on_host", 237),
+    // Nor does the pause-for-SIGCHLD test: 238.
+    ("test.cli_on_host", 238),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -2952,7 +2957,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the futex timeout clamp test: 1348.
     // And the Hermit thread-group test: 1349.
     // And the eleven real-time expiration fate tests: 1360.
-    ("test.detcore_unit_on_host", 1360),
+    // And the queued-sleep scheduler-signal test: 1361.
+    ("test.detcore_unit_on_host", 1361),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
