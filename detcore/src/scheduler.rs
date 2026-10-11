@@ -1372,6 +1372,12 @@ pub struct Scheduler {
     /// information and needs to "cooperate" and setup it's preemption for the amount
     pub timeslices: BTreeMap<DetTid, Option<LogicalTime>>,
 
+    /// The virtual time that remained before the earliest pending deadline
+    /// when each thread was last granted a turn ([`Scheduler::deadline_remaining`]),
+    /// taken by the grant's reply so the thread can end its slice there
+    /// (<https://github.com/rrnewton/hermit/issues/4121>).
+    deadline_hints: BTreeMap<DetTid, Duration>,
+
     /// Per-thread distribution of completed timeslice durations (virtual ns),
     /// collected from each thread as it deregisters at exit. Aggregated into the
     /// final run report. BTreeMap for deterministic iteration order.
@@ -3080,6 +3086,7 @@ impl Scheduler {
             thread_tree: Default::default(),
             priorities: Default::default(),
             timeslices: Default::default(),
+            deadline_hints: Default::default(),
             per_thread_timeslice: Default::default(),
             per_thread_syscalls: Default::default(),
             transferred_exec_syscall_offsets: Default::default(),
@@ -8832,9 +8839,48 @@ impl Scheduler {
                 .map(SchedValue::Value);
             SchedResponse::Go(as_schedvalue)
         };
+        match self.deadline_remaining() {
+            Some(remaining) => self.deadline_hints.insert(dtid, remaining),
+            None => self.deadline_hints.remove(&dtid),
+        };
         self.parked.running = Some(dtid);
         resp.put(answer);
         Ok(())
+    }
+
+    /// The virtual time left before the earliest deadline a turn would act
+    /// on: a timed wait or timer (`timed_waiters`) or a backed-off poller's
+    /// timeout (`poll_deadlines`). `None` when nothing is pending, or only
+    /// waits with no deadline.
+    ///
+    /// Both are compared against `committed_time` at turns, and global time
+    /// is the sum of every thread's local time, so while the granted thread
+    /// runs alone global time advances exactly as its own clock does. A
+    /// thread that ends its slice once this much of its own time has passed
+    /// therefore takes a turn no earlier than global time passes the deadline.
+    fn deadline_remaining(&self) -> Option<Duration> {
+        let timed = self
+            .blocked
+            .timed_waiters
+            .next_deadline()
+            .filter(|deadline| !deadline.is_indefinite());
+        let poll = self.poll_deadlines.first().map(|(deadline, _)| *deadline);
+        let earliest = match (timed, poll) {
+            (Some(a), Some(b)) => a.min(b),
+            (a, b) => a.or(b)?,
+        };
+        Some(Duration::from_nanos(
+            earliest
+                .as_nanos()
+                .saturating_sub(self.committed_time.as_nanos()),
+        ))
+    }
+
+    /// Take the deadline hint recorded when `dtid` was last granted a turn.
+    /// A resource request clears it on arrival, so a reply takes only the
+    /// hint of the grant it answers.
+    pub fn take_deadline_hint(&mut self, dtid: DetTid) -> Option<Duration> {
+        self.deadline_hints.remove(&dtid)
     }
 
     fn inbound_signals(&self, dettid: DetTid) -> Vec<SigWrapper> {

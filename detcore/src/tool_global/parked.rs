@@ -87,7 +87,10 @@ impl GlobalState {
             .await
             .0
         {
-            SchedulerRpcResult::Continue(reply) => GlobalResponse::ResumeParkedRequest(reply),
+            SchedulerRpcResult::Continue(reply) => GlobalResponse::ResumeParkedRequest(
+                reply,
+                self.sched.lock().unwrap().take_deadline_hint(tid),
+            ),
             SchedulerRpcResult::ThreadExited => GlobalResponse::ThreadExited,
         }
     }
@@ -275,8 +278,8 @@ where
     )
     .await
     .1;
-    let mut reply = match response {
-        GlobalResponse::ParkedRequest(reply) => reply,
+    let (mut reply, mut deadline) = match response {
+        GlobalResponse::ParkedRequest(reply, deadline) => (reply, deadline),
         _ => terminate_protocol(guest, ProtocolFailure::UnexpectedControl).await,
     };
     loop {
@@ -290,7 +293,10 @@ where
                 // None to this child-wait caller as an interrupted syscall.
                 terminate_protocol(guest, ProtocolFailure::UnexpectedControl).await
             }
-            ResourceReply::Grant(status) => return status,
+            ResourceReply::Grant(status) => {
+                cap_timeslice_at_deadline(guest, deadline);
+                return status;
+            }
             ResourceReply::ObserveSignal(control) => *control,
         };
         if guest.parked_signal_site() != Some(control.site)
@@ -354,7 +360,7 @@ where
         let Some(current_site) = guest.parked_signal_site() else {
             terminate_protocol(guest, ProtocolFailure::Identity).await;
         };
-        reply = match send_and_update_time(
+        (reply, deadline) = match send_and_update_time(
             guest,
             GlobalRequest::ResumeParkedRequest {
                 ticket,
@@ -364,7 +370,7 @@ where
         .await
         .1
         {
-            GlobalResponse::ResumeParkedRequest(reply) => reply,
+            GlobalResponse::ResumeParkedRequest(reply, deadline) => (reply, deadline),
             _ => terminate_protocol(guest, ProtocolFailure::UnexpectedControl).await,
         };
     }

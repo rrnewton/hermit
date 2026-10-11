@@ -30,6 +30,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU16;
 use std::sync::atomic::Ordering::SeqCst;
 use std::task::Poll;
+use std::time::Duration;
 use std::time::SystemTime;
 
 use anyhow::bail;
@@ -2130,7 +2131,9 @@ impl GlobalTool for GlobalState {
                     )
                     .await;
                 match response {
-                    SchedulerRpcResult::Continue(r) => R::ParkedRequest(r),
+                    SchedulerRpcResult::Continue(r) => {
+                        R::ParkedRequest(r, self.sched.lock().unwrap().take_deadline_hint(dtid))
+                    }
                     SchedulerRpcResult::ThreadExited => R::ThreadExited,
                 }
             }
@@ -2176,7 +2179,10 @@ impl GlobalTool for GlobalState {
                     .recv_request_resources(from, pid, rs, Some(request_mm))
                     .await;
                 match response {
-                    SchedulerRpcResult::Continue(response) => R::RequestResources(response),
+                    SchedulerRpcResult::Continue(response) => R::RequestResources(
+                        response,
+                        self.sched.lock().unwrap().take_deadline_hint(dtid),
+                    ),
                     SchedulerRpcResult::ThreadExited => R::ThreadExited,
                 }
             }
@@ -2850,6 +2856,7 @@ impl GlobalState {
                 "[detcore, dtid {}] ResourceRequest, filling request into {}",
                 &dettid, &nextturn.req
             );
+            sched.take_deadline_hint(dettid);
             if let Some(mm) = request_mm
                 && let Err(error) = sched.install_resource_origin(
                     dettid,
@@ -4441,9 +4448,11 @@ pub enum GlobalResponse {
     /// The scheduler permanently removed this raw TID. Guest-side RPC handling retires
     /// this task without cancelling a live group-exit issuer or resuming the operation.
     ThreadExited,
-    RequestResources(ResumeStatus),
-    ParkedRequest(ResourceReply),
-    ResumeParkedRequest(ResourceReply),
+    /// A grant, with the virtual time that remained before the earliest
+    /// pending deadline when it was made (`Scheduler::deadline_remaining`).
+    RequestResources(ResumeStatus, Option<Duration>),
+    ParkedRequest(ResourceReply, Option<Duration>),
+    ResumeParkedRequest(ResourceReply, Option<Duration>),
     FinishParkedObservation(Result<FinishAck, ProtocolFailure>),
     SignalDequeued {
         ack: Result<DequeueAck, TimerFailure>,
@@ -4820,6 +4829,29 @@ enum SchedulerRpcResult<T> {
     ThreadExited,
 }
 
+/// End a granted thread's slice no later than the earliest deadline that was
+/// pending at its grant (<https://github.com/rrnewton/hermit/issues/4121>).
+///
+/// A deadline is acted on only at a scheduler turn, and a thread running a
+/// long slice of cheap syscalls takes none, so without this a sleeper's
+/// wake-up waits for the whole slice.
+pub(crate) fn cap_timeslice_at_deadline<G, T>(guest: &mut G, deadline: Option<Duration>)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let Some(remaining) = deadline else {
+        return;
+    };
+    let clock_multiplier = guest.config().clock_multiplier.unwrap_or(1.0);
+    let schedule_replay = guest.config().replay_schedule_from.is_some();
+    guest.thread_state_mut().cap_timeslice_at_deadline(
+        remaining,
+        clock_multiplier,
+        schedule_replay,
+    );
+}
+
 /// Global method RPC to request to control a resource.
 ///
 /// Blocking: future returns only when resources are fully acquired.
@@ -4855,11 +4887,12 @@ where
         let resp =
             send_and_update_time(guest, GlobalRequest::RequestResources(r.clone(), detpid)).await;
         match resp.1 {
-            GlobalResponse::RequestResources(x) => {
+            GlobalResponse::RequestResources(x, deadline) => {
                 trace!(
                     "[detcore, dtid {}] UNBLOCKED, acquired resources: {:?}",
                     &dettid, r
                 );
+                cap_timeslice_at_deadline(guest, deadline);
                 x
             }
             _ => unreachable!(),
@@ -8069,7 +8102,10 @@ mod tests {
         assert!(background.is_err());
         assert_eq!(
             blocking.await,
-            (None, GlobalResponse::RequestResources(ResumeStatus::Normal))
+            (
+                None,
+                GlobalResponse::RequestResources(ResumeStatus::Normal, None)
+            )
         );
         let before_child = state.global_time.lock().unwrap().as_nanos();
         assert_eq!(before_child, epoch + LogicalTime::from_nanos(1_001));

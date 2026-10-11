@@ -1519,7 +1519,10 @@ async fn reused_exec_worker_vfork_registration_requires_creation_mode(
     assert!(background.is_err());
     assert_eq!(
         blocking.await,
-        (None, GlobalResponse::RequestResources(ResumeStatus::Normal))
+        (
+            None,
+            GlobalResponse::RequestResources(ResumeStatus::Normal, None)
+        )
     );
     let before = serde_json::to_value(&*fixture.state.global_time.lock().unwrap()).unwrap();
     let before_total = fixture.state.global_time.lock().unwrap().as_nanos();

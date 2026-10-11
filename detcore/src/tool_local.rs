@@ -3236,6 +3236,45 @@ impl<T> ThreadState<T> {
         }
     }
 
+    /// End the current slice no later than `remaining` from now: the virtual
+    /// time that was left before the earliest pending deadline when this
+    /// thread was granted its turn.
+    ///
+    /// Global time advances exactly as this thread's clock does while it runs
+    /// alone, so its slice then ends, and it takes a turn, once global time has
+    /// passed that deadline. The slice keeps at least one RCB's worth of time,
+    /// as the post-hook requires of a fresh slice. A replay applies only its
+    /// recorded slice ends.
+    pub(crate) fn cap_timeslice_at_deadline(
+        &mut self,
+        remaining: Duration,
+        clock_multiplier: f64,
+        schedule_replay: bool,
+    ) {
+        if self.preemption_points.is_some() || schedule_replay {
+            return;
+        }
+        let Some(end) = self.end_of_timeslice else {
+            return;
+        };
+        let one_rcb =
+            (NANOS_PER_RCB * clock_multiplier * self.rcb_time_multiplier().as_f64()).ceil() as u64;
+        let current = self.thread_logical_time.as_nanos();
+        let cap = current + remaining.max(Duration::from_nanos(one_rcb + 1));
+        if cap < end {
+            debug!(
+                "[dtid {}] end of slice moved from {} to {}, the earliest pending deadline (current {})",
+                self.dettid, end, cap, current
+            );
+            self.end_of_timeslice = Some(cap);
+        }
+        if let Some(max_end) = self.max_timeslice_end
+            && cap < max_end
+        {
+            self.max_timeslice_end = Some(cap);
+        }
+    }
+
     /// Whether this thread has consumed its current logical timeslice.
     pub(crate) fn timeslice_expired(&self) -> bool {
         if let Some(replay_rcb_end) = self.replay_rcb_end {
