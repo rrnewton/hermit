@@ -4487,6 +4487,36 @@ mod timeslice_tests {
         assert_eq!(state.max_timeslice_end, bounded_end);
     }
 
+    /// A preemption replay keeps a recorded slice end, but once the recording
+    /// runs out it computes slice ends as the record did, so it caps them.
+    #[test]
+    fn preemption_replay_caps_only_past_its_recording() {
+        let config = Config {
+            max_timeslice: nz(100_000),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+        let now = state.thread_logical_time.as_nanos();
+        let recorded_end = now + Duration::from_nanos(50_000);
+        let history = ThreadHistory::new()
+            .with_prio_changes(vec![(recorded_end, DEFAULT_PRIORITY)])
+            .with_preemption_rcbs(vec![5_000]);
+        state.preemption_points = Some(history.into_iter());
+
+        state.next_timeslice(&config);
+        assert_eq!(state.end_of_timeslice, Some(recorded_end));
+        state.cap_timeslice_at_deadline(Duration::from_nanos(1_000), 1.0, false);
+        assert_eq!(state.end_of_timeslice, Some(recorded_end));
+
+        let mut exhausted = ThreadState::new(DetPid::from_raw(3), &config, ());
+        exhausted.preemption_points = Some(ThreadHistory::new().into_iter());
+        exhausted.next_timeslice(&config);
+        exhausted.cap_timeslice_at_deadline(Duration::from_nanos(1_000), 1.0, false);
+        let capped = Some(now + Duration::from_nanos(1_000));
+        assert_eq!(exhausted.end_of_timeslice, capped);
+        assert_eq!(exhausted.max_timeslice_end, capped);
+    }
+
     #[test]
     fn timeslice_expiry_is_inclusive() {
         let config = Config::default();
