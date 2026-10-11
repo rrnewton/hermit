@@ -1260,17 +1260,27 @@ enum FutexTimeout {
     Absolute(LogicalTime),
 }
 
+/// Linux's `timespec64_valid`, which `futex_init_timeout` applies: a negative
+/// second count or a nanosecond count outside `0..1e9` is EINVAL. Any other
+/// value is valid, however large.
+fn futex_timespec_is_valid(timeout: Timespec) -> bool {
+    timeout.tv_sec >= 0 && (0..1_000_000_000).contains(&timeout.tv_nsec)
+}
+
+/// The largest futex timeout in nanoseconds: `timespec64_to_ktime` clamps a
+/// valid timespec beyond it to `KTIME_MAX` rather than refusing it.
+const FUTEX_KTIME_MAX_NANOS: u64 = i64::MAX as u64;
+
 fn parse_futex_timeout(futex_op: i32, timeout: Timespec) -> Result<FutexTimeout, Errno> {
-    let seconds = u64::try_from(timeout.tv_sec).map_err(|_| Errno::EINVAL)?;
-    let nanoseconds = u64::try_from(timeout.tv_nsec).map_err(|_| Errno::EINVAL)?;
-    if nanoseconds >= 1_000_000_000 {
+    if !futex_timespec_is_valid(timeout) {
         return Err(Errno::EINVAL);
     }
-
+    let seconds = timeout.tv_sec as u64;
+    let nanoseconds = timeout.tv_nsec as u64;
     let timeout_nanos = seconds
-        .checked_mul(1_000_000_000)
-        .and_then(|nanos| nanos.checked_add(nanoseconds))
-        .ok_or(Errno::EINVAL)?;
+        .saturating_mul(1_000_000_000)
+        .saturating_add(nanoseconds)
+        .min(FUTEX_KTIME_MAX_NANOS);
     // Mask off FUTEX_PRIVATE_FLAG / FUTEX_CLOCK_REALTIME before matching the
     // command: FUTEX_WAIT_BITSET measures its timeout as an *absolute* deadline,
     // whereas plain FUTEX_WAIT uses a *relative* one. A private-flagged
@@ -1906,26 +1916,53 @@ impl<T: RecordOrReplay> Detcore<T> {
             // `get_futex_key` refuses a misaligned futex word before any access.
             return Err(Error::Errno(Errno::EINVAL));
         }
-        let init_val = guest.memory().read_value(ptr)?;
+        if !self.cfg.sequentialize_threads {
+            return Ok(guest.inject(call).await?);
+        }
+        let polling = match self.cfg.debug_futex_mode {
+            BlockingMode::External => {
+                return self.record_or_replay_blocking(guest, call.into()).await;
+            }
+            BlockingMode::Precise => false,
+            BlockingMode::Polling => true,
+        };
+        // Only the waits compare the word, and they read it as Linux's
+        // `futex_wait_setup` does, with user-mode permissions: EFAULT for an
+        // unmapped, PROT_NONE or otherwise unreadable word
+        // (https://github.com/rrnewton/hermit/issues/4030). A wake left to the
+        // polling mode reads nothing, as Linux's `futex_wake` reads nothing.
+        //
+        // Linux checks a wait's other arguments first, without touching the
+        // word: `sys_futex` (kernel/futex/syscalls.c) copies and validates the
+        // timeout (EFAULT, EINVAL), then `__futex_wait` refuses a zero bitset
+        // (EINVAL). A restarted wait keeps its validated deadline.
+        let init_val = match call.futex_op() & libc::FUTEX_CMD_MASK {
+            command @ (libc::FUTEX_WAIT | libc::FUTEX_WAIT_BITSET) => {
+                if matches!(deadline, FutexDeadline::FromCall)
+                    && let Some(timeout) = call.timeout()
+                {
+                    let timeout = read_user_timespec(guest, timeout.as_raw())?;
+                    if !futex_timespec_is_valid(timeout) {
+                        return Err(Error::Errno(Errno::EINVAL));
+                    }
+                }
+                if command == libc::FUTEX_WAIT_BITSET && call.val3() == 0 {
+                    return Err(Error::Errno(Errno::EINVAL));
+                }
+                read_futex_word(guest, AddrMut::as_raw(ptr))?
+            }
+            _ => 0,
+        };
         trace!(
             "[detcore, dtid {}] futex op with memory address containing value {}",
             &dettid, init_val
         );
-
-        if !self.cfg.sequentialize_threads {
-            Ok(guest.inject(call).await?)
+        if polling {
+            self.handle_futex_polling(guest, call, init_val, deadline)
+                .await
         } else {
-            match self.cfg.debug_futex_mode {
-                BlockingMode::Precise => {
-                    self.handle_futex_blocking(guest, call, init_val, deadline)
-                        .await
-                }
-                BlockingMode::Polling => {
-                    self.handle_futex_polling(guest, call, init_val, deadline)
-                        .await
-                }
-                BlockingMode::External => self.record_or_replay_blocking(guest, call.into()).await,
-            }
+            self.handle_futex_blocking(guest, call, init_val, deadline)
+                .await
         }
     }
 
@@ -3940,24 +3977,83 @@ fn read_futex_word<G: Guest<Detcore<T>>, T: RecordOrReplay>(
 /// `/proc/<pid>/maps`. False if no mapping contains it or the file cannot be
 /// read.
 fn mapping_is_writable(pid: i32, address: usize) -> bool {
-    let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else {
-        return false;
-    };
-    maps.lines().any(|line| {
+    mapping_permissions(pid, address).is_some_and(|perms| perms[1] == b'w')
+}
+
+/// The `rwxp` permissions of the guest mapping containing `address`, from
+/// `/proc/<pid>/maps`, or `None` if no mapping contains it or the file cannot be
+/// read.
+fn mapping_permissions(pid: i32, address: usize) -> Option<[u8; 4]> {
+    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).ok()?;
+    maps.lines().find_map(|line| {
         let mut fields = line.split_whitespace();
         let (Some(range), Some(perms)) = (fields.next(), fields.next()) else {
-            return false;
+            return None;
         };
-        let Some((start, end)) = range.split_once('-') else {
-            return false;
-        };
+        let (start, end) = range.split_once('-')?;
         let (Ok(start), Ok(end)) = (
             usize::from_str_radix(start, 16),
             usize::from_str_radix(end, 16),
         ) else {
-            return false;
+            return None;
         };
-        (start..end).contains(&address) && perms.as_bytes().get(1) == Some(&b'w')
+        if !(start..end).contains(&address) {
+            return None;
+        }
+        perms.as_bytes().get(..4)?.try_into().ok()
+    })
+}
+
+/// A `struct timespec` copied from the guest as Linux's `get_timespec64`
+/// (`copy_from_user`) copies it: every byte must lie in a mapping user mode can
+/// read, which on x86 includes a write-only one, or the copy is EFAULT, with no
+/// partial result. The bytes are then read through the tracer, which is only
+/// safe because every page they span was checked first: the tracer's own read
+/// would force its way through a PROT_NONE page.
+fn read_user_timespec<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &mut G,
+    address: usize,
+) -> Result<Timespec, Error> {
+    let size = std::mem::size_of::<Timespec>();
+    let last = address.checked_add(size - 1).ok_or(Errno::EFAULT)?;
+    if last > user_ptr_max() {
+        return Err(Error::Errno(Errno::EFAULT));
+    }
+    // 4096 divides every page size, so probing each 4 KiB step checks every page.
+    let page = 4096;
+    let pid = guest.pid().as_raw();
+    let mut cursor = address & !(page - 1);
+    while cursor <= last {
+        let probe = cursor.max(address);
+        let readable = mapping_permissions(pid, probe)
+            .is_some_and(|perms| perms[0] == b'r' || perms[1] == b'w');
+        if !readable {
+            return Err(Error::Errno(Errno::EFAULT));
+        }
+        cursor += page;
+    }
+    // Read the bytes as aligned 8-byte words, which the tracer reads one at a
+    // time even from a write-only page; a larger read goes through
+    // `process_vm_readv`, which needs the page to be readable.
+    let start = address & !7;
+    let mut bytes = Vec::with_capacity(last + 1 - start);
+    let mut word = start;
+    while word <= last {
+        let value: u64 = guest
+            .memory()
+            .read_value(Addr::<u64>::from_raw(word).ok_or(Errno::EFAULT)?)
+            .map_err(|_| Error::Errno(Errno::EFAULT))?;
+        bytes.extend_from_slice(&value.to_ne_bytes());
+        word += 8;
+    }
+    let field = |at: usize| -> i64 {
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(&bytes[address - start + at..address - start + at + 8]);
+        i64::from_ne_bytes(raw)
+    };
+    Ok(Timespec {
+        tv_sec: field(0) as libc::time_t,
+        tv_nsec: field(8) as libc::c_long,
     })
 }
 
@@ -4931,6 +5027,34 @@ mod tests {
             host_realtime_now,
             logical_now
         ));
+    }
+
+    /// Linux's `futex_init_timeout` refuses only an invalid timespec, and
+    /// `timespec64_to_ktime` clamps a valid one beyond `KTIME_MAX` instead of
+    /// refusing it (Codex re-check of https://github.com/rrnewton/hermit/pull/4061).
+    #[test]
+    fn futex_timeout_clamps_a_huge_valid_timespec_like_ktime() {
+        let huge = Timespec {
+            tv_sec: libc::time_t::MAX,
+            tv_nsec: 0,
+        };
+        assert!(futex_timespec_is_valid(huge));
+        assert_eq!(
+            parse_futex_timeout(libc::FUTEX_WAIT, huge),
+            Ok(FutexTimeout::Relative(FUTEX_KTIME_MAX_NANOS))
+        );
+        assert_eq!(
+            parse_futex_timeout(libc::FUTEX_WAIT_BITSET, huge),
+            Ok(FutexTimeout::Absolute(LogicalTime::from_nanos(
+                FUTEX_KTIME_MAX_NANOS
+            )))
+        );
+        for invalid in [(-1, 0), (0, -1), (0, 1_000_000_000)] {
+            assert!(!futex_timespec_is_valid(Timespec {
+                tv_sec: invalid.0,
+                tv_nsec: invalid.1,
+            }));
+        }
     }
 
     #[test]

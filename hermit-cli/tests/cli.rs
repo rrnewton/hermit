@@ -129,6 +129,7 @@ static FUTEX_REQUEUE_WAKE_OP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_LOCK_PI_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_KEYED_ACCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_WAKE_OP_FILE_SHARED_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static FUTEX_WAIT_UNREADABLE_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_MULTITHREADED_PROCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_PROCESS_GROUP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_CREATE_RT_SIGNAL_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -21598,6 +21599,76 @@ fn futex_requeue_and_wake_op_match_linux() {
          wake B 1 released waiter 2\n\
          wake B 1 released waiter 3\n",
         "stderr:\n{log}"
+    );
+}
+
+/// FUTEX_WAIT and FUTEX_WAIT_BITSET on a word they cannot read give EFAULT,
+/// as Linux's `futex_wait_setup` does with its user-mode read
+/// (https://github.com/rrnewton/hermit/issues/4030). Before the fix, Detcore
+/// read every futex word through the tracer: an unmapped word gave EIO, which
+/// futex(2) never returns, and a PROT_NONE word was read anyway and compared,
+/// giving EAGAIN. The timeout and a zero bitset are checked first, without
+/// touching the word, as Linux does; the timeout is copied as `copy_from_user`
+/// copies it (a write-only page is readable on x86, a copy into a PROT_NONE
+/// page is EFAULT) and a huge valid one is clamped, not refused. Every line matches native Linux, and a
+/// record/replay of the guest matches.
+#[test]
+fn a_futex_wait_on_an_unreadable_word_is_efault() {
+    let guest = futex_c_guest(
+        &FUTEX_WAIT_UNREADABLE_WORD_GUEST,
+        "futex_wait_unreadable_word",
+    )
+    .to_str()
+    .unwrap()
+    .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&["run", "--strict", "--timeout", "60", "--", guest.as_str()]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "the run must finish and exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(
+        stdout,
+        "wait, readable word 7, expecting 1: -1 EAGAIN\n\
+         wait, unmapped private word: -1 EFAULT\n\
+         wait, PROT_NONE private word: -1 EFAULT\n\
+         wait, unmapped shared word: -1 EFAULT\n\
+         wait_bitset, unmapped private word: -1 EFAULT\n\
+         wait_bitset, PROT_NONE private word: -1 EFAULT\n\
+         wait_bitset, mask 0, PROT_NONE private word: -1 EINVAL\n\
+         wait, tv_nsec 1e9, PROT_NONE private word: -1 EINVAL\n\
+         wait, tv_nsec 1e9, readable word 7, expecting 1: -1 EINVAL\n\
+         wait, {0,0} timeout in a write-only page, readable word 7, expecting 1: -1 EAGAIN\n\
+         wait, timeout split onto a PROT_NONE page, readable word 7, expecting 1: -1 EFAULT\n\
+         wait, {LONG_MAX,0} timeout, readable word 7, expecting 1: -1 EAGAIN\n",
+        "stderr:\n{log}"
+    );
+    // Record and replay recompute these results (no futex event is recorded),
+    // so a recording made now replays to the same lines; RECORD_VERSION keeps an
+    // older recording, made with the tracer's read, from being replayed here.
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&["record", "--verify", "--", guest.as_str()]),
+        directory.path(),
+        Duration::from_secs(240),
+        false,
+    );
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "record --verify must succeed:\nstderr:\n{log}"
+    );
+    assert!(
+        log.contains("Success: replay matched recording."),
+        "the replay must match the recording:\nstderr:\n{log}"
     );
 }
 
