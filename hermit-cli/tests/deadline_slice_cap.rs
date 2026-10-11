@@ -44,6 +44,7 @@ const UNCAPPED_WAIT_US: i64 = 150_000;
 static SPIN_WAIT: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_RESUME: OnceLock<PathBuf> = OnceLock::new();
 static SELF_ALARM: OnceLock<PathBuf> = OnceLock::new();
+static START_CAP: OnceLock<PathBuf> = OnceLock::new();
 
 /// Compile `hermit-cli/tests/fixtures/<name>.c` once.
 fn fixture(cell: &'static OnceLock<PathBuf>, name: &str) -> &'static Path {
@@ -165,6 +166,19 @@ fn a_self_armed_timer_ends_a_syscall_spinners_slice() {
     assert!(
         (5_000..MAX_WAIT_US).contains(&waited),
         "a 5 ms alarm took {waited} us:\n{stdout}"
+    );
+}
+
+/// A new thread's first slice is capped: its start grant's hint arrives
+/// before the slice exists, and thread start applies it once the slice does.
+#[test]
+fn a_new_threads_first_slice_is_capped() {
+    let guest = fixture(&START_CAP, "deadline_start_cap");
+    let (stdout, _) = run_strict(guest, &[], &[]);
+    let waited = field(&stdout, "w_waited_us");
+    assert!(
+        (5_000..MAX_WAIT_US).contains(&waited),
+        "W's 5 ms sleep took {waited} us:\n{stdout}"
     );
 }
 
