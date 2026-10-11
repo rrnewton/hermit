@@ -7218,12 +7218,18 @@ impl RunOpts {
         // program, and hermit changing its signal dispositions would alter the
         // behaviour being observed.
         //
-        // SAFETY: the arming (prctl, an atomic read-modify-write and `_exit`)
-        // and the proc diagnostic use only Linux syscall wrappers and
-        // signal-set operations, without allocation or stdio locks.
+        //
+        // The guest also gets a process group of its own, taking over the
+        // terminal if Hermit's group owns it: nothing intercepts its
+        // `kill(0)` in this mode (https://github.com/rrnewton/hermit/issues/4065).
+        let terminal = super::container::foreground_terminal();
+        // SAFETY: the arming (prctl, setpgid, tcsetpgrp, an atomic
+        // read-modify-write and `_exit`) and the proc diagnostic use only Linux
+        // syscall wrappers and signal-set operations, without allocation or
+        // stdio locks.
         unsafe {
-            command.pre_exec(|| {
-                super::container::arm_namespace_only_guest()?;
+            command.pre_exec(move || {
+                super::container::arm_namespace_only_guest(terminal)?;
                 hermit::proc_mount::warn_if_readonly_proc();
                 Ok(())
             });
@@ -7245,7 +7251,22 @@ impl RunOpts {
 
         let mut child = command.spawn()?;
 
-        let exit_status = child.wait_blocking()?;
+        let exit_status = match terminal {
+            Some(fd) => {
+                let guest = child.id().as_raw();
+                let (relay, report) = super::container::spawn_keyboard_relay(guest)?;
+                let status = super::container::wait_relaying_job_control(&mut child, fd);
+                // SAFETY: the relay is this process's child; kill and waitpid
+                // read no caller memory beyond the local status.
+                unsafe {
+                    libc::kill(relay, libc::SIGKILL);
+                    let mut relay_status = 0;
+                    libc::waitpid(relay, &mut relay_status, 0);
+                }
+                super::container::relayed_exit_status(status?, report)
+            }
+            None => child.wait_blocking()?,
+        };
 
         Ok(exit_status)
     }

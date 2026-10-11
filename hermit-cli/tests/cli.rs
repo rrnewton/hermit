@@ -21450,6 +21450,55 @@ fn group_kills_never_reach_the_host_without_sequentialized_threads() {
     }
 }
 
+/// Under `--namespace-only` nothing intercepts the guest, so its `kill(0)`
+/// went to the kernel and reached Hermit's own process group: the guest's
+/// `kill(0, SIGUSR1)` killed Hermit (exit 138), and run without job control it
+/// would have reached the shell, make or test runner that started Hermit
+/// (https://github.com/rrnewton/hermit/issues/4065). The guest now gets a
+/// process group of its own at launch: it leads its group, its `kill(0,
+/// SIGUSR1)` reaches only itself (its handler runs once), and Hermit exits 0.
+/// Hermit runs in a session of its own, so even a regression cannot signal the
+/// test runner. (With a terminal owned by Hermit's group, the guest's group
+/// takes the terminal over and a keyboard relay keeps Ctrl-C and Ctrl-Z working;
+/// that path needs a terminal and is not exercised here.)
+#[test]
+fn a_namespace_only_guests_group_kill_stays_in_its_own_group() {
+    use std::os::unix::process::CommandExt;
+    let guest = kill_process_group_guest().to_str().unwrap().to_owned();
+    let mut command = hermit_command(&[
+        "run",
+        "--namespace-only",
+        "--timeout",
+        "60",
+        "--",
+        guest.as_str(),
+        "group-only",
+    ]);
+    // SAFETY: setsid is async-signal-safe and touches only the child.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) =
+        run_with_deadline(command, directory.path(), Duration::from_secs(120), false);
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "{status:?}\nstdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(
+        stdout, "own group: yes\nkill(0): 0, handled 1\n",
+        "stderr:\n{log}"
+    );
+}
+
 /// A POSIX timer that notifies with a real-time signal
 /// (https://github.com/rrnewton/hermit/issues/3893). Detcore cannot deliver
 /// real-time signals, and such a timer used to be armed and then silently never

@@ -24,7 +24,11 @@
  * guest keeps the process group it started in, which under Hermit is
  * Hermit's own (https://github.com/rrnewton/hermit/issues/4057), first
  * checks the group with signal 0, which sends nothing, and last sends
- * SIGKILL to it; run it only inside setsid.
+ * SIGKILL to it; run it only inside setsid. With the argument "group-only"
+ * it reports whether it leads its group without changing it, sends SIGUSR1
+ * to its group with kill(0) and returns: under --namespace-only, where nothing
+ * intercepts the call, Hermit must have given the guest a group of its own
+ * (https://github.com/rrnewton/hermit/issues/4065); run it only inside setsid.
  */
 
 #define _GNU_SOURCE
@@ -64,12 +68,18 @@ static long queue(pid_t pid) {
 int main(int argc, char** argv) {
   int broadcast = argc > 1 && strcmp(argv[1], "broadcast") == 0;
   int inherited = argc > 1 && strcmp(argv[1], "inherited") == 0;
+  int group_only = argc > 1 && strcmp(argv[1], "group-only") == 0;
   setvbuf(stdout, NULL, _IONBF, 0);
   struct sigaction action;
   memset(&action, 0, sizeof(action));
   action.sa_handler = on_usr1;
   sigaction(SIGUSR1, &action, NULL);
 
+  if (group_only) {
+    printf("own group: %s\n", getpgrp() == getpid() ? "yes" : "no");
+    report("kill(0)", kill(0, SIGUSR1));
+    return 0;
+  }
   /* EPERM when the caller already leads a session, which is fine: it then
    * already leads its own group. */
   if (!inherited) {
