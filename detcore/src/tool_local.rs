@@ -3243,15 +3243,19 @@ impl<T> ThreadState<T> {
     /// Global time advances exactly as this thread's clock does while it runs
     /// alone, so its slice then ends, and it takes a turn, once global time has
     /// passed that deadline. The slice keeps at least one RCB's worth of time,
-    /// as the post-hook requires of a fresh slice. A replay applies only its
-    /// recorded slice ends.
+    /// as the post-hook requires of a fresh slice. A schedule replay follows
+    /// its recorded turns, and a preemption replay its recorded slice ends
+    /// until they run out; past the last one it computes slice ends as the
+    /// record did, so it caps them as the record did.
     pub(crate) fn cap_timeslice_at_deadline(
         &mut self,
         remaining: Duration,
         clock_multiplier: f64,
         schedule_replay: bool,
     ) {
-        if self.preemption_points.is_some() || schedule_replay {
+        let recorded_slice =
+            self.preemption_points.is_some() && self.stats.last_recorded_slice.is_none();
+        if recorded_slice || schedule_replay {
             return;
         }
         let Some(end) = self.end_of_timeslice else {
