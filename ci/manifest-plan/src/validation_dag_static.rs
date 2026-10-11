@@ -1852,7 +1852,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/4020) retains all 1340: 1341.
     // scheduler::tests::a_terminal_deadlock_report_reaches_the_installed_hook_until_it_is_removed
     // (run_failed with deadlock) retains all 1341: 1342.
-    ("test.detcore_unit", 1342),
+    // scheduler::runqueue::tests::last_queued_priority_names_the_band_that_runs_last and
+    // scheduler::test::a_chaos_sched_yield_goes_behind_every_runnable_thread
+    // (https://github.com/rrnewton/hermit/issues/4068) retain all 1342: 1344.
+    ("test.detcore_unit", 1344),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2031,7 +2034,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4005): 274.
     // And external_signal_interrupt::ptrace_rt_sigtimedwait_takes_a_queued_signal_before_the_sigchld_of_an_exiting_child
     // (review of https://github.com/rrnewton/hermit/pull/4039): 275.
-    ("test.hermit_integration", 275),
+    // And chaos_sched_yield_progress::targeted_chaos_sched_yield_makes_progress_with_timer_preemption
+    // and chaos_sched_yield_progress::targeted_chaos_preemption_replay_of_sched_yield_matches_the_record
+    // (https://github.com/rrnewton/hermit/issues/4068): 277.
+    ("test.hermit_integration", 277),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -2805,7 +2811,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test: 1340.
     // And the interrupted shared-key probe test: 1341.
     // And the terminal-deadlock hook test: 1342.
-    ("test.detcore_unit_on_host", 1342),
+    // And the two chaos sched_yield placement tests: 1344.
+    ("test.detcore_unit_on_host", 1344),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -2836,7 +2843,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the robust-futex exec no-wake test: 273.
     // And the run-mode rt_sigtimedwait SIGCHLD test: 274.
     // And the queued-signal rt_sigtimedwait test: 275.
-    ("test.hermit_integration_on_host", 275),
+    // And the two targeted-chaos sched_yield tests: 277.
+    ("test.hermit_integration_on_host", 277),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

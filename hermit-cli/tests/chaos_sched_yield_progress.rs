@@ -17,6 +17,12 @@
 //! seeds exercised below deterministically reproduced that starvation. The fix
 //! turns `sched_yield` into a chaos reprioritization point, so every seed now
 //! makes progress and exits cleanly.
+//!
+//! With timer preemption on, the same loop starved under
+//! `--chaos --chaos-target-races` (https://github.com/rrnewton/hermit/issues/4068):
+//! the worker can start in the band that runs last, and chaos redraws a band
+//! only when a slice expires. There a `sched_yield` now puts the caller behind
+//! every runnable thread for one turn.
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
@@ -31,6 +37,17 @@ use std::sync::OnceLock;
 /// fix (verified by bisecting the unfixed binary). Any of these hanging is a
 /// regression.
 const SEEDS: [u64; 4] = [5, 6, 9, 12];
+
+/// Seeds at which the loop starved the worker on main 5e558a6a under
+/// `--chaos --chaos-target-races`, with timer preemption on
+/// (https://github.com/rrnewton/hermit/issues/4068).
+const TARGET_RACES_SEEDS: [u64; 4] = [4, 7, 8, 9];
+
+/// Seeds at which the guest's `--two-spinners` mode starved the worker on main
+/// 5e558a6a under `--chaos --chaos-target-races`, and still did with a one-turn
+/// yield that leaves the yielder in its own band: the two spinners took turns
+/// ahead of the worker.
+const TWO_SPINNERS_SEEDS: [u64; 4] = [0, 17, 22, 28];
 
 /// Generous per-run timeout. A healthy run finishes in well under a second; a
 /// starved run would otherwise spin forever.
@@ -72,7 +89,7 @@ fn guest() -> &'static Path {
         .as_path()
 }
 
-fn run_seed(seed: u64) {
+fn run_seed(seed: u64, chaos_args: &[&str], guest_args: &[&str]) {
     let mut command = Command::new("timeout");
     command
         .arg("--kill-after=2s")
@@ -83,11 +100,12 @@ fn run_seed(seed: u64) {
             "--base-env=minimal",
             "--no-virtualize-cpuid",
             "--chaos",
-            "--max-timeslice=disabled",
-            &format!("--seed={seed}"),
-            "--",
         ])
-        .arg(guest());
+        .args(chaos_args)
+        .arg(format!("--seed={seed}"))
+        .arg("--")
+        .arg(guest())
+        .args(guest_args);
 
     hermit_test::configure_guest_execution(&mut command);
     let rendered = format!("{command:?}");
@@ -120,7 +138,119 @@ fn run_seed(seed: u64) {
 #[test]
 fn chaos_sched_yield_makes_progress_without_timer_preemption() {
     for seed in SEEDS {
-        run_seed(seed);
+        run_seed(seed, &["--max-timeslice=disabled"], &[]);
+    }
+}
+
+#[test]
+fn targeted_chaos_sched_yield_makes_progress_with_timer_preemption() {
+    for seed in TARGET_RACES_SEEDS {
+        run_seed(seed, &["--chaos-target-races"], &[]);
+    }
+    for seed in TWO_SPINNERS_SEEDS {
+        run_seed(seed, &["--chaos-target-races"], &["--two-spinners"]);
+    }
+}
+
+/// The scheduler turns, syscalls and virtual time a run's summary reports.
+fn schedule_summary(path: &Path) -> (u64, u64, u64) {
+    let text = fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+    let summary: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("{} is not JSON: {error}", path.display()));
+    let field = |name: &str| {
+        summary[name]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{} has no integer {name}: {text}", path.display()))
+    };
+    (
+        field("sched_turns"),
+        field("syscalls"),
+        field("virttime_elapsed"),
+    )
+}
+
+/// How many priority changes a preemption record holds, over all threads.
+fn recorded_preemption_points(path: &Path) -> usize {
+    let text = fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+    let record: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("{} is not JSON: {error}", path.display()));
+    record["per_thread"]
+        .as_object()
+        .unwrap_or_else(|| panic!("{} has no per_thread map", path.display()))
+        .values()
+        .map(|thread| thread["prio_changes"].as_array().map_or(0, Vec::len))
+        .sum()
+}
+
+/// A `sched_yield` under chaos changes no priority, draws nothing from the
+/// chaos PRNG and consumes no recorded preemption point, so a preemption replay
+/// under `--chaos` reaches the recorded schedule: the same scheduler turns,
+/// syscalls, virtual time and output. The short `--max-timeslice` puts timer
+/// preemption points among the yields; the record must hold some, or the
+/// replay would test nothing.
+#[test]
+fn targeted_chaos_preemption_replay_of_sched_yield_matches_the_record() {
+    for seed in [4, 7] {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("chaos-yield-replay-{seed}"));
+        fs::create_dir_all(&dir).expect("failed to create the replay directory");
+        let preemptions = dir.join("preemptions.json");
+        let _ = fs::remove_file(&preemptions);
+        let mut results = Vec::new();
+        for (phase, option) in [
+            (
+                "record",
+                format!("--record-preemptions-to={}", preemptions.display()),
+            ),
+            (
+                "replay",
+                format!("--replay-preemptions-from={}", preemptions.display()),
+            ),
+        ] {
+            let summary = dir.join(format!("{phase}.summary.json"));
+            let mut command = Command::new("timeout");
+            command
+                .arg("--kill-after=2s")
+                .arg(format!("{TIMEOUT_SECONDS}s"))
+                .arg(hermit_test::hermit_binary())
+                .args([
+                    "run",
+                    "--base-env=minimal",
+                    "--no-virtualize-cpuid",
+                    "--chaos",
+                    "--chaos-target-races",
+                    "--max-timeslice=300000",
+                ])
+                .arg(format!("--seed={seed}"))
+                .arg(&option)
+                .arg(format!("--summary-json={}", summary.display()))
+                .arg("--")
+                .arg(guest());
+
+            hermit_test::configure_guest_execution(&mut command);
+            let rendered = format!("{command:?}");
+            let output = command.output().unwrap_or_else(|error| {
+                panic!("failed to start chaos {phase}: {rendered}: {error}")
+            });
+            assert!(
+                output.status.success(),
+                "chaos {phase} failed with seed {seed}: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            let stdout = String::from_utf8(output.stdout).expect("guest stdout should be UTF-8");
+            results.push((stdout, schedule_summary(&summary)));
+        }
+        assert!(
+            recorded_preemption_points(&preemptions) > 0,
+            "seed {seed}: the record holds no preemption point"
+        );
+        assert_eq!(
+            results[0], results[1],
+            "seed {seed}: replay left the record"
+        );
     }
 }
 
