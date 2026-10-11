@@ -1012,78 +1012,91 @@ impl<T: RecordOrReplay> Detcore<T> {
 
             let current_rcbs = guest.thread_state().thread_logical_time.rcbs();
             let current_pmu_rcbs = guest.thread_state().committed_clock_value;
-            let (ns_remaining, max_rcbs_remaining) = if let Some(replay_rcb_end) = replay_rcb_end {
-                assert!(
-                    replay_rcb_end > current_pmu_rcbs,
-                    "recorded PMU RCB deadline {} is not ahead of current {}",
-                    replay_rcb_end,
-                    current_pmu_rcbs
-                );
-                let logical_remaining = if max_timeslice_end > current_time {
-                    max_timeslice_end - current_time
-                } else {
-                    LogicalTime::ZERO
-                };
-                (logical_remaining, replay_rcb_end - current_pmu_rcbs)
-            } else {
-                let logical_remaining = max_timeslice_end - current_time;
-                (
-                    logical_remaining,
-                    logical_remaining.into_rcbs_with_multiplier(clock_multiplier),
-                )
-            };
-            let next_interrupt = self
-                .cfg
-                .use_rcb_time()
-                .then(|| {
-                    guest
-                        .thread_state()
-                        .interrupt_at
-                        .range((current_rcbs + 1)..)
-                        .next()
-                        .copied()
-                })
-                .flatten();
-            let (rcbs_remaining, timer_is_max) =
-                choose_rcb_timer(max_rcbs_remaining, current_rcbs, next_interrupt);
-            if let Some(next_interrupt) = next_interrupt {
-                debug!(
-                    "[dtid: {}] current rcbs: {}, next interrupt_at: {}",
-                    dettid, current_rcbs, next_interrupt
-                )
-            }
-
-            trace!(
-                "posthook [dtid {}] {} remaining before PMU maximum ({} rcbs).",
-                dettid, ns_remaining, rcbs_remaining,
-            );
-
-            if replay_rcb_end.is_none() && ns_remaining.is_zero() {
-                panic!(
-                    "Timer invariant broken: we should not exit a handler with 0 timeslice remaining."
-                );
-            }
-            assert!(rcbs_remaining > 0);
-            trace!(
-                "posthook [dtid {}] Resetting timer to {:?} RCBs in the future (current {})",
-                dettid,
-                rcbs_remaining,
-                guest.thread_state().thread_logical_time.rcbs()
-            );
-            {
+            // PROTOTYPE (hermit#4082): in replay, a slice whose recorded RCB
+            // count is reached but whose recorded time is not ends at a later
+            // hook of this same syscall, once its time charge lands. No branch
+            // remains to count, so no timer is armed.
+            let waiting_for_recorded_time =
+                replay_rcb_end.is_some_and(|replay_rcb_end| replay_rcb_end <= current_pmu_rcbs);
+            if waiting_for_recorded_time {
                 let thread_state = guest.thread_state_mut();
-                thread_state.last_rcb_timer = Some(rcbs_remaining);
-                thread_state.last_rcb_timer_is_max = timer_is_max;
-            }
-
-            if guest.config().imprecise_timers {
-                guest
-                    .set_timer(TimerSchedule::Rcbs(rcbs_remaining))
-                    .expect("Failed to set timer");
+                thread_state.last_rcb_timer = None;
+                thread_state.last_rcb_timer_is_max = false;
             } else {
-                guest
-                    .set_timer_precise(TimerSchedule::Rcbs(rcbs_remaining))
-                    .expect("Failed to set timer");
+                let (ns_remaining, max_rcbs_remaining) =
+                    if let Some(replay_rcb_end) = replay_rcb_end {
+                        assert!(
+                            replay_rcb_end > current_pmu_rcbs,
+                            "recorded PMU RCB deadline {} is not ahead of current {}",
+                            replay_rcb_end,
+                            current_pmu_rcbs
+                        );
+                        let logical_remaining = if max_timeslice_end > current_time {
+                            max_timeslice_end - current_time
+                        } else {
+                            LogicalTime::ZERO
+                        };
+                        (logical_remaining, replay_rcb_end - current_pmu_rcbs)
+                    } else {
+                        let logical_remaining = max_timeslice_end - current_time;
+                        (
+                            logical_remaining,
+                            logical_remaining.into_rcbs_with_multiplier(clock_multiplier),
+                        )
+                    };
+                let next_interrupt = self
+                    .cfg
+                    .use_rcb_time()
+                    .then(|| {
+                        guest
+                            .thread_state()
+                            .interrupt_at
+                            .range((current_rcbs + 1)..)
+                            .next()
+                            .copied()
+                    })
+                    .flatten();
+                let (rcbs_remaining, timer_is_max) =
+                    choose_rcb_timer(max_rcbs_remaining, current_rcbs, next_interrupt);
+                if let Some(next_interrupt) = next_interrupt {
+                    debug!(
+                        "[dtid: {}] current rcbs: {}, next interrupt_at: {}",
+                        dettid, current_rcbs, next_interrupt
+                    )
+                }
+
+                trace!(
+                    "posthook [dtid {}] {} remaining before PMU maximum ({} rcbs).",
+                    dettid, ns_remaining, rcbs_remaining,
+                );
+
+                if replay_rcb_end.is_none() && ns_remaining.is_zero() {
+                    panic!(
+                        "Timer invariant broken: we should not exit a handler with 0 timeslice remaining."
+                    );
+                }
+                assert!(rcbs_remaining > 0);
+                trace!(
+                    "posthook [dtid {}] Resetting timer to {:?} RCBs in the future (current {})",
+                    dettid,
+                    rcbs_remaining,
+                    guest.thread_state().thread_logical_time.rcbs()
+                );
+                {
+                    let thread_state = guest.thread_state_mut();
+                    thread_state.last_rcb_timer = Some(rcbs_remaining);
+                    thread_state.last_rcb_timer_is_max = timer_is_max;
+                }
+
+                if guest.config().imprecise_timers {
+                    guest
+                        .set_timer(TimerSchedule::Rcbs(rcbs_remaining))
+                        .expect("Failed to set timer");
+                } else {
+                    guest
+                        .set_timer_precise(TimerSchedule::Rcbs(rcbs_remaining))
+                        .expect("Failed to set timer");
+                }
             }
         } else {
             assert!(guest.config().max_timeslice.is_none());
