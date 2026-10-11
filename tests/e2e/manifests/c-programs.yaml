@@ -155,7 +155,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -168,11 +168,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -234,13 +229,11 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
           in-guest-trap: true
-        ci_disabled_reason:
-          dbt: {"result": "infrastructure-error", "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence", "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."}
         backends_enabled:
           - ptrace
           - dbt
@@ -310,7 +303,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -323,11 +316,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -457,7 +445,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -470,11 +458,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -536,13 +519,11 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
           in-guest-trap: true
-        ci_disabled_reason:
-          dbt: {"result": "infrastructure-error", "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence", "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."}
         backends_enabled:
           - ptrace
           - dbt
@@ -612,7 +593,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -625,11 +606,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -763,7 +739,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -776,11 +752,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -988,7 +959,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: false
           kvm: true
         backends_enabled:
@@ -1000,11 +971,10 @@ test:
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
-          sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
+          sabre:
+            evidence: TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4
+            reason: 'Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites'
+            result: crash-error
       naked:
         ci: false
         backends_enabled: []
@@ -1133,12 +1103,13 @@ test:
           ptrace: false
           liteinst: true
           in-guest-trap: true
+          dbt: true
         backends_enabled:
-          - ptrace
-          - liteinst
-          - in-guest-trap
+        - ptrace
+        - liteinst
+        - in-guest-trap
+        - dbt
         backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
         ci_disabled_reason:
@@ -1719,7 +1690,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -1732,11 +1703,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -1798,13 +1764,11 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
           in-guest-trap: true
-        ci_disabled_reason:
-          dbt: {"result": "infrastructure-error", "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence", "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."}
         backends_enabled:
           - ptrace
           - dbt
@@ -1874,7 +1838,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -1887,11 +1851,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -2027,13 +1986,11 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
           in-guest-trap: true
-        ci_disabled_reason:
-          dbt: {"result": "infrastructure-error", "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence", "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."}
         backends_enabled:
           - ptrace
           - dbt
@@ -2618,14 +2575,9 @@ test:
           ptrace: true
           sabre: true
           kvm: true
-          dbt: false
+          dbt: true
           liteinst: true
           in-guest-trap: true
-        ci_disabled_reason:
-          dbt:
-            result: parity-failure
-            evidence: "run s13-dbt-c at Hermit 12371d6cbf8a56c69175baea5baeb7507ca7e9cf (binary_sha256 037ad220fb4928cea94d79b0f77020001cb6140bf1feb3e929e28bfd9fce2560), reproduced in the isolated /test workdir; https://github.com/rrnewton/reverie/issues/764"
-            reason: "Under --verify the reverie-dbt evidence guard refuses io_uring_setup with EPERM instead of ENOSYS, so the guest exits 1 and the verification records no comparison; plain --strict DBT runs get ENOSYS and pass, which the custom dbt cell keeps selected."
         backends_enabled:
           - ptrace
           - sabre
@@ -2783,13 +2735,11 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
           in-guest-trap: true
-        ci_disabled_reason:
-          dbt: {"result": "infrastructure-error", "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence", "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."}
         backends_enabled:
           - ptrace
           - dbt
@@ -3155,13 +3105,11 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
           in-guest-trap: true
-        ci_disabled_reason:
-          dbt: {"result": "infrastructure-error", "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence", "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."}
         backends_enabled:
           - ptrace
           - dbt
@@ -3231,13 +3179,11 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
           in-guest-trap: true
-        ci_disabled_reason:
-          dbt: {"result": "infrastructure-error", "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence", "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."}
         backends_enabled:
           - ptrace
           - dbt
@@ -3523,7 +3469,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -3536,11 +3482,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -3602,7 +3543,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -3615,11 +3556,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -3681,7 +3617,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -3694,11 +3630,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -3843,7 +3774,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -3856,11 +3787,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -3922,7 +3848,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -3935,11 +3861,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -4361,12 +4282,18 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: false
-        ci_disabled_reason: New coverage (coord ruling D.2); enters blocking CI after its first validation receipts
+        ci:
+          ptrace: false
+          dbt: true
+        ci_disabled_reason:
+          ptrace:
+            result: not-measured
+            evidence: https://github.com/rrnewton/hermit/blob/40ec8312c326bbb46ed441780071d61343d8dba3/tests/e2e/manifests/c-programs.yaml
+            reason: New coverage (coord ruling D.2); enters blocking CI after its first validation receipts
         backends_enabled:
-          - ptrace
+        - ptrace
+        - dbt
         backends_disabled:
-          dbt: userfaultfd has not been qualified on DBT
           kvm: userfaultfd has not been qualified on KVM
           sabre: userfaultfd has not been qualified on SaBRe
           liteinst: This verify mode stays out of CI until its first validation receipts, so full validation would not run an in-guest cell here; it passed 10 of 10 verify runs with the maximum timeslice disabled in a local survey on 2026-10-08 and joins when the mode enters CI (https://github.com/rrnewton/hermit/issues/3745); in-guest LiteInst also runs this program in hermit-cli's liteinst_in_guest_serves_its_own_userfaultfd_and_exits_registered
@@ -5613,7 +5540,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -5626,11 +5553,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -5692,7 +5614,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -5705,11 +5627,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -5771,7 +5688,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -5784,11 +5701,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -5850,7 +5762,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -5863,11 +5775,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -6200,13 +6107,11 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
           in-guest-trap: true
-        ci_disabled_reason:
-          dbt: {"result": "parity-failure", "evidence": "637b0b19d63facb4cc77174334ed325132b83516; task drain_hermit_2059_to", "reason": "Exact-head structured verification preserved EFAULT/EINVAL precedence but exposed the host pipe capacity 65536 instead of Detcore's fixed 8192-byte capacity, so Run1 exited status 1 before comparison; this is an exact backend-parity failure, not absent DBT support."}
         backends_enabled:
           - ptrace
           - dbt
@@ -7033,7 +6938,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -7046,11 +6951,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -7540,7 +7440,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -7553,11 +7453,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -7693,7 +7588,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -7706,11 +7601,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -8060,12 +7950,13 @@ test:
           ptrace: true
           sabre: false
           kvm: true
+          dbt: true
         backends_enabled:
-          - ptrace
-          - sabre
-          - kvm
+        - ptrace
+        - sabre
+        - kvm
+        - dbt
         backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
@@ -8485,7 +8376,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -8498,11 +8389,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -8564,7 +8450,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -8577,11 +8463,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -8643,7 +8524,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -8656,8 +8537,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -8719,7 +8598,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -8732,11 +8611,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -9234,11 +9108,11 @@ test:
       verify:
         ci: true
         backends_enabled:
-          - ptrace
-          - sabre
-          - kvm
+        - ptrace
+        - sabre
+        - kvm
+        - dbt
         backends_disabled:
-          dbt: Strict verification fails on GitHub-hosted runners (determinism-failure, first divergence at record 158, syscall 57; both attempts of https://github.com/rrnewton/hermit/actions/runs/37784639364) though it passes on the validation host; re-enable once the run-to-run difference is understood
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
@@ -9906,14 +9780,15 @@ test:
           kvm: true
           liteinst: true
           in-guest-trap: true
+          dbt: true
         backends_enabled:
-          - ptrace
-          - sabre
-          - kvm
-          - liteinst
-          - in-guest-trap
-        backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+        - ptrace
+        - sabre
+        - kvm
+        - liteinst
+        - in-guest-trap
+        - dbt
+        backends_disabled: {}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -9975,13 +9850,13 @@ test:
       verify:
         ci: true
         backends_enabled:
-          - ptrace
-          - sabre
-          - kvm
-          - liteinst
-          - in-guest-trap
-        backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+        - ptrace
+        - sabre
+        - kvm
+        - liteinst
+        - in-guest-trap
+        - dbt
+        backends_disabled: {}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -10601,7 +10476,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -10614,11 +10489,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -10680,7 +10550,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -10693,11 +10563,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -10980,7 +10845,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -10993,11 +10858,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -11205,7 +11065,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -11218,11 +11078,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -11284,7 +11139,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -11297,11 +11152,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -11363,7 +11213,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -11376,11 +11226,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -11442,13 +11287,13 @@ test:
       verify:
         ci: true
         backends_enabled:
-          - ptrace
-          - sabre
-          - kvm
-          - liteinst
-          - in-guest-trap
-        backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+        - ptrace
+        - sabre
+        - kvm
+        - liteinst
+        - in-guest-trap
+        - dbt
+        backends_disabled: {}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -11510,13 +11355,13 @@ test:
       verify:
         ci: true
         backends_enabled:
-          - ptrace
-          - sabre
-          - kvm
-          - liteinst
-          - in-guest-trap
-        backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+        - ptrace
+        - sabre
+        - kvm
+        - liteinst
+        - in-guest-trap
+        - dbt
+        backends_disabled: {}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -11578,13 +11423,13 @@ test:
       verify:
         ci: true
         backends_enabled:
-          - ptrace
-          - sabre
-          - kvm
-          - liteinst
-          - in-guest-trap
-        backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+        - ptrace
+        - sabre
+        - kvm
+        - liteinst
+        - in-guest-trap
+        - dbt
+        backends_disabled: {}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -11646,7 +11491,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -11659,11 +11504,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -12351,7 +12191,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -12364,11 +12204,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -12508,7 +12343,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
           liteinst: true
@@ -12521,11 +12356,6 @@ test:
           - liteinst
           - in-guest-trap
         backends_disabled: {}
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -16031,13 +15861,13 @@ test:
       verify:
         ci: true
         backends_enabled:
-          - ptrace
-          - sabre
-          - kvm
-          - liteinst
-          - in-guest-trap
-        backends_disabled:
-          dbt: Never measured for this cell; the original .toml cited a missing toolchain on the authoring host, which is not evidence about the backend
+        - ptrace
+        - sabre
+        - kvm
+        - liteinst
+        - in-guest-trap
+        - dbt
+        backends_disabled: {}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -19637,9 +19467,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
-        ci_disabled_reason:
-          dbt: {"result": "determinism-failure", "evidence": "Generated scorecard ci/compat-envelope/cells.json at Hermit 5b811757980b9cab599206c047560a7962176a6b retains historical results determinism-failure at Hermit 90e46cba9ad83550205f3c9cd232ae222c6b6173; retained first divergent record positions: 492, 366, 374.", "reason": "Historical canonical verification diverged at recorded positions. The later clean observations do not erase that retained failure, so this backend remains excluded pending separate qualification."}
+          dbt: true
         backends_enabled:
           - ptrace
           - dbt
@@ -20021,11 +19849,12 @@ test:
         ci:
           ptrace: true
           kvm: true
+          dbt: true
         backends_enabled:
-          - ptrace
-          - kvm
+        - ptrace
+        - kvm
+        - dbt
         backends_disabled:
-          dbt: New top-of-funnel coverage is established on the ptrace reference first; DBI ratchets against it separately
           sabre: New top-of-funnel coverage is established on the ptrace reference first; SaBRe ratchets against it separately
           liteinst: New top-of-funnel coverage is established on the ptrace reference first; LiteInst ratchets against it separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -20450,11 +20279,15 @@ test:
       verify:
         ci: true
         backends_enabled:
-          - ptrace
-          - kvm
-          - liteinst
-          - in-guest-trap
+        - ptrace
+        - kvm
+        - liteinst
+        - in-guest-trap
+        - dbt
         guest_args:
+          dbt:
+            - --require-small-determinized
+            - --require-large-determinized
           ptrace:
             - --require-small-determinized
             - --require-large-determinized
@@ -20468,7 +20301,6 @@ test:
             - --require-small-determinized
             - --require-large-determinized
         backends_disabled:
-          dbt: DBT is not buildable on the current host (third-party-backends feature off; DynamoRIO needs cmake, absent), so no witness could be recorded; qualify DBT separately
           sabre: SaBRe is not buildable on the current host (same third-party-backends gate); qualify SaBRe separately
         hermit_args:
           liteinst:

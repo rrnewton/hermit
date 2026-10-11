@@ -445,7 +445,18 @@ labelled with the entry's run type, with one verify cell on the section's
 backend that keeps the section's environment and comparator but takes its
 `hermit_args` (none unless stated), budget, `slow_reason` and
 `no_retry_reason` from the entry and is never a diagnostic; the entry's own
-`unselected` lists its cells measured red. A row's own `labels` put its
+`unselected` lists its cells measured red. A variant may also declare
+`additional` entries with the same fields as the corpus's `additional`, naming
+row labels without the variant prefix. They add full-validation verify cells
+only to those existing variant tests: excepted or unknown rows are refused.
+Each added cell has its own flags, the global default budget, the shared
+verify environment and comparator, and the variant's single-attempt policy.
+It inherits neither the original backend's flags nor its focused run type.
+On a row with an added cell, the focused label is stored on the original
+backend's verify cell instead of on the whole test. Every existing enabled
+cell keeps its run types; disabled sibling cells remain disabled but no longer
+carry that test-level label. With no `additional` field (or an empty list),
+variant expansion is unchanged. A row's own `labels` put its
 verify cells in those run types, and not its replay cell, which carries only
 the `replay` section's run type. `unselected` lists cells
 measured red: each stays enabled with `ci: false` and a `ci_disabled_reason`

@@ -8757,6 +8757,198 @@ mod tests {
     use super::*;
     use crate::ci_selection::BackendCiDisabledReason;
 
+    /// The 26 corpus rows the strict variant took on 2026-10-10, when the
+    /// compat corpus was given uniform strict treatment: the 23 the strict
+    /// corpus never had, and the lua, perl and df `-direct` twins. They are labelled
+    /// sabre-compat-only, so their corpus cells are not the full run's and
+    /// ci/compat/corpus-strict.json, which validate.rs binds to the full run's
+    /// portable rows, does not hold them.
+    const STRICT_VARIANT_ROWS_BEYOND_THE_STRICT_CORPUS: [&str; 26] = [
+        "basenc",
+        "col",
+        "colrm",
+        "crc32",
+        "cscope",
+        "df-direct",
+        "diff3",
+        "dos2unix",
+        "envsubst",
+        "fallocate",
+        "flex",
+        "getconf",
+        "lua-direct",
+        "mountpoint",
+        "msgfmt",
+        "msgunfmt",
+        "namei",
+        "pathchk",
+        "perl-direct",
+        "setfacl",
+        "setfattr",
+        "shred",
+        "sync",
+        "timeout",
+        "truncate",
+        "uuidgen",
+    ];
+
+    /// compat.yaml's strict variant runs exactly the programs of
+    /// ci/compat/corpus-strict.json, the corpus STRICT_COMPAT_TOTAL counts and
+    /// the super suite still reads, plus the named rows beyond it: a row added
+    /// to either file, or to the strict variant, without the others fails here
+    /// instead of silently changing the strict run type.
+    #[test]
+    fn the_strict_variant_runs_exactly_the_strict_corpus_programs() {
+        use serde_yaml::Value;
+
+        use crate::manifest_corpus::expand_corpus;
+        use crate::manifest_corpus::test_support::tests_of;
+        let document: Value =
+            serde_yaml::from_str(include_str!("../../../tests/e2e/manifests/compat.yaml")).unwrap();
+        let label_of = document["corpus"]["rows"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                let label = row["label"].as_str().unwrap();
+                (
+                    row["id"].as_str().unwrap_or(label).to_owned(),
+                    label.to_owned(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let expanded = expand_corpus(document).unwrap();
+        let variant = tests_of(&expanded)
+            .iter()
+            .filter(|test| {
+                let recipe: TestRecipe = serde_yaml::from_value((*test).clone()).unwrap();
+                cell_labels(&recipe, &recipe.modes["verify"], Some("ptrace"))
+                    .contains("strict-compat-only")
+            })
+            .map(|test| {
+                let id = test["id"].as_str().unwrap();
+                let row = id.strip_prefix("compat/strict-").unwrap_or_else(|| {
+                    panic!("{id}: a strict-compat-only test outside the strict variant")
+                });
+                label_of[row].clone()
+            })
+            .collect::<BTreeSet<_>>();
+        let corpus: serde_json::Value =
+            serde_json::from_str(include_str!("../../compat/corpus-strict.json")).unwrap();
+        let strict = corpus["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["label"].as_str().unwrap().to_owned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(strict.len(), 193);
+        let mut expected = strict.clone();
+        for row in STRICT_VARIANT_ROWS_BEYOND_THE_STRICT_CORPUS {
+            assert!(
+                expected.insert(row.to_owned()),
+                "{row} is already in the strict corpus"
+            );
+        }
+        assert_eq!(expected.len(), 219);
+        assert_eq!(
+            variant.symmetric_difference(&expected).collect::<Vec<_>>(),
+            Vec::<&String>::new()
+        );
+    }
+
+    #[test]
+    fn variant_additional_cells_preserve_the_original_backend_and_default_budget() {
+        use serde_yaml::Value;
+
+        use crate::manifest_corpus::expand_corpus;
+        use crate::manifest_corpus::test_support::*;
+        let string = |text: &str| Value::String(text.to_owned());
+        let source = variant_with_additional_backend();
+        let expanded = expand_corpus(document(&source)).unwrap();
+        let before = expand_corpus(document(&variant_corpus().replace(
+            "      timeout_seconds: 30",
+            "      hermit_args: [--no-virtualize-cpuid]\n      hermit_args_reason: fixture variant flags\n      timeout_seconds: 30",
+        ))).unwrap();
+        let tests = tests_of(&expanded);
+        let original = tests_of(&before);
+        assert_eq!(tests.len(), original.len());
+        assert_eq!(
+            tests[..4],
+            original[..4],
+            "base and unselected variant rows changed"
+        );
+        let slow: TestRecipe = serde_yaml::from_value(tests[4].clone()).unwrap();
+        let verify = &slow.modes["verify"];
+        assert_eq!(
+            cell_labels(&slow, verify, Some("ptrace")),
+            BTreeSet::from(["strict-compat-only"])
+        );
+        assert_eq!(
+            cell_labels(&slow, verify, Some("dbt")),
+            BTreeSet::from(["full"])
+        );
+        let old_slow: TestRecipe = serde_yaml::from_value(original[4].clone()).unwrap();
+        assert_eq!(
+            cell_labels(&old_slow, &old_slow.modes["replay"], Some("ptrace")),
+            BTreeSet::from(["strict-compat-only"])
+        );
+        assert_eq!(
+            cell_labels(&slow, &slow.modes["replay"], Some("ptrace")),
+            BTreeSet::from(["full"])
+        );
+        assert!(slow.modes["replay"].backends_enabled.is_empty());
+        assert!(slow.modes["verify"].backends_disabled.contains_key("kvm"));
+
+        assert_eq!(
+            cell_hermit_args(verify, "ptrace"),
+            ["--no-virtualize-cpuid"]
+        );
+        assert!(cell_hermit_args(verify, "dbt").is_empty());
+        assert_eq!(verify.timeout_seconds["ptrace"], 30);
+        assert_eq!(verify.cpu_timeout_seconds["ptrace"], 29);
+        assert!(!verify.timeout_seconds.contains_key("dbt"));
+        assert!(!verify.cpu_timeout_seconds.contains_key("dbt"));
+        assert!(!verify.slow_reason.contains_key("dbt"));
+        let seq = |text: &str| serde_yaml::from_str::<Value>(text).unwrap();
+        let mode = &tests[4]["modes"]["verify"];
+        assert_eq!(mode["backends_enabled"], seq("[ptrace, dbt]"));
+        assert_eq!(mode["ci"], seq("{ptrace: false, dbt: true}"));
+        assert_eq!(
+            mode["ci_disabled_reason"],
+            original[4]["modes"]["verify"]["ci_disabled_reason"]
+        );
+        assert!(mode["backends_disabled"].get("dbt").is_none());
+        // Reverse only the declared selection and label representation changes:
+        // every other byte-valued recipe field, other mode and assertion stays.
+        let mut restored = tests[4].clone();
+        restored
+            .as_mapping_mut()
+            .unwrap()
+            .insert(string("labels"), original[4]["labels"].clone());
+        restored["modes"]["verify"]
+            .as_mapping_mut()
+            .unwrap()
+            .remove(string("labels"));
+        for field in ["ci", "backends_enabled", "backends_disabled"] {
+            restored["modes"]["verify"][field] = original[4]["modes"]["verify"][field].clone();
+        }
+        assert_eq!(restored, original[4]);
+        // Backend-specific flags and their explanation stay on that backend.
+        let flagged = expand_corpus(document(&source.replace(
+            "        - backend: dbt\n          rows: [slow]",
+            "        - backend: dbt\n          hermit_args: [--max-timeslice=disabled]\n          hermit_args_reason: fixture added flags\n          rows: [slow]",
+        ))).unwrap();
+        let mode = &tests_of(&flagged)[4]["modes"]["verify"];
+        assert_eq!(
+            mode["hermit_args"],
+            seq("{ptrace: [--no-virtualize-cpuid], dbt: [--max-timeslice=disabled]}")
+        );
+        assert_eq!(
+            mode["hermit_args_reason"],
+            seq("{ptrace: fixture variant flags, dbt: fixture added flags}")
+        );
+    }
+
     #[test]
     fn source_sha_must_be_one_full_lowercase_commit() {
         assert!(validate_source_sha("03bbb83581fad247251df6363f50e61e24c2957e").is_ok());
@@ -11300,31 +11492,27 @@ corpus:
             assert_eq!(cell.cpu_timeout_seconds, DEFAULT_TEST_CPU_TIMEOUT_SECONDS);
             assert_eq!(cell.timeout_seconds, DEFAULT_TEST_WALL_TIMEOUT_SECONDS);
         }
-        // Slice S13 of https://github.com/rrnewton/hermit/issues/3301 selected three
-        // DBT verify cells that were enabled with ci:false and enabled one new
-        // ci:false DBT verify cell; the timeouts module names them.
-        let dbt_verify = |population: &[SelectedCell], test: &str| {
-            population.iter().any(|cell| {
-                cell.id.test == test
-                    && cell.id.mode == "verify"
-                    && cell.id.backend.as_deref() == Some("dbt")
-            })
-        };
-        for test in DBT_MATRIX_2026_09_29_PROMOTED_CI_FALSE_TESTS {
-            assert!(
-                dbt_verify(&required, test),
-                "{test} verify/dbt is not required"
-            );
-        }
-        for test in DBT_MATRIX_2026_09_29_ENABLED_CI_FALSE_TESTS {
-            assert!(
-                dbt_verify(&enabled, test),
-                "{test} verify/dbt is not enabled"
-            );
-            assert!(
-                !dbt_verify(&required, test),
-                "{test} verify/dbt is required"
-            );
+        // Slice S13 of https://github.com/rrnewton/hermit/issues/3301 selected
+        // three DBT verify cells and enabled io-uring-fallback with ci:false.
+        // The 2026-10-11 repeat-confirmed selection now requires that fourth
+        // cell too. Both historical groups retain the ordinary CPU/wall bounds;
+        // this promotion does not revise the frozen timeout calibration.
+        for test in DBT_MATRIX_2026_09_29_PROMOTED_CI_FALSE_TESTS
+            .into_iter()
+            .chain(DBT_MATRIX_2026_09_29_ENABLED_CI_FALSE_TESTS)
+        {
+            for population in [&required, &enabled] {
+                let cell = population
+                    .iter()
+                    .find(|cell| {
+                        cell.id.test == test
+                            && cell.id.mode == "verify"
+                            && cell.id.backend.as_deref() == Some("dbt")
+                    })
+                    .unwrap_or_else(|| panic!("{test} verify/dbt is not selected"));
+                assert_eq!(cell.cpu_timeout_seconds, DEFAULT_TEST_CPU_TIMEOUT_SECONDS);
+                assert_eq!(cell.timeout_seconds, DEFAULT_TEST_WALL_TIMEOUT_SECONDS);
+            }
         }
 
         // The two dated LiteInst groups were qualified on the ptrace-owned

@@ -26,11 +26,12 @@ test:
         ci:
           ptrace: true
           kvm: true
+          dbt: true
         backends_enabled:
-          - ptrace
-          - kvm
+        - ptrace
+        - kvm
+        - dbt
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -91,12 +92,13 @@ test:
           ptrace: true
           kvm: true
           sabre: false
+          dbt: true
         backends_enabled:
-          - ptrace
-          - kvm
-          - sabre
+        - ptrace
+        - kvm
+        - sabre
+        - dbt
         backends_disabled:
-          dbt: Concurrent shell stdout differed between strict verification runs
           liteinst: The preload runtime cannot survive the shell script's post-start exec
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
@@ -222,10 +224,10 @@ test:
       verify:
         ci: true
         backends_enabled:
-          - ptrace
-          - kvm
+        - ptrace
+        - kvm
+        - dbt
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)

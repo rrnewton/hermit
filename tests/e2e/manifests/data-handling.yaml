@@ -25,10 +25,10 @@ test:
       verify:
         ci: true
         backends_enabled:
-          - ptrace
-          - kvm
+        - ptrace
+        - kvm
+        - dbt
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
           sabre: The exec socket is fixed, but SaBRe strict verification intermittently diverges in shell PATH lookup and multi-exec DETLOG ordering
@@ -157,7 +157,7 @@ test:
           - ptrace
           - kvm
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
+          dbt: "DBT verify has a failed attempt before a later retry passed in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
           sabre: SaBRe jq qualification is tracked by backend compatibility
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -223,7 +223,7 @@ test:
           - ptrace
           - kvm
         backends_disabled:
-          dbt: DBT SQLite qualification is tracked by backend compatibility
+          dbt: "DBT verify has a retained failed attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst SQLite qualification is tracked by backend compatibility
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)

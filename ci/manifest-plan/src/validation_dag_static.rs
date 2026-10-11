@@ -991,8 +991,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_rejected_versioned_config_keeps_the_existing_parse_fallback_policy}
     // (detcore-dbt), retain all 1058 prior cases: 1064.
     // stress_series::tests::failed_match_pressure_evidence_is_a_non_canonical_failed_attempt
-    // retains all 1058: 1059.
-    ("test.regular_crates", 1065),
+    // retains all 1064: 1065.
+    // The two manifest_corpus variant_additional_cells_* regressions and
+    // test-harness's sync_cells_round_trips_a_variant_additional_cell retain
+    // all 1065 selected identities: 1065 + 3 = 1068.
+    ("test.regular_crates", 1068),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3194,8 +3197,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same depth-boundary, repeated-key and extension-count tests: 1056.
     // And the run_failed runner test: 1049.
     // And the same six model/runtime config transport tests: 1064.
-    // And the failed-match pressure evidence test: 1059.
-    ("test.regular_crates_on_host", 1065),
+    // And the failed-match pressure evidence test: 1065.
+    // The same two variant_additional_cells_* parser/expansion regressions
+    // and the variant-additional sync round trip retain all prior identities:
+    // 1065 + 3 = 1068, as in test.regular_crates.
+    ("test.regular_crates_on_host", 1068),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
@@ -4768,6 +4774,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"build.host_hermit_link"########,
             r########"build.rust_scripts"########,
             r########"compatprep.fixtures"########,
+            r########"check.dbt_runtime_abi"########,
             r########"gate.manifest"########,
         ],
         env: &[(
@@ -4999,6 +5006,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"build.e2e_artifact_in_pinned_root"########,
             r########"build.manifest_guests_in_pinned_root"########,
             r########"build.rust_scripts_in_pinned_root"########,
+            r########"check.dbt_runtime_abi"########,
             r########"gate.manifest"########,
             r########"setup.pinned_root_fetch"########,
         ],
@@ -5136,6 +5144,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"build.e2e_artifact_in_pinned_root"########,
             r########"build.manifest_guests_in_pinned_root"########,
             r########"build.rust_scripts_in_pinned_root"########,
+            r########"check.dbt_runtime_abi"########,
             r########"gate.manifest"########,
             r########"setup.pinned_root_fetch"########,
         ],
@@ -6681,6 +6690,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         deps: &[
             r########"build.e2e_artifact_in_pinned_root"########,
             r########"build.rust_scripts_in_pinned_root"########,
+            r########"check.dbt_runtime_abi"########,
             r########"gate.manifest"########,
             r########"privileged-build.manifest_guests_in_pinned_root"########,
             r########"privileged-build.privileged_tests"########,
@@ -6774,6 +6784,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         deps: &[
             r########"build.e2e_artifact_in_pinned_root"########,
             r########"build.rust_scripts_in_pinned_root"########,
+            r########"check.dbt_runtime_abi"########,
             r########"gate.manifest"########,
             r########"privileged-build.manifest_guests_in_pinned_root"########,
             r########"privileged-build.privileged_tests"########,

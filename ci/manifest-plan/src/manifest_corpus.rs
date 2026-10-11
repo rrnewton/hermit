@@ -118,6 +118,10 @@ struct CorpusVariant {
     /// Variant cells measured red, as in the corpus's own `unselected`.
     #[serde(default)]
     unselected: Vec<CorpusVariantUnselected>,
+    /// Full-validation cells on named rows with their own flags and the
+    /// global default budget, as in the corpus's `additional`.
+    #[serde(default)]
+    additional: Vec<CorpusAdditional>,
 }
 
 /// Rows sharing one reason.
@@ -355,6 +359,99 @@ fn check_row_groups<'a>(
     Ok(excepted)
 }
 
+/// Validate the same opt-in backend cells for base rows and variant rows.
+fn check_additional(
+    bucket: &str,
+    scope: &str,
+    primary_backend: &str,
+    focused_backends: &BTreeSet<&str>,
+    labels: &BTreeSet<&str>,
+    additional_cells: &[CorpusAdditional],
+) -> Result<(), String> {
+    let mut additional_backends = BTreeSet::new();
+    for additional in additional_cells {
+        let backend = additional.backend.as_str();
+        if backend == primary_backend
+            || !BACKENDS.contains(&backend)
+            || focused_backends.contains(backend)
+        {
+            return Err(format!(
+                "{bucket}: corpus {scope} backend `{backend}` must be one of {BACKENDS:?} other than `{}` and every focused backend",
+                primary_backend
+            ));
+        }
+        if !additional_backends.insert(backend) {
+            return Err(format!(
+                "{bucket}: corpus {scope} backend `{backend}` is repeated"
+            ));
+        }
+        nonempty(
+            bucket,
+            &format!("{scope} {backend} disabled_reason"),
+            &additional.disabled_reason,
+        )?;
+        match (
+            additional.hermit_args.is_empty(),
+            additional.hermit_args_reason.as_deref(),
+        ) {
+            (true, None) => {}
+            (false, Some(reason)) => nonempty(
+                bucket,
+                &format!("{scope} {backend} hermit_args_reason"),
+                reason,
+            )?,
+            (false, None) => {
+                return Err(format!(
+                    "{bucket}: corpus {scope} {backend} hermit_args relax determinism and require a hermit_args_reason"
+                ));
+            }
+            (true, Some(_)) => {
+                return Err(format!(
+                    "{bucket}: corpus {scope} {backend} hermit_args_reason without hermit_args"
+                ));
+            }
+        }
+        if additional.rows.is_empty() {
+            return Err(format!("{bucket}: corpus {scope} {backend} names no rows"));
+        }
+        let mut with_cell = BTreeSet::new();
+        for label in &additional.rows {
+            if !labels.contains(label.as_str()) {
+                return Err(format!(
+                    "{bucket}: corpus {scope} {backend} names `{label}`, which is no row"
+                ));
+            }
+            if !with_cell.insert(label.as_str()) {
+                return Err(format!(
+                    "{bucket}: corpus {scope} {backend} names `{label}` twice"
+                ));
+            }
+        }
+        for (label, reason) in &additional.disabled {
+            if !labels.contains(label.as_str()) {
+                return Err(format!(
+                    "{bucket}: corpus {scope} {backend} disabled names `{label}`, which is no row"
+                ));
+            }
+            nonempty(
+                bucket,
+                &format!("{scope} {backend} disabled reason for `{label}`"),
+                reason,
+            )?;
+        }
+        if let Some(label) = additional
+            .disabled
+            .keys()
+            .find(|label| with_cell.contains(label.as_str()))
+        {
+            return Err(format!(
+                "{bucket}: corpus {scope} {backend} names `{label}` both with and without the cell"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
     if !BACKENDS.contains(&corpus.backend.as_str()) {
         return Err(format!(
@@ -448,81 +545,14 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
             "{bucket}: corpus verify hermit_args and hermit_args_reason must be given together"
         ));
     }
-    let mut additional_backends = BTreeSet::new();
-    for additional in &corpus.additional {
-        let backend = additional.backend.as_str();
-        if backend == corpus.backend
-            || !BACKENDS.contains(&backend)
-            || focused_backends.contains(backend)
-        {
-            return Err(format!(
-                "{bucket}: corpus additional backend `{backend}` must be one of {BACKENDS:?} other than `{}` and every focused backend",
-                corpus.backend
-            ));
-        }
-        if !additional_backends.insert(backend) {
-            return Err(format!(
-                "{bucket}: corpus additional backend `{backend}` is repeated"
-            ));
-        }
-        nonempty(
-            bucket,
-            &format!("additional {backend} disabled_reason"),
-            &additional.disabled_reason,
-        )?;
-        match (
-            additional.hermit_args.is_empty(),
-            additional.hermit_args_reason.as_deref(),
-        ) {
-            (true, None) => {}
-            (false, Some(reason)) => nonempty(
-                bucket,
-                &format!("additional {backend} hermit_args_reason"),
-                reason,
-            )?,
-            (false, None) => {
-                return Err(format!(
-                    "{bucket}: corpus additional {backend} hermit_args relax determinism and require a hermit_args_reason"
-                ));
-            }
-            (true, Some(_)) => {
-                return Err(format!(
-                    "{bucket}: corpus additional {backend} hermit_args_reason without hermit_args"
-                ));
-            }
-        }
-        if additional.rows.is_empty() {
-            return Err(format!(
-                "{bucket}: corpus additional {backend} names no rows"
-            ));
-        }
-        let mut with_cell = BTreeSet::new();
-        for label in &additional.rows {
-            if !labels.contains(label.as_str()) {
-                return Err(format!(
-                    "{bucket}: corpus additional {backend} names `{label}`, which is no row"
-                ));
-            }
-            if !with_cell.insert(label.as_str()) {
-                return Err(format!(
-                    "{bucket}: corpus additional {backend} names `{label}` twice"
-                ));
-            }
-        }
-        policy_rows(
-            &format!("additional {backend} disabled"),
-            &additional.disabled,
-        )?;
-        if let Some(label) = additional
-            .disabled
-            .keys()
-            .find(|label| with_cell.contains(label.as_str()))
-        {
-            return Err(format!(
-                "{bucket}: corpus additional {backend} names `{label}` both with and without the cell"
-            ));
-        }
-    }
+    check_additional(
+        bucket,
+        "additional",
+        &corpus.backend,
+        &focused_backends,
+        &labels,
+        &corpus.additional,
+    )?;
     let mut unselected_cells = BTreeMap::<(&str, &str), &CorpusUnselected>::new();
     for class in &corpus.unselected {
         nonempty(bucket, "unselected evidence", &class.evidence)?;
@@ -599,6 +629,23 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
             &variant.except,
             &variant.unselected,
         )?;
+        let variant_rows = labels.difference(&excepted).copied().collect();
+        check_additional(
+            bucket,
+            &what("additional"),
+            &corpus.backend,
+            &BTreeSet::new(),
+            &variant_rows,
+            &variant.additional,
+        )?;
+        if !variant.additional.is_empty()
+            && variant.hermit_args.is_empty() != variant.hermit_args_reason.is_none()
+        {
+            return Err(format!(
+                "{bucket}: corpus {} hermit_args and hermit_args_reason must be given together",
+                what("verify")
+            ));
+        }
         for row in corpus
             .rows
             .iter()
@@ -941,19 +988,50 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
             .filter(|row| !excepted.contains(row.label.as_str()))
         {
             let class = unselected.get(row.label.as_str());
+            let additional = variant
+                .additional
+                .iter()
+                .filter(|cell| cell.rows.contains(&row.label))
+                .collect::<Vec<_>>();
+            let enabled = std::iter::once(backend)
+                .chain(additional.iter().map(|cell| cell.backend.as_str()))
+                .collect::<Vec<_>>();
             let mut recipe = vec![
                 (
                     "ci",
-                    class.map_or(Value::Bool(true), |_| per_cell(Value::Bool(false))),
+                    class.map_or(Value::Bool(true), |_| {
+                        mapping(
+                            enabled
+                                .iter()
+                                .map(|cell| (*cell, Value::Bool(*cell != backend))),
+                        )
+                    }),
                 ),
-                ("backends_enabled", strings(&[backend.to_string()])),
+                (
+                    "backends_enabled",
+                    Value::Sequence(enabled.iter().map(|cell| string(cell)).collect()),
+                ),
                 (
                     "backends_disabled",
                     mapping(
                         BACKENDS
                             .iter()
-                            .filter(|other| **other != backend)
-                            .map(|other| (*other, string(&off_reason))),
+                            .filter(|other| !enabled.contains(other))
+                            .map(|other| {
+                                let reason = variant
+                                    .additional
+                                    .iter()
+                                    .find(|cell| cell.backend == *other)
+                                    .map(|cell| {
+                                        cell.disabled
+                                            .get(&row.label)
+                                            .unwrap_or(&cell.disabled_reason)
+                                    });
+                                (
+                                    *other,
+                                    string(reason.map_or(off_reason.as_str(), String::as_str)),
+                                )
+                            }),
                     ),
                 ),
                 (
@@ -976,11 +1054,50 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
                     )),
                 ));
             }
-            if !variant.hermit_args.is_empty() {
-                recipe.push(("hermit_args", per_cell(strings(&variant.hermit_args))));
-            }
-            if let Some(reason) = &variant.hermit_args_reason {
-                recipe.push(("hermit_args_reason", string(reason)));
+            if additional.is_empty() {
+                // Without an additional cell, preserve the previous expansion.
+                if !variant.hermit_args.is_empty() {
+                    recipe.push(("hermit_args", per_cell(strings(&variant.hermit_args))));
+                }
+                if let Some(reason) = &variant.hermit_args_reason {
+                    recipe.push(("hermit_args_reason", string(reason)));
+                }
+            } else {
+                let flagged = std::iter::once((
+                    backend,
+                    &variant.hermit_args,
+                    variant.hermit_args_reason.as_deref(),
+                ))
+                .chain(additional.iter().map(|cell| {
+                    (
+                        cell.backend.as_str(),
+                        &cell.hermit_args,
+                        cell.hermit_args_reason.as_deref(),
+                    )
+                }))
+                .filter(|(_, args, _)| !args.is_empty())
+                .collect::<Vec<_>>();
+                if !flagged.is_empty() {
+                    recipe.push((
+                        "hermit_args",
+                        mapping(
+                            flagged
+                                .iter()
+                                .map(|(backend, args, _)| (*backend, strings(args))),
+                        ),
+                    ));
+                }
+                if let Some(reason) =
+                    hermit_args_reason(&flagged, backend, variant.hermit_args_reason.as_deref())
+                {
+                    recipe.push(("hermit_args_reason", reason));
+                }
+                // Full-validation cells carry no focused label. The original
+                // backend retains exactly its variant run type.
+                recipe.push((
+                    "labels",
+                    per_cell(strings(std::slice::from_ref(&variant.label))),
+                ));
             }
             push_shared_verify_settings(&mut recipe, &corpus.verify);
             recipe.push(("no_retry_reason", string(&variant.no_retry_reason)));
@@ -991,7 +1108,11 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
                 row,
                 vec![("verify", recipe)],
                 &off_reason,
-                std::slice::from_ref(&variant.label),
+                if additional.is_empty() {
+                    std::slice::from_ref(&variant.label)
+                } else {
+                    &[]
+                },
             ));
         }
     }
@@ -1282,15 +1403,17 @@ pub fn direct_shell_word(
     Ok(out)
 }
 
+// These fixtures are shared by corpus expansion and runner interpretation tests.
+// Keep this module runner-independent: rust-script adapters include this file.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
 
-    fn document(corpus: &str) -> Value {
+    pub(crate) fn document(corpus: &str) -> Value {
         serde_yaml::from_str(&format!("schema: 3\nbucket: fixture\ncorpus:\n{corpus}")).unwrap()
     }
 
-    const CORPUS: &str = r#"
+    pub(crate) const CORPUS: &str = r#"
   description: Fixture program
   lane: portable
   requires: [linux]
@@ -1316,109 +1439,52 @@ mod tests {
     - {label: "slow", argv: ["/bin/true"]}
 "#;
 
-    fn tests_of(document: &Value) -> &Vec<Value> {
+    pub(crate) fn tests_of(document: &Value) -> &Vec<Value> {
         document["test"].as_sequence().unwrap()
     }
+
+    /// The corpus with a strict variant: one row excepted, one red.
+    pub(crate) fn variant_corpus() -> String {
+        CORPUS.replace(
+            "  rows:\n    - {label: \"echo\"",
+            r#"  variants:
+    - label: strict-compat-only
+      id_prefix: strict-
+      description: Fixture program without relaxations
+      timeout_seconds: 30
+      cpu_timeout_seconds: 29
+      slow_reason: strict fixture budget
+      no_retry_reason: strict fixture single run
+      except:
+        - reason: not in the fixture strict corpus
+          rows: [echo]
+      unselected:
+        - result: determinism-failure
+          evidence: https://github.com/rrnewton/hermit/issues/3
+          reason: fixture strict divergence
+          rows: [slow]
+  rows:
+    - {label: "echo""#,
+        )
+    }
+
+    pub(crate) fn variant_with_additional_backend() -> String {
+        variant_corpus().replace(
+            "      timeout_seconds: 30",
+            "      hermit_args: [--no-virtualize-cpuid]\n      hermit_args_reason: fixture variant flags\n      additional:\n        - backend: dbt\n          rows: [slow]\n          disabled_reason: A fixture corpus row's strict-compat-only test runs only its verify cell on ptrace\n      timeout_seconds: 30",
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::*;
+    use super::*;
 
     /// The shipped compat manifest, read at compile time relative to this
     /// file, because scripts/manifest-to-commands.rs compiles this module
     /// under rust-script, where CARGO_MANIFEST_DIR is not ci/manifest-plan.
     const COMPAT_YAML: &str = include_str!("../../../tests/e2e/manifests/compat.yaml");
-
-    /// The 26 corpus rows the strict variant took on 2026-10-10, when the
-    /// compat corpus was given uniform strict treatment: the 23 the strict
-    /// corpus never had, and the lua, perl and df `-direct` twins. They are labelled
-    /// sabre-compat-only, so their corpus cells are not the full run's and
-    /// ci/compat/corpus-strict.json, which validate.rs binds to the full run's
-    /// portable rows, does not hold them.
-    const STRICT_VARIANT_ROWS_BEYOND_THE_STRICT_CORPUS: [&str; 26] = [
-        "basenc",
-        "col",
-        "colrm",
-        "crc32",
-        "cscope",
-        "df-direct",
-        "diff3",
-        "dos2unix",
-        "envsubst",
-        "fallocate",
-        "flex",
-        "getconf",
-        "lua-direct",
-        "mountpoint",
-        "msgfmt",
-        "msgunfmt",
-        "namei",
-        "pathchk",
-        "perl-direct",
-        "setfacl",
-        "setfattr",
-        "shred",
-        "sync",
-        "timeout",
-        "truncate",
-        "uuidgen",
-    ];
-
-    /// compat.yaml's strict variant runs exactly the programs of
-    /// ci/compat/corpus-strict.json, the corpus STRICT_COMPAT_TOTAL counts and
-    /// the super suite still reads, plus the named rows beyond it: a row added
-    /// to either file, or to the strict variant, without the others fails here
-    /// instead of silently changing the strict run type.
-    #[test]
-    fn the_strict_variant_runs_exactly_the_strict_corpus_programs() {
-        let document: Value = serde_yaml::from_str(COMPAT_YAML).unwrap();
-        let label_of = document["corpus"]["rows"]
-            .as_sequence()
-            .unwrap()
-            .iter()
-            .map(|row| {
-                let label = row["label"].as_str().unwrap();
-                (
-                    row["id"].as_str().unwrap_or(label).to_owned(),
-                    label.to_owned(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let expanded = expand_corpus(document).unwrap();
-        let strict_label = Value::from("strict-compat-only");
-        let variant = tests_of(&expanded)
-            .iter()
-            .filter(|test| {
-                test["labels"]
-                    .as_sequence()
-                    .is_some_and(|labels| labels.contains(&strict_label))
-            })
-            .map(|test| {
-                let id = test["id"].as_str().unwrap();
-                let row = id.strip_prefix("compat/strict-").unwrap_or_else(|| {
-                    panic!("{id}: a strict-compat-only test outside the strict variant")
-                });
-                label_of[row].clone()
-            })
-            .collect::<BTreeSet<_>>();
-        let corpus: serde_json::Value =
-            serde_json::from_str(include_str!("../../compat/corpus-strict.json")).unwrap();
-        let strict = corpus["rows"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|row| row["label"].as_str().unwrap().to_owned())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(strict.len(), 193);
-        let mut expected = strict.clone();
-        for row in STRICT_VARIANT_ROWS_BEYOND_THE_STRICT_CORPUS {
-            assert!(
-                expected.insert(row.to_owned()),
-                "{row} is already in the strict corpus"
-            );
-        }
-        assert_eq!(expected.len(), 219);
-        assert_eq!(
-            variant.symmetric_difference(&expected).collect::<Vec<_>>(),
-            Vec::<&String>::new()
-        );
-    }
 
     /// compat.yaml's replay cells cover every row but the lua, perl and df
     /// `-direct` twins and netlink-sock-diag, whose own check asserts run-mode
@@ -1909,31 +1975,6 @@ mod tests {
         );
     }
 
-    /// The corpus with a strict variant: one row excepted, one red.
-    fn variant_corpus() -> String {
-        CORPUS.replace(
-            "  rows:\n    - {label: \"echo\"",
-            r#"  variants:
-    - label: strict-compat-only
-      id_prefix: strict-
-      description: Fixture program without relaxations
-      timeout_seconds: 30
-      cpu_timeout_seconds: 29
-      slow_reason: strict fixture budget
-      no_retry_reason: strict fixture single run
-      except:
-        - reason: not in the fixture strict corpus
-          rows: [echo]
-      unselected:
-        - result: determinism-failure
-          evidence: https://github.com/rrnewton/hermit/issues/3
-          reason: fixture strict divergence
-          rows: [slow]
-  rows:
-    - {label: "echo""#,
-        )
-    }
-
     #[test]
     fn a_variant_adds_one_labelled_test_per_row_on_the_corpus_backend() {
         let expanded = expand_corpus(document(&variant_corpus())).unwrap();
@@ -2005,6 +2046,88 @@ mod tests {
         let verify = &tests_of(&flagged)[3]["modes"]["verify"];
         assert_eq!(verify["hermit_args"], seq("{ptrace: [--fixture-flag]}"));
         assert_eq!(verify["hermit_args_reason"], "fixture reason");
+    }
+
+    #[test]
+    fn variant_additional_cells_refuse_absent_excepted_and_ambiguous_rows() {
+        let source = variant_with_additional_backend();
+        let additional = source
+            .split_once("      additional:\n")
+            .unwrap()
+            .1
+            .split_once("      timeout_seconds:")
+            .unwrap()
+            .0;
+        let refused = |from: &str, to: &str| {
+            // Scope row mutations to the additional entry, never the separate
+            // unselected entry which also names `slow`.
+            let changed = if additional.contains(from) {
+                assert_eq!(additional.matches(from).count(), 1, "{from}");
+                source.replacen(additional, &additional.replace(from, to), 1)
+            } else {
+                assert_eq!(source.matches(from).count(), 1, "{from}");
+                source.replace(from, to)
+            };
+            expand_corpus(document(&changed)).unwrap_err()
+        };
+        for row in ["absent", "echo"] {
+            assert!(
+                refused(
+                    "          rows: [slow]",
+                    &format!("          rows: [{row}]")
+                )
+                .contains("which is no row")
+            );
+        }
+        assert!(
+            refused("          rows: [slow]", "          rows: [slow, slow]").contains("twice")
+        );
+        assert!(refused("          rows: [slow]", "          rows: []").contains("names no rows"));
+        assert!(refused("backend: dbt", "backend: ptrace").contains("must be one of"));
+        assert!(refused("backend: dbt", "backend: unknown").contains("must be one of"));
+        assert!(
+            refused(
+                "          rows: [slow]",
+                "          disabled: {slow: excluded}\n          rows: [slow]"
+            )
+            .contains("both with and without")
+        );
+        assert!(
+            refused(
+                "          rows: [slow]",
+                "          hermit_args: [--max-timeslice=disabled]\n          rows: [slow]"
+            )
+            .contains("require a hermit_args_reason")
+        );
+        assert!(
+            refused(
+                "          rows: [slow]",
+                "          hermit_args_reason: extra\n          rows: [slow]"
+            )
+            .contains("without hermit_args")
+        );
+        assert!(
+            refused("      hermit_args_reason: fixture variant flags\n", "")
+                .contains("must be given together")
+        );
+        assert!(
+            refused(
+                "          rows: [slow]",
+                "          surprise: true\n          rows: [slow]"
+            )
+            .contains("invalid corpus section")
+        );
+        assert!(refused("      additional:\n", "      additional:\n        - backend: dbt\n          rows: [g++]\n          disabled_reason: not selected\n").contains("is repeated"));
+        // An explicit empty list has exactly the pre-extension expansion.
+        let unchanged = variant_corpus();
+        assert_eq!(
+            expand_corpus(document(&unchanged.replace(
+                "      id_prefix:",
+                "      additional: []\n      id_prefix:"
+            )))
+            .unwrap(),
+            expand_corpus(document(&unchanged)).unwrap(),
+        );
     }
 
     #[test]

@@ -33,7 +33,7 @@ test:
           ptrace: 32
           kvm: 24
         slow_reason:
-          ptrace: The ptrace workload runs the same 53 busy-wait and print intervals at 5 ms as KVM instead of 50 at 20 ms. Every clock read is a ptrace stop, and remote-execution hosts differ widely in what a stop costs. On 2026-10-05 the default workload took about 7 CPU seconds on one development host but reached the 32-second CPU bound on one remote-execution host (both named in docs/TESTING_ENVIRONMENTS.md, Named measurement hosts), where zstd-multithread verify/ptrace ran 5.7x slower than at 3446e8af. Across 3 passing first-attempt test-harness qualification repetitions with Hermit built at d1744e9fc07e5262a93c19971947a6b168b61252, nearest-rank p90 was 2.828 wall seconds and 2.636419 CPU seconds; ceil(4x wall)=12 and ceil(1.5x CPU)=4, both covered by the retained 91/32 bounds, which were set from 60 earlier rows with a p90 of 22.531 wall and 20.710660 CPU seconds and are kept as remote-execution headroom. No CI cell now runs the default 50 x 20 ms workload under ptrace; applications/example-timed-progress-bar, which does, is not CI-selected.
+          ptrace: The ptrace workload runs the same 53 busy-wait and print intervals at 5 ms as KVM instead of 50 at 20 ms. Every clock read is a ptrace stop, and remote-execution hosts differ widely in what a stop costs. On 2026-10-05 the default workload took about 7 CPU seconds on one development host but reached the 32-second CPU bound on one remote-execution host (both named in docs/TESTING_ENVIRONMENTS.md, Named measurement hosts), where zstd-multithread verify/ptrace ran 5.7x slower than at 3446e8af. Across 3 passing first-attempt test-harness qualification repetitions with Hermit built at d1744e9fc07e5262a93c19971947a6b168b61252, nearest-rank p90 was 2.828 wall seconds and 2.636419 CPU seconds; ceil(4x wall)=12 and ceil(1.5x CPU)=4, both covered by the retained 91/32 bounds, which were set from 60 earlier rows with a p90 of 22.531 wall and 20.710660 CPU seconds and are kept as remote-execution headroom. No CI cell now runs the default 50 x 20 ms workload under ptrace; applications/example-timed-progress-bar, which does, is not CI-selected on ptrace.
           kvm: The KVM-only workload runs 53 busy-wait and print intervals at 5 ms instead of 50 at 20 ms, reducing VM-exit-heavy clock reads while preserving the baseline's 200-turn instrumented scheduler coverage. Across 3 clean qualification repetitions at Hermit f190205a7b3e65e7ebf347ba0875b668fd72d9a7, nearest-rank p90 was 13.753 wall seconds and 12.809181 CPU seconds; ceil(4x wall)=56 and ceil(1.5x CPU)=20, both covered by the retained 80/24 bounds.
         backends_enabled:
           - ptrace
@@ -121,7 +121,7 @@ test:
       verify:
         ci:
           ptrace: false
-          dbt: false
+          dbt: true
           kvm: false
           liteinst: true
           in-guest-trap: true
@@ -134,12 +134,14 @@ test:
         backends_disabled:
           sabre: SaBRe does not yet determinize busy-wait polling on virtual wall-clock advancement; keep the identical example workload unqualified
         ci_disabled_reason:
-          ptrace: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit", "result": "infrastructure-error"}
-          kvm: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit", "result": "infrastructure-error"}
-          dbt:
+          ptrace:
+            evidence: TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4
+            reason: 'Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit'
             result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
+          kvm:
+            evidence: TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4
+            reason: 'Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit'
+            result: infrastructure-error
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -200,6 +202,7 @@ test:
       verify:
         ci:
           kvm: false
+          dbt: true
         timeout_seconds:
           kvm: 74
         cpu_timeout_seconds:
@@ -207,10 +210,10 @@ test:
         slow_reason:
           kvm: Across 58 retained typed passing rows, nearest-rank p90 was 18.271 wall seconds and 16.656796 CPU seconds; ceil(4x wall)=74 and ceil(1.5x CPU)=25.
         backends_enabled:
-          - kvm
+        - kvm
+        - dbt
         backends_disabled:
           ptrace: This test specifically asserts the KVM execution path
-          dbt: This test specifically asserts the KVM execution path
           sabre: This test specifically asserts the KVM execution path
           liteinst: This test specifically asserts the KVM execution path
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -272,10 +275,10 @@ test:
       verify:
         ci: true
         backends_enabled:
-          - kvm
+        - kvm
+        - dbt
         backends_disabled:
           ptrace: This test specifically asserts the KVM execution path
-          dbt: This test specifically asserts the KVM execution path
           sabre: This test specifically asserts the KVM execution path
           liteinst: This test specifically asserts the KVM execution path
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)

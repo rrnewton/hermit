@@ -7822,13 +7822,51 @@ sys.exit(1 if failed else 0)
         // c-programs/socket-timestamp-edge-cases. Both were enabled but not
         // run by full, and full planned neither side of their parity cell, so
         // they were unreported; switched off, they are no longer applicable.
-        // The 2 left are example-timed-progress-bar's DBT and KVM cells.
-        assert_eq!(unreported.len(), 2 + 30, "{unreported:?}");
-        let sabre_only = unreported
-            .iter()
-            .filter(|cell| cell.starts_with("compat/") && cell.ends_with("@sabre"))
-            .count();
-        assert_eq!(sabre_only, 30, "{unreported:?}");
+        // The 2026-10-11 DBT selection reports example-timed-progress-bar's
+        // DBT cell. Its KVM cell and these 30 SaBRe-only cells remain outside
+        // the full profile. Pin identities, not just their count.
+        let mut expected_unreported =
+            BTreeSet::from(["applications/example-timed-progress-bar@kvm".to_owned()]);
+        expected_unreported.extend(
+            [
+                "basenc",
+                "col",
+                "colrm",
+                "crc32",
+                "cscope",
+                "df-direct",
+                "diff3",
+                "dos2unix",
+                "envsubst",
+                "fallocate",
+                "flex",
+                "getconf",
+                "java",
+                "javac",
+                "lua-direct",
+                "mountpoint",
+                "msgfmt",
+                "msgunfmt",
+                "namei",
+                "node",
+                "pathchk",
+                "perl-direct",
+                "rustc",
+                "setfacl",
+                "setfattr",
+                "shred",
+                "sync",
+                "timeout",
+                "truncate",
+                "uuidgen",
+            ]
+            .into_iter()
+            .map(|test| format!("compat/{test}@sabre")),
+        );
+        assert_eq!(
+            unreported.into_iter().collect::<BTreeSet<_>>(),
+            expected_unreported
+        );
     }
 
     #[test]
@@ -10763,21 +10801,44 @@ sys.exit(1 if failed else 0)
         use serde_yaml::Value;
         assert_eq!(mode, "verify", "{test}: a corpus flip is a verify cell");
         let suffix = test.split_once('/').map_or(test, |(_, suffix)| suffix);
-        let label = manifest["corpus"]["rows"]
-            .as_sequence()
-            .unwrap()
-            .iter()
-            .find(|row| {
-                row.get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_else(|| row["label"].as_str().unwrap())
-                    == suffix
-            })
-            .unwrap_or_else(|| panic!("{test} is no corpus row"))["label"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let entries = manifest["corpus"]["additional"]
+        let corpus = &manifest["corpus"];
+        let row_label = |suffix: &str| {
+            corpus["rows"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .find(|row| {
+                    row.get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_else(|| row["label"].as_str().unwrap())
+                        == suffix
+                })
+                .map(|row| row["label"].as_str().unwrap().to_owned())
+        };
+        let (label, variant) = if let Some(label) = row_label(suffix) {
+            (label, None)
+        } else {
+            let matches = corpus["variants"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, variant)| {
+                    suffix
+                        .strip_prefix(variant["id_prefix"].as_str().unwrap())
+                        .and_then(row_label)
+                        .map(|label| (label, Some(index)))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(matches.len(), 1, "{test} is no unique corpus variant row");
+            matches.into_iter().next().unwrap()
+        };
+        let owner = if let Some(index) = variant {
+            &mut manifest["corpus"]["variants"][index]
+        } else {
+            &mut manifest["corpus"]
+        };
+        let entries = owner["additional"]
             .as_sequence_mut()
             .unwrap_or_else(|| panic!("{test}: the corpus has no additional backend"));
         let entry = entries
@@ -10844,6 +10905,76 @@ sys.exit(1 if failed else 0)
         assert_eq!(
             fs::read(root.join(super::EXPECTED_PLAN_PATH)).unwrap(),
             committed_plan
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn sync_cells_round_trips_a_variant_additional_cell() {
+        let root = sync_cells_fixture("variant-additional");
+        let manifest = root.join("tests/e2e/manifests/compat.yaml");
+        let original = fs::read_to_string(&manifest).unwrap();
+        let mut document: YamlValue = serde_yaml::from_str(&original).unwrap();
+        let variant = document["corpus"]["variants"]
+            .as_sequence_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|variant| variant["id_prefix"].as_str() == Some("strict-"))
+            .unwrap();
+        let entries = variant
+            .as_mapping_mut()
+            .unwrap()
+            .entry("additional".into())
+            .or_insert_with(|| YamlValue::Sequence(Vec::new()))
+            .as_sequence_mut()
+            .unwrap();
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry["backend"].as_str() != Some("kvm"))
+        );
+        entries.push(
+            serde_yaml::from_str(
+                "backend: kvm\nrows: [echo]\ndisabled_reason: sync fixture only\n",
+            )
+            .unwrap(),
+        );
+        let promoted = serde_yaml::to_string(&document).unwrap();
+        fs::write(&manifest, &promoted).unwrap();
+        assert_eq!(sync(&root), [super::EXPECTED_PLAN_PATH]);
+        let selected = fs::read(root.join(super::EXPECTED_PLAN_PATH)).unwrap();
+        let selected_plan: serde_json::Value = serde_json::from_slice(&selected).unwrap();
+        let cell = selected_plan["cells"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|cell| {
+                cell["test"] == "compat/strict-echo"
+                    && cell["mode"] == "verify"
+                    && cell["backend"] == "kvm"
+            })
+            .unwrap();
+        assert_eq!(cell["timeout_seconds"], 57);
+        assert_eq!(cell["cpu_timeout_seconds"], 22);
+        fs::write(
+            &manifest,
+            unflip(&promoted, "compat/strict-echo", "verify", "kvm"),
+        )
+        .unwrap();
+        assert_eq!(sync(&root), [super::EXPECTED_PLAN_PATH]);
+        let unselected: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join(super::EXPECTED_PLAN_PATH)).unwrap())
+                .unwrap();
+        assert_eq!(
+            unselected["cells"].as_array().unwrap().len() + 1,
+            selected_plan["cells"].as_array().unwrap().len()
+        );
+        assert!(!unselected["cells"].as_array().unwrap().contains(cell));
+        fs::write(&manifest, promoted).unwrap();
+        assert_eq!(sync(&root), [super::EXPECTED_PLAN_PATH]);
+        assert_eq!(
+            fs::read(root.join(super::EXPECTED_PLAN_PATH)).unwrap(),
+            selected
         );
         fs::remove_dir_all(&root).unwrap();
     }

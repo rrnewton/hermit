@@ -8,8 +8,8 @@ bucket: compat
 # each `additional` entry names. The rr lane's rows also have a replay cell
 # (`replay`) that records and replays the program on ptrace, for the rr run
 # type alone. The `variants` entry repeats the strict corpus's rows as
-# strict-<row> tests for the strict run type alone, on ptrace with none of the
-# relaxations below.
+# strict-<row> tests for the strict run type on ptrace with none of the
+# relaxations below. Its qualified DBT cells join full validation separately.
 # The scheduled super suite still runs its four heavy rows (rustc, javac, java,
 # node) on ptrace from ci/compat/corpus-strict.json. Lane settings are stated
 # once below and every row is expanded into an ordinary test recipe
@@ -1438,6 +1438,165 @@ corpus:
   # Cells measured red on 2026-10-01 (release Hermit at 03bbb8358, through
   # this bucket): each stays enabled with ci: false and its failure class's
   # issue, so the SaBRe run type does not require it.
+  # DBT rows below matched canonical strict verify in both the eba3c978e0eb
+  # census and its original-epoch confirmation on 2026-10-11. Each keeps
+  # the global 22-CPU-second/57-wall-second budget and has no relaxation.
+    - backend: dbt
+      rows:
+      - echo
+      - 'true'
+      - pwd
+      - cat
+      - wc
+      - head
+      - base64
+      - base32
+      - id
+      - lua
+      - perl
+      - bc
+      - dc
+      - awk
+      - xmllint
+      - bash
+      - ruby
+      - python3
+      - curl
+      - m4
+      - nm
+      - objcopy
+      - objdump
+      - readelf
+      - size
+      - strip
+      - elfedit
+      - gprof
+      - gcov
+      - bzip2
+      - gzip
+      - xz
+      - openssl
+      - sort
+      - uniq
+      - tr
+      - cut
+      - tee
+      - paste
+      - comm
+      - join
+      - stat
+      - file
+      - basename
+      - dirname
+      - env
+      - printenv
+      - uname
+      - factor
+      - expr
+      - dd
+      - du
+      - hostname
+      - ss
+      - whoami
+      - nproc
+      - arch
+      - mktemp
+      - sha256sum
+      - sha1sum
+      - md5sum
+      - sha224sum
+      - sha384sum
+      - sha512sum
+      - wc-lines
+      - nl
+      - expand
+      - unexpand
+      - test
+      - bracket
+      - printf
+      - pr
+      - ls
+      - iconv
+      - sleep
+      - stdbuf
+      - nohup
+      - nice
+      - ionice
+      - taskset
+      - chrt
+      - logger
+      - getopt
+      - column
+      - hexdump
+      - xxd
+      - strings
+      - od
+      - sum
+      - cksum
+      - b2sum
+      - tsort
+      - ptx
+      - pinky
+      - users
+      - uptime
+      - iostat
+      - vmstat-disk
+      - pidstat-disk
+      - findmnt
+      - sysctl-random-uuid
+      - sar-resource-tables
+      - lsirq
+      - lsmod
+      - numastat
+      - numactl-hardware
+      - vmstat
+      - grep
+      - egrep
+      - fgrep
+      - sed
+      - cp
+      - mv
+      - rm
+      - rmdir
+      - touch
+      - chmod
+      - chown
+      - ln
+      - date
+      - cal
+      - 'yes'
+      - tac
+      - rev
+      - fold
+      - fmt
+      - numfmt
+      - split
+      - install
+      - mkfifo
+      - cmp
+      - free
+      - setfattr
+      - setfacl
+      - col
+      - crc32
+      - shred
+      - sync
+      - pathchk
+      - getconf
+      - perl-direct
+      disabled_reason: This DBT verify cell has not matched canonically in both the eba3c978e0eb census and the same-recipe, original-epoch confirmation; it remains unselected.
+      disabled:
+        "addr2line": "DBT verify has a retained failed attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+        "as": "DBT verify has a retained failed attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+        "envsubst": "DBT verify has a retained failed attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+        "fallocate": "DBT verify has a retained failed attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+        "logname": "DBT verify has a retained failed attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+        "lua-direct": "DBT verify has an ERROR/no_result attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+        "seq": "DBT verify has a retained failed attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+        "tcl": "DBT verify has a retained failed attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+        "uuidgen": "DBT verify has a retained failed attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+        "diff": "DBT verify has a retained initial canonical divergence in validation at df908e70a84ef3398a444bb0b3a5e36dde8c9d05; a later retry does not qualify this cell for CI."
+        "mkdir": "DBT verify has a retained initial canonical divergence in validation at df908e70a84ef3398a444bb0b3a5e36dde8c9d05; a later retry does not qualify this cell for CI."
   unselected:
     - backend: sabre
       result: crash-error
@@ -1606,6 +1765,167 @@ corpus:
         strictcompat.<program> node, and a failure of that one run failed
         the validation; a second attempt would let a nondeterministic
         program pass
+      # These DBT cells independently met the same two-observation rule.
+      # Ptrace keeps the strict-only label and its original lane budget.
+      additional:
+      - backend: dbt
+        rows:
+        - echo
+        - 'true'
+        - pwd
+        - cat
+        - wc
+        - head
+        - base64
+        - base32
+        - id
+        - bc
+        - dc
+        - awk
+        - xmllint
+        - bash
+        - python3
+        - m4
+        - as
+        - nm
+        - objcopy
+        - objdump
+        - readelf
+        - size
+        - strip
+        - elfedit
+        - gprof
+        - gcov
+        - bzip2
+        - gzip
+        - sort
+        - uniq
+        - tr
+        - cut
+        - tee
+        - paste
+        - comm
+        - join
+        - file
+        - basename
+        - dirname
+        - env
+        - printenv
+        - uname
+        - expr
+        - dd
+        - du
+        - hostname
+        - ss
+        - whoami
+        - nproc
+        - arch
+        - mktemp
+        - sha256sum
+        - sha1sum
+        - md5sum
+        - sha224sum
+        - sha384sum
+        - sha512sum
+        - wc-lines
+        - nl
+        - expand
+        - unexpand
+        - test
+        - bracket
+        - printf
+        - pr
+        - ls
+        - iconv
+        - sleep
+        - stdbuf
+        - nohup
+        - nice
+        - ionice
+        - taskset
+        - chrt
+        - logger
+        - getopt
+        - column
+        - hexdump
+        - xxd
+        - strings
+        - od
+        - sum
+        - cksum
+        - b2sum
+        - tsort
+        - ptx
+        - pinky
+        - users
+        - uptime
+        - vmstat-disk
+        - findmnt
+        - sysctl-random-uuid
+        - lsirq
+        - lsmod
+        - numastat
+        - numactl-hardware
+        - vmstat
+        - diff
+        - grep
+        - egrep
+        - fgrep
+        - sed
+        - cp
+        - mv
+        - rm
+        - mkdir
+        - rmdir
+        - chmod
+        - chown
+        - ln
+        - date
+        - cal
+        - 'yes'
+        - tac
+        - rev
+        - fold
+        - fmt
+        - numfmt
+        - split
+        - install
+        - mkfifo
+        - cmp
+        - free
+        - fallocate
+        - setfattr
+        - setfacl
+        - crc32
+        - uuidgen
+        - shred
+        - getconf
+        - perl-direct
+        disabled_reason: A compat corpus row's strict-compat-only test runs only its verify cell on ptrace
+        disabled:
+          "clang": "DBT verify has a retained failed attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+          "colrm": "DBT verify has a retained failed attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+          "curl": "DBT verify has a retained failed attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+          "envsubst": "DBT verify has a retained failed attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+          "find": "DBT verify has a retained failed attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+          "iostat": "DBT verify has an ERROR/no_result attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+          "ip": "DBT verify has a retained failed attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+          "jq": "DBT verify has a retained failed attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+          "lscpu": "DBT verify has a retained failed attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+          "lua": "DBT verify has a retained failed attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+          "lua-direct": "DBT verify has an ERROR/no_result attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+          "openssl": "DBT verify has a retained failed attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+          "pathchk": "DBT verify has a retained failed attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+          "pidstat-disk": "DBT verify has an ERROR/no_result attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+          "ruby": "DBT verify has an ERROR/no_result attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+          "sar-resource-tables": "DBT verify has an ERROR/no_result attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+          "stat": "DBT verify has a retained failed attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+          "tcl": "DBT verify has a retained failed attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+          "touch": "DBT verify has a retained failed attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+          "xz": "DBT verify has a retained failed attempt in validation at af9b9c8dbb534133ae234626047510a056fb0eff; its earlier two canonical observations do not qualify this cell for CI."
+          "factor": "DBT verify has a retained initial canonical divergence in validation at df908e70a84ef3398a444bb0b3a5e36dde8c9d05; a later retry does not qualify this cell for CI."
+          "seq": "DBT verify has a retained initial canonical divergence in validation at df908e70a84ef3398a444bb0b3a5e36dde8c9d05; a later retry does not qualify this cell for CI."
+          "truncate": "DBT verify has a retained initial canonical divergence in validation at df908e70a84ef3398a444bb0b3a5e36dde8c9d05; a later retry does not qualify this cell for CI."
   rows:
     - {label: "echo", argv: ["/bin/echo", "hermit-compat"]}
     - {label: "true", argv: ["/usr/bin/true"]}
