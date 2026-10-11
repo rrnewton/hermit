@@ -4140,6 +4140,54 @@ mod timeslice_tests {
         NonZeroU64::new(value)
     }
 
+    /// The cap of hermit#4121 only lowers both slice ends, and keeps one RCB
+    /// of room (10 ns at the default clock) plus one nanosecond.
+    #[test]
+    fn a_deadline_cap_lowers_both_slice_ends_and_keeps_one_rcb() {
+        let config = Config {
+            max_timeslice: nz(200_000_000),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+        state.next_timeslice(&config);
+        let now = state.thread_logical_time.as_nanos();
+        let end = state.end_of_timeslice.unwrap();
+        assert_eq!(end, now + Duration::from_nanos(200_000_000));
+        assert_eq!(state.max_timeslice_end, Some(end));
+
+        state.cap_timeslice_at_deadline(Duration::from_nanos(5_000_000), 1.0, false);
+        let capped = now + Duration::from_nanos(5_000_000);
+        assert_eq!(state.end_of_timeslice, Some(capped));
+        assert_eq!(state.max_timeslice_end, Some(capped));
+
+        // A later deadline never raises the end.
+        state.cap_timeslice_at_deadline(Duration::from_nanos(9_000_000), 1.0, false);
+        assert_eq!(state.end_of_timeslice, Some(capped));
+
+        // A deadline already due leaves one RCB and a nanosecond.
+        state.cap_timeslice_at_deadline(Duration::ZERO, 1.0, false);
+        assert_eq!(state.end_of_timeslice, Some(now + Duration::from_nanos(11)));
+        assert_eq!(
+            state.max_timeslice_end,
+            Some(now + Duration::from_nanos(11))
+        );
+    }
+
+    /// Schedule replay follows its recorded turns: the cap leaves its slices
+    /// alone.
+    #[test]
+    fn schedule_replay_takes_no_deadline_cap() {
+        let config = Config {
+            max_timeslice: nz(200_000_000),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+        state.next_timeslice(&config);
+        let end = state.end_of_timeslice;
+        state.cap_timeslice_at_deadline(Duration::from_nanos(5_000), 1.0, true);
+        assert_eq!(state.end_of_timeslice, end);
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1151)
     #[test]

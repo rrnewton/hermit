@@ -12737,6 +12737,133 @@ mod test {
         );
     }
 
+    /// `scheduler` with `tid` queued for a turn, its request already posted.
+    fn queue_request(scheduler: &mut Scheduler, tid: DetTid, request: Resources) {
+        let req = Ivar::new();
+        req.put(Ok(request));
+        scheduler.next_turns.insert(
+            tid,
+            ThreadNextTurn {
+                dettid: tid,
+                child_tid_addr: 0,
+                req,
+                resp: Ivar::new(),
+                protocol: Default::default(),
+            },
+        );
+        scheduler.run_queue.push_back(tid, DEFAULT_PRIORITY);
+    }
+
+    fn sleep_request(tid: DetTid, deadline: LogicalTime) -> Resources {
+        let mut request = Resources::new(tid);
+        request.insert(ResourceID::SleepUntil(deadline), Permission::W);
+        request
+    }
+
+    const NOW_NS: u64 = 5_000_000;
+
+    fn at(offset_ns: u64) -> LogicalTime {
+        LogicalTime::from_nanos(NOW_NS + offset_ns)
+    }
+
+    /// The deadline hint of hermit#4121 is the time from `committed_time` to
+    /// the earliest pending deadline, wherever it is pending.
+    #[test]
+    fn a_grant_hints_the_earliest_pending_deadline_from_every_source() {
+        let granted = DetTid::from_raw(3);
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.committed_time = at(0);
+        assert_eq!(scheduler.deadline_remaining(granted), None);
+
+        scheduler
+            .blocked
+            .timed_waiters
+            .insert(at(9_000), DetTid::from_raw(5));
+        assert_eq!(
+            scheduler.deadline_remaining(granted),
+            Some(Duration::from_nanos(9_000))
+        );
+
+        let sleeper = DetTid::from_raw(7);
+        queue_request(&mut scheduler, sleeper, sleep_request(sleeper, at(7_000)));
+        assert_eq!(
+            scheduler.deadline_remaining(granted),
+            Some(Duration::from_nanos(7_000))
+        );
+
+        let poller = DetTid::from_raw(9);
+        let mut poll = Resources::new(poller);
+        poll.insert(ResourceID::InternalIOPolling, Permission::W);
+        poll.poll_deadline = Some(at(6_000));
+        queue_request(&mut scheduler, poller, poll);
+        assert_eq!(
+            scheduler.deadline_remaining(granted),
+            Some(Duration::from_nanos(6_000))
+        );
+
+        scheduler
+            .poll_deadlines
+            .insert((at(5_000), DetTid::from_raw(11)));
+        assert_eq!(
+            scheduler.deadline_remaining(granted),
+            Some(Duration::from_nanos(5_000))
+        );
+    }
+
+    /// A queued request whose deadline has passed, including a yield's
+    /// `SleepUntil(0)`, is merely runnable and hints nothing; neither does a
+    /// wait with no deadline, nor the granted thread's own request.
+    #[test]
+    fn passed_indefinite_and_own_deadlines_are_no_hint() {
+        let granted = DetTid::from_raw(3);
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.committed_time = at(0);
+
+        let yielder = DetTid::from_raw(5);
+        queue_request(
+            &mut scheduler,
+            yielder,
+            sleep_request(yielder, LogicalTime::from_nanos(0)),
+        );
+        let due = DetTid::from_raw(7);
+        queue_request(&mut scheduler, due, sleep_request(due, at(0)));
+        let pause = DetTid::from_raw(9);
+        queue_request(
+            &mut scheduler,
+            pause,
+            sleep_request(pause, LogicalTime::INDEFINITE),
+        );
+        scheduler
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::INDEFINITE, DetTid::from_raw(11));
+        queue_request(&mut scheduler, granted, sleep_request(granted, at(1_000)));
+        assert_eq!(scheduler.deadline_remaining(granted), None);
+
+        // A timed waiter already due still hints (zero): its turn is next.
+        scheduler
+            .blocked
+            .timed_waiters
+            .insert(at(0), DetTid::from_raw(13));
+        assert_eq!(scheduler.deadline_remaining(granted), Some(Duration::ZERO));
+    }
+
+    /// A hint is taken once: the reply that takes it leaves none behind.
+    #[test]
+    fn a_deadline_hint_is_taken_once() {
+        let tid = DetTid::from_raw(3);
+        let mut scheduler = Scheduler::new(&Config::default());
+        assert_eq!(scheduler.take_deadline_hint(tid), None);
+        scheduler
+            .deadline_hints
+            .insert(tid, Duration::from_nanos(42));
+        assert_eq!(
+            scheduler.take_deadline_hint(tid),
+            Some(Duration::from_nanos(42))
+        );
+        assert_eq!(scheduler.take_deadline_hint(tid), None);
+    }
+
     /// `scheduler` with `sleeper` asleep until 1 µs from now; returns the clock
     /// and the deadline.
     fn add_sleeper(
