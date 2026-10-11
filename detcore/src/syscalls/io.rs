@@ -174,10 +174,7 @@ impl<Guard> StagedMask<Guard> {
 /// re-check #3). The guest's own wrapper and mask may be overwritten: Linux
 /// reads neither, as the call is redirected to the copy, and both are
 /// restored. When no window is free and writable, this returns `None`, and
-/// the call keeps the guest's wrapper, as before the copy existed: Linux's
-/// result then, but a sibling rewriting the mask before the call enters the
-/// kernel makes the entry barrier wait for a mask the kernel never installs,
-/// until its valve ends the run by name. The guest
+/// the caller refuses the call (`refuse_unstageable_pselect6_mask`). The guest
 /// runs no code in between: the call holds the thread in the kernel, a signal
 /// frame is built below the red zone, and a call the kernel restarts comes
 /// back as a new syscall with the guest's own arguments, which is staged
@@ -603,6 +600,39 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Refuses a large-nfds pselect6 with a temporary mask whose private copy
+    /// has nowhere to go: the stack has no writable scratch below its red zone,
+    /// and every red-zone window overlaps one of the call's own buffers
+    /// (`stage_pselect6_mask_copy`). Forwarding the guest's wrapper instead
+    /// would let a sibling change the mask the kernel installs after the
+    /// scheduler has recorded the one it waits for, so the call could time out
+    /// with a wrong answer (Codex re-check #4 of
+    /// https://github.com/rrnewton/hermit/pull/4053). A fail-closed run stops
+    /// with the policy refusal and this message. A run started with
+    /// `--allow-unsupported-syscalls` runs on: the call keeps the guest's
+    /// wrapper, and the scheduler records no temporary mask for it, so it
+    /// waits for nothing the kernel may not install.
+    async fn refuse_unstageable_pselect6_mask<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Pselect6,
+    ) -> Result<i64, Error> {
+        use std::io::Write as _;
+        let message = "unsupported: pselect6 with more than 64 descriptors and a temporary \
+            signal mask, on a stack with no room below its red zone whose red zone the \
+            call's own buffers fill: Hermit has nowhere to put the private copy of the mask \
+            the kernel must install (https://github.com/rrnewton/hermit/pull/4053)";
+        tracing::error!("[tid {}] {message}", guest.tid());
+        if self.cfg.panic_on_unsupported_syscalls {
+            let _ = writeln!(crate::util::RetryingStderr, "{message}");
+            return self
+                .refuse_unserviceable_operation(guest, Sysno::pselect6, Errno::EFAULT)
+                .await;
+        }
+        self.record_or_replay_blocking_with_mask(guest, Syscall::Pselect6(call), None)
+            .await
+    }
+
     /// pselect6 syscall (MAYHANG).
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#686): Review scratch fd sets and scheduler polling.
@@ -743,21 +773,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             .flatten()
             .map(|(start, len)| start..start.saturating_add(len))
             .collect();
-            let staged = stage_pselect6_mask_copy(guest, mask, &live).await?;
-            let staged_call = match &staged {
-                Some(staged) => call.with_sigmask(Addr::from_raw(staged.wrapper)),
-                None => call,
+            let Some(staged) = stage_pselect6_mask_copy(guest, mask, &live).await? else {
+                return self.refuse_unstageable_pselect6_mask(guest, call).await;
             };
             let result = self
                 .record_or_replay_blocking_with_mask(
                     guest,
-                    Syscall::Pselect6(staged_call),
+                    Syscall::Pselect6(call.with_sigmask(Addr::from_raw(staged.wrapper))),
                     Some(kernel_installed_signal_mask(mask)),
                 )
                 .await;
-            if let Some(staged) = staged {
-                staged.release(guest);
-            }
+            staged.release(guest);
             return result;
         }
 

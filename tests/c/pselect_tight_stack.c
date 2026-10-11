@@ -2,7 +2,7 @@
  * stack with no writable memory below its red zone (Codex re-check of
  * https://github.com/rrnewton/hermit/pull/4053).
  *
- * Usage: pselect_tight_stack <tight|adjacent|ample>
+ * Usage: pselect_tight_stack <tight|adjacent|ample|crowded>
  *
  * The call runs on a stack placed 144 (tight), 160 (adjacent) or 1024 (ample)
  * bytes into a writable page with an inaccessible page below it. Each mode
@@ -22,8 +22,6 @@
  *            of the red zone, which a leaf function may use: Linux reads and
  *            writes them, so Hermit must stage nothing there, and the rest of
  *            the red zone must survive too.
- *   crowded  the ready call with nfds 1024 and its 128-byte fd set filling
- *            the whole red zone, so there is no room to stage anything.
  *
  * Then two batches of four threads each make the ready call on a stack of
  * their own at the same depth. The bytes mapped, summed over /proc/self/maps,
@@ -35,7 +33,12 @@
  * may stage there only if it puts the guest's bytes back.
  *
  * Natively every mode prints
- *   mode=<mode> ready=1 signal=-4 alarms=1 restart=0 again=1 aliased=1 crowded=1 maps=1 threads=1 red_zone=1 oracle=1
+ *   mode=<mode> ready=1 signal=-4 alarms=1 restart=0 again=1 aliased=1 maps=1 threads=1 red_zone=1 oracle=1
+ *
+ * Mode crowded makes one call on the tight stack: the ready call with nfds
+ * 1024 and its 128-byte fd set filling the whole red zone, so Hermit has no
+ * room for its private copy of the mask. Natively it prints
+ *   mode=crowded crowded=1 oracle=1
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -216,7 +219,8 @@ int main(int argc, char **argv) {
     size_t offset;
     if (argc != 2)
         return 2;
-    if (!strcmp(argv[1], "tight"))
+    int crowded_mode = !strcmp(argv[1], "crowded");
+    if (!strcmp(argv[1], "tight") || crowded_mode)
         offset = 144; /* 16 bytes below rsp minus the 128-byte red zone */
     else if (!strcmp(argv[1], "adjacent"))
         offset = 160;
@@ -259,6 +263,11 @@ int main(int argc, char **argv) {
         return 9;
     if (write(ready_pipe[1], "x", 1) != 1)
         return 10;
+    if (crowded_mode) {
+        long crowded = select_crowded(stack, ready_pipe[0]);
+        printf("mode=crowded crowded=%ld oracle=%d\n", crowded, crowded == 1);
+        return crowded == 1 ? 0 : 42;
+    }
 
     /* Every mapping the run needs is made before the first count. */
     struct worker workers[WORKERS];
@@ -287,7 +296,6 @@ int main(int argc, char **argv) {
 
     long again = select_on(stack, ready_pipe[0], 2, 0);
     long aliased = select_aliased(stack, ready_pipe[0]);
-    long crowded = select_crowded(stack, ready_pipe[0]);
     long maps_after = mapped_bytes();
 
     int first_batch = run_batch(workers);
@@ -300,11 +308,11 @@ int main(int argc, char **argv) {
                   maps_second == maps_first;
     int red_zone = atomic_load(&red_zone_changed) == 0;
     int oracle = ready == 1 && signal == -EINTR && alarms_seen == 1 && restart == 0 &&
-                 again == 1 && aliased == 1 && crowded == 1 && maps && threads && red_zone;
+                 again == 1 && aliased == 1 && maps && threads && red_zone;
     printf("mode=%s ready=%ld signal=%ld alarms=%d restart=%ld again=%ld aliased=%ld "
-           "crowded=%ld maps=%d threads=%d red_zone=%d oracle=%d\n",
-           argv[1], ready, signal, alarms_seen, restart, again, aliased, crowded, maps,
-           threads, red_zone, oracle);
+           "maps=%d threads=%d red_zone=%d oracle=%d\n",
+           argv[1], ready, signal, alarms_seen, restart, again, aliased, maps, threads,
+           red_zone, oracle);
     if (!oracle)
         fprintf(stderr, "maps before=%ld after=%ld first=%ld second=%ld batches=%d,%d\n",
                 maps_before, maps_after, maps_first, maps_second, first_batch,
