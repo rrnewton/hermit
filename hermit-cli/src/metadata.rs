@@ -247,7 +247,14 @@ impl RecordVersion {
 // futex results, so an older recording replayed here could take the other
 // branch, although no event shape changed (Codex review of
 // https://github.com/rrnewton/hermit/pull/4039).
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x12a);
+// 0x12a -> 0x12b: a precise FUTEX_WAIT woken for a signal that is no longer
+// pending for it re-reads its word and answers EAGAIN if the word changed
+// (EFAULT if unreadable), where it answered 0 as a wakeup; Linux's woken waiter
+// reaches the same EAGAIN through -ERESTARTSYS and the restarted wait. A signal
+// still pending for it is answered before the word is compared (https://github.com/rrnewton/hermit/issues/4033). Replay recomputes
+// precise futex results, so an older recording replayed here could see another
+// result and take another branch, although no event shape changed.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x12b);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -272,7 +279,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x12a);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x12a;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x12b;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -877,6 +884,11 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_that_held_a_committed_sigchld_in_a_futex_wait() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x129)));
+    }
+
+    #[test]
+    fn record_version_rejects_streams_that_answered_a_futex_rewait_as_woken() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x12a)));
     }
 
     /// Record and replay run under ptrace with serialized threads, so their

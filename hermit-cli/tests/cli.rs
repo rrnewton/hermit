@@ -129,6 +129,7 @@ static FUTEX_REQUEUE_WAKE_OP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_LOCK_PI_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_KEYED_ACCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_WAKE_OP_FILE_SHARED_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static FUTEX_REWAIT_CHANGED_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_MULTITHREADED_PROCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_PROCESS_GROUP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_CREATE_RT_SIGNAL_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -21598,6 +21599,90 @@ fn futex_requeue_and_wake_op_match_linux() {
          wake B 1 released waiter 2\n\
          wake B 1 released waiter 3\n",
         "stderr:\n{log}"
+    );
+}
+
+/// A futex waiter whose word changed while it was parked answers EAGAIN when a
+/// signal ends its wait, as Linux does
+/// (https://github.com/rrnewton/hermit/issues/4033). The guest changes the word
+/// under the parked waiter without waking it, then arms a one-shot SIGALRM.
+/// - By default, as natively, the signal goes to the spinning main thread and
+///   the waiter is woken only by the final FUTEX_WAKE: 0.
+/// - When the handler runs on the main thread after the scheduler woke the
+///   waiter for the signal, Linux's woken waiter keeps TIF_SIGPENDING, returns
+///   -ERESTARTSYS, finds nothing to deliver, and its restarted FUTEX_WAIT finds
+///   the changed word: EAGAIN. (Detcore reaches the same answer by re-reading
+///   the word when nothing is pending, as `__futex_wait`'s retry would.)
+/// - When the handler runs on the waiter, its wait is interrupted and restarted
+///   (`SA_RESTART`), and the restarted FUTEX_WAIT finds the changed word:
+///   EAGAIN. Natively, with the signal forced onto the waiter, that is 30/30.
+///
+/// Before the fix both chaos classes answered 0, which Linux cannot produce.
+/// The listed targeted-chaos seeds must each give a legal line, and both
+/// EAGAIN classes must be reached, so a scheduler change that moves the seeds
+/// fails loudly rather than passing without the paths.
+#[test]
+fn a_futex_waiter_woken_for_a_signal_another_thread_takes_rereads_its_word() {
+    let guest = futex_c_guest(
+        &FUTEX_REWAIT_CHANGED_WORD_GUEST,
+        "futex_rewait_changed_word",
+    )
+    .to_str()
+    .unwrap()
+    .to_owned();
+    let run = |extra: &[&str]| {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let mut args = vec!["run", "--strict", "--timeout", "60"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--", guest.as_str()]);
+        let (status, log) = run_with_deadline(
+            hermit_command(&args),
+            directory.path(),
+            Duration::from_secs(120),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{extra:?}: the run must finish and exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        stdout
+    };
+    assert_eq!(run(&[]), "handler on main, waiter woken (0)\n");
+    let (mut retried_on_main, mut restarted_on_waiter) = (0, 0);
+    for seed in ["1", "2", "19", "34"] {
+        let stdout = run(&["--chaos", "--chaos-target-races", "--seed", seed]);
+        match stdout.as_str() {
+            "handler on main, waiter EAGAIN\n" => retried_on_main += 1,
+            "handler on waiter, waiter EAGAIN\n" => restarted_on_waiter += 1,
+            "handler on main, waiter woken (0)\n" => {}
+            other => panic!("seed {seed}: a line Linux cannot produce here: {other:?}"),
+        }
+    }
+    assert!(
+        retried_on_main > 0 && restarted_on_waiter > 0,
+        "the listed chaos seeds no longer reach both EAGAIN paths \
+         (main: {retried_on_main}, waiter: {restarted_on_waiter}); pick new seeds"
+    );
+    // Record and replay recompute futex results; a recording made now replays
+    // to a match, and RECORD_VERSION refuses one made before the change.
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&["record", "--verify", "--", guest.as_str()]),
+        directory.path(),
+        Duration::from_secs(240),
+        false,
+    );
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "record --verify must succeed:\nstderr:\n{log}"
+    );
+    assert!(
+        log.contains("Success: replay matched recording."),
+        "the replay must match the recording:\nstderr:\n{log}"
     );
 }
 
