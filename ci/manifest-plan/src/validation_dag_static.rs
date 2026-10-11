@@ -1340,7 +1340,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // canonical_verdict::tests::run_failure_round_trips_and_names_no_guest_disposition
     // and verify::tests::a_typed_run_failure_replaces_the_stamp_and_an_untyped_error_does_not
     // (the run_failed verification reason) retain all 1023: 1025.
-    ("test.hermit_unit", 1025),
+    // container::tests::{the_keyboard_relay_reads_which_signals_a_guest_catches,
+    // a_relayed_kill_reports_the_terminal_signal}
+    // (https://github.com/rrnewton/hermit/issues/4065) retain all 1025: 1027.
+    ("test.hermit_unit", 1027),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2445,7 +2448,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/dev-hermit/issues/553) retain all 294: 297.
     // group_kills_never_reach_the_host_without_sequentialized_threads
     // (https://github.com/rrnewton/hermit/issues/4057) retains all 297: 298.
-    ("test.cli", 298),
+    // a_namespace_only_guests_group_kill_stays_in_its_own_group
+    // (https://github.com/rrnewton/hermit/issues/4065) retains all 298: 299.
+    ("test.cli", 299),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2669,7 +2674,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Nor do the three HERMIT_VERIFY_TMPDIR tests, which start ptrace guests or
     // none: 233.
     // Nor does the unsequentialized group-kill test: 234.
-    ("test.cli_on_host", 234),
+    // Nor does the namespace-only group-kill test: 235.
+    ("test.cli_on_host", 235),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 55),
@@ -2919,7 +2925,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two signal-target metadata tests: 1022.
     // And the 0x129 record-version refusal test: 1023.
     // And the two run_failed tests: 1025.
-    ("test.hermit_unit_on_host", 1025),
+    // And the two namespace-only keyboard relay tests: 1027.
+    ("test.hermit_unit_on_host", 1027),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
