@@ -3249,8 +3249,14 @@ impl<T> ThreadState<T> {
     ///
     /// Global time advances exactly as this thread's clock does while it runs
     /// alone, so its slice then ends, and it takes a turn, once global time has
-    /// passed that deadline. The slice keeps at least one RCB's worth of time,
-    /// as the post-hook requires of a fresh slice. A schedule replay follows
+    /// passed that deadline. The slice keeps at least one RCB's worth of time.
+    ///
+    /// Only the software slice end moves, which takes effect at the thread's
+    /// next check-in: a syscall, signal or timer event. The PMU maximum keeps
+    /// its value, so a thread that makes no syscalls still runs to it: a
+    /// precise PMU stop at every deadline costs about 70 ms of host time each,
+    /// and a fast timer would make them constant
+    /// (<https://github.com/rrnewton/hermit/issues/4121>). A schedule replay follows
     /// its recorded turns, and a preemption replay its recorded slice ends
     /// until they run out; past the last one it computes slice ends as the
     /// record did, so it caps them as the record did.
@@ -3278,11 +3284,6 @@ impl<T> ThreadState<T> {
                 self.dettid, end, cap, current
             );
             self.end_of_timeslice = Some(cap);
-        }
-        if let Some(max_end) = self.max_timeslice_end
-            && cap < max_end
-        {
-            self.max_timeslice_end = Some(cap);
         }
     }
 
@@ -4147,10 +4148,11 @@ mod timeslice_tests {
         NonZeroU64::new(value)
     }
 
-    /// The cap of hermit#4121 only lowers both slice ends, and keeps one RCB
-    /// of room (10 ns at the default clock) plus one nanosecond.
+    /// The cap of hermit#4121 only lowers the software slice end, keeps one
+    /// RCB of room (10 ns at the default clock) plus one nanosecond, and
+    /// leaves the PMU maximum alone.
     #[test]
-    fn a_deadline_cap_lowers_both_slice_ends_and_keeps_one_rcb() {
+    fn a_deadline_cap_lowers_the_slice_end_and_keeps_one_rcb() {
         let config = Config {
             max_timeslice: nz(200_000_000),
             ..Default::default()
@@ -4165,7 +4167,7 @@ mod timeslice_tests {
         state.cap_timeslice_at_deadline(Duration::from_nanos(5_000_000), 1.0, false);
         let capped = now + Duration::from_nanos(5_000_000);
         assert_eq!(state.end_of_timeslice, Some(capped));
-        assert_eq!(state.max_timeslice_end, Some(capped));
+        assert_eq!(state.max_timeslice_end, Some(end));
 
         // A later deadline never raises the end.
         state.cap_timeslice_at_deadline(Duration::from_nanos(9_000_000), 1.0, false);
@@ -4174,10 +4176,7 @@ mod timeslice_tests {
         // A deadline already due leaves one RCB and a nanosecond.
         state.cap_timeslice_at_deadline(Duration::ZERO, 1.0, false);
         assert_eq!(state.end_of_timeslice, Some(now + Duration::from_nanos(11)));
-        assert_eq!(
-            state.max_timeslice_end,
-            Some(now + Duration::from_nanos(11))
-        );
+        assert_eq!(state.max_timeslice_end, Some(end));
     }
 
     /// Schedule replay follows its recorded turns: the cap leaves its slices
@@ -4521,7 +4520,10 @@ mod timeslice_tests {
         exhausted.cap_timeslice_at_deadline(Duration::from_nanos(1_000), 1.0, false);
         let capped = Some(now + Duration::from_nanos(1_000));
         assert_eq!(exhausted.end_of_timeslice, capped);
-        assert_eq!(exhausted.max_timeslice_end, capped);
+        assert_eq!(
+            exhausted.max_timeslice_end,
+            Some(now + Duration::from_nanos(100_000))
+        );
     }
 
     #[test]
