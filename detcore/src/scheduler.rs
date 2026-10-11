@@ -8851,11 +8851,11 @@ impl Scheduler {
     /// The virtual time left before the earliest deadline a turn would act
     /// on: a timed wait or timer (`timed_waiters`), a backed-off poller's
     /// timeout (`poll_deadlines`), or the deadline of a sleep or poll another
-    /// thread has requested but not yet had a turn for. A sleep becomes a
-    /// timed waiter only at the turn that commits its request, so one queued
-    /// behind the thread being granted would otherwise wait out that thread's
-    /// whole slice. `None` when nothing is pending, or only waits with no
-    /// deadline.
+    /// thread has requested but not yet had a turn for, if still ahead. A
+    /// sleep becomes a timed waiter only at the turn that commits its
+    /// request, so one queued behind the thread being granted would otherwise
+    /// wait out that thread's whole slice. `None` when nothing is pending, or
+    /// only waits with no deadline.
     ///
     /// Both are compared against `committed_time` at turns, and global time
     /// is the sum of every thread's local time, so while the granted thread
@@ -8877,6 +8877,10 @@ impl Scheduler {
                 Some(Ok(request)) => request.queued_deadline(),
                 _ => None,
             })
+            // A deadline already passed (including a yield's `SleepUntil(0)`)
+            // marks a request that is simply runnable, like any other queued
+            // one: it waits its turn and ends no slice.
+            .filter(|deadline| *deadline > self.committed_time)
             .min();
         let earliest = [timed, poll, queued].into_iter().flatten().min()?;
         Some(Duration::from_nanos(
