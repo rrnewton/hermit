@@ -8839,7 +8839,7 @@ impl Scheduler {
                 .map(SchedValue::Value);
             SchedResponse::Go(as_schedvalue)
         };
-        match self.deadline_remaining() {
+        match self.deadline_remaining(dtid) {
             Some(remaining) => self.deadline_hints.insert(dtid, remaining),
             None => self.deadline_hints.remove(&dtid),
         };
@@ -8849,26 +8849,36 @@ impl Scheduler {
     }
 
     /// The virtual time left before the earliest deadline a turn would act
-    /// on: a timed wait or timer (`timed_waiters`) or a backed-off poller's
-    /// timeout (`poll_deadlines`). `None` when nothing is pending, or only
-    /// waits with no deadline.
+    /// on: a timed wait or timer (`timed_waiters`), a backed-off poller's
+    /// timeout (`poll_deadlines`), or the deadline of a sleep or poll another
+    /// thread has requested but not yet had a turn for. A sleep becomes a
+    /// timed waiter only at the turn that commits its request, so one queued
+    /// behind the thread being granted would otherwise wait out that thread's
+    /// whole slice. `None` when nothing is pending, or only waits with no
+    /// deadline.
     ///
     /// Both are compared against `committed_time` at turns, and global time
     /// is the sum of every thread's local time, so while the granted thread
     /// runs alone global time advances exactly as its own clock does. A
     /// thread that ends its slice once this much of its own time has passed
     /// therefore takes a turn no earlier than global time passes the deadline.
-    fn deadline_remaining(&self) -> Option<Duration> {
+    fn deadline_remaining(&self, granted: DetTid) -> Option<Duration> {
         let timed = self
             .blocked
             .timed_waiters
             .next_deadline()
             .filter(|deadline| !deadline.is_indefinite());
         let poll = self.poll_deadlines.first().map(|(deadline, _)| *deadline);
-        let earliest = match (timed, poll) {
-            (Some(a), Some(b)) => a.min(b),
-            (a, b) => a.or(b)?,
-        };
+        let queued = self
+            .run_queue
+            .tids()
+            .filter(|tid| **tid != granted)
+            .filter_map(|tid| match self.next_turns.get(tid)?.req.try_read() {
+                Some(Ok(request)) => request.queued_deadline(),
+                _ => None,
+            })
+            .min();
+        let earliest = [timed, poll, queued].into_iter().flatten().min()?;
         Some(Duration::from_nanos(
             earliest
                 .as_nanos()
