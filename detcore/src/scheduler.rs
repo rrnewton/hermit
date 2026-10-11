@@ -8883,9 +8883,10 @@ impl Scheduler {
         if self.recordreplay_modes {
             return None;
         }
+        // The granted thread's own timer signals count: they must end its
+        // slice too. Only its own queued request (being granted) does not.
         let acts = |tid: DetTid| {
-            tid != granted
-                && !self.pending_run_queue_removals.contains_key(&tid)
+            !self.pending_run_queue_removals.contains_key(&tid)
                 && !self
                     .thread_tree
                     .process_of(tid)
@@ -8911,7 +8912,7 @@ impl Scheduler {
         let queued = self
             .run_queue
             .tids()
-            .filter(|tid| acts(**tid))
+            .filter(|tid| **tid != granted && acts(**tid))
             .filter_map(|tid| {
                 self.next_turns
                     .get(tid)?
@@ -12923,6 +12924,24 @@ mod test {
 
         scheduler.sigkilled_processes.remove(&process);
         assert_eq!(hint(&scheduler, granted), Some(Duration::from_nanos(2_000)));
+    }
+
+    /// The granted thread's own timer counts: a thread that armed an alarm
+    /// must end its slice when the alarm is due, even with nothing else
+    /// pending. Its own queued request does not.
+    #[test]
+    fn the_granted_threads_own_timer_is_a_hint() {
+        let granted = DetTid::from_raw(3);
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.committed_time = at(0);
+        scheduler.blocked.timed_waiters.insert_alarm(
+            at(4_000),
+            DetPid::from_raw(3),
+            granted,
+            nix::sys::signal::Signal::SIGALRM,
+            LogicalTime::ZERO,
+        );
+        assert_eq!(hint(&scheduler, granted), Some(Duration::from_nanos(4_000)));
     }
 
     /// Record/replay records no hint: there the cap is off.
