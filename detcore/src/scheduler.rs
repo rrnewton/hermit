@@ -6238,7 +6238,15 @@ impl Scheduler {
                         })
                     });
 
-                if is_internal_io_polling {
+                // A `pause` or `nanosleep` filed but not yet parked is still
+                // queued. Granting it would park the thread with the signal
+                // already gone by, and a pause would then never return: the run
+                // ended in a false deadlock where Linux returns from the call
+                // (https://github.com/rrnewton/hermit/issues/4126). It is woken
+                // as one already parked is (`NotRunning` below); its own turn
+                // decides again whether the signal ends it.
+                let is_queued_sleep = self.filed_signal_sleep(dettid).is_some();
+                if is_internal_io_polling || is_queued_sleep {
                     assert!(self.run_queue.remove_tid(dettid));
                     let mut rsrcs = Resources::new(dettid);
                     rsrcs.insert(
@@ -19072,6 +19080,40 @@ mod test {
         set_sleeper_state(&mut scheduler, target, sleeper_state(0, 0, 0, 0));
         send_cross_task(&mut scheduler, target, &[libc::SIGTERM], None);
         assert_sleep_woken(&scheduler, target, &[libc::SIGTERM], "queued pause");
+    }
+
+    /// A signal the scheduler sends itself (a child exit's `SIGCHLD`, a timer's
+    /// `SIGALRM`) to a thread whose `pause` or `nanosleep` request is filed but
+    /// still queued, not yet parked, ends it in place, as it ends one already
+    /// parked: the thread stays queued exactly once with the signal as its
+    /// request, on every backend. Before, the queued sleep was left alone, and
+    /// a pause parked with the signal gone by, a false deadlock
+    /// (https://github.com/rrnewton/hermit/issues/4126).
+    #[test]
+    fn a_scheduler_signal_ends_a_sleep_still_on_the_run_queue() {
+        for (models_signal_targets, deadline, fyi) in [
+            (true, LogicalTime::INDEFINITE, PAUSE_FYI),
+            (false, LogicalTime::INDEFINITE, PAUSE_FYI),
+            (true, LogicalTime::from_nanos(1_000_000_000), NANOSLEEP_FYI),
+        ] {
+            let case = format!("{fyi}, models_signal_targets={models_signal_targets}");
+            let mut scheduler = gated_scheduler();
+            scheduler.models_signal_targets = models_signal_targets;
+            let target = filed_sleep(&mut scheduler, deadline, fyi, true);
+            assert!(scheduler.filed_signal_sleep(target).is_some(), "{case}");
+            scheduler.wake_signaled_guest(target, Signal::SIGCHLD);
+            assert_eq!(
+                scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
+                vec![target],
+                "{case}"
+            );
+            assert_eq!(
+                scheduler.inbound_signals(target),
+                vec![SigWrapper(libc::SIGCHLD)],
+                "{case}"
+            );
+            assert_eq!(scheduler.filed_signal_sleep(target), None, "{case}");
+        }
     }
 
     /// Signals a pause does not return for leave it parked: one its mask

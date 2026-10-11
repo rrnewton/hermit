@@ -106,6 +106,13 @@ impl Scheduler {
         if !self.models_signal_targets {
             return None;
         }
+        self.filed_signal_sleep(dettid)
+    }
+
+    /// The emulated sleep `dettid`'s filed request is, a `pause` or a
+    /// `nanosleep`, on any backend: a signal the scheduler itself sends ends it
+    /// whether it is still queued or already parked (`wake_signaled_guest`).
+    pub(super) fn filed_signal_sleep(&self, dettid: DetTid) -> Option<SignalSleep> {
         let resources = self.next_turns.get(&dettid)?.req.try_read()?.ok()?;
         if resources.resources.len() != 1 {
             return None;

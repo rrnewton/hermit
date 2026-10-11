@@ -120,6 +120,7 @@ static HB_RELATIVE_ANCHOR_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_CHILD_WAIT_CYCLE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_KILL_HELD_CHILD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_HERMIT_TASKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PAUSE_SIGCHLD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_POSTHOOK_FUTEX_INTERRUPT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_PIPE_READ_HELD_WRITER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_TIMEOUT_VS_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1009,6 +1010,31 @@ fn kill_multithreaded_process_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "kill-multithreaded-process guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn pause_sigchld_guest() -> &'static Path {
+    PAUSE_SIGCHLD_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("pause-sigchld");
+        fs::create_dir_all(&build_root).expect("failed to create pause-sigchld directory");
+        let guest = build_root.join("pause_sigchld");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/pause_sigchld.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile pause-sigchld guest");
+        assert!(
+            output.status.success(),
+            "pause-sigchld guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -21937,6 +21963,31 @@ fn a_namespace_only_run_on_a_terminal_keeps_its_terminal_behaviour() {
         status.signal(),
         Some(libc::SIGINT),
         "Ctrl-C must end the run as SIGINT: {status:?}\n{transcript}"
+    );
+}
+
+/// A parent waiting in `pause()` for a child's `SIGCHLD` returns from it, as
+/// on Linux. The scheduler sends that `SIGCHLD` when the child exits, which can
+/// be while the parent's pause request is filed but still queued; the signal
+/// was dropped there, the pause parked with it gone by, and the run ended in a
+/// false "Deadlock detected" (https://github.com/rrnewton/hermit/issues/4126).
+#[test]
+fn a_pause_returns_for_a_childs_sigchld() {
+    let guest = pause_sigchld_guest().to_str().unwrap().to_owned();
+    let command = hermit_command(&["run", "--strict", "--timeout", "60", "--", guest.as_str()]);
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) =
+        run_with_deadline(command, directory.path(), Duration::from_secs(120), false);
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "{status:?}\nstdout:\n{stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(
+        stdout, "SIGCHLD handled: 1, child exit status: 0\n",
+        "stderr:\n{log}"
     );
 }
 
