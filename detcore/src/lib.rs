@@ -2315,7 +2315,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
 
         // Except for the root task, let's block until it's our turn to go:
-        let th = tool_global::thread_start_request(&self.cfg, guest, detpid).await;
+        let (th, deadline) = tool_global::thread_start_request(&self.cfg, guest, detpid).await;
 
         // Finish the delayed initialization of the full threadstate:
         {
@@ -2323,6 +2323,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             ts.preemption_points = th.map(|x| x.into_iter());
             ts.next_timeslice(&self.cfg); // Must be after preemption_points is set.
         }
+        tool_global::cap_timeslice_at_deadline(guest, deadline);
 
         // The prehook is a noop for a thread just starting.  Can't end the timeslice.  There's no
         // RCB progress to record.  However, we call it for consistency with all the other handlers.

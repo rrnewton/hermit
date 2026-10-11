@@ -2453,7 +2453,10 @@ impl GlobalTool for GlobalState {
                     )
                     .await
                 {
-                    SchedulerRpcResult::Continue(history) => R::StartNewThread(history),
+                    SchedulerRpcResult::Continue(history) => R::StartNewThread(
+                        history,
+                        self.sched.lock().unwrap().take_deadline_hint(dtid),
+                    ),
                     SchedulerRpcResult::ThreadExited => R::ThreadExited,
                 }
             }
@@ -4470,7 +4473,9 @@ pub enum GlobalResponse {
     MarkPastFirstExecve(ExecFdBlockingOverrides),
     CreateChildThread(Option<MmId>),
     /// Includes optional preemption points for the new thread.
-    StartNewThread(Option<ThreadHistory>),
+    /// The thread's preemption history to replay, and its first grant's
+    /// deadline hint, as in [`GlobalResponse::RequestResources`].
+    StartNewThread(Option<ThreadHistory>, Option<Duration>),
     DeregisterThread(()),
     SetChildTidAddress(()),
     SetSavedGuestSigmask(()),
@@ -4925,12 +4930,12 @@ where
 /// Blocking: future returns only when the thread execution is truly ready to proceed.
 ///
 /// Returns: a history of the thread preemptions, for it to play back when --replay-preemptions-from
-/// is used.
+/// is used, and the deadline hint of the grant that starts the thread.
 pub async fn thread_start_request<G, T>(
     cfg: &Config,
     guest: &mut G,
     detpid: DetPid,
-) -> Option<ThreadHistory>
+) -> (Option<ThreadHistory>, Option<Duration>)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -4950,14 +4955,14 @@ where
         )
         .await;
         match resp.1 {
-            GlobalResponse::StartNewThread(preempts) => {
+            GlobalResponse::StartNewThread(preempts, deadline) => {
                 trace!("[detcore, dtid {}] new thread UNBLOCKED (post-rpc)", dettid);
-                preempts
+                (preempts, deadline)
             }
             _ => unreachable!(),
         }
     } else {
-        None
+        (None, None)
     }
 }
 
@@ -7997,7 +8002,7 @@ mod tests {
         if child_first {
             assert_eq!(
                 startup.as_mut().await,
-                (None, GlobalResponse::StartNewThread(None))
+                (None, GlobalResponse::StartNewThread(None, None))
             );
         } else {
             assert_eq!(
@@ -8049,7 +8054,10 @@ mod tests {
                 (None, GlobalResponse::CreateChildThread(None))
             );
         } else {
-            assert_eq!(startup.await, (None, GlobalResponse::StartNewThread(None)));
+            assert_eq!(
+                startup.await,
+                (None, GlobalResponse::StartNewThread(None, None))
+            );
         }
         let mut scheduler = state.sched.lock().unwrap();
         let next_time = scheduler.committed_time;
@@ -8154,7 +8162,10 @@ mod tests {
         .await
         .expect("vfork child must receive its first turn");
         assert_eq!(first.tid, child);
-        assert_eq!(startup.await, (None, GlobalResponse::StartNewThread(None)));
+        assert_eq!(
+            startup.await,
+            (None, GlobalResponse::StartNewThread(None, None))
+        );
         assert_eq!(state.global_time.lock().unwrap().as_nanos(), before_child);
     }
 
@@ -8341,7 +8352,10 @@ mod tests {
         .await
         .expect("replacement leader must run");
         assert_eq!(first.tid, leader);
-        assert_eq!(startup.await, (None, GlobalResponse::StartNewThread(None)));
+        assert_eq!(
+            startup.await,
+            (None, GlobalResponse::StartNewThread(None, None))
+        );
         assert_eq!(state.global_time.lock().unwrap().as_nanos(), total);
 
         fresh.advance_to(fresh.as_nanos() + LogicalTime::from_nanos(1));
@@ -8509,7 +8523,10 @@ mod tests {
             .await;
         assert_eq!(
             start_response,
-            (Some(thread_before), GlobalResponse::StartNewThread(None))
+            (
+                Some(thread_before),
+                GlobalResponse::StartNewThread(None, None)
+            )
         );
 
         let scheduler = state.sched.lock().unwrap();
@@ -8726,7 +8743,7 @@ mod tests {
             start_response,
             (
                 Some(worker_clock.as_nanos()),
-                GlobalResponse::StartNewThread(None)
+                GlobalResponse::StartNewThread(None, None)
             )
         );
         {
