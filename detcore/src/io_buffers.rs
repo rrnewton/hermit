@@ -1125,7 +1125,7 @@ mod event_tests {
                         .lock()
                         .unwrap()
                         .extend(request.resources.keys().cloned());
-                    GlobalResponse::RequestResources(ResumeStatus::Normal, None)
+                    GlobalResponse::RequestResources(ResumeStatus::Normal)
                 }
                 GlobalRequest::RequestResources(request, _) => {
                     assert_eq!(request.resources.len(), 1);
@@ -1148,7 +1148,7 @@ mod event_tests {
                         }
                         attempt => panic!("unexpected extra readv poll {attempt}"),
                     }
-                    GlobalResponse::RequestResources(ResumeStatus::Normal, None)
+                    GlobalResponse::RequestResources(ResumeStatus::Normal)
                 }
                 GlobalRequest::ReleaseAllResources => {
                     self.audit_call("release");

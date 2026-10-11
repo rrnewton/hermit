@@ -8927,16 +8927,21 @@ impl Scheduler {
         ))
     }
 
-    /// The deadline hint for a thread that has just registered a timer in
-    /// its own turn, measured from the `now` the timer was armed against: the
-    /// grant's hint could not include it.
-    pub fn deadline_hint_after_arming(&self, dtid: DetTid, now: LogicalTime) -> Option<Duration> {
-        self.deadline_remaining_from(dtid, now)
+    /// Record the deadline hint for a thread that has just armed or re-armed
+    /// a timer during its own turn, measured from the `now` the timer was
+    /// armed against: the hint of the grant it runs under could not include
+    /// that deadline. The reply to the arming request carries it.
+    pub fn note_arming_hint(&mut self, dtid: DetTid, now: LogicalTime) {
+        match self.deadline_remaining_from(dtid, now) {
+            Some(remaining) => self.deadline_hints.insert(dtid, remaining),
+            None => self.deadline_hints.remove(&dtid),
+        };
     }
 
-    /// Take the deadline hint recorded when `dtid` was last granted a turn.
-    /// A resource request clears it on arrival, so a reply takes only the
-    /// hint of the grant it answers.
+    /// Take the deadline hint recorded when `dtid` was last granted a turn or
+    /// armed a timer. Every request clears it on arrival
+    /// (`GlobalState::receive_rpc`), so a reply takes only a hint recorded
+    /// while its own request was pending.
     pub fn take_deadline_hint(&mut self, dtid: DetTid) -> Option<Duration> {
         self.deadline_hints.remove(&dtid)
     }

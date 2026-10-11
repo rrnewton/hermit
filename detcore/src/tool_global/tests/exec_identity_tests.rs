@@ -1396,10 +1396,7 @@ async fn reused_exec_worker_start_waits_for_parent_registration_before_clock_or_
     .await
     .expect("registered reused newborn must receive a real grant");
     assert_eq!(child_turn.tid, WORKER);
-    assert_eq!(
-        startup.await,
-        (None, GlobalResponse::StartNewThread(None, None))
-    );
+    assert_eq!(startup.await, (None, GlobalResponse::StartNewThread(None)));
     assert_eq!(fixture.state.sched.lock().unwrap().turn, 2);
     let total = fixture.before_tail + LogicalTime::from_nanos(497);
     assert_eq!(fixture.state.global_time.lock().unwrap().as_nanos(), total);
@@ -1522,10 +1519,7 @@ async fn reused_exec_worker_vfork_registration_requires_creation_mode(
     assert!(background.is_err());
     assert_eq!(
         blocking.await,
-        (
-            None,
-            GlobalResponse::RequestResources(ResumeStatus::Normal, None)
-        )
+        (None, GlobalResponse::RequestResources(ResumeStatus::Normal))
     );
     let before = serde_json::to_value(&*fixture.state.global_time.lock().unwrap()).unwrap();
     let before_total = fixture.state.global_time.lock().unwrap().as_nanos();
@@ -1666,10 +1660,7 @@ async fn reused_exec_worker_vfork_registration_requires_creation_mode(
     .await
     .expect("authorized reused vfork child must receive its first turn");
     assert_eq!(turn.tid, WORKER);
-    assert_eq!(
-        startup.await,
-        (None, GlobalResponse::StartNewThread(None, None))
-    );
+    assert_eq!(startup.await, (None, GlobalResponse::StartNewThread(None)));
     assert_eq!(fixture.state.sched.lock().unwrap().turn, 3);
     assert_eq!(
         fixture.state.global_time.lock().unwrap().as_nanos(),

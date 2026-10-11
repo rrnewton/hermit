@@ -1808,6 +1808,38 @@ impl GlobalTool for GlobalState {
     }
 
     async fn receive_rpc(&self, from: Tid, gr: Self::Request) -> Self::Response {
+        // The deadline hint of https://github.com/rrnewton/hermit/issues/4121
+        // rides on whichever reply resumes the thread after its grant: an
+        // ordinary or parked resource grant, a futex wake, a parent's
+        // continuation, thread start, the exec continuation. Clearing on
+        // arrival means a reply carries only a hint recorded while its own
+        // request was pending (a grant, or a timer the request armed).
+        // Only a request whose reply resumes the thread from a grant, or arms
+        // a timer, touches the hint: control messages sent on another task's
+        // behalf must neither consume nor carry it.
+        if !resumes_from_grant(&gr.2) {
+            return self.dispatch_rpc(from, gr).await;
+        }
+        let dtid = DetTid::from_raw(from.as_raw());
+        self.sched.lock().unwrap().take_deadline_hint(dtid);
+        let (time, response) = self.dispatch_rpc(from, gr).await;
+        let hint = self.sched.lock().unwrap().take_deadline_hint(dtid);
+        match hint {
+            Some(remaining) if response != GlobalResponse::ThreadExited => (
+                time,
+                GlobalResponse::WithDeadline(remaining, Box::new(response)),
+            ),
+            _ => (time, response),
+        }
+    }
+}
+
+impl GlobalState {
+    async fn dispatch_rpc(
+        &self,
+        from: Tid,
+        gr: <Self as GlobalTool>::Request,
+    ) -> <Self as GlobalTool>::Response {
         // Records an in-guest Tool forwarded before sending this request are queued,
         // and the sender's are written now if it runs alone (the order rule at
         // `detlog::set_forwarded_source`).
@@ -2097,11 +2129,7 @@ impl GlobalTool for GlobalState {
                     .recv_request_resources(from, process, resources, Some(request_mm))
                     .await;
                 match response {
-                    SchedulerRpcResult::Continue(status) => R::ResumeExec(
-                        status,
-                        duration,
-                        self.sched.lock().unwrap().take_deadline_hint(dtid),
-                    ),
+                    SchedulerRpcResult::Continue(status) => R::ResumeExec(status, duration),
                     SchedulerRpcResult::ThreadExited => R::ThreadExited,
                 }
             }
@@ -2135,9 +2163,7 @@ impl GlobalTool for GlobalState {
                     )
                     .await;
                 match response {
-                    SchedulerRpcResult::Continue(r) => {
-                        R::ParkedRequest(r, self.sched.lock().unwrap().take_deadline_hint(dtid))
-                    }
+                    SchedulerRpcResult::Continue(r) => R::ParkedRequest(r),
                     SchedulerRpcResult::ThreadExited => R::ThreadExited,
                 }
             }
@@ -2183,10 +2209,7 @@ impl GlobalTool for GlobalState {
                     .recv_request_resources(from, pid, rs, Some(request_mm))
                     .await;
                 match response {
-                    SchedulerRpcResult::Continue(response) => R::RequestResources(
-                        response,
-                        self.sched.lock().unwrap().take_deadline_hint(dtid),
-                    ),
+                    SchedulerRpcResult::Continue(response) => R::RequestResources(response),
                     SchedulerRpcResult::ThreadExited => R::ThreadExited,
                 }
             }
@@ -2457,10 +2480,7 @@ impl GlobalTool for GlobalState {
                     )
                     .await
                 {
-                    SchedulerRpcResult::Continue(history) => R::StartNewThread(
-                        history,
-                        self.sched.lock().unwrap().take_deadline_hint(dtid),
-                    ),
+                    SchedulerRpcResult::Continue(history) => R::StartNewThread(history),
                     SchedulerRpcResult::ThreadExited => R::ThreadExited,
                 }
             }
@@ -2567,7 +2587,7 @@ impl GlobalTool for GlobalState {
             // TODO-HUMAN-REVIEW(#869)
             GlobalRequest::RegisterAlarm(dpid, dtid, duration, interval, sig) => {
                 let now = self.global_time.lock().unwrap().as_nanos();
-                match self
+                let response = match self
                     .recv_register_alarm(
                         dpid,
                         RpcIncarnation {
@@ -2581,15 +2601,11 @@ impl GlobalTool for GlobalState {
                     )
                     .await
                 {
-                    SchedulerRpcResult::Continue(remaining) => R::RegisterAlarm(
-                        remaining,
-                        self.sched
-                            .lock()
-                            .unwrap()
-                            .deadline_hint_after_arming(dtid, now),
-                    ),
+                    SchedulerRpcResult::Continue(remaining) => R::RegisterAlarm(remaining),
                     SchedulerRpcResult::ThreadExited => R::ThreadExited,
-                }
+                };
+                self.sched.lock().unwrap().note_arming_hint(dtid, now);
+                response
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-841): Review logical alarm query RPC.
@@ -2608,7 +2624,7 @@ impl GlobalTool for GlobalState {
             // TODO-HUMAN-REVIEW(#869)
             GlobalRequest::RegisterPosixTimer(dpid, dtid, timer_id, deadline, interval, sig) => {
                 let now = self.global_time.lock().unwrap().as_nanos();
-                match self
+                let response = match self
                     .recv_register_posix_timer(
                         dpid,
                         RpcIncarnation {
@@ -2622,14 +2638,11 @@ impl GlobalTool for GlobalState {
                     )
                     .await
                 {
-                    SchedulerRpcResult::Continue(()) => R::RegisterPosixTimer(
-                        self.sched
-                            .lock()
-                            .unwrap()
-                            .deadline_hint_after_arming(dtid, now),
-                    ),
+                    SchedulerRpcResult::Continue(()) => R::RegisterPosixTimer(()),
                     SchedulerRpcResult::ThreadExited => R::ThreadExited,
-                }
+                };
+                self.sched.lock().unwrap().note_arming_hint(dtid, now);
+                response
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#663)
@@ -2844,9 +2857,7 @@ impl GlobalTool for GlobalState {
         };
         (time_update, resp)
     }
-}
 
-impl GlobalState {
     async fn recv_resources_with_origin(
         &self,
         from: Tid,
@@ -2875,7 +2886,6 @@ impl GlobalState {
                 "[detcore, dtid {}] ResourceRequest, filling request into {}",
                 &dettid, &nextturn.req
             );
-            sched.take_deadline_hint(dettid);
             if let Some(mm) = request_mm
                 && let Err(error) = sched.install_resource_origin(
                     dettid,
@@ -4467,11 +4477,14 @@ pub enum GlobalResponse {
     /// The scheduler permanently removed this raw TID. Guest-side RPC handling retires
     /// this task without cancelling a live group-exit issuer or resuming the operation.
     ThreadExited,
-    /// A grant, with the virtual time that remained before the earliest
-    /// pending deadline when it was made (`Scheduler::deadline_remaining`).
-    RequestResources(ResumeStatus, Option<Duration>),
-    ParkedRequest(ResourceReply, Option<Duration>),
-    ResumeParkedRequest(ResourceReply, Option<Duration>),
+    /// A reply, with the virtual time that remained before the earliest
+    /// pending deadline when the thread was granted the turn it resumes, or
+    /// armed a timer (`Scheduler::deadline_remaining_from`). Unwrapped by
+    /// [`send_and_update_time`], which caps the thread's slice there.
+    WithDeadline(Duration, Box<GlobalResponse>),
+    RequestResources(ResumeStatus),
+    ParkedRequest(ResourceReply),
+    ResumeParkedRequest(ResourceReply),
     FinishParkedObservation(Result<FinishAck, ProtocolFailure>),
     SignalDequeued {
         ack: Result<DequeueAck, TimerFailure>,
@@ -4484,16 +4497,12 @@ pub enum GlobalResponse {
     PrepareExec(()),
     CancelExec(()),
     ReconnectExec(bool),
-    /// The exec continuation's grant, its replay duration, and its deadline
-    /// hint, as in [`GlobalResponse::RequestResources`].
-    ResumeExec(ResumeStatus, Option<LogicalTime>, Option<Duration>),
+    ResumeExec(ResumeStatus, Option<LogicalTime>),
     RetireExec(bool),
     MarkPastFirstExecve(ExecFdBlockingOverrides),
     CreateChildThread(Option<MmId>),
     /// Includes optional preemption points for the new thread.
-    /// The thread's preemption history to replay, and its first grant's
-    /// deadline hint, as in [`GlobalResponse::RequestResources`].
-    StartNewThread(Option<ThreadHistory>, Option<Duration>),
+    StartNewThread(Option<ThreadHistory>),
     DeregisterThread(()),
     SetChildTidAddress(()),
     SetSavedGuestSigmask(()),
@@ -4516,14 +4525,10 @@ pub enum GlobalResponse {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     // TODO-HUMAN-REVIEW(#869)
-    /// The previous alarm's remaining time and interval, and the deadline
-    /// hint after arming the new one
-    /// ([`Scheduler::deadline_hint_after_arming`](crate::scheduler::Scheduler::deadline_hint_after_arming)).
-    RegisterAlarm((LogicalTime, LogicalTime), Option<Duration>),
+    RegisterAlarm((LogicalTime, LogicalTime)),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#869)
-    /// The deadline hint after arming, as for [`GlobalResponse::RegisterAlarm`].
-    RegisterPosixTimer(Option<Duration>),
+    RegisterPosixTimer(()),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-841): Review logical alarm query RPC.
     ReadyChildWait((Option<DetPid>, bool)),
@@ -4814,7 +4819,16 @@ where
     );
     let mytime = guest.thread_state().thread_logical_time.clone();
     let mm = guest.thread_state().mm_id;
-    let resp = guest.send_rpc((mytime, mm, counted_request(request))).await;
+    let mut resp = guest.send_rpc((mytime, mm, counted_request(request))).await;
+    let deadline = match resp.1 {
+        GlobalResponse::WithDeadline(remaining, response) => {
+            resp.1 = *response;
+            Some(remaining)
+        }
+        _ => None,
+    };
+    guest.thread_state_mut().last_grant_deadline = deadline;
+    cap_timeslice_at_deadline(guest, deadline);
     if resp.1 == GlobalResponse::ThreadExited {
         let dettid = guest.thread_state().dettid;
         trace!(
@@ -4856,8 +4870,32 @@ enum SchedulerRpcResult<T> {
     ThreadExited,
 }
 
-/// End a granted thread's slice no later than the earliest deadline that was
-/// pending at its grant (<https://github.com/rrnewton/hermit/issues/4121>).
+/// Whether the reply to `request` can resume its thread from a scheduler grant
+/// (`Scheduler::unblock_guest`), or answers a timer it armed: the requests
+/// whose replies carry a deadline hint
+/// (<https://github.com/rrnewton/hermit/issues/4121>). Every handler that
+/// awaits a grant is reached from one of these.
+fn resumes_from_grant(request: &GlobalRequest) -> bool {
+    match request {
+        GlobalRequest::WithForwardedCount(_, request) => resumes_from_grant(request),
+        GlobalRequest::RequestResources(..)
+        | GlobalRequest::ParkedRequest(..)
+        | GlobalRequest::ResumeParkedRequest { .. }
+        | GlobalRequest::ResumeExec(..)
+        | GlobalRequest::CreateChildThread(..)
+        | GlobalRequest::CreateVforkChildThread(..)
+        | GlobalRequest::StartNewThread(..)
+        | GlobalRequest::FutexAction(..)
+        | GlobalRequest::TraceSchedEvent(..)
+        | GlobalRequest::RegisterAlarm(..)
+        | GlobalRequest::RegisterPosixTimer(..) => true,
+        _ => false,
+    }
+}
+
+/// End this thread's slice no later than the earliest deadline that was
+/// pending when it was granted the turn it resumes
+/// (<https://github.com/rrnewton/hermit/issues/4121>).
 ///
 /// A deadline is acted on only at a scheduler turn, and a thread running a
 /// long slice of cheap syscalls takes none, so without this a sleeper's
@@ -4914,12 +4952,11 @@ where
         let resp =
             send_and_update_time(guest, GlobalRequest::RequestResources(r.clone(), detpid)).await;
         match resp.1 {
-            GlobalResponse::RequestResources(x, deadline) => {
+            GlobalResponse::RequestResources(x) => {
                 trace!(
                     "[detcore, dtid {}] UNBLOCKED, acquired resources: {:?}",
                     &dettid, r
                 );
-                cap_timeslice_at_deadline(guest, deadline);
                 x
             }
             _ => unreachable!(),
@@ -4952,12 +4989,12 @@ where
 /// Blocking: future returns only when the thread execution is truly ready to proceed.
 ///
 /// Returns: a history of the thread preemptions, for it to play back when --replay-preemptions-from
-/// is used, and the deadline hint of the grant that starts the thread.
+/// is used.
 pub async fn thread_start_request<G, T>(
     cfg: &Config,
     guest: &mut G,
     detpid: DetPid,
-) -> (Option<ThreadHistory>, Option<Duration>)
+) -> Option<ThreadHistory>
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -4977,14 +5014,14 @@ where
         )
         .await;
         match resp.1 {
-            GlobalResponse::StartNewThread(preempts, deadline) => {
+            GlobalResponse::StartNewThread(preempts) => {
                 trace!("[detcore, dtid {}] new thread UNBLOCKED (post-rpc)", dettid);
-                (preempts, deadline)
+                preempts
             }
             _ => unreachable!(),
         }
     } else {
-        (None, None)
+        None
     }
 }
 
@@ -5744,10 +5781,7 @@ where
     )
     .await;
     match resp.1 {
-        GlobalResponse::RegisterAlarm(x, deadline) => {
-            cap_timeslice_at_deadline(guest, deadline);
-            x
-        }
+        GlobalResponse::RegisterAlarm(x) => x,
         _ => unreachable!(),
     }
 }
@@ -5796,7 +5830,7 @@ pub async fn register_posix_timer<G, T>(
     )
     .await;
     match resp.1 {
-        GlobalResponse::RegisterPosixTimer(deadline) => cap_timeslice_at_deadline(guest, deadline),
+        GlobalResponse::RegisterPosixTimer(()) => {}
         _ => unreachable!(),
     }
 }
@@ -8027,7 +8061,7 @@ mod tests {
         if child_first {
             assert_eq!(
                 startup.as_mut().await,
-                (None, GlobalResponse::StartNewThread(None, None))
+                (None, GlobalResponse::StartNewThread(None))
             );
         } else {
             assert_eq!(
@@ -8079,10 +8113,7 @@ mod tests {
                 (None, GlobalResponse::CreateChildThread(None))
             );
         } else {
-            assert_eq!(
-                startup.await,
-                (None, GlobalResponse::StartNewThread(None, None))
-            );
+            assert_eq!(startup.await, (None, GlobalResponse::StartNewThread(None)));
         }
         let mut scheduler = state.sched.lock().unwrap();
         let next_time = scheduler.committed_time;
@@ -8135,10 +8166,7 @@ mod tests {
         assert!(background.is_err());
         assert_eq!(
             blocking.await,
-            (
-                None,
-                GlobalResponse::RequestResources(ResumeStatus::Normal, None)
-            )
+            (None, GlobalResponse::RequestResources(ResumeStatus::Normal))
         );
         let before_child = state.global_time.lock().unwrap().as_nanos();
         assert_eq!(before_child, epoch + LogicalTime::from_nanos(1_001));
@@ -8187,10 +8215,7 @@ mod tests {
         .await
         .expect("vfork child must receive its first turn");
         assert_eq!(first.tid, child);
-        assert_eq!(
-            startup.await,
-            (None, GlobalResponse::StartNewThread(None, None))
-        );
+        assert_eq!(startup.await, (None, GlobalResponse::StartNewThread(None)));
         assert_eq!(state.global_time.lock().unwrap().as_nanos(), before_child);
     }
 
@@ -8377,10 +8402,7 @@ mod tests {
         .await
         .expect("replacement leader must run");
         assert_eq!(first.tid, leader);
-        assert_eq!(
-            startup.await,
-            (None, GlobalResponse::StartNewThread(None, None))
-        );
+        assert_eq!(startup.await, (None, GlobalResponse::StartNewThread(None)));
         assert_eq!(state.global_time.lock().unwrap().as_nanos(), total);
 
         fresh.advance_to(fresh.as_nanos() + LogicalTime::from_nanos(1));
@@ -8548,10 +8570,7 @@ mod tests {
             .await;
         assert_eq!(
             start_response,
-            (
-                Some(thread_before),
-                GlobalResponse::StartNewThread(None, None)
-            )
+            (Some(thread_before), GlobalResponse::StartNewThread(None))
         );
 
         let scheduler = state.sched.lock().unwrap();
@@ -8768,7 +8787,7 @@ mod tests {
             start_response,
             (
                 Some(worker_clock.as_nanos()),
-                GlobalResponse::StartNewThread(None, None)
+                GlobalResponse::StartNewThread(None)
             )
         );
         {

@@ -2237,6 +2237,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     chaos_slowdown_active: false,
                     pending_chaos_epochs: Vec::new(),
                     max_timeslice_end: None,
+                    last_grant_deadline: None,
                     last_rcb_timer: None,
                     last_rcb_timer_is_max: false,
 
@@ -2315,7 +2316,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
 
         // Except for the root task, let's block until it's our turn to go:
-        let (th, deadline) = tool_global::thread_start_request(&self.cfg, guest, detpid).await;
+        let th = tool_global::thread_start_request(&self.cfg, guest, detpid).await;
 
         // Finish the delayed initialization of the full threadstate:
         {
@@ -2323,6 +2324,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             ts.preemption_points = th.map(|x| x.into_iter());
             ts.next_timeslice(&self.cfg); // Must be after preemption_points is set.
         }
+        // The start grant's deadline hint arrived before the first slice
+        // existed; cap the slice now.
+        let deadline = guest.thread_state_mut().last_grant_deadline.take();
         tool_global::cap_timeslice_at_deadline(guest, deadline);
 
         // The prehook is a noop for a thread just starting.  Can't end the timeslice.  There's no

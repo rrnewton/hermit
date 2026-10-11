@@ -2244,6 +2244,12 @@ pub struct ThreadState<T> {
     /// `end_of_timeslice` so syscall-heavy workloads can use a shorter, cheap target deadline.
     pub max_timeslice_end: Option<LogicalTime>,
 
+    /// The deadline hint carried by the last scheduler reply this thread
+    /// received ([`ThreadState::cap_timeslice_at_deadline`]). Applied when the
+    /// reply arrives, and again by the two paths that then install a fresh
+    /// slice end: thread start and the exec continuation.
+    pub last_grant_deadline: Option<Duration>,
+
     /// Track what our last timer was set for, just to double check that RCB timers are behaving
     /// as expected and see if we went over.  (For exmaple, this behaves badly if threads are not
     /// pinned and our we migrate between cores.)
@@ -2708,6 +2714,7 @@ impl<T> ThreadState<T> {
             chaos_slowdown_active: false,
             pending_chaos_epochs: Vec::new(),
             max_timeslice_end: None,
+            last_grant_deadline: None,
             last_rcb_timer: None,
             last_rcb_timer_is_max: false,
             record_or_replay,
