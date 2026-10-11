@@ -326,6 +326,12 @@ impl RunQueue {
         self.push_back(tid, priority)
     }
 
+    /// The priority of the band that runs last among the queued threads (the
+    /// numerically largest), or `None` if the queue is empty.
+    pub fn last_queued_priority(&self) -> Option<Priority> {
+        self.queue.keys().next_back().map(|k| k.priority)
+    }
+
     /// Push a polling thread. The priority level is an exponential backoff from
     /// the given `normal_priority` value. The pushed thread will also
     /// participatein "poll upgrades" in which periodically polling threads are
@@ -1050,6 +1056,24 @@ mod tests {
         assert_eq!(queue.tentative_pop_next(), Some(peer));
         assert_eq!(queue.commit_tentative_pop_completed_turn(), peer);
         assert_eq!(queue.yielded_skip, None);
+    }
+
+    #[test]
+    fn last_queued_priority_names_the_band_that_runs_last() {
+        let mut queue = RunQueue::default();
+        assert_eq!(queue.last_queued_priority(), None);
+
+        queue.push_back(DetTid::from_raw(1), DEFAULT_PRIORITY);
+        queue.push_front(DetTid::from_raw(2), FIRST_PRIORITY);
+        assert_eq!(queue.last_queued_priority(), Some(DEFAULT_PRIORITY));
+
+        // A poller backs off to the last band; an eager repoll runs first.
+        queue.push_poller(DetTid::from_raw(3), DEFAULT_PRIORITY, 20);
+        queue.push_eager_io_repoll(DetTid::from_raw(4));
+        assert_eq!(queue.last_queued_priority(), Some(LAST_PRIORITY));
+
+        assert!(queue.remove_tid(DetTid::from_raw(3)));
+        assert_eq!(queue.last_queued_priority(), Some(DEFAULT_PRIORITY));
     }
 
     #[test]

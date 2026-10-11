@@ -2567,6 +2567,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
                 let request = Self::sched_yield_request(guest);
                 resource_request(guest, request).await;
+            } else if self.cfg.chaos && self.cfg.replay_schedule_from.is_none() {
+                // With timer preemption on, chaos redraws priorities only when
+                // a slice expires, which a sched_yield loop may never reach.
+                // A weak yield would put the caller back in its own band, so a
+                // spinner in a band that runs before the thread it waits for
+                // would be selected again forever; `--chaos-target-races`
+                // starts half of all new threads in the last band
+                // (https://github.com/rrnewton/hermit/issues/4068). The strong
+                // yield puts the caller behind every runnable thread for one
+                // turn (`Scheduler::step6_reenquue`). It changes no priority,
+                // draws nothing from the chaos PRNG and consumes no recorded
+                // preemption point, so a preemption replay under `--chaos`
+                // makes the same decision.
+                let request = Self::sched_yield_request(guest);
+                resource_request(guest, request).await;
             } else if self.cfg.chaos || self.cfg.replay_schedule_from.is_some() {
                 let request = Self::yield_request(guest);
                 resource_request(guest, request).await;

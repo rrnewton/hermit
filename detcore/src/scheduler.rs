@@ -1361,6 +1361,10 @@ pub struct Scheduler {
     /// meaningful in chaos mode) the scheduler biases its nondeterminism points
     /// toward known race patterns rather than exploring uniformly.
     chaos_target_races: bool,
+    /// A cached copy of the same (immutable) field in Config. Under chaos an
+    /// explicit yield goes behind every runnable thread
+    /// ([`Self::step6_reenquue`]).
+    chaos: bool,
 
     /// Happens-before enforcement state, present only when the run carries a
     /// `HappensBeforeProgram`. Holds AFTER anchors until their BEFORE anchors
@@ -2909,6 +2913,7 @@ impl Scheduler {
             transferred_exec_syscall_offsets: Default::default(),
             fuzz_futexes: cfg.fuzz_futexes,
             chaos_target_races: cfg.chaos_target_races,
+            chaos: cfg.chaos,
             fuzz_prng: Pcg64Mcg::seed_from_u64(cfg.fuzz_seed()),
             post_fork_prng: Pcg64Mcg::seed_from_u64(cfg.sched_seed() ^ 0x706f_7374_666f_726b),
             happens_before: cfg.happens_before.clone().map(HbRuntime::new),
@@ -8519,10 +8524,18 @@ impl Scheduler {
         // thread from the front to the back of the queue.
         let dt2 = self.run_queue.commit_tentative_pop_completed_turn();
         assert_eq!(next_dtid, dt2);
-        // SchedYield is emitted in normal execution and non-chaos preemption replay. Its
-        // queue placement is transient, so persistent priorities remain unchanged.
+        // SchedYield is emitted in normal execution, in non-chaos preemption replay, and for
+        // sched_yield under chaos. Its queue placement is transient, so persistent priorities
+        // remain unchanged. Under chaos the threads' bands are random, so the yielder goes to
+        // the back of the last band that holds a runnable thread, never ahead of its own band:
+        // behind every runnable thread, as sched_yield(2) puts a SCHED_OTHER thread
+        // (https://github.com/rrnewton/hermit/issues/4068).
         let pos = if sched_yield {
-            let priority = self.get_priority(next_dtid);
+            let own = self.get_priority(next_dtid);
+            let priority = match self.run_queue.last_queued_priority() {
+                Some(last) if self.chaos => last.max(own),
+                _ => own,
+            };
             self.run_queue.push_yielded(next_dtid, priority)
         } else {
             self.runqueue_push_back(next_dtid)
@@ -13189,6 +13202,55 @@ mod test {
                 scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
                 expected
             );
+        }
+    }
+
+    /// Under `--chaos` a `SchedYield` turn, which is what `sched_yield` takes,
+    /// puts the yielder behind every runnable thread for one turn, whatever
+    /// their chaos bands, and leaves its persistent priority alone
+    /// (https://github.com/rrnewton/hermit/issues/4068). Without chaos the
+    /// yielder stays in its own band.
+    #[test]
+    fn a_chaos_sched_yield_goes_behind_every_runnable_thread() {
+        for chaos in [false, true] {
+            let mut scheduler = Scheduler::new(&Config {
+                chaos,
+                ..Config::default()
+            });
+            let yielder = DetTid::from_raw(100);
+            let awaited = DetTid::from_raw(101);
+            for tid in [yielder, awaited] {
+                register_known_thread(&mut scheduler, tid);
+            }
+            scheduler
+                .priorities
+                .insert(yielder, runqueue::FIRST_PRIORITY);
+            scheduler
+                .priorities
+                .insert(awaited, runqueue::LAST_PRIORITY);
+            scheduler.runqueue_push_back(yielder);
+            scheduler.runqueue_push_back(awaited);
+            let order =
+                |scheduler: &Scheduler| scheduler.run_queue.tids().copied().collect::<Vec<_>>();
+
+            assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(yielder));
+            scheduler.step6_reenquue(yielder, true);
+            let expected = if chaos {
+                vec![awaited, yielder]
+            } else {
+                vec![yielder, awaited]
+            };
+            assert_eq!(order(&scheduler), expected, "chaos={chaos}");
+            assert_eq!(scheduler.get_priority(yielder), runqueue::FIRST_PRIORITY);
+
+            // The one-turn exclusion gives the other thread the next turn in
+            // both modes; after it, the yielder's next ordinary turn puts it
+            // back in its own band.
+            assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(awaited));
+            scheduler.step6_reenquue(awaited, false);
+            assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(yielder));
+            scheduler.step6_reenquue(yielder, false);
+            assert_eq!(order(&scheduler), vec![yielder, awaited], "chaos={chaos}");
         }
     }
 
