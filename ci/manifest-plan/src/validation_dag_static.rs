@@ -984,7 +984,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // runner::tests::a_typed_run_failure_is_a_product_crash_with_its_reason
     // (hermit-manifest-plan, the run_failed verification reason) retains all
     // 1048: 1049.
-    ("test.regular_crates", 1058),
+    // stress_series::tests::failed_match_pressure_evidence_is_a_non_canonical_failed_attempt
+    // retains all 1058: 1059.
+    ("test.regular_crates", 1059),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3049,7 +3051,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The DBT startup-authority refusal regression retains all 1048 prior identities.
     // And the same depth-boundary, repeated-key and extension-count tests: 1056.
     // And the run_failed runner test: 1049.
-    ("test.regular_crates_on_host", 1058),
+    // And the failed-match pressure evidence test: 1059.
+    ("test.regular_crates_on_host", 1059),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
