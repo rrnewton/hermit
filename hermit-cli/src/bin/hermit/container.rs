@@ -968,12 +968,25 @@ pub(super) fn arm_container_init_guards() -> Result<(), SerializableError> {
 
 /// The `run --namespace-only` counterpart of [`arm_container_init_guards`], run
 /// from Reverie's `pre_exec` in the forked child that then execs the guest as
-/// PID 1 of its namespace. Only the death signal is armed; see the launch
-/// site in `run.rs` for why the stop handlers are not.
+/// PID 1 of its namespace. The death signal is armed (see the launch site in
+/// `run.rs` for why the stop handlers are not), and the guest is put in a
+/// process group of its own.
+///
+/// The group: without it the guest inherits Hermit's process group, and since
+/// nothing intercepts the guest in this mode, its `kill(0, sig)` reaches Hermit,
+/// the rest of Hermit's pipeline, and, run without job control, the shell, make
+/// or test runner that started it
+/// (https://github.com/rrnewton/hermit/issues/4065). `kill(-1)` and
+/// `kill(-pgid)` already stay inside the PID namespace. When Hermit's group
+/// owns the controlling terminal (`terminal`, from [`foreground_terminal`]),
+/// the guest's group takes it over, so the guest can still read it without
+/// being stopped by SIGTTIN; Hermit takes it back when the guest stops or exits
+/// ([`wait_relaying_job_control`]).
 ///
 /// It runs between fork and exec, so it must stay async-signal-safe: `prctl`,
-/// one atomic read-modify-write, `_exit` and the error value only.
-pub(super) fn arm_namespace_only_guest() -> Result<(), reverie::Errno> {
+/// `setpgid`, `sigprocmask`, `tcsetpgrp`, one atomic read-modify-write, `_exit`
+/// and the error value only.
+pub(super) fn arm_namespace_only_guest(terminal: Option<i32>) -> Result<(), reverie::Errno> {
     // SAFETY: as in `arm_parent_death_signal`: it reads and writes no caller
     // memory.
     if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } == -1 {
@@ -983,7 +996,289 @@ pub(super) fn arm_namespace_only_guest() -> Result<(), reverie::Errno> {
     // subscriber, so it is the likeliest crosser: see
     // `exit_if_log_cap_already_crossed`.
     super::tracing::exit_if_log_cap_already_crossed();
+    // SAFETY: setpgid on the calling process reads and writes no memory.
+    if unsafe { libc::setpgid(0, 0) } == -1 {
+        return Err(reverie::Errno::last());
+    }
+    if let Some(fd) = terminal {
+        // SAFETY: getpgrp reads no memory.
+        hand_terminal_to(fd, unsafe { libc::getpgrp() })?;
+    }
     Ok(())
+}
+
+/// The first of stdin, stdout and stderr that is a terminal whose foreground
+/// process group is Hermit's, or `None`. The `--namespace-only` guest's group
+/// takes that terminal over for the run ([`arm_namespace_only_guest`]).
+pub(super) fn foreground_terminal() -> Option<i32> {
+    [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO]
+        .into_iter()
+        // SAFETY: isatty, tcgetpgrp and getpgrp read no caller memory.
+        .find(|fd| unsafe { libc::isatty(*fd) == 1 && libc::tcgetpgrp(*fd) == libc::getpgrp() })
+}
+
+/// Make `group` the foreground process group of terminal `fd`, with SIGTTOU
+/// blocked: a caller outside the foreground group would otherwise be stopped
+/// by it. The signal mask is restored before returning. Async-signal-safe.
+fn hand_terminal_to(fd: i32, group: libc::pid_t) -> Result<(), reverie::Errno> {
+    // SAFETY: the signal sets are local, and sigprocmask and tcsetpgrp read
+    // and write only them.
+    unsafe {
+        let mut ttou: libc::sigset_t = std::mem::zeroed();
+        let mut previous: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut ttou);
+        libc::sigaddset(&mut ttou, libc::SIGTTOU);
+        libc::sigprocmask(libc::SIG_BLOCK, &ttou, &mut previous);
+        let handed = libc::tcsetpgrp(fd, group);
+        let error = reverie::Errno::last();
+        libc::sigprocmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+        if handed == -1 {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+/// The guest the keyboard relay acts on ([`spawn_keyboard_relay`]).
+static RELAY_TARGET: AtomicI32 = AtomicI32::new(0);
+/// The pipe on which the keyboard relay reports the terminal signal it ended
+/// the guest for.
+static RELAY_REPORT: AtomicI32 = AtomicI32::new(-1);
+
+/// The terminal signals the keyboard relay acts on.
+const RELAYED_SIGNALS: [libc::c_int; 4] =
+    [libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGHUP];
+
+/// Start the keyboard relay for a `--namespace-only` guest whose process group
+/// owns the terminal. Returns its pid and the read end of the pipe on which it
+/// reports the signal it ended the guest for ([`relayed_exit_status`]).
+///
+/// The guest is PID 1 of its namespace, and the kernel drops every signal to a
+/// namespace init whose disposition is the default, but SIGKILL and SIGSTOP
+/// from an ancestor namespace. While Hermit's group owned the terminal, Ctrl-C
+/// reached Hermit, whose death took the guest with it; with the terminal handed
+/// to the guest's own group, Ctrl-C would reach only the guest and be dropped.
+/// The relay is a process of Hermit's namespace in the guest's group. For
+/// SIGINT, SIGQUIT and SIGHUP it reports the signal and kills the guest; for
+/// SIGTSTP it stops the guest ([`wait_relaying_job_control`] then stops
+/// Hermit). It does neither when the guest catches the signal: the terminal
+/// already delivered it. Every other signal is ignored, so a guest's own
+/// `kill(0, sig)` reaches the relay harmlessly, or, for those four, ends or
+/// stops the guest as it would a process that was not an init.
+pub(super) fn spawn_keyboard_relay(guest: libc::pid_t) -> io::Result<(libc::pid_t, i32)> {
+    let mut pipe = [-1; 2];
+    // SAFETY: `pipe` is local storage for two descriptors.
+    if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    RELAY_TARGET.store(guest, Ordering::SeqCst);
+    RELAY_REPORT.store(pipe[1], Ordering::SeqCst);
+    // SAFETY: the child runs only async-signal-safe calls (prctl, setpgid,
+    // close, sigaction, pause, kill, open, read, write, _exit) before it ends.
+    match unsafe { libc::fork() } {
+        -1 => {
+            let error = io::Error::last_os_error();
+            // SAFETY: both descriptors are this function's own.
+            unsafe {
+                libc::close(pipe[0]);
+                libc::close(pipe[1]);
+            }
+            Err(error)
+        }
+        0 => unsafe {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            libc::close(pipe[0]);
+            if libc::setpgid(0, guest) == -1 {
+                libc::_exit(1);
+            }
+            for signal in 1..libc::SIGRTMIN() {
+                if signal == libc::SIGKILL || signal == libc::SIGSTOP {
+                    continue;
+                }
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = if RELAYED_SIGNALS.contains(&signal) {
+                    relay_to_guest as *const () as libc::sighandler_t
+                } else {
+                    libc::SIG_IGN
+                };
+                action.sa_flags = libc::SA_RESTART;
+                libc::sigaction(signal, &action, std::ptr::null_mut());
+            }
+            loop {
+                libc::pause();
+            }
+        },
+        relay => {
+            // SAFETY: the write end is the relay's now.
+            unsafe { libc::close(pipe[1]) };
+            Ok((relay, pipe[0]))
+        }
+    }
+}
+
+/// The guest's exit `status`, as the terminal signal the keyboard relay
+/// reported on `report` when the relay is what killed it
+/// ([`spawn_keyboard_relay`]): Ctrl-C then ends the run as SIGINT, as it did
+/// when Hermit's group owned the terminal. Closes `report`.
+pub(super) fn relayed_exit_status(
+    status: reverie::process::ExitStatus,
+    report: i32,
+) -> reverie::process::ExitStatus {
+    let mut signal = 0u8;
+    // SAFETY: `signal` is one byte of local storage; `report` is ours.
+    let read = unsafe {
+        let read = libc::read(report, (&raw mut signal).cast(), 1);
+        libc::close(report);
+        read
+    };
+    match status {
+        reverie::process::ExitStatus::Signaled(killed, _)
+            if read == 1 && killed == nix::sys::signal::Signal::SIGKILL =>
+        {
+            match nix::sys::signal::Signal::try_from(i32::from(signal)) {
+                Ok(relayed) => reverie::process::ExitStatus::Signaled(relayed, false),
+                Err(_) => status,
+            }
+        }
+        status => status,
+    }
+}
+
+/// The keyboard relay's handler: unless the guest catches `signal`, stop the
+/// guest for SIGTSTP, and otherwise report `signal` and kill the guest; both
+/// signals are delivered to a namespace init when sent from Hermit's
+/// namespace. Async-signal-safe: it reads `/proc/<guest>/status` with raw
+/// syscalls and a stack buffer.
+extern "C" fn relay_to_guest(signal: libc::c_int) {
+    let guest = RELAY_TARGET.load(Ordering::SeqCst);
+    if guest <= 0 || guest_catches(guest, signal) {
+        return;
+    }
+    // SAFETY: write reads one local byte; kill reads no memory.
+    unsafe {
+        if signal == libc::SIGTSTP {
+            libc::kill(guest, libc::SIGSTOP);
+        } else {
+            let byte = signal as u8;
+            libc::write(
+                RELAY_REPORT.load(Ordering::SeqCst),
+                (&raw const byte).cast(),
+                1,
+            );
+            libc::kill(guest, libc::SIGKILL);
+        }
+    }
+}
+
+/// Whether `/proc/<pid>/status` says `pid` catches `signal` (its `SigCgt`
+/// mask). False when it cannot be read. Async-signal-safe.
+fn guest_catches(pid: libc::pid_t, signal: libc::c_int) -> bool {
+    let mut path = *b"/proc/0000000000/status\0";
+    let mut digits = [0u8; 10];
+    let mut value = pid as u32;
+    let mut length = 0;
+    loop {
+        digits[length] = b'0' + (value % 10) as u8;
+        value /= 10;
+        length += 1;
+        if value == 0 {
+            break;
+        }
+    }
+    let mut end = 6;
+    for index in (0..length).rev() {
+        path[end] = digits[index];
+        end += 1;
+    }
+    let suffix = b"/status\0";
+    path[end..end + suffix.len()].copy_from_slice(suffix);
+    let mut buffer = [0u8; 4096];
+    // SAFETY: `path` is NUL-terminated and `buffer` is local storage.
+    let read = unsafe {
+        let fd = libc::open(path.as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC);
+        if fd < 0 {
+            return false;
+        }
+        let read = libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len());
+        libc::close(fd);
+        read
+    };
+    if read <= 0 {
+        return false;
+    }
+    let text = &buffer[..read as usize];
+    let Some(at) = text.windows(7).position(|window| window == b"SigCgt:") else {
+        return false;
+    };
+    let mut mask: u64 = 0;
+    for &byte in text[at + 7..]
+        .iter()
+        .skip_while(|byte| **byte == b'\t' || **byte == b' ')
+    {
+        let digit = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            _ => break,
+        };
+        mask = mask.wrapping_shl(4) | u64::from(digit);
+    }
+    (1..=64).contains(&signal) && mask & (1u64 << (signal - 1)) != 0
+}
+
+/// Wait for the `--namespace-only` guest `child`, whose process group owns
+/// terminal `fd`, relaying job control between the guest's group and Hermit's
+/// ([`arm_namespace_only_guest`]). When the guest's group is stopped (Ctrl-Z, or
+/// SIGTTIN/SIGTTOU), Hermit takes the terminal back and stops itself, so the
+/// shell that started it regains the terminal; when the shell continues
+/// Hermit, the terminal goes back to the guest's group, which is continued. The
+/// terminal returns to Hermit's group once the guest has exited.
+pub(super) fn wait_relaying_job_control(
+    child: &mut reverie::process::Child,
+    fd: i32,
+) -> Result<reverie::process::ExitStatus, Error> {
+    let pid = child.id().as_raw();
+    loop {
+        // SAFETY: a zeroed siginfo_t is valid storage for waitid to fill.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // Leave an exit unreaped (WNOWAIT): `wait_blocking` below collects it.
+        // SAFETY: `info` is valid storage for one siginfo_t.
+        if unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WSTOPPED | libc::WNOWAIT,
+            )
+        } == -1
+        {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(error.into());
+        }
+        if info.si_code != libc::CLD_STOPPED {
+            break;
+        }
+        // Consume the stop that WNOWAIT left pending.
+        // SAFETY: as above.
+        while unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WSTOPPED) }
+            == -1
+            && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+        {}
+        // SAFETY: getpgrp, raise and kill read no caller memory.
+        unsafe {
+            let _ = hand_terminal_to(fd, libc::getpgrp());
+            libc::raise(libc::SIGTSTP);
+            // Continued: give the terminal back and wake the guest's group.
+            let _ = hand_terminal_to(fd, pid);
+            libc::kill(-pid, libc::SIGCONT);
+        }
+    }
+    let status = child.wait_blocking()?;
+    // SAFETY: getpgrp reads no memory.
+    let _ = hand_terminal_to(fd, unsafe { libc::getpgrp() });
+    Ok(status)
 }
 
 /// Where the most recent panic inside the container child happened.
@@ -2341,7 +2636,61 @@ mod tests {
     /// arms in `pre_exec` and then execs the guest itself.
     #[test]
     fn log_cap_crossed_before_the_namespace_only_guest_arms_stops_the_exec() {
-        let outcome = arm_after_the_parent_crossed(|| arm_namespace_only_guest().is_ok());
+        let outcome = arm_after_the_parent_crossed(|| arm_namespace_only_guest(None).is_ok());
         assert_stopped_by_the_crossing("arm_namespace_only_guest", outcome);
+    }
+
+    /// The keyboard relay leaves a terminal signal to a guest that catches it,
+    /// reading the guest's `SigCgt` mask from `/proc`
+    /// (https://github.com/rrnewton/hermit/issues/4065). Checked on this test
+    /// process: a signal it catches, and ones it leaves at the default.
+    #[test]
+    fn the_keyboard_relay_reads_which_signals_a_guest_catches() {
+        extern "C" fn ignore(_: libc::c_int) {}
+        // SAFETY: installs a handler that does nothing for SIGUSR2 only.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = ignore as *const () as libc::sighandler_t;
+            libc::sigaction(libc::SIGUSR2, &action, std::ptr::null_mut());
+        }
+        // SAFETY: getpid reads no memory.
+        let me = unsafe { libc::getpid() };
+        assert!(guest_catches(me, libc::SIGUSR2));
+        assert!(!guest_catches(me, libc::SIGWINCH));
+        assert!(!guest_catches(me, libc::SIGTTIN));
+        assert!(
+            !guest_catches(0, libc::SIGUSR2),
+            "an unreadable status is not a catch"
+        );
+    }
+
+    /// A guest the keyboard relay killed for a terminal signal ends with that
+    /// signal, as when Ctrl-C reached Hermit; any other status is kept.
+    #[test]
+    fn a_relayed_kill_reports_the_terminal_signal() {
+        use nix::sys::signal::Signal;
+        use reverie::process::ExitStatus;
+        let report = |byte: Option<u8>| {
+            let mut pipe = [-1; 2];
+            // SAFETY: `pipe` is local storage; the byte is local.
+            unsafe {
+                assert_eq!(libc::pipe2(pipe.as_mut_ptr(), libc::O_NONBLOCK), 0);
+                if let Some(byte) = byte {
+                    assert_eq!(libc::write(pipe[1], (&raw const byte).cast(), 1), 1);
+                }
+                libc::close(pipe[1]);
+            }
+            pipe[0]
+        };
+        let killed = ExitStatus::Signaled(Signal::SIGKILL, false);
+        assert_eq!(
+            relayed_exit_status(killed, report(Some(libc::SIGINT as u8))),
+            ExitStatus::Signaled(Signal::SIGINT, false)
+        );
+        assert_eq!(relayed_exit_status(killed, report(None)), killed);
+        assert_eq!(
+            relayed_exit_status(ExitStatus::Exited(3), report(Some(libc::SIGINT as u8))),
+            ExitStatus::Exited(3)
+        );
     }
 }
