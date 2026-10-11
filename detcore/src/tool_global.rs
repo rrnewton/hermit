@@ -2097,7 +2097,11 @@ impl GlobalTool for GlobalState {
                     .recv_request_resources(from, process, resources, Some(request_mm))
                     .await;
                 match response {
-                    SchedulerRpcResult::Continue(status) => R::ResumeExec(status, duration),
+                    SchedulerRpcResult::Continue(status) => R::ResumeExec(
+                        status,
+                        duration,
+                        self.sched.lock().unwrap().take_deadline_hint(dtid),
+                    ),
                     SchedulerRpcResult::ThreadExited => R::ThreadExited,
                 }
             }
@@ -2577,7 +2581,13 @@ impl GlobalTool for GlobalState {
                     )
                     .await
                 {
-                    SchedulerRpcResult::Continue(remaining) => R::RegisterAlarm(remaining),
+                    SchedulerRpcResult::Continue(remaining) => R::RegisterAlarm(
+                        remaining,
+                        self.sched
+                            .lock()
+                            .unwrap()
+                            .deadline_hint_after_arming(dtid, now),
+                    ),
                     SchedulerRpcResult::ThreadExited => R::ThreadExited,
                 }
             }
@@ -2597,6 +2607,7 @@ impl GlobalTool for GlobalState {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#869)
             GlobalRequest::RegisterPosixTimer(dpid, dtid, timer_id, deadline, interval, sig) => {
+                let now = self.global_time.lock().unwrap().as_nanos();
                 match self
                     .recv_register_posix_timer(
                         dpid,
@@ -2611,7 +2622,12 @@ impl GlobalTool for GlobalState {
                     )
                     .await
                 {
-                    SchedulerRpcResult::Continue(()) => R::RegisterPosixTimer(()),
+                    SchedulerRpcResult::Continue(()) => R::RegisterPosixTimer(
+                        self.sched
+                            .lock()
+                            .unwrap()
+                            .deadline_hint_after_arming(dtid, now),
+                    ),
                     SchedulerRpcResult::ThreadExited => R::ThreadExited,
                 }
             }
@@ -4468,7 +4484,9 @@ pub enum GlobalResponse {
     PrepareExec(()),
     CancelExec(()),
     ReconnectExec(bool),
-    ResumeExec(ResumeStatus, Option<LogicalTime>),
+    /// The exec continuation's grant, its replay duration, and its deadline
+    /// hint, as in [`GlobalResponse::RequestResources`].
+    ResumeExec(ResumeStatus, Option<LogicalTime>, Option<Duration>),
     RetireExec(bool),
     MarkPastFirstExecve(ExecFdBlockingOverrides),
     CreateChildThread(Option<MmId>),
@@ -4498,10 +4516,14 @@ pub enum GlobalResponse {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     // TODO-HUMAN-REVIEW(#869)
-    RegisterAlarm((LogicalTime, LogicalTime)),
+    /// The previous alarm's remaining time and interval, and the deadline
+    /// hint after arming the new one
+    /// ([`Scheduler::deadline_hint_after_arming`](crate::scheduler::Scheduler::deadline_hint_after_arming)).
+    RegisterAlarm((LogicalTime, LogicalTime), Option<Duration>),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#869)
-    RegisterPosixTimer(()),
+    /// The deadline hint after arming, as for [`GlobalResponse::RegisterAlarm`].
+    RegisterPosixTimer(Option<Duration>),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-841): Review logical alarm query RPC.
     ReadyChildWait((Option<DetPid>, bool)),
@@ -5722,7 +5744,10 @@ where
     )
     .await;
     match resp.1 {
-        GlobalResponse::RegisterAlarm(x) => x,
+        GlobalResponse::RegisterAlarm(x, deadline) => {
+            cap_timeslice_at_deadline(guest, deadline);
+            x
+        }
         _ => unreachable!(),
     }
 }
@@ -5771,7 +5796,7 @@ pub async fn register_posix_timer<G, T>(
     )
     .await;
     match resp.1 {
-        GlobalResponse::RegisterPosixTimer(()) => {}
+        GlobalResponse::RegisterPosixTimer(deadline) => cap_timeslice_at_deadline(guest, deadline),
         _ => unreachable!(),
     }
 }

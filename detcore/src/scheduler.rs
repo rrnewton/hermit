@@ -4693,6 +4693,7 @@ impl Scheduler {
 
     /// Remove entries from everywhere that non-runnable threads lurk.
     fn remove_blocking_entries(&mut self, dtid: &DetTid) {
+        self.deadline_hints.remove(dtid);
         self.blocked.timed_waiters.remove(*dtid);
         let _ = self.blocked.external_io_blockers.remove(dtid);
         self.blocked.replay_log_served.remove(dtid);
@@ -8839,7 +8840,7 @@ impl Scheduler {
                 .map(SchedValue::Value);
             SchedResponse::Go(as_schedvalue)
         };
-        match self.deadline_remaining(dtid) {
+        match self.deadline_remaining_from(dtid, self.committed_time) {
             Some(remaining) => self.deadline_hints.insert(dtid, remaining),
             None => self.deadline_hints.remove(&dtid),
         };
@@ -8848,46 +8849,89 @@ impl Scheduler {
         Ok(())
     }
 
-    /// The virtual time left before the earliest deadline a turn would act
-    /// on: a timed wait or timer (`timed_waiters`), a backed-off poller's
-    /// timeout (`poll_deadlines`), or the deadline of a sleep or poll another
-    /// thread has requested but not yet had a turn for, if still ahead. A
-    /// sleep becomes a timed waiter only at the turn that commits its
-    /// request, so one queued behind the thread being granted would otherwise
-    /// wait out that thread's whole slice. `None` when nothing is pending, or
-    /// only waits with no deadline.
+    /// The virtual time left, from `now`, before the earliest deadline a turn
+    /// would act on (<https://github.com/rrnewton/hermit/issues/4121>):
+    ///   - a timed wait or timer (`timed_waiters`);
+    ///   - a backed-off poller's timeout (`poll_deadlines`);
+    ///   - the deadline of a sleep or poll another thread has requested but
+    ///     not yet had a turn for. A sleep becomes a timed waiter only at the
+    ///     turn that commits its request, so one queued behind the granted
+    ///     thread would otherwise wait out that thread's whole slice.
     ///
-    /// Both are compared against `committed_time` at turns, and global time
-    /// is the sum of every thread's local time, so while the granted thread
-    /// runs alone global time advances exactly as its own clock does. A
-    /// thread that ends its slice once this much of its own time has passed
-    /// therefore takes a turn no earlier than global time passes the deadline.
-    fn deadline_remaining(&self, granted: DetTid) -> Option<Duration> {
+    /// Only deadlines still ahead of `now` count, from threads that will take
+    /// another turn: a passed one (including a yield's `SleepUntil(0)`) marks
+    /// a request that is simply runnable or an entry kept past its time, and
+    /// a thread pending removal or in a process a committed SIGKILL has
+    /// doomed will never act on its deadline. `None` when nothing qualifies,
+    /// and always under record/replay, which records no hint (as it records
+    /// no poll deadline, `note_poll_deadline`).
+    ///
+    /// Deadlines are compared against `committed_time` at turns, and global
+    /// time is the sum of every thread's local time, so while the granted
+    /// thread runs alone global time advances exactly as its own clock does:
+    /// a thread that ends its slice once this much of its own time has passed
+    /// takes a turn no earlier than global time passes the deadline. That
+    /// relies on serialized execution: one thread runs between turns.
+    ///
+    /// Determinism: every input is scheduler state fixed at a turn, after all
+    /// threads have quiesced (`step1_check_quiescence`), so the hint is a
+    /// function of the guest's execution. It inherits, and adds nothing to,
+    /// the host-timed inputs that already reach `committed_time` and the
+    /// timed waiters: internal IO-polling retries, background threads' time
+    /// reports, and exit wakes from robust-list cleanup.
+    fn deadline_remaining_from(&self, granted: DetTid, now: LogicalTime) -> Option<Duration> {
+        if self.recordreplay_modes {
+            return None;
+        }
+        let acts = |tid: DetTid| {
+            tid != granted
+                && !self.pending_run_queue_removals.contains_key(&tid)
+                && !self
+                    .thread_tree
+                    .process_of(tid)
+                    .is_some_and(|process| self.sigkilled_processes.contains(&process))
+        };
+        let ahead = |deadline: &LogicalTime| *deadline > now && !deadline.is_indefinite();
         let timed = self
             .blocked
             .timed_waiters
-            .next_deadline()
-            .filter(|deadline| !deadline.is_indefinite());
-        let poll = self.poll_deadlines.first().map(|(deadline, _)| *deadline);
+            .iter()
+            .find(|(deadline, event)| {
+                ahead(deadline)
+                    && acts(match event {
+                        TimedEvent::ThreadEvt(tid) | TimedEvent::SignalEvt(_, tid, _) => *tid,
+                    })
+            })
+            .map(|(deadline, _)| deadline);
+        let poll = self
+            .poll_deadlines
+            .iter()
+            .find(|(deadline, tid)| ahead(deadline) && acts(*tid))
+            .map(|(deadline, _)| *deadline);
         let queued = self
             .run_queue
             .tids()
-            .filter(|tid| **tid != granted)
-            .filter_map(|tid| match self.next_turns.get(tid)?.req.try_read() {
-                Some(Ok(request)) => request.queued_deadline(),
-                _ => None,
+            .filter(|tid| acts(**tid))
+            .filter_map(|tid| {
+                self.next_turns
+                    .get(tid)?
+                    .req
+                    .try_read_with(|request| request.as_ref().ok()?.queued_deadline())
+                    .flatten()
             })
-            // A deadline already passed (including a yield's `SleepUntil(0)`)
-            // marks a request that is simply runnable, like any other queued
-            // one: it waits its turn and ends no slice.
-            .filter(|deadline| *deadline > self.committed_time)
+            .filter(ahead)
             .min();
         let earliest = [timed, poll, queued].into_iter().flatten().min()?;
         Some(Duration::from_nanos(
-            earliest
-                .as_nanos()
-                .saturating_sub(self.committed_time.as_nanos()),
+            earliest.as_nanos().saturating_sub(now.as_nanos()),
         ))
+    }
+
+    /// The deadline hint for a thread that has just registered a timer in
+    /// its own turn, measured from the `now` the timer was armed against: the
+    /// grant's hint could not include it.
+    pub fn deadline_hint_after_arming(&self, dtid: DetTid, now: LogicalTime) -> Option<Duration> {
+        self.deadline_remaining_from(dtid, now)
     }
 
     /// Take the deadline hint recorded when `dtid` was last granted a turn.
@@ -12762,6 +12806,10 @@ mod test {
 
     const NOW_NS: u64 = 5_000_000;
 
+    fn hint(scheduler: &Scheduler, granted: DetTid) -> Option<Duration> {
+        scheduler.deadline_remaining_from(granted, scheduler.committed_time)
+    }
+
     fn at(offset_ns: u64) -> LogicalTime {
         LogicalTime::from_nanos(NOW_NS + offset_ns)
     }
@@ -12773,41 +12821,29 @@ mod test {
         let granted = DetTid::from_raw(3);
         let mut scheduler = Scheduler::new(&Config::default());
         scheduler.committed_time = at(0);
-        assert_eq!(scheduler.deadline_remaining(granted), None);
+        assert_eq!(hint(&scheduler, granted), None);
 
         scheduler
             .blocked
             .timed_waiters
             .insert(at(9_000), DetTid::from_raw(5));
-        assert_eq!(
-            scheduler.deadline_remaining(granted),
-            Some(Duration::from_nanos(9_000))
-        );
+        assert_eq!(hint(&scheduler, granted), Some(Duration::from_nanos(9_000)));
 
         let sleeper = DetTid::from_raw(7);
         queue_request(&mut scheduler, sleeper, sleep_request(sleeper, at(7_000)));
-        assert_eq!(
-            scheduler.deadline_remaining(granted),
-            Some(Duration::from_nanos(7_000))
-        );
+        assert_eq!(hint(&scheduler, granted), Some(Duration::from_nanos(7_000)));
 
         let poller = DetTid::from_raw(9);
         let mut poll = Resources::new(poller);
         poll.insert(ResourceID::InternalIOPolling, Permission::W);
         poll.poll_deadline = Some(at(6_000));
         queue_request(&mut scheduler, poller, poll);
-        assert_eq!(
-            scheduler.deadline_remaining(granted),
-            Some(Duration::from_nanos(6_000))
-        );
+        assert_eq!(hint(&scheduler, granted), Some(Duration::from_nanos(6_000)));
 
         scheduler
             .poll_deadlines
             .insert((at(5_000), DetTid::from_raw(11)));
-        assert_eq!(
-            scheduler.deadline_remaining(granted),
-            Some(Duration::from_nanos(5_000))
-        );
+        assert_eq!(hint(&scheduler, granted), Some(Duration::from_nanos(5_000)));
     }
 
     /// A queued request whose deadline has passed, including a yield's
@@ -12838,14 +12874,65 @@ mod test {
             .timed_waiters
             .insert(LogicalTime::INDEFINITE, DetTid::from_raw(11));
         queue_request(&mut scheduler, granted, sleep_request(granted, at(1_000)));
-        assert_eq!(scheduler.deadline_remaining(granted), None);
+        assert_eq!(hint(&scheduler, granted), None);
 
-        // A timed waiter already due still hints (zero): its turn is next.
+        // Nor does an entry kept past its time: a backed-off poller's
+        // deadline a suspended poller still holds, or a due timer. Hinting
+        // zero for one would give every grant a one-RCB slice.
+        scheduler
+            .poll_deadlines
+            .insert((at(0), DetTid::from_raw(13)));
         scheduler
             .blocked
             .timed_waiters
-            .insert(at(0), DetTid::from_raw(13));
-        assert_eq!(scheduler.deadline_remaining(granted), Some(Duration::ZERO));
+            .insert(at(0), DetTid::from_raw(15));
+        assert_eq!(hint(&scheduler, granted), None);
+    }
+
+    /// A thread that will never take another turn hints nothing: one pending
+    /// removal from the run queue, or one in a process a committed SIGKILL
+    /// has doomed.
+    #[test]
+    fn deadlines_of_threads_that_will_not_act_are_no_hint() {
+        let granted = DetTid::from_raw(3);
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.committed_time = at(0);
+
+        let removed = DetTid::from_raw(5);
+        queue_request(&mut scheduler, removed, sleep_request(removed, at(1_000)));
+        scheduler
+            .pending_run_queue_removals
+            .insert(removed, RemovalDisposition::Retire);
+        assert_eq!(hint(&scheduler, granted), None);
+
+        let doomed = DetTid::from_raw(7);
+        let process = DetPid::from_raw(7);
+        scheduler
+            .thread_tree
+            .thread_to_leader
+            .insert(doomed, process);
+        scheduler.sigkilled_processes.insert(process);
+        scheduler.blocked.timed_waiters.insert(at(2_000), doomed);
+        scheduler.poll_deadlines.insert((at(3_000), doomed));
+        assert_eq!(hint(&scheduler, granted), None);
+
+        scheduler.sigkilled_processes.remove(&process);
+        assert_eq!(hint(&scheduler, granted), Some(Duration::from_nanos(2_000)));
+    }
+
+    /// Record/replay records no hint: there the cap is off.
+    #[test]
+    fn record_and_replay_take_no_deadline_hint() {
+        let granted = DetTid::from_raw(3);
+        let mut scheduler = Scheduler::new(&Config::default());
+        scheduler.committed_time = at(0);
+        scheduler
+            .blocked
+            .timed_waiters
+            .insert(at(1_000), DetTid::from_raw(5));
+        assert_eq!(hint(&scheduler, granted), Some(Duration::from_nanos(1_000)));
+        scheduler.recordreplay_modes = true;
+        assert_eq!(hint(&scheduler, granted), None);
     }
 
     /// A hint is taken once: the reply that takes it leaves none behind.

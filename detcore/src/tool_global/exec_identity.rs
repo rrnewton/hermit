@@ -226,7 +226,7 @@ where
     }
     if guest.config().sequentialize_threads {
         let (_, response) = send_and_update_time(guest, GlobalRequest::ResumeExec(process)).await;
-        let GlobalResponse::ResumeExec(_, duration) = response else {
+        let GlobalResponse::ResumeExec(_, duration, deadline) = response else {
             unreachable!("exec continuation must receive its typed grant");
         };
         if let Some(duration) = duration {
@@ -238,6 +238,10 @@ where
                 thread.max_timeslice_end = Some(deadline);
             }
         }
+        // The continuation's first slice ends at the earliest pending
+        // deadline like any other grant's
+        // (<https://github.com/rrnewton/hermit/issues/4121>).
+        super::cap_timeslice_at_deadline(guest, deadline);
     }
     Ok(())
 }
