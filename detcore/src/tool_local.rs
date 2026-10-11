@@ -3238,10 +3238,15 @@ impl<T> ThreadState<T> {
 
     /// Whether this thread has consumed its current logical timeslice.
     pub(crate) fn timeslice_expired(&self) -> bool {
-        if let Some(replay_rcb_end) = self.replay_rcb_end {
-            return self.committed_clock_value >= replay_rcb_end;
-        }
         let current_time = self.thread_logical_time.as_nanos();
+        if let Some(replay_rcb_end) = self.replay_rcb_end {
+            // PROTOTYPE (hermit#4082): a syscall's pre-hook and post-hook share
+            // an RCB count; the recorded logical time tells them apart.
+            return self.committed_clock_value >= replay_rcb_end
+                && self
+                    .end_of_timeslice
+                    .is_none_or(|end_of_timeslice| current_time >= end_of_timeslice);
+        }
         self.end_of_timeslice
             .is_some_and(|end_of_timeslice| current_time >= end_of_timeslice)
     }
