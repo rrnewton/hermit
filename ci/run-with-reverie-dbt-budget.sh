@@ -1406,7 +1406,10 @@ fi
 # native SDK input Git objects are equal. Preserve SDK key, inventory 941,
 # the 16-job clamp and 1050/572-job-second budgets. This carries the SDK budget
 # only; runtime qualification, test and timing evidence must be measured anew.
-expected_pin=0f7cdd3232d3216637bc076aaa7517a981d6fdec
+# PRIVATE PIN-ONLY CONTROL (2026-10-12): 0f7 -> 19cdd incoming changes.
+# All seven recorded native SDK inputs are object-equal; preserve every budget.
+# No owned DBT signal patch and no runtime qualification is carried by this note.
+expected_pin=19cdd8f59d2c69621f42b789169b0907e68f7144
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
