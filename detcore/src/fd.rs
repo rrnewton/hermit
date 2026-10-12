@@ -25,6 +25,8 @@ use serde::Serialize;
 
 use crate::dirents::DirEntry;
 use crate::dirents::DirectoryStream;
+use crate::fdinfo_projection::FdinfoOfdDelta;
+use crate::fdinfo_projection::FdinfoOfdProjection;
 use crate::procfs::ProcfsFile;
 use crate::procfs::ProcfsSnapshotContext;
 use crate::procfs::TimerSlackReadPreview;
@@ -102,6 +104,12 @@ pub struct DetFd {
     pub(crate) fd: RawFd,
     /// Per-slot descriptor flags, currently only `O_CLOEXEC`.
     fd_flags: i32,
+    /// Successful per-slot changes awaiting the current owner's next admitted
+    /// RPC. A copied or newly installed slot starts with no pending old writes.
+    #[serde(skip)]
+    fdinfo_cloexec_updates: Vec<bool>,
+    #[serde(default = "fdinfo_recording_default")]
+    fdinfo_recording: bool,
     /// State shared by every descriptor referring to the same Linux `struct file`.
     open_file: Arc<Mutex<OpenFileState>>,
 }
@@ -300,6 +308,20 @@ struct OpenFileDescription {
     pidfd_target: Option<DetPid>,
     /// File status flags shared by dup and fork aliases.
     status_flags: i32,
+    /// Field updates, rather than a whole cached description. Forked tools may
+    /// retain old values for other fields or aliases; those cannot overwrite a
+    /// newer canonical field when this owner publishes one successful setter.
+    #[serde(skip)]
+    fdinfo_updates: Vec<FdinfoOfdDelta>,
+    #[serde(default = "fdinfo_recording_default")]
+    fdinfo_recording: bool,
+    /// Loader reentry may restart the real local allocator. Only the
+    /// authenticated exec handoff assigns this read-only canonical identity;
+    /// it does not replace the actual DetFd identity or scheduler model.
+    #[serde(default)]
+    fdinfo_reentry: Option<FdinfoOfdProjection>,
+    #[serde(default)]
+    fdinfo_logical_open_file: Option<OpenFileId>,
     /// File path associated with fd.
     /// This cannot be relied upon. Special devices won't have it, for example.
     path: Option<PathBuf>,
@@ -450,6 +472,18 @@ struct OpenFileDescription {
     flock_mode_ever_known: bool,
 }
 
+fn fdinfo_recording_default() -> bool {
+    true
+}
+
+impl OpenFileDescription {
+    fn record_fdinfo_update(&mut self, update: FdinfoOfdDelta) {
+        if self.fdinfo_recording {
+            self.fdinfo_updates.push(update);
+        }
+    }
+}
+
 impl PartialEq for DetFd {
     fn eq(&self, other: &Self) -> bool {
         self.fd == other.fd
@@ -478,11 +512,17 @@ impl DetFd {
         DetFd {
             fd,
             fd_flags: bits & OFlag::O_CLOEXEC.bits(),
+            fdinfo_cloexec_updates: Vec::new(),
+            fdinfo_recording: true,
             open_file: Arc::new(Mutex::new(OpenFileState::Local(OpenFileDescription {
                 id,
                 ty,
                 pidfd_target: None,
                 status_flags: bits & !OFlag::O_CLOEXEC.bits(),
+                fdinfo_updates: Vec::new(),
+                fdinfo_recording: true,
+                fdinfo_reentry: None,
+                fdinfo_logical_open_file: None,
                 path: None,
                 inode: None,
                 dirty: false,
@@ -531,16 +571,24 @@ impl DetFd {
     /// update fd
     pub fn with_fd(mut self, fd: RawFd) -> Self {
         self.fd = fd;
+        self.fdinfo_cloexec_updates.clear();
         self
     }
     /// change fd type
     pub fn with_type(self, ty: FdType) -> Self {
-        self.with_description(|d| d.ty = ty);
+        self.with_description(|d| {
+            d.ty = ty;
+            d.record_fdinfo_update(FdinfoOfdDelta::Type {
+                open_file: d.id,
+                ty,
+            });
+        });
         self
     }
     /// Set per-slot descriptor flags on a newly duplicated fd.
     pub fn with_fd_flags(mut self, flags: OFlag) -> Self {
         self.fd_flags = flags.bits() & OFlag::O_CLOEXEC.bits();
+        self.fdinfo_cloexec_updates.clear();
         self
     }
     /// set path associated with `fd`
@@ -568,14 +616,26 @@ impl DetFd {
     /// set resource id
     pub fn with_resource<S: Into<Option<ResourceID>>>(self, resource: S) -> Self {
         let resource = resource.into();
-        self.with_description(|d| d.resource = resource);
+        self.with_description(|d| {
+            d.resource = resource.clone();
+            d.record_fdinfo_update(FdinfoOfdDelta::Resource {
+                open_file: d.id,
+                resource,
+            });
+        });
         self
     }
 
     /// Update the scheduler resource shared by aliases of this open file.
     pub(crate) fn set_resource<S: Into<Option<ResourceID>>>(&self, resource: S) {
         let resource = resource.into();
-        self.with_description(|d| d.resource = resource);
+        self.with_description(|d| {
+            d.resource = resource.clone();
+            d.record_fdinfo_update(FdinfoOfdDelta::Resource {
+                open_file: d.id,
+                resource,
+            });
+        });
     }
 
     /// If fd is non blocking
@@ -591,6 +651,9 @@ impl DetFd {
     /// Update close-on-exec for this descriptor slot only.
     pub fn set_cloexec(&mut self, enabled: bool) {
         self.fd_flags = if enabled { OFlag::O_CLOEXEC.bits() } else { 0 };
+        if self.fdinfo_recording {
+            self.fdinfo_cloexec_updates.push(enabled);
+        }
     }
 
     /// Update both the logical (guest-visible) and physical (scheduler)
@@ -606,6 +669,11 @@ impl DetFd {
                 description.status_flags &= !OFlag::O_NONBLOCK.bits();
             }
             description.physically_nonblocking = enabled;
+            description.record_fdinfo_update(FdinfoOfdDelta::StatusFlags {
+                open_file: description.id,
+                mask: OFlag::O_NONBLOCK.bits(),
+                value: description.status_flags,
+            });
         })
     }
 
@@ -620,6 +688,11 @@ impl DetFd {
             } else {
                 description.status_flags &= !OFlag::O_NONBLOCK.bits();
             }
+            description.record_fdinfo_update(FdinfoOfdDelta::StatusFlags {
+                open_file: description.id,
+                mask: OFlag::O_NONBLOCK.bits(),
+                value: description.status_flags,
+            });
         })
     }
 
@@ -978,8 +1051,14 @@ impl DetFd {
         self.with_description(|d| d.procfs.as_ref().map(ProcfsFile::position))
     }
 
-    pub(crate) fn procfs_target_fd(&self) -> Option<i32> {
-        self.with_description(|d| d.procfs.as_ref().and_then(ProcfsFile::target_fd))
+    pub(crate) fn procfs_fdinfo_target(&self) -> Option<crate::procfs::FdinfoTarget> {
+        self.with_description(|d| d.procfs.as_ref().and_then(ProcfsFile::fdinfo_target))
+    }
+
+    pub(crate) fn procfs_fdinfo_open_subject(
+        &self,
+    ) -> Option<crate::syscalls::fdinfo_acquisition::ProcFdinfoOpenSubjectRelation> {
+        self.with_description(|d| d.procfs.as_ref().and_then(ProcfsFile::fdinfo_open_subject))
     }
 
     /// Update the cursor shared by every alias of a procfs open file.
@@ -1006,6 +1085,102 @@ impl DetFd {
         self.with_description(|d| d.status_flags)
     }
 
+    pub(crate) fn fdinfo_projection(&self) -> FdinfoOfdProjection {
+        self.with_description(|d| {
+            d.fdinfo_reentry
+                .clone()
+                .unwrap_or_else(|| FdinfoOfdProjection {
+                    open_file: d.id,
+                    status_flags: d.status_flags,
+                    resource: d.resource.clone(),
+                    ty: d.ty,
+                    // Cached fstat has no ordinary mount ID. An actual raw Statx
+                    // capture must supply a complete backing-object binding.
+                    object: None,
+                })
+        })
+    }
+
+    pub(crate) fn fdinfo_open_file_id(&self) -> OpenFileId {
+        self.with_description(|d| d.fdinfo_reentry.as_ref().map_or(d.id, |p| p.open_file))
+    }
+
+    pub(crate) fn fdinfo_logical_open_file_id(&self) -> OpenFileId {
+        self.with_description(|d| d.fdinfo_logical_open_file.unwrap_or(d.id))
+    }
+
+    /// All aliases share the OFD producer setting; close-on-exec remains a
+    /// slot producer. Unsupported relaxed mode changes no real FD metadata.
+    pub(crate) fn set_fdinfo_recording(&mut self, enabled: bool) {
+        self.fdinfo_recording = enabled;
+        if !enabled {
+            self.fdinfo_cloexec_updates.clear();
+        }
+        self.with_description(|description| {
+            description.fdinfo_recording = enabled;
+            if !enabled {
+                description.fdinfo_updates.clear();
+            }
+        });
+    }
+
+    pub(crate) fn bind_fdinfo_reentry(&self, projection: FdinfoOfdProjection, logical: OpenFileId) {
+        self.with_description(|d| {
+            d.fdinfo_updates.clear();
+            d.fdinfo_reentry = Some(projection);
+            d.fdinfo_logical_open_file = Some(logical);
+        });
+    }
+
+    pub(crate) fn take_fdinfo_ofd_updates(&self) -> Vec<FdinfoOfdDelta> {
+        self.with_description(|d| {
+            let mut updates = std::mem::take(&mut d.fdinfo_updates);
+            if let Some(projection) = &mut d.fdinfo_reentry {
+                for update in &mut updates {
+                    match update {
+                        FdinfoOfdDelta::StatusFlags {
+                            open_file,
+                            mask,
+                            value,
+                        } => {
+                            *open_file = projection.open_file;
+                            projection.status_flags =
+                                (projection.status_flags & !*mask) | (*value & *mask);
+                        }
+                        FdinfoOfdDelta::Resource {
+                            open_file,
+                            resource,
+                        } => {
+                            *open_file = projection.open_file;
+                            projection.resource = resource.clone();
+                        }
+                        FdinfoOfdDelta::Type { open_file, ty } => {
+                            *open_file = projection.open_file;
+                            projection.ty = *ty;
+                        }
+                        FdinfoOfdDelta::Object { open_file, object } => {
+                            *open_file = projection.open_file;
+                            projection.object = *object;
+                        }
+                        FdinfoOfdDelta::Seed(_) => {
+                            unreachable!("seeds belong to table installation")
+                        }
+                    }
+                }
+            }
+            updates
+        })
+    }
+
+    pub(crate) fn take_fdinfo_cloexec_updates(&mut self) -> Vec<bool> {
+        std::mem::take(&mut self.fdinfo_cloexec_updates)
+    }
+
+    pub(crate) fn without_fdinfo_slot_updates(mut self) -> Self {
+        self.fdinfo_cloexec_updates.clear();
+        self
+    }
+
     /// Mark every alias of this open file description physically nonblocking.
     pub fn set_physically_nonblocking(&self) {
         self.with_description(|d| d.physically_nonblocking = true);
@@ -1025,6 +1200,11 @@ impl DetFd {
                 .bits();
             description.status_flags = (description.status_flags & !mutable) | (flags & mutable);
             description.physically_nonblocking = oflags_nonblocking(description.status_flags);
+            description.record_fdinfo_update(FdinfoOfdDelta::StatusFlags {
+                open_file: description.id,
+                mask: mutable,
+                value: flags,
+            });
         })
     }
 

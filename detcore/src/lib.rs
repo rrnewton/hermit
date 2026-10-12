@@ -47,6 +47,8 @@ pub mod edit_distance;
 pub mod exit_dependencies;
 mod fatal_core;
 mod fd;
+mod fdinfo_projection;
+mod fdinfo_rpc;
 mod host_inputs;
 pub mod in_guest_site_patching;
 mod io_buffers;
@@ -2172,6 +2174,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         dettid,
                         clone_flags.contains(CloneFlags::CLONE_VM),
                     ),
+                    fdinfo_publication_mm: None,
+                    fdinfo_publication_sequence: 0,
+                    fdinfo_exec_seed: None,
+                    fdinfo_identity_request: None,
+                    fdinfo_identity_pending: None,
                     memory_metadata: if clone_flags.contains(CloneFlags::CLONE_VM) {
                         Arc::clone(&pts.1.memory_metadata)
                     } else {
@@ -2194,9 +2201,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         if clone_flags.contains(CloneFlags::CLONE_FILES) {
                             pts.1.file_metadata.clone()
                         } else {
-                            Arc::new(Mutex::new(
-                                pts.1.file_metadata.lock().unwrap().fork_for(dettid),
-                            ))
+                            let parent = pts.1.file_metadata.lock().unwrap();
+                            let copied = parent.fork_for(dettid);
+                            Arc::new(Mutex::new(copied))
                         }
                     },
                     tool_shares_guest_descriptor_table: pts.1.tool_shares_guest_descriptor_table,
@@ -2346,6 +2353,20 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 "[detcore, dtid {}] recovered process memory identity {} for unparented thread state",
                 new_dettid, detpid
             );
+        }
+
+        // Lifecycle callbacks can register a task without an instruction
+        // context. Queue the observation at this authenticated start edge;
+        // acquire it only after the first real syscall's original prehook.
+        // The root's original-parent admission window closes below: a parent
+        // sampled later is only a candidate, never that missing original fact.
+        if self.cfg.sequentialize_threads {
+            use crate::syscalls::fdinfo_acquisition::ProcIdentityCaptureRequest;
+            guest.thread_state_mut().fdinfo_identity_request = Some(if is_root_thread {
+                ProcIdentityCaptureRequest::CallerAndOriginalInitialParent
+            } else {
+                ProcIdentityCaptureRequest::Caller
+            });
         }
 
         if let Some(vfork) = guest.thread_state_mut().pending_vfork.take() {
@@ -2652,6 +2673,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             );
         }
         self.pre_handler_hook(guest, false, CheckIn::Event).await;
+
+        // Private acquisition needs this real syscall instruction context,
+        // after the unchanged RCB/grant prehook and before its original work.
+        // The signal-entry restart above deliberately leaves this pending.
+        if let Some(request) = guest.thread_state_mut().fdinfo_identity_request.take() {
+            let acquisition = self.capture_fdinfo_proc_identity(guest, request).await?;
+            guest.thread_state_mut().fdinfo_identity_pending =
+                crate::fdinfo_rpc::FdinfoOwnIdentity::from_acquisition(&acquisition);
+        }
 
         // Linux's restart of an interrupted wait is the thread's very next syscall,
         // so the record a wait kept for it lives only until then

@@ -538,8 +538,9 @@ mod tests {
             &self,
             message: <GlobalState as GlobalTool>::Request,
         ) -> <GlobalState as GlobalTool>::Response {
-            let GlobalRequest::ConsumeChildWait(parent, child) = message.2 else {
-                panic!("unexpected RPC after private proof: {:?}", message.2);
+            let original = message.2.without_fdinfo_publication();
+            let GlobalRequest::ConsumeChildWait(parent, child) = original else {
+                panic!("unexpected RPC after private proof: {original:?}");
             };
             assert_eq!(parent, DetPid::from_raw(3));
             assert_eq!(child, DetPid::from_raw(7));

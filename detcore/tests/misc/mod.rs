@@ -69,6 +69,19 @@ impl Tool for PhysicalTimerSlackProbe {
     }
 }
 
+// This existing test-only inner tool does no recording. Keep its actual
+// Detcore<PhysicalTimerSlackProbe> instantiation explicit after blanket removal.
+impl detcore::RecordOrReplay for PhysicalTimerSlackProbe {
+    async fn fdinfo_capture_fact<G: Guest<Self>>(
+        &self,
+        _guest: &mut G,
+        _kind: u8,
+        observed: Option<&[u8]>,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        Ok(observed.map(<[u8]>::to_vec))
+    }
+}
+
 #[repr(C)]
 struct TimerSlackBracketState {
     stage: AtomicU8,

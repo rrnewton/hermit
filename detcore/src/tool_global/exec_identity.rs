@@ -67,7 +67,7 @@ impl GlobalState {
         let prepared = pending.remove(&process).unwrap();
         let mut global_time = self.global_time.lock().unwrap();
         global_time.update_global_time(former, time.as_nanos(), time.inherited_nanos());
-        sched.reconnect_transferred_exec(ExecReconnect {
+        let retired = sched.reconnect_transferred_exec(ExecReconnect {
             caller: former,
             new_leader: current,
             detpid: process,
@@ -76,6 +76,13 @@ impl GlobalState {
             child_tid_addr: 0,
             reconnect_priority: None,
         });
+        self.retire_fdinfo_exec_cohort(
+            FdinfoIncarnation {
+                tid: former,
+                mm: prepared.mm,
+            },
+            &retired,
+        );
         global_time.reassign_thread(former, current);
         self.completed_exec_transfers.lock().unwrap().insert(
             process,
@@ -92,7 +99,16 @@ impl GlobalState {
                 .unwrap()
                 .insert(current, prepared.fd_blocking);
         }
-        (None, GlobalResponse::ReconnectExec(true))
+        let response = self.fdinfo_exec_reply(
+            FdinfoIncarnation {
+                tid: former,
+                mm: prepared.mm,
+            },
+            FdinfoIncarnation { tid: current, mm },
+            GlobalResponse::ReconnectExec(true),
+            None,
+        );
+        (None, response)
     }
 
     /// Called only after ordinary incarnation and sender checks, with the
@@ -205,12 +221,16 @@ where
             GlobalRequest::ReconnectExec { former, process },
         ))
         .await;
-    if response != (None, GlobalResponse::ReconnectExec(true)) {
+    let (binding, original) = split_fdinfo_reentry(response.1);
+    if (response.0, original) != (None, GlobalResponse::ReconnectExec(true)) {
         return Err(Errno::EINVAL);
     }
     // There is no await between the acknowledgment and local binding. If the
     // transport loses the reply, consuming cleanup uses the completed receipt.
     guest.thread_state_mut().dettid = current;
+    if let Some(binding) = binding {
+        guest.thread_state_mut().apply_fdinfo_reentry(binding);
+    }
     // Preemption artifacts have one history per raw TID, with no exec
     // incarnation. Appending this worker's PMU targets to the displaced
     // leader's history is invalid; replay would still read the worker's tail.

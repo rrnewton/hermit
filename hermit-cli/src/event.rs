@@ -132,6 +132,13 @@ pub enum SyscallEvent {
     /// The outcome and peer-address copy-out of an `accept4` that the kernel
     /// completed.
     Accept(AcceptEvent),
+    /// Internal, already serialized fdinfo acquisition/result/refusal fact.
+    /// Keep this variant last: the existing codec's older variant tags retain
+    /// their original ordinal. No syscall debug/INFO event is added.
+    FdinfoFact {
+        kind: u8,
+        bytes: Vec<u8>,
+    },
 }
 
 /// Recorded output and signal side effects of a read syscall.
@@ -601,5 +608,28 @@ mod tests {
         };
         assert_eq!(materialization.path, b"relative/\xff-program");
         assert_eq!(materialization.symlinks[0].target, b"target-\xfe");
+    }
+
+    #[test]
+    fn fdinfo_capture_fact_roundtrips_opaque_bytes_in_existing_event_codec() {
+        let original = vec![0, 0xff, b'\n', 0x80, 7];
+        let event = Event {
+            event: Ok(SyscallEvent::FdinfoFact {
+                kind: 3,
+                bytes: original.clone(),
+            }),
+        };
+        let encoded = bincode::serde::encode_to_vec(&event, bincode::config::legacy()).unwrap();
+        let (decoded, consumed) =
+            bincode::serde::decode_from_slice::<Event, _>(&encoded, bincode::config::legacy())
+                .unwrap();
+        assert_eq!(consumed, encoded.len());
+        match decoded.event {
+            Ok(SyscallEvent::FdinfoFact { kind, bytes }) => {
+                assert_eq!(kind, 3);
+                assert_eq!(bytes, original);
+            }
+            other => panic!("fdinfo capture fact decoded as a different event: {other:?}"),
+        }
     }
 }

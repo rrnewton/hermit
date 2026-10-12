@@ -75,6 +75,15 @@ use tracing::warn;
 use crate::config::Config;
 use crate::consts::ROOT_DETPID;
 use crate::fd::SharedOpenFileError;
+use crate::fdinfo_projection::FdinfoIncarnation;
+use crate::fdinfo_projection::FdinfoProjectionGap;
+use crate::fdinfo_rpc::FdinfoControl;
+use crate::fdinfo_rpc::FdinfoControlOperation;
+use crate::fdinfo_rpc::FdinfoControlReply;
+use crate::fdinfo_rpc::FdinfoControlValue;
+use crate::fdinfo_rpc::FdinfoPublication;
+use crate::fdinfo_rpc::FdinfoReentryBinding;
+use crate::fdinfo_rpc::FdinfoRpcState;
 use crate::ivar::Ivar;
 use crate::preemptions::PreemptionReader;
 use crate::preemptions::ThreadHistory;
@@ -1048,6 +1057,10 @@ pub struct GlobalState {
     // never before it.
     shared_open_files: Mutex<SharedOpenFileStore>,
 
+    /// Read-only target descriptor projection. Lock after `sched`, just as
+    /// the existing shared-open-file state; it never acquires a remote lease.
+    fdinfo: Mutex<FdinfoRpcState>,
+
     // Optional append-only sink shared by DBT fork descendants.
     unsupported_syscall_report_fd: Option<Mutex<File>>,
 
@@ -1230,6 +1243,7 @@ impl GlobalState {
             host_inputs: Mutex::new(Vec::new()),
             host_mutations: Mutex::new(BTreeSet::new()),
             shared_open_files: Mutex::new(SharedOpenFileStore::default()),
+            fdinfo: Mutex::new(FdinfoRpcState::default()),
             unsupported_syscall_report_fd,
             port_start_range: AtomicU16::new(range[0]),
             port_end_range: AtomicU16::new(range[1]),
@@ -1853,13 +1867,27 @@ impl GlobalState {
         type R = GlobalResponse;
         let dtid = DetTid::from_raw(from.into()); // TODO(T78538674): FIXME
         let (guest_time, request_mm, request) = gr;
-        let request = match request {
-            GlobalRequest::WithForwardedCount(produced, request) => {
-                crate::detlog::check_forwarded_count(from.as_raw(), produced);
-                *request
-            }
-            request => request,
-        };
+        let mut request = request;
+        let mut fdinfo_publication = None;
+        loop {
+            request = match request {
+                GlobalRequest::WithForwardedCount(produced, inner) => {
+                    crate::detlog::check_forwarded_count(from.as_raw(), produced);
+                    *inner
+                }
+                GlobalRequest::WithFdinfoPublication(publication, inner) => {
+                    assert!(
+                        fdinfo_publication.replace(publication).is_none(),
+                        "one fdinfo journal per original request"
+                    );
+                    *inner
+                }
+                original => {
+                    request = original;
+                    break;
+                }
+            };
+        }
         let time_from_guest = guest_time.as_nanos();
         // Exec transfer messages authenticate both incarnations before ordinary
         // sender-clock accounting. The carried clock still belongs to the former
@@ -2142,6 +2170,56 @@ impl GlobalState {
             // Tool received the transfer acknowledgment and rebound its state.
             self.acknowledge_exec_transfer(dtid, request_mm);
 
+            if exec_reconnect.is_none()
+                && !is_exec_caller_after_local_mm_swap
+                && tombstoned_deregistration.is_none()
+                // A newborn may arrive before its parent's successful clone
+                // registration. Retain this exact first Table batch until the
+                // existing StartNewThread admission below has that reservation.
+                && !matches!(&request, GlobalRequest::StartNewThread(..))
+                && let Some(publication) = &fdinfo_publication
+            {
+                self.publish_fdinfo_admitted(
+                    FdinfoIncarnation {
+                        tid: dtid,
+                        mm: request_mm,
+                    },
+                    publication,
+                );
+                if !sched.thread_was_registered(dtid)
+                    && matches!(&request, GlobalRequest::CreateChildThread(child, process, _, None, ..)
+                        if *child == dtid && *process == dtid)
+                {
+                    self.fdinfo.lock().unwrap().register_original_root(
+                        FdinfoIncarnation {
+                            tid: dtid,
+                            mm: request_mm,
+                        },
+                        publication.own_identity.as_ref(),
+                    );
+                }
+            }
+
+            if let GlobalRequest::FdinfoControl(control) = request {
+                // Observation inside the already granted serialized turn.
+                // Admission does not grant or park a task, tick a clock, or
+                // wake the target whose metadata is being read.
+                let reply = if self.cfg.sequentialize_threads && sched.holds_serial_grant(dtid) {
+                    self.fdinfo.lock().unwrap().control_admitted(
+                        FdinfoIncarnation {
+                            tid: dtid,
+                            mm: request_mm,
+                        },
+                        control,
+                    )
+                } else {
+                    FdinfoControlReply {
+                        result: Err(FdinfoProjectionGap::RejectedUpdate),
+                    }
+                };
+                return (None, R::FdinfoControl(reply));
+            }
+
             let is_thread_reconnect = matches!(
                 &request,
                 GlobalRequest::StartNewThread(child_dettid, ..) if *child_dettid == dtid
@@ -2177,6 +2255,12 @@ impl GlobalState {
             }
             GlobalRequest::WithForwardedCount(..) => {
                 unreachable!("a counted request is unwrapped on arrival")
+            }
+            GlobalRequest::WithFdinfoPublication(..) => {
+                unreachable!("publication unwrapped before request classification")
+            }
+            GlobalRequest::FdinfoControl(..) => {
+                unreachable!("capture control answered inside original MM admission")
             }
             GlobalRequest::ResumeExec(process) => {
                 let mut resources = Resources::new(dtid);
@@ -2313,6 +2397,18 @@ impl GlobalState {
                         fd_blocking,
                     },
                 );
+                if let Some(seed) = fdinfo_publication.as_ref().and_then(|p| p.exec.clone())
+                    && let Err(error) = self.fdinfo.lock().unwrap().prepare_exec_admitted(
+                        FdinfoIncarnation {
+                            tid: dtid,
+                            mm: request_mm,
+                        },
+                        process,
+                        seed,
+                    )
+                {
+                    warn!("fdinfo exec projection unavailable: {error:?}");
+                }
                 R::PrepareExec(())
             }
             GlobalRequest::CancelExec(process) => {
@@ -2324,6 +2420,15 @@ impl GlobalState {
                 {
                     let prepared = pending.remove(&process).unwrap();
                     sched.finish_exec_teardown(prepared.caller, process, prepared.mm, false);
+                    if let Err(error) = self.fdinfo.lock().unwrap().cancel_exec_admitted(
+                        FdinfoIncarnation {
+                            tid: dtid,
+                            mm: request_mm,
+                        },
+                        process,
+                    ) {
+                        warn!("fdinfo canceled exec projection unavailable: {error:?}");
+                    }
                 }
                 R::CancelExec(())
             }
@@ -2383,7 +2488,7 @@ impl GlobalState {
                     && prepared.process == dtid
                     && prepared.mm.for_exec(dtid) == request_mm
                 {
-                    sched.reconnect_after_exec(ExecReconnect {
+                    let retired = sched.reconnect_after_exec(ExecReconnect {
                         caller: dtid,
                         new_leader: dtid,
                         detpid: dtid,
@@ -2392,6 +2497,13 @@ impl GlobalState {
                         child_tid_addr: 0,
                         reconnect_priority: None,
                     });
+                    self.retire_fdinfo_exec_cohort(
+                        FdinfoIncarnation {
+                            tid: dtid,
+                            mm: prepared.mm,
+                        },
+                        &retired,
+                    );
                     self.pending_exec_states.lock().unwrap().remove(&dtid);
                 }
                 self.past_first_execve.store(true, SeqCst);
@@ -2405,7 +2517,27 @@ impl GlobalState {
                     "[detcore, dtid {}] restoring logically blocking descriptors after exec: {:?}",
                     dtid, overrides,
                 );
-                R::MarkPastFirstExecve(overrides)
+                let response = R::MarkPastFirstExecve(overrides);
+                if let Some(prepared) = prepared
+                    && prepared.caller == dtid
+                    && prepared.process == dtid
+                    && prepared.mm.for_exec(dtid) == request_mm
+                {
+                    self.fdinfo_exec_reply(
+                        FdinfoIncarnation {
+                            tid: dtid,
+                            mm: prepared.mm,
+                        },
+                        FdinfoIncarnation {
+                            tid: dtid,
+                            mm: request_mm,
+                        },
+                        response,
+                        None,
+                    )
+                } else {
+                    response
+                }
             }
             // Requested by the parent thread:
             GlobalRequest::CreateChildThread(
@@ -2452,6 +2584,13 @@ impl GlobalState {
                         child_tid_addr: ctid,
                         reconnect_priority: priority,
                     });
+                    self.retire_fdinfo_exec_cohort(
+                        FdinfoIncarnation {
+                            tid: pending.caller,
+                            mm: pending.mm,
+                        },
+                        &retired,
+                    );
                     if pending.caller != dettid {
                         self.global_time
                             .lock()
@@ -2468,7 +2607,20 @@ impl GlobalState {
                         "[detcore, dtid {}] reconciled successful exec from caller {}; retired prior identities {:?}",
                         dtid, pending.caller, retired
                     );
-                    R::CreateChildThread(Some(post_exec_mm))
+                    self.fdinfo_exec_reply(
+                        FdinfoIncarnation {
+                            tid: pending.caller,
+                            mm: pending.mm,
+                        },
+                        FdinfoIncarnation {
+                            tid: dettid,
+                            mm: post_exec_mm,
+                        },
+                        R::CreateChildThread(Some(post_exec_mm)),
+                        fdinfo_publication
+                            .as_ref()
+                            .and_then(|publication| publication.own_identity.as_ref()),
+                    )
                 } else {
                     match self
                         .recv_create_child_thread(
@@ -2528,11 +2680,14 @@ impl GlobalState {
                 match self
                     .recv_start_new_thread(
                         from,
-                        dettid,
+                        FdinfoIncarnation {
+                            tid: dettid,
+                            mm: request_mm,
+                        },
                         detpid,
-                        request_mm,
                         physical_ids,
                         signal_identity,
+                        fdinfo_publication.as_ref(),
                     )
                     .await
                 {
@@ -3279,6 +3434,20 @@ impl GlobalState {
                 child_dettid,
                 flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_VM)),
             );
+            if !parent_is_kernel_blocked
+                && let Err(error) = self.fdinfo.lock().unwrap().reserve_registered_child(
+                    FdinfoIncarnation {
+                        tid: sender,
+                        mm: request_mm,
+                    },
+                    FdinfoIncarnation {
+                        tid: child_dettid,
+                        mm: child_mm,
+                    },
+                )
+            {
+                warn!("fdinfo copied-table projection unavailable: {error:?}");
+            }
             sched.register_reused_transferred_exec_tid(child_dettid, child_mm);
             sched.record_thread_mm(child_dettid, child_mm);
             // The guest's procfs paths name a task by its thread ID in the
@@ -3438,12 +3607,16 @@ impl GlobalState {
     async fn recv_start_new_thread(
         &self,
         from: Tid,
-        dettid: DetTid,
+        incarnation: FdinfoIncarnation,
         detpid: DetPid,
-        request_mm: MmId,
         physical_ids: Option<(i32, i32)>,
         signal_identity: Option<reverie::SignalTaskIdentity>,
+        fdinfo_publication: Option<&FdinfoPublication>,
     ) -> SchedulerRpcResult<Option<ThreadHistory>> {
+        let FdinfoIncarnation {
+            tid: dettid,
+            mm: request_mm,
+        } = incarnation;
         let mut tries: u64 = 0;
         // TODO: eliminate this loop. Could instead signal with an ivar.
         let response_ivar = loop {
@@ -3552,6 +3725,14 @@ impl GlobalState {
             ) {
                 sched.fail_parked(dettid, error);
                 return SchedulerRpcResult::ThreadExited;
+            }
+            // The parent's original registration has reserved this copied
+            // table, and the original MM/liveness/signal admission above has
+            // succeeded. Apply the retained journal once, before the existing
+            // start request can grant guest execution. Clock accounting stays
+            // at its original receive_rpc site; no extra request or turn.
+            if let Some(publication) = fdinfo_publication {
+                self.publish_fdinfo_admitted(incarnation, publication);
             }
             sched.request_put(&nextturn.req, rsrcs, &self.global_time);
             break nextturn.resp;
@@ -3678,6 +3859,13 @@ impl GlobalState {
                 dettid
             );
             return;
+        }
+        {
+            let mut projection = self.fdinfo.lock().unwrap();
+            if let Err(error) = projection.retire_admitted(FdinfoIncarnation { tid: dettid, mm }) {
+                projection.cache.invalidate_authority();
+                warn!("fdinfo projection retirement unavailable: {:?}", error);
+            }
         }
         if let Some(writer) = &mut sched.preemption_writer {
             for transition in chaos_epochs {
@@ -4650,6 +4838,28 @@ pub enum GlobalRequest {
     /// the recorded process group. Appended after `CommitSigkill`, for the
     /// same reason.
     ReserveSigkillGroup(DetTid, DetPid, u32),
+    /// Successful local mutations piggyback on the original request and its
+    /// existing time/MM envelope. Unwrapping this is not incarnation admission.
+    /// Appended so every original variant retains its serialized tag.
+    WithFdinfoPublication(FdinfoPublication, Box<GlobalRequest>),
+    /// An fdinfo capture observation inside an existing serialized grant.
+    FdinfoControl(FdinfoControl),
+}
+
+#[cfg(test)]
+impl GlobalRequest {
+    /// Test transports inspect the original request while retaining its
+    /// values/count/order assertions. Real transports still forward the
+    /// complete envelope to the production admission path unchanged.
+    pub(crate) fn without_fdinfo_publication(self) -> Self {
+        match self {
+            Self::WithFdinfoPublication(_, original) => {
+                assert!(!matches!(&*original, Self::WithFdinfoPublication(..)));
+                *original
+            }
+            original => original,
+        }
+    }
 }
 
 /// Responses from the global object
@@ -4779,6 +4989,10 @@ pub enum GlobalResponse {
     /// `ThreadExited`, it never tail-injects an exit. Appended after
     /// `CommitSigkill`, for the same reason.
     Retired,
+    /// Private projection binding on an already authenticated successful exec
+    /// reply. The original response and time accounting remain intact.
+    WithFdinfoReentry(FdinfoReentryBinding, Box<GlobalResponse>),
+    FdinfoControl(FdinfoControlReply),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -4789,6 +5003,146 @@ pub(crate) fn counted_request(request: GlobalRequest) -> GlobalRequest {
     match crate::detlog::take_forwarded_since_request() {
         0 => request,
         produced => GlobalRequest::WithForwardedCount(produced, Box::new(request)),
+    }
+}
+
+/// Attach the journal to an already selected incarnation-admitted request.
+/// The observation/control fast paths have no MM admission and must neither
+/// drain local mutations nor pretend to publish them.
+pub(crate) fn published_request<G, T>(guest: &mut G, request: GlobalRequest) -> GlobalRequest
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let admitted_path = guest.config().sequentialize_threads
+        && !matches!(
+            &request,
+            GlobalRequest::RecordHostInput { .. }
+                | GlobalRequest::RecordHostMutation { .. }
+                | GlobalRequest::RecordDeterminismLoss(_)
+                | GlobalRequest::SharedOpenFile(_)
+                | GlobalRequest::Sigalrm(_)
+                | GlobalRequest::ChildExitSigchld(_)
+                | GlobalRequest::SignalDequeued { .. }
+                | GlobalRequest::UnrecoverableShutdown
+                | GlobalRequest::ReconnectExec { .. }
+                | GlobalRequest::RetireExec { .. }
+                | GlobalRequest::FdinfoControl(..)
+        );
+    let request = if admitted_path {
+        let include_exec = matches!(&request, GlobalRequest::PrepareExec(..));
+        let publication = guest
+            .thread_state_mut()
+            .take_fdinfo_publication(include_exec);
+        GlobalRequest::WithFdinfoPublication(publication, Box::new(request))
+    } else {
+        request
+    };
+    counted_request(request)
+}
+
+impl GlobalState {
+    fn publish_fdinfo_admitted(
+        &self,
+        incarnation: FdinfoIncarnation,
+        publication: &FdinfoPublication,
+    ) {
+        let mut projection = self.fdinfo.lock().unwrap();
+        if let Err(error) = projection.publish_admitted(incarnation, publication) {
+            projection.cache.invalidate_authority();
+            // A private projection gap is not a Linux syscall result and does
+            // not cancel the original request or change its scheduling/clock.
+            warn!("fdinfo projection unavailable for {incarnation:?}: {error:?}");
+        }
+    }
+
+    /// Call only while the original scheduler/MM exec admission is held.
+    fn fdinfo_exec_reply(
+        &self,
+        former: FdinfoIncarnation,
+        target: FdinfoIncarnation,
+        response: GlobalResponse,
+        own_identity: Option<&crate::fdinfo_rpc::FdinfoOwnIdentity>,
+    ) -> GlobalResponse {
+        let mut projection = self.fdinfo.lock().unwrap();
+        if !projection.has_pending_exec(target.tid) {
+            return response;
+        }
+        match projection.adopt_exec_admitted(former, target, own_identity) {
+            Ok(binding) => GlobalResponse::WithFdinfoReentry(binding, Box::new(response)),
+            Err(error) => {
+                projection.cache.invalidate_authority();
+                warn!(
+                    "fdinfo projection could not adopt an authenticated exec: {:?}",
+                    error
+                );
+                response
+            }
+        }
+    }
+
+    fn retire_fdinfo_exec_cohort(&self, former: FdinfoIncarnation, retired: &[DetTid]) {
+        let mut projection = self.fdinfo.lock().unwrap();
+        for &tid in retired {
+            if tid == former.tid {
+                continue;
+            }
+            if let Err(error) = projection.retire_admitted(FdinfoIncarnation { tid, mm: former.mm })
+            {
+                projection.cache.invalidate_authority();
+                warn!("fdinfo exec-cohort retirement unavailable: {:?}", error);
+            }
+        }
+    }
+}
+
+fn split_fdinfo_reentry(
+    response: GlobalResponse,
+) -> (Option<FdinfoReentryBinding>, GlobalResponse) {
+    match response {
+        GlobalResponse::WithFdinfoReentry(binding, original) => (Some(binding), *original),
+        original => (None, original),
+    }
+}
+
+/// The begin/bind request flushes ordered mutations before acquiring a private
+/// server-side token. Finish/cancel must not publish an empty batch, which
+/// would change the committed revision inside the held acquisition window.
+pub(crate) async fn fdinfo_control<G, T>(
+    guest: &mut G,
+    operation: FdinfoControlOperation,
+) -> Result<FdinfoControlValue, FdinfoProjectionGap>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if !guest.config().sequentialize_threads {
+        return Err(FdinfoProjectionGap::PartialView);
+    }
+    let flush = matches!(
+        &operation,
+        FdinfoControlOperation::BindOpened { .. } | FdinfoControlOperation::BeginCapture { .. }
+    );
+    let mut request = GlobalRequest::FdinfoControl(FdinfoControl { operation });
+    if flush {
+        let publication = guest.thread_state_mut().take_fdinfo_publication(false);
+        request = GlobalRequest::WithFdinfoPublication(publication, Box::new(request));
+    }
+    let time = guest.thread_state().thread_logical_time.clone();
+    let mm = guest.thread_state().mm_id;
+    // This observation does not account time or forwarded records. Leave the
+    // pending forwarded count for the next original accounted request.
+    let response = guest.send_rpc((time, mm, request)).await;
+    match response {
+        (None, GlobalResponse::FdinfoControl(reply)) => reply.result,
+        (_, GlobalResponse::Retired) => {
+            // Match the original accounted-request path: a committed SIGKILL
+            // victim never resumes into acquisition or another injection.
+            // Its existing terminal owner consumes the actual kernel death.
+            std::future::pending().await
+        }
+        (_, GlobalResponse::ThreadExited) => guest.retire_current_thread().await,
+        _ => Err(FdinfoProjectionGap::RejectedUpdate),
     }
 }
 
@@ -4845,6 +5199,17 @@ where
     T: RecordOrReplay,
 {
     let detpid = guest.thread_state().detpid.expect("detpid unset");
+    if guest.thread_state().fdinfo_exec_seed.is_none() {
+        let actor = guest.thread_state().dettid;
+        let seed = guest
+            .thread_state()
+            .file_metadata
+            .lock()
+            .unwrap()
+            .for_exec(actor)
+            .fdinfo_exec_seed();
+        guest.thread_state_mut().fdinfo_exec_seed = Some(seed);
+    }
     let (_, response) =
         send_and_update_time(guest, GlobalRequest::PrepareExec(detpid, mm, fd_blocking)).await;
     assert_eq!(response, GlobalResponse::PrepareExec(()));
@@ -5062,7 +5427,8 @@ where
     );
     let mytime = guest.thread_state().thread_logical_time.clone();
     let mm = guest.thread_state().mm_id;
-    let mut resp = guest.send_rpc((mytime, mm, counted_request(request))).await;
+    let request = published_request(guest, request);
+    let mut resp = guest.send_rpc((mytime, mm, request)).await;
     let deadline = match resp.1 {
         GlobalResponse::WithDeadline(remaining, response) => {
             resp.1 = *response;
@@ -5072,6 +5438,16 @@ where
     };
     guest.thread_state_mut().last_grant_deadline = deadline;
     cap_timeslice_at_deadline(guest, deadline);
+    let (binding, response) = split_fdinfo_reentry(resp.1);
+    if let Some(binding) = binding {
+        if let GlobalResponse::CreateChildThread(Some(post_exec_mm)) = &response {
+            // The original caller installs this same authenticated MM before
+            // issuing another request; bind the projection on that exact reply.
+            guest.thread_state_mut().mm_id = *post_exec_mm;
+        }
+        guest.thread_state_mut().apply_fdinfo_reentry(binding);
+    }
+    let resp = (resp.0, response);
     if resp.1 == GlobalResponse::Retired {
         // A committed SIGKILL victim (`Scheduler::is_unaccounted_sigkill_victim`):
         // this callback never resumes. No error, errno or injection reaches
@@ -5130,7 +5506,8 @@ enum SchedulerRpcResult<T> {
 /// awaits a grant is reached from one of these.
 fn resumes_from_grant(request: &GlobalRequest) -> bool {
     match request {
-        GlobalRequest::WithForwardedCount(_, request) => resumes_from_grant(request),
+        GlobalRequest::WithForwardedCount(_, request)
+        | GlobalRequest::WithFdinfoPublication(_, request) => resumes_from_grant(request),
         GlobalRequest::RequestResources(..)
         | GlobalRequest::ParkedRequest(..)
         | GlobalRequest::ResumeParkedRequest { .. }
@@ -5309,6 +5686,22 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    if let Some(flags) = flags {
+        let parent = guest.thread_state();
+        let child = FdinfoIncarnation {
+            tid: child_dettid,
+            mm: MmId::for_clone(
+                parent.mm_id,
+                child_dettid,
+                flags.contains(CloneFlags::CLONE_VM),
+            ),
+        };
+        parent
+            .file_metadata
+            .lock()
+            .unwrap()
+            .stage_fdinfo_fork_seed(child, flags);
+    }
     // Random (or replayed) starting priority in chaos mode, constant priority otherwise.
     let starting_priority = if guest.config().replay_preemptions_from.is_some() {
         // In preemption replay mode, the initial priority is set on the other
@@ -7547,7 +7940,10 @@ mod tests {
             &self,
             message: <GlobalState as GlobalTool>::Request,
         ) -> <GlobalState as GlobalTool>::Response {
-            self.requests.lock().unwrap().push(message.2.clone());
+            self.requests
+                .lock()
+                .unwrap()
+                .push(message.2.clone().without_fdinfo_publication());
             self.global
                 .receive_rpc(Tid::from_raw(self.thread.dettid.as_raw()), message)
                 .await
@@ -7654,7 +8050,10 @@ mod tests {
             &self,
             message: <GlobalState as GlobalTool>::Request,
         ) -> <GlobalState as GlobalTool>::Response {
-            self.requests.lock().unwrap().push(message.2.clone());
+            self.requests
+                .lock()
+                .unwrap()
+                .push(message.2.clone().without_fdinfo_publication());
             self.global
                 .receive_rpc(Tid::from_raw(self.thread.dettid.as_raw()), message)
                 .await

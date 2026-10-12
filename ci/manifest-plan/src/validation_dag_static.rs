@@ -1391,7 +1391,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4108): 1053.
     // And metadata::tests::record_version_rejects_streams_that_answered_pidfd_self_sentinels_without_an_event
     // (https://github.com/rrnewton/hermit/issues/4147): 1054.
-    ("test.hermit_unit", 1054),
+    // The fdinfo event-codec and typed replay controls retain all 1054 prior
+    // identities; the shipped lib+bins selection measures 1056.
+    ("test.hermit_unit", 1056),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1943,7 +1945,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the three single-virtual-CPU procfs tests (cpuinfo, sysfs CPU lists, /proc/stat;
     // https://github.com/rrnewton/hermit/issues/4160): 1445.
     // And the cpu0-topology and node0 single-CPU test (https://github.com/rrnewton/hermit/issues/4160): 1446.
-    ("test.detcore_unit", 1446),
+    // The shipped lib+bins listing measures 1485 selected identities, including
+    // the fdinfo model, acquisition, procfs and parent-cut controls; no filters changed.
+    ("test.detcore_unit", 1489),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2026,7 +2030,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/3997): 129.
     // raw_clone's five raw-clone process tests
     // (https://github.com/rrnewton/hermit/issues/4012) retain all 129: 134.
-    ("test.detcore_misc", 134),
+    // The held foreign fdinfo target regression retains all 134 selected
+    // identities; absent and unrelated reader slots are branches of one test.
+    ("test.detcore_misc", 135),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -2920,7 +2926,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same twelve descriptor-entry identity tests: 118.
     // And the same eleven child-subreaper guest tests: 129.
     // And the same five raw-clone process tests: 134.
-    ("test.detcore_misc_on_host", 134),
+    // And the same held foreign fdinfo target regression: 135.
+    ("test.detcore_misc_on_host", 135),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -3057,7 +3064,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the 11 deadline-cap tests: 1442.
     // And the three single-virtual-CPU procfs tests: 1445.
     // And the cpu0-topology and node0 single-CPU test: 1446.
-    ("test.detcore_unit_on_host", 1446),
+    // The host twin uses the same measured lib+bins selection: 1485.
+    ("test.detcore_unit_on_host", 1489),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3202,7 +3210,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The identical lib+bins selection includes the three descriptor controls.
     // And the pidfd scope-flag record-epoch test: 1053.
     // And the PIDFD_SELF record-epoch test: 1054.
-    ("test.hermit_unit_on_host", 1054),
+    // And the same two fdinfo event-codec and typed replay controls: 1056.
+    ("test.hermit_unit_on_host", 1056),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

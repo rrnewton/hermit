@@ -347,7 +347,9 @@ fn remember_materialized_path(
 }
 
 use crate::desync::DesyncError;
+use crate::event::Event;
 use crate::event::OpenMaterialization;
+use crate::event::SyscallEvent;
 use crate::event_stream::ChildEventStreamIds;
 use crate::event_stream::DebugEvent;
 use crate::event_stream::EventReader;
@@ -740,6 +742,41 @@ impl Tool for Replayer {
         _request: Rdtsc,
     ) -> Result<RdtscResult, Errno> {
         next_event!(guest, Rdtsc)
+    }
+}
+
+/// Consume exactly the next typed acquisition fact. A missing/misordered
+/// fact, bare syscall errno or another event cannot supply subject authority.
+fn fdinfo_capture_fact_bytes(event: Event, expected_kind: u8) -> Result<Vec<u8>, Error> {
+    match event.event {
+        Ok(SyscallEvent::FdinfoFact { kind, bytes }) if kind == expected_kind => Ok(bytes),
+        Ok(SyscallEvent::FdinfoFact { kind, .. }) => Err(Error::Tool(anyhow::anyhow!(
+            "fdinfo capture fact replay kind mismatch: expected {expected_kind}, found {kind}"
+        ))),
+        Ok(_) => Err(Error::Tool(anyhow::anyhow!(
+            "fdinfo capture fact replay expected kind {expected_kind}, found another event type"
+        ))),
+        Err(errno) => Err(Error::Tool(anyhow::anyhow!(
+            "fdinfo capture fact replay expected kind {expected_kind}, found a bare syscall error {errno}"
+        ))),
+    }
+}
+
+impl detcore::RecordOrReplay for Replayer {
+    async fn fdinfo_capture_fact<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        kind: u8,
+        _observed: Option<&[u8]>,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        // This is the ordinary event stream, not the syscall debug stream:
+        // do not advance debug-event count, inject, or query present-day proc.
+        let event = guest.thread_state_mut().next_event().map_err(|error| {
+            Error::Tool(anyhow::anyhow!(
+                "could not replay fdinfo capture fact kind {kind}: {error}"
+            ))
+        })?;
+        fdinfo_capture_fact_bytes(event, kind).map(Some)
     }
 }
 
@@ -2823,5 +2860,50 @@ mod shutdown_replay_tests {
             Some(34567)
         );
         assert_eq!(socket_inode(std::path::Path::new("pipe:[34567]")), None);
+    }
+}
+
+#[cfg(test)]
+mod fdinfo_capture_fact_tests {
+    use super::*;
+
+    #[test]
+    fn fdinfo_capture_fact_replay_requires_next_typed_kind_without_errno_fallback() {
+        let event = |kind, bytes| Event {
+            event: Ok(SyscallEvent::FdinfoFact { kind, bytes }),
+        };
+        let bytes = vec![0, 0xff, b'\n'];
+        assert_eq!(
+            fdinfo_capture_fact_bytes(event(4, bytes.clone()), 4).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            fdinfo_capture_fact_bytes(event(5, Vec::new()), 5).unwrap(),
+            Vec::<u8>::new()
+        );
+        for wrong in [
+            event(3, vec![1]),
+            Event {
+                event: Ok(SyscallEvent::Bytes(vec![1])),
+            },
+            Event {
+                event: Err(Errno::EBADF),
+            },
+        ] {
+            assert!(matches!(
+                fdinfo_capture_fact_bytes(wrong, 4),
+                Err(Error::Tool(_))
+            ));
+        }
+        let mut ordered = [event(3, vec![3]), event(4, vec![4])].into_iter();
+        assert!(matches!(
+            fdinfo_capture_fact_bytes(ordered.next().unwrap(), 4),
+            Err(Error::Tool(_))
+        ));
+        // No searching/skipping or synthesizing an errno after the first mismatch.
+        assert_eq!(
+            fdinfo_capture_fact_bytes(ordered.next().unwrap(), 4).unwrap(),
+            vec![4]
+        );
     }
 }

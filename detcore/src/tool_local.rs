@@ -45,6 +45,20 @@ use tracing::info;
 use crate::config::Config;
 use crate::detlog;
 use crate::fd::*;
+use crate::fdinfo_projection::FdinfoIncarnation;
+use crate::fdinfo_projection::FdinfoOfdDelta;
+use crate::fdinfo_projection::FdinfoProjectionBatch;
+use crate::fdinfo_projection::FdinfoProjectionDelta;
+use crate::fdinfo_projection::FdinfoSlotDelta;
+use crate::fdinfo_projection::FdinfoSlotProjection;
+use crate::fdinfo_projection::FdinfoTableOrigin;
+use crate::fdinfo_projection::FdinfoTableSeed;
+use crate::fdinfo_rpc::FdinfoAllocationCursors;
+use crate::fdinfo_rpc::FdinfoExecSeed;
+use crate::fdinfo_rpc::FdinfoForkSeed;
+use crate::fdinfo_rpc::FdinfoInheritedSlot;
+use crate::fdinfo_rpc::FdinfoPublication;
+use crate::fdinfo_rpc::FdinfoReentryBinding;
 use crate::memory::MemoryMetadata;
 use crate::preemptions::ThreadHistoryIterator;
 use crate::record_or_replay::NoopTool;
@@ -92,6 +106,33 @@ pub struct FileMetadata {
     /// Deserialization restores aliasing (`crate::fd::intern_open_files`).
     #[serde(deserialize_with = "deserialize_interned_file_handles")]
     pub(crate) file_handles: HashMap<RawFd, DetFd>,
+    /// The actual creation boundary of this table, not a later parent's view.
+    #[serde(default = "initial_fdinfo_table_origin")]
+    fdinfo_origin: FdinfoTableOrigin,
+    #[serde(default = "fdinfo_seed_pending")]
+    fdinfo_seed_pending: bool,
+    /// The projection is unavailable without serialization. Never retain a
+    /// mutation history in that supported execution mode.
+    #[serde(default = "fdinfo_recording_default")]
+    pub(crate) fdinfo_recording: bool,
+    /// Ordered successful slot/OFD field writes awaiting an admitted RPC.
+    #[serde(skip)]
+    fdinfo_updates: Vec<FdinfoProjectionDelta>,
+    /// Exact init-time copies awaiting the parent's existing child-registration
+    /// transaction. They are never reconstructed from a later child table.
+    #[serde(skip)]
+    pub(crate) fdinfo_forks: Vec<FdinfoForkSeed>,
+    /// Private projection table instance. Actual `files_id` is unchanged.
+    #[serde(default)]
+    fdinfo_files: Option<FilesId>,
+    #[serde(default)]
+    fdinfo_cursors: Option<FdinfoAllocationCursors>,
+    #[serde(skip)]
+    fdinfo_allocated: HashMap<OpenFileId, OpenFileId>,
+    /// Surviving exec slots not yet discovered by the reloaded local tool.
+    /// The successful exec transaction, not a number/inode guess, supplies them.
+    #[serde(default)]
+    fdinfo_inherited: HashMap<RawFd, FdinfoInheritedSlot>,
     /// Blocking accepts waiting in this table, each as (operation, listener):
     /// a `close` of a listener here is refused while an accept waits on it
     /// (`crate::syscalls::accept_in_turn`). Waits never cross a fork or an
@@ -103,6 +144,18 @@ pub struct FileMetadata {
     /// The next accept-wait operation number in this table.
     #[serde(skip)]
     next_accept_wait: u64,
+}
+
+fn initial_fdinfo_table_origin() -> FdinfoTableOrigin {
+    FdinfoTableOrigin::Initial
+}
+
+fn fdinfo_seed_pending() -> bool {
+    true
+}
+
+fn fdinfo_recording_default() -> bool {
+    true
 }
 
 /// Deserializes a descriptor table with its aliases restored, so a table
@@ -384,6 +437,66 @@ impl<T: RecordOrReplay> AsMut<T> for Detcore<T> {
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    /// One typed acquisition fact in the inner tool's existing event stream.
+    /// Decode the exact type and consume all bytes: replay never reconstructs
+    /// authority or a backend refusal from the current host or a bare errno.
+    pub(crate) async fn fdinfo_capture_fact<G, V>(
+        &self,
+        guest: &mut G,
+        kind: u8,
+        observed: &V,
+    ) -> Result<V, Error>
+    where
+        G: Guest<Self>,
+        V: Serialize + serde::de::DeserializeOwned + Send + Sync,
+    {
+        let encoded = bincode::serde::encode_to_vec(observed, bincode::config::legacy())
+            .map_err(|error| Error::Tool(anyhow::anyhow!("fdinfo fact encode failed: {error}")))?;
+        let recorded = self
+            .record_or_replay
+            .fdinfo_capture_fact(&mut guest.into_guest(), kind, Some(&encoded))
+            .await?
+            .ok_or_else(|| {
+                Error::Tool(anyhow::anyhow!("fdinfo captured fact returned no payload"))
+            })?;
+        Self::decode_fdinfo_capture_fact(&recorded)
+    }
+
+    /// Replay obtains a private helper fact before executing that operation.
+    /// Other inner tools do not consume or create an event for this probe.
+    pub(crate) async fn fdinfo_replay_capture_fact<G, V>(
+        &self,
+        guest: &mut G,
+        kind: u8,
+    ) -> Result<Option<V>, Error>
+    where
+        G: Guest<Self>,
+        V: serde::de::DeserializeOwned + Send + Sync,
+    {
+        self.record_or_replay
+            .fdinfo_capture_fact(&mut guest.into_guest(), kind, None)
+            .await?
+            .as_deref()
+            .map(Self::decode_fdinfo_capture_fact)
+            .transpose()
+    }
+
+    fn decode_fdinfo_capture_fact<V: serde::de::DeserializeOwned>(
+        recorded: &[u8],
+    ) -> Result<V, Error> {
+        let (value, consumed) =
+            bincode::serde::decode_from_slice::<V, _>(recorded, bincode::config::legacy())
+                .map_err(|error| {
+                    Error::Tool(anyhow::anyhow!("fdinfo fact decode failed: {error}"))
+                })?;
+        if consumed != recorded.len() {
+            return Err(Error::Tool(anyhow::anyhow!(
+                "fdinfo fact contains trailing bytes"
+            )));
+        }
+        Ok(value)
+    }
+
     /// Delegate to the record/replay tool without collapsing a tool failure
     /// into a guest-visible errno. Syscall errors remain [`Error::Errno`], while
     /// failures of the record/replay machinery retain their non-errno variant.
@@ -515,8 +628,29 @@ impl FileMetadata {
             next_open_file_sequence: 0,
             next_socket_open_file_sequence: 0,
             file_handles: HashMap::new(),
+            fdinfo_origin: FdinfoTableOrigin::Initial,
+            fdinfo_seed_pending: true,
+            fdinfo_recording: true,
+            fdinfo_updates: Vec::new(),
+            fdinfo_forks: Vec::new(),
+            fdinfo_files: None,
+            fdinfo_cursors: None,
+            fdinfo_allocated: HashMap::new(),
+            fdinfo_inherited: HashMap::new(),
             accept_waits: Vec::new(),
             next_accept_wait: 0,
+        }
+    }
+
+    fn set_fdinfo_recording(&mut self, enabled: bool) {
+        self.fdinfo_recording = enabled;
+        if !enabled {
+            self.fdinfo_updates.clear();
+            self.fdinfo_forks.clear();
+            self.fdinfo_seed_pending = false;
+        }
+        for detfd in self.file_handles.values_mut() {
+            detfd.set_fdinfo_recording(enabled);
         }
     }
 
@@ -545,7 +679,7 @@ impl FileMetadata {
     }
 
     fn allocate_open_file_id(&mut self, creator: DetTid, ty: FdType) -> OpenFileId {
-        if ty == FdType::Socket {
+        let id = if ty == FdType::Socket {
             let id = OpenFileId::new_socket(creator, self.next_socket_open_file_sequence);
             self.next_socket_open_file_sequence += 1;
             id
@@ -553,6 +687,144 @@ impl FileMetadata {
             let id = OpenFileId::new(creator, self.next_open_file_sequence);
             self.next_open_file_sequence += 1;
             id
+        };
+        if let Some(cursors) = &mut self.fdinfo_cursors {
+            let key = Self::allocate_fdinfo_key(cursors, creator, ty);
+            self.fdinfo_allocated.insert(id, key);
+        }
+        id
+    }
+
+    fn allocate_fdinfo_key(
+        cursors: &mut FdinfoAllocationCursors,
+        creator: DetTid,
+        ty: FdType,
+    ) -> OpenFileId {
+        let (sequence, socket) = if ty == FdType::Socket {
+            (&mut cursors.socket, true)
+        } else {
+            (&mut cursors.regular, false)
+        };
+        let current = *sequence;
+        *sequence = sequence
+            .checked_add(1)
+            .expect("fdinfo key sequence overflow");
+        if socket {
+            OpenFileId::new_socket(creator, current)
+        } else {
+            OpenFileId::new(creator, current)
+        }
+    }
+
+    pub(crate) fn fdinfo_files_id(&self) -> FilesId {
+        self.fdinfo_files.unwrap_or(self.files_id)
+    }
+
+    fn fdinfo_allocation_cursors(&self) -> FdinfoAllocationCursors {
+        self.fdinfo_cursors.unwrap_or(FdinfoAllocationCursors {
+            regular: self.next_open_file_sequence,
+            socket: self.next_socket_open_file_sequence,
+        })
+    }
+
+    pub(crate) fn fdinfo_exec_seed(&self) -> FdinfoExecSeed {
+        FdinfoExecSeed {
+            table: self.fdinfo_table_seed(),
+            cursors: self.fdinfo_allocation_cursors(),
+        }
+    }
+
+    fn fdinfo_logical_ids(&self) -> Vec<(OpenFileId, OpenFileId)> {
+        let mut ids = BTreeMap::new();
+        for inherited in self.fdinfo_inherited.values() {
+            if inherited.ofd.open_file != inherited.logical {
+                ids.insert(inherited.ofd.open_file, inherited.logical);
+            }
+        }
+        for detfd in self.file_handles.values() {
+            let key = detfd.fdinfo_open_file_id();
+            let logical = detfd.fdinfo_logical_open_file_id();
+            if key != logical {
+                ids.insert(key, logical);
+            }
+        }
+        ids.into_iter().collect()
+    }
+
+    /// Bind only the projection to the held, authenticated successful exec
+    /// cut. The actual FileMetadata IDs, allocator and scheduler state remain
+    /// those of this newly represented local tool.
+    fn apply_fdinfo_reentry(&mut self, owner: DetTid, binding: FdinfoReentryBinding) {
+        let logical: HashMap<_, _> = binding.logical_ids.into_iter().collect();
+        let ofds: HashMap<_, _> = binding
+            .table
+            .ofds
+            .into_iter()
+            .map(|ofd| (ofd.open_file, ofd))
+            .collect();
+        self.fdinfo_files = Some(binding.table.files);
+        self.fdinfo_origin = binding.table.origin;
+        self.fdinfo_cursors = Some(binding.cursors);
+        self.fdinfo_allocated.clear();
+        self.fdinfo_inherited = binding
+            .table
+            .slots
+            .into_iter()
+            .map(|(fd, slot)| {
+                let ofd = ofds
+                    .get(&slot.open_file)
+                    .expect("admitted seed OFD")
+                    .clone();
+                let logical = logical
+                    .get(&slot.open_file)
+                    .copied()
+                    .unwrap_or(slot.open_file);
+                (
+                    fd,
+                    FdinfoInheritedSlot {
+                        ofd,
+                        logical,
+                        cloexec: slot.cloexec,
+                    },
+                )
+            })
+            .collect();
+        self.fdinfo_updates.clear();
+        self.fdinfo_forks.clear();
+        self.fdinfo_seed_pending = false;
+        let mut fds: Vec<_> = self.file_handles.keys().copied().collect();
+        fds.sort_unstable();
+        let mut fresh = HashMap::new();
+        for fd in fds {
+            let detfd = &self.file_handles[&fd];
+            if let Some(inherited) = self.fdinfo_inherited.get(&fd) {
+                detfd.bind_fdinfo_reentry(inherited.ofd.clone(), inherited.logical);
+            } else {
+                let id = detfd.open_file_id();
+                let key = *fresh.entry(id).or_insert_with(|| {
+                    Self::allocate_fdinfo_key(
+                        self.fdinfo_cursors.as_mut().expect("reentry cursor"),
+                        owner,
+                        detfd.ty(),
+                    )
+                });
+                let mut projection = detfd.fdinfo_projection();
+                projection.open_file = key;
+                detfd.bind_fdinfo_reentry(projection, id);
+                self.fdinfo_updates
+                    .push(FdinfoProjectionDelta::Ofd(FdinfoOfdDelta::Seed(
+                        detfd.fdinfo_projection(),
+                    )));
+                self.fdinfo_updates
+                    .push(FdinfoProjectionDelta::Slot(FdinfoSlotDelta::Install {
+                        files: binding.table.files,
+                        fd,
+                        slot: FdinfoSlotProjection {
+                            open_file: key,
+                            cloexec: detfd.is_cloexec(),
+                        },
+                    }));
+            }
         }
     }
 
@@ -632,7 +904,22 @@ impl FileMetadata {
             files_id: FilesId::forked(child),
             next_open_file_sequence: self.next_open_file_sequence,
             next_socket_open_file_sequence: self.next_socket_open_file_sequence,
-            file_handles: self.file_handles.clone(),
+            file_handles: self
+                .file_handles
+                .iter()
+                .map(|(&fd, detfd)| (fd, detfd.clone().without_fdinfo_slot_updates()))
+                .collect(),
+            fdinfo_origin: FdinfoTableOrigin::Fork {
+                source: self.fdinfo_files_id(),
+            },
+            fdinfo_seed_pending: self.fdinfo_recording,
+            fdinfo_recording: self.fdinfo_recording,
+            fdinfo_updates: Vec::new(),
+            fdinfo_forks: Vec::new(),
+            fdinfo_files: None,
+            fdinfo_cursors: self.fdinfo_cursors,
+            fdinfo_allocated: HashMap::new(),
+            fdinfo_inherited: self.fdinfo_inherited.clone(),
             accept_waits: Vec::new(),
             next_accept_wait: 0,
         }
@@ -646,7 +933,31 @@ impl FileMetadata {
             file_handles: self
                 .file_handles
                 .iter()
-                .filter_map(|(&fd, detfd)| (!detfd.is_cloexec()).then_some((fd, detfd.clone())))
+                .filter_map(|(&fd, detfd)| {
+                    (!detfd.is_cloexec())
+                        .then_some((fd, detfd.clone().without_fdinfo_slot_updates()))
+                })
+                .collect(),
+            fdinfo_origin: FdinfoTableOrigin::Exec {
+                source: self.fdinfo_files_id(),
+            },
+            fdinfo_seed_pending: self.fdinfo_recording,
+            fdinfo_recording: self.fdinfo_recording,
+            fdinfo_updates: Vec::new(),
+            fdinfo_forks: Vec::new(),
+            fdinfo_files: self.fdinfo_files.map(|files| files.for_exec(task)),
+            fdinfo_cursors: self.fdinfo_cursors,
+            fdinfo_allocated: HashMap::new(),
+            fdinfo_inherited: self
+                .fdinfo_inherited
+                .iter()
+                .filter_map(|(&fd, inherited)| {
+                    (!self
+                        .file_handles
+                        .get(&fd)
+                        .map_or(inherited.cloexec, DetFd::is_cloexec))
+                    .then_some((fd, inherited.clone()))
+                })
                 .collect(),
             accept_waits: Vec::new(),
             next_accept_wait: 0,
@@ -802,7 +1113,15 @@ impl FileMetadata {
         if fd_flags & libc::FD_CLOEXEC != 0 {
             flags.insert(OFlag::O_CLOEXEC);
         }
-        self.add_fd(owner, fd, flags, ty, Some(raw_stat.into()))?;
+        let id = self.allocate_open_file_id(owner, ty);
+        let detfd = DetFd::new(fd, flags, ty, id).with_stat(Some(raw_stat.into()));
+        if let Some(inherited) = self.fdinfo_inherited.get(&fd) {
+            // This alias comes from the admitted successful exec cut, not the
+            // newly restarted local allocator or an inode/slot-number guess.
+            detfd.bind_fdinfo_reentry(inherited.ofd.clone(), inherited.logical);
+            self.fdinfo_allocated.remove(&id);
+        }
+        self.add_detfd(detfd);
         // This newly discovered description predates our observation. Its
         // kernel lock may be held, but no cached lock claim existed to go stale.
         self.with_detfd(fd, |detfd| detfd.mark_flock_mode_unobserved())?;
@@ -820,13 +1139,74 @@ impl FileMetadata {
     where
         F: FnMut(&mut DetFd) -> U,
     {
+        let files = self.fdinfo_files_id();
         let detfd = self.file_handles.get_mut(&fd).ok_or(Errno::EBADF)?;
-        Ok(f(detfd))
+        detfd.set_fdinfo_recording(self.fdinfo_recording);
+        let result = f(detfd);
+        if !self.fdinfo_recording {
+            return Ok(result);
+        }
+        let open_file = detfd.fdinfo_open_file_id();
+        self.fdinfo_updates.extend(
+            detfd
+                .take_fdinfo_ofd_updates()
+                .into_iter()
+                .map(FdinfoProjectionDelta::Ofd),
+        );
+        self.fdinfo_updates
+            .extend(
+                detfd
+                    .take_fdinfo_cloexec_updates()
+                    .into_iter()
+                    .map(|cloexec| {
+                        FdinfoProjectionDelta::Slot(FdinfoSlotDelta::Cloexec {
+                            files,
+                            fd,
+                            expected: open_file,
+                            cloexec,
+                        })
+                    }),
+            );
+        Ok(result)
     }
 
     /// add a detfd
-    fn add_detfd(&mut self, detfd: DetFd) {
+    fn add_detfd(&mut self, mut detfd: DetFd) {
         let fd = detfd.fd;
+        detfd.set_fdinfo_recording(self.fdinfo_recording);
+        if !self.fdinfo_recording {
+            self.file_handles.insert(fd, detfd);
+            return;
+        }
+        // Creation consumes the private allocation once. Dup/captured installs
+        // retain the existing alias, and any successful replacement revokes a
+        // surviving reload-slot mapping before installing the new description.
+        if let Some(key) = self.fdinfo_allocated.remove(&detfd.open_file_id()) {
+            let logical = detfd.fdinfo_logical_open_file_id();
+            let mut projection = detfd.fdinfo_projection();
+            projection.open_file = key;
+            detfd.bind_fdinfo_reentry(projection, logical);
+        }
+        self.fdinfo_inherited.remove(&fd);
+        self.fdinfo_updates
+            .push(FdinfoProjectionDelta::Ofd(FdinfoOfdDelta::Seed(
+                detfd.fdinfo_projection(),
+            )));
+        self.fdinfo_updates.extend(
+            detfd
+                .take_fdinfo_ofd_updates()
+                .into_iter()
+                .map(FdinfoProjectionDelta::Ofd),
+        );
+        self.fdinfo_updates
+            .push(FdinfoProjectionDelta::Slot(FdinfoSlotDelta::Install {
+                files: self.fdinfo_files_id(),
+                fd,
+                slot: FdinfoSlotProjection {
+                    open_file: detfd.fdinfo_open_file_id(),
+                    cloexec: detfd.is_cloexec(),
+                },
+            }));
         self.file_handles.insert(fd, detfd);
     }
 
@@ -847,7 +1227,34 @@ impl FileMetadata {
 
     /// remove a rawfd
     fn remove_fd(&mut self, fd: RawFd) -> Option<OpenFileId> {
-        let detfd = self.file_handles.remove(&fd)?;
+        if !self.fdinfo_recording {
+            let detfd = self.file_handles.remove(&fd)?;
+            return (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id());
+        }
+        let inherited = self.fdinfo_inherited.remove(&fd);
+        let Some(detfd) = self.file_handles.remove(&fd) else {
+            if let Some(inherited) = inherited {
+                self.fdinfo_updates
+                    .push(FdinfoProjectionDelta::Slot(FdinfoSlotDelta::Remove {
+                        files: self.fdinfo_files_id(),
+                        fd,
+                        expected: inherited.ofd.open_file,
+                    }));
+            }
+            return None;
+        };
+        self.fdinfo_updates.extend(
+            detfd
+                .take_fdinfo_ofd_updates()
+                .into_iter()
+                .map(FdinfoProjectionDelta::Ofd),
+        );
+        self.fdinfo_updates
+            .push(FdinfoProjectionDelta::Slot(FdinfoSlotDelta::Remove {
+                files: self.fdinfo_files_id(),
+                fd,
+                expected: detfd.fdinfo_open_file_id(),
+            }));
         (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())
     }
 
@@ -859,7 +1266,14 @@ impl FileMetadata {
             .copied()
             .filter(|fd| *fd >= 0 && first <= *fd as u32 && *fd as u32 <= last)
             .collect();
+        descriptors.extend(
+            self.fdinfo_inherited
+                .keys()
+                .copied()
+                .filter(|fd| *fd >= 0 && first <= *fd as u32 && *fd as u32 <= last),
+        );
         descriptors.sort_unstable();
+        descriptors.dedup();
         descriptors
             .into_iter()
             .filter_map(|fd| self.remove_fd(fd))
@@ -881,7 +1295,8 @@ impl FileMetadata {
         let detfd = self.with_detfd(oldfd, |old_detfd| {
             old_detfd.clone().with_fd(newfd).with_fd_flags(flags)
         })?;
-        let replaced = self.file_handles.insert(newfd, detfd);
+        let replaced = self.file_handles.get(&newfd).cloned();
+        self.add_detfd(detfd);
         Ok(replaced
             .and_then(|detfd| (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())))
     }
@@ -916,7 +1331,8 @@ impl FileMetadata {
         }
 
         let detfd = captured.detfd.with_fd(newfd).with_fd_flags(flags);
-        let replaced = self.file_handles.insert(newfd, detfd);
+        let replaced = self.file_handles.get(&newfd).cloned();
+        self.add_detfd(detfd);
         Ok(replaced
             .and_then(|detfd| (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())))
     }
@@ -928,6 +1344,108 @@ impl FileMetadata {
             (captured.detfd.open_file_alias_count() == 1).then(|| captured.detfd.open_file_id());
         drop(captured);
         release
+    }
+
+    pub(crate) fn fdinfo_table_seed(&self) -> FdinfoTableSeed {
+        let mut slots = BTreeMap::new();
+        let mut ofds = BTreeMap::new();
+        for (&fd, inherited) in &self.fdinfo_inherited {
+            ofds.entry(inherited.ofd.open_file)
+                .or_insert_with(|| inherited.ofd.clone());
+            slots.insert(
+                fd,
+                FdinfoSlotProjection {
+                    open_file: inherited.ofd.open_file,
+                    cloexec: inherited.cloexec,
+                },
+            );
+        }
+        for (&fd, detfd) in &self.file_handles {
+            ofds.entry(detfd.fdinfo_open_file_id())
+                .or_insert_with(|| detfd.fdinfo_projection());
+            slots.insert(
+                fd,
+                FdinfoSlotProjection {
+                    open_file: detfd.fdinfo_open_file_id(),
+                    cloexec: detfd.is_cloexec(),
+                },
+            );
+        }
+        FdinfoTableSeed {
+            files: self.fdinfo_files_id(),
+            origin: self.fdinfo_origin,
+            slots: slots.into_iter().collect(),
+            ofds: ofds.into_values().collect(),
+            complete: false,
+        }
+    }
+
+    /// Capture the copied table in the successful ordinary parent's existing
+    /// registration callback, before it publishes or resumes guest code. An
+    /// in-process backend constructs the child in a separate address space;
+    /// that constructor cannot publish a seed through the parent's journal.
+    pub(crate) fn stage_fdinfo_fork_seed(&mut self, child: FdinfoIncarnation, flags: CloneFlags) {
+        if !self.fdinfo_recording
+            || flags.intersects(CloneFlags::CLONE_FILES | CloneFlags::CLONE_VFORK)
+        {
+            // A shared table needs no new seed. A vfork parent's later return
+            // is not the clone cut; its child-only route stays unavailable.
+            return;
+        }
+        let source = self.fdinfo_files_id();
+        let mut table = self.fdinfo_table_seed();
+        table.files = FilesId::forked(child.tid);
+        table.origin = FdinfoTableOrigin::Fork { source };
+        self.fdinfo_forks.push(FdinfoForkSeed { child, table });
+    }
+
+    pub(crate) fn take_fdinfo_updates(&mut self) -> Vec<FdinfoProjectionDelta> {
+        if !self.fdinfo_recording {
+            self.fdinfo_updates.clear();
+            return Vec::new();
+        }
+        let files = self.fdinfo_files_id();
+        // An escaped capture can have updated an OFD outside with_detfd. Drain
+        // reachable descriptions once each in stable slot order before handing
+        // off the serial grant or answering a target metadata query.
+        let mut fds: Vec<_> = self.file_handles.keys().copied().collect();
+        fds.sort_unstable();
+        for fd in &fds {
+            let detfd = self.file_handles.get_mut(fd).unwrap();
+            self.fdinfo_updates.extend(
+                detfd
+                    .take_fdinfo_ofd_updates()
+                    .into_iter()
+                    .map(FdinfoProjectionDelta::Ofd),
+            );
+            let open_file = detfd.fdinfo_open_file_id();
+            self.fdinfo_updates
+                .extend(
+                    detfd
+                        .take_fdinfo_cloexec_updates()
+                        .into_iter()
+                        .map(|cloexec| {
+                            FdinfoProjectionDelta::Slot(FdinfoSlotDelta::Cloexec {
+                                files,
+                                fd: *fd,
+                                expected: open_file,
+                                cloexec,
+                            })
+                        }),
+                );
+        }
+        if self.fdinfo_seed_pending {
+            let table = self.fdinfo_table_seed();
+            // Initial setup's slot operations are represented by the actual
+            // creation snapshot. OFD setters remain ordered field updates;
+            // they must not be replaced with a stale whole-description word.
+            self.fdinfo_updates
+                .retain(|delta| !matches!(delta, FdinfoProjectionDelta::Slot(_)));
+            self.fdinfo_updates
+                .insert(0, FdinfoProjectionDelta::Table(table));
+            self.fdinfo_seed_pending = false;
+        }
+        std::mem::take(&mut self.fdinfo_updates)
     }
 }
 
@@ -1083,6 +1601,117 @@ mod file_metadata_tests {
     use std::os::fd::AsRawFd;
 
     use super::*;
+
+    #[test]
+    fn parent_fork_publication_retains_the_clone_cut_before_slot_replacement() {
+        let parent_tid = DetTid::from_raw(3);
+        let child_tid = DetTid::from_raw(5);
+        let mut parent = FileMetadata::new(parent_tid);
+        parent
+            .add_fd(
+                parent_tid,
+                7,
+                OFlag::O_RDONLY | OFlag::O_CLOEXEC,
+                FdType::Regular,
+                None,
+            )
+            .unwrap();
+        parent.dup_fd(7, 8, OFlag::empty()).unwrap();
+        let copied = parent.fork_for(child_tid).fdinfo_table_seed();
+        let child = FdinfoIncarnation {
+            tid: child_tid,
+            mm: MmId::for_clone(MmId::initial(parent_tid), child_tid, false),
+        };
+        parent.stage_fdinfo_fork_seed(child, CloneFlags::empty());
+        assert_eq!(parent.fdinfo_forks.len(), 1);
+        let seed = parent.fdinfo_forks[0].clone();
+        assert_eq!(seed.child, child);
+        assert_eq!(seed.table, copied);
+        let old_slot = seed.table.slots.iter().find(|(fd, _)| *fd == 7).unwrap().1;
+        assert!(old_slot.cloexec);
+        assert_eq!(
+            old_slot.open_file,
+            seed.table
+                .slots
+                .iter()
+                .find(|(fd, _)| *fd == 8)
+                .unwrap()
+                .1
+                .open_file,
+        );
+
+        parent.remove_fd(7);
+        parent
+            .add_fd(parent_tid, 7, OFlag::O_WRONLY, FdType::Pipe, None)
+            .unwrap();
+        assert_ne!(
+            parent.file_handles[&7].fdinfo_open_file_id(),
+            old_slot.open_file
+        );
+        assert_eq!(parent.fdinfo_forks[0].table, copied);
+    }
+
+    #[test]
+    fn shared_vfork_and_disabled_registration_do_not_mint_copied_table_seeds() {
+        let owner = DetTid::from_raw(3);
+        let child = FdinfoIncarnation {
+            tid: DetTid::from_raw(5),
+            mm: MmId::for_clone(MmId::initial(owner), DetTid::from_raw(5), false),
+        };
+        let mut metadata = FileMetadata::new(owner);
+        metadata.stage_fdinfo_fork_seed(child, CloneFlags::CLONE_FILES);
+        metadata.stage_fdinfo_fork_seed(child, CloneFlags::CLONE_VFORK);
+        assert!(metadata.fdinfo_forks.is_empty());
+        metadata.set_fdinfo_recording(false);
+        metadata.stage_fdinfo_fork_seed(child, CloneFlags::empty());
+        assert!(metadata.fdinfo_forks.is_empty());
+    }
+
+    #[test]
+    fn unsupported_projection_mode_does_not_retain_mutation_journals() {
+        let owner = DetTid::from_raw(3);
+        let mut metadata = FileMetadata::new(owner);
+        metadata.set_fdinfo_recording(false);
+        for _ in 0..32 {
+            metadata
+                .add_fd(owner, 7, OFlag::O_RDWR, FdType::Pipe, None)
+                .unwrap();
+            let alias = metadata.file_handles[&7].clone().with_fd(8);
+            metadata.add_detfd(alias);
+            metadata
+                .with_detfd(7, |fd| {
+                    fd.set_nonblocking(true);
+                    fd.set_logical_nonblocking(false);
+                    fd.set_status_flags(OFlag::O_APPEND.bits());
+                    fd.set_cloexec(true);
+                    fd.set_resource(ResourceID::Device(
+                        crate::resources::Device::ContainerStdout,
+                    ));
+                })
+                .unwrap();
+            // Escaped aliases use the same disabled OFD producer.
+            let escaped = metadata.file_handles[&8].clone();
+            escaped.set_logical_nonblocking(true);
+            assert!(escaped.is_nonblocking());
+            assert_eq!(escaped.status_flags() & libc::O_ACCMODE, libc::O_RDWR);
+            assert!(escaped.take_fdinfo_ofd_updates().is_empty());
+            assert!(
+                metadata
+                    .file_handles
+                    .get_mut(&7)
+                    .unwrap()
+                    .take_fdinfo_cloexec_updates()
+                    .is_empty()
+            );
+            assert!(metadata.fdinfo_updates.is_empty());
+            metadata.remove_fd(7);
+            metadata.remove_fd(8);
+            assert!(metadata.fdinfo_updates.is_empty());
+        }
+        assert!(metadata.take_fdinfo_updates().is_empty());
+        assert!(!metadata.fork_for(DetTid::from_raw(4)).fdinfo_recording);
+        assert!(!metadata.for_exec(owner).fdinfo_recording);
+    }
 
     #[test]
     fn on_demand_discovery_finds_a_live_descriptor() {
@@ -2014,6 +2643,22 @@ pub struct ThreadState<T> {
     /// Linux memory address space shared by tasks created with `CLONE_VM`.
     pub mm_id: MmId,
 
+    /// Publication sequence belongs to this actual MM incarnation. It is not
+    /// a clock and advances only when an existing admitted request carries it.
+    #[serde(skip)]
+    pub(crate) fdinfo_publication_mm: Option<MmId>,
+    #[serde(skip)]
+    pub(crate) fdinfo_publication_sequence: u64,
+    #[serde(skip)]
+    pub(crate) fdinfo_exec_seed: Option<FdinfoExecSeed>,
+    /// An authenticated start/reentry queued this observation; lifecycle-only
+    /// callbacks need no guest instruction or raw proc authority.
+    #[serde(skip)]
+    pub(crate) fdinfo_identity_request:
+        Option<crate::syscalls::fdinfo_acquisition::ProcIdentityCaptureRequest>,
+    #[serde(skip)]
+    pub(crate) fdinfo_identity_pending: Option<crate::fdinfo_rpc::FdinfoOwnIdentity>,
+
     /// Shared memory mappings used to resolve process-shared futex keys.
     pub(crate) memory_metadata: Arc<Mutex<MemoryMetadata>>,
 
@@ -2407,6 +3052,71 @@ pub(crate) fn chaos_per_thread_slowdown_factor(
 }
 
 impl<T> ThreadState<T> {
+    pub(crate) fn apply_fdinfo_reentry(&mut self, binding: FdinfoReentryBinding) {
+        if binding.incarnation
+            != (FdinfoIncarnation {
+                tid: self.dettid,
+                mm: self.mm_id,
+            })
+        {
+            tracing::warn!("fdinfo projection rejected a stale loader reply");
+            return;
+        }
+        self.file_metadata
+            .lock()
+            .unwrap()
+            .apply_fdinfo_reentry(self.dettid, binding);
+        // The matching successful global exec transaction already committed
+        // this incarnation's held Table as sequence one.
+        self.fdinfo_publication_mm = Some(self.mm_id);
+        self.fdinfo_publication_sequence = 1;
+        self.fdinfo_exec_seed = None;
+        self.fdinfo_identity_pending = None;
+        self.fdinfo_identity_request =
+            Some(crate::syscalls::fdinfo_acquisition::ProcIdentityCaptureRequest::Caller);
+    }
+    /// This is attached to an existing request only after its caller has
+    /// selected an incarnation-admitted route. Observation-only traffic never
+    /// consumes the journal or invents projection admission.
+    pub(crate) fn take_fdinfo_publication(&mut self, include_exec: bool) -> FdinfoPublication {
+        if self.fdinfo_publication_mm != Some(self.mm_id) {
+            self.fdinfo_publication_mm = Some(self.mm_id);
+            self.fdinfo_publication_sequence = 0;
+        }
+        self.fdinfo_publication_sequence = self
+            .fdinfo_publication_sequence
+            .checked_add(1)
+            .expect("fdinfo publication sequence overflow");
+        let (files, deltas, forks) = {
+            let mut metadata = self.file_metadata.lock().unwrap();
+            (
+                metadata.fdinfo_files_id(),
+                metadata.take_fdinfo_updates(),
+                std::mem::take(&mut metadata.fdinfo_forks),
+            )
+        };
+        let origin = deltas.iter().find_map(|delta| match delta {
+            FdinfoProjectionDelta::Table(seed) => Some(seed.origin),
+            _ => None,
+        });
+        FdinfoPublication {
+            files,
+            origin,
+            batch: FdinfoProjectionBatch {
+                sequence: self.fdinfo_publication_sequence,
+                deltas,
+            },
+            forks,
+            logical_ids: self.file_metadata.lock().unwrap().fdinfo_logical_ids(),
+            exec: if include_exec {
+                self.fdinfo_exec_seed.take()
+            } else {
+                None
+            },
+            own_identity: self.fdinfo_identity_pending.take(),
+        }
+    }
+
     pub(crate) fn observe_guest_clock(&self, raw: LogicalTime) -> LogicalTime {
         self.guest_clock
             .lock()
@@ -2658,6 +3368,7 @@ impl<T> ThreadState<T> {
         let last_accounted_system_time = thread_logical_time.system_cpu_time();
         let file_metadata = if cfg.backend.tool_shares_guest_descriptor_table {
             let mut metadata = FileMetadata::new(pid);
+            metadata.set_fdinfo_recording(cfg.sequentialize_threads);
             for fd in 0..=2 {
                 match metadata.discover_fd_from_current_process(pid, fd) {
                     Ok(()) | Err(Errno::EBADF) => {}
@@ -2666,7 +3377,9 @@ impl<T> ThreadState<T> {
             }
             metadata
         } else {
-            FileMetadata::new(pid).setup_stdio(pid.into(), pid)
+            let mut metadata = FileMetadata::new(pid);
+            metadata.set_fdinfo_recording(cfg.sequentialize_threads);
+            metadata.setup_stdio(pid.into(), pid)
         };
         ThreadState {
             dettid: pid,
@@ -2676,6 +3389,11 @@ impl<T> ThreadState<T> {
             signal_task_identity: None,
             open_file_creator: None,
             mm_id: MmId::initial(pid),
+            fdinfo_publication_mm: None,
+            fdinfo_publication_sequence: 0,
+            fdinfo_exec_seed: None,
+            fdinfo_identity_request: None,
+            fdinfo_identity_pending: None,
             memory_metadata: Arc::new(Mutex::new(MemoryMetadata::new())),
             pedigree: Pedigree::new(), // Root thread.
             stats: ThreadStats::new(),

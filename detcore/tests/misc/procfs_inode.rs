@@ -25,6 +25,7 @@
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::fs::File;
+use std::io::Read;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::fd::IntoRawFd;
@@ -855,6 +856,103 @@ fn a_descriptor_numbered_as_openat_is_detcores_when_it_was_free() {
                 assert!(!open(OPENAT_OWN_NUMBER + 1), "Detcore opened another");
             });
             assert_eq!(detcore::detlog::determinism_loss(), None);
+        },
+    );
+}
+
+/// The proc target owns N until acknowledgement. The reader first has no N,
+/// then an unrelated object at N; neither state can supply target metadata.
+#[test]
+fn foreign_fdinfo_reads_the_held_target_with_absent_or_unrelated_reader_slot() {
+    in_its_own_process(
+        "foreign_fdinfo_reads_the_held_target_with_absent_or_unrelated_reader_slot",
+        || {
+            for occupied in [false, true] {
+                under_detcore(move || {
+                    const TARGET: i32 = 73;
+                    let mut ready = [0; 2];
+                    let mut release = [0; 2];
+                    unsafe {
+                        assert_eq!(libc::pipe2(ready.as_mut_ptr(), libc::O_CLOEXEC), 0);
+                        assert_eq!(libc::pipe2(release.as_mut_ptr(), libc::O_CLOEXEC), 0);
+                        for fd in ready.iter_mut().chain(release.iter_mut()) {
+                            let moved = libc::fcntl(*fd, libc::F_DUPFD_CLOEXEC, 80);
+                            assert!(moved >= 80);
+                            assert_eq!(libc::close(*fd), 0);
+                            *fd = moved;
+                        }
+                    }
+                    let directory = File::open("/").unwrap();
+                    let expected_inode = directory.metadata().unwrap().ino();
+                    assert_eq!(
+                        unsafe { libc::dup3(directory.as_raw_fd(), TARGET, libc::O_CLOEXEC) },
+                        TARGET
+                    );
+                    drop(directory);
+                    let child = unsafe { libc::fork() };
+                    assert!(child >= 0);
+                    if child == 0 {
+                        unsafe {
+                            libc::close(ready[0]);
+                            libc::close(release[1]);
+                            let mut byte = 81u8;
+                            if libc::write(ready[1], (&byte as *const u8).cast(), 1) != 1 {
+                                libc::_exit(1);
+                            }
+                            if libc::read(release[0], (&mut byte as *mut u8).cast(), 1) != 1 {
+                                libc::_exit(2);
+                            }
+                            libc::_exit(if libc::close(TARGET) == 0 { 0 } else { 3 });
+                        }
+                    }
+                    unsafe {
+                        libc::close(ready[1]);
+                        libc::close(release[0]);
+                        libc::close(TARGET);
+                    }
+                    let mut byte = 0u8;
+                    assert_eq!(
+                        unsafe { libc::read(ready[0], (&mut byte as *mut u8).cast(), 1) },
+                        1
+                    );
+                    assert_eq!(byte, 81);
+                    if occupied {
+                        let unrelated = File::open("/dev/null").unwrap();
+                        assert_eq!(
+                            unsafe { libc::dup3(unrelated.as_raw_fd(), TARGET, libc::O_CLOEXEC) },
+                            TARGET
+                        );
+                    } else {
+                        assert_eq!(unsafe { libc::fcntl(TARGET, libc::F_GETFD) }, -1);
+                    }
+                    let mut contents = String::new();
+                    let observed = File::open(format!("/proc/{child}/fdinfo/{TARGET}"))
+                        .and_then(|mut file| file.read_to_string(&mut contents));
+                    unsafe {
+                        assert_eq!(libc::write(release[1], (&byte as *const u8).cast(), 1), 1);
+                        libc::close(ready[0]);
+                        libc::close(release[1]);
+                        if occupied {
+                            libc::close(TARGET);
+                        }
+                        let mut status = 0;
+                        assert_eq!(libc::waitpid(child, &mut status, 0), child);
+                        assert_eq!(status, 0);
+                    }
+                    assert!(observed.is_ok(), "held foreign fdinfo failed: {observed:?}");
+                    let inode = contents
+                        .lines()
+                        .find_map(|line| line.strip_prefix("ino:"))
+                        .unwrap()
+                        .trim()
+                        .parse::<u64>()
+                        .unwrap();
+                    assert_eq!(
+                        inode, expected_inode,
+                        "fdinfo described the reader's slot: {contents}"
+                    );
+                });
+            }
         },
     );
 }

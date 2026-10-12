@@ -1130,7 +1130,7 @@ mod event_tests {
             &self,
             message: <GlobalState as GlobalTool>::Request,
         ) -> <GlobalState as GlobalTool>::Response {
-            let response = match message.2 {
+            let response = match message.2.without_fdinfo_publication() {
                 GlobalRequest::RequestResources(request, _)
                     if request.resources.keys().any(|resource| {
                         matches!(

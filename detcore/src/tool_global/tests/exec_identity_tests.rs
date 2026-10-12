@@ -67,7 +67,10 @@ impl GlobalRPC<GlobalState> for ExecRpc<'_> {
         request: <GlobalState as GlobalTool>::Request,
     ) -> <GlobalState as GlobalTool>::Response {
         let reconnect = matches!(&request.2, GlobalRequest::ReconnectExec { .. });
-        self.requests.lock().unwrap().push(request.2.clone());
+        self.requests
+            .lock()
+            .unwrap()
+            .push(request.2.clone().without_fdinfo_publication());
         if reconnect && self.gate == Gate::BeforeCommit {
             self.suspend().await;
         }

@@ -24,7 +24,12 @@ pub(crate) use detcore_model::procfs::parse_mountinfo;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::fdinfo_projection::FdinfoProjectionGap;
 use crate::syscalls::DETERMINISTIC_PIPE_CAPACITY_BYTES;
+use crate::syscalls::fdinfo_acquisition::ProcFdinfoOpenSubjectRelation;
+use crate::syscalls::fdinfo_acquisition::ProcFdinfoSubjectSelector;
+use crate::syscalls::fdinfo_acquisition::ProcIdentityGap;
+use crate::types::FilesId;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ProcfsKind {
@@ -346,12 +351,162 @@ fn sysfs_rtc_kind(path: &Path) -> Option<ProcfsKind> {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ProcfsFile {
     kind: ProcfsKind,
-    target_fd: Option<i32>,
+    fdinfo_target: Option<FdinfoTarget>,
+    #[serde(default)]
+    fdinfo_open_subject: Option<ProcFdinfoOpenSubjectRelation>,
+    #[serde(default)]
+    fdinfo_projection: Option<FdinfoProjectionOutcome>,
     bound_thread_identity: Option<(i32, i32, i32)>,
     #[serde(default)]
     timer_slack_identity: Option<(u64, u64)>,
     contents: Option<Vec<u8>>,
     offset: usize,
+}
+
+/// The task and descriptor table named by an open fdinfo inode. `self` and
+/// `thread-self` are resolved when it is opened, never by the later reader.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct FdinfoTarget {
+    subject: FdinfoSubject,
+    pub(crate) fd: i32,
+    pub(crate) files: Option<FilesId>,
+    pub(crate) proc_inode: Option<(u64, u64)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum FdinfoSubject {
+    Process(Option<i32>),
+    ThreadSelf,
+    Task { process: Option<i32>, thread: i32 },
+}
+
+impl FdinfoTarget {
+    pub(crate) fn selector(&self, current_pid: Option<i32>) -> Option<ProcFdinfoSubjectSelector> {
+        Some(match self.subject {
+            FdinfoSubject::Process(None) => ProcFdinfoSubjectSelector::SelfProcess,
+            FdinfoSubject::Process(Some(pid)) => ProcFdinfoSubjectSelector::Process { pid },
+            FdinfoSubject::ThreadSelf => ProcFdinfoSubjectSelector::ThreadSelf,
+            FdinfoSubject::Task { process, thread } => ProcFdinfoSubjectSelector::Task {
+                pid: process.or(current_pid)?,
+                tid: thread,
+            },
+        })
+    }
+
+    #[cfg(test)]
+    fn bind(&mut self, tgid: i32, tid: i32, files: FilesId, proc_inode: (u64, u64)) {
+        match &mut self.subject {
+            FdinfoSubject::Process(process @ None)
+            | FdinfoSubject::Task {
+                process: process @ None,
+                ..
+            } => *process = Some(tgid),
+            FdinfoSubject::ThreadSelf => self.subject = FdinfoSubject::Process(Some(tid)),
+            _ => {}
+        }
+        let target_tid = match self.subject {
+            FdinfoSubject::Process(process) => process,
+            FdinfoSubject::Task { thread, .. } => Some(thread),
+            FdinfoSubject::ThreadSelf => unreachable!("thread-self was not bound"),
+        };
+        // A different task can have an independent files_struct even in the
+        // same thread group. Only the exact opener establishes this authority.
+        self.files = (target_tid == Some(tid)).then_some(files);
+        self.proc_inode = Some(proc_inode);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_reader(&self, tid: i32, files: FilesId) -> bool {
+        let subject_is_reader = match self.subject {
+            FdinfoSubject::Process(Some(process)) => process == tid,
+            FdinfoSubject::Task { thread, .. } => thread == tid,
+            _ => false,
+        };
+        subject_is_reader && self.files == Some(files)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn path(&self, directory: &str) -> Option<String> {
+        let base = match self.subject {
+            FdinfoSubject::Process(Some(process)) => format!("/proc/{process}"),
+            FdinfoSubject::Task {
+                process: Some(process),
+                thread,
+            } => {
+                format!("/proc/{process}/task/{thread}")
+            }
+            _ => return None,
+        };
+        Some(format!("{base}/{directory}/{}", self.fd))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct FdinfoIdentity {
+    pub(crate) inode: u64,
+    pub(crate) flags: i32,
+    pub(crate) open_file: Option<u64>,
+    pub(crate) mount_id: u64,
+}
+
+/// A valid Linux read remains readable when target logical metadata cannot be
+/// authenticated. Raw successful bytes in Unavailable carry no projection or
+/// determinism assurance; they are not a guessed logical descriptor identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) enum FdinfoProjectionOutcome {
+    Projected(FdinfoIdentity),
+    Unavailable {
+        reason: FdinfoProjectionGap,
+        acquisition: Option<ProcIdentityGap>,
+    },
+}
+
+/// Identity fields from the same kernel snapshot that supplies fdinfo's text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FdinfoFields {
+    pub(crate) inode: u64,
+    pub(crate) flags: i32,
+    pub(crate) mount_id: u64,
+}
+
+pub(crate) fn parse_fdinfo_fields(contents: &[u8]) -> Option<FdinfoFields> {
+    let mut inode = None;
+    let mut flags = None;
+    let mut mount_id = None;
+    for line in std::str::from_utf8(contents).ok()?.lines() {
+        let (key, value) = line.split_once(':')?;
+        let value = value.trim();
+        match key {
+            "ino"
+                if inode.is_none()
+                    && !value.is_empty()
+                    && value.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                inode = Some(value.parse().ok()?)
+            }
+            "flags"
+                if flags.is_none()
+                    && !value.is_empty()
+                    && value.bytes().all(|b| (b'0'..=b'7').contains(&b)) =>
+            {
+                flags = Some(i32::from_str_radix(value, 8).ok()?)
+            }
+            "mnt_id"
+                if mount_id.is_none()
+                    && !value.is_empty()
+                    && value.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                mount_id = Some(value.parse().ok()?)
+            }
+            "ino" | "flags" | "mnt_id" => return None,
+            _ => {}
+        }
+    }
+    Some(FdinfoFields {
+        inode: inode?,
+        flags: flags?,
+        mount_id: mount_id?,
+    })
 }
 
 /// A non-mutating candidate for one sequential timer-slack read.
@@ -645,7 +800,7 @@ pub(crate) struct ProcfsSnapshotContext {
     pub(crate) virtual_pid: i32,
     pub(crate) virtual_ppid: i32,
     pub(crate) virtual_pty_count: usize,
-    pub(crate) fdinfo_identity: Option<(u64, i32, u64, u64)>,
+    pub(crate) fdinfo_projection: Option<FdinfoProjectionOutcome>,
     /// Raw `(device, inode)` -> determinized `(device, inode)` for every backed
     /// mapping in a `maps`/`smaps` snapshot.
     ///
@@ -685,7 +840,7 @@ impl ProcfsFile {
     pub(crate) fn from_path(path: &Path) -> Option<Self> {
         let path = normalize_observed_path(path)?;
         let path_text = path.to_str()?;
-        let target_fd = parse_fdinfo_target(path_text);
+        let fdinfo_target = parse_fdinfo_target(path_text);
         let kind = match path_text {
             "/proc/self/stat" => ProcfsKind::Stat,
             "/proc/self/status" => ProcfsKind::Status,
@@ -758,7 +913,7 @@ impl ProcfsFile {
             other if is_process_file_path(other, "sched") => ProcfsKind::SelfSched,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-931): Review fdinfo backing-identity normalization.
-            _ if target_fd.is_some() => ProcfsKind::Fdinfo,
+            _ if fdinfo_target.is_some() => ProcfsKind::Fdinfo,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-934): Review host NUMA observation normalization.
             other if is_process_file_path(other, "numa_maps") => ProcfsKind::NumaMaps,
@@ -873,7 +1028,9 @@ impl ProcfsFile {
         };
         Some(Self {
             kind,
-            target_fd,
+            fdinfo_target,
+            fdinfo_open_subject: None,
+            fdinfo_projection: None,
             bound_thread_identity: None,
             timer_slack_identity: None,
             contents: None,
@@ -953,12 +1110,13 @@ impl ProcfsFile {
             virtual_pid,
             virtual_ppid,
             virtual_pty_count,
-            fdinfo_identity,
+            fdinfo_projection,
             random_uuid,
             mapping_identities,
             mountinfo,
         } = context;
         let mapping_identities = &mapping_identities;
+        self.fdinfo_projection = fdinfo_projection.clone();
         self.contents = Some(match &self.kind {
             ProcfsKind::Stat => sanitize_stat(&contents, Some((virtual_pid, virtual_ppid))),
             ProcfsKind::Status => {
@@ -1008,7 +1166,13 @@ impl ProcfsFile {
             ProcfsKind::IrqPerCpuCount => sanitize_irq_per_cpu_count(&contents),
             ProcfsKind::PtyNr => sanitize_pty_nr(&contents, virtual_pty_count),
             ProcfsKind::SelfSched => sanitize_self_sched(&contents),
-            ProcfsKind::Fdinfo => sanitize_fdinfo(&contents, fdinfo_identity),
+            ProcfsKind::Fdinfo => match fdinfo_projection {
+                Some(FdinfoProjectionOutcome::Projected(identity)) => {
+                    sanitize_fdinfo(&contents, Some(identity))
+                }
+                Some(FdinfoProjectionOutcome::Unavailable { .. }) => contents,
+                None => sanitize_fdinfo(&contents, None),
+            },
             ProcfsKind::AioNr => sanitize_aio_nr(&contents),
             ProcfsKind::AioMaxNr => sanitize_aio_nr(&contents),
             ProcfsKind::PipeMaxSize => sanitize_pipe_max_size(&contents),
@@ -1195,8 +1359,30 @@ impl ProcfsFile {
         }
     }
 
-    pub(crate) fn target_fd(&self) -> Option<i32> {
-        self.target_fd
+    pub(crate) fn fdinfo_target(&self) -> Option<FdinfoTarget> {
+        self.fdinfo_target
+    }
+
+    pub(crate) fn fdinfo_open_subject(&self) -> Option<ProcFdinfoOpenSubjectRelation> {
+        self.fdinfo_open_subject
+    }
+
+    pub(crate) fn bind_fdinfo_open_subject(&mut self, relation: ProcFdinfoOpenSubjectRelation) {
+        self.fdinfo_open_subject = Some(relation);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bind_fdinfo_target(
+        &mut self,
+        tgid: i32,
+        tid: i32,
+        files: FilesId,
+        proc_inode: (u64, u64),
+    ) {
+        self.fdinfo_target
+            .as_mut()
+            .expect("not fdinfo")
+            .bind(tgid, tid, files, proc_inode);
     }
 }
 
@@ -1250,19 +1436,34 @@ fn parse_timer_slack_target(path: &str) -> Option<Option<i32>> {
     Some(Some(target))
 }
 
-fn parse_fdinfo_target(path: &str) -> Option<i32> {
+fn parse_fdinfo_target(path: &str) -> Option<FdinfoTarget> {
     let relative = path.strip_prefix("/proc/")?;
     let components = relative.split('/').collect::<Vec<_>>();
-    let fd = match components.as_slice() {
-        [task, "fdinfo", fd] if is_proc_task_name(task) => *fd,
-        [process, "task", thread, "fdinfo", fd]
-            if is_proc_process_name(process) && is_numeric_id(thread) =>
-        {
-            *fd
+    let process = |value: &str| {
+        if value == "self" {
+            Some(None)
+        } else {
+            value.parse::<i32>().ok().filter(|id| *id > 0).map(Some)
         }
+    };
+    let (subject, fd) = match components.as_slice() {
+        ["thread-self", "fdinfo", fd] => (FdinfoSubject::ThreadSelf, *fd),
+        [task, "fdinfo", fd] => (FdinfoSubject::Process(process(task)?), *fd),
+        [task, "task", thread, "fdinfo", fd] => (
+            FdinfoSubject::Task {
+                process: process(task)?,
+                thread: thread.parse().ok().filter(|id| *id > 0)?,
+            },
+            *fd,
+        ),
         _ => return None,
     };
-    fd.parse().ok()
+    Some(FdinfoTarget {
+        subject,
+        fd: fd.parse().ok().filter(|fd| *fd >= 0)?,
+        files: None,
+        proc_inode: None,
+    })
 }
 
 const VIRTUAL_CPU_FREQUENCY_KHZ: u64 = 1_000_000;
@@ -2989,8 +3190,14 @@ fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-931): Review the /proc/self/fdinfo field policy.
-fn sanitize_fdinfo(contents: &[u8], identity: Option<(u64, i32, u64, u64)>) -> Vec<u8> {
-    let Some((virtual_inode, logical_flags, virtual_open_file, virtual_mount_id)) = identity else {
+fn sanitize_fdinfo(contents: &[u8], identity: Option<FdinfoIdentity>) -> Vec<u8> {
+    let Some(FdinfoIdentity {
+        inode: virtual_inode,
+        flags: logical_flags,
+        open_file: virtual_open_file,
+        mount_id: virtual_mount_id,
+    }) = identity
+    else {
         return Vec::new();
     };
     let Ok(text) = std::str::from_utf8(contents) else {
@@ -3008,6 +3215,9 @@ fn sanitize_fdinfo(contents: &[u8], identity: Option<(u64, i32, u64, u64)>) -> V
         } else if body.starts_with("flags:") {
             normalized.extend_from_slice(format!("flags:\t{logical_flags:07o}").as_bytes());
         } else if body.starts_with("eventfd-id:") {
+            let Some(virtual_open_file) = virtual_open_file else {
+                return Vec::new();
+            };
             normalized.extend_from_slice(format!("eventfd-id: {virtual_open_file}").as_bytes());
         } else if body.starts_with("Pid:") {
             normalized.extend_from_slice(b"Pid:\t1");
@@ -4333,7 +4543,7 @@ mod tests {
         ] {
             let procfs = ProcfsFile::from_path(Path::new(path)).unwrap();
             assert_eq!(procfs.kind, ProcfsKind::Fdinfo);
-            assert_eq!(procfs.target_fd(), Some(17));
+            assert_eq!(procfs.fdinfo_target().map(|target| target.fd), Some(17));
         }
         assert!(ProcfsFile::from_path(Path::new("/proc/self/fdinfo/")).is_none());
         assert!(ProcfsFile::from_path(Path::new("/proc/self/fdinfo/stdin")).is_none());
@@ -6603,6 +6813,83 @@ THPeligible:    0\n"
     }
 
     #[test]
+    fn fdinfo_subject_is_bound_to_the_opener_and_its_actual_table() {
+        let files = FilesId::initial(crate::types::DetTid::from_raw(3));
+        for (path, bound, local) in [
+            ("/proc/self/fdinfo/7", "/proc/3/fd/7", false),
+            ("/proc/thread-self/fdinfo/7", "/proc/4/fd/7", true),
+            ("/proc/4/fdinfo/7", "/proc/4/fd/7", true),
+            ("/proc/1/fdinfo/7", "/proc/1/fd/7", false),
+            ("/proc/self/task/4/fdinfo/7", "/proc/3/task/4/fd/7", true),
+        ] {
+            let mut file = ProcfsFile::from_path(Path::new(path)).unwrap();
+            file.bind_fdinfo_target(3, 4, files, (10, 20));
+            let target = file.fdinfo_target().unwrap();
+            assert_eq!(target.path("fd").as_deref(), Some(bound));
+            assert_eq!(target.files, local.then_some(files));
+            assert_eq!(target.proc_inode, Some((10, 20)));
+            assert_eq!(target.is_reader(4, files), local);
+            assert!(
+                !target.is_reader(5, files),
+                "a passed fd cannot borrow the old reader table"
+            );
+            assert!(!target.is_reader(4, files.for_exec(crate::types::DetTid::from_raw(4))));
+            // A descriptor passed to another files_struct cannot acquire that
+            // reader's unrelated N merely because the numeric PID matches.
+            assert_ne!(
+                target.files,
+                Some(FilesId::forked(crate::types::DetTid::from_raw(5)))
+            );
+        }
+        for path in [
+            "/proc/0/fdinfo/7",
+            "/proc/self/fdinfo/-1",
+            "/proc/self/task/0/fdinfo/7",
+        ] {
+            assert!(parse_fdinfo_target(path).is_none(), "{path}");
+        }
+    }
+
+    #[test]
+    fn fdinfo_snapshot_identity_is_unique_and_foreign_cookie_is_not_invented() {
+        let bytes = b"pos: 0\nflags: 0200000\nmnt_id: 17\nino: 41\n";
+        assert_eq!(
+            parse_fdinfo_fields(bytes),
+            Some(FdinfoFields {
+                inode: 41,
+                flags: 0o200000,
+                mount_id: 17,
+            })
+        );
+        for suffix in ["ino: 42\n", "flags: 02\n", "mnt_id: 18\n"] {
+            let mut duplicate = bytes.to_vec();
+            duplicate.extend_from_slice(suffix.as_bytes());
+            assert!(parse_fdinfo_fields(&duplicate).is_none());
+        }
+        for invalid in [
+            b"ino: +41\nflags: 02\nmnt_id: 17\n".as_slice(),
+            b"ino: 41\nflags: -2\nmnt_id: 17\n",
+            b"ino: 41\nflags: 09\nmnt_id: 17\n",
+            b"ino: 41\nflags: 02\n",
+        ] {
+            assert!(parse_fdinfo_fields(invalid).is_none());
+        }
+        let identity = FdinfoIdentity {
+            inode: 9001,
+            flags: 0,
+            open_file: None,
+            mount_id: 2,
+        };
+        assert_eq!(
+            sanitize_fdinfo(bytes, Some(identity)),
+            b"pos: 0\nflags:\t0000000\nmnt_id:\t2\nino:\t9001\n"
+        );
+        let mut eventfd = bytes.to_vec();
+        eventfd.extend_from_slice(b"eventfd-id: 123\n");
+        assert!(sanitize_fdinfo(&eventfd, Some(identity)).is_empty());
+    }
+
+    #[test]
     fn fdinfo_hides_backing_identity_only() {
         let contents = b"pos:\t1\n\
 flags:\t0100002\n\
@@ -6612,7 +6899,15 @@ eventfd-count: 0000000000000007\n\
 scm_fds: 2\n";
 
         assert_eq!(
-            sanitize_fdinfo(contents, Some((9007, 0o100002, 42, 7))),
+            sanitize_fdinfo(
+                contents,
+                Some(FdinfoIdentity {
+                    inode: 9007,
+                    flags: 0o100002,
+                    open_file: Some(42),
+                    mount_id: 7
+                })
+            ),
             b"pos:\t1\n\
 flags:\t0100002\n\
 mnt_id:\t7\n\
@@ -6623,7 +6918,12 @@ scm_fds: 2\n"
         assert!(
             sanitize_fdinfo(
                 b"pos:\t1\nflags:\t02\nmnt_id:\t7\nino:\t8\nunknown-field: 9\n",
-                Some((9007, 2, 42, 7))
+                Some(FdinfoIdentity {
+                    inode: 9007,
+                    flags: 2,
+                    open_file: Some(42),
+                    mount_id: 7
+                })
             )
             .is_empty(),
             "an unknown fdinfo field must continue to refuse normalization"
@@ -6644,8 +6944,24 @@ scm_fds: 2\n"
 
         let root_fdinfo = b"pos:\t0\nflags:\t0100000\nmnt_id:\t37\nino:\t10\n";
         let proc_fdinfo = b"pos:\t0\nflags:\t0100000\nmnt_id:\t48\nino:\t20\n";
-        let root = sanitize_fdinfo(root_fdinfo, Some((100, 0o100000, 1, root_mount)));
-        let proc = sanitize_fdinfo(proc_fdinfo, Some((200, 0o100000, 2, proc_mount)));
+        let root = sanitize_fdinfo(
+            root_fdinfo,
+            Some(FdinfoIdentity {
+                inode: 100,
+                flags: 0o100000,
+                open_file: Some(1),
+                mount_id: root_mount,
+            }),
+        );
+        let proc = sanitize_fdinfo(
+            proc_fdinfo,
+            Some(FdinfoIdentity {
+                inode: 200,
+                flags: 0o100000,
+                open_file: Some(2),
+                mount_id: proc_mount,
+            }),
+        );
         assert!(
             root.windows(b"mnt_id:\t1".len())
                 .any(|w| w == b"mnt_id:\t1")
@@ -6656,11 +6972,27 @@ scm_fds: 2\n"
         );
         assert_eq!(
             root,
-            sanitize_fdinfo(root_fdinfo, Some((100, 0o100000, 1, root_mount)))
+            sanitize_fdinfo(
+                root_fdinfo,
+                Some(FdinfoIdentity {
+                    inode: 100,
+                    flags: 0o100000,
+                    open_file: Some(1),
+                    mount_id: root_mount
+                })
+            )
         );
         assert_eq!(
             proc,
-            sanitize_fdinfo(proc_fdinfo, Some((200, 0o100000, 2, proc_mount)))
+            sanitize_fdinfo(
+                proc_fdinfo,
+                Some(FdinfoIdentity {
+                    inode: 200,
+                    flags: 0o100000,
+                    open_file: Some(2),
+                    mount_id: proc_mount
+                })
+            )
         );
     }
 

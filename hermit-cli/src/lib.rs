@@ -6045,7 +6045,7 @@ mod tests {
         assert!(!reason.contains("not enabled in this build"));
         assert!(!reason.contains("has not been checked"));
     }
-    #[cfg(feature = "sabre")]
+    #[cfg(any(feature = "sabre", feature = "liteinst"))]
     use std::ffi::OsStr;
     use std::fs;
     #[cfg(feature = "sabre")]

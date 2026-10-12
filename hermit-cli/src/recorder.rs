@@ -878,6 +878,34 @@ impl Tool for Recorder {
     }
 }
 
+impl detcore::RecordOrReplay for Recorder {
+    async fn fdinfo_capture_fact<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        kind: u8,
+        observed: Option<&[u8]>,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        let Some(observed) = observed else {
+            return Ok(None);
+        };
+        let bytes = observed.to_vec();
+        guest
+            .thread_state_mut()
+            .push_event(Event {
+                event: Ok(SyscallEvent::FdinfoFact {
+                    kind,
+                    bytes: bytes.clone(),
+                }),
+            })
+            .map_err(|error| {
+                Error::Tool(anyhow::anyhow!(
+                    "could not record fdinfo capture fact kind {kind}: {error}"
+                ))
+            })?;
+        Ok(Some(bytes))
+    }
+}
+
 impl Recorder {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#662): Audit recorded physical-open classification.

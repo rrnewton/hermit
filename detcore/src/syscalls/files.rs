@@ -40,6 +40,7 @@ use reverie::syscalls::ReadAddr;
 use reverie::syscalls::SockFlag;
 use reverie::syscalls::StatPtr;
 use reverie::syscalls::StatxMask;
+use reverie::syscalls::StatxPtr;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
@@ -51,10 +52,21 @@ use tracing::info;
 use tracing::trace;
 use tracing::warn;
 
+use self::fdinfo_acquisition::ProcFdinfoOpenSubjectRelation;
+use self::fdinfo_acquisition::ProcFdinfoSubjectSelector;
+use self::fdinfo_acquisition::ProcIdentityGap;
+use self::fdinfo_acquisition::ProcRawAliasName;
 use super::deterministic_stdio_inode_for_resource;
 use crate::config::SchedHeuristic;
 use crate::dirents::*;
 use crate::fd::*;
+use crate::fdinfo_projection::FdinfoProjectionGap;
+use crate::fdinfo_projection::FdinfoRawObject;
+use crate::fdinfo_rpc::FdinfoCapturedAuthority;
+use crate::fdinfo_rpc::FdinfoControlOperation;
+use crate::fdinfo_rpc::FdinfoControlValue;
+use crate::procfs::FdinfoIdentity;
+use crate::procfs::FdinfoProjectionOutcome;
 use crate::procfs::MountInfoSnapshot;
 use crate::procfs::ProcfsFile;
 use crate::procfs::ProcfsSnapshotContext;
@@ -79,6 +91,8 @@ use crate::tool_local::Detcore;
 use crate::tool_local::finish_partial_record_or_replay_write;
 use crate::types::*;
 
+pub(crate) mod fdinfo_acquisition;
+
 /// A conversion from SOCK_* flags to O_* flags which makes unsafe (but checked during testing) assumptions.
 fn oflag_from_sock_bits(s_bits: i32) -> OFlag {
     // An otherwise unsafe "cast" which leans on the `linux_flags_assumptions` below.
@@ -101,6 +115,32 @@ struct TimerSlackBinding {
     target: i32,
     device: u64,
     inode: u64,
+}
+
+struct FdinfoSnapshotAcquisition {
+    target_fd: i32,
+    control: Result<u64, FdinfoProjectionGap>,
+    current_subject: Option<ProcFdinfoOpenSubjectRelation>,
+    target_path: String,
+    target_stat: Result<(reverie::syscalls::StatxBuf, ProcfsEntry), ProcIdentityGap>,
+}
+
+fn matching_fdinfo_object(
+    stat: &reverie::syscalls::StatxBuf,
+    fields: crate::procfs::FdinfoFields,
+) -> Option<FdinfoRawObject> {
+    let required = libc::STATX_TYPE | libc::STATX_INO | libc::STATX_MNT_ID;
+    (stat.stx_mask & required == required
+        && stat.stx_ino == fields.inode
+        && stat.stx_mnt_id == fields.mount_id)
+        .then(|| FdinfoRawObject {
+            inode: RawInode::new(
+                libc::makedev(stat.stx_dev_major, stat.stx_dev_minor),
+                stat.stx_ino,
+            ),
+            mode: u32::from(stat.stx_mode),
+            mount_id: stat.stx_mnt_id,
+        })
 }
 
 fn classify_timer_slack_binding(
@@ -2220,6 +2260,37 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .expect("thread identity request lost its procfs file")
                         .bind_thread_identity(tgid, tid, ppid);
                 }
+                if let Some(target) = procfs.as_ref().and_then(ProcfsFile::fdinfo_target) {
+                    // Resolve self/thread-self at the successful open, while
+                    // this exact source OFD and the serialized turn are held.
+                    let pid = if target.selector(None).is_none() {
+                        self.proc_identity_recorded(guest, syscalls::Getpid::new())
+                            .await
+                            .ok()
+                            .and_then(|pid| i32::try_from(pid).ok())
+                    } else {
+                        None
+                    };
+                    if let Some(selector) = target.selector(pid) {
+                        let acquired = self
+                            .capture_fdinfo_open_subject(guest, fd, selector, target.fd)
+                            .await?;
+                        if let Some(relation) = acquired.observed_open_subject_relation() {
+                            let source = guest
+                                .thread_state()
+                                .with_detfd(fd, |detfd| detfd.fdinfo_open_file_id())?;
+                            let _ = fdinfo_control(
+                                guest,
+                                FdinfoControlOperation::BindOpened { source, relation },
+                            )
+                            .await;
+                            procfs
+                                .as_mut()
+                                .expect("fdinfo disappeared")
+                                .bind_fdinfo_open_subject(relation);
+                        }
+                    }
+                }
                 if procfs
                     .as_ref()
                     .and_then(ProcfsFile::timer_slack_target)
@@ -2732,7 +2803,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         let capture = call.with_buf(Some(scratch)).with_len(chunk);
         let mut contents = Vec::new();
         loop {
-            let bytes_read = self.record_or_replay(guest, capture).await? as usize;
+            let fdinfo = guest
+                .thread_state()
+                .with_detfd(call.fd(), |fd| fd.procfs_fdinfo_target().is_some())?;
+            let bytes_read = if fdinfo {
+                self.proc_identity_recorded(guest, capture)
+                    .await
+                    .map_err(ProcIdentityGap::into_error)?
+            } else {
+                self.record_or_replay(guest, capture).await?
+            } as usize;
             if bytes_read == 0 {
                 return Ok(contents);
             }
@@ -2745,12 +2825,407 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Record target metadata in scratch memory, never the caller's buffer.
+    /// The private typed acquisition fact retains Statx's complete device,
+    /// inode, type and mount output without using historical replay pointers.
+    async fn capture_fdinfo_statx<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        dirfd: i32,
+        path: &str,
+        name_target: bool,
+    ) -> Result<(reverie::syscalls::StatxBuf, ProcfsEntry), ProcIdentityGap> {
+        const PAGE: usize = 4096;
+        const STAT_OFFSET: usize = 512;
+        if path.len() >= STAT_OFFSET {
+            return Err(Error::Tool(anyhow::anyhow!("fdinfo target path exceeds scratch")).into());
+        }
+        let mapped = self
+            .proc_identity_inject_with_retry(
+                guest,
+                syscalls::Mmap::new()
+                    .with_addr(None)
+                    .with_len(PAGE)
+                    .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+                    .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
+                    .with_fd(-1)
+                    .with_offset(0)
+                    .into(),
+            )
+            .await?;
+        let mapping = usize::try_from(mapped)
+            .ok()
+            .and_then(AddrMut::<u8>::from_raw)
+            .ok_or(Errno::EFAULT)?;
+        let mapping_address = mapping.as_raw();
+        let result: Result<(reverie::syscalls::StatxBuf, ProcfsEntry), ProcIdentityGap> = async {
+            let mapping = AddrMut::<u8>::from_raw(mapping_address).ok_or(Errno::EFAULT)?;
+            let mut text = path.as_bytes().to_vec();
+            text.push(0);
+            guest.memory().write_exact(mapping, &text)?;
+            let pathptr =
+                PathPtr::from_ptr(mapping.as_raw() as *const libc::c_char).ok_or(Errno::EFAULT)?;
+            let stat_address = mapping
+                .as_raw()
+                .checked_add(STAT_OFFSET)
+                .ok_or(Errno::EFAULT)?;
+            let statptr = StatxPtr(
+                AddrMut::<u8>::from_raw(stat_address)
+                    .ok_or(Errno::EFAULT)?
+                    .cast(),
+            );
+            guest
+                .memory()
+                .write_exact(statptr.0.cast(), &[0u8; std::mem::size_of::<libc::statx>()])?;
+            let flags = if path.is_empty() {
+                AtFlags::AT_EMPTY_PATH
+            } else {
+                AtFlags::empty()
+            };
+            self.proc_identity_recorded(
+                guest,
+                syscalls::Statx::new()
+                    .with_dirfd(dirfd)
+                    .with_path(Some(pathptr))
+                    .with_flags(flags)
+                    .with_mask(StatxMask::from_bits_retain(
+                        libc::STATX_BASIC_STATS | libc::STATX_MNT_ID,
+                    ))
+                    .with_statx(Some(statptr)),
+            )
+            .await?;
+            let stat = reverie::syscalls::StatxBuf::from(statptr.read(&guest.memory())?);
+            let named = if name_target {
+                Self::procfs_entry(
+                    guest,
+                    &DetStat::from(libc::statx::from(stat)),
+                    StatTarget::Path {
+                        dirfd,
+                        path: Some(pathptr),
+                        follow: true,
+                    },
+                )
+                .await
+            } else {
+                ProcfsEntry::NotProcfs
+            };
+            Ok((stat, named))
+        }
+        .await;
+        let unmapped = self
+            .proc_identity_inject_with_retry(
+                guest,
+                syscalls::Munmap::new()
+                    .with_addr(Some(Addr::from(mapping).cast()))
+                    .with_len(PAGE)
+                    .into(),
+            )
+            .await;
+        // Acquisition and cleanup gaps are metadata facts. The caller always
+        // takes the real read before using them; they are never its errno.
+        match (result, unmapped) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(observed), Ok(_)) => Ok(observed),
+        }
+    }
+
+    async fn fdinfo_mount_id<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        raw_mount_id: u64,
+    ) -> Result<u64, Error> {
+        // CLI container and recording paths provide the exact namespace's
+        // row order. Replay intentionally retains the recording-time raw
+        // IDs because ReadV2 supplies recording-time fdinfo bytes.
+        let has_configured_mount_ids = guest.config().mountinfo_mount_ids_captured;
+        let virtual_mount_id = if raw_mount_id == 0 {
+            // Linux uses zero for anonymous objects such as memfd. Key the
+            // equivalence on the observed value, not our descriptor type.
+            0
+        } else if !has_configured_mount_ids {
+            // Public non-container callers have no pre-captured provenance.
+            // Mount/unshare/setns are refused once Detcore starts, so a
+            // tracer-side snapshot of this task's namespace is immutable.
+            let mountinfo_path = format!("/proc/{}/mountinfo", guest.pid().as_raw());
+            let mountinfo_contents = std::fs::read(&mountinfo_path).map_err(|error| {
+                Error::Tool(anyhow::anyhow!(
+                    "failed to read {mountinfo_path} while validating fdinfo mnt_id: {error}"
+                ))
+            })?;
+            // Same guest mount model as the mountinfo capture path:
+            // ephemeral host seed rows are not guest namespace members
+            // and must not shift run-global mount-ID assignment.
+            let mountinfo_contents =
+                crate::procfs::exclude_ephemeral_host_seed_mounts(&mountinfo_contents);
+            let mountinfo_rows =
+                crate::procfs::parse_mountinfo(&mountinfo_contents).ok_or_else(|| {
+                    Error::Tool(anyhow::anyhow!(
+                        "kernel returned malformed {mountinfo_path} while validating fdinfo mnt_id"
+                    ))
+                })?;
+            let snapshot = MountInfoSnapshot::new(
+                mountinfo_rows,
+                &[],
+                false,
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+            .ok_or_else(|| {
+                Error::Tool(anyhow::anyhow!(
+                    "{mountinfo_path} failed strict identity validation for fdinfo"
+                ))
+            })?;
+            determinize_mount_id(guest, raw_mount_id, Some(snapshot.raw_mount_id_order()))
+                    .await
+                    .ok_or_else(|| {
+                        Error::Tool(anyhow::anyhow!(
+                            "mountinfo mount-ID order changed after the identity snapshot while resolving fdinfo mnt_id {raw_mount_id} for fdinfo target from {mountinfo_path}"
+                        ))
+                    })?
+        } else {
+            determinize_mount_id(guest, raw_mount_id, None)
+                    .await
+                    .ok_or_else(|| {
+                        Error::Tool(anyhow::anyhow!(
+                            "recorded mount identity provenance was invalid while resolving fdinfo mnt_id {raw_mount_id} for fdinfo target"
+                        ))
+                    })?
+        };
+        Ok(virtual_mount_id)
+    }
+
+    /// Normalize only an authenticated target selected before acquisition.
+    /// Missing target authority preserves the successful Linux bytes and is
+    /// recorded separately, never converted into read errno, EOF or Tool abort.
+    async fn project_fdinfo_snapshot<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        capture: FdinfoSnapshotAcquisition,
+        contents: &[u8],
+    ) -> Result<FdinfoProjectionOutcome, Error> {
+        let unavailable = |reason, acquisition| FdinfoProjectionOutcome::Unavailable {
+            reason,
+            acquisition,
+        };
+        let key = match capture.control {
+            Ok(key) => key,
+            Err(reason) => return Ok(unavailable(reason, None)),
+        };
+        let raw = crate::procfs::parse_fdinfo_fields(contents);
+        let observation = match (capture.target_stat, raw) {
+            (Ok((stat, name)), Some(fields)) => matching_fdinfo_object(&stat, fields)
+                .map(|object| (stat, name, fields, object))
+                .ok_or(None),
+            (Err(gap), _) => Err(Some(gap)),
+            (_, None) => Err(None),
+        };
+        let (stat, mut name, fields, object) = match observation {
+            Ok(observation) => observation,
+            Err(gap) => {
+                let _ = fdinfo_control(
+                    guest,
+                    FdinfoControlOperation::CancelCapture { capture: key },
+                )
+                .await;
+                return Ok(unavailable(FdinfoProjectionGap::MissingObject, gap));
+            }
+        };
+        // Finish before any inode/mount/time RPC can advance the projection
+        // revision. The raw syscall capture held the same serialized turn.
+        let authority = match fdinfo_control(
+            guest,
+            FdinfoControlOperation::FinishCapture {
+                capture: key,
+                object,
+                relation: capture.current_subject,
+            },
+        )
+        .await
+        {
+            Ok(FdinfoControlValue::Captured(authority)) => authority,
+            Ok(_) => return Ok(unavailable(FdinfoProjectionGap::RejectedUpdate, None)),
+            Err(reason) => return Ok(unavailable(reason, None)),
+        };
+        let Some(relation) = capture.current_subject else {
+            return Ok(unavailable(FdinfoProjectionGap::UnboundAlias, None));
+        };
+        if relation.target_mount_namespace.inode != relation.caller_mount_namespace.inode {
+            return Ok(unavailable(FdinfoProjectionGap::UnsupportedMountView, None));
+        }
+        let raw_stat = DetStat::from(libc::statx::from(stat));
+        // Procfs naming can use an existing global RPC. It is deliberately
+        // after token completion, and any later failed/conflicting lookup is
+        // only missing normalization evidence for the already successful read.
+        if procfs_inode::may_be_procfs(raw_stat.dev, raw_stat.blksize) {
+            match self
+                .capture_fdinfo_statx(guest, libc::AT_FDCWD, &capture.target_path, true)
+                .await
+            {
+                Ok((again, named)) if matching_fdinfo_object(&again, fields) == Some(object) => {
+                    name = named
+                }
+                Ok(_) => return Ok(unavailable(FdinfoProjectionGap::ObjectChanged, None)),
+                Err(gap) => return Ok(unavailable(FdinfoProjectionGap::MissingObject, Some(gap))),
+            }
+        }
+        let (flags, resource, cookie) = match authority {
+            FdinfoCapturedAuthority::Managed {
+                target,
+                logical_open_file,
+            } => (
+                target.fdinfo_flags(),
+                target.ofd.resource,
+                Some(logical_open_file.deterministic_socket_cookie()),
+            ),
+            FdinfoCapturedAuthority::OriginalParent => {
+                if contents
+                    .split(|&byte| byte == b'\n')
+                    .any(|line| line.starts_with(b"eventfd-id:"))
+                {
+                    return Ok(unavailable(
+                        FdinfoProjectionGap::MissingLogicalMetadata,
+                        None,
+                    ));
+                }
+                (fields.flags, None, None)
+            }
+        };
+        let inode = match deterministic_stdio_inode_for_resource(capture.target_fd, resource) {
+            Some(inode) => inode,
+            None => {
+                determinize_inode_observing_mtime(
+                    guest,
+                    raw_stat.raw_inode(),
+                    name.name(raw_stat.dev),
+                    ObservedMtime::Unobserved,
+                    InodeSighting::Descriptor,
+                )
+                .await
+                .0
+            }
+        };
+        let mount_id = match self.fdinfo_mount_id(guest, fields.mount_id).await {
+            Ok(id) => id,
+            Err(error) => {
+                return Ok(unavailable(
+                    FdinfoProjectionGap::MissingObject,
+                    Some(ProcIdentityGap::from_error(error)),
+                ));
+            }
+        };
+        Ok(FdinfoProjectionOutcome::Projected(FdinfoIdentity {
+            inode: inode.as_raw(),
+            flags,
+            open_file: cookie,
+            mount_id,
+        }))
+    }
+
     async fn initialize_procfs_snapshot<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Read,
     ) -> Result<(), Error> {
-        let raw_contents = self.snapshot_procfs(guest, call).await?;
+        let target = guest
+            .thread_state()
+            .with_detfd(call.fd(), |fd| fd.procfs_fdinfo_target())?;
+        let fdinfo_capture = if let Some(target) = target {
+            let (source, opened) = guest.thread_state().with_detfd(call.fd(), |fd| {
+                (fd.fdinfo_open_file_id(), fd.procfs_fdinfo_open_subject())
+            })?;
+            let control = match fdinfo_control(
+                guest,
+                FdinfoControlOperation::BeginCapture {
+                    source,
+                    target_fd: target.fd,
+                },
+            )
+            .await
+            {
+                Ok(FdinfoControlValue::Capture(key)) => Ok(key),
+                Ok(_) => Err(FdinfoProjectionGap::RejectedUpdate),
+                Err(gap) => Err(gap),
+            };
+            let (current_subject, target_path, target_stat) = if control.is_ok()
+                && let Some(opened) = opened
+            {
+                let selector = match opened.alias {
+                    ProcRawAliasName::Process { pid } => ProcFdinfoSubjectSelector::Process { pid },
+                    ProcRawAliasName::Task { pid, tid } => {
+                        ProcFdinfoSubjectSelector::Task { pid, tid }
+                    }
+                };
+                let current = self
+                    .capture_fdinfo_open_subject(guest, call.fd(), selector, target.fd)
+                    .await?
+                    .observed_open_subject_relation()
+                    .filter(|current| *current == opened);
+                let base = match opened.alias {
+                    ProcRawAliasName::Process { pid } => format!("/proc/{pid}"),
+                    ProcRawAliasName::Task { pid, tid } => format!("/proc/{pid}/task/{tid}"),
+                };
+                let path = format!("{base}/fd/{}", target.fd);
+                let stat = if current.is_some() {
+                    self.capture_fdinfo_statx(guest, libc::AT_FDCWD, &path, false)
+                        .await
+                } else {
+                    Err(ProcIdentityGap::DependencyUnavailable)
+                };
+                (current, path, stat)
+            } else {
+                (
+                    None,
+                    String::new(),
+                    Err(ProcIdentityGap::DependencyUnavailable),
+                )
+            };
+            Some(FdinfoSnapshotAcquisition {
+                target_fd: target.fd,
+                control,
+                current_subject,
+                target_path,
+                target_stat,
+            })
+        } else {
+            None
+        };
+        let raw_contents = match self.snapshot_procfs(guest, call).await {
+            Ok(contents) => contents,
+            Err(error) => {
+                if let Some(capture) = &fdinfo_capture
+                    && let Ok(key) = &capture.control
+                {
+                    let _ = fdinfo_control(
+                        guest,
+                        FdinfoControlOperation::CancelCapture { capture: *key },
+                    )
+                    .await;
+                }
+                return Err(error);
+            }
+        };
+        let fdinfo_projection = if let Some(capture) = fdinfo_capture {
+            let observed = self
+                .project_fdinfo_snapshot(guest, capture, &raw_contents)
+                .await?;
+            let recorded: FdinfoProjectionOutcome =
+                self.fdinfo_capture_fact(guest, 5, &observed).await?;
+            if let FdinfoProjectionOutcome::Unavailable {
+                reason,
+                acquisition,
+            } = &recorded
+            {
+                warn!(
+                    ?reason,
+                    ?acquisition,
+                    "fdinfo read succeeded; logical target projection is unavailable"
+                );
+            }
+            Some(recorded)
+        } else {
+            None
+        };
         // The guest mount view is the launch namespace (guest mount/unshare/
         // setns are refused under Detcore). Ephemeral host FUSE seed rows
         // (per-process and named-tool seeds) are other tenants' propagated
@@ -2786,116 +3261,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             std::path::Path::new("/dev/ptmx"),
             std::path::Path::new("/dev/pts/ptmx"),
         ]);
-        let target_fd = guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_target_fd())?;
-        let fdinfo_identity = if let Some(target_fd) = target_fd {
-            let (cached_stat, logical_flags, open_file_id, fd_type, inode_override) =
-                guest.thread_state().with_detfd(target_fd, |detfd| {
-                    (
-                        detfd.stat(),
-                        detfd.status_flags(),
-                        detfd.open_file_id(),
-                        detfd.ty(),
-                        deterministic_stdio_inode_for_resource(target_fd, detfd.resource()),
-                    )
-                })?;
-            let stat = match cached_stat {
-                Some(stat) => stat,
-                None => DetStat::from(self.inject_fstat(guest, target_fd).await?),
-            };
-            // Keyed as `fstat` keys the descriptor, so the two numbers agree.
-            let virtual_inode = match inode_override {
-                Some(inode) => inode,
-                None => {
-                    let procfs =
-                        Self::procfs_entry(guest, &stat, StatTarget::Descriptor(target_fd)).await;
-                    determinize_inode_observing_mtime(
-                        guest,
-                        stat.raw_inode(),
-                        procfs.name(stat.dev),
-                        ObservedMtime::Unobserved,
-                        InodeSighting::Descriptor,
-                    )
-                    .await
-                    .0
-                }
-            };
-            let raw_mount_id =
-                detcore_model::procfs::parse_fdinfo_mount_id(&contents).ok_or_else(|| {
-                    Error::Tool(anyhow::anyhow!(
-                        "kernel returned malformed /proc/*/fdinfo without one numeric mnt_id"
-                    ))
-                })?;
-            // CLI container and recording paths provide the exact namespace's
-            // row order. Replay intentionally retains the recording-time raw
-            // IDs because ReadV2 supplies recording-time fdinfo bytes.
-            let has_configured_mount_ids = guest.config().mountinfo_mount_ids_captured;
-            let virtual_mount_id = if raw_mount_id == 0 {
-                // Linux uses zero for anonymous objects such as memfd. Key the
-                // equivalence on the observed value, not our descriptor type.
-                0
-            } else if !has_configured_mount_ids {
-                // Public non-container callers have no pre-captured provenance.
-                // Mount/unshare/setns are refused once Detcore starts, so a
-                // tracer-side snapshot of this task's namespace is immutable.
-                let mountinfo_path = format!("/proc/{}/mountinfo", guest.pid().as_raw());
-                let mountinfo_contents = std::fs::read(&mountinfo_path).map_err(|error| {
-                    Error::Tool(anyhow::anyhow!(
-                        "failed to read {mountinfo_path} while validating fdinfo mnt_id: {error}"
-                    ))
-                })?;
-                // Same guest mount model as the mountinfo capture path:
-                // ephemeral host seed rows are not guest namespace members
-                // and must not shift run-global mount-ID assignment.
-                let mountinfo_contents =
-                    crate::procfs::exclude_ephemeral_host_seed_mounts(&mountinfo_contents);
-                let mountinfo_rows =
-                    crate::procfs::parse_mountinfo(&mountinfo_contents).ok_or_else(|| {
-                        Error::Tool(anyhow::anyhow!(
-                            "kernel returned malformed {mountinfo_path} while validating fdinfo mnt_id"
-                        ))
-                    })?;
-                let snapshot = MountInfoSnapshot::new(
-                    mountinfo_rows,
-                    &[],
-                    false,
-                    BTreeMap::new(),
-                    BTreeMap::new(),
-                )
-                .ok_or_else(|| {
-                    Error::Tool(anyhow::anyhow!(
-                        "{mountinfo_path} failed strict identity validation for fdinfo"
-                    ))
-                })?;
-                determinize_mount_id(guest, raw_mount_id, Some(snapshot.raw_mount_id_order()))
-                    .await
-                    .ok_or_else(|| {
-                        Error::Tool(anyhow::anyhow!(
-                            "mountinfo mount-ID order changed after the identity snapshot while resolving fdinfo mnt_id {raw_mount_id} for {fd_type:?} from {mountinfo_path}"
-                        ))
-                    })?
-            } else {
-                determinize_mount_id(guest, raw_mount_id, None)
-                    .await
-                    .ok_or_else(|| {
-                        Error::Tool(anyhow::anyhow!(
-                            "recorded mount identity provenance was invalid while resolving fdinfo mnt_id {raw_mount_id} for {fd_type:?}"
-                        ))
-                    })?
-            };
-            Some((
-                // Determinized immediately above (stdio-special or
-                // `determinize_inode`); lowered to an integer only here, at the
-                // point it is rendered into guest-visible fdinfo text.
-                virtual_inode.as_raw(),
-                logical_flags,
-                open_file_id.deterministic_socket_cookie(),
-                virtual_mount_id,
-            ))
-        } else {
-            None
-        };
         let needs_random_uuid = guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_needs_random_uuid())?;
@@ -3099,7 +3464,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     virtual_pid,
                     virtual_ppid,
                     virtual_pty_count,
-                    fdinfo_identity,
+                    fdinfo_projection: fdinfo_projection.clone(),
                     random_uuid,
                 },
             );
@@ -8380,12 +8745,24 @@ mod procfs_wiring_guard {
     #[test]
     fn snapshot_initializer_excludes_host_seed_mounts_at_both_captures() {
         let body = handler_body("initialize_procfs_snapshot");
-        let calls = body.matches("exclude_ephemeral_host_seed_mounts(").count();
+        let projection = handler_body("project_fdinfo_snapshot");
+        let mount_ids = handler_body("fdinfo_mount_id");
+        // Rustfmt may place the receiver and method on separate lines. Bind
+        // the same two helper calls independently of that whitespace; the
+        // filter counts and capture-before-parse checks below stay literal.
+        let body_calls = body.split_whitespace().collect::<String>();
+        let projection_calls = projection.split_whitespace().collect::<String>();
+        assert!(body_calls.contains("self.project_fdinfo_snapshot("));
+        assert!(projection_calls.contains("self.fdinfo_mount_id("));
+        let calls = body.matches("exclude_ephemeral_host_seed_mounts(").count()
+            + mount_ids
+                .matches("exclude_ephemeral_host_seed_mounts(")
+                .count();
         assert_eq!(
             calls, 2,
-            "MISSING MECHANISM: initialize_procfs_snapshot must call \
-             exclude_ephemeral_host_seed_mounts exactly twice (the guest mountinfo \
-             capture and the fdinfo mnt_id capture); found {calls}. Without it, \
+            "MISSING MECHANISM: initialize_procfs_snapshot and its fdinfo_mount_id \
+             helper must call exclude_ephemeral_host_seed_mounts exactly twice \
+             (the guest mountinfo capture and the fdinfo mnt_id capture); found {calls}. Without it, \
              unrelated host squashfuse seed mounts make /proc/<pid>/mountinfo and \
              fdinfo mount IDs depend on host timing."
         );
@@ -8405,13 +8782,13 @@ mod procfs_wiring_guard {
              the files that carry mountinfo identities (`let contents = if ... \
              procfs_needs_mountinfo_identities()`); found {gate:?}"
         );
-        let fdinfo_capture = body
+        let fdinfo_capture = mount_ids
             .find("exclude_ephemeral_host_seed_mounts(&mountinfo_contents)")
             .expect(
                 "MISSING MECHANISM: the fdinfo mnt_id capture (`mountinfo_contents`) is \
                  no longer filtered for host seed mounts",
             );
-        let parse = body
+        let parse = mount_ids
             .find("parse_mountinfo(&mountinfo_contents)")
             .expect("the fdinfo mnt_id capture no longer parses mountinfo_contents");
         assert!(
@@ -10271,5 +10648,57 @@ mod untraced_code_tests {
                 "{label}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod foreign_fdinfo_tests {
+    use super::matching_fdinfo_object;
+    use crate::procfs::FdinfoFields;
+
+    #[test]
+    fn foreign_fdinfo_uses_the_captured_target_not_the_readers_number() {
+        let mut raw: libc::statx = unsafe { std::mem::zeroed() };
+        raw.stx_mask = libc::STATX_TYPE | libc::STATX_INO | libc::STATX_MNT_ID;
+        raw.stx_mode = libc::S_IFDIR as u16;
+        raw.stx_ino = 41;
+        raw.stx_mnt_id = 17;
+        let snapshot = FdinfoFields {
+            inode: 41,
+            flags: 0,
+            mount_id: 17,
+        };
+        let stat = reverie::syscalls::StatxBuf::from(raw);
+        assert!(matching_fdinfo_object(&stat, snapshot).is_some());
+        assert!(
+            matching_fdinfo_object(
+                &stat,
+                FdinfoFields {
+                    inode: 42,
+                    ..snapshot
+                }
+            )
+            .is_none()
+        );
+        assert!(
+            matching_fdinfo_object(
+                &stat,
+                FdinfoFields {
+                    mount_id: 18,
+                    ..snapshot
+                }
+            )
+            .is_none()
+        );
+        for mode in [libc::S_IFSOCK, libc::S_IFIFO, libc::S_IFREG, libc::S_IFCHR] {
+            raw.stx_mode = mode as u16;
+            assert!(
+                matching_fdinfo_object(&raw.into(), snapshot).is_some(),
+                "raw object authentication is independent of logical projection authority"
+            );
+        }
+        raw.stx_mode = libc::S_IFDIR as u16;
+        raw.stx_mask &= !libc::STATX_MNT_ID;
+        assert!(matching_fdinfo_object(&raw.into(), snapshot).is_none());
     }
 }

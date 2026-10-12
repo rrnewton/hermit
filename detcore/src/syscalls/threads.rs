@@ -2540,6 +2540,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let preserve_exec_fd_status = guest.config().backend.rediscovers_descriptors_after_exec;
 
+        // Retain the genuine former-caller-created table at the existing exec
+        // cut. PrepareExec still authenticates it under the old MM; failure
+        // cancels exactly that hold before this image continues.
+        guest.thread_state_mut().fdinfo_exec_seed = new_metadata
+            .fdinfo_recording
+            .then(|| new_metadata.fdinfo_exec_seed());
+
         prepare_exec(
             guest,
             old_mm_id,
