@@ -1483,7 +1483,7 @@ fi
 # native SDK input Git objects are equal. Preserve SDK key, inventory 941,
 # the 16-job clamp and 1050/572-job-second budgets. This carries the SDK budget
 # only; runtime qualification, test and timing evidence must be measured anew.
-# BOUND TO 242c6afd78edc34248ee612ec66a215710ee089d (2026-10-12):
+# BOUND TO d955a9fb5df71f765785fd610d7c64ed456924a4 (2026-10-12):
 # This rebased commit preserves the entire DBT tree and all seven SDK inputs
 # of 458a67572a1322bf57efcd176b3f4dcfc50a77b1. The 0a10b391 restack
 # preserves those same seven input objects from d46946bb; only inherited
@@ -1506,8 +1506,8 @@ fi
 # calibration or satisfy its >=5-sample replacement rule. The six native
 # signal-state regression files increase the tracked DBT inventory 941 to 947;
 # they add no SDK compilation target. Runtime results are separate evidence.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 242c6afd78edc34248ee612ec66a215710ee089d ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 242c6afd78edc34248ee612ec66a215710ee089d (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != d955a9fb5df71f765785fd610d7c64ed456924a4 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie d955a9fb5df71f765785fd610d7c64ed456924a4 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

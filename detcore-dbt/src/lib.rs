@@ -78,10 +78,10 @@ const MAX_OBSERVED_BUFFER: usize = 1024 * 1024;
 const RANDOM_FILL_CHUNK_BYTES: usize = 4096;
 const GETRANDOM_MAX_BYTES: usize = (i32::MAX as usize) & !4095;
 const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | libc::GRND_INSECURE;
-/// Version 7 adds the owned pre-delivery signal event entry. The version-6
-/// startup handshake and 48-byte callback layout remain unchanged.
-const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 7;
-const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 48;
+/// Version 8 retains the owned signal entry and appends a fixed native-control
+/// executor to the version-6 startup handshake (56-byte callback layout).
+const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 8;
+const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 56;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review the inherited DBT report descriptor.
@@ -112,6 +112,7 @@ fn upgrade_runtime_callbacks_v1(
         emit_stdout: callbacks.emit_stdout,
         emit_evidence: callbacks.emit,
         evidence_log_level: 0,
+        native_control: None,
     }
 }
 
@@ -1327,6 +1328,10 @@ pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v3(
         return 1;
     }
     let callbacks = unsafe { &*argument.cast::<reverie_dbt::DbtRuntimeCallbacks>() };
+    if let Err(error) = reverie_dbt::native_control::register(callbacks.native_control) {
+        unsafe { (callbacks.emit)(error.as_ptr(), error.len()) };
+        return 1;
+    }
     let startup = reverie_dbt::DbtStartupMode::try_from(native_mode)
         .map_err(|error| error.to_string())
         .and_then(|mode| unsafe { runtime_background_init(callbacks, RuntimeAbi::Current, mode) });
@@ -3100,7 +3105,7 @@ mod tests {
 
     #[test]
     fn exported_runtime_identity_matches_the_pinned_reverie_abi() {
-        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 7);
+        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 8);
         assert_eq!(std::mem::size_of::<DbtSignalEvent>(), 200);
         assert_eq!(std::mem::align_of::<DbtSignalEvent>(), 8);
         assert_eq!(std::mem::offset_of!(DbtSignalEvent, signal_info), 8);
@@ -3158,6 +3163,7 @@ mod tests {
             emit_stdout: test_stdout,
             emit_evidence: test_emit_evidence,
             evidence_log_level: 3,
+            native_control: None,
         };
         let (diagnostic, evidence, level) = runtime_callback_channels(&callbacks);
 
