@@ -1408,7 +1408,7 @@ fi
 # only; runtime qualification, test and timing evidence must be measured anew.
 # CANONICAL vDSO VERSION TABLES AND VALIDATION PIN CARRY (2026-10-12):
 # Advance the consumer from 0f7cdd3232d3216637bc076aaa7517a981d6fdec to
-# 19cdd8f59d2c69621f42b789169b0907e68f7144. The canonical vDSO gains the
+# ab8cd5171e502e0332a9b3b0a536c12438670995. The canonical vDSO gains the
 # kernel's symbol-version tables (reverie 1002), realtime-signal and Tool-region
 # work lands, and validate.sh's counted step is fixed (reverie 1006). All seven
 # recorded native SDK input Git objects are equal (build.rs ff1eeb32, vendor/
@@ -1417,7 +1417,7 @@ fi
 # Preserve SDK key, inventory 941, the 16-job clamp and 1050/572-job-second
 # budgets. This carries the SDK budget only; runtime qualification, test and
 # timing evidence must be measured anew.
-expected_pin=19cdd8f59d2c69621f42b789169b0907e68f7144
+expected_pin=ab8cd5171e502e0332a9b3b0a536c12438670995
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
