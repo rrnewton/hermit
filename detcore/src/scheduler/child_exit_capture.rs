@@ -236,7 +236,7 @@ impl Scheduler {
             phase: "authentic child-exit capture reservation",
         }) {
             self.parked.failure_wakes.push(wake);
-            self.parked.wake.try_put(());
+            self.wake_control_waiter();
         }
     }
 }
