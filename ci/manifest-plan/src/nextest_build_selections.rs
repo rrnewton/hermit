@@ -647,8 +647,9 @@ mod tests {
             // (https://github.com/rrnewton/hermit/issues/4111), plus the two
             // single-virtual-CPU procfs tests in procfs_determinism
             // (https://github.com/rrnewton/hermit/issues/4160), plus its
-            // single-CPU sysfs numbers and node files test (the same issue).
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "286");
+            // single-CPU sysfs numbers and node files test and its directory
+            // listing test (the same issue).
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "287");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
