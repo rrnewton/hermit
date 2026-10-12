@@ -14,6 +14,7 @@ pub(crate) mod exec_teardown_tests;
 pub(crate) mod parked;
 #[cfg(test)]
 mod parked_tests;
+pub(crate) mod pid_namespaces;
 pub(crate) mod real_timer;
 mod rejoin_log;
 mod replayer;
@@ -1619,6 +1620,9 @@ pub struct ThreadTree {
     /// namespace, which Linux marks `SIGNAL_UNKILLABLE` against senders inside
     /// it (`sigkill_retirement`).
     pid_namespace_inits: HashSet<DetPid>,
+    /// Each nested task's pid in each namespace it belongs to, recorded at its
+    /// creation (`pid_namespaces`).
+    pub(crate) pid_namespaces: pid_namespaces::PidNamespaces,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4165,7 +4169,7 @@ impl Scheduler {
         let mut ancestor = self.thread_tree.parent_process(&exited);
         while let Some(candidate) = ancestor {
             if self.thread_tree.pid_ns_depth(candidate) != depth {
-                return None;
+                return self.namespace_reaper(exited);
             }
             // A process killed by the SIGKILL being committed is dying, like a
             // subreaper with no live thread: the search passes it by.
@@ -4188,7 +4192,58 @@ impl Scheduler {
             }
             ancestor = self.thread_tree.parent_process(&candidate);
         }
-        None
+        self.namespace_reaper(exited)
+    }
+
+    /// `exiting`'s exit was just granted. If it is a PID namespace's init, its
+    /// namespace ends with it: Linux's `zap_pid_namespace` sends SIGKILL to
+    /// every live process left in it, which then die at host-timed moments
+    /// Detcore does not order, so that is a determinism loss, named here
+    /// (https://github.com/rrnewton/hermit/issues/4155). Every other thread is
+    /// stopped at a request or parked at this grant, so which members are
+    /// live is fixed by the schedule. A zombie is already dead.
+    fn note_pid_namespace_end(&mut self, exiting: DetPid) {
+        if self.thread_tree.pid_namespaces.namespace_of(exiting) != Some(exiting) {
+            return;
+        }
+        let mut live: Vec<DetPid> = self
+            .thread_tree
+            .pid_namespaces
+            .members(exiting)
+            .into_iter()
+            .filter(|task| self.next_turns.contains_key(task))
+            .filter_map(|task| self.thread_tree.process_of(task))
+            .filter(|process| *process != exiting)
+            .collect();
+        live.sort();
+        live.dedup();
+        if !live.is_empty() {
+            self.note_determinism_loss(format!(
+                "PID namespace init {exiting} exited while its namespace still held live processes {live:?}; Linux kills them at host-timed moments (https://github.com/rrnewton/hermit/issues/4155)"
+            ));
+        }
+    }
+
+    /// The reaper Linux's `find_new_reaper` falls back to when no subreaper
+    /// adopts: the init of `exited`'s own PID namespace
+    /// (`pid_namespace::child_reaper`), with its first live thread, leader
+    /// first (https://github.com/rrnewton/hermit/issues/4090). `None` in the
+    /// container's namespace, whose init is Hermit (the orphan goes to it,
+    /// `orphan_to_init`), and for the namespace's init itself, whose
+    /// namespace ends with it.
+    fn namespace_reaper(&self, exited: DetPid) -> Option<(DetPid, DetTid)> {
+        let init = self.thread_tree.pid_namespaces.namespace_of(exited)?;
+        if init == exited {
+            return None;
+        }
+        let mut live: Vec<DetTid> = self
+            .thread_tree
+            .my_thread_group(&init)
+            .into_iter()
+            .filter(|tid| self.next_turns.contains_key(tid))
+            .collect();
+        live.sort_by_key(|tid| (*tid != init, *tid));
+        live.first().map(|owner| (init, *owner))
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -6353,6 +6408,40 @@ impl Scheduler {
             return None;
         }
         self.thread_tree.thread_to_leader.get(&detpid).copied()
+    }
+
+    /// What the positive `pid`, named by the nested thread `caller` in its own
+    /// PID namespace, names (`PidNamespaces::resolve_for`). For a task of the
+    /// caller's own namespace's init, the answer carries the signals that init
+    /// catches, read from a live thread of it: every thread but the caller is
+    /// stopped at a request or parked, and the init's dispositions change
+    /// only in its own turns.
+    pub fn guest_pid(&self, caller: DetTid, pid: i32) -> pid_namespaces::GuestPidAnswer {
+        use pid_namespaces::GuestPidAnswer;
+        let answer = self.thread_tree.pid_namespaces.resolve_for(caller, pid);
+        let GuestPidAnswer::Task { task, .. } = answer else {
+            return answer;
+        };
+        let process = self.thread_tree.process_of(task).unwrap_or(task);
+        let own_namespace = self.thread_tree.pid_namespaces.namespace_of(caller);
+        if own_namespace != Some(process) || !self.thread_tree.is_pid_namespace_init(process) {
+            return answer;
+        }
+        let Some(thread) = self.process_signal_targets(process).into_iter().next() else {
+            return answer;
+        };
+        match crate::syscalls::read_kernel_signal_state(
+            reverie::Pid::from_raw(process.as_raw()),
+            reverie::Pid::from_raw(thread.as_raw()),
+        ) {
+            Ok(state) => GuestPidAnswer::Task {
+                task,
+                own_init_caught: Some(state.caught),
+            },
+            Err(errno) => GuestPidAnswer::Untranslatable(format!(
+                "cannot read the dispositions of PID namespace init {process}: {errno}"
+            )),
+        }
     }
 
     pub fn process_signal_targets(&self, detpid: DetPid) -> Vec<DetTid> {
@@ -8619,6 +8708,7 @@ impl Scheduler {
                             .any(|tid| tid != dettid && self.next_turns.contains_key(&tid)))
                 {
                     self.thread_tree.granted_exits.insert(exiting);
+                    self.note_pid_namespace_end(exiting);
                 }
                 // The grant is a vfork child's release edge: a barrier whose
                 // parent has died ends here, inside this committed turn.

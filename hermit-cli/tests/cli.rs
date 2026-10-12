@@ -136,6 +136,7 @@ static PIDFD_SEND_SIGNAL_MULTITHREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PIDFD_SEND_SIGNAL_FLAGS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_MULTITHREADED_PROCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static OWN_PROCESS_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PID_NAMESPACE_NESTED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_PROCESS_GROUP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_CREATE_RT_SIGNAL_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_RT_SIGNAL_PENDING_OBSERVED_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1064,6 +1065,31 @@ fn own_process_signal_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "own-process-signal guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn pid_namespace_nested_guest() -> &'static Path {
+    PID_NAMESPACE_NESTED_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("pid-namespace-nested");
+        fs::create_dir_all(&build_root).expect("failed to create pid-namespace-nested directory");
+        let guest = build_root.join("pid_namespace_nested");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/pid_namespace_nested.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile pid-namespace-nested guest");
+        assert!(
+            output.status.success(),
+            "pid-namespace-nested guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -23347,6 +23373,121 @@ fn a_pending_real_time_timer_expiration_is_refused_only_where_it_is_observed() {
             }
         }
     }
+}
+
+/// A guest in a nested PID namespace names and receives the pids of its own
+/// namespace (https://github.com/rrnewton/hermit/issues/4155,
+/// https://github.com/rrnewton/hermit/issues/4090). Each mode of
+/// `tests/c/pid_namespace_nested.c` is strict-verified at bitwise parity and
+/// must print what Linux printed under `unshare --user --map-root-user` (5
+/// native runs of each, identical, 2026-10-12): the init's `kill(getpid())`
+/// reaches its handler; `fork` returns the child's nested pid and `waitpid` on
+/// it, or on -1, reaps it; `kill(3)` reaches the init's second child, not the
+/// container process 3 (the outer process); the init's own SIGKILL and default
+/// SIGTERM are dropped with 0; an orphan is adopted by the nested init; a
+/// container-only pid is ESRCH; `tgkill` reaches a nested thread. Before (main
+/// 1b4674f7): ESRCH for the self-kill and the init's own signals, `fork`
+/// returned 7 and `waitpid` failed with ECHILD, the sibling kill hung, and the
+/// orphan was never reaped. An init that exits leaving only a zombie behind
+/// is at parity too; one that leaves a live process is the next test.
+#[test]
+fn a_nested_pid_namespace_names_its_own_pids_at_bitwise_parity() {
+    let guest = pid_namespace_nested_guest().to_str().unwrap().to_owned();
+    let cases = [
+        ("self_kill", "self_kill pid=1 rc=0 ran=1\ninit exit=0\n"),
+        (
+            "fork_wait",
+            "child pid=2 ppid=1\nfork_wait fork=2 waitpid=2 status=5\ninit exit=0\n",
+        ),
+        (
+            "wait_any",
+            "wait_any fork=2 waitpid=2 status=6\ninit exit=0\n",
+        ),
+        (
+            "sibling",
+            "sibling a=2 b=3 kill3=0 waited=3 status=7\ninit exit=0\n",
+        ),
+        (
+            "init_sigkill",
+            "init_sigkill kill1=0 term=0 alive=1\ninit exit=0\n",
+        ),
+        ("orphan", "orphan grandchild_ppid=1 reaped=3\ninit exit=0\n"),
+        ("outer", "outer kill0=ESRCH\ninit exit=0\n"),
+        ("tgkill", "tgkill thread=2 rc=0 on_thread=1\ninit exit=0\n"),
+        (
+            "init_leaves_zombie",
+            "init_leaves_zombie child=2\ninit exit=0\n",
+        ),
+    ];
+    for (mode, expected) in cases {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let verdict = directory.path().join("verify.json");
+        let (status, log) = run_with_deadline(
+            hermit_command(&[
+                "--log=info",
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                "--verify-json",
+                verdict.to_str().unwrap(),
+                "--timeout",
+                "60",
+                "--",
+                guest.as_str(),
+                mode,
+            ]),
+            directory.path(),
+            Duration::from_secs(180),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{mode}:\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(stdout, expected, "{mode}: stderr:\n{log}");
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
+                .expect("the verdict must be JSON");
+        assert_eq!(report["bitwise_parity"], true, "{mode}: {report}");
+    }
+}
+
+/// A nested PID namespace's init that exits while a live process is left in
+/// its namespace ends the namespace: Linux kills that process
+/// (`zap_pid_namespace`) at a moment the host chooses, which Hermit cannot
+/// order, so a strict verified run stops on a determinism loss that names the
+/// init and the live process (https://github.com/rrnewton/hermit/issues/4155).
+#[test]
+fn a_nested_namespace_init_exiting_beside_a_live_process_is_a_named_determinism_loss() {
+    let guest = pid_namespace_nested_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--log=info",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+            "init_dies",
+        ]),
+        directory.path(),
+        Duration::from_secs(180),
+        false,
+    );
+    assert_eq!(status.and_then(|status| status.code()), Some(125), "{log}");
+    assert!(
+        log.contains("determinism loss recorded: PID namespace init")
+            && log.contains("exited while its namespace still held live processes"),
+        "{log}"
+    );
 }
 
 /// A POSIX timer that notifies with a real-time signal

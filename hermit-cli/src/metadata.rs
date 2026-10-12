@@ -342,7 +342,14 @@ impl RecordVersion {
 // forwarded, where Detcore answered EINVAL or EBADF without an event
 // (https://github.com/rrnewton/hermit/issues/4108). An older recording holds no
 // event for such a call, so this replayer would desynchronize at it.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x139);
+// 0x13d -> 0x13e: a guest in a nested PID namespace has its pids translated
+// (https://github.com/rrnewton/hermit/issues/4155,
+// https://github.com/rrnewton/hermit/issues/4090): kill and its relatives
+// deliver where they answered ESRCH, fork returns the nested pid, waits reap
+// where they answered ECHILD, the init's own default signals are dropped, and
+// orphans go to the nested init. Replay recomputes these, so an older
+// recording of such a guest could diverge.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x13e);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -367,7 +374,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x139);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x139;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x13e;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1106,6 +1113,14 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_that_answered_pidfd_scope_flags_without_an_event() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x138)));
+    }
+
+    /// A 0x13d recording was made when Detcore used a nested PID namespace's
+    /// pids as container pids, which this replayer translates
+    /// (https://github.com/rrnewton/hermit/issues/4155).
+    #[test]
+    fn record_version_rejects_streams_made_before_nested_pid_translation() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x13d)));
     }
 
     #[test]

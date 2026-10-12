@@ -2875,6 +2875,17 @@ impl GlobalState {
                     .thread_tree
                     .process_of(dettid),
             ),
+            GlobalRequest::GuestPid(caller, pid) => {
+                let sched = self.lock_rpc_scheduler(false).await;
+                R::GuestPid(sched.guest_pid(caller, pid))
+            }
+            GlobalRequest::LocalPid(caller, task) => R::LocalPid(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .thread_tree
+                    .pid_namespaces
+                    .localize_for(caller, task),
+            ),
             GlobalRequest::SignalTargetProcess(named) => R::SignalTargetProcess(
                 self.lock_rpc_scheduler(false)
                     .await
@@ -3315,11 +3326,40 @@ impl GlobalState {
                     flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_PARENT)),
                     exit_signal,
                 );
-                if is_group_leader
-                    && flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_NEWPID))
-                {
+                let new_pid_namespace = is_group_leader
+                    && flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_NEWPID));
+                if new_pid_namespace {
                     sched.thread_tree.enter_new_pid_namespace(child_dettid);
                     sched.thread_tree.mark_pid_namespace_init(child_dettid);
+                }
+                // A nested task's pid in each namespace is fixed now, in its
+                // creator's turn, before either runs again
+                // (https://github.com/rrnewton/hermit/issues/4155).
+                let pid_namespaces = &mut sched.thread_tree.pid_namespaces;
+                let mut chain = pid_namespaces.chain_of(parent_dettid);
+                if new_pid_namespace {
+                    chain.push(child_dettid);
+                }
+                if let Some(reason) = pid_namespaces.untranslatable(parent_dettid) {
+                    let reason = format!("its creator {parent_dettid}: {reason}");
+                    pid_namespaces.mark_untranslatable(child_dettid, reason);
+                } else if chain.is_empty() {
+                    pid_namespaces.forget(child_dettid);
+                } else {
+                    let recorded =
+                        crate::scheduler::pid_namespaces::read_nspid(child_detpid, child_dettid)
+                            .and_then(|nspid| {
+                                pid_namespaces
+                                    .record(child_dettid, &chain, &nspid)
+                                    .map_err(|error| error.to_string())
+                            });
+                    if let Err(reason) = recorded {
+                        error!(
+                            "[detcore, dtid {}] cannot record its pids in its PID namespaces: {}",
+                            child_dettid, reason
+                        );
+                        pid_namespaces.mark_untranslatable(child_dettid, reason);
+                    }
                 }
                 if is_group_leader && flags.is_some() {
                     sched.inherit_real_time_records(parent_detpid, child_dettid);
@@ -4650,6 +4690,14 @@ pub enum GlobalRequest {
     /// the recorded process group. Appended after `CommitSigkill`, for the
     /// same reason.
     ReserveSigkillGroup(DetTid, DetPid, u32),
+    /// What a positive pid the given nested thread names, in its own PID
+    /// namespace, names (`PidNamespaces::resolve_for`). Appended after
+    /// `ReserveSigkillGroup`, for the same reason.
+    GuestPid(DetTid, i32),
+    /// The pid the given nested thread sees for a task
+    /// (`PidNamespaces::localize_for`). Appended after `GuestPid`, for the
+    /// same reason.
+    LocalPid(DetTid, DetTid),
 }
 
 /// Responses from the global object
@@ -4779,6 +4827,10 @@ pub enum GlobalResponse {
     /// `ThreadExited`, it never tail-injects an exit. Appended after
     /// `CommitSigkill`, for the same reason.
     Retired,
+    /// Appended after `Retired`, for the same reason.
+    GuestPid(crate::scheduler::pid_namespaces::GuestPidAnswer),
+    /// Appended after `GuestPid`, for the same reason.
+    LocalPid(Result<Option<i32>, String>),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -6433,6 +6485,41 @@ where
     let response = send_and_update_time(guest, GlobalRequest::SetChildSubreaper(process, on)).await;
     match response.1 {
         GlobalResponse::SetChildSubreaper(()) => {}
+        _ => unreachable!(),
+    }
+}
+
+/// What the positive pid `pid`, named by the calling thread in its nested PID
+/// namespace, names (`PidNamespaces::resolve_for`). Asked only by a thread
+/// below the container's namespace (`ThreadState::nested_pid_namespace`).
+pub async fn guest_pid<G, T>(
+    guest: &mut G,
+    pid: i32,
+) -> crate::scheduler::pid_namespaces::GuestPidAnswer
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let caller = guest.thread_state().dettid;
+    let response = send_and_update_time(guest, GlobalRequest::GuestPid(caller, pid)).await;
+    match response.1 {
+        GlobalResponse::GuestPid(answer) => answer,
+        _ => unreachable!(),
+    }
+}
+
+/// The pid the calling thread, in its nested PID namespace, sees for `task`
+/// (`PidNamespaces::localize_for`): `Ok(None)` when `task` is not visible
+/// there.
+pub async fn local_pid<G, T>(guest: &mut G, task: DetTid) -> Result<Option<i32>, String>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let caller = guest.thread_state().dettid;
+    let response = send_and_update_time(guest, GlobalRequest::LocalPid(caller, task)).await;
+    match response.1 {
+        GlobalResponse::LocalPid(answer) => answer,
         _ => unreachable!(),
     }
 }

@@ -6784,6 +6784,36 @@ impl<T: RecordOrReplay> Detcore<T> {
         // would open it; refusing it with EPERM is a policy, the answer the
         // guest already gets for `ptrace` and `process_vm_readv` on that process.
         let pid = call.pid() as i32;
+        // A nested caller names its own namespace's pid, where none of
+        // Hermit's tasks is visible; the pidfd records the task it names
+        // (https://github.com/rrnewton/hermit/issues/4155). A pid no task of
+        // that namespace has goes to the kernel, which answers ESRCH.
+        if pid > 0 && guest.thread_state().nested_pid_namespace {
+            let target = match crate::tool_global::guest_pid(guest, pid).await {
+                crate::scheduler::pid_namespaces::GuestPidAnswer::Task { task, .. } => Some(task),
+                crate::scheduler::pid_namespaces::GuestPidAnswer::NoSuchPid => None,
+                crate::scheduler::pid_namespaces::GuestPidAnswer::Untranslatable(reason) => {
+                    tracing::error!(
+                        "[detcore, dtid {}] pidfd_open of pid {} from a nested PID namespace is not supported: {} (https://github.com/rrnewton/hermit/issues/4155)",
+                        guest.thread_state().dettid,
+                        pid,
+                        reason,
+                    );
+                    return self
+                        .refuse_unserviceable_operation(guest, Sysno::pidfd_open, Errno::ENOSYS)
+                        .await;
+                }
+            };
+            let fd = self.record_or_replay(guest, call).await? as RawFd;
+            let flags = OFlag::O_CLOEXEC | OFlag::from_bits_truncate(call.flags() as libc::c_int);
+            self.add_fd(guest, fd, flags, FdType::Pidfd).await?;
+            if let Some(target) = target {
+                guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.set_pidfd_target(target))?;
+            }
+            return Ok(fd as i64);
+        }
         if pid > 0 && crate::tool_global::names_hermit_task(guest, Some(pid), pid).await {
             tracing::info!(
                 "[detcore, dtid {}] pidfd_open of {}, Hermit's own process: refused with EPERM \
