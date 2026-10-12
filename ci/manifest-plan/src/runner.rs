@@ -4806,8 +4806,9 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
     if verify_strict && mode_recipe.comparator != Some(Comparator::Stripped) {
         argv.push("--verify-strict".into());
     }
-    // Validation admits these relaxations only on a verify recipe, and a
-    // replay cell does not inherit them: `record start` has no such flags.
+    // Validation admits these relaxations only on a verify or a chaos recipe,
+    // and a replay cell does not inherit them: `record start` has no such
+    // flags.
     // Validation refuses `compare_io_buffers=false` outright; the flag is
     // still rendered for a recipe built without validation, such as one that
     // reproduces a retained row recorded before the refusal.
@@ -8282,16 +8283,28 @@ fn allowed_hermit_arg(arg: &str) -> bool {
 }
 
 /// Validate a mode's `hermit_args`, `env` and `comparator`.
+///
+/// A chaos mode may declare `hermit_args`: a chaos cell is built by the same
+/// argv builder as a verify cell ([`verified_invocation_argv`]) and records
+/// its relaxations the same way. The fp-reduction chaos cell runs with
+/// `--max-timeslice=disabled`, an exemption that stops the flake of
+/// <https://github.com/rrnewton/hermit/issues/4150> while the host dependence
+/// of PMU-preempted chaos schedules is tracked in <https://github.com/rrnewton/hermit/issues/4159>.
 fn validate_mode_extensions(id: &str, mode: &str, recipe: &ModeRecipe) -> Result<(), String> {
-    let extends = !recipe.hermit_args.is_empty()
-        || recipe.hermit_args_reason.is_some()
-        || recipe.comparator.is_some()
+    let verify_only = recipe.comparator.is_some()
         || recipe.comparator_reason.is_some()
         || !recipe.diagnostic.is_empty()
         || recipe.no_retry_reason.is_some();
-    if extends && mode != "verify" {
+    if verify_only && mode != "verify" {
         return Err(format!(
-            "{id}: {mode} declares hermit_args, comparator, diagnostic or no_retry_reason, which only a verify mode accepts"
+            "{id}: {mode} declares comparator, diagnostic or no_retry_reason, which only a verify mode accepts"
+        ));
+    }
+    let declares_hermit_args =
+        !recipe.hermit_args.is_empty() || recipe.hermit_args_reason.is_some();
+    if declares_hermit_args && !matches!(mode, "verify" | "chaos") {
+        return Err(format!(
+            "{id}: {mode} declares hermit_args, which only a verify or a chaos mode accepts"
         ));
     }
     // A replay cell records and replays the program its verify cell checks,
@@ -9404,6 +9417,38 @@ corpus:
             assert!(error.contains(needle), "{error}");
         };
         refused(&|_| {}, "replay", "only a verify mode accepts");
+        // A chaos mode accepts the flags and their reason, and nothing else
+        // a verify mode alone accepts; a replay mode accepts neither.
+        let chaos = ModeRecipe {
+            backends_enabled: vec!["ptrace".into()],
+            hermit_args: BTreeMap::from([(
+                "ptrace".into(),
+                vec!["--max-timeslice=disabled".into()],
+            )]),
+            hermit_args_reason: Some("its schedule must not depend on the host PMU".into()),
+            ..ModeRecipe::default()
+        };
+        validate_mode_extensions("fixture/test", "chaos", &chaos).unwrap();
+        let error = validate_mode_extensions("fixture/test", "replay", &chaos).unwrap_err();
+        assert!(
+            error.contains("only a verify or a chaos mode accepts"),
+            "{error}"
+        );
+        let mut chaos_comparator = chaos.clone();
+        chaos_comparator.comparator = Some(Comparator::Stripped);
+        chaos_comparator.comparator_reason = Some("a stripped comparison".into());
+        let error =
+            validate_mode_extensions("fixture/test", "chaos", &chaos_comparator).unwrap_err();
+        assert!(error.contains("only a verify mode accepts"), "{error}");
+        let mut chaos_unreasoned = chaos.clone();
+        chaos_unreasoned.hermit_args_reason = None;
+        assert!(validate_mode_extensions("fixture/test", "chaos", &chaos_unreasoned).is_err());
+        let mut chaos_outside_allowlist = chaos.clone();
+        chaos_outside_allowlist.hermit_args =
+            BTreeMap::from([("ptrace".into(), vec!["--no-rcb-time".into()])]);
+        assert!(
+            validate_mode_extensions("fixture/test", "chaos", &chaos_outside_allowlist).is_err()
+        );
         // Anything outside the allowlist, including every flag that would
         // weaken the comparison or determinism by another route.
         for flag in [
@@ -9882,6 +9927,11 @@ corpus:
     }
 
     fn verify_spec_of(cell: SelectedCell) -> CellRunSpec {
+        spec_of(cell, None)
+    }
+
+    /// The run spec of `cell`'s attempt "1", with this chaos seed.
+    fn spec_of(cell: SelectedCell, seed: Option<i64>) -> CellRunSpec {
         let context = RunContext {
             root: PathBuf::from("/repo"),
             hermit_bin: PathBuf::from("/repo/hermit"),
@@ -9913,7 +9963,7 @@ corpus:
             PathBuf::from("/repo/results/cell"),
             vec!["/bin/true".into()],
             "1",
-            None,
+            seed,
             cell.timeout_seconds,
         )
         .unwrap()
@@ -11190,6 +11240,44 @@ corpus:
         assert_eq!(
             retained.execution_wall_timeout_seconds,
             Some(resolved.wall_seconds)
+        );
+    }
+
+    #[test]
+    fn the_fp_reduction_chaos_cell_runs_without_pmu_preemption() {
+        // With PMU preemption the cell's chaos schedule followed the host CPU
+        // (https://github.com/rrnewton/hermit/issues/4150; root cause in
+        // https://github.com/rrnewton/hermit/issues/4159). The real
+        // manifest's required cell must run with the timer off and record
+        // that exemption with a reason naming both.
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifests = ManifestSet::load(&root).unwrap();
+        let cell = manifests
+            .select(&Selection {
+                population: Some(Population::Required),
+                ..Selection::default()
+            })
+            .unwrap()
+            .into_iter()
+            .find(|cell| {
+                cell.id.test == "c-programs/fp-reduction-nondeterminism"
+                    && cell.id.mode == "chaos"
+                    && cell.id.backend.as_deref() == Some("ptrace")
+            })
+            .expect("the fp-reduction chaos cell is required");
+        let relaxations = cell_relaxations(&cell);
+        let spec = spec_of(cell, Some(0));
+        let at = |arg: &str| spec.argv.iter().position(|a| a == arg);
+        let flag = at("--max-timeslice=disabled").expect("the timer is off");
+        assert!(at("--chaos").is_some(), "{:?}", spec.argv);
+        assert!(flag < at("--").unwrap(), "{:?}", spec.argv);
+        assert!(
+            relaxations.iter().any(|relaxation| {
+                relaxation.starts_with("--max-timeslice=disabled: ")
+                    && relaxation.contains("issues/4150")
+                    && relaxation.contains("issues/4159")
+            }),
+            "{relaxations:?}"
         );
     }
 

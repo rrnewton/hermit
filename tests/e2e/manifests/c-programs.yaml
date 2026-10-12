@@ -1640,6 +1640,23 @@ test:
         # output calculation but narrowed seeds 0..31 to 6/8 classes.
         # min_distinct=7 accepts the measured healthy window and refuses that
         # partial narrowing. All selected outcomes must exit successfully.
+        #
+        # PMU PREEMPTION IS OFF (hermit_args below). This is an exemption,
+        # not a fix: it stops the flake by removing what differs between
+        # hosts, whose cause is tracked, with a PMU-on repro, in
+        # https://github.com/rrnewton/hermit/issues/4159.
+        # With the default
+        # --max-timeslice, chaos preempted the guest on a retired-branch
+        # counter overflow, whose point depends on the host CPU: in October
+        # 2026 the cell narrowed to 6/8 on every remote-execution worker with
+        # CPUID faulting and passed on 14 of 15 without it, most likely the
+        # Intel and the older AMD workers
+        # (https://github.com/rrnewton/hermit/issues/4150). With the timer
+        # off, the guest's sched_yield points are the only preemption points,
+        # the result does not depend on branch counts (--no-rcb-time gives
+        # the same outcome for every seed), and the same seeds gave 8/8 for
+        # the Buck-built guest and for the pinned-root guest with its own
+        # libraries, identically on repeated runs.
         seeds:
           - 0
           - 1
@@ -1683,6 +1700,10 @@ test:
         guest_args:
           ptrace:
             - chaos
+        hermit_args:
+          ptrace:
+            - --max-timeslice=disabled
+        hermit_args_reason: An exemption that stops the CI flake of https://github.com/rrnewton/hermit/issues/4150, not a fix - PMU preemption gives this chaos cell a different schedule on hosts with and without CPUID faulting (root cause tracked in https://github.com/rrnewton/hermit/issues/4159, which carries the PMU-on repro), so its 7-of-8 floor failed on every worker with faulting and passed on 14 of 15 without; with the timer off its sched_yield points alone vary the order, and seeds 0..31 gave 8 of 8 classes, the same for every seed on repeated runs, for both the Buck-built and the pinned-root guest
         backends_disabled:
           dbt: Chaos scheduling is unsupported by DBT
           kvm: Chaos scheduling is unsupported by KVM

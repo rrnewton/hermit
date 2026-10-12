@@ -1338,7 +1338,16 @@ fn validate_mode_with_cpu(
     }
     match mode {
         "naked" => allowed.extend(["runs", "assert"]),
-        "chaos" => allowed.extend(["seeds", "assert", "outcome_classes"]),
+        // A chaos cell may relax determinism like a verify cell, with the
+        // same allowlisted flags and required reason
+        // (runner::validate_mode_extensions).
+        "chaos" => allowed.extend([
+            "seeds",
+            "assert",
+            "outcome_classes",
+            "hermit_args",
+            "hermit_args_reason",
+        ]),
         "custom" => allowed.extend(["args", "assert"]),
         // `verify` accepts one assertion: `bitwise_parity`, which upgrades the
         // cell from the lossy default comparator to the L2 parity comparator and

@@ -992,7 +992,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (detcore-dbt), retain all 1058 prior cases: 1064.
     // stress_series::tests::failed_match_pressure_evidence_is_a_non_canonical_failed_attempt
     // retains all 1058: 1059.
-    ("test.regular_crates", 1065),
+    // runner::tests::the_fp_reduction_chaos_cell_runs_without_pmu_preemption
+    // (hermit-manifest-plan) retains all 1065 prior cases: 1066.
+    ("test.regular_crates", 1066),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3305,7 +3307,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the run_failed runner test: 1049.
     // And the same six model/runtime config transport tests: 1064.
     // And the failed-match pressure evidence test: 1059.
-    ("test.regular_crates_on_host", 1065),
+    // And the fp-reduction chaos exemption test: 1066.
+    ("test.regular_crates_on_host", 1066),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

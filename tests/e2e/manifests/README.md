@@ -365,7 +365,12 @@ specific configuration:
 ```
 
 - `hermit_args` are Hermit `run` flags added after the runner's own, per
-  enabled backend: a backend not named gets none. Only
+  enabled backend: a backend not named gets none. A `chaos` mode may declare
+  `hermit_args` and `hermit_args_reason` too (and none of the other keys
+  here): `c-programs/fp-reduction-nondeterminism` runs its chaos cell with
+  `--max-timeslice=disabled`, an exemption that stops the flake of
+  https://github.com/rrnewton/hermit/issues/4150 while the host dependence of
+  PMU-preempted chaos schedules is tracked in https://github.com/rrnewton/hermit/issues/4159. Only
   `--no-virtualize-cpuid` and `--max-timeslice=VALUE` are accepted. Each
   relaxes determinism, so a non-empty `hermit_args_reason` is required and
   every flag is recorded, with that reason, in the result row's
