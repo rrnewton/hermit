@@ -80,7 +80,7 @@ const GETRANDOM_MAX_BYTES: usize = (i32::MAX as usize) & !4095;
 const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | libc::GRND_INSECURE;
 /// Version 8 retains the owned signal entry and appends a fixed native-control
 /// executor to the version-6 startup handshake (56-byte callback layout).
-const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 8;
+const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 9;
 const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 56;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -3105,7 +3105,7 @@ mod tests {
 
     #[test]
     fn exported_runtime_identity_matches_the_pinned_reverie_abi() {
-        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 8);
+        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 9);
         assert_eq!(std::mem::size_of::<DbtSignalEvent>(), 200);
         assert_eq!(std::mem::align_of::<DbtSignalEvent>(), 8);
         assert_eq!(std::mem::offset_of!(DbtSignalEvent, signal_info), 8);

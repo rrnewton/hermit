@@ -8,6 +8,7 @@
 
 //! Deterministic scheduling algorithm.
 
+pub(crate) mod child_exit_capture;
 pub(crate) mod child_exit_sigchld;
 #[cfg(test)]
 pub(crate) mod exec_teardown_tests;
@@ -1349,6 +1350,9 @@ pub struct Scheduler {
     /// schedule, as KVM's controlled publication queues its SIGCHLD.
     child_exit_publications_pending: BTreeSet<DetPid>,
 
+    /// Asynchronous native capture transactions; independent of KVM publication.
+    native_child_capture: child_exit_capture::CaptureState,
+
     /// Process leaders whose exit publication the backend reported before any
     /// hold existed for them: a process killed before its Exit request was
     /// granted is consumed, and reported, by the tracer while that request is
@@ -2200,6 +2204,7 @@ async fn sched_loop_inner(
     blocking_backoff: bool,
     observer: Option<SchedulerObserver>,
 ) {
+    let _capture_failure_drain = child_exit_capture::FailureDrain(sched.clone());
     // The "daemon task starting up" INFO line is deliberately NOT emitted here.
     //
     // This body runs inside a `tokio::spawn`ed task (see
@@ -2265,6 +2270,7 @@ async fn sched_loop_inner(
         }
         iter += 1;
 
+        child_exit_capture::drain_failure(&sched);
         // If there are NO threads left in the system, then we're truly done:
         {
             let mut sched = sched.lock().unwrap();
@@ -2283,6 +2289,7 @@ async fn sched_loop_inner(
                     .as_ref()
                     .is_none_or(|hb| hb.parked.is_empty())
                 && sched.pending_physical_process_exits.is_empty()
+                && sched.native_child_capture.holds.is_empty()
                 && sched.pending_run_queue_admissions.is_empty()
                 && sched.pending_run_queue_removals.is_empty()
                 && !sched.control_barrier()
@@ -2323,6 +2330,7 @@ async fn sched_loop_inner(
         // Otherwise we trust the turn function to either choose a runnable thread or wait
         // until something blocked is ready to run again.
         last_res = do_a_turn_blocking(sched.clone(), timer.clone(), &last_res).await;
+        child_exit_capture::drain_failure(&sched);
 
         // A vfork barrier whose backend event never arrived. Taken here, after
         // either turn function, because both run step2a: the ordinary one
@@ -3216,6 +3224,7 @@ impl Scheduler {
             autoreaped_exits: Default::default(),
             completed_physical_process_exits: Default::default(),
             child_exit_publications_pending: Default::default(),
+            native_child_capture: Default::default(),
             child_exit_publications_completed: Default::default(),
             child_exit_sigchld: Default::default(),
             saved_guest_sigmasks: Default::default(),
@@ -4613,6 +4622,7 @@ impl Scheduler {
             event.phase
         );
         self.backend_failure = Some(event);
+        self.abort_native_capture_state();
         self.backend_failure_sender.take()
     }
 
@@ -5434,7 +5444,9 @@ impl Scheduler {
             std::thread::yield_now();
             return Err(SkipTurn);
         }
-        if !self.child_exit_publications_pending.is_empty() {
+        if !self.child_exit_publications_pending.is_empty()
+            || !self.native_child_capture.holds.is_empty()
+        {
             // A child's exit grant left its notification to the kernel (None
             // or Discard). Select no turn until the backend reports the kernel
             // has published the exit to the parent; the report's host timing
@@ -8595,6 +8607,10 @@ impl Scheduler {
             // SI_TKILL for one child, so only the scheduler wait readiness is
             // synthesized on that path.
             ResourceID::Exit { group, process, mm } => {
+                if let Err(error) = self.reserve_native_child_capture(dettid, *process, *mm) {
+                    self.fail_native_child_capture(dettid, &error);
+                    return Err(SkipTurn);
+                }
                 let reserve_mode = match self.reserve_exit_boundary(dettid, *process, *mm, *group) {
                     Ok(mode) => mode,
                     Err(failure) => {
