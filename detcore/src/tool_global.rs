@@ -5048,11 +5048,20 @@ impl GlobalState {
         publication: &FdinfoPublication,
     ) {
         let mut projection = self.fdinfo.lock().unwrap();
+        tracing::trace!(target: "fdinfo_diagnostic", ?incarnation, files = ?publication.files,
+            origin = ?publication.origin, sequence = publication.batch.sequence,
+            own_identity = ?publication.own_identity,
+            "private fdinfo publication admission");
         if let Err(error) = projection.publish_admitted(incarnation, publication) {
             projection.cache.invalidate_authority();
             // A private projection gap is not a Linux syscall result and does
             // not cancel the original request or change its scheduling/clock.
             warn!("fdinfo projection unavailable for {incarnation:?}: {error:?}");
+            tracing::trace!(target: "fdinfo_diagnostic", ?incarnation, ?error,
+                "private fdinfo publication rejected");
+        } else {
+            tracing::trace!(target: "fdinfo_diagnostic", ?incarnation,
+                "private fdinfo publication admitted");
         }
     }
 
@@ -5123,6 +5132,9 @@ where
         &operation,
         FdinfoControlOperation::BindOpened { .. } | FdinfoControlOperation::BeginCapture { .. }
     );
+    tracing::trace!(target: "fdinfo_diagnostic", dtid = ?guest.thread_state().dettid,
+        mm = ?guest.thread_state().mm_id, ?operation,
+        "private fdinfo control request");
     let mut request = GlobalRequest::FdinfoControl(FdinfoControl { operation });
     if flush {
         let publication = guest.thread_state_mut().take_fdinfo_publication(false);
@@ -5134,7 +5146,12 @@ where
     // pending forwarded count for the next original accounted request.
     let response = guest.send_rpc((time, mm, request)).await;
     match response {
-        (None, GlobalResponse::FdinfoControl(reply)) => reply.result,
+        (None, GlobalResponse::FdinfoControl(reply)) => {
+            tracing::trace!(target: "fdinfo_diagnostic", dtid = ?guest.thread_state().dettid,
+                mm = ?guest.thread_state().mm_id, result = ?reply.result,
+                "private fdinfo control response");
+            reply.result
+        }
         (_, GlobalResponse::Retired) => {
             // Match the original accounted-request path: a committed SIGKILL
             // victim never resumes into acquisition or another injection.

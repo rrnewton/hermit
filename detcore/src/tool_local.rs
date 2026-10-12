@@ -451,15 +451,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         V: Serialize + serde::de::DeserializeOwned + Send + Sync,
     {
         let encoded = bincode::serde::encode_to_vec(observed, bincode::config::legacy())
+            .inspect_err(|error| {
+                tracing::trace!(target: "fdinfo_diagnostic", kind, phase = "encode", ?error,
+                    "private fdinfo fact codec failed");
+            })
             .map_err(|error| Error::Tool(anyhow::anyhow!("fdinfo fact encode failed: {error}")))?;
         let recorded = self
             .record_or_replay
             .fdinfo_capture_fact(&mut guest.into_guest(), kind, Some(&encoded))
-            .await?
+            .await
+            .inspect_err(|error| {
+                tracing::trace!(target: "fdinfo_diagnostic", kind, phase = "hook", ?error,
+                    "private fdinfo fact hook failed");
+            })?
             .ok_or_else(|| {
+                tracing::trace!(target: "fdinfo_diagnostic", kind, phase = "missing_payload",
+                    "private fdinfo fact hook returned no payload");
                 Error::Tool(anyhow::anyhow!("fdinfo captured fact returned no payload"))
             })?;
-        Self::decode_fdinfo_capture_fact(&recorded)
+        Self::decode_fdinfo_capture_fact(&recorded).inspect_err(|error| {
+            tracing::trace!(target: "fdinfo_diagnostic", kind, phase = "decode", ?error,
+                "private fdinfo fact codec failed");
+        })
     }
 
     /// Replay obtains a private helper fact before executing that operation.
@@ -475,10 +488,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     {
         self.record_or_replay
             .fdinfo_capture_fact(&mut guest.into_guest(), kind, None)
-            .await?
+            .await
+            .inspect_err(|error| {
+                tracing::trace!(target: "fdinfo_diagnostic", kind, phase = "replay_hook", ?error,
+                    "private fdinfo fact hook failed");
+            })?
             .as_deref()
             .map(Self::decode_fdinfo_capture_fact)
             .transpose()
+            .inspect_err(|error| {
+                tracing::trace!(target: "fdinfo_diagnostic", kind, phase = "replay_decode", ?error,
+                    "private fdinfo fact codec failed");
+            })
     }
 
     fn decode_fdinfo_capture_fact<V: serde::de::DeserializeOwned>(

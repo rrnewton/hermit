@@ -793,7 +793,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: Syscall,
         open_owner: Option<&mut Vec<i32>>,
     ) -> Result<i64, ProcIdentityGap> {
-        let (operation, output) = proc_identity_operation(guest, call)?;
+        let (operation, output) = proc_identity_operation(guest, call).inspect_err(|error| {
+            tracing::trace!(target: "fdinfo_diagnostic", dtid = ?guest.thread_state().dettid,
+                mm = ?guest.thread_state().mm_id, kind = 1, phase = "describe", ?error,
+                "private fdinfo helper description failed");
+        })?;
+        tracing::trace!(target: "fdinfo_diagnostic", dtid = ?guest.thread_state().dettid,
+            mm = ?guest.thread_state().mm_id, kind = 1, ?operation,
+            "private fdinfo helper begin");
         if matches!(operation, ProcIdentityOperation::Openat { .. }) && open_owner.is_none() {
             return Err(ProcIdentityGap::Tool(
                 "private proc open has no resource owner".to_owned(),
@@ -804,7 +811,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await
             .map_err(ProcIdentityGap::from_error)?
         {
-            recorded.validate(&operation)?;
+            recorded.validate(&operation).inspect_err(|error| {
+                tracing::trace!(target: "fdinfo_diagnostic", dtid = ?guest.thread_state().dettid,
+                    mm = ?guest.thread_state().mm_id, kind = 1, mode = "replayed",
+                    phase = "validate", ?operation, ?error,
+                    "private fdinfo helper fact validation failed");
+            })?;
+            tracing::trace!(target: "fdinfo_diagnostic", dtid = ?guest.thread_state().dettid,
+                mm = ?guest.thread_state().mm_id, kind = 1, mode = "replayed", ?operation,
+                result = ?recorded.result, output = ?recorded.output.as_ref().map(Vec::len),
+                "private fdinfo helper recorded result");
             if let (Some(held), Some(fd)) = (open_owner, proc_identity_returned(&recorded.result)) {
                 // Register a nonphysical cleanup token even when the actual
                 // successful open was masked by a refusal. Its Close consumes
@@ -813,13 +829,22 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             // Restore bytes only to the current call's scratch, preserving the
             // refusal after registering any owned cleanup token.
-            return output.finish(guest, recorded, true);
+            return output.finish(guest, recorded, true).inspect_err(|error| {
+                tracing::trace!(target: "fdinfo_diagnostic", dtid = ?guest.thread_state().dettid,
+                    mm = ?guest.thread_state().mm_id, kind = 1, mode = "replayed",
+                    phase = "finish", ?operation, ?error,
+                    "private fdinfo helper completion returned error");
+            });
         }
         // Private physical acquisition is outside ordinary guest syscall and
         // debug-argument recording. Preserve its full result in the typed fact.
         let _ = guest.take_unsupported_refusal();
         let result = guest.inject(call).await.map_err(Error::from);
         let refusal = guest.take_unsupported_refusal();
+        tracing::trace!(target: "fdinfo_diagnostic", dtid = ?guest.thread_state().dettid,
+            mm = ?guest.thread_state().mm_id, kind = 1, mode = "physical", ?operation,
+            actual_result = ?result, immediate_refusal = ?refusal,
+            "private fdinfo helper physical return");
         if let (Some(held), Ok(fd)) = (open_owner, &result) {
             // Register the actual physical descriptor before fact encoding,
             // writing, decoding or validation can fail, including a refusal
@@ -828,6 +853,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let result = proc_identity_injection_result(result, refusal);
         let bytes = output.capture(guest, &operation, &result);
+        tracing::trace!(target: "fdinfo_diagnostic", dtid = ?guest.thread_state().dettid,
+            mm = ?guest.thread_state().mm_id, kind = 1, mode = "physical", ?operation,
+            result = ?result, output = ?bytes.as_ref().map(Vec::len),
+            "private fdinfo helper output copy result");
         let observed = ProcIdentityOperationFact {
             version: 1,
             operation: operation.clone(),
@@ -841,13 +870,22 @@ impl<T: RecordOrReplay> Detcore<T> {
                 result: Box::new(observed.result.clone()),
                 primary: Box::new(ProcIdentityGap::from_error(error)),
             })?;
-        recorded
-            .validate(&operation)
-            .map_err(|error| ProcIdentityGap::CaptureFact {
+        recorded.validate(&operation).map_err(|error| {
+            tracing::trace!(target: "fdinfo_diagnostic", dtid = ?guest.thread_state().dettid,
+                    mm = ?guest.thread_state().mm_id, kind = 1, mode = "physical",
+                    phase = "validate", ?operation, ?error,
+                    "private fdinfo helper fact validation failed");
+            ProcIdentityGap::CaptureFact {
                 result: Box::new(observed.result.clone()),
                 primary: Box::new(error),
-            })?;
-        output.finish(guest, recorded, false)
+            }
+        })?;
+        output.finish(guest, recorded, false).inspect_err(|error| {
+            tracing::trace!(target: "fdinfo_diagnostic", dtid = ?guest.thread_state().dettid,
+                mm = ?guest.thread_state().mm_id, kind = 1, mode = "physical",
+                phase = "finish", ?operation, ?error,
+                "private fdinfo helper completion returned error");
+        })
     }
 
     async fn rollback_proc_identity_scratch<G: Guest<Self>>(
@@ -879,6 +917,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 ProcIdentityFact::from_result(proc_identity_injection_result(result, refusal))
             }
         };
+        tracing::trace!(target: "fdinfo_diagnostic", dtid = ?guest.thread_state().dettid,
+            mm = ?guest.thread_state().mm_id, kind = 2, physical_owned_mapping = true,
+            ?primary, cleanup = ?cleanup,
+            "private fdinfo scratch rollback result");
         ProcIdentityGap::Cleanup {
             primary: Box::new(primary),
             cleanup: Box::new(ProcCleanupObservation {
@@ -898,6 +940,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         loop {
             let result = guest.inject(call).await.map_err(Error::from);
             let refusal = guest.take_unsupported_refusal();
+            tracing::trace!(target: "fdinfo_diagnostic", dtid = ?guest.thread_state().dettid,
+                mm = ?guest.thread_state().mm_id, kind = 2, physical_returned = result.is_ok(),
+                physical_error = ?result.as_ref().err(), immediate_refusal = ?refusal,
+                "private fdinfo scratch physical return");
             let physical_returned = result.as_ref().ok().copied();
             let actual = proc_identity_injection_result(result, refusal);
             // Scratch addresses belong to this execution. Only the outcome
@@ -938,6 +984,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .await)
                 }
             };
+            tracing::trace!(target: "fdinfo_diagnostic", dtid = ?guest.thread_state().dettid,
+                mm = ?guest.thread_state().mm_id, kind = 2,
+                result_class = ?result.as_ref().map(|_| ()),
+                "private fdinfo scratch selected outcome");
             match result {
                 // The pre-existing mapping helper retries these interruptions.
                 // Consume the marker before a retry; never retry a refusal.
@@ -1216,11 +1266,24 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<ProcIdentityAcquisition, Error> {
         let actual = self.capture_fdinfo_proc_identity_raw(guest, request).await;
         let recorded = self.fdinfo_capture_fact(guest, 3, &actual).await?;
-        Ok(if actual.cleanup_complete() {
+        let selected = if actual.cleanup_complete() {
             recorded
         } else {
             actual
-        })
+        };
+        tracing::trace!(target: "fdinfo_diagnostic", dtid = ?guest.thread_state().dettid,
+            mm = ?guest.thread_state().mm_id, kind = 3, ?request,
+            pid = ?selected.injected_pid, tid = ?selected.injected_tid, ppid = ?selected.injected_ppid,
+            scratch = ?selected.scratch, procfs_root = ?selected.procfs_root,
+            procfs_type = ?selected.procfs_type, mounted_pid_namespace = ?selected.mounted_pid_namespace,
+            process_alias = ?selected.process_alias, task_alias = ?selected.task_alias,
+            task_directory = ?selected.task.directory, task_stat = ?selected.task.stat,
+            task_pid_namespace = ?selected.task.pid_namespace, task_mount_namespace = ?selected.task.mount_namespace,
+            process_directory = ?selected.process.directory, process_stat = ?selected.process.stat,
+            process_pid_namespace = ?selected.process.pid_namespace, process_mount_namespace = ?selected.process.mount_namespace,
+            cleanup_complete = selected.cleanup_complete(), cleanup = ?selected.cleanup,
+            "private fdinfo own acquisition selected facts");
+        Ok(selected)
     }
 
     async fn capture_fdinfo_proc_identity_raw<G: Guest<Self>>(
@@ -1795,11 +1858,33 @@ impl<T: RecordOrReplay> Detcore<T> {
             .capture_fdinfo_open_subject_raw(guest, source_local_fd, selector, target_fd)
             .await;
         let recorded = self.fdinfo_capture_fact(guest, 4, &actual).await?;
-        Ok(if actual.cleanup_complete() {
+        let selected = if actual.cleanup_complete() {
             recorded
         } else {
             actual
-        })
+        };
+        tracing::trace!(target: "fdinfo_diagnostic", dtid = ?guest.thread_state().dettid,
+            mm = ?guest.thread_state().mm_id, kind = 4, ?selector, source_local_fd, target_fd,
+            pid = ?selected.injected_pid, tid = ?selected.injected_tid,
+            scratch = ?selected.scratch, procfs_root = ?selected.procfs_root, procfs_type = ?selected.procfs_type,
+            mounted_pid_namespace_before = ?selected.mounted_pid_namespace_before,
+            mounted_pid_namespace_after = ?selected.mounted_pid_namespace_after,
+            caller_pid_namespace_before = ?selected.caller_pid_namespace_before,
+            caller_pid_namespace_after = ?selected.caller_pid_namespace_after,
+            caller_mount_namespace_before = ?selected.caller_mount_namespace_before,
+            caller_mount_namespace_after = ?selected.caller_mount_namespace_after,
+            resolved_alias = ?selected.resolved_alias,
+            source_object_before = ?selected.source_object_before, source_object_after = ?selected.source_object_after,
+            path_object_before = ?selected.path_object_before, path_object_after = ?selected.path_object_after,
+            target_directory_before = ?selected.target_before.directory, target_directory_after = ?selected.target_after.directory,
+            target_stat_before = ?selected.target_before.stat, target_stat_after = ?selected.target_after.stat,
+            target_pid_namespace_before = ?selected.target_before.pid_namespace, target_pid_namespace_after = ?selected.target_after.pid_namespace,
+            target_mount_namespace_before = ?selected.target_before.mount_namespace, target_mount_namespace_after = ?selected.target_after.mount_namespace,
+            process_directory_before = ?selected.process_before.directory, process_directory_after = ?selected.process_after.directory,
+            process_stat_before = ?selected.process_before.stat, process_stat_after = ?selected.process_after.stat,
+            cleanup_complete = selected.cleanup_complete(), cleanup = ?selected.cleanup,
+            "private fdinfo opened-subject acquisition selected facts");
+        Ok(selected)
     }
 
     async fn capture_fdinfo_open_subject_raw<G: Guest<Self>>(

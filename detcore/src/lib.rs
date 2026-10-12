@@ -2681,6 +2681,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             let acquisition = self.capture_fdinfo_proc_identity(guest, request).await?;
             guest.thread_state_mut().fdinfo_identity_pending =
                 crate::fdinfo_rpc::FdinfoOwnIdentity::from_acquisition(&acquisition);
+            tracing::trace!(target: "fdinfo_diagnostic", dtid = ?guest.thread_state().dettid,
+                mm = ?guest.thread_state().mm_id,
+                accepted = guest.thread_state().fdinfo_identity_pending.is_some(),
+                identity = ?guest.thread_state().fdinfo_identity_pending,
+                "private fdinfo own identity conversion");
         }
 
         // Linux's restart of an interrupted wait is the thread's very next syscall,
