@@ -643,7 +643,8 @@ mod tests {
             // tight-stack test (https://github.com/rrnewton/hermit/issues/4113),
             // plus the stop-signal SIGHUP poll test
             // (https://github.com/rrnewton/hermit/issues/4111).
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "283");
+            // Add the real DBT pending-sigsuspend EINTR/delivery/mask regression.
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "284");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
