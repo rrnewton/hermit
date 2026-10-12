@@ -15,4 +15,7 @@
 
 /// `git ls-files -- reverie-dbt` in the pinned Reverie checkout lists this
 /// many files.
-pub const REVERIE_DBT_FILES: usize = 941;
+/// Reverie 458a675 adds the signal_admission_state Rust integration target and
+/// its CMake, client.c, guest.c, clobber.S, and probe.S fixtures: 941 + 6.
+/// These are source files for real native signal-state regressions.
+pub const REVERIE_DBT_FILES: usize = 947;

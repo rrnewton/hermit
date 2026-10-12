@@ -2127,7 +2127,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4113): 282.
     // And external_signal_interrupt::ptrace_a_stop_signal_send_keeps_a_sighup_poll_to_its_deadline
     // (https://github.com/rrnewton/hermit/issues/4111): 283.
-    ("test.hermit_integration", 283),
+    // dbt_pending_signal_completes_sigsuspend_and_restores_mask adds EINTR,
+    // exactly-once delivery, restored SIGUSR1 blocking, and cleared pending state.
+    ("test.hermit_integration", 284),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -2626,7 +2628,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_cross_process_sigkill_verifies_at_bitwise_parity and a_recorded_kill_of_a_victim_in_a_background_read_is_refused_at_replay (https://github.com/rrnewton/hermit/issues/3994) retain all 301: 303.
     // The four own-process signal CLI tests (https://github.com/rrnewton/hermit/issues/4034) retain all 303: 307.
     // And the four pidfd_send_signal flag, process-group, Hermit-directory and sibling tests (https://github.com/rrnewton/hermit/issues/4108): 311.
-    ("test.cli", 311),
+    // dbt_caught_sigchld_reaches_shared_tool_before_its_handler_write
+    // (https://github.com/rrnewton/hermit/issues/4074) retains all 311: 312.
+    ("test.cli", 312),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2872,7 +2876,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Nor do the cross-process SIGKILL parity and record-refusal tests: 239.
     // Nor do the four own-process signal CLI tests: 243.
     // Nor do the four pidfd_send_signal tests: 247.
-    ("test.cli_on_host", 247),
+    // The same DBT shared-hook regression retains all 247 host cases.
+    ("test.cli_on_host", 248),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3060,7 +3065,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the four targeted-chaos sched_yield tests: 281.
     // And the ppoll tight-stack test: 282.
     // And the stop-signal SIGHUP poll test: 283.
-    ("test.hermit_integration_on_host", 283),
+    // The same DBT pending-sigsuspend regression retains all 283 host cases.
+    ("test.hermit_integration_on_host", 284),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
