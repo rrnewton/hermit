@@ -1406,7 +1406,30 @@ fi
 # native SDK input Git objects are equal. Preserve SDK key, inventory 941,
 # the 16-job clamp and 1050/572-job-second budgets. This carries the SDK budget
 # only; runtime qualification, test and timing evidence must be measured anew.
-expected_pin=0f7cdd3232d3216637bc076aaa7517a981d6fdec
+# BOUND TO 47f8fe75572faea8ff51e9869facbd67af0fc199 (2026-10-12):
+# This rebased commit preserves the entire DBT tree and all seven SDK inputs
+# of 458a67572a1322bf57efcd176b3f4dcfc50a77b1. The 0a10b391 restack
+# preserves those same seven input objects from d46946bb; only inherited
+# ptrace realtime-signal handling and the default raw-signal Tool hook changed.
+# Owned signal admission and returning injected waits change ten vendored
+# DynamoRIO core files. This is NOT an unchanged-vendor or unchanged-key carry.
+# The other six recorded SDK inputs remain Git-object equal to 0f7cdd32:
+# build.rs, native/CMakeLists.txt, DBT Cargo.toml, third-party, root Cargo.toml,
+# and rust-toolchain.toml. Build topology, Release options and job clamp match.
+# A bounded production build of the exact committed source, with CMAKE and
+# CMAKE_GENERATOR unset and SOURCE_DATE_EPOCH=0, recorded a content-key MISS:
+#   ff4576416a64218bcbccb4528cee86e5fc4da7119267d963751b37c39f68e542
+# then completed configure/build/install in 12.64s with jobs=16, NUM_JOBS=16,
+# available CPUs=16 (202.19 job-seconds), and PUBLISHED the complete Release SDK.
+# The unchanged MISS path allocates a fresh empty staging/build directory;
+# this is cold SDK work in a reused Cargo target, not a cold total Rust build.
+# 202.19 is below both the 1050-job-second wrapper and 572-job-second fallback.
+# Retain both thresholds, the 16-job clamp, and every refusal predicate.
+# This one local observation does not replace the original hosted n=3
+# calibration or satisfy its >=5-sample replacement rule. The six native
+# signal-state regression files increase the tracked DBT inventory 941 to 947;
+# they add no SDK compilation target. Runtime results are separate evidence.
+expected_pin=47f8fe75572faea8ff51e9869facbd67af0fc199
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

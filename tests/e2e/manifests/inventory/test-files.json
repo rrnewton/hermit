@@ -260,6 +260,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/dbt_sigchld_shared_hook.c",
+      "runner": "test-harness",
+      "why": "The shared c-programs/caught-sigchld-shared-hook manifest row owns the guest Linux signal contract across declared backend/mode cells. The DBT CLI regression additionally compiles the same unchanged guest and checks real same-thread shared Tool admission before the handler write; generic manifest registration does not claim that stronger oracle."
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/dbt_unsupported_syscall.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/dbt_unsupported_syscall.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"

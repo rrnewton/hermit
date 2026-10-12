@@ -9,6 +9,8 @@ c-programs/add-key-enosys verify dbt
 c-programs/adjtimex-deterministic verify dbt
 c-programs/bpf-enosys verify dbt
 c-programs/cachestat-enosys verify dbt
+c-programs/caught-sigchld-shared-hook verify dbt
+c-programs/caught-sigchld-shared-hook verify ptrace
 c-programs/clock-adjtime-deterministic verify dbt
 c-programs/copy-file-range-refusal-probe verify dbt
 c-programs/dbt-execveat-unsupported verify dbt

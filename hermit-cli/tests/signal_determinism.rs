@@ -314,6 +314,21 @@ fn pending_signal_completes_sigsuspend_and_restores_mask() {
     );
 }
 
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_pending_signal_completes_sigsuspend_and_restores_mask() {
+    // Exercise the real Detcore<DbtGuest> syscall path as well as the native
+    // delivery path: a pending signal must end the temporary-mask wait with
+    // EINTR, exactly one handler delivery, restored SIGUSR1 blocking, and no
+    // pending SIGUSR1.
+    run_signal_scenario_on_backend(
+        Some("dbt"),
+        "pending-sigsuspend",
+        "sigsuspend delivered\npending sigsuspend restored=1 deliveries=1 pending=0\n",
+        1,
+    );
+}
+
 #[test]
 fn sigsuspend_without_signal_reports_terminal_deadlock() {
     let _guard = hermit_signal_lock();
