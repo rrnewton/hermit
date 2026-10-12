@@ -2651,7 +2651,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/reverie/issues/1001): 315.
     // And realtime_signals_are_delivered_with_their_values_and_verify
     // (https://github.com/rrnewton/reverie/issues/207): 316.
-    ("test.cli", 316),
+    // And a_cpu_set_sized_from_kernel_max_holds_the_one_virtual_cpu
+    // (https://github.com/rrnewton/hermit/issues/4160): 317.
+    ("test.cli", 317),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2907,7 +2909,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two skid-retry loop unit tests, which run here too: 250.
     // Nor does the vDSO symbol-version test: 251.
     // The realtime-signal delivery test runs on the host too: 252.
-    ("test.cli_on_host", 252),
+    // Nor does the kernel_max affinity test: 253.
+    ("test.cli_on_host", 253),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
