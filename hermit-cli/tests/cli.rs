@@ -23389,7 +23389,9 @@ fn a_pending_real_time_timer_expiration_is_refused_only_where_it_is_observed() {
 /// 1b4674f7): ESRCH for the self-kill and the init's own signals, `fork`
 /// returned 7 and `waitpid` failed with ECHILD, the sibling kill hung, and the
 /// orphan was never reaped. An init that exits leaving only a zombie behind
-/// is at parity too; one that leaves a live process is the next test.
+/// is at parity too; one that leaves a live process is the next test. Phase 2:
+/// `setpgid` on a nested child, `prlimit64` on the init's own pid 1 (was
+/// EPERM) and `sched_setattr` on a nested thread (was ESRCH).
 #[test]
 fn a_nested_pid_namespace_names_its_own_pids_at_bitwise_parity() {
     let guest = pid_namespace_nested_guest().to_str().unwrap().to_owned();
@@ -23417,6 +23419,15 @@ fn a_nested_pid_namespace_names_its_own_pids_at_bitwise_parity() {
         (
             "init_leaves_zombie",
             "init_leaves_zombie child=2\ninit exit=0\n",
+        ),
+        (
+            "setpgid",
+            "child pid=2 pgid=2\nsetpgid rc=0 getpgid=2\ninit exit=0\n",
+        ),
+        ("prlimit", "prlimit pid=1 rc=0\ninit exit=0\n"),
+        (
+            "sched_setattr",
+            "sched_setattr thread=2 rc=0\ninit exit=0\n",
         ),
     ];
     for (mode, expected) in cases {

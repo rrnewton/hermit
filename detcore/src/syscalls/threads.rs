@@ -3745,8 +3745,26 @@ impl<T: RecordOrReplay> Detcore<T> {
         // leader. The kill-target resolver is the wrong question here: it
         // models `kill(2)`, whose first act is to refuse anything that is not a
         // leader, so a perfectly live non-leader thread's tid reported ESRCH.
-        if call.pid() != 0 && !thread_is_live(guest, DetTid::from_raw(call.pid())).await {
-            return Err(Errno::ESRCH.into());
+        // A nested caller names the thread by its own namespace's tid
+        // (https://github.com/rrnewton/hermit/issues/4155).
+        let named = if call.pid() > 0 && guest.thread_state().nested_pid_namespace {
+            match crate::tool_global::guest_pid(guest, call.pid()).await {
+                GuestPidAnswer::Task { task, .. } => Some(task),
+                GuestPidAnswer::NoSuchPid => None,
+                GuestPidAnswer::Untranslatable(reason) => {
+                    return Err(self
+                        .refuse_nested_pid(guest, reverie::syscalls::Sysno::sched_setattr, &reason)
+                        .await);
+                }
+            }
+        } else {
+            Some(DetTid::from_raw(call.pid()))
+        };
+        if call.pid() != 0 {
+            match named {
+                Some(task) if thread_is_live(guest, task).await => {}
+                _ => return Err(Errno::ESRCH.into()),
+            }
         }
 
         // And everything `__sched_setscheduler` decides after it.

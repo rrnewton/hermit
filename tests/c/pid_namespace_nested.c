@@ -35,6 +35,11 @@
  *                 tid>, SIGUSR1), which runs the handler on that thread.
  *   init_leaves_zombie: the init forks a child that exits, and exits without
  *                 waiting for it; only a zombie is left in the namespace.
+ *   setpgid:      the init forks a child and puts it in its own group with
+ *                 setpgid(child, child); the child sees pgid 2.
+ *   prlimit:      the init reads its own RLIMIT_NOFILE with prlimit64(1, ...).
+ *   sched_setattr: the init sets SCHED_OTHER on its thread by the thread's
+ *                 nested tid.
  *   init_dies:    the init forks a child that waits forever, and exits; Linux
  *                 kills the child (zap_pid_namespace) at a moment the host
  *                 chooses, which Hermit reports as a determinism loss.
@@ -47,6 +52,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <linux/sched/types.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -171,6 +178,39 @@ static int init_main(const char *mode) {
     int rc = (int)syscall(SYS_tgkill, getpid(), tid, SIGUSR1);
     pthread_join(t, NULL);
     printf("tgkill thread=%d rc=%s on_thread=%d\n", tid, err(rc), ran_tid == tid);
+  } else if (!strcmp(mode, "setpgid")) {
+    int ready[2];
+    if (pipe(ready)) _exit(98);
+    pid_t c = fork();
+    if (c == 0) {
+      char b;
+      if (read(ready[0], &b, 1) != 1) _exit(99);
+      printf("child pid=%d pgid=%d\n", getpid(), getpgid(0));
+      fflush(stdout);
+      _exit(0);
+    }
+    int rc = setpgid(c, c);
+    int group = getpgid(c);
+    if (write(ready[1], "x", 1) != 1) _exit(100);
+    waitpid(c, NULL, 0);
+    printf("setpgid rc=%s getpgid=%d\n", err(rc), group);
+  } else if (!strcmp(mode, "prlimit")) {
+    struct rlimit old;
+    int rc = (int)syscall(SYS_prlimit64, getpid(), RLIMIT_NOFILE, NULL, &old);
+    printf("prlimit pid=%d rc=%s\n", getpid(), err(rc));
+  } else if (!strcmp(mode, "sched_setattr")) {
+    volatile int tid = 0;
+    pthread_t t;
+    if (pthread_create(&t, NULL, idle, (void *)&tid)) _exit(101);
+    while (!tid) usleep(1000);
+    struct sched_attr attr;
+    memset(&attr, 0, sizeof attr);
+    attr.size = sizeof attr;
+    attr.sched_policy = SCHED_OTHER;
+    int rc = (int)syscall(SYS_sched_setattr, tid, &attr, 0);
+    ran = 1;
+    pthread_join(t, NULL);
+    printf("sched_setattr thread=%d rc=%s\n", tid, err(rc));
   } else if (!strcmp(mode, "init_leaves_zombie")) {
     int fds[2];
     if (pipe(fds)) _exit(97);
