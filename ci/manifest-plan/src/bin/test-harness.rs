@@ -7823,7 +7823,9 @@ sys.exit(1 if failed else 0)
         // run by full, and full planned neither side of their parity cell, so
         // they were unreported; switched off, they are no longer applicable.
         // The 2 left are example-timed-progress-bar's DBT and KVM cells.
-        assert_eq!(unreported.len(), 2 + 30, "{unreported:?}");
+        // c-programs/caught-sigchld-shared-hook adds one applicable DBT cell;
+        // both verify sides are non-gating, so full plans neither side.
+        assert_eq!(unreported.len(), 2 + 30 + 1, "{unreported:?}");
         let sabre_only = unreported
             .iter()
             .filter(|cell| cell.starts_with("compat/") && cell.ends_with("@sabre"))

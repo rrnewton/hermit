@@ -649,7 +649,8 @@ mod tests {
             // (https://github.com/rrnewton/hermit/issues/4160), plus the
             // random-heuristic sched_yield progress test
             // (https://github.com/rrnewton/hermit/issues/4150).
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "286");
+            // Add the real DBT pending-sigsuspend EINTR/delivery/mask regression.
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "287");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

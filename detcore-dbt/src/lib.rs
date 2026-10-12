@@ -79,9 +79,8 @@ const MAX_OBSERVED_BUFFER: usize = 1024 * 1024;
 const RANDOM_FILL_CHUNK_BYTES: usize = 4096;
 const GETRANDOM_MAX_BYTES: usize = (i32::MAX as usize) & !4095;
 const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | libc::GRND_INSECURE;
-/// Version 6 adds the initialized native mode and returned startup status.
-/// Version 7 adds `reverie_dbt_runtime_signal_event`. The 48-byte callback
-/// layout and version-5 RDTSC entry remain unchanged.
+/// Version 7 adds the owned pre-delivery signal event entry. The version-6
+/// startup handshake and 48-byte callback layout remain unchanged.
 const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 7;
 const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 48;
 
@@ -2140,9 +2139,9 @@ unsafe fn write_deferred_syscall(syscall: Syscall, number: *mut i64, args: *mut 
 
 /// Builds and starts this thread's Detcore state on its first runtime event:
 /// constructs it, runs the thread-start hook, then the post-exec hook. A
-/// syscall is usually that event, but an rdtsc can come first (the loader reads
-/// the TSC before its first syscall), so both callbacks start the thread here,
-/// in the same order. Returns `scratch.runtime_state`; `Err` carries the
+/// syscall is usually that event, but an rdtsc or an owned signal can come
+/// first, so all three callbacks start the thread here in the same order.
+/// Returns `scratch.runtime_state`; `Err` carries the
 /// syscall result to install.
 ///
 /// # Safety
@@ -2347,28 +2346,25 @@ pub unsafe extern "C" fn reverie_dbt_runtime_rdtsc(
     }
 }
 
-/// Reports one caught signal to Detcore's `Tool::handle_signal_event` (ABI
-/// version 7) from the native client's owned signal continuation, before the
-/// application handler runs.
+/// Admits an owned native signal through the real Detcore Tool before delivery.
 ///
-/// Returns 0 to deliver the signal, 1 to suppress it, or 2 after writing a
-/// terminal `exit` or `exit_group` into `event`'s deferred syscall; a negative
-/// value ends the run. Two kinds are delivered unchanged without the Tool, as
-/// before version 7:
-/// - A realtime signal (32 to 64): `reverie_dbt`'s signal runner names
-///   signals with nix's `Signal`, which has no realtime numbers, and refuses
-///   them.
-/// - A `SIGCHLD`, while the backend does not report child-exit publication
-///   (`BackendCapabilities::reports_child_exit_publication`). Detcore then
-///   cannot match the kernel's copy to the scheduler's own, so its turn would
-///   come at the host-timed point the kernel sent it, and a guest that forks
-///   would no longer verify (`determinism-stress-c/fork-tree`).
+/// The native continuation, rather than DynamoRIO's pending-signal callback,
+/// calls this entry after releasing the signal queue guard. No Rust borrow or
+/// future survives the return to native code. A deferred syscall is returned
+/// to that continuation; it is not executed on the signal callback's stack.
+///
+/// Realtime signals retain main's unchanged native delivery because the named-
+/// signal Tool entry cannot represent them. Named SIGCHLD enters the shared Tool.
+///
+/// Returns 0 to deliver, 1 to suppress, 2 for a deferred native syscall, or a
+/// negative value to end the run on a runtime or Tool failure.
 ///
 /// # Safety
 ///
-/// `scratch` must name this thread's initialized storage, `event` must be the
-/// native client's initialized, exclusively owned event, and the callbacks must
-/// be valid for this call.
+/// `scratch` must be this thread's exclusive native scratch storage, `event`
+/// must contain its owned signal information, and all callbacks and storage
+/// must remain valid for this call. No other Tool callback may hold this
+/// thread's state while the native signal continuation is active.
 #[allow(clippy::too_many_arguments)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reverie_dbt_runtime_signal_event(
@@ -2376,7 +2372,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_signal_event(
     scratch: *mut c_void,
     tid: i32,
     pid: i32,
-    _image_generation: u64,
+    image_generation: u64,
     branches: u64,
     event: *mut DbtSignalEvent,
     invoke_syscall: SyscallInvoker,
@@ -2384,25 +2380,31 @@ pub unsafe extern "C" fn reverie_dbt_runtime_signal_event(
     write_registers: RegisterWriter,
     read_memory: MemoryReader,
     _write_memory: MemoryWriter,
-    emit: unsafe extern "C" fn(*const u8, usize),
+    emit: Emitter,
 ) -> i32 {
     if context.is_null() || scratch.is_null() || event.is_null() {
         return -1;
     }
     let event = unsafe { &mut *event };
-    let runtime = current_runtime();
-    let bypasses_tool = match Signal::try_from(event.signal) {
-        Ok(Signal::SIGCHLD) => !runtime.config.backend.reports_child_exit_publication,
-        Ok(_) => false,
-        Err(_) if (libc::SIGRTMIN()..=libc::SIGRTMAX()).contains(&event.signal) => true,
+    // Preserve main's unchanged native delivery for realtime signal numbers:
+    // the current named-signal Tool entry cannot represent them.
+    match Signal::try_from(event.signal) {
+        Ok(_) => {}
+        Err(_) if (libc::SIGRTMIN()..=libc::SIGRTMAX()).contains(&event.signal) => {
+            event.delivered_signal = event.signal;
+            event.signal_info_changed = 0;
+            return 0;
+        }
         Err(_) => return -1,
-    };
-    if bypasses_tool {
-        event.delivered_signal = event.signal;
-        event.signal_info_changed = 0;
-        return 0;
+    }
+    if image_generation == 0
+        || IMAGE_GENERATION.load(Ordering::Acquire) != image_generation
+        || READY_IMAGE.load(Ordering::Acquire) != image_generation
+    {
+        return -1;
     }
     let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
+    let runtime = current_runtime();
     let Some((det_tid, det_pid)) =
         runtime
             .abi
@@ -2412,7 +2414,6 @@ pub unsafe extern "C" fn reverie_dbt_runtime_signal_event(
     };
     TOTAL_BRANCHES.store(branches, Ordering::Relaxed);
     let host_pid = Pid::from_raw(pid);
-    let det_tid = Pid::from_raw(det_tid.into());
     let tool = runtime
         .tool
         .get_or_init(|| Detcore::new(det_pid, &runtime.config));
@@ -2423,7 +2424,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_signal_event(
             tool,
             context,
             tid,
-            det_tid,
+            Pid::from_raw(det_tid.into()),
             det_pid,
             host_pid,
             branches,
@@ -2437,7 +2438,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_signal_event(
         Ok(thread) => unsafe { &mut *thread },
         Err(_) => return -1,
     };
-    let outcome = reverie_dbt::run_tool_signal_with_memory_reader(
+    match reverie_dbt::run_tool_signal_with_memory_reader(
         tool,
         context as usize,
         thread.tid,
@@ -2451,9 +2452,11 @@ pub unsafe extern "C" fn reverie_dbt_runtime_signal_event(
         read_registers,
         write_registers,
         read_memory,
-    );
-    match outcome {
-        Ok(DbtSignalOutcome::Deliver(_)) => 0,
+    ) {
+        Ok(DbtSignalOutcome::Deliver(signal)) => {
+            event.delivered_signal = signal as i32;
+            0
+        }
         Ok(DbtSignalOutcome::Suppress) => 1,
         Ok(DbtSignalOutcome::ExecuteOriginal(syscall)) => {
             unsafe {
@@ -2466,7 +2469,9 @@ pub unsafe extern "C" fn reverie_dbt_runtime_signal_event(
             2
         }
         Err(error) => {
-            let message = format!("detcore-dbt: signal admission failed: {error}\n");
+            // A signal event has no syscall return value to receive an errno.
+            // Failure cannot be mistaken for permission to deliver it.
+            let message = format!("detcore-dbt: Detcore failed handling a signal: {error:#}\n");
             unsafe { emit(message.as_ptr(), message.len()) };
             -1
         }
@@ -3111,9 +3116,11 @@ mod tests {
     #[test]
     fn exported_runtime_identity_matches_the_pinned_reverie_abi() {
         assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 7);
-        // The native client's dbt_signal_event_t (ABI version 7).
         assert_eq!(std::mem::size_of::<DbtSignalEvent>(), 200);
         assert_eq!(std::mem::align_of::<DbtSignalEvent>(), 8);
+        assert_eq!(std::mem::offset_of!(DbtSignalEvent, signal_info), 8);
+        assert_eq!(std::mem::offset_of!(DbtSignalEvent, deferred_sysnum), 144);
+        assert_eq!(std::mem::offset_of!(DbtSignalEvent, deferred_args), 152);
         assert_eq!(
             reverie_dbt::DBT_RUNTIME_ABI_VERSION,
             IMPLEMENTED_DBT_RUNTIME_ABI_VERSION
@@ -3324,6 +3331,21 @@ mod tests {
             MemoryWriter,
             Emitter,
         ) -> i32 = reverie_dbt_runtime_pre_syscall;
+        let _: unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            i32,
+            i32,
+            u64,
+            u64,
+            *mut DbtSignalEvent,
+            SyscallInvoker,
+            RegisterReader,
+            RegisterWriter,
+            MemoryReader,
+            MemoryWriter,
+            Emitter,
+        ) -> i32 = reverie_dbt_runtime_signal_event;
         let _: unsafe extern "C" fn(*mut c_void) = reverie_dbt_runtime_background_init_v2;
         let _: extern "C" fn() = reverie_dbt_runtime_process_exit;
         let _: extern "C" fn(u64) -> i32 = reverie_dbt_runtime_ready;

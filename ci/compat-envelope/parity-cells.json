@@ -8,8 +8,8 @@
   "population_rule": "Every manifest test whose ptrace verify cell full validation selects (Population::Required), crossed with every candidate backend (dbt, in-guest-trap, kvm, liteinst, sabre). A candidate whose verify cell is disabled, enabled but not selected, red, refused or missing is in the population and scores 0. A cell whose ptrace reference left no usable golden log is outside it and is counted apart.",
   "counts": {
     "all": {
-      "cells": 4085,
-      "applicable": 1701,
+      "cells": 4090,
+      "applicable": 1702,
       "selectable": 1399,
       "population": 2775,
       "population_candidate_selected": 1399,
@@ -18,8 +18,8 @@
     },
     "by_backend": {
       "dbt": {
-        "cells": 817,
-        "applicable": 252,
+        "cells": 818,
+        "applicable": 253,
         "selectable": 205,
         "population": 555,
         "population_candidate_selected": 205,
@@ -27,7 +27,7 @@
         "population_candidate_disabled": 304
       },
       "in-guest-trap": {
-        "cells": 817,
+        "cells": 818,
         "applicable": 319,
         "selectable": 313,
         "population": 555,
@@ -36,7 +36,7 @@
         "population_candidate_disabled": 242
       },
       "kvm": {
-        "cells": 817,
+        "cells": 818,
         "applicable": 334,
         "selectable": 330,
         "population": 555,
@@ -45,7 +45,7 @@
         "population_candidate_disabled": 222
       },
       "liteinst": {
-        "cells": 817,
+        "cells": 818,
         "applicable": 318,
         "selectable": 312,
         "population": 555,
@@ -54,7 +54,7 @@
         "population_candidate_disabled": 243
       },
       "sabre": {
-        "cells": 817,
+        "cells": 818,
         "applicable": 478,
         "selectable": 239,
         "population": 555,
@@ -155,6 +155,11 @@
     {"test_id":"c-programs/cachestat-refusal","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/cachestat-refusal","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/cachestat-refusal","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/caught-sigchld-shared-hook","backend":"dbt","category":"c-programs","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Shared guest registration is not CI calibration; the dedicated DBT CLI regression retains its stronger hook-before-handler oracle"},
+    {"test_id":"c-programs/caught-sigchld-shared-hook","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Shared guest registration is not CI calibration; the dedicated DBT CLI regression retains its stronger hook-before-handler oracle"},
+    {"test_id":"c-programs/caught-sigchld-shared-hook","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Shared guest registration is not CI calibration; the dedicated DBT CLI regression retains its stronger hook-before-handler oracle"},
+    {"test_id":"c-programs/caught-sigchld-shared-hook","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Shared guest registration is not CI calibration; the dedicated DBT CLI regression retains its stronger hook-before-handler oracle"},
+    {"test_id":"c-programs/caught-sigchld-shared-hook","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Shared guest registration is not CI calibration; the dedicated DBT CLI regression retains its stronger hook-before-handler oracle"},
     {"test_id":"c-programs/child-subreaper-refusal","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is disabled: The ptrace backend supports the subreaper prctls since https://github.com/rrnewton/hermit/pull/4000, because Detcore's wait model re-parents orphans there; c-programs/child-subreaper-support asserts that instead"},
     {"test_id":"c-programs/child-subreaper-refusal","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is disabled: The ptrace backend supports the subreaper prctls since https://github.com/rrnewton/hermit/pull/4000, because Detcore's wait model re-parents orphans there; c-programs/child-subreaper-support asserts that instead"},
     {"test_id":"c-programs/child-subreaper-refusal","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is disabled: The ptrace backend supports the subreaper prctls since https://github.com/rrnewton/hermit/pull/4000, because Detcore's wait model re-parents orphans there; c-programs/child-subreaper-support asserts that instead"},

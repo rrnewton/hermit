@@ -2154,7 +2154,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4160): 285.
     // And chaos_sched_yield_progress::random_chaos_sched_yield_makes_progress_with_timer_preemption
     // (https://github.com/rrnewton/hermit/issues/4150): 286.
-    ("test.hermit_integration", 286),
+    // DBT pending-sigsuspend adds EINTR, one delivery, restored blocking and no pending signal.
+    ("test.hermit_integration", 287),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -2672,7 +2673,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/reverie/issues/997): 319.
     // And a_nested_vfork_child_that_exits_completes_at_bitwise_parity
     // (https://github.com/rrnewton/hermit/issues/4163): 320.
-    ("test.cli", 320),
+    // The DBT caught-SIGCHLD regression requires shared-hook completion before the handler write.
+    ("test.cli", 321),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2934,7 +2936,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Nor do the two SIGEV_THREAD_ID timer tests: 254.
     // And the realtime-termination test: 255.
     // Nor does the nested-vfork test: 256.
-    ("test.cli_on_host", 256),
+    // The same DBT shared-hook regression retains every existing host case.
+    ("test.cli_on_host", 257),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3131,7 +3134,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the stop-signal SIGHUP poll test: 283.
     // And the two single-virtual-CPU procfs tests: 285.
     // And the random-heuristic sched_yield progress test: 286.
-    ("test.hermit_integration_on_host", 286),
+    // The same DBT pending-sigsuspend regression retains every existing host case.
+    ("test.hermit_integration_on_host", 287),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
