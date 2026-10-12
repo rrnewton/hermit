@@ -1525,6 +1525,42 @@ fn required_proc_fact<T>(fact: &ProcIdentityFact<T>) -> Result<&T, ProcIdentityG
     }
 }
 
+/// Names returned by procfs self links belong to that held proc view, not
+/// necessarily to the backend's application-facing Getpid/Gettid domain.
+/// This parses names only. The caller must still authenticate the held proc
+/// root, task directories/stat/lifetime, opened source and namespace relation.
+pub(crate) fn proc_view_self_ids(
+    process_link: &ProcIdentityFact<Vec<u8>>,
+    task_link: &ProcIdentityFact<Vec<u8>>,
+) -> (ProcIdentityFact<i32>, ProcIdentityFact<i32>) {
+    let resolved: Result<(i32, i32), ProcIdentityGap> = (|| {
+        let process = parse_process_alias(required_proc_fact(process_link)?)
+            .map_err(ProcIdentityGap::Malformed)?;
+        let task =
+            parse_task_alias(required_proc_fact(task_link)?).map_err(ProcIdentityGap::Malformed)?;
+        match (process, task) {
+            (ProcRawAliasName::Process { pid }, ProcRawAliasName::Task { pid: group, tid })
+                if pid == group =>
+            {
+                Ok((pid, tid))
+            }
+            _ => Err(ProcIdentityGap::Malformed(
+                ProcIdentityParseError::AliasSyntax,
+            )),
+        }
+    })();
+    match resolved {
+        Ok((pid, tid)) => (
+            ProcIdentityFact::Observed(pid),
+            ProcIdentityFact::Observed(tid),
+        ),
+        Err(gap) => (
+            ProcIdentityFact::Unavailable(gap.clone()),
+            ProcIdentityFact::Unavailable(gap),
+        ),
+    }
+}
+
 fn resolve_fdinfo_subject(
     selector: ProcFdinfoSubjectSelector,
     process: &ProcIdentityFact<ProcRawAliasName>,
@@ -1646,12 +1682,14 @@ impl ProcFdinfoOpenSubjectAcquisition {
             return None;
         }
         let alias = *self.resolved_alias.value()?;
+        let (proc_pid, proc_tid) =
+            proc_view_self_ids(&self.process_link_bytes, &self.task_link_bytes);
         if resolve_fdinfo_subject(
             self.selector,
             &self.process_alias,
             &self.task_alias,
-            &self.injected_pid,
-            &self.injected_tid,
+            &proc_pid,
+            &proc_tid,
         )
         .value()
             != Some(&alias)
@@ -2028,12 +2066,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                         ProcIdentityFact::Unavailable(gap.clone())
                     }
                 };
+                let (proc_pid, proc_tid) =
+                    proc_view_self_ids(&result.process_link_bytes, &result.task_link_bytes);
                 result.resolved_alias = resolve_fdinfo_subject(
                     selector,
                     &result.process_alias,
                     &result.task_alias,
-                    &result.injected_pid,
-                    &result.injected_tid,
+                    &proc_pid,
+                    &proc_tid,
                 );
                 if let Some(alias) = result.resolved_alias.value().copied() {
                     let path = match alias {
@@ -2619,6 +2659,63 @@ mod tests {
         assert_eq!(value.observed_open_subject_relation(), None);
         let mut value = valid.clone();
         value.source_local_fd = -1;
+        assert_eq!(value.observed_open_subject_relation(), None);
+    }
+
+    #[test]
+    fn own_proc_identity_keeps_application_getters_out_of_proc_view_authority() {
+        let mut value = observed_parent();
+        value.process_link_bytes = ProcIdentityFact::Observed(b"3".to_vec());
+        value.task_link_bytes = ProcIdentityFact::Observed(b"3/task/3".to_vec());
+        value.injected_pid = ProcIdentityFact::Observed(17);
+        value.injected_tid = ProcIdentityFact::Observed(19);
+        let own = crate::fdinfo_rpc::FdinfoOwnIdentity::from_acquisition(&value).unwrap();
+        assert_eq!(own.aliases.len(), 2);
+        assert!(own.aliases.iter().any(|alias| alias.kind
+            == crate::fdinfo_projection::FdinfoProcAliasKind::Task { pid: 3, tid: 3 }));
+        assert!(
+            own.aliases.iter().any(|alias| alias.kind
+                == crate::fdinfo_projection::FdinfoProcAliasKind::Process { pid: 3 })
+        );
+        assert_eq!(own.original_parent_candidate, None);
+
+        let valid = value.clone();
+        value.task_alias = ProcIdentityFact::Observed(ProcRawAliasName::Task { pid: 4, tid: 3 });
+        assert_eq!(
+            crate::fdinfo_rpc::FdinfoOwnIdentity::from_acquisition(&value),
+            None
+        );
+        value = valid.clone();
+        value.process_link_bytes = ProcIdentityFact::Observed(b"03".to_vec());
+        assert_eq!(
+            crate::fdinfo_rpc::FdinfoOwnIdentity::from_acquisition(&value),
+            None
+        );
+        value = valid;
+        value.mounted_pid_namespace =
+            ProcIdentityFact::Unavailable(ProcIdentityGap::Errno(libc::EACCES));
+        assert_eq!(
+            crate::fdinfo_rpc::FdinfoOwnIdentity::from_acquisition(&value),
+            None
+        );
+    }
+
+    #[test]
+    fn opened_proc_subject_keeps_application_getters_out_of_proc_view_authority() {
+        let mut value = observed_open_subject();
+        value.injected_pid = ProcIdentityFact::Observed(3);
+        value.injected_tid = ProcIdentityFact::Observed(3);
+        let relation = value.observed_open_subject_relation().unwrap();
+        assert_eq!(relation.alias, ProcRawAliasName::Task { pid: 17, tid: 19 });
+        assert_eq!(relation.target_start_ticks, 37);
+        assert_eq!(relation.opened_proc_file.inode, RawInode::new(9, 101));
+
+        let valid = value.clone();
+        value.task_link_bytes = ProcIdentityFact::Observed(b"18/task/19".to_vec());
+        assert_eq!(value.observed_open_subject_relation(), None);
+        value = valid;
+        value.caller_pid_namespace_after =
+            ProcIdentityFact::Unavailable(ProcIdentityGap::Errno(libc::EACCES));
         assert_eq!(value.observed_open_subject_relation(), None);
     }
 

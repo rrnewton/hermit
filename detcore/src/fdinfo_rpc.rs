@@ -51,8 +51,15 @@ impl FdinfoOwnIdentity {
         if !raw.cleanup_complete() || observed(&raw.procfs_type) != Some(&0x9fa0) {
             return None;
         }
-        let pid = *observed(&raw.injected_pid)?;
-        let tid = *observed(&raw.injected_tid)?;
+        // Application getters may be virtualized by the backend. Resolve raw
+        // names in the held proc view from its canonical self links instead;
+        // directory/stat/lifetime and namespace checks below remain authority.
+        let (proc_pid, proc_tid) = crate::syscalls::fdinfo_acquisition::proc_view_self_ids(
+            &raw.process_link_bytes,
+            &raw.task_link_bytes,
+        );
+        let pid = *observed(&proc_pid)?;
+        let tid = *observed(&proc_tid)?;
         if pid <= 0
             || tid <= 0
             || observed(&raw.process_alias) != Some(&ProcRawAliasName::Process { pid })
