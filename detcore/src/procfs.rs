@@ -26,6 +26,7 @@ use serde::Serialize;
 
 use crate::fdinfo_projection::FdinfoProjectionGap;
 use crate::syscalls::DETERMINISTIC_PIPE_CAPACITY_BYTES;
+use crate::syscalls::fdinfo_acquisition::ProcFdinfoMountSubjectRelation;
 use crate::syscalls::fdinfo_acquisition::ProcFdinfoOpenSubjectRelation;
 use crate::syscalls::fdinfo_acquisition::ProcFdinfoSubjectSelector;
 use crate::syscalls::fdinfo_acquisition::ProcIdentityGap;
@@ -355,6 +356,10 @@ pub(crate) struct ProcfsFile {
     #[serde(default)]
     fdinfo_open_subject: Option<ProcFdinfoOpenSubjectRelation>,
     #[serde(default)]
+    fdinfo_open_mount_subject: Option<ProcFdinfoMountSubjectRelation>,
+    #[serde(default)]
+    fdinfo_mount_identity: Option<FdinfoMountIdentity>,
+    #[serde(default)]
     fdinfo_projection: Option<FdinfoProjectionOutcome>,
     bound_thread_identity: Option<(i32, i32, i32)>,
     #[serde(default)]
@@ -459,6 +464,52 @@ pub(crate) enum FdinfoProjectionOutcome {
         reason: FdinfoProjectionGap,
         acquisition: Option<ProcIdentityGap>,
     },
+}
+
+/// Independently authenticated scalar mount numbering. The whole target
+/// projection can still be Unavailable; no other fdinfo field is authorized.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct FdinfoMountIdentity {
+    pub(crate) raw_mount_id: u64,
+    pub(crate) canonical_mount_id: u64,
+}
+
+fn fdinfo_mount_id_span(contents: &[u8]) -> Option<(u64, std::ops::Range<usize>)> {
+    let mut field = None;
+    let mut offset = 0;
+    for line in contents.split_inclusive(|byte| *byte == b'\n') {
+        if let Some(value) = line.strip_prefix(b"mnt_id:") {
+            if field.is_some() {
+                return None;
+            }
+            let first = value.iter().position(|byte| !byte.is_ascii_whitespace())?;
+            let last = value.iter().rposition(|byte| !byte.is_ascii_whitespace())? + 1;
+            let number = &value[first..last];
+            if !number.iter().all(u8::is_ascii_digit) {
+                return None;
+            }
+            let raw = std::str::from_utf8(number).ok()?.parse().ok()?;
+            let start = offset + b"mnt_id:".len() + first;
+            field = Some((raw, start..offset + b"mnt_id:".len() + last));
+        }
+        offset += line.len();
+    }
+    field
+}
+
+pub(crate) fn parse_fdinfo_mount_id(contents: &[u8]) -> Option<u64> {
+    fdinfo_mount_id_span(contents).map(|(id, _)| id)
+}
+
+/// Replace only the bound decimal token, preserving every other byte.
+fn normalize_fdinfo_mount_id(contents: &[u8], identity: FdinfoMountIdentity) -> Option<Vec<u8>> {
+    let (raw, range) = fdinfo_mount_id_span(contents)?;
+    if raw != identity.raw_mount_id {
+        return None;
+    }
+    let mut rendered = contents.to_vec();
+    rendered.splice(range, identity.canonical_mount_id.to_string().bytes());
+    Some(rendered)
 }
 
 /// Identity fields from the same kernel snapshot that supplies fdinfo's text.
@@ -801,6 +852,7 @@ pub(crate) struct ProcfsSnapshotContext {
     pub(crate) virtual_ppid: i32,
     pub(crate) virtual_pty_count: usize,
     pub(crate) fdinfo_projection: Option<FdinfoProjectionOutcome>,
+    pub(crate) fdinfo_mount_identity: Option<FdinfoMountIdentity>,
     /// Raw `(device, inode)` -> determinized `(device, inode)` for every backed
     /// mapping in a `maps`/`smaps` snapshot.
     ///
@@ -1030,6 +1082,8 @@ impl ProcfsFile {
             kind,
             fdinfo_target,
             fdinfo_open_subject: None,
+            fdinfo_open_mount_subject: None,
+            fdinfo_mount_identity: None,
             fdinfo_projection: None,
             bound_thread_identity: None,
             timer_slack_identity: None,
@@ -1111,12 +1165,14 @@ impl ProcfsFile {
             virtual_ppid,
             virtual_pty_count,
             fdinfo_projection,
+            fdinfo_mount_identity,
             random_uuid,
             mapping_identities,
             mountinfo,
         } = context;
         let mapping_identities = &mapping_identities;
         self.fdinfo_projection = fdinfo_projection.clone();
+        self.fdinfo_mount_identity = fdinfo_mount_identity;
         self.contents = Some(match &self.kind {
             ProcfsKind::Stat => sanitize_stat(&contents, Some((virtual_pid, virtual_ppid))),
             ProcfsKind::Status => {
@@ -1170,7 +1226,12 @@ impl ProcfsFile {
                 Some(FdinfoProjectionOutcome::Projected(identity)) => {
                     sanitize_fdinfo(&contents, Some(identity))
                 }
-                Some(FdinfoProjectionOutcome::Unavailable { .. }) => contents,
+                Some(FdinfoProjectionOutcome::Unavailable { .. }) => match fdinfo_mount_identity {
+                    Some(identity) => {
+                        normalize_fdinfo_mount_id(&contents, identity).unwrap_or(contents)
+                    }
+                    None => contents,
+                },
                 None => sanitize_fdinfo(&contents, None),
             },
             ProcfsKind::AioNr => sanitize_aio_nr(&contents),
@@ -1361,6 +1422,17 @@ impl ProcfsFile {
 
     pub(crate) fn fdinfo_target(&self) -> Option<FdinfoTarget> {
         self.fdinfo_target
+    }
+
+    pub(crate) fn fdinfo_open_mount_subject(&self) -> Option<ProcFdinfoMountSubjectRelation> {
+        self.fdinfo_open_mount_subject
+    }
+
+    pub(crate) fn bind_fdinfo_open_mount_subject(
+        &mut self,
+        relation: ProcFdinfoMountSubjectRelation,
+    ) {
+        self.fdinfo_open_mount_subject = Some(relation);
     }
 
     pub(crate) fn fdinfo_open_subject(&self) -> Option<ProcFdinfoOpenSubjectRelation> {
@@ -6810,6 +6882,38 @@ THPeligible:    0\n"
 
         let invalid_counter = b"71000000 default active=recent N0=1\n";
         assert_eq!(sanitize_numa_maps(invalid_counter), invalid_counter);
+    }
+
+    #[test]
+    fn mount_only_fdinfo_rendering_retains_every_unknown_and_target_byte() {
+        let raw = b"pos:\t7\nino:\t123\nflags:\t02000000\nmnt_id:\t419 \r\nfuture:\xff\x01\n";
+        let identity = FdinfoMountIdentity {
+            raw_mount_id: 419,
+            canonical_mount_id: 1,
+        };
+        assert_eq!(
+            normalize_fdinfo_mount_id(raw, identity).unwrap(),
+            b"pos:\t7\nino:\t123\nflags:\t02000000\nmnt_id:\t1 \r\nfuture:\xff\x01\n"
+        );
+        assert_eq!(
+            normalize_fdinfo_mount_id(
+                raw,
+                FdinfoMountIdentity {
+                    raw_mount_id: 420,
+                    ..identity
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            normalize_fdinfo_mount_id(b"mnt_id: 419\nmnt_id: 419\n", identity),
+            None
+        );
+        assert_eq!(
+            normalize_fdinfo_mount_id(b"mnt_id: invalid\n", identity),
+            None
+        );
+        assert_eq!(normalize_fdinfo_mount_id(b"ino: 123\n", identity), None);
     }
 
     #[test]

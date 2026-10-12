@@ -52,6 +52,7 @@ use tracing::info;
 use tracing::trace;
 use tracing::warn;
 
+use self::fdinfo_acquisition::ProcFdinfoMountSubjectRelation;
 use self::fdinfo_acquisition::ProcFdinfoOpenSubjectRelation;
 use self::fdinfo_acquisition::ProcFdinfoSubjectSelector;
 use self::fdinfo_acquisition::ProcIdentityGap;
@@ -86,6 +87,7 @@ use crate::scheduler::terminal_signals;
 use crate::stat::*;
 use crate::syscalls::threads::kernel_sigset_bit;
 use crate::tool_global::*;
+use crate::tool_local::CapturedDetFd;
 use crate::tool_local::CapturedDetFdInstallError;
 use crate::tool_local::Detcore;
 use crate::tool_local::finish_partial_record_or_replay_write;
@@ -121,6 +123,8 @@ struct FdinfoSnapshotAcquisition {
     target_fd: i32,
     control: Result<u64, FdinfoProjectionGap>,
     current_subject: Option<ProcFdinfoOpenSubjectRelation>,
+    current_mount_subject: Option<ProcFdinfoMountSubjectRelation>,
+    source_cleanup: Option<ProcIdentityGap>,
     target_path: String,
     target_stat: Result<(reverie::syscalls::StatxBuf, ProcfsEntry), ProcIdentityGap>,
 }
@@ -2275,6 +2279,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                         let acquired = self
                             .capture_fdinfo_open_subject(guest, fd, selector, target.fd)
                             .await?;
+                        if let Some(relation) = acquired.observed_mount_subject_relation() {
+                            procfs
+                                .as_mut()
+                                .expect("fdinfo disappeared")
+                                .bind_fdinfo_open_mount_subject(relation);
+                        }
                         if let Some(relation) = acquired.observed_open_subject_relation() {
                             let source = guest
                                 .thread_state()
@@ -3008,6 +3018,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             reason,
             acquisition,
         };
+        if let Some(cleanup) = capture.source_cleanup {
+            if let Ok(key) = capture.control {
+                let _ = fdinfo_control(
+                    guest,
+                    FdinfoControlOperation::CancelCapture { capture: key },
+                )
+                .await;
+            }
+            return Ok(unavailable(
+                FdinfoProjectionGap::MissingObject,
+                Some(cleanup),
+            ));
+        }
         let key = match capture.control {
             Ok(key) => key,
             Err(reason) => return Ok(unavailable(reason, None)),
@@ -3126,96 +3149,293 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         call: syscalls::Read,
-    ) -> Result<(), Error> {
-        let target = guest
-            .thread_state()
-            .with_detfd(call.fd(), |fd| fd.procfs_fdinfo_target())?;
-        let fdinfo_capture = if let Some(target) = target {
-            let (source, opened) = guest.thread_state().with_detfd(call.fd(), |fd| {
-                (fd.fdinfo_open_file_id(), fd.procfs_fdinfo_open_subject())
-            })?;
-            let control = match fdinfo_control(
-                guest,
-                FdinfoControlOperation::BeginCapture {
-                    source,
-                    target_fd: target.fd,
-                },
-            )
-            .await
-            {
-                Ok(FdinfoControlValue::Capture(key)) => Ok(key),
-                Ok(_) => Err(FdinfoProjectionGap::RejectedUpdate),
-                Err(gap) => Err(gap),
-            };
-            let (current_subject, target_path, target_stat) = if control.is_ok()
-                && let Some(opened) = opened
-            {
-                let selector = match opened.alias {
-                    ProcRawAliasName::Process { pid } => ProcFdinfoSubjectSelector::Process { pid },
-                    ProcRawAliasName::Task { pid, tid } => {
-                        ProcFdinfoSubjectSelector::Task { pid, tid }
-                    }
-                };
-                let current = self
-                    .capture_fdinfo_open_subject(guest, call.fd(), selector, target.fd)
-                    .await?
-                    .observed_open_subject_relation()
-                    .filter(|current| *current == opened);
-                let base = match opened.alias {
-                    ProcRawAliasName::Process { pid } => format!("/proc/{pid}"),
-                    ProcRawAliasName::Task { pid, tid } => format!("/proc/{pid}/task/{tid}"),
-                };
-                let path = format!("{base}/fd/{}", target.fd);
-                let stat = if current.is_some() {
-                    self.capture_fdinfo_statx(guest, libc::AT_FDCWD, &path, false)
-                        .await
-                } else {
-                    Err(ProcIdentityGap::DependencyUnavailable)
-                };
-                (current, path, stat)
-            } else {
-                (
-                    None,
-                    String::new(),
-                    Err(ProcIdentityGap::DependencyUnavailable),
+        source: &CapturedDetFd,
+    ) -> Result<bool, Error> {
+        let detfd = source.descriptor();
+        let mut held = Vec::new();
+        let mut active_capture = None;
+        let mut declined_source = None;
+        let acquired: Result<_, ProcIdentityGap> = async {
+            let target = detfd.procfs_fdinfo_target();
+            let mut held_source = None;
+            let fdinfo_capture = if let Some(target) = target {
+                let opened = detfd.procfs_fdinfo_open_subject();
+                let opened_mount = detfd.procfs_fdinfo_open_mount_subject();
+                let control = match fdinfo_control(
+                    guest,
+                    FdinfoControlOperation::BeginCapture {
+                        source: detfd.fdinfo_open_file_id(),
+                        target_fd: target.fd,
+                    },
                 )
-            };
-            Some(FdinfoSnapshotAcquisition {
-                target_fd: target.fd,
-                control,
-                current_subject,
-                target_path,
-                target_stat,
-            })
-        } else {
-            None
-        };
-        let raw_contents = match self.snapshot_procfs(guest, call).await {
-            Ok(contents) => contents,
-            Err(error) => {
-                if let Some(capture) = &fdinfo_capture
-                    && let Ok(key) = &capture.control
+                .await
                 {
-                    let _ = fdinfo_control(
-                        guest,
-                        FdinfoControlOperation::CancelCapture { capture: *key },
+                    Ok(FdinfoControlValue::Capture(key)) => {
+                        active_capture = Some(key);
+                        Ok(key)
+                    }
+                    Ok(_) => Err(FdinfoProjectionGap::RejectedUpdate),
+                    Err(gap) => Err(gap),
+                };
+                let (current_subject, target_path, target_stat, current_mount_subject) = if control
+                    .is_ok()
+                    && let Some(opened) = opened
+                {
+                    let selector = match opened.alias {
+                        ProcRawAliasName::Process { pid } => {
+                            ProcFdinfoSubjectSelector::Process { pid }
+                        }
+                        ProcRawAliasName::Task { pid, tid } => {
+                            ProcFdinfoSubjectSelector::Task { pid, tid }
+                        }
+                    };
+                    let current = self
+                        .capture_fdinfo_open_subject(guest, call.fd(), selector, target.fd)
+                        .await
+                        .map_err(ProcIdentityGap::from_error)?
+                        .observed_open_subject_relation()
+                        .filter(|current| *current == opened);
+                    let base = match opened.alias {
+                        ProcRawAliasName::Process { pid } => format!("/proc/{pid}"),
+                        ProcRawAliasName::Task { pid, tid } => format!("/proc/{pid}/task/{tid}"),
+                    };
+                    let path = format!("{base}/fd/{}", target.fd);
+                    let stat = if current.is_some() {
+                        self.capture_fdinfo_statx(guest, libc::AT_FDCWD, &path, false)
+                            .await
+                    } else {
+                        Err(ProcIdentityGap::DependencyUnavailable)
+                    };
+                    (current, path, stat, None)
+                } else if control.is_err()
+                    && guest.config().mountinfo_mount_ids_captured
+                    && let Some(opened) = opened_mount
+                    && opened.matches_captured_mount_view(&guest.config().mountinfo_mount_ids)
+                    && guest
+                        .thread_state()
+                        .procfs_source_still_named(call.fd(), source)
+                {
+                    // A failed whole-target admission supplies no token. Hold
+                    // the actual source once before its independent scalar proof.
+                    let current = match self.hold_fdinfo_source(guest, call.fd(), &mut held).await {
+                        Ok(fd) => {
+                            let current = self
+                                .capture_fdinfo_open_subject(guest, fd, opened.selector, target.fd)
+                                .await
+                                .map_err(ProcIdentityGap::from_error)?
+                                .observed_mount_subject_relation()
+                                .filter(|current| *current == opened);
+                            if current.is_none()
+                                || !guest
+                                    .thread_state()
+                                    .procfs_source_still_named(call.fd(), source)
+                            {
+                                // The actual hold did not join the captured
+                                // source. Do not rewind, drain, or install its
+                                // bytes on that modeled OFD; retain raw fallback.
+                                return Ok(None);
+                            }
+                            held_source = Some(fd);
+                            current
+                        }
+                        Err(error) if error.cleanup_preserves_completed_read() => {
+                            tracing::trace!(target: "fdinfo_diagnostic", ?error,
+                                "independent mount source hold unavailable");
+                            declined_source = Some(error);
+                            return Ok(None);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    (
+                        None,
+                        String::new(),
+                        Err(ProcIdentityGap::DependencyUnavailable),
+                        current,
                     )
-                    .await;
+                } else {
+                    (
+                        None,
+                        String::new(),
+                        Err(ProcIdentityGap::DependencyUnavailable),
+                        None,
+                    )
+                };
+                Some(FdinfoSnapshotAcquisition {
+                    target_fd: target.fd,
+                    control,
+                    current_subject,
+                    current_mount_subject,
+                    source_cleanup: None,
+                    target_path,
+                    target_stat,
+                })
+            } else {
+                None
+            };
+            let mut fdinfo_capture = fdinfo_capture;
+            let raw_contents = match held_source {
+                Some(fd) => {
+                    let snapshot = self.snapshot_held_fdinfo(guest, fd).await?;
+                    fdinfo_capture
+                        .as_mut()
+                        .expect("held fdinfo source has no capture")
+                        .source_cleanup = snapshot.cleanup;
+                    snapshot.contents
                 }
-                return Err(error);
+                None => self
+                    .snapshot_procfs(guest, call)
+                    .await
+                    .map_err(ProcIdentityGap::from_error)?,
+            };
+            let current_mount_subject = if let (Some(fd), Some(capture)) =
+                (held_source, &fdinfo_capture)
+                && let Some(opened) = capture.current_mount_subject
+                && guest
+                    .thread_state()
+                    .procfs_source_still_named(call.fd(), source)
+            {
+                self.capture_fdinfo_open_subject(guest, fd, opened.selector, capture.target_fd)
+                    .await
+                    .map_err(ProcIdentityGap::from_error)?
+                    .observed_mount_subject_relation()
+                    .filter(|current| *current == opened)
+            } else {
+                None
+            };
+            Ok(Some((raw_contents, fdinfo_capture, current_mount_subject)))
+        }
+        .await;
+        // The private source lease is closed before ordinary numbering/time
+        // RPCs. Every branch, including a fact-hook failure, drains ownership.
+        let cleanup_resource = held.first().copied();
+        let cleanup = self.close_fdinfo_source(guest, &mut held).await;
+        let acquired = match (acquired, cleanup) {
+            (result, Ok(())) => result,
+            (Ok(Some((raw_contents, mut capture, _))), Err(error))
+                if error.cleanup_preserves_completed_read() =>
+            {
+                let observation = Box::new(fdinfo_acquisition::ProcCleanupObservation {
+                    resource: fdinfo_acquisition::ProcTemporaryResource::Descriptor(
+                        cleanup_resource.expect("failed cleanup had no held descriptor"),
+                    ),
+                    result: fdinfo_acquisition::ProcIdentityFact::Unavailable(error),
+                });
+                let capture_ref = capture.as_mut().expect("held fdinfo source has no capture");
+                capture_ref.source_cleanup = Some(match capture_ref.source_cleanup.take() {
+                    Some(primary) => ProcIdentityGap::Cleanup {
+                        primary: Box::new(primary),
+                        cleanup: observation,
+                    },
+                    None => ProcIdentityGap::CleanupAfterSuccess {
+                        returned_bytes: raw_contents.len(),
+                        cleanup: observation,
+                    },
+                });
+                Ok(Some((raw_contents, capture, None)))
+            }
+            (Ok(None), Err(cleanup)) if cleanup.cleanup_preserves_completed_read() => {
+                let observation = ProcIdentityGap::Cleanup {
+                    primary: Box::new(
+                        declined_source.unwrap_or(ProcIdentityGap::DependencyUnavailable),
+                    ),
+                    cleanup: Box::new(fdinfo_acquisition::ProcCleanupObservation {
+                        resource: fdinfo_acquisition::ProcTemporaryResource::Descriptor(
+                            cleanup_resource.expect("failed cleanup had no held descriptor"),
+                        ),
+                        result: fdinfo_acquisition::ProcIdentityFact::Unavailable(cleanup),
+                    }),
+                };
+                warn!(
+                    ?observation,
+                    "private fdinfo hold declined; ordinary read retains its Linux result"
+                );
+                Ok(None)
+            }
+            (Ok(Some((raw_contents, capture, _))), Err(error)) => {
+                let cleanup = Box::new(fdinfo_acquisition::ProcCleanupObservation {
+                    resource: fdinfo_acquisition::ProcTemporaryResource::Descriptor(
+                        cleanup_resource.expect("failed cleanup had no held descriptor"),
+                    ),
+                    result: fdinfo_acquisition::ProcIdentityFact::Unavailable(error),
+                });
+                Err(match capture.and_then(|capture| capture.source_cleanup) {
+                    Some(primary) => ProcIdentityGap::Cleanup {
+                        primary: Box::new(primary),
+                        cleanup,
+                    },
+                    None => ProcIdentityGap::CleanupAfterSuccess {
+                        returned_bytes: raw_contents.len(),
+                        cleanup,
+                    },
+                })
+            }
+            (Ok(None), Err(cleanup)) => Err(ProcIdentityGap::Cleanup {
+                primary: Box::new(
+                    declined_source.unwrap_or(ProcIdentityGap::DependencyUnavailable),
+                ),
+                cleanup: Box::new(fdinfo_acquisition::ProcCleanupObservation {
+                    resource: fdinfo_acquisition::ProcTemporaryResource::Descriptor(
+                        cleanup_resource.expect("failed cleanup had no held descriptor"),
+                    ),
+                    result: fdinfo_acquisition::ProcIdentityFact::Unavailable(cleanup),
+                }),
+            }),
+            (Err(primary), Err(cleanup)) => Err(ProcIdentityGap::Cleanup {
+                primary: Box::new(primary),
+                cleanup: Box::new(fdinfo_acquisition::ProcCleanupObservation {
+                    resource: fdinfo_acquisition::ProcTemporaryResource::Descriptor(
+                        cleanup_resource.expect("failed cleanup had no held descriptor"),
+                    ),
+                    result: fdinfo_acquisition::ProcIdentityFact::Unavailable(cleanup),
+                }),
+            }),
+        };
+        let (raw_contents, fdinfo_capture, current_mount_subject) = match acquired {
+            Ok(Some(value)) => value,
+            Ok(None) => return Ok(false),
+            Err(error) => {
+                if let Some(capture) = active_capture {
+                    let _ =
+                        fdinfo_control(guest, FdinfoControlOperation::CancelCapture { capture })
+                            .await;
+                }
+                return Err(error.into_error());
             }
         };
+        let mut fdinfo_mount_identity = None;
         let fdinfo_projection = if let Some(capture) = fdinfo_capture {
+            let source_cleanup_complete = capture.source_cleanup.is_none();
             let observed = self
                 .project_fdinfo_snapshot(guest, capture, &raw_contents)
                 .await?;
             let recorded: FdinfoProjectionOutcome =
                 self.fdinfo_capture_fact(guest, 5, &observed).await?;
+            let recorded_cleanup_complete = !matches!(
+                &recorded,
+                FdinfoProjectionOutcome::Unavailable {
+                    acquisition: Some(
+                        ProcIdentityGap::CleanupAfterSuccess { .. }
+                            | ProcIdentityGap::Cleanup { .. }
+                    ),
+                    ..
+                }
+            );
             if let FdinfoProjectionOutcome::Unavailable {
                 reason,
                 acquisition,
             } = &recorded
             {
+                if source_cleanup_complete
+                    && recorded_cleanup_complete
+                    && current_mount_subject.is_some()
+                    && let Some(raw_mount_id) = crate::procfs::parse_fdinfo_mount_id(&raw_contents)
+                    && let Ok(canonical_mount_id) = self.fdinfo_mount_id(guest, raw_mount_id).await
+                {
+                    fdinfo_mount_identity = Some(crate::procfs::FdinfoMountIdentity {
+                        raw_mount_id,
+                        canonical_mount_id,
+                    });
+                }
                 warn!(
                     ?reason,
                     ?acquisition,
@@ -3232,10 +3452,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // runtime state, not part of that namespace; exclude the class at
         // capture so snapshot identity assignment and every later read agree
         // on the same membership.
-        let contents = if guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_needs_mountinfo_identities())?
-        {
+        let contents = if detfd.procfs_needs_mountinfo_identities() {
             crate::procfs::exclude_ephemeral_host_seed_mounts(&raw_contents)
         } else {
             raw_contents
@@ -3244,9 +3461,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Only `/proc/stat` renders btime. Computing it for every snapshot let
         // an unrepresentable boot instant refuse unrelated files such as
         // `/proc/uptime`.
-        let needs_boot_time = guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_needs_boot_time())?;
+        let needs_boot_time = detfd.procfs_needs_boot_time();
         let virtual_boot_time_seconds = needs_boot_time
             .then(|| self.calculate_procfs_boot_time())
             .transpose()?;
@@ -3261,9 +3476,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             std::path::Path::new("/dev/ptmx"),
             std::path::Path::new("/dev/pts/ptmx"),
         ]);
-        let needs_random_uuid = guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_needs_random_uuid())?;
+        let needs_random_uuid = detfd.procfs_needs_random_uuid();
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-955): Review deterministic kernel UUID generation.
         let random_uuid =
@@ -3281,9 +3494,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // BOTH COLUMNS, not just the inode. `determinize_stat` sanitizes
         // `st_dev` as well, so rewriting only the inode would leave the device
         // disagreeing -- the same defect with the reported symptom removed.
-        let needs_mapping_identities = guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_needs_mapping_identities())?;
+        let needs_mapping_identities = detfd.procfs_needs_mapping_identities();
         let mut mapping_identities: BTreeMap<(u64, u64), (u64, u64)> = BTreeMap::new();
         if needs_mapping_identities {
             // A mapping backed by stdio must report the SAME inode fdinfo
@@ -3353,10 +3564,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 mapping_identities.insert((raw_dev, raw_inode), (det_dev, det_inode.as_raw()));
             }
         }
-        let mountinfo = if guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_needs_mountinfo_identities())?
-        {
+        let mountinfo = if detfd.procfs_needs_mountinfo_identities() {
             let mut rows = crate::procfs::parse_mountinfo(&contents).ok_or_else(|| {
                 Error::Tool(anyhow::anyhow!(
                     "kernel returned malformed /proc/*/mountinfo"
@@ -3451,25 +3659,24 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
-        guest.thread_state().with_detfd(call.fd(), |detfd| {
-            detfd.initialize_procfs(
-                contents.clone(),
-                ProcfsSnapshotContext {
-                    mapping_identities: mapping_identities.clone(),
-                    mountinfo: mountinfo.clone(),
-                    virtual_uptime_seconds,
-                    virtual_boot_time_seconds,
-                    virtual_realtime_seconds,
-                    virtual_memory_kb,
-                    virtual_pid,
-                    virtual_ppid,
-                    virtual_pty_count,
-                    fdinfo_projection: fdinfo_projection.clone(),
-                    random_uuid,
-                },
-            );
-        })?;
-        Ok(())
+        detfd.initialize_procfs(
+            contents.clone(),
+            ProcfsSnapshotContext {
+                mapping_identities: mapping_identities.clone(),
+                mountinfo: mountinfo.clone(),
+                virtual_uptime_seconds,
+                virtual_boot_time_seconds,
+                virtual_realtime_seconds,
+                virtual_memory_kb,
+                virtual_pid,
+                virtual_ppid,
+                virtual_pty_count,
+                fdinfo_projection: fdinfo_projection.clone(),
+                fdinfo_mount_identity,
+                random_uuid,
+            },
+        );
+        Ok(true)
     }
 
     /// SYS_read system call (MAYHANG).
@@ -3513,36 +3720,39 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await;
         }
 
-        let (needs_procfs_snapshot, serves_procfs_snapshot) =
-            guest.thread_state().with_detfd(call.fd(), |detfd| {
-                (
-                    detfd.procfs_needs_snapshot(),
-                    detfd.procfs_serves_snapshot(),
-                )
-            })?;
-        if serves_procfs_snapshot {
-            validate_procfs_destination(
-                || crate::iovecs::UserAddressLimit::from_query(guest.user_address_limit()),
-                call.buf(),
-                call.len(),
-            )?;
-        }
-        if needs_procfs_snapshot {
-            self.initialize_procfs_snapshot(guest, call).await?;
-        }
-
-        // Like a seq_file read, advance the shared cursor only by the bytes
-        // actually copied: a read that faults before copying anything leaves
-        // it where it was.
-        let procfs_preview = guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.preview_procfs(call.len()))?;
-        if let Some((offset, bytes)) = procfs_preview {
-            let copied = copy_procfs_output(&mut guest.memory(), call.buf(), &bytes)?;
-            guest.thread_state().with_detfd(call.fd(), |detfd| {
-                detfd.commit_procfs_read(offset, copied);
-            })?;
-            return Ok(copied as i64);
+        if let Some(source) = guest.thread_state().capture_procfs_source(call.fd())? {
+            let result: Result<Option<i64>, Error> = async {
+                let detfd = source.descriptor();
+                if detfd.procfs_serves_snapshot() {
+                    validate_procfs_destination(
+                        || crate::iovecs::UserAddressLimit::from_query(guest.user_address_limit()),
+                        call.buf(),
+                        call.len(),
+                    )?;
+                }
+                if detfd.procfs_needs_snapshot() {
+                    if !self
+                        .initialize_procfs_snapshot(guest, call, &source)
+                        .await?
+                    {
+                        return Ok(None);
+                    }
+                }
+                if let Some((offset, bytes)) = detfd.preview_procfs(call.len()) {
+                    let copied = copy_procfs_output(&mut guest.memory(), call.buf(), &bytes)?;
+                    detfd.commit_procfs_read(offset, copied);
+                    Ok(Some(copied as i64))
+                } else {
+                    Ok(None)
+                }
+            }
+            .await;
+            if let Some(open_file_id) = guest.thread_state().abandon_captured_fd(source) {
+                self.release_port_for_open_file(guest, open_file_id).await;
+            }
+            if let Some(copied) = result? {
+                return Ok(copied);
+            }
         }
 
         let (fd_type, physically_nonblocking, logically_nonblocking, resource, random_device) =
@@ -3658,34 +3868,42 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let offset = usize::try_from(call.offset()).map_err(|_| Errno::EINVAL)?;
-        let (needs_procfs_snapshot, serves_procfs_snapshot) =
-            guest.thread_state().with_detfd(call.fd(), |detfd| {
-                (
-                    detfd.procfs_needs_snapshot(),
-                    detfd.procfs_serves_snapshot(),
-                )
-            })?;
-        if serves_procfs_snapshot {
-            validate_procfs_destination(
-                || crate::iovecs::UserAddressLimit::from_query(guest.user_address_limit()),
-                call.buf(),
-                call.len(),
-            )?;
-        }
-        if needs_procfs_snapshot {
-            let read = syscalls::Read::new()
-                .with_fd(call.fd())
-                .with_buf(call.buf())
-                .with_len(call.len());
-            self.initialize_procfs_snapshot(guest, read).await?;
-        }
-
-        let procfs_bytes = guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.take_procfs_at(offset, call.len()))?;
-        if let Some(bytes) = procfs_bytes {
-            let copied = copy_procfs_output(&mut guest.memory(), call.buf(), &bytes)?;
-            return Ok(copied as i64);
+        if let Some(source) = guest.thread_state().capture_procfs_source(call.fd())? {
+            let result: Result<Option<i64>, Error> = async {
+                let detfd = source.descriptor();
+                if detfd.procfs_serves_snapshot() {
+                    validate_procfs_destination(
+                        || crate::iovecs::UserAddressLimit::from_query(guest.user_address_limit()),
+                        call.buf(),
+                        call.len(),
+                    )?;
+                }
+                if detfd.procfs_needs_snapshot() {
+                    let read = syscalls::Read::new()
+                        .with_fd(call.fd())
+                        .with_buf(call.buf())
+                        .with_len(call.len());
+                    if !self
+                        .initialize_procfs_snapshot(guest, read, &source)
+                        .await?
+                    {
+                        return Ok(None);
+                    }
+                }
+                if let Some(bytes) = detfd.take_procfs_at(offset, call.len()) {
+                    let copied = copy_procfs_output(&mut guest.memory(), call.buf(), &bytes)?;
+                    Ok(Some(copied as i64))
+                } else {
+                    Ok(None)
+                }
+            }
+            .await;
+            if let Some(open_file_id) = guest.thread_state().abandon_captured_fd(source) {
+                self.release_port_for_open_file(guest, open_file_id).await;
+            }
+            if let Some(copied) = result? {
+                return Ok(copied);
+            }
         }
 
         let (fd_type, resource) = guest

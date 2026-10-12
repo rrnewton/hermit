@@ -75,6 +75,12 @@ pub(crate) enum ProcIdentityGap {
         primary: Box<ProcIdentityGap>,
         cleanup: Box<ProcCleanupObservation>,
     },
+    /// The raw drain completed. A private cleanup failure removes authority,
+    /// but is neither the guest read's errno nor a replacement for its bytes.
+    CleanupAfterSuccess {
+        returned_bytes: usize,
+        cleanup: Box<ProcCleanupObservation>,
+    },
 }
 
 impl ProcIdentityGap {
@@ -97,6 +103,22 @@ impl ProcIdentityGap {
             Error::Io(error) => Self::Io {
                 errno: error.raw_os_error(),
             },
+        }
+    }
+
+    /// Only a semantic private cleanup errno/refusal may leave completed raw
+    /// bytes available. Fact-hook, codec, ordering and Tool failures remain
+    /// fatal even when their nested cause contains a low-level IO errno.
+    pub(super) fn cleanup_preserves_completed_read(&self) -> bool {
+        match self {
+            Self::Errno(_) | Self::Io { errno: Some(_) } => true,
+            Self::BackendRefusal(refusal) => matches!(
+                &refusal.result,
+                ProcIdentityCallResult::Returned(_)
+                    | ProcIdentityCallResult::Errno(_)
+                    | ProcIdentityCallResult::Io { errno: Some(_) }
+            ),
+            _ => false,
         }
     }
 }
@@ -555,6 +577,13 @@ enum ProcIdentityOperation {
         fd: i32,
         len: u64,
     },
+    /// Append variants so all existing private-operation discriminants remain.
+    DuplicateSource {
+        fd: i32,
+    },
+    RewindSource {
+        fd: i32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -580,9 +609,9 @@ impl ProcIdentityOperation {
             }
             Self::Statx { .. } if returned == 0 => Ok(std::mem::size_of::<libc::statx>()),
             Self::Fstatfs { .. } if returned == 0 => Ok(std::mem::size_of::<libc::statfs>()),
-            Self::Close { .. } if returned == 0 => Ok(0),
+            Self::Close { .. } | Self::RewindSource { .. } if returned == 0 => Ok(0),
             Self::Getpid | Self::Gettid if (1..=i64::from(i32::MAX)).contains(&returned) => Ok(0),
-            Self::Getppid | Self::Openat { .. }
+            Self::Getppid | Self::Openat { .. } | Self::DuplicateSource { .. }
                 if (0..=i64::from(i32::MAX)).contains(&returned) =>
             {
                 Ok(0)
@@ -672,6 +701,13 @@ fn proc_identity_operation<G: Guest<T>, T: reverie::Tool>(
             None,
         ),
         Syscall::Close(call) => (ProcIdentityOperation::Close { fd: call.fd() }, None),
+        Syscall::Fcntl(call) if matches!(call.cmd(), F_DUPFD_CLOEXEC(0)) => (
+            ProcIdentityOperation::DuplicateSource { fd: call.fd() },
+            None,
+        ),
+        Syscall::Lseek(call) if call.offset() == 0 && call.whence() == Whence::SEEK_SET => {
+            (ProcIdentityOperation::RewindSource { fd: call.fd() }, None)
+        }
         Syscall::Statx(call) => (
             ProcIdentityOperation::Statx {
                 dirfd: call.dirfd(),
@@ -777,6 +813,48 @@ fn proc_identity_scratch_failure(
     }
 }
 
+pub(super) struct HeldFdinfoSnapshot {
+    pub(super) contents: Vec<u8>,
+    pub(super) cleanup: Option<ProcIdentityGap>,
+}
+
+fn finish_held_fdinfo_snapshot(
+    result: Result<Vec<u8>, ProcIdentityGap>,
+    cleanup: Result<i64, ProcIdentityGap>,
+) -> Result<HeldFdinfoSnapshot, ProcIdentityGap> {
+    let cleanup_observation = |error| ProcCleanupObservation {
+        resource: ProcTemporaryResource::ScratchMapping {
+            bytes: SCRATCH_BYTES as u64,
+        },
+        result: ProcIdentityFact::Unavailable(error),
+    };
+    match (result, cleanup) {
+        (Ok(contents), Ok(_)) => Ok(HeldFdinfoSnapshot {
+            contents,
+            cleanup: None,
+        }),
+        (Ok(contents), Err(error)) if error.cleanup_preserves_completed_read() => {
+            let returned_bytes = contents.len();
+            Ok(HeldFdinfoSnapshot {
+                contents,
+                cleanup: Some(ProcIdentityGap::CleanupAfterSuccess {
+                    returned_bytes,
+                    cleanup: Box::new(cleanup_observation(error)),
+                }),
+            })
+        }
+        (Ok(contents), Err(error)) => Err(ProcIdentityGap::CleanupAfterSuccess {
+            returned_bytes: contents.len(),
+            cleanup: Box::new(cleanup_observation(error)),
+        }),
+        (Err(primary), Ok(_)) => Err(primary),
+        (Err(primary), Err(cleanup)) => Err(ProcIdentityGap::Cleanup {
+            primary: Box::new(primary),
+            cleanup: Box::new(cleanup_observation(cleanup)),
+        }),
+    }
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     pub(super) async fn proc_identity_recorded<G: Guest<Self>, S: Into<Syscall>>(
         &self,
@@ -801,7 +879,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         tracing::trace!(target: "fdinfo_diagnostic", dtid = ?guest.thread_state().dettid,
             mm = ?guest.thread_state().mm_id, kind = 1, ?operation,
             "private fdinfo helper begin");
-        if matches!(operation, ProcIdentityOperation::Openat { .. }) && open_owner.is_none() {
+        if matches!(
+            operation,
+            ProcIdentityOperation::Openat { .. } | ProcIdentityOperation::DuplicateSource { .. }
+        ) && open_owner.is_none()
+        {
             return Err(ProcIdentityGap::Tool(
                 "private proc open has no resource owner".to_owned(),
             ));
@@ -809,7 +891,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let Some(recorded) = self
             .fdinfo_replay_capture_fact::<_, ProcIdentityOperationFact>(guest, 1)
             .await
-            .map_err(ProcIdentityGap::from_error)?
+            .map_err(|error| ProcIdentityGap::CaptureFact {
+                // The hook failed before any physical delegate was requested.
+                result: Box::new(Err(ProcIdentityGap::NotRequested)),
+                primary: Box::new(ProcIdentityGap::from_error(error)),
+            })?
         {
             recorded.validate(&operation).inspect_err(|error| {
                 tracing::trace!(target: "fdinfo_diagnostic", dtid = ?guest.thread_state().dettid,
@@ -995,6 +1081,103 @@ impl<T: RecordOrReplay> Detcore<T> {
                 result => return result,
             }
         }
+    }
+
+    /// Select the actual source OFD once. A physical success is registered in
+    /// `held` before any fact-hook failure; replay registers only a token.
+    pub(super) async fn hold_fdinfo_source<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: i32,
+        held: &mut Vec<i32>,
+    ) -> Result<i32, ProcIdentityGap> {
+        let returned = self
+            .proc_identity_recorded_operation(
+                guest,
+                syscalls::Fcntl::new()
+                    .with_fd(fd)
+                    .with_cmd(F_DUPFD_CLOEXEC(0))
+                    .into(),
+                Some(held),
+            )
+            .await?;
+        i32::try_from(returned)
+            .map_err(|_| ProcIdentityGap::Malformed(ProcIdentityParseError::InvalidSyscallReturn))
+    }
+
+    /// Close each owned hold once, including a success masked by a refusal or
+    /// fact failure. Do not retry Close on EINTR or inject replay token numbers.
+    pub(super) async fn close_fdinfo_source<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        held: &mut Vec<i32>,
+    ) -> Result<(), ProcIdentityGap> {
+        let mut failure = None;
+        while let Some(fd) = held.pop() {
+            if let Err(error) = self
+                .proc_identity_recorded(guest, syscalls::Close::new().with_fd(fd))
+                .await
+            {
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    /// Take the initial fdinfo bytes from the held source, never by looking up
+    /// the guest's slot again. Scratch belongs to this execution; each semantic
+    /// read and rewind remains in the existing private fact stream.
+    pub(super) async fn snapshot_held_fdinfo<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: i32,
+    ) -> Result<HeldFdinfoSnapshot, ProcIdentityGap> {
+        match self
+            .proc_identity_recorded(
+                guest,
+                syscalls::Lseek::new()
+                    .with_fd(fd)
+                    .with_offset(0)
+                    .with_whence(Whence::SEEK_SET),
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(ProcIdentityGap::Errno(errno)) if errno == libc::ESPIPE => {}
+            Err(error) => return Err(error),
+        }
+        let mapped = self
+            .proc_identity_inject_with_retry(
+                guest,
+                Syscall::Mmap(
+                    syscalls::Mmap::new()
+                        .with_addr(None)
+                        .with_len(SCRATCH_BYTES)
+                        .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+                        .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
+                        .with_fd(-1)
+                        .with_offset(0),
+                ),
+            )
+            .await?;
+        let address = usize::try_from(mapped).map_err(|_| {
+            ProcIdentityGap::Malformed(ProcIdentityParseError::InvalidSyscallReturn)
+        })?;
+        let result = match AddrMut::<u8>::from_raw(address) {
+            Some(buffer) => self.proc_identity_drain(guest, fd, buffer).await,
+            None => Err(ProcIdentityGap::Errno(libc::EFAULT)),
+        };
+        let cleanup = self
+            .proc_identity_inject_with_retry(
+                guest,
+                Syscall::Munmap(
+                    syscalls::Munmap::new()
+                        .with_addr(Addr::<u8>::from_raw(address))
+                        .with_len(SCRATCH_BYTES),
+                ),
+            )
+            .await;
+        finish_held_fdinfo_snapshot(result, cleanup)
     }
 
     async fn proc_identity_open<G: Guest<Self>>(
@@ -1518,6 +1701,30 @@ pub(crate) struct ProcFdinfoOpenSubjectRelation {
     pub process_incarnation: Option<(ProcRawObject, u64)>,
 }
 
+/// A positive self-source/proc/mount-view relation only. This deliberately
+/// supplies neither mounted-PID-namespace nor target FilesId/slot/OFD authority.
+/// It may normalize one raw mount number, never an inode, flags or cookies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ProcFdinfoMountSubjectRelation {
+    pub selector: ProcFdinfoSubjectSelector,
+    pub alias: ProcRawAliasName,
+    pub target_fd: i32,
+    pub opened_proc_file: ProcRawObject,
+    pub procfs_root: ProcRawObject,
+    pub target_directory: ProcRawObject,
+    pub target_start_ticks: u64,
+    pub caller_pid_namespace: ProcRawObject,
+    pub mount_namespace: ProcRawObject,
+}
+
+impl ProcFdinfoMountSubjectRelation {
+    pub(crate) fn matches_captured_mount_view(&self, order: &[u64]) -> bool {
+        self.procfs_root
+            .mount_id
+            .is_some_and(|id| id != 0 && order.contains(&id))
+    }
+}
+
 fn required_proc_fact<T>(fact: &ProcIdentityFact<T>) -> Result<&T, ProcIdentityGap> {
     match fact {
         ProcIdentityFact::Observed(value) => Ok(value),
@@ -1668,6 +1875,114 @@ impl ProcFdinfoOpenSubjectAcquisition {
                 .cleanup
                 .iter()
                 .all(|item| item.result == ProcIdentityFact::Observed(0))
+    }
+
+    /// Independently authenticate a current self/thread-self proc source and
+    /// its mount view. A denied mounted-PID-namespace probe remains denied;
+    /// this relation cannot authorize whole target projection or a foreign FD.
+    pub(crate) fn observed_mount_subject_relation(&self) -> Option<ProcFdinfoMountSubjectRelation> {
+        if self.source_local_fd < 0
+            || self.target_fd < 0
+            || !self.cleanup_complete()
+            || self.procfs_type.value() != Some(&PROC_SUPER_MAGIC)
+        {
+            return None;
+        }
+        let process = parse_process_alias(self.process_link_bytes.value()?).ok()?;
+        let task = parse_task_alias(self.task_link_bytes.value()?).ok()?;
+        let (pid, tid) = proc_view_self_ids(&self.process_link_bytes, &self.task_link_bytes);
+        if self.process_alias.value() != Some(&process) || self.task_alias.value() != Some(&task) {
+            return None;
+        }
+        let alias = match self.selector {
+            ProcFdinfoSubjectSelector::SelfProcess => process,
+            ProcFdinfoSubjectSelector::ThreadSelf => task,
+            ProcFdinfoSubjectSelector::Process { .. } | ProcFdinfoSubjectSelector::Task { .. } => {
+                return None;
+            }
+        };
+        if self.resolved_alias.value() != Some(&alias)
+            || resolve_fdinfo_subject(
+                self.selector,
+                &self.process_alias,
+                &self.task_alias,
+                &pid,
+                &tid,
+            )
+            .value()
+                != Some(&alias)
+        {
+            return None;
+        }
+        let root = *self.procfs_root.value()?;
+        let source = *self.source_object_before.value()?;
+        if root.mode & libc::S_IFMT != libc::S_IFDIR
+            || root.mount_id.is_none()
+            || source.mount_id != root.mount_id
+        {
+            return None;
+        }
+        for object in [
+            self.source_object_after.value()?,
+            self.path_object_before.value()?,
+            self.path_object_after.value()?,
+        ] {
+            if !same_observed_proc_object(source, *object, libc::S_IFREG) {
+                return None;
+            }
+        }
+        let directory = *self.target_before.directory.value()?;
+        if directory.mount_id != root.mount_id
+            || !same_observed_proc_object(
+                directory,
+                *self.target_after.directory.value()?,
+                libc::S_IFDIR,
+            )
+        {
+            return None;
+        }
+        let before = *self.target_before.stat.value()?;
+        let after = *self.target_after.stat.value()?;
+        let expected = match alias {
+            ProcRawAliasName::Process { pid } => pid,
+            ProcRawAliasName::Task { tid, .. } => tid,
+        };
+        if expected <= 0
+            || before.pid != expected
+            || after.pid != expected
+            || before.start_ticks != after.start_ticks
+            || parse_raw_proc_stat(self.target_before.stat_bytes.value()?).ok() != Some(before)
+            || parse_raw_proc_stat(self.target_after.stat_bytes.value()?).ok() != Some(after)
+        {
+            return None;
+        }
+        let caller_pid = *self.caller_pid_namespace_before.value()?;
+        let caller_mount = *self.caller_mount_namespace_before.value()?;
+        let target_pid = *self.target_before.pid_namespace.value()?;
+        let target_mount = *self.target_before.mount_namespace.value()?;
+        for (before, after) in [
+            (caller_pid, *self.caller_pid_namespace_after.value()?),
+            (caller_mount, *self.caller_mount_namespace_after.value()?),
+            (target_pid, *self.target_after.pid_namespace.value()?),
+            (target_mount, *self.target_after.mount_namespace.value()?),
+            (caller_pid, target_pid),
+            (caller_mount, target_mount),
+        ] {
+            if !same_observed_proc_object(before, after, libc::S_IFREG) {
+                return None;
+            }
+        }
+        Some(ProcFdinfoMountSubjectRelation {
+            selector: self.selector,
+            alias,
+            target_fd: self.target_fd,
+            opened_proc_file: source,
+            procfs_root: root,
+            target_directory: directory,
+            target_start_ticks: before.start_ticks,
+            caller_pid_namespace: caller_pid,
+            mount_namespace: caller_mount,
+        })
     }
 
     /// Integration calls acquisition at the actual proc-open seam and retains
@@ -2720,6 +3035,51 @@ mod tests {
     }
 
     #[test]
+    fn mount_subject_proves_self_view_without_claiming_missing_pid_or_target_authority() {
+        let mut valid = observed_open_subject();
+        valid.mounted_pid_namespace_before =
+            ProcIdentityFact::Unavailable(ProcIdentityGap::Errno(libc::EACCES));
+        valid.mounted_pid_namespace_after = valid.mounted_pid_namespace_before.clone();
+        assert_eq!(valid.observed_open_subject_relation(), None);
+        let relation = valid.observed_mount_subject_relation().unwrap();
+        assert!(relation.matches_captured_mount_view(&[8, 17]));
+        assert!(!relation.matches_captured_mount_view(&[17]));
+        assert_eq!(relation.opened_proc_file.inode, RawInode::new(9, 101));
+        assert_eq!(relation.target_start_ticks, 37);
+
+        let mut value = valid.clone();
+        value.selector = ProcFdinfoSubjectSelector::Task { pid: 17, tid: 19 };
+        assert_eq!(value.observed_mount_subject_relation(), None);
+        let mut value = valid.clone();
+        value.task_link_bytes = ProcIdentityFact::Observed(b"18/task/19".to_vec());
+        assert_eq!(value.observed_mount_subject_relation(), None);
+        let mut value = valid.clone();
+        value.source_object_after = ProcIdentityFact::Observed(ProcRawObject {
+            inode: RawInode::new(9, 102),
+            mode: libc::S_IFREG,
+            mount_id: Some(8),
+        });
+        assert_eq!(value.observed_mount_subject_relation(), None);
+        let mut value = valid.clone();
+        value.target_after.stat = ProcIdentityFact::Observed(ProcRawTaskStat {
+            pid: 19,
+            ppid: 1,
+            start_ticks: 38,
+        });
+        assert_eq!(value.observed_mount_subject_relation(), None);
+        let mut value = valid.clone();
+        value.caller_mount_namespace_after =
+            ProcIdentityFact::Unavailable(ProcIdentityGap::Errno(libc::EACCES));
+        assert_eq!(value.observed_mount_subject_relation(), None);
+        let mut value = valid;
+        value.cleanup.push(ProcCleanupObservation {
+            resource: ProcTemporaryResource::Descriptor(6),
+            result: ProcIdentityFact::Unavailable(ProcIdentityGap::Errno(libc::EIO)),
+        });
+        assert_eq!(value.observed_mount_subject_relation(), None);
+    }
+
+    #[test]
     fn private_fdinfo_operation_facts_preserve_full_buffers_and_refusals() {
         let operations = [
             (
@@ -2758,6 +3118,12 @@ mod tests {
                 0,
                 vec![0x5a; std::mem::size_of::<libc::statfs>()],
             ),
+            (
+                ProcIdentityOperation::DuplicateSource { fd: 7 },
+                9,
+                Vec::new(),
+            ),
+            (ProcIdentityOperation::RewindSource { fd: 9 }, 0, Vec::new()),
         ];
         for (operation, returned, bytes) in operations {
             let fact = ProcIdentityOperationFact {
@@ -2838,6 +3204,8 @@ mod tests {
                 mode: None,
             },
             ProcIdentityOperation::Close { fd: 9 },
+            ProcIdentityOperation::DuplicateSource { fd: 9 },
+            ProcIdentityOperation::RewindSource { fd: 9 },
         ] {
             assert!(matches!(
                 fact.validate(&changed),
@@ -2932,6 +3300,75 @@ mod tests {
                 }),
             };
             assert_eq!(gap.retry_interrupted(), retry);
+        }
+
+        let bytes = b"ino: 71\nmnt_id: 419\nopaque: \xff\n".to_vec();
+        let completed =
+            finish_held_fdinfo_snapshot(Ok(bytes.clone()), Err(ProcIdentityGap::Errno(libc::EIO)))
+                .unwrap();
+        assert_eq!(completed.contents, bytes);
+        let cleanup = completed.cleanup.unwrap();
+        assert!(matches!(&cleanup,
+            ProcIdentityGap::CleanupAfterSuccess { returned_bytes, cleanup }
+            if *returned_bytes == bytes.len()
+                && cleanup.result == ProcIdentityFact::Unavailable(ProcIdentityGap::Errno(libc::EIO))));
+        assert!(!cleanup.retry_interrupted());
+        assert!(matches!(cleanup.into_error(), Error::Tool(_)));
+        assert!(matches!(finish_held_fdinfo_snapshot(
+            Err(ProcIdentityGap::Errno(libc::EBADF)), Err(ProcIdentityGap::Errno(libc::EIO)),
+        ), Err(ProcIdentityGap::Cleanup { primary, cleanup })
+            if *primary == ProcIdentityGap::Errno(libc::EBADF)
+                && cleanup.result == ProcIdentityFact::Unavailable(ProcIdentityGap::Errno(libc::EIO))));
+
+        let semantic_refusal = ProcIdentityGap::BackendRefusal(ProcIdentityBackendRefusal {
+            operation: ProcIdentityUnsupportedOperation::NonLeaderExec,
+            errno: libc::EOPNOTSUPP,
+            diagnostic: "private cleanup refused".to_owned(),
+            result: ProcIdentityCallResult::Errno(libc::EOPNOTSUPP),
+        });
+        for semantic in [
+            ProcIdentityGap::Errno(libc::EIO),
+            ProcIdentityGap::Io {
+                errno: Some(libc::EIO),
+            },
+            semantic_refusal.clone(),
+        ] {
+            assert!(semantic.cleanup_preserves_completed_read());
+            let completed =
+                finish_held_fdinfo_snapshot(Ok(bytes.clone()), Err(semantic.clone())).unwrap();
+            assert_eq!(completed.contents, bytes);
+            assert!(matches!(completed.cleanup,
+                Some(ProcIdentityGap::CleanupAfterSuccess { returned_bytes, cleanup })
+                if returned_bytes == bytes.len()
+                    && cleanup.result == ProcIdentityFact::Unavailable(semantic)));
+        }
+        let mut failed_refusal = semantic_refusal;
+        if let ProcIdentityGap::BackendRefusal(refusal) = &mut failed_refusal {
+            refusal.result = ProcIdentityCallResult::Tool("replay hook failed".to_owned());
+        }
+        for fatal in [
+            primary,
+            ProcIdentityGap::CaptureFact {
+                result: Box::new(Err(ProcIdentityGap::NotRequested)),
+                primary: Box::new(ProcIdentityGap::Io {
+                    errno: Some(libc::EIO),
+                }),
+            },
+            ProcIdentityGap::Tool("replay kind mismatch".to_owned()),
+            ProcIdentityGap::Malformed(ProcIdentityParseError::InvalidSyscallReturn),
+            ProcIdentityGap::Io { errno: None },
+            failed_refusal,
+        ] {
+            assert!(!fatal.cleanup_preserves_completed_read());
+            let rejected = finish_held_fdinfo_snapshot(Ok(bytes.clone()), Err(fatal.clone()))
+                .err()
+                .unwrap();
+            assert!(matches!(&rejected,
+                ProcIdentityGap::CleanupAfterSuccess { returned_bytes, cleanup }
+                if *returned_bytes == bytes.len()
+                    && cleanup.result == ProcIdentityFact::Unavailable(fatal)));
+            assert!(!rejected.retry_interrupted());
+            assert!(matches!(rejected.into_error(), Error::Tool(_)));
         }
     }
 

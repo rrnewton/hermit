@@ -1061,6 +1061,16 @@ impl DetFd {
         self.with_description(|d| d.procfs.as_ref().and_then(ProcfsFile::fdinfo_open_subject))
     }
 
+    pub(crate) fn procfs_fdinfo_open_mount_subject(
+        &self,
+    ) -> Option<crate::syscalls::fdinfo_acquisition::ProcFdinfoMountSubjectRelation> {
+        self.with_description(|d| {
+            d.procfs
+                .as_ref()
+                .and_then(ProcfsFile::fdinfo_open_mount_subject)
+        })
+    }
+
     /// Update the cursor shared by every alias of a procfs open file.
     pub(crate) fn set_procfs_offset(&self, offset: usize) {
         self.with_description(|d| {

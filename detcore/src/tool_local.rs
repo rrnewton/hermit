@@ -182,6 +182,12 @@ pub(crate) struct CapturedDetFd {
     detfd: DetFd,
 }
 
+impl CapturedDetFd {
+    pub(crate) fn descriptor(&self) -> &DetFd {
+        &self.detfd
+    }
+}
+
 /// A captured descriptor could not be installed into the current descriptor
 /// table. The capture is returned so the caller can release any resource held
 /// alive solely by the in-flight operation.
@@ -1331,6 +1337,15 @@ impl FileMetadata {
         })
     }
 
+    fn procfs_source_still_named(&mut self, fd: RawFd, source: &CapturedDetFd) -> bool {
+        self.files_id == source.files_id
+            && self
+                .with_detfd(fd, |detfd| {
+                    detfd.open_file_id() == source.detfd.open_file_id()
+                })
+                .unwrap_or(false)
+    }
+
     /// Install a previously captured open-file description as `newfd`.
     ///
     /// Unlike [`Self::dup_fd`], this never resolves the source fd number again.
@@ -2172,6 +2187,76 @@ mod file_metadata_tests {
                 .expect("captured alias should be installed"),
             (source_id, true)
         );
+    }
+
+    #[test]
+    fn captured_procfs_snapshot_keeps_the_original_open_file_description() {
+        let owner = DetTid::from_raw(36);
+        let mut metadata = FileMetadata::new(owner);
+        metadata
+            .add_fd(owner, 3, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        metadata
+            .with_detfd(3, |fd| {
+                fd.set_procfs(
+                    crate::procfs::ProcfsFile::from_path(Path::new("/proc/self/fdinfo/7")).unwrap(),
+                )
+            })
+            .unwrap();
+        let captured = metadata.capture_fd(3).unwrap();
+        let original_id = captured.descriptor().open_file_id();
+        assert!(metadata.procfs_source_still_named(3, &captured));
+        assert_eq!(metadata.dup_fd(3, 4, OFlag::empty()).unwrap(), None);
+        assert_eq!(metadata.remove_fd(3), None);
+        metadata
+            .add_fd(owner, 3, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        metadata
+            .with_detfd(3, |fd| {
+                fd.set_procfs(
+                    crate::procfs::ProcfsFile::from_path(Path::new("/proc/self/fdinfo/8")).unwrap(),
+                )
+            })
+            .unwrap();
+        assert_ne!(
+            metadata.with_detfd(3, |fd| fd.open_file_id()).unwrap(),
+            original_id
+        );
+        assert!(!metadata.procfs_source_still_named(3, &captured));
+        assert!(metadata.procfs_source_still_named(4, &captured));
+        assert!(captured.descriptor().procfs_needs_snapshot());
+        assert_eq!(captured.descriptor().preview_procfs(128), None);
+
+        let raw = b"ino: 81\nmnt_id: 419\nflags: 0100002\n";
+        captured.descriptor().initialize_procfs(
+            raw.to_vec(),
+            crate::procfs::ProcfsSnapshotContext {
+                fdinfo_projection: Some(crate::procfs::FdinfoProjectionOutcome::Unavailable {
+                    reason: crate::fdinfo_projection::FdinfoProjectionGap::PartialView,
+                    acquisition: None,
+                }),
+                fdinfo_mount_identity: Some(crate::procfs::FdinfoMountIdentity {
+                    raw_mount_id: 419,
+                    canonical_mount_id: 1,
+                }),
+                ..Default::default()
+            },
+        );
+        let (offset, bytes) = captured.descriptor().preview_procfs(128).unwrap();
+        assert_eq!(bytes, b"ino: 81\nmnt_id: 1\nflags: 0100002\n");
+        captured.descriptor().commit_procfs_read(offset, 3);
+        assert_eq!(captured.descriptor().procfs_position().unwrap().0, 3);
+        assert!(
+            metadata
+                .with_detfd(3, |fd| fd.procfs_needs_snapshot())
+                .unwrap()
+        );
+        assert_eq!(
+            metadata.with_detfd(3, |fd| fd.preview_procfs(128)).unwrap(),
+            None
+        );
+        assert_eq!(metadata.remove_fd(4), None);
+        assert_eq!(metadata.abandon_captured_fd(captured), Some(original_id));
     }
 
     #[test]
@@ -3816,6 +3901,26 @@ impl<T> ThreadState<T> {
             metadata.discover_fd_from_current_process(self.dettid, fd)?;
         }
         metadata.with_detfd(fd, f)
+    }
+
+    /// Keep snapshot publication and the current read cursor on the source OFD
+    /// captured at syscall entry, including when its numeric slot is replaced.
+    pub(crate) fn capture_procfs_source(&self, fd: RawFd) -> Result<Option<CapturedDetFd>, Errno> {
+        let mut metadata = self.metadata();
+        if self.tool_shares_guest_descriptor_table {
+            metadata.discover_fd_from_current_process(self.dettid, fd)?;
+        }
+        if metadata.with_detfd(fd, |detfd| detfd.procfs_serves_snapshot())? {
+            metadata.capture_fd(fd).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// An endpoint check only. This does not certify an unobserved nonsequential
+    /// replace-and-restore interval and supplies no target-projection authority.
+    pub(crate) fn procfs_source_still_named(&self, fd: RawFd, source: &CapturedDetFd) -> bool {
+        self.metadata().procfs_source_still_named(fd, source)
     }
 
     /// Preserve logical blocking for scheduler-managed descriptors when exec

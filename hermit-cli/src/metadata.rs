@@ -347,7 +347,12 @@ impl RecordVersion {
 // without an event (https://github.com/rrnewton/hermit/issues/4147). An older
 // recording holds no event for such a call, so this replayer would
 // desynchronize at it.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x13c);
+// 0x13c -> 0x13d: independently authenticated self fdinfo mount numbering
+// can run when full target projection is unavailable. Its read-time kind4
+// observations, source-hold/rewind facts and the existing mount-ID RPC
+// now occur on that branch, so older
+// recording/replay streams cannot claim compatibility with this call order.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x13d);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -372,7 +377,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x13c);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x13c;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x13d;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
