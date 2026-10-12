@@ -139,12 +139,14 @@ fn copied_source_checks(case: &Path, original: &Path, runner: &mut Runner) -> Re
             .len(),
         6
     );
+    // The reviewed catalog's 14 entries include tool_region_keyed.rs; the
+    // separately authenticated qualifier makes 15 declared Reverie files.
     assert_eq!(
         observed["authority"]["reverie_inventory"]
             .as_array()
             .unwrap()
             .len(),
-        14
+        15
     );
     let alias = case.join("cargo-alias");
     let private_home = case.join("cargo-home");
@@ -236,7 +238,7 @@ fn gitless_standalone_compiler_sources() -> Result<()> {
     io(symlink(case.join("cargo-home"), case.join("cargo-alias")))?;
     // Change the child's environment only. Concurrent allocator workload tests
     // retain their original cache, and only this source check is re-executed.
-    runner.run(
+    if let Err(error) = runner.run(
         "env",
         &[
             format!("{CHILD_ROOT}={}", text(&case)?),
@@ -249,7 +251,13 @@ fn gitless_standalone_compiler_sources() -> Result<()> {
             "--test-threads=1".into(),
         ],
         &copied,
-    )?;
+    ) {
+        let retained = directory.keep();
+        return Err(format!(
+            "{error}; preserved source-copy fixture {}",
+            retained.display()
+        ));
+    }
     original_context.verify_unchanged(&mut runner)?;
     Ok(())
 }
