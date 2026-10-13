@@ -11757,7 +11757,13 @@ fn manifest_bucket_of(step: &Step) -> Option<(String, String)> {
                 i += 1;
             }
             // Tokens that change nothing about WHICH cells are selected.
-            "--allow-empty" | "--prebuilt" => i += 1,
+            // `--diagnostic-results` changes only the report's schema, so a
+            // diagnostic cell's failure is reported without failing the node;
+            // the compat bucket's selector ends with it. Left unmodelled, the
+            // compat node's 201 kvm cells were withheld on a host without KVM
+            // with no record against completeness
+            // (validate of main 17a5e44e96cb, selftest.validate_rs).
+            "--allow-empty" | "--prebuilt" | "--diagnostic-results" => i += 1,
             // How many cells run at once, never which: a bucket with `--jobs 1`
             // selects the same cells, and leaving it out would hide its
             // withheld cells from the accounting. The value must be a count.
@@ -16209,7 +16215,9 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
     }
 
     // INERT — selections whose bucket nodes cannot run kvm cells: KVM absence
-    // refuses nothing, and they carry no cell-level kvm need at all.
+    // refuses nothing, and they carry no cell-level kvm need at all. The compat
+    // bucket is no longer one: it has required kvm cells since 9b1a9f5c58 (201
+    // of them), so it is accounted with the other kvm-running buckets above.
     for (label, argv) in [
         (
             "hosted-portable profile",
@@ -16217,10 +16225,6 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
                 "--hosted-portable-only",
                 ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION,
             ],
-        ),
-        (
-            "--only portable e2e.manifest_compat",
-            vec!["--only", "portable", "e2e.manifest_compat"],
         ),
         (
             "--only portable e2e.manifest_bin_c",
