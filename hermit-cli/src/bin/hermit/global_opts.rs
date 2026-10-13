@@ -325,6 +325,23 @@ impl GlobalOpts {
         guard
     }
 
+    /// Install the DBT coordinator's diagnostics once, before its host workers.
+    ///
+    /// The guest runtime has its own subscriber and authenticated evidence
+    /// stream. Host events belong on host stderr; they must not enter that
+    /// stream or the verify adapter's comparison files. Reuse the ordinary
+    /// filter and log budget without opening a file, spawning a logger, or
+    /// reserving the generic initializer's PID slot. A conflicting process-wide
+    /// subscriber is an error rather than silently missing scheduler records.
+    #[cfg(feature = "dbt")]
+    pub(crate) fn init_dbt_host_tracing(&self) -> Result<(), Error> {
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        super::tracing::stderr_subscriber(self.log, self.log_budget())
+            .try_init()
+            .map_err(|error| anyhow::anyhow!("cannot initialize DBT host tracing: {error}"))
+    }
+
     fn install_tracing_for_backend(&self, backend: Backend) -> Option<TracingGuard> {
         if let Some(handle) = &self.log_file_handle {
             // Each subscriber needs an owned File; `try_clone` dups the descriptor,
@@ -402,6 +419,86 @@ mod tests {
             run_evidence_write_error: None,
             unsafe_ignore_host_seccomp: false,
             backend: None,
+        }
+    }
+
+    #[cfg(feature = "dbt")]
+    #[test]
+    fn dbt_host_tracing_reaches_workers_without_replacing_evidence_sinks() {
+        const CHILD: &str = "HERMIT_TEST_DBT_HOST_TRACING_CHILD_DIR";
+        if let Some(directory) = std::env::var_os(CHILD) {
+            let directory = PathBuf::from(directory);
+            let public_log = directory.join("public.log");
+            let evidence_log = directory.join("evidence.log");
+            let mut options = log_options(public_log.clone());
+            options.log = Some(LevelFilter::TRACE);
+            options.max_log_bytes = Some(64 * 1024);
+            options.prepare_log_budget().unwrap();
+            options.set_run_evidence_log_handle(
+                Arc::new(OpenOptions::new().write(true).open(&evidence_log).unwrap()),
+                WriteErrorLatch::new().unwrap(),
+            );
+            options.init_dbt_host_tracing().unwrap();
+            std::thread::spawn(|| {
+                ::tracing::info!("dbt-host-native-thread-info");
+                ::tracing::trace!("dbt-host-native-thread-trace");
+            })
+            .join()
+            .unwrap();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                tokio::spawn(async {
+                    ::tracing::info!("dbt-host-tokio-worker-info");
+                    ::tracing::trace!("dbt-host-tokio-worker-trace");
+                })
+                .await
+                .unwrap();
+            });
+            drop(runtime);
+            let error = options.init_dbt_host_tracing().unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("cannot initialize DBT host tracing")
+            );
+            ::tracing::info!("dbt-host-existing-subscriber-retained");
+            assert_eq!(std::fs::read(public_log).unwrap(), b"public log unchanged");
+            assert_eq!(std::fs::read(evidence_log).unwrap(), b"evidence unchanged");
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("public.log"), b"public log unchanged").unwrap();
+        std::fs::write(directory.path().join("evidence.log"), b"evidence unchanged").unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "global_opts::tests::dbt_host_tracing_reaches_workers_without_replacing_evidence_sinks",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, directory.path())
+            .env_remove("RUST_LOG")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "child output: {output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        for marker in [
+            "dbt-host-native-thread-info",
+            "dbt-host-native-thread-trace",
+            "dbt-host-tokio-worker-info",
+            "dbt-host-tokio-worker-trace",
+            "dbt-host-existing-subscriber-retained",
+        ] {
+            assert_eq!(
+                stderr.lines().filter(|line| line.contains(marker)).count(),
+                1,
+                "{stderr}"
+            );
         }
     }
 

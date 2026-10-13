@@ -5675,6 +5675,11 @@ impl RunOpts {
             | Backend::Kvm
             | Backend::E9patch => {}
             Backend::Dbt => {
+                // This early-return path never reaches run_in_container's
+                // tracing initializer. Install one process-wide host subscriber
+                // before DbtExecution starts its isolation and Tokio workers.
+                #[cfg(feature = "dbt")]
+                global.init_dbt_host_tracing()?;
                 let environment = self.guest_command()?.get_captured_envs();
                 // Keep the dedicated DynamoRIO launcher, but give it the same
                 // backend capability configuration as the public library path.
