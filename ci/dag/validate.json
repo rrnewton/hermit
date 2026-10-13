@@ -6958,6 +6958,13 @@
           "category": "c-programs",
           "test": "c-programs/proc-fd-link-aliases",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/proc-fd-link-aliases",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -10403,6 +10410,13 @@
           "test": "c-programs/thp-disable",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/thread-self-procfs-handoff",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -49872,6 +49886,13 @@
           "category": "c-programs",
           "test": "c-programs/proc-fd-link-aliases",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/proc-fd-link-aliases",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -53317,6 +53338,13 @@
           "test": "c-programs/thp-disable",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/thread-self-procfs-handoff",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
