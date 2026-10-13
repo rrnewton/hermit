@@ -1452,13 +1452,13 @@ fi
 # threshold and the 16-job clamp. These local samples do not replace the
 # original n=3 hosted calibration or satisfy the >=5-sample replacement rule;
 # fresh validation is required.
-# CARRY TO 66b494165d9df650f46c3a00bb013c6a89c66c98 (2026-10-12): from
+# CARRY TO 42adb396e00c7788a1c133e4616608fafda193cf (2026-10-12): from
 # ab8cd5171e502e0332a9b3b0a536c12438670995 via Reverie main 101f504b2e5b,
-# whose tree equals ab8cd517. The two added commits change only
-# reverie-kvm/src (FIONBIO and personality); the DynamoRIO SDK recipe inputs,
+# whose tree equals ab8cd517. Every later commit on this pin changes only
+# reverie-kvm/; the DynamoRIO SDK recipe inputs,
 # build.rs and vendor tree are unchanged, so the recorded calibration, the
 # 16-job clamp and the 1050/572 job-second budgets carry over unmeasured.
-expected_pin=66b494165d9df650f46c3a00bb013c6a89c66c98
+expected_pin=42adb396e00c7788a1c133e4616608fafda193cf
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
