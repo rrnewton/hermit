@@ -1476,7 +1476,14 @@ fi
 # recipe input: build.rs, the vendored DynamoRIO tree, third-party/, the root
 # Cargo.toml and rust-toolchain.toml are unchanged. The two fixtures raise the
 # reverie-dbt inventory from 947 to 949. No new timing sample is claimed.
-expected_pin=48e78557804772b7e0d2f988504ca9ae2ab6115c
+# SHARED RPC CLIENT SDK-BUDGET CARRY (2026-10-13): advance from 48e785578 to
+# 5b1d34acda3428532fae750983a9abaabcfd6112. This changes Rust RPC clients,
+# codec helpers and tests. SDK recipe inputs, build.rs, vendored DynamoRIO,
+# native client sources, root Cargo.toml and rust-toolchain.toml are unchanged.
+# With unchanged CMAKE, generator and normalized SOURCE_DATE_EPOCH, preserve
+# the existing SDK job and time budgets. No new timing sample or runtime
+# validation is claimed. Rust runtime artifacts must be rebuilt.
+expected_pin=5b1d34acda3428532fae750983a9abaabcfd6112
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
