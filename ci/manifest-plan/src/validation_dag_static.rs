@@ -6196,8 +6196,9 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         engine_only: false,
         timeout: 900,
         cpu_timeout: 2400,
-        jobs_flag: None,
-        jobs_env: None,
+        // Keep inherited-terminal tests serial without appending a second -j.
+        jobs_flag: Some(r########""########),
+        jobs_env: Some(r########"CARGO_BUILD_JOBS"########),
     },
     StaticStepSpec {
         group: r########"test"########,

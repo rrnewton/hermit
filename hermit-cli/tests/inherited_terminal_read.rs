@@ -30,6 +30,17 @@ enum Backend {
     Dbt,
 }
 
+struct OwnedChild(std::process::Child);
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        // Also reap the bounded launcher if controller setup or an assertion
+        // unwinds. The maintained containing step owns descendant cleanup.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn raw_terminal() -> (fs::File, fs::File) {
     let (mut master, mut slave) = (-1, -1);
     assert_eq!(
@@ -187,14 +198,16 @@ fn run_guest(backend: Backend, mode: &str, prefix: &str, guest_source: &str) {
     let (mut input, terminal) = raw_terminal();
     nonblocking(input.as_raw_fd());
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut child = command
-        .stdin(Stdio::from(terminal))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("launch bounded guest");
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
+    let mut child = OwnedChild(
+        command
+            .stdin(Stdio::from(terminal))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("launch bounded guest"),
+    );
+    let mut stdout = child.0.stdout.take().unwrap();
+    let mut stderr = child.0.stderr.take().unwrap();
     nonblocking(stdout.as_raw_fd());
     nonblocking(stderr.as_raw_fd());
     let mut out = Stream::new(&root.join("guest.stdout"));
@@ -207,7 +220,7 @@ fn run_guest(backend: Backend, mode: &str, prefix: &str, guest_source: &str) {
     let mut drain_until = None;
     loop {
         if status.is_none() {
-            status = child.try_wait().expect("observe bounded guest status");
+            status = child.0.try_wait().expect("observe bounded guest status");
             if status.is_some() {
                 drain_until = Some(Instant::now() + Duration::from_secs(1));
             }
@@ -263,6 +276,7 @@ fn run_guest(backend: Backend, mode: &str, prefix: &str, guest_source: &str) {
     }
     drop(input);
     let status = status.expect("bounded launcher was reaped");
+    assert_eq!(child.0.wait().expect("reap bounded guest"), status);
     fs::write(root.join("status.txt"), format!("status={status}\ninput_sent={input_sent}\ncontroller_error={controller_error:?}\nstdout_eof={} stdout_error={:?}\nstderr_eof={} stderr_error={:?}\n", out.eof, out.error, err.eof, err.error)).unwrap();
     assert!(
         status.success(),

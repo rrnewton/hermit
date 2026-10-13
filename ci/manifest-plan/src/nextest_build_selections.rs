@@ -938,6 +938,15 @@ mod tests {
             .find(|step| step.tag() == "test.inherited_terminal_read")
             .unwrap();
         assert_command_selection(terminal).unwrap();
+        assert_eq!(
+            dagrun::model::command_with_inner_jobs(terminal, "-j", Some(8)),
+            terminal.cmd,
+            "the eight-CPU terminal node must preserve its single -j 1 argument"
+        );
+        assert_eq!(
+            dagrun::model::env_with_inner_jobs(terminal, "", Some(8)),
+            Some(("CARGO_BUILD_JOBS".into(), "8".into()))
+        );
         let terminal_selection: Vec<String> =
             serde_json::from_str(&terminal.env[SELECTION_ENV]).unwrap();
         assert_eq!(
