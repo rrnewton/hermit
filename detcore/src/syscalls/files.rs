@@ -2941,6 +2941,43 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Resolve the actual task's mount view for both scalar source proof and
+    /// ordinary mount-ID assignment. The public recording API learns this view
+    /// only after child setup; replay uses its completed recorded provenance.
+    fn fdinfo_mount_view<G: Guest<Self>>(&self, guest: &G) -> Result<Vec<u64>, Error> {
+        if guest.config().mountinfo_mount_ids_captured {
+            return Ok(guest.config().mountinfo_mount_ids.clone());
+        }
+        // Public non-container callers have no pre-captured provenance.
+        // Mount/unshare/setns are refused once Detcore starts, so a
+        // tracer-side snapshot of this task's namespace is immutable.
+        let mountinfo_path = format!("/proc/{}/mountinfo", guest.pid().as_raw());
+        let mountinfo_contents = std::fs::read(&mountinfo_path).map_err(|error| {
+            Error::Tool(anyhow::anyhow!(
+                "failed to read {mountinfo_path} while validating fdinfo mnt_id: {error}"
+            ))
+        })?;
+        // Same guest mount model as the mountinfo capture path:
+        // ephemeral host seed rows are not guest namespace members
+        // and must not shift run-global mount-ID assignment.
+        let mountinfo_contents =
+            crate::procfs::exclude_ephemeral_host_seed_mounts(&mountinfo_contents);
+        let mountinfo_rows =
+            crate::procfs::parse_mountinfo(&mountinfo_contents).ok_or_else(|| {
+                Error::Tool(anyhow::anyhow!(
+                    "kernel returned malformed {mountinfo_path} while validating fdinfo mnt_id"
+                ))
+            })?;
+        let snapshot =
+            MountInfoSnapshot::new(mountinfo_rows, &[], false, BTreeMap::new(), BTreeMap::new())
+                .ok_or_else(|| {
+                    Error::Tool(anyhow::anyhow!(
+                        "{mountinfo_path} failed strict identity validation for fdinfo"
+                    ))
+                })?;
+        Ok(snapshot.raw_mount_id_order())
+    }
+
     async fn fdinfo_mount_id<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2955,53 +2992,22 @@ impl<T: RecordOrReplay> Detcore<T> {
             // equivalence on the observed value, not our descriptor type.
             0
         } else if !has_configured_mount_ids {
-            // Public non-container callers have no pre-captured provenance.
-            // Mount/unshare/setns are refused once Detcore starts, so a
-            // tracer-side snapshot of this task's namespace is immutable.
-            let mountinfo_path = format!("/proc/{}/mountinfo", guest.pid().as_raw());
-            let mountinfo_contents = std::fs::read(&mountinfo_path).map_err(|error| {
-                Error::Tool(anyhow::anyhow!(
-                    "failed to read {mountinfo_path} while validating fdinfo mnt_id: {error}"
-                ))
-            })?;
-            // Same guest mount model as the mountinfo capture path:
-            // ephemeral host seed rows are not guest namespace members
-            // and must not shift run-global mount-ID assignment.
-            let mountinfo_contents =
-                crate::procfs::exclude_ephemeral_host_seed_mounts(&mountinfo_contents);
-            let mountinfo_rows =
-                crate::procfs::parse_mountinfo(&mountinfo_contents).ok_or_else(|| {
+            let mountinfo_order = self.fdinfo_mount_view(guest)?;
+            determinize_mount_id(guest, raw_mount_id, Some(mountinfo_order))
+                .await
+                .ok_or_else(|| {
                     Error::Tool(anyhow::anyhow!(
-                        "kernel returned malformed {mountinfo_path} while validating fdinfo mnt_id"
+                        "mountinfo mount-ID order changed after the identity snapshot while resolving fdinfo mnt_id {raw_mount_id} for fdinfo target"
                     ))
-                })?;
-            let snapshot = MountInfoSnapshot::new(
-                mountinfo_rows,
-                &[],
-                false,
-                BTreeMap::new(),
-                BTreeMap::new(),
-            )
-            .ok_or_else(|| {
-                Error::Tool(anyhow::anyhow!(
-                    "{mountinfo_path} failed strict identity validation for fdinfo"
-                ))
-            })?;
-            determinize_mount_id(guest, raw_mount_id, Some(snapshot.raw_mount_id_order()))
-                    .await
-                    .ok_or_else(|| {
-                        Error::Tool(anyhow::anyhow!(
-                            "mountinfo mount-ID order changed after the identity snapshot while resolving fdinfo mnt_id {raw_mount_id} for fdinfo target from {mountinfo_path}"
-                        ))
-                    })?
+                })?
         } else {
             determinize_mount_id(guest, raw_mount_id, None)
-                    .await
-                    .ok_or_else(|| {
-                        Error::Tool(anyhow::anyhow!(
-                            "recorded mount identity provenance was invalid while resolving fdinfo mnt_id {raw_mount_id} for fdinfo target"
-                        ))
-                    })?
+                .await
+                .ok_or_else(|| {
+                    Error::Tool(anyhow::anyhow!(
+                        "recorded mount identity provenance was invalid while resolving fdinfo mnt_id {raw_mount_id} for fdinfo target"
+                    ))
+                })?
         };
         Ok(virtual_mount_id)
     }
@@ -3223,10 +3229,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                             };
                             (current, path, stat, None)
                         } else if control.is_err()
-                            && guest.config().mountinfo_mount_ids_captured
                             && let Some(opened) = opened_mount
-                            && opened
-                                .matches_captured_mount_view(&guest.config().mountinfo_mount_ids)
+                            && let Ok(mount_view) = self.fdinfo_mount_view(guest)
+                            && opened.matches_mount_view(&mount_view)
                             && guest
                                 .thread_state()
                                 .procfs_source_still_named(call.fd(), source)
@@ -9006,6 +9011,7 @@ mod procfs_wiring_guard {
         let body = handler_body("initialize_procfs_snapshot");
         let projection = handler_body("project_fdinfo_snapshot");
         let mount_ids = handler_body("fdinfo_mount_id");
+        let mount_view = handler_body("fdinfo_mount_view");
         // Rustfmt may place the receiver and method on separate lines. Bind
         // the same two helper calls independently of that whitespace; the
         // filter counts and capture-before-parse checks below stay literal.
@@ -9013,14 +9019,17 @@ mod procfs_wiring_guard {
         let projection_calls = projection.split_whitespace().collect::<String>();
         assert!(body_calls.contains("self.project_fdinfo_snapshot("));
         assert!(projection_calls.contains("self.fdinfo_mount_id("));
+        let mount_id_calls = mount_ids.split_whitespace().collect::<String>();
+        assert!(body_calls.contains("self.fdinfo_mount_view(guest)"));
+        assert!(mount_id_calls.contains("self.fdinfo_mount_view(guest)"));
         let calls = body.matches("exclude_ephemeral_host_seed_mounts(").count()
-            + mount_ids
+            + mount_view
                 .matches("exclude_ephemeral_host_seed_mounts(")
                 .count();
         assert_eq!(
             calls, 2,
             "MISSING MECHANISM: initialize_procfs_snapshot and its fdinfo_mount_id \
-             helper must call exclude_ephemeral_host_seed_mounts exactly twice \
+             mount-view helper must call exclude_ephemeral_host_seed_mounts exactly twice \
              (the guest mountinfo capture and the fdinfo mnt_id capture); found {calls}. Without it, \
              unrelated host squashfuse seed mounts make /proc/<pid>/mountinfo and \
              fdinfo mount IDs depend on host timing."
@@ -9041,13 +9050,13 @@ mod procfs_wiring_guard {
              the files that carry mountinfo identities (`let contents = if ... \
              procfs_needs_mountinfo_identities()`); found {gate:?}"
         );
-        let fdinfo_capture = mount_ids
+        let fdinfo_capture = mount_view
             .find("exclude_ephemeral_host_seed_mounts(&mountinfo_contents)")
             .expect(
                 "MISSING MECHANISM: the fdinfo mnt_id capture (`mountinfo_contents`) is \
                  no longer filtered for host seed mounts",
             );
-        let parse = mount_ids
+        let parse = mount_view
             .find("parse_mountinfo(&mountinfo_contents)")
             .expect("the fdinfo mnt_id capture no longer parses mountinfo_contents");
         assert!(

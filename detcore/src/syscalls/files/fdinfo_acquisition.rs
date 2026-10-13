@@ -1718,7 +1718,7 @@ pub(crate) struct ProcFdinfoMountSubjectRelation {
 }
 
 impl ProcFdinfoMountSubjectRelation {
-    pub(crate) fn matches_captured_mount_view(&self, order: &[u64]) -> bool {
+    pub(crate) fn matches_mount_view(&self, order: &[u64]) -> bool {
         self.procfs_root
             .mount_id
             .is_some_and(|id| id != 0 && order.contains(&id))
@@ -3042,8 +3042,24 @@ mod tests {
         valid.mounted_pid_namespace_after = valid.mounted_pid_namespace_before.clone();
         assert_eq!(valid.observed_open_subject_relation(), None);
         let relation = valid.observed_mount_subject_relation().unwrap();
-        assert!(relation.matches_captured_mount_view(&[8, 17]));
-        assert!(!relation.matches_captured_mount_view(&[17]));
+        assert!(relation.matches_mount_view(&[8, 17]));
+        assert!(!relation.matches_mount_view(&[17]));
+        // Runtime provenance is a strictly parsed view of the same task, not
+        // a requirement that the caller supplied mount IDs before launch.
+        let rows = crate::procfs::parse_mountinfo(
+            b"17 17 8:1 / / rw - ext4 /dev/root rw\n8 17 0:8 / /proc rw - proc proc rw\n",
+        )
+        .unwrap();
+        let runtime_view =
+            MountInfoSnapshot::new(rows, &[], false, BTreeMap::new(), BTreeMap::new()).unwrap();
+        assert!(relation.matches_mount_view(&runtime_view.raw_mount_id_order()));
+        assert!(!relation.matches_mount_view(&[]));
+        let mut missing_root = relation;
+        missing_root.procfs_root.mount_id = None;
+        assert!(!missing_root.matches_mount_view(&runtime_view.raw_mount_id_order()));
+        let mut zero_root = relation;
+        zero_root.procfs_root.mount_id = Some(0);
+        assert!(!zero_root.matches_mount_view(&runtime_view.raw_mount_id_order()));
         assert_eq!(relation.opened_proc_file.inode, RawInode::new(9, 101));
         assert_eq!(relation.target_start_ticks, 37);
 

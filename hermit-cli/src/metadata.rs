@@ -356,7 +356,10 @@ impl RecordVersion {
 // SourceChoice/Observation phases of kind6 and a separately scoped kind5
 // result. Older streams have neither the complete-snapshot/cleanup facts nor
 // that authority scope and cannot be replayed under the new call order.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x13e);
+// 0x13e -> 0x13f: uncaptured public recordings now authenticate the runtime
+// proc mount view and emit the same held-source scalar capture facts as replay.
+// Older streams lack that private capture sequence and must be refused.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x13f);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -381,7 +384,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x13e);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x13e;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x13f;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
