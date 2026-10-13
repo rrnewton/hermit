@@ -2858,7 +2858,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run_kvm_a_parked_sleep_carries_the_deadline_cap
     // (https://github.com/rrnewton/hermit/issues/4156) retains all 56:
     // 56 + 1 = 57, of which 56 are run_kvm_ tests.
-    ("privileged-test.cli_kvm", 57),
+    // And run_kvm_a_signal_to_a_guest_blocked_in_a_polled_call_acts_as_on_linux: 58.
+    ("privileged-test.cli_kvm", 58),
     // The same three https://github.com/rrnewton/hermit/issues/3260 tests as
     // test.cli; all 99 prior identities retained. The same
     // https://github.com/rrnewton/hermit/pull/3547 version test as test.cli
@@ -3029,7 +3030,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
     // (https://github.com/rrnewton/hermit/issues/4030) retains all 55: 56.
     // And run_kvm_a_parked_sleep_carries_the_deadline_cap: 57.
-    ("privileged-only-test.cli_kvm", 57),
+    // And run_kvm_a_signal_to_a_guest_blocked_in_a_polled_call_acts_as_on_linux: 58.
+    ("privileged-only-test.cli_kvm", 58),
     ("privileged-only-test.pmu_buck_chaos_cases_on_host", 6),
     // And the KVM unreadable futex word test: 56.
     // And run_kvm_a_parked_sleep_carries_the_deadline_cap: 57.
