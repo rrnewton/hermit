@@ -2717,7 +2717,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4160): 324.
     // And cpu_directory_reads_list_only_cpu0_on_every_path
     // (https://github.com/rrnewton/hermit/issues/4160): 325.
-    ("test.cli", 325),
+    // a_cross_process_sigkill_verifies_at_bitwise_parity split into three
+    // tests, same modes (https://github.com/rrnewton/hermit/issues/4220): 327.
+    ("test.cli", 327),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2983,7 +2985,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // So does the own-copy mark refusal test: 259.
     // Nor does the kernel_max affinity test: 260.
     // Nor does the CPU directory reads test: 261.
-    ("test.cli_on_host", 261),
+    // And the cross-process SIGKILL parity test split into three: 263.
+    ("test.cli_on_host", 263),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
