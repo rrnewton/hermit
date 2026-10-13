@@ -1494,8 +1494,14 @@ fi
 # Preserve SDK key, inventory 941, the 16-job clamp and 1050/572-job-second
 # budgets. This carries the SDK budget only; runtime qualification, test and
 # timing evidence must be measured anew.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 19cdd8f59d2c69621f42b789169b0907e68f7144 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 19cdd8f59d2c69621f42b789169b0907e68f7144 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CURRENT-ACTOR FDINFO PREREQUISITE PIN CARRY (2026-10-12):
+# 19cdd8f59d2c69621f42b789169b0907e68f7144 -> a19ca54fb9cc144cf72d76ebbba2a730004cb9a7.
+# The seven native SDK inputs remain Git-object equal. Retain SDK inventory
+# 941, the existing recipe key, 16-job clamp and 1050/572-job-second budgets.
+# Only the build budget carries; current compilation/runtime and public pin
+# acceptance remain separate from this local unpublished prerequisite.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a19ca54fb9cc144cf72d76ebbba2a730004cb9a7 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a19ca54fb9cc144cf72d76ebbba2a730004cb9a7 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

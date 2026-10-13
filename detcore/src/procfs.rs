@@ -460,6 +460,13 @@ pub(crate) struct FdinfoIdentity {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum FdinfoProjectionOutcome {
     Projected(FdinfoIdentity),
+    /// Current represented ordinary object only. This carries no physical
+    /// proc subject, alias, namespace or original-parent authority.
+    CurrentActor {
+        identity: FdinfoIdentity,
+        target: Box<crate::fdinfo_projection::FdinfoCapturedCurrentTarget>,
+        logical_open_file: crate::types::OpenFileId,
+    },
     Unavailable {
         reason: FdinfoProjectionGap,
         acquisition: Option<ProcIdentityGap>,
@@ -1223,7 +1230,8 @@ impl ProcfsFile {
             ProcfsKind::PtyNr => sanitize_pty_nr(&contents, virtual_pty_count),
             ProcfsKind::SelfSched => sanitize_self_sched(&contents),
             ProcfsKind::Fdinfo => match fdinfo_projection {
-                Some(FdinfoProjectionOutcome::Projected(identity)) => {
+                Some(FdinfoProjectionOutcome::Projected(identity))
+                | Some(FdinfoProjectionOutcome::CurrentActor { identity, .. }) => {
                     sanitize_fdinfo(&contents, Some(identity))
                 }
                 Some(FdinfoProjectionOutcome::Unavailable { .. }) => match fdinfo_mount_identity {

@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 
+use reverie::SignalTaskIdentity;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -224,6 +225,18 @@ pub(crate) enum FdinfoControlOperation {
         object: FdinfoRawObject,
         relation: Option<ProcFdinfoOpenSubjectRelation>,
     },
+    BeginCurrent {
+        files: FilesId,
+        source_fd: crate::types::RawFd,
+        source: crate::types::OpenFileId,
+        target_fd: crate::types::RawFd,
+        actor: SignalTaskIdentity,
+    },
+    FinishCurrent {
+        capture: u64,
+        object: FdinfoRawObject,
+        actor: SignalTaskIdentity,
+    },
     CancelCapture {
         capture: u64,
     },
@@ -239,7 +252,34 @@ pub(crate) enum FdinfoControlValue {
     Bound,
     Capture(u64),
     Captured(FdinfoCapturedAuthority),
+    CapturedCurrent(FdinfoCapturedCurrentAuthority),
     Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FdinfoCapturedCurrentAuthority {
+    pub target: Box<FdinfoCapturedCurrentTarget>,
+    pub logical_open_file: crate::types::OpenFileId,
+}
+
+/// Supplied only from the scheduler's existing registered actor/MM lookup.
+/// This is not a wire type and a decoded request cannot mint it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FdinfoRegisteredActor {
+    incarnation: FdinfoIncarnation,
+    identity: SignalTaskIdentity,
+}
+
+impl FdinfoRegisteredActor {
+    pub(crate) fn after_registered_lookup(
+        incarnation: FdinfoIncarnation,
+        identity: SignalTaskIdentity,
+    ) -> Self {
+        Self {
+            incarnation,
+            identity,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,6 +303,10 @@ enum OpenedSubject {
 enum CurrentCaptureKind {
     Managed(FdinfoCurrentSlotCapture),
     OriginalParent(ProcFdinfoOpenSubjectRelation),
+    Represented {
+        token: FdinfoAdmittedSlotCapture,
+        actor: SignalTaskIdentity,
+    },
 }
 
 #[derive(Debug)]
@@ -335,7 +379,17 @@ impl FdinfoRpcState {
         control: FdinfoControl,
     ) -> FdinfoControlReply {
         FdinfoControlReply {
-            result: self.control(incarnation, control.operation),
+            result: self.control(incarnation, control.operation, None),
+        }
+    }
+
+    pub(crate) fn control_current_admitted(
+        &mut self,
+        registered: FdinfoRegisteredActor,
+        control: FdinfoControl,
+    ) -> FdinfoControlReply {
+        FdinfoControlReply {
+            result: self.control(registered.incarnation, control.operation, Some(registered)),
         }
     }
 
@@ -362,6 +416,7 @@ impl FdinfoRpcState {
         &mut self,
         incarnation: FdinfoIncarnation,
         control: FdinfoControlOperation,
+        registered: Option<FdinfoRegisteredActor>,
     ) -> Result<FdinfoControlValue, FdinfoProjectionGap> {
         let admission = self
             .admission(incarnation)
@@ -460,8 +515,83 @@ impl FdinfoRpcState {
                         }
                         FdinfoCapturedAuthority::OriginalParent
                     }
+                    CurrentCaptureKind::Represented { .. } => {
+                        return Err(FdinfoProjectionGap::RejectedUpdate);
+                    }
                 };
                 Ok(FdinfoControlValue::Captured(authority))
+            }
+            FdinfoControlOperation::BeginCurrent {
+                files,
+                source_fd,
+                source,
+                target_fd,
+                actor,
+            } => {
+                let registered = registered.ok_or(FdinfoProjectionGap::RejectedUpdate)?;
+                if registered.identity != actor {
+                    return Err(FdinfoProjectionGap::RejectedUpdate);
+                }
+                owns_source(&self.cache, source)?;
+                let token = self
+                    .cache
+                    .capture_admitted_slot_token(admission, files, source_fd, source, target_fd)?;
+                self.captures
+                    .retain(|_, capture| capture.owner != incarnation);
+                let key = self
+                    .next_capture
+                    .checked_add(1)
+                    .ok_or(FdinfoProjectionGap::RejectedUpdate)?;
+                self.next_capture = key;
+                self.captures.insert(
+                    key,
+                    CurrentCapture {
+                        owner: incarnation,
+                        source,
+                        kind: CurrentCaptureKind::Represented { token, actor },
+                    },
+                );
+                Ok(FdinfoControlValue::Capture(key))
+            }
+            FdinfoControlOperation::FinishCurrent {
+                capture,
+                object,
+                actor,
+            } => {
+                let registered = registered.ok_or(FdinfoProjectionGap::RejectedUpdate)?;
+                if registered.identity != actor {
+                    return Err(FdinfoProjectionGap::RejectedUpdate);
+                }
+                let current = self
+                    .captures
+                    .get(&capture)
+                    .filter(|capture| capture.owner == incarnation)
+                    .ok_or(FdinfoProjectionGap::RejectedUpdate)?;
+                owns_source(&self.cache, current.source)?;
+                if !matches!(&current.kind,
+                    CurrentCaptureKind::Represented { actor: issuing, .. } if *issuing == actor)
+                {
+                    return Err(FdinfoProjectionGap::RejectedUpdate);
+                }
+                let current = self
+                    .captures
+                    .remove(&capture)
+                    .expect("validated current capture");
+                let CurrentCaptureKind::Represented { token, .. } = current.kind else {
+                    unreachable!("validated represented capture");
+                };
+                let target = self.cache.capture_admitted_slot_object(token, object)?;
+                let logical_open_file = self
+                    .logical_ids
+                    .get(&target.ofd.open_file)
+                    .copied()
+                    .unwrap_or(target.ofd.open_file);
+                Ok(FdinfoControlValue::CapturedCurrent(
+                    FdinfoCapturedCurrentAuthority {
+                        target: Box::new(target),
+                        logical_open_file,
+                    },
+                ))
             }
             FdinfoControlOperation::CancelCapture { capture } => {
                 if !self

@@ -186,6 +186,10 @@ impl CapturedDetFd {
     pub(crate) fn descriptor(&self) -> &DetFd {
         &self.detfd
     }
+
+    pub(crate) fn files_id(&self) -> FilesId {
+        self.files_id
+    }
 }
 
 /// A captured descriptor could not be installed into the current descriptor
@@ -3915,6 +3919,12 @@ impl<T> ThreadState<T> {
         } else {
             Ok(None)
         }
+    }
+
+    /// The already authenticated projection table, including exec reentry.
+    /// This does not replace the actual table identity held by CapturedDetFd.
+    pub(crate) fn fdinfo_files_id(&self) -> FilesId {
+        self.metadata().fdinfo_files_id()
     }
 
     /// An endpoint check only. This does not certify an unobserved nonsequential

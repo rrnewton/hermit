@@ -352,7 +352,11 @@ impl RecordVersion {
 // observations, source-hold/rewind facts and the existing mount-ID RPC
 // now occur on that branch, so older
 // recording/replay streams cannot claim compatibility with this call order.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x13d);
+// 0x13d -> 0x13e: optional represented-current fdinfo observations add the
+// SourceChoice/Observation phases of kind6 and a separately scoped kind5
+// result. Older streams have neither the complete-snapshot/cleanup facts nor
+// that authority scope and cannot be replayed under the new call order.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x13e);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -377,7 +381,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x13d);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x13d;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x13e;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

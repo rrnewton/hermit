@@ -83,6 +83,7 @@ use crate::fdinfo_rpc::FdinfoControlReply;
 use crate::fdinfo_rpc::FdinfoControlValue;
 use crate::fdinfo_rpc::FdinfoPublication;
 use crate::fdinfo_rpc::FdinfoReentryBinding;
+use crate::fdinfo_rpc::FdinfoRegisteredActor;
 use crate::fdinfo_rpc::FdinfoRpcState;
 use crate::ivar::Ivar;
 use crate::preemptions::PreemptionReader;
@@ -2205,13 +2206,39 @@ impl GlobalState {
                 // Admission does not grant or park a task, tick a clock, or
                 // wake the target whose metadata is being read.
                 let reply = if self.cfg.sequentialize_threads && sched.holds_serial_grant(dtid) {
-                    self.fdinfo.lock().unwrap().control_admitted(
-                        FdinfoIncarnation {
-                            tid: dtid,
-                            mm: request_mm,
-                        },
-                        control,
-                    )
+                    let incarnation = FdinfoIncarnation {
+                        tid: dtid,
+                        mm: request_mm,
+                    };
+                    let current_actor = match &control.operation {
+                        FdinfoControlOperation::BeginCurrent { actor, .. }
+                        | FdinfoControlOperation::FinishCurrent { actor, .. } => Some(*actor),
+                        _ => None,
+                    };
+                    if let Some(actor) = current_actor {
+                        // Stored thread identity alone is not registration. Only
+                        // the existing successful process/MM binding can admit
+                        // this separately scoped observation. This lookup has
+                        // no timer, signal, scheduler or physical-proc effect.
+                        let registered = sched
+                            .registered_process(dtid)
+                            .and_then(|process| sched.real_timers.task_identity(process, dtid));
+                        if registered == Some((request_mm, actor)) {
+                            self.fdinfo.lock().unwrap().control_current_admitted(
+                                FdinfoRegisteredActor::after_registered_lookup(incarnation, actor),
+                                control,
+                            )
+                        } else {
+                            FdinfoControlReply {
+                                result: Err(FdinfoProjectionGap::RejectedUpdate),
+                            }
+                        }
+                    } else {
+                        self.fdinfo
+                            .lock()
+                            .unwrap()
+                            .control_admitted(incarnation, control)
+                    }
                 } else {
                     FdinfoControlReply {
                         result: Err(FdinfoProjectionGap::RejectedUpdate),
@@ -5130,7 +5157,9 @@ where
     }
     let flush = matches!(
         &operation,
-        FdinfoControlOperation::BindOpened { .. } | FdinfoControlOperation::BeginCapture { .. }
+        FdinfoControlOperation::BindOpened { .. }
+            | FdinfoControlOperation::BeginCapture { .. }
+            | FdinfoControlOperation::BeginCurrent { .. }
     );
     tracing::trace!(target: "fdinfo_diagnostic", dtid = ?guest.thread_state().dettid,
         mm = ?guest.thread_state().mm_id, ?operation,

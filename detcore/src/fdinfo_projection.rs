@@ -298,6 +298,47 @@ pub(crate) struct FdinfoCapturedTarget {
     pub revision: u64,
 }
 
+/// Owned logical evidence for a separately authenticated current actor.
+/// It has no physical proc alias, task start field, or namespace authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FdinfoCapturedCurrentTarget {
+    pub incarnation: FdinfoIncarnation,
+    pub files: FilesId,
+    pub source_fd: RawFd,
+    pub source: OpenFileId,
+    pub target_fd: RawFd,
+    pub slot: FdinfoSlotProjection,
+    pub ofd: FdinfoOfdProjection,
+    pub observed_object: FdinfoRawObject,
+    pub revision: u64,
+}
+
+/// Issued only through the integration's actual registered actor/MM gate.
+/// Keeping this separate cannot turn an absent proc lifetime into a subject.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FdinfoAdmittedSlotCapture {
+    admission: FdinfoAdmission,
+    files: FilesId,
+    source_fd: RawFd,
+    source_slot: FdinfoSlotProjection,
+    target_fd: RawFd,
+    target_slot: FdinfoSlotProjection,
+    ofd: FdinfoOfdProjection,
+    anchor: Option<FdinfoRawObject>,
+    revision: u64,
+}
+
+impl FdinfoCapturedCurrentTarget {
+    pub(crate) fn fdinfo_flags(&self) -> i32 {
+        self.ofd.status_flags
+            | if self.slot.cloexec {
+                libc::O_CLOEXEC
+            } else {
+                0
+            }
+    }
+}
+
 /// Positive current-slot authority captured before acquiring a raw target
 /// object. Not a wire/admission type and not a retained guest descriptor or
 /// cache lease. The issuing cache and its serialized turn remain the owner.
@@ -1027,6 +1068,91 @@ impl FdinfoProjectionCache {
         Ok(table.open_files.contains_key(&open_file))
     }
 
+    /// Capture known source and target slots of the already admitted actor.
+    /// Integration must separately prove actual backend registration, the
+    /// source description, and the ordinary target object in that same table.
+    /// This never classifies or binds a physical proc subject.
+    pub(crate) fn capture_admitted_slot_token(
+        &self,
+        admission: FdinfoAdmission,
+        files: FilesId,
+        source_fd: RawFd,
+        source: OpenFileId,
+        target_fd: RawFd,
+    ) -> Result<FdinfoAdmittedSlotCapture, FdinfoProjectionGap> {
+        if !self.valid {
+            return Err(FdinfoProjectionGap::RejectedUpdate);
+        }
+        let sender = self
+            .sender(admission)
+            .map_err(|_| FdinfoProjectionGap::RetiredTask)?;
+        if sender.files.files != files {
+            return Err(FdinfoProjectionGap::RejectedUpdate);
+        }
+        let table = self.table(files).ok_or(FdinfoProjectionGap::PartialTable)?;
+        let missing = if table.complete {
+            FdinfoProjectionGap::MissingSlot
+        } else {
+            FdinfoProjectionGap::PartialTable
+        };
+        let source_slot = *table.slots.get(&source_fd).ok_or_else(|| missing.clone())?;
+        if source_slot.open_file != source {
+            return Err(FdinfoProjectionGap::MissingSlot);
+        }
+        let target_slot = *table.slots.get(&target_fd).ok_or(missing)?;
+        let ofd = self
+            .ofds
+            .get(&target_slot.open_file)
+            .ok_or(FdinfoProjectionGap::MissingObject)?;
+        Ok(FdinfoAdmittedSlotCapture {
+            admission,
+            files,
+            source_fd,
+            source_slot,
+            target_fd,
+            target_slot,
+            ofd: ofd.projection.clone(),
+            anchor: ofd.anchor,
+            revision: self.revision,
+        })
+    }
+
+    /// Complete the one-use current-actor token after the same fresh rendered
+    /// snapshot and ordinary object have been authenticated by integration.
+    pub(crate) fn capture_admitted_slot_object(
+        &mut self,
+        token: FdinfoAdmittedSlotCapture,
+        observed_object: FdinfoRawObject,
+    ) -> Result<FdinfoCapturedCurrentTarget, FdinfoProjectionGap> {
+        let current = self.capture_admitted_slot_token(
+            token.admission,
+            token.files,
+            token.source_fd,
+            token.source_slot.open_file,
+            token.target_fd,
+        )?;
+        if current != token {
+            return Err(FdinfoProjectionGap::RejectedUpdate);
+        }
+        let (ofd, revision) = self.commit_slot_object(
+            current.target_slot,
+            current.anchor,
+            &current.ofd,
+            observed_object,
+        )?;
+        Ok(FdinfoCapturedCurrentTarget {
+            incarnation: current.admission.incarnation,
+            files: current.files,
+            source_fd: current.source_fd,
+            source: current.source_slot.open_file,
+            target_fd: current.target_fd,
+            slot: current.target_slot,
+            ofd,
+            observed_object,
+            revision,
+        })
+    }
+
     pub(crate) fn release_open_subject(
         &mut self,
         subject: FdinfoBoundSubject,
@@ -1185,12 +1311,34 @@ impl FdinfoProjectionCache {
         if current != token {
             return Err(FdinfoProjectionGap::RejectedUpdate);
         }
-        for object in [current.anchor, current.ofd.object].into_iter().flatten() {
+        let (projection, revision) =
+            self.commit_slot_object(current.slot, current.anchor, &current.ofd, observed_object)?;
+        Ok(FdinfoCapturedTarget {
+            subject: current.subject,
+            incarnation: current.incarnation,
+            files: current.files,
+            slot: current.slot,
+            ofd: projection,
+            observed_object,
+            revision,
+        })
+    }
+
+    /// Both authority domains use the same immutable ordinary-object anchors.
+    /// No source ownership, target slot, flag or resource is filled here.
+    fn commit_slot_object(
+        &mut self,
+        slot: FdinfoSlotProjection,
+        anchor: Option<FdinfoRawObject>,
+        projection: &FdinfoOfdProjection,
+        observed_object: FdinfoRawObject,
+    ) -> Result<(FdinfoOfdProjection, u64), FdinfoProjectionGap> {
+        for object in [anchor, projection.object].into_iter().flatten() {
             if !object.same_object(observed_object) {
                 return Err(FdinfoProjectionGap::ObjectChanged);
             }
         }
-        let fill = current.anchor.is_none() || current.ofd.object.is_none();
+        let fill = anchor.is_none() || projection.object.is_none();
         let revision = if fill {
             self.revision
                 .checked_add(1)
@@ -1203,7 +1351,7 @@ impl FdinfoProjectionCache {
         // historical hold, slot rewrite or logical metadata replacement.
         let ofd = self
             .ofds
-            .get_mut(&current.slot.open_file)
+            .get_mut(&slot.open_file)
             .expect("validated current OFD");
         if ofd.anchor.is_none() {
             ofd.anchor = Some(observed_object);
@@ -1213,15 +1361,7 @@ impl FdinfoProjectionCache {
         }
         let projection = ofd.projection.clone();
         self.revision = revision;
-        Ok(FdinfoCapturedTarget {
-            subject: current.subject,
-            incarnation: current.incarnation,
-            files: current.files,
-            slot: current.slot,
-            ofd: projection,
-            observed_object,
-            revision,
-        })
+        Ok((projection, revision))
     }
 
     pub(crate) fn contains_ofd(&self, open_file: OpenFileId) -> bool {
@@ -2107,6 +2247,203 @@ mod tests {
         let result = f.cache.capture(subject, 7, f.object).unwrap();
         f.cache.release_open_subject(subject).unwrap();
         result
+    }
+
+    struct CurrentFixture {
+        cache: FdinfoProjectionCache,
+        admission: FdinfoAdmission,
+        files: FilesId,
+        source: OpenFileId,
+        target: OpenFileId,
+        object: FdinfoRawObject,
+    }
+
+    fn current_fixture() -> CurrentFixture {
+        let tid = DetTid::from_raw(3);
+        let files = FilesId::initial(tid);
+        let source = OpenFileId::new(tid, 1);
+        let target = OpenFileId::new(tid, 2);
+        let object = FdinfoRawObject {
+            inode: RawInode::new(33, 256),
+            mode: libc::S_IFREG | 0o600,
+            mount_id: 7,
+        };
+        let mut cache = FdinfoProjectionCache::default();
+        let admission = cache
+            .register_after_admission(
+                FdinfoIncarnation {
+                    tid,
+                    mm: MmId::initial(tid),
+                },
+                FdinfoFilesAdmission {
+                    files,
+                    new_origin: Some(FdinfoTableOrigin::Initial),
+                },
+            )
+            .unwrap();
+        cache
+            .apply(
+                admission,
+                batch(
+                    1,
+                    vec![FdinfoProjectionDelta::Table(FdinfoTableSeed {
+                        files,
+                        origin: FdinfoTableOrigin::Initial,
+                        complete: false,
+                        slots: vec![
+                            (
+                                7,
+                                FdinfoSlotProjection {
+                                    open_file: source,
+                                    cloexec: false,
+                                },
+                            ),
+                            (
+                                0,
+                                FdinfoSlotProjection {
+                                    open_file: target,
+                                    cloexec: true,
+                                },
+                            ),
+                        ],
+                        ofds: vec![
+                            FdinfoOfdProjection {
+                                open_file: source,
+                                status_flags: libc::O_RDONLY,
+                                resource: Some(ResourceID::Device(
+                                    crate::resources::Device::ContainerStdout,
+                                )),
+                                ty: FdType::Regular,
+                                object: None,
+                            },
+                            FdinfoOfdProjection {
+                                open_file: target,
+                                status_flags: libc::O_RDWR | libc::O_NONBLOCK,
+                                resource: None,
+                                ty: FdType::Regular,
+                                object: None,
+                            },
+                        ],
+                    })],
+                ),
+            )
+            .unwrap();
+        CurrentFixture {
+            cache,
+            admission,
+            files,
+            source,
+            target,
+            object,
+        }
+    }
+
+    #[test]
+    fn current_actor_known_slot_keeps_physical_alias_and_target_resource_domains_separate() {
+        let CurrentFixture {
+            mut cache,
+            admission,
+            files,
+            source,
+            target,
+            object,
+        } = current_fixture();
+        assert!(cache.tasks.is_empty() && cache.aliases.is_empty());
+        assert_eq!(cache.senders[&admission.owner].lifetime, None);
+        assert_eq!(
+            cache.capture_admitted_slot_token(admission, files, 7, source, 8),
+            Err(FdinfoProjectionGap::PartialTable)
+        );
+        assert_eq!(
+            cache.capture_admitted_slot_token(admission, files, 0, source, 0),
+            Err(FdinfoProjectionGap::MissingSlot)
+        );
+        let token = cache
+            .capture_admitted_slot_token(admission, files, 7, source, 0)
+            .unwrap();
+        let captured = cache.capture_admitted_slot_object(token, object).unwrap();
+        assert_eq!(captured.source, source);
+        assert_eq!(captured.slot.open_file, target);
+        assert_eq!(captured.ofd.resource, None);
+        assert_eq!(
+            captured.fdinfo_flags(),
+            libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC
+        );
+        assert_eq!(captured.observed_object, object);
+        // Current ordinary-object evidence neither invents a physical task
+        // lifetime nor borrows the source's stdout ResourceID for target 0.
+        assert!(cache.tasks.is_empty() && cache.aliases.is_empty());
+    }
+
+    #[test]
+    fn current_actor_capture_rejects_source_and_target_revision_changes_before_object_commit() {
+        for fd in [7, 0] {
+            let CurrentFixture {
+                mut cache,
+                admission,
+                files,
+                source,
+                target,
+                object,
+            } = current_fixture();
+            let token = cache
+                .capture_admitted_slot_token(admission, files, 7, source, 0)
+                .unwrap();
+            let slot = token.source_slot;
+            let (expected, cloexec) = if fd == 7 {
+                (source, slot.cloexec)
+            } else {
+                (target, token.target_slot.cloexec)
+            };
+            // An equal-valued setter is still an ordered mutation and must
+            // not make a held token look continuously unchanged.
+            cache
+                .apply(
+                    admission,
+                    batch(
+                        2,
+                        vec![FdinfoProjectionDelta::Slot(FdinfoSlotDelta::Cloexec {
+                            files,
+                            fd,
+                            expected,
+                            cloexec,
+                        })],
+                    ),
+                )
+                .unwrap();
+            assert_eq!(
+                cache.capture_admitted_slot_object(token, object),
+                Err(FdinfoProjectionGap::RejectedUpdate)
+            );
+            assert_eq!(cache.ofds[&target].projection.object, None);
+            assert_eq!(cache.ofds[&target].anchor, None);
+        }
+        let CurrentFixture {
+            mut cache,
+            admission,
+            files,
+            source,
+            target,
+            object,
+        } = current_fixture();
+        let token = cache
+            .capture_admitted_slot_token(admission, files, 7, source, 0)
+            .unwrap();
+        cache
+            .apply(
+                admission,
+                batch(
+                    2,
+                    vec![FdinfoProjectionDelta::Slot(FdinfoSlotDelta::Remove {
+                        files,
+                        fd: 7,
+                        expected: source,
+                    })],
+                ),
+            )
+            .unwrap();
+        assert!(cache.capture_admitted_slot_object(token, object).is_err());
+        assert_eq!(cache.ofds[&target].projection.object, None);
     }
 
     #[test]
