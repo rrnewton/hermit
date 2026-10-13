@@ -7823,12 +7823,18 @@ sys.exit(1 if failed else 0)
         // run by full, and full planned neither side of their parity cell, so
         // they were unreported; switched off, they are no longer applicable.
         // The 2 left are example-timed-progress-bar's DBT and KVM cells.
-        assert_eq!(unreported.len(), 2 + 30, "{unreported:?}");
+        // 2 + 5 since https://github.com/rrnewton/hermit/issues/4269 (option 1)
+        // took the label sabre-compat-only off 25 of the 30 compat rows,
+        // lua-direct, perl-direct and df-direct among them, so the full run
+        // plans their ptrace side and reports their SaBRe cell. The 5 left are
+        // rustc, javac, java and node, which validate_corpus.rs names the
+        // super suite's alone, and timeout.
+        assert_eq!(unreported.len(), 2 + 5, "{unreported:?}");
         let sabre_only = unreported
             .iter()
             .filter(|cell| cell.starts_with("compat/") && cell.ends_with("@sabre"))
             .count();
-        assert_eq!(sabre_only, 30, "{unreported:?}");
+        assert_eq!(sabre_only, 5, "{unreported:?}");
     }
 
     #[test]
@@ -10783,6 +10789,36 @@ sys.exit(1 if failed else 0)
             .as_str()
             .unwrap()
             .to_owned();
+        // A row's ptrace verify cell is the corpus's own, which the full run
+        // selects unless the row carries `sabre-compat-only`, so its reverse
+        // puts that label back (https://github.com/rrnewton/hermit/issues/4269
+        // moved 25 rows the other way).
+        if backend == "ptrace" {
+            let row = manifest["corpus"]["rows"]
+                .as_sequence_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|row| row["label"].as_str() == Some(label.as_str()))
+                .unwrap();
+            let labels = row
+                .as_mapping_mut()
+                .unwrap()
+                .entry("labels".into())
+                .or_insert_with(|| Value::Sequence(Vec::new()));
+            assert!(
+                !labels
+                    .as_sequence()
+                    .unwrap()
+                    .iter()
+                    .any(|name| name.as_str() == Some("sabre-compat-only")),
+                "{test} is already sabre-compat-only"
+            );
+            labels
+                .as_sequence_mut()
+                .unwrap()
+                .push("sabre-compat-only".into());
+            return serde_yaml::to_string(&manifest).unwrap();
+        }
         let entries = manifest["corpus"]["additional"]
             .as_sequence_mut()
             .unwrap_or_else(|| panic!("{test}: the corpus has no additional backend"));
