@@ -14,7 +14,8 @@
 //! group's parked peers held. Finally a single-threaded writer, first the root
 //! and then an orphan, dies by a synchronous SIGSEGV, a hardware fault rather
 //! than an exit that passes through the fence. The run must still report the
-//! root's status, 139 when the root itself faults and 0 when the orphan does,
+//! root's status, death by SIGSEGV when the root itself faults and exit 0 when
+//! the orphan does,
 //! and the reader must still print after EOF. The unchanged full INFO/output
 //! comparator must match every pair exactly.
 //!
@@ -24,6 +25,7 @@
 //! process-retirement unit tests are the binding control for the fence.
 
 use std::fs;
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -96,48 +98,48 @@ pub(super) fn run() {
     // A writer group prints only after every peer and the reader are running,
     // and its reader prints only after EOF, which follows the group's end. A
     // faulting writer prints before its fault, which is what brings EOF.
-    let cases: [(&str, i32, &str); 6] = [
+    let cases: [(&str, Outcome, &str); 6] = [
         (
             "root-exits",
-            7,
+            Outcome::Exit(7),
             "root: exiting 7 with a live child and grandchild\n\
              late child: parent changed=yes now=other(1)\n\
              late grandchild: parent changed=yes now=other(1)\n",
         ),
         (
             "root-worker-exit-group",
-            0,
+            Outcome::Exit(0),
             "writer: class=root termination=exit_group peers=2\n\
              reader: EOF class=root termination=exit_group peers=2\n",
         ),
         (
             "orphan-worker-exit-group",
-            0,
+            Outcome::Exit(0),
             "writer: class=direct-parent-terminal termination=exit_group peers=2\n\
              reader: EOF class=direct-parent-terminal termination=exit_group peers=2\n",
         ),
         (
             "orphan-worker-fatal",
-            0,
+            Outcome::Exit(0),
             "writer: class=direct-parent-terminal termination=fatal peers=2\n\
              reader: EOF class=direct-parent-terminal termination=fatal peers=2\n",
         ),
         (
             "root-segfault",
-            // KVM reports a guest killed by a signal as 128 plus the signal
-            // number, with no separate signal.
-            139,
+            // A root killed by SIGSEGV has no exit code; the signal is its
+            // outcome, as wait(2) and the ptrace backend report it.
+            Outcome::Signal(libc::SIGSEGV),
             "writer: class=root termination=SIGSEGV\n\
              reader: EOF class=root termination=SIGSEGV\n",
         ),
         (
             "orphan-segfault",
-            0,
+            Outcome::Exit(0),
             "writer: class=direct-parent-terminal termination=SIGSEGV\n\
              reader: EOF class=direct-parent-terminal termination=SIGSEGV\n",
         ),
     ];
-    for (mode, expected_status, expected) in cases {
+    for (mode, outcome, expected) in cases {
         let directory = root.join(mode);
         let logs = directory.join("verify-logs");
         fs::create_dir_all(&logs).expect("retained verification logs");
@@ -159,7 +161,7 @@ pub(super) fn run() {
             "--verify-strict",
             "--verify",
         ];
-        if expected_status != 0 {
+        if outcome != Outcome::Exit(0) {
             // The root's exit status is the observable, so both runs must
             // complete and be compared despite the nonzero status.
             args.push("--verify-allow=failure");
@@ -193,8 +195,8 @@ pub(super) fn run() {
         );
         let status = bounded_command_with_timeout(&mut command, &directory, remaining);
         assert_eq!(
-            status.code(),
-            Some(expected_status),
+            (status.code(), status.signal()),
+            (outcome.code(), outcome.signal()),
             "root exit status for mode {mode}"
         );
         assert_eq!(
@@ -210,8 +212,8 @@ pub(super) fn run() {
         report
             .require_exact_output_match()
             .expect("exact two-run status/stdout/stderr match");
-        assert_eq!(report.guest_exit_code, Some(expected_status));
-        assert!(report.guest_signal.is_none());
+        assert_eq!(report.guest_exit_code, outcome.code());
+        assert_eq!(report.guest_signal, outcome.signal());
         let policy = report.comparison.as_ref().unwrap();
         assert_eq!(policy.display_name.as_deref(), Some("BitwiseInfoV1"));
         assert_eq!(policy.compare_io_buffers, Some(true));
@@ -234,8 +236,8 @@ pub(super) fn run() {
         );
         let outputs = report.compared_outputs.as_ref().unwrap();
         for operand in [&outputs.left, &outputs.right] {
-            assert_eq!(operand.exit_code, Some(expected_status));
-            assert!(operand.signal.is_none());
+            assert_eq!(operand.exit_code, outcome.code());
+            assert_eq!(operand.signal, outcome.signal());
             assert_eq!(operand.stdout_bytes, expected.len() as u64);
             assert_eq!(
                 operand.stdout_sha256,
@@ -273,4 +275,28 @@ pub(super) fn run() {
         eprintln!("KVM reparenting mode {mode}: two actual guests and full INFO match");
     }
     assert_eq!(completed, cases.len());
+}
+
+/// How the root guest ended, as wait(2) reports it: an exit has no signal and
+/// a signal death has no exit code. Hermit ends the same way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    Exit(i32),
+    Signal(i32),
+}
+
+impl Outcome {
+    fn code(self) -> Option<i32> {
+        match self {
+            Outcome::Exit(code) => Some(code),
+            Outcome::Signal(_) => None,
+        }
+    }
+
+    fn signal(self) -> Option<i32> {
+        match self {
+            Outcome::Exit(_) => None,
+            Outcome::Signal(signal) => Some(signal),
+        }
+    }
 }
