@@ -2063,7 +2063,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4161): 1527, by listing.
     // And get_mempolicy_output_faults_are_efault_and_backend_errors_are_tool_errors
     // (Claude re-check of https://github.com/rrnewton/hermit/pull/4249): 1528, by listing.
-    ("test.detcore_unit", 1528),
+    // And the two raw-exit SIGCHLD tests
+    // (a_raw_exit_of_the_last_thread_registers_the_child_exit_timer,
+    // a_raw_exit_status_is_settled_at_its_grant,
+    // https://github.com/rrnewton/hermit/issues/3895): 1530.
+    ("test.detcore_unit", 1530),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3319,7 +3323,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the rendered-snapshot-across-exec test: 1523.
     // And the four virtual-cpuinfo tests: 1527, by listing.
     // And the get_mempolicy output-error test: 1528, by listing.
-    ("test.detcore_unit_on_host", 1528),
+    // And the two raw-exit SIGCHLD tests: 1530.
+    ("test.detcore_unit_on_host", 1530),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
