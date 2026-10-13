@@ -1406,7 +1406,7 @@ fi
 # native SDK input Git objects are equal. Preserve SDK key, inventory 941,
 # the 16-job clamp and 1050/572-job-second budgets. This carries the SDK budget
 # only; runtime qualification, test and timing evidence must be measured anew.
-# BOUND TO 0253c3a05e4c95cd437018dead9faacfde49b052 (2026-10-12):
+# BOUND TO e88ca9435a9be2cefed30cbd3f7a612153b46b72 (2026-10-12):
 # This rebased commit preserves the entire DBT tree and all seven SDK inputs
 # of 458a67572a1322bf57efcd176b3f4dcfc50a77b1. The 0a10b391 restack
 # preserves those same seven input objects from d46946bb; only inherited
@@ -1429,7 +1429,7 @@ fi
 # calibration or satisfy its >=5-sample replacement rule. The six native
 # signal-state regression files increase the tracked DBT inventory 941 to 947;
 # they add no SDK compilation target. Runtime results are separate evidence.
-expected_pin=0253c3a05e4c95cd437018dead9faacfde49b052
+expected_pin=e88ca9435a9be2cefed30cbd3f7a612153b46b72
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

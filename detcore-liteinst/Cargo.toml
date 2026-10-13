@@ -24,6 +24,6 @@ allocator-fixture = ["reverie-liteinst/allocator-fixture"]
 [dependencies]
 detcore = { package = "hermit-detcore", version = "0.4.0", path = "../detcore" }
 libc = "0.2.186"
-reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "0253c3a05e4c95cd437018dead9faacfde49b052" }
-reverie-inguest = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "0253c3a05e4c95cd437018dead9faacfde49b052", default-features = false }
-reverie-liteinst = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "0253c3a05e4c95cd437018dead9faacfde49b052", default-features = false }
+reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "e88ca9435a9be2cefed30cbd3f7a612153b46b72" }
+reverie-inguest = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "e88ca9435a9be2cefed30cbd3f7a612153b46b72", default-features = false }
+reverie-liteinst = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "e88ca9435a9be2cefed30cbd3f7a612153b46b72", default-features = false }
