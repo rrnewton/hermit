@@ -1465,12 +1465,12 @@ fi
 # This retains the hard budget, not the public-main SDK identity or validation.
 # Callback framing and paired ABI9/56 require fresh build/runtime evidence.
 # Caught-handler and ordinary-callback publication support remains incomplete.
-# PRIVATE ABI10 SUCCESSOR TO 30afa0a620bfc95a9c11fde705a368bb1577f962:
+# PRIVATE ABI10 SUCCESSOR TO c3c8ba567804ac373454149c45863668f043949f:
 # The generated TSC scope, caught-frame and wait-finalizer SDK source changed.
 # Retain existing numeric hard budgets without claiming unchanged recipe bytes
 # or a new cold calibration. Fresh paired ABI10/232 compile and runtime
 # evidence is required; the private successor is not publication-ready.
-expected_pin=30afa0a620bfc95a9c11fde705a368bb1577f962
+expected_pin=c3c8ba567804ac373454149c45863668f043949f
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
