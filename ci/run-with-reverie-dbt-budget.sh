@@ -1419,13 +1419,13 @@ fi
 # timing evidence must be measured anew.
 # CURRENT-ACTOR FDINFO PREREQUISITE PIN CARRY (2026-10-12):
 # Advance the private consumer from 19cdd8f59d2c69621f42b789169b0907e68f7144
-# to a19ca54fb9cc144cf72d76ebbba2a730004cb9a7. Only the current-actor Guest
+# to 1d11224f7e2224f5aa7dba6b2200cb8464213ea0. Only the current-actor Guest
 # receipt and KVM lifecycle/owned-source support change. All seven recorded
 # native SDK input Git objects are identical. Preserve the SDK key, inventory
 # 941, 16-job clamp and 1050/572-job-second budgets. This carries only the
 # native SDK build budget; compilation/runtime evidence must be measured anew.
 # The prerequisite is local and unpublished; public-main pin acceptance is pending.
-expected_pin=a19ca54fb9cc144cf72d76ebbba2a730004cb9a7
+expected_pin=1d11224f7e2224f5aa7dba6b2200cb8464213ea0
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
