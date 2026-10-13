@@ -241,6 +241,12 @@
       "why": "tests/c/dbt_execveat_unsupported.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/dbt_first_event_rdtsc.c",
+      "runner": "hermit-cli/tests/cli.rs::dbt_first_rdtsc_and_new_thread_complete_through_shared_detcore",
+      "why": "The explicit DBT CLI regression owns literal first-entry RDTSC, new-thread registration and ordered exit observations in both complete strict canonical logs. A generic exit/output-only manifest row would not assert this callback-owner protocol."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/dbt_mmap_exec.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
@@ -263,6 +269,18 @@
       "path": "tests/c/dbt_self_sigqueue.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/dbt_self_sigqueue.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/dbt_sigchld_shared_hook.c",
+      "runner": "test-harness",
+      "why": "The shared c-programs/caught-sigchld-shared-hook manifest row owns the guest Linux signal contract across declared backend/mode cells. The DBT CLI regression additionally compiles the same unchanged guest and checks real same-thread shared Tool admission before the handler write; generic manifest registration does not claim that stronger oracle."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/dbt_sigchld_wait_later_child.c",
+      "runner": "hermit-cli/tests/dbt_owned_signal_publication.rs",
+      "why": "The dedicated genuine Detcore integration test owns the live stdin release protocol and DEBUG transaction-order assertions while the parent waits for a later child. A standalone manifest exit/output check cannot assert the authenticated capture, release and shared Tool-hook sequence."
     },
     {
       "disposition": "manifest-test",

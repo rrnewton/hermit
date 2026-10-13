@@ -25101,3 +25101,334 @@ fn an_unusable_verify_tmpdir_is_a_clean_error_naming_the_variable() {
         );
     }
 }
+
+#[test]
+#[cfg(feature = "dbt")]
+fn dbt_caught_sigchld_reaches_shared_tool_before_its_handler_write() {
+    let _guard = hermit_run_guard();
+    // Preserve evidence even if the missing-hook assertion fails.
+    let root = tempfile::Builder::new()
+        .prefix("dbt-sigchld-shared-hook-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create signal regression directory")
+        .keep();
+    eprintln!("DBT SIGCHLD regression evidence: {}", root.display());
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("repository root")
+        .join("tests/c/dbt_sigchld_shared_hook.c");
+    let guest = root.join("dbt_sigchld_shared_hook");
+    let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let compile = Command::new(compiler)
+        .args(["-O2", "-g", "-std=c11", "-Wall", "-Wextra", "-Werror"])
+        .arg(source)
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("compile actual SIGCHLD guest");
+    fs::write(root.join("compile.stdout"), &compile.stdout).unwrap();
+    fs::write(root.join("compile.stderr"), &compile.stderr).unwrap();
+    assert!(
+        compile.status.success(),
+        "fixture compiler failed: {compile:?}"
+    );
+
+    let logs = root.join("verify-logs");
+    fs::create_dir(&logs).unwrap();
+    let verdict_path = root.join("verdict.json");
+    let args = [
+        "--backend",
+        "dbt",
+        "--log",
+        "info",
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--keep-logs",
+        "--verify-log-dir",
+        logs.to_str().unwrap(),
+        "--verify-json",
+        verdict_path.to_str().unwrap(),
+        "--base-env=minimal",
+        "--epoch=2026-10-11T14:20:44+00:00",
+        "--",
+        guest.to_str().unwrap(),
+    ];
+    let output = hermit_command(&args)
+        .env_remove("RUST_LOG")
+        .env_remove("HERMIT_LOG")
+        .env_remove("HERMIT_LOG_FILE")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run actual Detcore<DbtGuest> SIGCHLD pair");
+    fs::write(root.join("guest.stdout"), &output.stdout).unwrap();
+    fs::write(root.join("hermit.stderr"), &output.stderr).unwrap();
+    fs::write(root.join("hermit.status"), output.status.to_string()).unwrap();
+    let verdict = read_terminal_dbt_verdict(&verdict_path);
+    assert_eq!(
+        output.stdout,
+        b"caught-sigchld\ncompleted-sigchld\n",
+        "handler, child reap, or mask restoration failed; evidence={}; verdict={verdict}",
+        root.display(),
+    );
+
+    let golden: Vec<_> = fs::read_dir(&logs)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.starts_with("run1_log_"))
+        })
+        .collect();
+    assert_eq!(
+        golden.len(),
+        1,
+        "missing/ambiguous real run1 log: {golden:?}"
+    );
+    let log = fs::read_to_string(&golden[0]).unwrap();
+    let lines: Vec<_> = log.lines().collect();
+    let unique = |label: &str, predicate: fn(&str) -> bool| {
+        let found: Vec<_> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| predicate(line).then_some(index))
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "expected one {label}, got {found:?}; evidence={}; verdict={verdict}\n{log}",
+            root.display()
+        );
+        found[0]
+    };
+    let enter = unique("real shared SIGCHLD hook entry", |line| {
+        line.contains("] handling inbound signal (#") && line.contains(") SIGCHLD")
+    });
+    let granted = unique("completed shared SIGCHLD resource admission", |line| {
+        line.contains("] finish delivering signal (#") && line.contains(") SIGCHLD")
+    });
+    let handler = unique("handler's actual first 15-byte stdout write", |line| {
+        line.contains("inbound syscall: write(1, ") && line.contains(", 15) = ?")
+    });
+    let completion = unique("main's actual 18-byte completion write", |line| {
+        line.contains("inbound syscall: write(1, ") && line.contains(", 18) = ?")
+    });
+    let tid = |index: usize| -> i32 {
+        lines[index]
+            .split_once("dtid ")
+            .expect("real record thread ID")
+            .1
+            .split_once(']')
+            .expect("record thread end")
+            .0
+            .parse()
+            .expect("numeric DetTid")
+    };
+    for index in [granted, handler, completion] {
+        assert_eq!(
+            tid(index),
+            tid(enter),
+            "hook and handler must be the same guest thread"
+        );
+    }
+    let signal_count = |index: usize| -> u64 {
+        lines[index]
+            .split_once("signal (#")
+            .unwrap()
+            .1
+            .split_once(')')
+            .unwrap()
+            .0
+            .parse()
+            .unwrap()
+    };
+    assert_eq!(signal_count(enter), signal_count(granted));
+    assert!(
+        enter < granted && granted < handler && handler < completion,
+        "actual hook/admission/handler order violated: {enter}/{granted}/{handler}/{completion}; {}",
+        root.display()
+    );
+
+    // A correct admission trace cannot turn a divergent pair into a pass.
+    assert!(
+        output.status.success(),
+        "Hermit failed: {verdict}; {}",
+        root.display()
+    );
+    assert_eq!(verdict["verdict"], "matched", "{verdict}");
+    assert_eq!(verdict["bitwise_parity"], true, "{verdict}");
+}
+
+/// A real DBT root can enter Detcore before its first syscall, and a newly
+/// registered native thread can do the same before completing its exit.
+#[test]
+#[cfg(feature = "dbt")]
+fn dbt_first_rdtsc_and_new_thread_complete_through_shared_detcore() {
+    let _guard = hermit_run_guard();
+    let root = tempfile::Builder::new()
+        .prefix("dbt-first-event-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("create first-event regression directory")
+        .keep();
+    eprintln!("DBT first-event regression evidence: {}", root.display());
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("repository root")
+        .join("tests/c/dbt_first_event_rdtsc.c");
+    let guest = root.join("dbt_first_event_rdtsc");
+    let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let compile = Command::new(compiler)
+        .args([
+            "-nostdlib",
+            "-static",
+            "-fno-pie",
+            "-no-pie",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wl,-e,_start",
+        ])
+        .arg(&source)
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("compile actual first-event guest");
+    fs::write(root.join("compile.stdout"), &compile.stdout).unwrap();
+    fs::write(root.join("compile.stderr"), &compile.stderr).unwrap();
+    assert!(
+        compile.status.success(),
+        "fixture compiler failed: {compile:?}"
+    );
+
+    let logs = root.join("verify-logs");
+    fs::create_dir(&logs).unwrap();
+    let verdict_path = root.join("verdict.json");
+    let args = [
+        "--backend",
+        "dbt",
+        "--log",
+        "info",
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--keep-logs",
+        "--verify-log-dir",
+        logs.to_str().unwrap(),
+        "--verify-json",
+        verdict_path.to_str().unwrap(),
+        "--base-env=minimal",
+        "--epoch=2026-10-11T14:20:44+00:00",
+        "--",
+        guest.to_str().unwrap(),
+    ];
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after", "2s", "30s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"));
+    append_hermit_args(&mut command, &args);
+    command
+        .env_remove("RUST_LOG")
+        .env_remove("HERMIT_LOG")
+        .env_remove("HERMIT_LOG_FILE");
+    let (output, run2) =
+        output_capturing_run2_log(&mut command, &logs, &root.join("captured-run2.log"));
+    fs::write(root.join("guest.stdout"), &output.stdout).unwrap();
+    fs::write(root.join("hermit.stderr"), &output.stderr).unwrap();
+    fs::write(root.join("hermit.status"), output.status.to_string()).unwrap();
+    assert!(
+        output.status.success(),
+        "real first-event DBT pair failed: {output:?}; evidence={}",
+        root.display()
+    );
+    let verdict = read_terminal_dbt_verdict(&verdict_path);
+    assert_eq!(verdict["verdict"], "matched", "{verdict}");
+    assert_eq!(
+        output.stdout,
+        b"first-event root\nfirst-event child\nfirst-event done\n",
+        "root/child entry or orderly thread completion failed; evidence={}",
+        root.display()
+    );
+
+    let golden = retained_captures(&logs, "run1_log_");
+    assert_eq!(golden.len(), 1, "missing/ambiguous golden log: {golden:?}");
+    let run2 = run2.expect("run 2's complete log was not retained by the existing capture helper");
+    for path in [&golden[0], &run2] {
+        let log = fs::read_to_string(path).expect("read complete retained INFO log");
+        let lines: Vec<_> = log.lines().collect();
+        let rdtscs: Vec<_> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| line.contains("] inbound rdtsc,").then_some(index))
+            .collect();
+        assert_eq!(
+            rdtscs.len(),
+            2,
+            "expected root and child real Tool events: {}\n{log}",
+            path.display()
+        );
+        let tid = |index: usize| -> i32 {
+            lines[index]
+                .split_once("dtid ")
+                .expect("real Detcore thread identity")
+                .1
+                .split_once(']')
+                .expect("thread identity terminator")
+                .0
+                .parse()
+                .expect("numeric DetTid")
+        };
+        let root_tid = tid(rdtscs[0]);
+        let child_tid = tid(rdtscs[1]);
+        assert_ne!(
+            root_tid, child_tid,
+            "two RDTSCs must belong to different real Tool threads"
+        );
+        for (entry, owner) in [(rdtscs[0], root_tid), (rdtscs[1], child_tid)] {
+            let calls: Vec<_> = lines
+                .iter()
+                .enumerate()
+                .filter_map(|(index, line)| {
+                    (line.contains("] inbound syscall: ") && tid(index) == owner).then_some(index)
+                })
+                .collect();
+            assert!(
+                calls.first().is_some_and(|first| entry < *first),
+                "RDTSC must precede this thread's first syscall: owner={owner}; {}\n{log}",
+                path.display()
+            );
+            assert!(lines[calls[0]].contains("inbound syscall: write(1, "));
+        }
+        let child_exits: Vec<_> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| {
+                (line.contains("inbound syscall: exit(0)") && tid(index) == child_tid)
+                    .then_some(index)
+            })
+            .collect();
+        let parent_exits: Vec<_> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| {
+                (line.contains("inbound syscall: exit_group(0)") && tid(index) == root_tid)
+                    .then_some(index)
+            })
+            .collect();
+        assert_eq!(
+            child_exits.len(),
+            1,
+            "missing child exit: {}\n{log}",
+            path.display()
+        );
+        assert_eq!(
+            parent_exits.len(),
+            1,
+            "missing root completion: {}\n{log}",
+            path.display()
+        );
+        assert!(rdtscs[1] < child_exits[0] && child_exits[0] < parent_exits[0]);
+    }
+}

@@ -1,6 +1,71 @@
 schema: 3
 bucket: c-programs
 test:
+  - id: c-programs/caught-sigchld-shared-hook
+    description: A reaped child's pending SIGCHLD runs one real handler with the correct masks before the parent continues
+    lane: portable
+    requires: [linux, x86_64, userns, ptrace, cc]
+    occasional: false
+    program: tests/c/dbt_sigchld_shared_hook.c
+    build:
+      cflags: [-O2, -g, -std=c11, -Wall, -Wextra, -Werror]
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    # The CLI regression separately proves actual shared Tool admission before
+    # the handler write. This shared row owns the guest's Linux signal contract;
+    # registering its cells does not claim the stronger CLI log oracle or add CI.
+    modes:
+      verify:
+        ci: false
+        ci_disabled_reason: Shared guest registration is not CI calibration; the dedicated DBT CLI regression retains its stronger hook-before-handler oracle
+        backends_enabled: [ptrace, dbt]
+        backends_disabled:
+          kvm: This caught child-exit signal and mask contract has not been qualified on KVM
+          sabre: This caught child-exit signal and mask contract has not been qualified on SaBRe
+          liteinst: This caught child-exit signal and mask contract has not been qualified on LiteInst
+          in-guest-trap: This caught child-exit signal and mask contract has not been qualified on in-guest-trap
+      naked:
+        ci: false
+        ci_disabled_reason: The fixture asserts deterministic signal semantics and does not provide the variation oracle required by naked mode
+        backends_enabled: []
+        backends_disabled:
+          native: The fixture has no native nondeterminism oracle
+      replay:
+        ci: false
+        ci_disabled_reason: Record/replay qualification of this caught SIGCHLD guest is a separate unmeasured contract
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification of this caught SIGCHLD guest is unmeasured
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest-trap
+      chaos:
+        ci: false
+        ci_disabled_reason: The fixture has no schedule-diversity oracle for chaos mode
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The fixture has no schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest-trap
+      custom:
+        ci: false
+        ci_disabled_reason: Default execution contains the complete child-reap, delivery, and mask assertions without custom arguments
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No separate custom-mode contract is declared
+          dbt: No separate custom-mode contract is declared
+          kvm: No separate custom-mode contract is declared
+          sabre: No separate custom-mode contract is declared
+          liteinst: No separate custom-mode contract is declared
+          in-guest-trap: No separate custom-mode contract is declared
   - id: c-programs/random-readv-stream
     description: Random-device scalar and vector reads share exact seeded bytes and cursor state through dup, fork, exec, and copy faults
     lane: portable

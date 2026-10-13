@@ -1459,7 +1459,13 @@ fi
 # Preserve CMAKE, CMAKE_GENERATOR, normalized SOURCE_DATE_EPOCH, inventory 947,
 # the 16-job clamp and existing 1050/572-job-second budgets. This carries only
 # the SDK budget; no new cold timing sample or runtime acceptance is claimed.
-expected_pin=a7402b9d25fcf785bf0b5bbeffb3e5b3c35bde43
+# PRIVATE WIP TO 10bb779a790dbd10510e302994d44a4f045f502c:
+# The native capture SDK differs from main a740; its vendor tree is identical
+# to the compiled private e88ca943 tree 3962faeb63564e054285ceea7ba32278f31637be.
+# This retains the hard budget, not the public-main SDK identity or validation.
+# Callback framing and paired ABI9/56 require fresh build/runtime evidence.
+# Caught-handler and ordinary-callback publication support remains incomplete.
+expected_pin=10bb779a790dbd10510e302994d44a4f045f502c
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

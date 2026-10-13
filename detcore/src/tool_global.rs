@@ -1014,6 +1014,9 @@ impl DevicePool {
 pub struct GlobalState {
     sched: Arc<Mutex<Scheduler>>,
 
+    /// Run-owned capture workers, aborted with the GlobalState on termination.
+    capture_tasks: Mutex<tokio::task::JoinSet<()>>,
+
     inodes: Arc<Mutex<InodePool>>,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1225,6 +1228,7 @@ impl GlobalState {
 
         Self {
             sched,
+            capture_tasks: Mutex::new(tokio::task::JoinSet::new()),
             next_port: AtomicU16::new(range[0]),
             used_ports: Mutex::new(HashSet::new()),
             unsupported_syscalls: Mutex::new(BTreeSet::new()),
@@ -1700,6 +1704,16 @@ impl GlobalTool for GlobalState {
             .install_signal_control(control, self.cfg.sequentialize_threads)
     }
 
+    fn install_backend_child_exit_capture(
+        &self,
+        control: Arc<dyn reverie::BackendChildExitCapture>,
+    ) -> Result<bool, reverie::Error> {
+        self.sched
+            .lock()
+            .unwrap()
+            .install_child_exit_capture(control, self.cfg.sequentialize_threads)
+    }
+
     /// Dequeues carry real-timer signals only in a run that installed the
     /// backend's control; any other run leaves them to the guest kernel.
     fn observe_signal_dequeues(&self, mode: reverie::BackendSignalControlMode) -> bool {
@@ -1780,6 +1794,7 @@ impl GlobalTool for GlobalState {
                 sched.take_signal_failure_wakes(),
             )
         };
+        crate::scheduler::child_exit_capture::drain_failure(&self.sched);
         for wake in deferred {
             let _ = wake.send(());
         }
@@ -3090,12 +3105,22 @@ impl GlobalState {
         answer: SchedResponse,
     ) -> (SchedulerRpcResult<ResourceReply>, Option<LogicalTime>) {
         let dettid = DetTid::from_raw(from.as_raw());
-        let request_became_stale = {
+        let (request_became_stale, has_native_capture) = {
             let sched = self.lock_rpc_scheduler(false).await;
-            sched.thread_is_logically_killed(dettid)
-                || request_mm.is_some_and(|mm| !sched.rpc_incarnation_matches(dettid, mm))
+            (
+                sched.thread_is_logically_killed(dettid)
+                    || request_mm.is_some_and(|mm| !sched.rpc_incarnation_matches(dettid, mm)),
+                sched.has_native_child_capture(dettid),
+            )
         };
         if request_became_stale {
+            if has_native_capture {
+                self.report_backend_failure(reverie::BackendFailure {
+                    pid: reverie::Pid::from_raw(detpid.as_raw()),
+                    tid: from,
+                    phase: "selected child Exit response became stale before native Arm",
+                });
+            }
             // `logically_kill_thread` wakes an already-pending request with a
             // signal response.  Treat that wake-up as terminal: otherwise a
             // caller that ignores `ResumeStatus::Signaled` can inject the
@@ -3127,6 +3152,25 @@ impl GlobalState {
                 SchedulerRpcResult::Continue(ResourceReply::ObserveSignal(control)),
                 None,
             );
+        }
+        if rs.exit_identity().is_some() {
+            let reserved = self.sched.lock().unwrap().take_native_child_capture(dettid);
+            if let Some(reserved) = reserved {
+                match crate::scheduler::child_exit_capture::arm_selected(
+                    self.sched.clone(),
+                    reserved,
+                )
+                .await
+                {
+                    Ok(Some(completion)) => {
+                        let mut tasks = self.capture_tasks.lock().unwrap();
+                        while tasks.try_join_next().is_some() {}
+                        tasks.spawn(completion);
+                    }
+                    Ok(None) => {}
+                    Err(()) => return (SchedulerRpcResult::ThreadExited, None),
+                }
+            }
         }
         if let Some((true, process, mm)) = rs.exit_identity() {
             info!(

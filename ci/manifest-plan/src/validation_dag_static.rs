@@ -1005,7 +1005,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // disjoint_main_floor_is_well_formed_only_with_a_bounded_main_delta, and
     // ledger::admission::tests::disjoint_main_floor_is_not_canonical_without_the_git_proof
     // (hermit-manifest-plan) retains all 1073: 1074.
-    ("test.regular_crates", 1074),
+    // detcore-dbt adds signal_routing_uses_validated_transport_and_preserves_raw_realtime
+    // and startup_transport_remains_bound_to_its_initialized_image.
+    ("test.regular_crates", 1076),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1981,7 +1983,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the absent-CPU directory entry test (https://github.com/rrnewton/hermit/issues/4160): 1462.
     // And a_signal_the_temporary_mask_blocks_is_held_not_ended: 1463.
     // And the three restartable internal IO poll signal-filter tests (https://github.com/rrnewton/hermit/issues/4187): 1466.
-    ("test.detcore_unit", 1466),
+    // Native capture adds failure_before_grant_guard_releases_stored_reply_once_outside_scheduler_lock,
+    // scheduler_scope_cancellation_aborts_a_stored_unarmed_reservation,
+    // capture_completion_survives_child_consuming_cleanup_but_not_parent_reincarnation,
+    // and abandoning_armed_transaction_is_terminal_without_publication_credit.
+    // Also native_capture_and_signal_control_refuse_both_installation_orders.
+    // Also unsupported_required_capture_aborts_without_granting_the_child.
+    ("test.detcore_unit", 1472),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2185,7 +2193,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4160): 293.
     // And procfs_determinism::cpu_and_node_directories_list_one_cpu_and_node
     // (https://github.com/rrnewton/hermit/issues/4160): 294.
-    ("test.hermit_integration", 294),
+    // The DBT pending-sigsuspend regression adds exactly one case.
+    ("test.hermit_integration", 295),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -2722,7 +2731,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4160): 325.
     // And a_signal_to_a_guest_blocked_in_a_polled_call_acts_as_on_linux
     // (https://github.com/rrnewton/hermit/issues/4187): 326.
-    ("test.cli", 326),
+    // The DBT caught-SIGCHLD shared-hook regression adds exactly one case.
+    // dbt_first_rdtsc_and_new_thread_complete_through_shared_detcore: 328.
+    ("test.cli", 328),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -2989,7 +3000,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Nor does the kernel_max affinity test: 260.
     // Nor does the CPU directory reads test: 261.
     // And the polled-call signal test: 262.
-    ("test.cli_on_host", 262),
+    // The DBT caught-SIGCHLD shared-hook regression adds exactly one host case.
+    // dbt_first_rdtsc_and_new_thread_complete_through_shared_detcore: 264.
+    ("test.cli_on_host", 264),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3155,7 +3168,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the absent-CPU directory entry test: 1462.
     // And the pselect6 temporary-mask hold test: 1463.
     // And the three internal IO poll signal-filter tests: 1466.
-    ("test.detcore_unit_on_host", 1466),
+    // Native capture adds failure_before_grant_guard_releases_stored_reply_once_outside_scheduler_lock,
+    // scheduler_scope_cancellation_aborts_a_stored_unarmed_reservation,
+    // capture_completion_survives_child_consuming_cleanup_but_not_parent_reincarnation,
+    // and abandoning_armed_transaction_is_terminal_without_publication_credit.
+    // Also native_capture_and_signal_control_refuse_both_installation_orders.
+    // Also unsupported_required_capture_aborts_without_granting_the_child.
+    ("test.detcore_unit_on_host", 1472),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3197,7 +3216,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the crowded-stack pselect6 record refusal test: 292.
     // And the single-CPU sysfs numbers and node files test: 293.
     // And the single-CPU directory listing test: 294.
-    ("test.hermit_integration_on_host", 294),
+    // The DBT pending-sigsuspend regression adds exactly one host case.
+    ("test.hermit_integration_on_host", 295),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -3433,7 +3453,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the failed-match pressure evidence test: 1059.
     // And the same eight disjoint-main floor admission tests: 1073.
     // And the same disjoint-main not-canonical test: 1074.
-    ("test.regular_crates_on_host", 1074),
+    // detcore-dbt adds signal_routing_uses_validated_transport_and_preserves_raw_realtime
+    // and startup_transport_remains_bound_to_its_initialized_image.
+    ("test.regular_crates_on_host", 1076),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

@@ -257,6 +257,47 @@ fn async_exit_completion_refuses_signal_control() {
     assert!(!s.signal_control_installed());
 }
 
+#[test]
+fn native_capture_and_signal_control_refuse_both_installation_orders() {
+    #[derive(Debug)]
+    struct Capture;
+
+    impl reverie::BackendChildExitCapture for Capture {
+        fn reserve(
+            &self,
+            _: reverie::ChildExitCaptureRequest,
+        ) -> Result<Box<dyn reverie::ReservedChildExitCapture>, reverie::Error> {
+            panic!("startup ownership test must not reserve a capture")
+        }
+    }
+
+    for capture_first in [false, true] {
+        let (mut scheduler, backend) = fixture_with_control(false);
+        let capture = Arc::new(Capture);
+        let signal = Some(BackendSignalControl { process: backend });
+        if capture_first {
+            assert!(scheduler.install_child_exit_capture(capture, true).unwrap());
+            assert!(matches!(
+                scheduler.install_signal_control(signal, true),
+                Err(reverie::Error::Errno(reverie::Errno::EINVAL))
+            ));
+        } else {
+            assert_eq!(
+                scheduler.install_signal_control(signal, true).unwrap(),
+                BackendSignalControlMode::ToolControlled
+            );
+            assert!(matches!(
+                scheduler.install_child_exit_capture(capture, true),
+                Err(reverie::Error::Errno(reverie::Errno::EINVAL))
+            ));
+        }
+        // A refused second offer must leave the first authority installed.
+        assert_eq!(scheduler.native_child_capture_installed(), capture_first);
+        assert_eq!(scheduler.signal_control_installed(), !capture_first);
+        assert!(scheduler.native_child_capture.holds.is_empty());
+    }
+}
+
 fn add(s: &mut Scheduler, pid: i32, tid: i32) -> (DetTid, MmId, reverie::CallbackSignalSite) {
     add_with_mm(s, pid, tid, MmId::initial(DetTid::from_raw(pid)))
 }

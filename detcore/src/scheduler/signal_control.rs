@@ -250,7 +250,7 @@ impl Scheduler {
     /// answer is not `ToolControlled`, which this method never gives for a
     /// sequentialized run that it does not refuse itself.
     ///
-    /// Two offers are refused with EINVAL rather than answered:
+    /// Offers are refused with EINVAL rather than answered:
     ///
     /// - one that comes after a guest thread registered, after a turn, or after
     ///   an earlier installation, because the answer is fixed before the first
@@ -267,7 +267,10 @@ impl Scheduler {
     ///   releases the scheduler mutex between its phases, so an exit barrier
     ///   installed between them would escape the hold in `step2_drain_prefix`.
     ///   No backend reports both today; the combination is refused rather
-    ///   than run.
+    ///   than run;
+    /// - one after native child-exit capture was installed. Its reservations
+    ///   hold the ordinary turn loop, so the two run-scoped authorities must
+    ///   not be combined, in either installation order.
     pub(crate) fn install_signal_control(
         &mut self,
         control: Option<BackendSignalControl>,
@@ -282,6 +285,7 @@ impl Scheduler {
         if !self.backend.provides_process_signal_control
             || self.backend.process_exits_complete_asynchronously
             || self.parked.control.is_some()
+            || self.native_child_capture_installed()
             || !self.next_turns.is_empty()
             || self.turn != 0
             || self.started_up.try_read().is_some()

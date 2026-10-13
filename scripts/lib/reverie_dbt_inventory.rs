@@ -15,4 +15,6 @@
 
 /// `git ls-files -- reverie-dbt` in the pinned Reverie checkout lists this
 /// many files.
-pub const REVERIE_DBT_FILES: usize = 947;
+/// Native child-exit capture adds fourteen runtime/probe/fixture source files
+/// to the existing 947-file inventory; it adds no DynamoRIO SDK build target.
+pub const REVERIE_DBT_FILES: usize = 961;
