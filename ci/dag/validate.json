@@ -7462,6 +7462,13 @@
           "category": "c-programs",
           "test": "c-programs/pty-nr-count",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pty-nr-count",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -20241,6 +20248,13 @@
           "category": "system-utils",
           "test": "system-utils/overflow-gid-resolves",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/overflow-gid-resolves",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -20284,6 +20298,13 @@
           "test": "system-utils/printf-argument-forwarding",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/proc-random-uuid",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -50390,6 +50411,13 @@
           "category": "c-programs",
           "test": "c-programs/pty-nr-count",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pty-nr-count",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -57876,6 +57904,13 @@
           "category": "system-utils",
           "test": "system-utils/overflow-gid-resolves",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/overflow-gid-resolves",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -57919,6 +57954,13 @@
           "test": "system-utils/printf-argument-forwarding",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/proc-random-uuid",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",

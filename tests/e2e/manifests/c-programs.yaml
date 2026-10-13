@@ -7771,10 +7771,10 @@ test:
           - ptrace
           - sabre
           - dbt
+          - kvm
           - liteinst
           - in-guest-trap
-        backends_disabled:
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
+        backends_disabled: {}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled

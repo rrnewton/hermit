@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 4085,
-      "applicable": 1704,
-      "selectable": 1402,
+      "applicable": 1707,
+      "selectable": 1405,
       "population": 2775,
-      "population_candidate_selected": 1402,
+      "population_candidate_selected": 1405,
       "population_candidate_not_selected": 258,
-      "population_candidate_disabled": 1115
+      "population_candidate_disabled": 1112
     },
     "by_backend": {
       "dbt": {
@@ -37,12 +37,12 @@
       },
       "kvm": {
         "cells": 817,
-        "applicable": 337,
-        "selectable": 333,
+        "applicable": 340,
+        "selectable": 336,
         "population": 555,
-        "population_candidate_selected": 333,
+        "population_candidate_selected": 336,
         "population_candidate_not_selected": 3,
-        "population_candidate_disabled": 219
+        "population_candidate_disabled": 216
       },
       "liteinst": {
         "cells": 817,
@@ -982,7 +982,7 @@
     {"test_id":"c-programs/ptrace-traceme-eperm","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/pty-nr-count","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/pty-nr-count","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"c-programs/pty-nr-count","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"},
+    {"test_id":"c-programs/pty-nr-count","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/pty-nr-count","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/pty-nr-count","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/racewrite-nostdlib","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
@@ -4057,7 +4057,7 @@
     {"test_id":"system-utils/openssl-x509","backend":"sabre","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Certificate issuance combines wall-clock validity with multiple entropy draws; clock, random-stream, and full-trace support remain unqualified"},
     {"test_id":"system-utils/overflow-gid-resolves","backend":"dbt","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: DBT coverage is owned by its backend parity partition"},
     {"test_id":"system-utils/overflow-gid-resolves","backend":"in-guest-trap","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
-    {"test_id":"system-utils/overflow-gid-resolves","backend":"kvm","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: KVM requires the privileged runner"},
+    {"test_id":"system-utils/overflow-gid-resolves","backend":"kvm","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"system-utils/overflow-gid-resolves","backend":"liteinst","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: LiteInst coverage is owned by its backend compatibility partition"},
     {"test_id":"system-utils/overflow-gid-resolves","backend":"sabre","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: SaBRe coverage is owned by its backend compatibility partition"},
     {"test_id":"system-utils/printf-argument-forwarding","backend":"dbt","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
@@ -4067,7 +4067,7 @@
     {"test_id":"system-utils/printf-argument-forwarding","backend":"sabre","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"system-utils/proc-random-uuid","backend":"dbt","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: DBT coverage is owned by its backend parity partition"},
     {"test_id":"system-utils/proc-random-uuid","backend":"in-guest-trap","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
-    {"test_id":"system-utils/proc-random-uuid","backend":"kvm","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: KVM requires the privileged runner"},
+    {"test_id":"system-utils/proc-random-uuid","backend":"kvm","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"system-utils/proc-random-uuid","backend":"liteinst","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: LiteInst coverage is owned by its backend compatibility partition"},
     {"test_id":"system-utils/proc-random-uuid","backend":"sabre","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: SaBRe requires its external runtime"},
     {"test_id":"system-utils/proc-uptime","backend":"dbt","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: DBT coverage is owned by its backend parity partition"},
