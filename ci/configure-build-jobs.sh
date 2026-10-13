@@ -1529,8 +1529,14 @@ fi
 # threshold and the 16-job clamp. These local samples do not replace the
 # original n=3 hosted calibration or satisfy the >=5-sample replacement rule;
 # fresh validation is required.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != ab8cd5171e502e0332a9b3b0a536c12438670995 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie ab8cd5171e502e0332a9b3b0a536c12438670995 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 4d1281bd494b1e13cacce83675aaacf7cfb73003 (2026-10-12): from
+# ab8cd5171e502e0332a9b3b0a536c12438670995 via Reverie main 101f504b2e5b,
+# whose tree equals ab8cd517. The two added commits change only
+# reverie-kvm/src (FIONBIO and personality); the DynamoRIO SDK recipe inputs,
+# build.rs and vendor tree are unchanged, so the recorded calibration, the
+# 16-job clamp and the 1050/572 job-second budgets carry over unmeasured.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 4d1281bd494b1e13cacce83675aaacf7cfb73003 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 4d1281bd494b1e13cacce83675aaacf7cfb73003 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
