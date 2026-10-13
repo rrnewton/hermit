@@ -1129,6 +1129,7 @@ async fn capture_at_tsc(
 
 // Transport identity and SDK callback eligibility are distinct authenticated
 // records. observe() joins their image/epoch and physical owner before selection.
+#[derive(Debug)]
 struct SelectedTscOwner {
     native: reverie_rpc_transport::native_control::NativeOwner,
     publication: reverie_rpc_transport::native_control::PublicationOwner,
