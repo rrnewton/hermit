@@ -2569,9 +2569,10 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // ptrace cases that need the PMU timer.
     // One required local M1 target adds one Nextest result producer.
     // 137 with the additive required M2 stack consumer; all 136 prior producers remain.
-    if expected.len() != 137 {
+    // test.inherited_terminal_read adds one producer for the six terminal regressions.
+    if expected.len() != 138 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 137",
+            "structured result producer registry has {} entries, expected 138",
             expected.len()
         ));
     }
@@ -2588,9 +2589,10 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // test.pmu_integration_cases joined it.
     // The M1 seven-identity and M2 eleven-identity targets each add one
     // registry entry without altering existing CLI counts.
-    if expected_counts.len() != 45 {
+    // The six-case inherited-terminal target adds one independently counted population.
+    if expected_counts.len() != 46 {
         return Err(format!(
-            "Nextest expected-count registry has {} entries, expected 45",
+            "Nextest expected-count registry has {} entries, expected 46",
             expected_counts.len()
         ));
     }
@@ -2728,7 +2730,8 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // (https://github.com/rrnewton/hermit/issues/3520), and 69 with
     // test.record_replay, and 70 with test.pmu_integration_cases.
     // The local required allocator and stack consumers each add one Nextest writer.
-    if actual_group_counts != [72, 56, 7, 2] {
+    // test.inherited_terminal_read adds the 73rd Nextest writer; other groups are unchanged.
+    if actual_group_counts != [73, 56, 7, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
