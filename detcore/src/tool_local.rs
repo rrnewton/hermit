@@ -1993,12 +1993,25 @@ impl PendingRobustListWakes {
     }
 }
 
+/// A registered robust list: its owner, head, and the owner's host TID where
+/// the backend's scheduler identity is virtual.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RobustListOwner {
+    pub(crate) dettid: DetTid,
+    pub(crate) head: usize,
+    pub(crate) physical_tid: Option<i32>,
+}
+
 /// Robust-list registrations and staged wakes shared by one Linux thread
 /// group. A forked process starts with an empty instance; `CLONE_THREAD`
 /// members share it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct RobustListProcessState {
     heads: BTreeMap<DetTid, usize>,
+    /// Host TIDs of the threads in `heads`, where the backend's scheduler
+    /// identity is virtual ([`ThreadState::physical_tid`]).
+    #[serde(default)]
+    physical_tids: BTreeMap<DetTid, i32>,
     pending: BTreeMap<DetTid, PendingRobustListWakes>,
     matched_physical_exits: BTreeMap<DetTid, DetTime>,
     /// Wakes read at an `execve`'s entry, delivered only if it succeeds.
@@ -2846,9 +2859,31 @@ impl<T> ThreadState<T> {
             .expect("robust-list process state mutex poisoned");
         if let Some(head) = head {
             process.heads.insert(self.dettid, head);
+            if let Some(physical_tid) = self.physical_tid {
+                process.physical_tids.insert(self.dettid, physical_tid);
+            }
         } else {
             process.heads.remove(&self.dettid);
+            process.physical_tids.remove(&self.dettid);
         }
+    }
+
+    /// [`Self::robust_list_heads`] with each owner's host TID, where the
+    /// backend gives one.
+    pub(crate) fn robust_list_owners(&self) -> Vec<RobustListOwner> {
+        let process = self
+            .robust_list_process
+            .lock()
+            .expect("robust-list process state mutex poisoned");
+        process
+            .heads
+            .iter()
+            .map(|(&dettid, &head)| RobustListOwner {
+                dettid,
+                head,
+                physical_tid: process.physical_tids.get(&dettid).copied(),
+            })
+            .collect()
     }
 
     pub(crate) fn robust_list_heads(&self) -> Vec<(DetTid, usize)> {

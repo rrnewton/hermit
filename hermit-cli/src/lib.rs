@@ -3276,9 +3276,12 @@ mod dbt_detconfig_tests {
     fn dbt_detconfig_matches_806cf2fa_bytes() {
         for ((name, mut config), (golden_name, golden)) in cases().into_iter().zip(GOLDEN) {
             // Keep the historical capability value as well as its byte oracle.
-            // Current DBT descriptor facts need the versioned transport below.
+            // Current DBT descriptor facts, and DBT's guest-memory
+            // compare-and-exchange, which the legacy form predates, need the
+            // versioned transport below.
             config.backend.tool_shares_guest_descriptor_table = false;
             config.backend.rediscovers_descriptors_after_exec = false;
+            config.backend.supports_guest_memory_compare_exchange = false;
             assert_eq!(name, golden_name);
             let encoded = dbt_detconfig_json(&config).unwrap();
             assert_eq!(
@@ -3329,6 +3332,9 @@ mod dbt_detconfig_tests {
         // opt into host-timed turns or loopback poller yielding.
         for mask in 0_u8..16 {
             let mut config = prepare_backend_config(default_config(), Backend::Dbt);
+            // Only the four coupled descriptor facts vary here; DBT's
+            // compare-and-exchange alone would need the versioned form.
+            config.backend.supports_guest_memory_compare_exchange = false;
             config.backend.tool_shares_guest_descriptor_table = mask & 1 != 0;
             config.backend.rediscovers_descriptors_after_exec = mask & 2 != 0;
             config.backend.internal_pipe_turns_are_host_timed = mask & 4 != 0;
@@ -3353,6 +3359,8 @@ mod dbt_detconfig_tests {
     fn representable_descriptor_facts_keep_the_current_config_bytes() {
         for discover in [false, true] {
             let mut config = prepare_backend_config(rich_config(), Backend::Dbt);
+            // The legacy form cannot carry DBT's compare-and-exchange.
+            config.backend.supports_guest_memory_compare_exchange = false;
             config.backend.tool_shares_guest_descriptor_table = discover;
             config.backend.rediscovers_descriptors_after_exec = discover;
             config.backend.internal_pipe_turns_are_host_timed = discover;
@@ -6555,6 +6563,7 @@ mod tests {
                 matches!(backend, Backend::Ptrace | Backend::E9patch),
             "provides_process_signal_control": kvm,
             "emulates_child_waits": kvm,
+            "supports_guest_memory_compare_exchange": dbt,
         })
     }
 
@@ -6699,6 +6708,8 @@ mod tests {
         ] {
             config.backend.tool_shares_guest_descriptor_table = false;
             config.backend.rediscovers_descriptors_after_exec = false;
+            // Postdates the legacy form, like the current descriptor facts.
+            config.backend.supports_guest_memory_compare_exchange = false;
             assert_eq!(
                 detcore::to_legacy_backend_json(&config).unwrap(),
                 before,

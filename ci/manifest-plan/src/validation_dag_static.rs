@@ -2029,7 +2029,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two host-signal-state refusal tests (host_signal_state_reads_are_refused_only_where_guest_
     // tids_are_not_host_tasks, a_latched_refusal_never_reads_a_host_task_signal_
     // state): 1520.
-    ("test.detcore_unit", 1520),
+    // The five robust_list tests for an owner whose native exit can come
+    // before the walk (https://github.com/rrnewton/hermit/issues/4238) add
+    // to main's population: 1525 (source projection; combined listing pending).
+    ("test.detcore_unit", 1525),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2244,7 +2247,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4041): 299.
     // And epoll_determinism::epoll_pwait2_polls_under_run_strict
     // (https://github.com/rrnewton/hermit/issues/4228): 300.
-    ("test.hermit_integration", 300),
+    // And robust_futex_owner_death::dbt_robust_futex_owner_death_wakes_the_waiter_at_l2
+    // and robust_futex_owner_death::dbt_detcore_stores_the_owner_word_before_waking_the_waiter
+    // And robust_futex_owner_death::dbt_wakes_the_waiter_when_an_exit_group_ends_the_owner
+    // (https://github.com/rrnewton/hermit/issues/4238): 303.
+    ("test.hermit_integration", 303),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -3278,7 +3285,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the ten rendered-procfs tests: 1517.
     // And the SIGCHLD sibling-before-stopped-creator test: 1518.
     // And the two host-signal-state refusal tests: 1520.
-    ("test.detcore_unit_on_host", 1520),
+    // The five robust_list native-exit tests add to main's population: 1525
+    // (source projection; current combined listing pending).
+    ("test.detcore_unit_on_host", 1525),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3323,7 +3332,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And four of the five ppoll_simulation tests: 298.
     // And the masked epoll_pwait test: 299.
     // And the epoll_pwait2 run test: 300.
-    ("test.hermit_integration_on_host", 300),
+    // And the three DBT robust-futex owner-death tests: 303.
+    ("test.hermit_integration_on_host", 303),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

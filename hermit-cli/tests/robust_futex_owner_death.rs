@@ -635,3 +635,200 @@ fn ptrace_wakes_nobody_when_an_exec_leaves_the_owner_word_alone() {
         );
     }
 }
+
+/// DBT reports a thread's exit to Detcore before the native exit runs, so
+/// Linux has not yet marked the owner word when Detcore's wake could let the
+/// waiter run. Detcore therefore makes the owner-word transition itself, with
+/// the guest-memory compare-and-exchange that DBT provides
+/// (`BackendCapabilities::supports_guest_memory_compare_exchange`), before it
+/// wakes the waiter (https://github.com/rrnewton/hermit/issues/4238). Before
+/// that, DBT did not model owner death at all, and this guest ended in
+/// Detcore's "Deadlock detected" report with the waiter parked.
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_robust_futex_owner_death_wakes_the_waiter_at_l2() {
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-owner-death-dbt");
+    let guest = build_guest(&build_root);
+    let verify_json = build_root.join("dbt.verify.json");
+    let _ = fs::remove_file(&verify_json);
+
+    let mut verify = Command::new("timeout");
+    verify
+        .args(["--kill-after", "5s", "120s"])
+        .arg(hermit_test::hermit_binary())
+        .args([
+            "--log=info",
+            "--backend=dbt",
+            "run",
+            "--strict",
+            "--tmp=/tmp",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+        ])
+        .arg(&verify_json)
+        .args(["--base-env=minimal", "--"])
+        .arg(&guest);
+    let captured = run_captured(
+        verify,
+        "DBT robust-futex owner-death strict verification",
+        &build_root.join("verify.out"),
+        &build_root.join("verify.err"),
+        true,
+    );
+    assert!(
+        captured
+            .stdout
+            .contains("PASS: robust mutex waiter received EOWNERDEAD"),
+        "the waiter did not observe EOWNERDEAD under Hermit DBT\nstdout:\n{}\nstderr:\n{}",
+        captured.stdout,
+        captured.stderr,
+    );
+    assert_nonempty_canonical_l2(&verify_json, &captured.stdout, &captured.stderr);
+}
+
+/// The DBT leg of `detcore_wakes_the_modeled_waiter_before_linux_finishes_exit`:
+/// Detcore stores the owner word itself and wakes exactly one modeled waiter,
+/// and never takes the ptrace path that leaves the store to Linux. The store
+/// record is at DEBUG because it carries a raw guest address.
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_detcore_stores_the_owner_word_before_waking_the_waiter() {
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-dbt-evidence");
+    let guest = build_guest(&build_root);
+
+    let mut run = Command::new("timeout");
+    run.args(["--kill-after", "5s", "120s"])
+        .arg(hermit_test::hermit_binary())
+        .args([
+            "--log=debug",
+            "--backend=dbt",
+            "run",
+            "--strict",
+            "--tmp=/tmp",
+            "--base-env=minimal",
+            "--",
+        ])
+        .arg(&guest);
+    let captured = run_captured(
+        run,
+        "DBT robust-futex owner-death instrumented run",
+        &build_root.join("run.out"),
+        &build_root.join("run.err"),
+        true,
+    );
+    let stdout = captured.stdout;
+    let stderr = captured.stderr;
+    assert!(
+        stdout.contains("PASS: robust mutex waiter received EOWNERDEAD"),
+        "the waiter did not observe EOWNERDEAD under Hermit DBT\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("robust-list owner death: stored futex word")
+            && stderr.contains("atomically"),
+        "Detcore did not store the owner word itself on DBT\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("robust-list owner death woke 1 waiter(s)"),
+        "Detcore's owner-death wake did not reach exactly one modeled waiter\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("for backend exit cleanup"),
+        "DBT took the deferred-write path that depends on the native exit's timing\nstderr:\n{stderr}"
+    );
+}
+
+/// An exit_group by a thread that does not own the robust mutex ends the
+/// owning sibling too, and Linux walks that sibling's list as it dies. On DBT,
+/// Detcore marks the owner word and wakes the waiter in the exit_group's own
+/// handler, after its grant has logically killed the group
+/// (https://github.com/rrnewton/hermit/issues/4238). The sibling's native exit
+/// can come first: the native client rewrites its owner words to the host TID
+/// so that Linux's own walk finds them, and Linux may mark the word before
+/// Detcore reads it. Detcore takes the word under either TID, and wakes in
+/// Linux's place when Linux already marked it, so the waiter is woken exactly
+/// once whichever comes first. Before, this mode left the waiter parked in
+/// about a third of runs.
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_wakes_the_waiter_when_an_exit_group_ends_the_owner() {
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("robust-futex-lifecycle-dbt");
+    let guest = build_lifecycle_guest(&build_root);
+    let verify_json = build_root.join("dbt-exit-group.verify.json");
+    let _ = fs::remove_file(&verify_json);
+
+    let mut verify = Command::new("timeout");
+    verify
+        .args(["--kill-after", "5s", "120s"])
+        .arg(hermit_test::hermit_binary())
+        .args([
+            "--log=info",
+            "--backend=dbt",
+            "run",
+            "--strict",
+            "--tmp=/tmp",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+        ])
+        .arg(&verify_json)
+        .args(["--base-env=minimal", "--"])
+        .arg(&guest)
+        .arg("exit-group");
+    let captured = run_captured(
+        verify,
+        "DBT robust-futex exit-group strict verification",
+        &build_root.join("dbt-exit-group-verify.out"),
+        &build_root.join("dbt-exit-group-verify.err"),
+        true,
+    );
+    assert!(
+        captured.stdout.contains("PASS: waiter received EOWNERDEAD"),
+        "the waiter did not observe EOWNERDEAD after exit_group under Hermit DBT\nstdout:\n{}\nstderr:\n{}",
+        captured.stdout,
+        captured.stderr,
+    );
+    assert_nonempty_canonical_l2(&verify_json, &captured.stdout, &captured.stderr);
+
+    let mut run = Command::new("timeout");
+    run.args(["--kill-after", "5s", "120s"])
+        .arg(hermit_test::hermit_binary())
+        .args([
+            "--log=info",
+            "--backend=dbt",
+            "run",
+            "--strict",
+            "--tmp=/tmp",
+            "--base-env=minimal",
+            "--",
+        ])
+        .arg(&guest)
+        .arg("exit-group");
+    let captured = run_captured(
+        run,
+        "DBT robust-futex exit-group run",
+        &build_root.join("dbt-exit-group.out"),
+        &build_root.join("dbt-exit-group.err"),
+        true,
+    );
+    assert!(
+        captured.stdout.contains("PASS: waiter received EOWNERDEAD"),
+        "the waiter did not observe EOWNERDEAD after exit_group under Hermit DBT\nstdout:\n{}\nstderr:\n{}",
+        captured.stdout,
+        captured.stderr,
+    );
+    assert_eq!(
+        captured
+            .stderr
+            .matches("robust-list owner death woke 1 waiter(s)")
+            .count(),
+        1,
+        "Detcore must wake exactly one modeled waiter\nstderr:\n{}",
+        captured.stderr,
+    );
+    assert!(
+        !captured.stderr.contains("after physical exit"),
+        "DBT took the staged path that waits for exit callbacks\nstderr:\n{}",
+        captured.stderr,
+    );
+}

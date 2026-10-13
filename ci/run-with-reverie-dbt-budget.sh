@@ -1476,7 +1476,18 @@ fi
 # recipe input: build.rs, the vendored DynamoRIO tree, third-party/, the root
 # Cargo.toml and rust-toolchain.toml are unchanged. The two fixtures raise the
 # reverie-dbt inventory from 947 to 949. No new timing sample is claimed.
-expected_pin=48e78557804772b7e0d2f988504ca9ae2ab6115c
+# DBT ROBUST-FUTEX COMPARE-EXCHANGE SDK-BUDGET CARRY (2026-10-13): advance from 48e78557 to 60a68e8bce0630c06e9c6cb453fc005467250d80.
+# The added commits are cb1fd8be0, 57b25878e, bb510cd10 and c710d37a2
+# (BACKENDS.md, reverie-inguest, reverie-liteinst, reverie-rpc-transport's
+# codec and scripts/m1_artifact.rs) and 60a68e8bc
+# (https://github.com/rrnewton/reverie/pull/1023: reverie-dbt/native/client.c,
+# reverie-dbt/src/lib.rs and tools.rs, the thread_start_live test,
+# reverie-memory/src/lib.rs, reverie/src/capabilities.rs and one new reverie-dbt
+# test fixture). None is an SDK recipe input: build.rs, the vendored DynamoRIO
+# tree, third-party/, the root Cargo.toml and rust-toolchain.toml are unchanged.
+# The fixture raises the reverie-dbt inventory from 949 to 950. No new timing
+# sample is claimed.
+expected_pin=60a68e8bce0630c06e9c6cb453fc005467250d80
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

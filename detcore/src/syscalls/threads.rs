@@ -78,6 +78,7 @@ use crate::tool_global::yield_once;
 use crate::tool_local::Detcore;
 use crate::tool_local::PendingVfork;
 use crate::tool_local::RobustListExit;
+use crate::tool_local::RobustListOwner;
 use crate::tool_local::RobustListWake;
 use crate::types::ChildWaitExitClass;
 use crate::types::ChildWaitSelector;
@@ -1811,8 +1812,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Linux runs this from `mm_release()` while a task dies. Detcore performs
     /// the same walk and issues the wake against its own modeled waiter pool,
     /// which is where precise-mode futex waiters actually live. Ptrace leaves
-    /// the atomic word transition to Linux; backends without that ordering do
-    /// not enter this path. The algorithm is in
+    /// the atomic word transition to Linux; DBT makes it itself with an atomic
+    /// compare-and-exchange before the wake ([`OwnerWordStore`]); other
+    /// backends do not enter this path. The algorithm is in
     /// [`crate::syscalls::robust_list`]; this function only supplies guest
     /// memory and the scheduler wake.
     ///
@@ -1824,12 +1826,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     // TODO-HUMAN-REVIEW(PR-2223): Review owner-death wakeup
     // emulation, which changes how a dying thread's peers are scheduled.
     async fn run_robust_list_owner_death<G: Guest<Self>>(&self, guest: &mut G) {
-        if !self.cfg.backend.runs_exit_robust_list
-            || !self.cfg.sequentialize_threads
-            || self.cfg.debug_futex_mode != BlockingMode::Precise
-        {
+        let Some(store) = self.robust_owner_word_store() else {
             return;
-        }
+        };
         let Some(head) = guest.thread_state().robust_list_head else {
             return;
         };
@@ -1852,6 +1851,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest,
             dettid,
             staged_wakes: None,
+            store,
+            physical_tid: None,
             tool: PhantomData,
         };
         let outcome = robust_list::exit_robust_list(&mut effects, head, owner_tid).await;
@@ -1870,24 +1871,100 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Read every registered robust list in the current thread group while
     /// its address space still exists, but hold its modeled wakes until the
-    /// corresponding ptrace exit callback confirms Linux has completed the
-    /// atomic owner-word update.
+    /// corresponding exit callback. On ptrace that callback confirms Linux has
+    /// completed the atomic owner-word update.
+    ///
+    /// Where Detcore stores the owner words itself ([`OwnerWordStore::Tool`]),
+    /// nothing is staged. An exit_group marks the words and wakes their
+    /// waiters at once instead (`Self::handle_exit_group`). A delivered signal
+    /// may still be caught or ignored: Detcore must not mark a live owner's
+    /// word, and that backend's native exit callback cannot tell which signal
+    /// ended the thread group.
     pub(crate) async fn stage_thread_group_robust_list_wakes<G: Guest<Self>>(
         &self,
         guest: &mut G,
         reason: RobustListExit,
     ) {
-        if let Some(staged) = self
-            .read_thread_group_robust_list_wakes(guest, OwnerDeath::Exit)
-            .await
+        match self.robust_owner_word_store() {
+            None | Some(OwnerWordStore::Tool) => {}
+            Some(OwnerWordStore::Kernel) => {
+                let staged = self
+                    .read_thread_group_robust_list_wakes(guest, OwnerDeath::Exit)
+                    .await;
+                guest.thread_state().stage_robust_list_wakes(reason, staged);
+            }
+        }
+    }
+
+    /// Replay Linux's `exit_robust_list()` for each `(owner, head)` of the
+    /// current thread group, as that owner's list, storing each owner word
+    /// with the guest-memory compare-and-exchange and waking at once
+    /// ([`OwnerWordStore::Tool`]).
+    async fn run_thread_group_robust_list_owner_death<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        heads: Vec<RobustListOwner>,
+    ) {
+        let current = guest.thread_state().dettid;
+        for RobustListOwner {
+            dettid: owner,
+            head,
+            physical_tid,
+        } in heads
         {
-            guest.thread_state().stage_robust_list_wakes(reason, staged);
+            // The grant has logically killed the group's other threads, and on
+            // DBT each then makes its native exit, which can come before this
+            // walk: the native client first rewrites the thread's owner words
+            // to its host TID, so that Linux's own exit_robust_list finds them,
+            // and Linux may then mark them and wake nobody Detcore parked. The
+            // calling thread's own exit has not begun.
+            let physical_tid = physical_tid
+                .filter(|_| owner != current)
+                .map(|tid| tid as u32);
+            let mut effects = GuestRobustEffects::<'_, G, T> {
+                guest,
+                dettid: owner,
+                staged_wakes: None,
+                store: OwnerWordStore::Tool,
+                physical_tid,
+                tool: PhantomData,
+            };
+            let outcome =
+                robust_list::exit_robust_list(&mut effects, head, owner.as_raw() as u32).await;
+            if outcome.head_unreadable || outcome.aborted {
+                trace!(
+                    "[detcore, dtid {}] robust-list owner death stopped early: {:?}",
+                    owner, outcome,
+                );
+            }
+        }
+    }
+
+    /// Who changes a dead owner's robust-futex word on this backend, or `None`
+    /// where Detcore does not model robust-futex owner death.
+    ///
+    /// Only the precise futex model needs owner death modeled. Polling and
+    /// external modes park waiters in the host kernel, which performs its own
+    /// robust-list cleanup; and without thread sequentialization Detcore does
+    /// not model futexes at all.
+    fn robust_owner_word_store(&self) -> Option<OwnerWordStore> {
+        if !self.cfg.sequentialize_threads || self.cfg.debug_futex_mode != BlockingMode::Precise {
+            return None;
+        }
+        if self.cfg.backend.runs_exit_robust_list {
+            Some(OwnerWordStore::Kernel)
+        } else if self.cfg.backend.supports_guest_memory_compare_exchange {
+            Some(OwnerWordStore::Tool)
+        } else {
+            None
         }
     }
 
     /// The owner-death wakes Linux's `exit_robust_list` would make for every
     /// registered robust list in the current thread group, read without
-    /// changing guest memory. `None` where Detcore does not model them.
+    /// changing guest memory: Linux makes the owner-word transitions. Callers
+    /// decide whether Detcore models owner death at all
+    /// ([`Self::robust_owner_word_store`]).
     ///
     /// Each list is walked as its owner's, with that owner's TID, except the
     /// caller's own list in an exec by a thread that is not the group leader.
@@ -1899,14 +1976,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         death: OwnerDeath,
-    ) -> Option<Vec<(DetTid, Vec<RobustListWake>)>> {
-        if !self.cfg.backend.runs_exit_robust_list
-            || !self.cfg.sequentialize_threads
-            || self.cfg.debug_futex_mode != BlockingMode::Precise
-        {
-            return None;
-        }
-
+    ) -> Vec<(DetTid, Vec<RobustListWake>)> {
         let caller = guest.thread_state().dettid;
         let tgid = guest.thread_state().detpid.expect("detpid unset");
         let heads = guest.thread_state().robust_list_heads();
@@ -1922,6 +1992,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 guest,
                 dettid: owner,
                 staged_wakes: Some(&mut wakes),
+                store: OwnerWordStore::Kernel,
+                physical_tid: None,
                 tool: PhantomData,
             };
             let outcome = robust_list::exit_robust_list(&mut effects, head, walked_as as u32).await;
@@ -1933,7 +2005,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             staged.push((owner, wakes));
         }
-        Some(staged)
+        staged
     }
 
     /// Exit system call
@@ -1977,6 +2049,20 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await;
         }
+        // Where Detcore stores the owner words itself, it marks them and wakes
+        // their waiters after the grant, as an exit does
+        // (`Self::run_robust_list_owner_death`): nothing can call the
+        // exit_group off, the stores are atomic and precede every wake, and
+        // the grant logically kills the group's other threads, so none of them
+        // runs again. Holding the wakes for their exit callbacks would lose
+        // them on DBT, which answers a logically killed thread's callback
+        // `ThreadExited`. Read the heads before the grant: a cancelled
+        // thread's exit hook drops its head
+        // (`ThreadState::take_robust_list_wakes_after_exit`), and on DBT that
+        // hook runs on the thread itself and can come before this walk. The
+        // lists stay mapped until the native exit_group.
+        let tool_store_heads = (self.robust_owner_word_store() == Some(OwnerWordStore::Tool))
+            .then(|| guest.thread_state().robust_list_owners());
         let request = guest.thread_state().mk_request(
             ResourceID::Exit {
                 group: true,
@@ -1986,8 +2072,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             Permission::RW,
         );
         resource_request(guest, request).await;
-        self.stage_thread_group_robust_list_wakes(guest, RobustListExit::ExitGroup)
-            .await;
+        match tool_store_heads {
+            Some(heads) => {
+                self.run_thread_group_robust_list_owner_death(guest, heads)
+                    .await
+            }
+            None => {
+                self.stage_thread_group_robust_list_wakes(guest, RobustListExit::ExitGroup)
+                    .await
+            }
+        }
         // It's ok here that we skip running the posthook:
         guest.tail_inject(call).await
     }
@@ -2676,9 +2770,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         // `ThreadState::stage_robust_list_wakes_for_exec`), then clears
         // `task->robust_list`; the new image re-registers its own. Read the
         // lists while the old image is still mapped.
-        let exec_robust_wakes = self
-            .read_thread_group_robust_list_wakes(guest, OwnerDeath::Exec)
-            .await;
+        // Linux marks the owner words itself at a successful exec, on DBT after
+        // the native client has rewritten them to the TIDs Linux knows, and a
+        // failed exec must leave them alone, so Detcore only reads them here
+        // whoever stores them at an exit.
+        let exec_robust_wakes = match self.robust_owner_word_store() {
+            Some(_) => Some(
+                self.read_thread_group_robust_list_wakes(guest, OwnerDeath::Exec)
+                    .await,
+            ),
+            None => None,
+        };
         let old_robust_list_head;
 
         {
@@ -3940,6 +4042,11 @@ struct GuestRobustEffects<'a, G, T> {
     guest: &'a mut G,
     dettid: DetTid,
     staged_wakes: Option<&'a mut Vec<RobustListWake>>,
+    store: OwnerWordStore,
+    /// The owner's host TID, for a thread-group walk over another thread's
+    /// list where Detcore stores the words
+    /// ([`robust_list::RobustDeathEffects::owner_physical_tid`]).
+    physical_tid: Option<u32>,
     tool: PhantomData<T>,
 }
 
@@ -3948,6 +4055,10 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    fn owner_physical_tid(&self) -> Option<u32> {
+        self.physical_tid
+    }
+
     fn read_u64(&mut self, address: usize) -> Option<u64> {
         let at = Addr::<u64>::from_raw(address)?;
         self.guest.memory().read_value::<_, u64>(at).ok()
@@ -3962,10 +4073,50 @@ where
         &mut self,
         address: usize,
         expected: u32,
-        _desired: u32,
+        desired: u32,
     ) -> robust_list::FutexCasOutcome {
         use robust_list::FutexCasOutcome;
 
+        if self.store == OwnerWordStore::Tool {
+            // The backend's guest memory has an atomic compare-and-exchange
+            // (`BackendCapabilities::supports_guest_memory_compare_exchange`),
+            // which is the kernel's `futex_cmpxchg_value_locked`, so Detcore
+            // makes the transition itself and the wake that follows never
+            // depends on when the native exit runs. Linux's own walk later
+            // finds a word that no longer names the dying thread.
+            let Some(at) = AddrMut::<u32>::from_raw(address) else {
+                return FutexCasOutcome::Faulted;
+            };
+            return match self
+                .guest
+                .memory()
+                .compare_exchange_u32(at, expected, desired)
+            {
+                Ok(observed) if observed == expected => {
+                    // DEBUG, not INFO: the line carries a raw guest address.
+                    debug!(
+                        "[detcore, dtid {}] robust-list owner death: stored futex word {:#x} atomically",
+                        self.dettid, address,
+                    );
+                    FutexCasOutcome::Matched
+                }
+                Ok(observed) => FutexCasOutcome::Changed(observed),
+                // The backend advertised the operation, so its absence is a
+                // backend failure, not a fault to walk past.
+                Err(Errno::ENOSYS) => panic!(
+                    "[detcore, dtid {}] the backend advertises \
+                     supports_guest_memory_compare_exchange but its guest memory \
+                     has no compare-and-exchange (ENOSYS)",
+                    self.dettid
+                ),
+                // A lost store, as in Linux's handle_futex_death when it
+                // cannot make the word writable: the walk ends and nothing is
+                // woken. EFAULT is also what the DBT exchange gives for a word
+                // on a code page DynamoRIO protects outside a system-call
+                // event, for example from a killed thread's exit event.
+                Err(_) => FutexCasOutcome::Faulted,
+            };
+        }
         let Some(read_at) = Addr::<u32>::from_raw(address) else {
             return FutexCasOutcome::Faulted;
         };
@@ -3973,7 +4124,8 @@ where
         // cross-address-space cmpxchg, so Detcore never stores the owner word
         // itself. It re-reads the word to decide whether the kernel's retry
         // loop would take another pass, then leaves the replacement to the
-        // native task exit. Both callers return early unless
+        // native task exit. This branch runs only for
+        // [`OwnerWordStore::Kernel`], where
         // `BackendCapabilities::runs_exit_robust_list` says the backend performs
         // that exit.
         let observed = match self.guest.memory().read_value::<_, u32>(read_at) {
@@ -4052,6 +4204,19 @@ enum OwnerDeath {
     /// A successful execve: the other threads exit with their own TIDs, and the
     /// caller's list is walked under the TID it holds after `de_thread`.
     Exec,
+}
+
+/// Who changes a dead owner's robust-futex word to `FUTEX_OWNER_DIED`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerWordStore {
+    /// Linux, in the native task exit that the backend completes before it
+    /// lets another modeled thread run
+    /// (`BackendCapabilities::runs_exit_robust_list`). Detcore only reads the
+    /// word.
+    Kernel,
+    /// Detcore, with an atomic compare-and-exchange on guest memory, before it
+    /// wakes a waiter (`BackendCapabilities::supports_guest_memory_compare_exchange`).
+    Tool,
 }
 
 /// How precise and polling futex modes answer a futex command, decided as

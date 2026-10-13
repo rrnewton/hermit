@@ -211,6 +211,24 @@ pub(crate) trait RobustDeathEffects {
     /// `observed` is the word's value at this point, carried so the caller can
     /// pass it to the scheduler RPC and log it.
     async fn wake_one(&mut self, address: usize, observed: u32);
+
+    /// The owner's TID as Linux knows it, where it differs from the TID this
+    /// walk was given and the owner's own native exit may run concurrently
+    /// with this walk. Before that exit the backend may rewrite the owner's
+    /// words to this TID so that Linux's `exit_robust_list()` finds them, and
+    /// that kernel walk may then already have marked them.
+    ///
+    /// So, outside the pending slot, a word naming this TID is the owner's
+    /// and is marked as such, and a non-PI word that holds
+    /// `FUTEX_OWNER_DIED | FUTEX_WAITERS` and no owner is the kernel walk's
+    /// store: the kernel's wake found no waiter where this walk's caller parks
+    /// them, so this walk wakes one in its place. A lock on the list is held,
+    /// so its word names the owner, and no other store leaves it ownerless
+    /// with `FUTEX_OWNER_DIED`; where that is wrong the wake is spurious, which
+    /// futex waiters tolerate. `None` by default.
+    fn owner_physical_tid(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// Why a walk stopped, for logging and for tests.
@@ -327,6 +345,13 @@ pub(crate) async fn exit_robust_list<E: RobustDeathEffects>(
 
 /// Replay the kernel's `handle_futex_death()` for one list entry.
 ///
+/// Whether `uval` is the value Linux's `handle_futex_death()` leaves on a
+/// non-PI word with waiters: `FUTEX_OWNER_DIED | FUTEX_WAITERS` and no owner
+/// (see [`RobustDeathEffects::owner_physical_tid`]).
+fn marked_by_a_native_exit(uval: u32, is_pi: bool) -> bool {
+    !is_pi && uval == FUTEX_WAITERS | FUTEX_OWNER_DIED
+}
+
 /// `cas_retries` accumulates every `goto retry` taken because the futex word
 /// changed between being read and being written.
 async fn handle_futex_death<E: RobustDeathEffects>(
@@ -376,7 +401,15 @@ async fn handle_futex_death<E: RobustDeathEffects>(
             return DeathStep::Continue;
         }
 
-        let Some(transition) = futex_death_transition(uval, owner_tid, entry.is_pi) else {
+        let physical_tid = effects.owner_physical_tid().filter(|_| !pending_op);
+        let transition = futex_death_transition(uval, owner_tid, entry.is_pi).or_else(|| {
+            physical_tid.and_then(|tid| futex_death_transition(uval, tid, entry.is_pi))
+        });
+        let Some(transition) = transition else {
+            if physical_tid.is_some() && marked_by_a_native_exit(uval, entry.is_pi) {
+                effects.wake_one(word, uval).await;
+                return DeathStep::Continue;
+            }
             // `if ((uval & FUTEX_TID_MASK) != task_pid_vnr(curr)) return 0;`
             // On the first pass this is an entry the dying thread never owned.
             // On a retry it is the race this loop exists for: the futex was
@@ -419,6 +452,8 @@ mod tests {
     const GLIBC_FUTEX_OFFSET: i64 = -32;
 
     const OWNER: u32 = 5;
+    /// The owner's TID as Linux knows it, for `owner_physical_tid`.
+    const PHYSICAL: u32 = 11;
 
     /// Byte-addressed fake guest memory plus a recorder for every effect the
     /// walk performs, so a test can assert the exact sequence.
@@ -441,6 +476,8 @@ mod tests {
         races_before_write: BTreeMap<usize, VecDeque<u32>>,
         /// Leave the owner-word transition to the backend's task-exit cleanup.
         defer_owner_death_to_backend: bool,
+        /// Answer `owner_physical_tid` with this.
+        physical_tid: Option<u32>,
         /// `(word, before, after)` for each applied transition, in order.
         marks: Vec<(usize, u32, u32)>,
         /// `(word, observed)` for each wake, in order.
@@ -560,6 +597,10 @@ mod tests {
 
         async fn wake_one(&mut self, address: usize, observed: u32) {
             self.wakes.push((address, observed));
+        }
+
+        fn owner_physical_tid(&self) -> Option<u32> {
+            self.physical_tid
         }
     }
 
@@ -886,6 +927,122 @@ mod tests {
         assert!(guest.wakes.is_empty());
         assert_eq!(outcome.entries_visited, 1);
         assert_eq!(outcome.cas_retries, 1);
+    }
+
+    #[test]
+    fn a_word_a_native_exit_already_marked_is_woken_without_a_store() {
+        // The owner's own Linux exit ran exit_robust_list first: the word
+        // holds FUTEX_OWNER_DIED | FUTEX_WAITERS and no owner.
+        for (native, wakes) in [(true, 1), (false, 0)] {
+            let mut guest = FakeGuest {
+                physical_tid: native.then_some(PHYSICAL),
+                ..FakeGuest::default()
+            };
+            guest.head(0x1000, 0x2020, 0);
+            guest.node(0x2020, 0x1000, FUTEX_WAITERS | FUTEX_OWNER_DIED);
+
+            let outcome = walk(&mut guest, 0x1000, OWNER);
+
+            assert!(guest.marks.is_empty());
+            assert_eq!(
+                guest.get_u32(0x2000),
+                Some(FUTEX_WAITERS | FUTEX_OWNER_DIED)
+            );
+            assert_eq!(guest.wakes.len(), wakes, "owner exited natively: {native}");
+            assert_eq!(outcome.entries_visited, 1);
+        }
+    }
+
+    #[test]
+    fn a_native_exit_between_the_read_and_the_store_is_woken_once() {
+        // The owner's Linux exit marks the word after the walk reads it, so
+        // the compare-and-swap sees the kernel's value and the retry wakes.
+        let mut guest = FakeGuest {
+            physical_tid: Some(PHYSICAL),
+            ..FakeGuest::default()
+        };
+        guest.head(0x1000, 0x2020, 0);
+        guest.node(0x2020, 0x1000, FUTEX_WAITERS | OWNER);
+        guest.race_after_read(0x2000, FUTEX_WAITERS | FUTEX_OWNER_DIED);
+
+        let outcome = walk(&mut guest, 0x1000, OWNER);
+
+        assert!(guest.marks.is_empty());
+        assert_eq!(
+            guest.wakes,
+            vec![(0x2000, FUTEX_WAITERS | FUTEX_OWNER_DIED)]
+        );
+        assert_eq!(outcome.cas_retries, 1);
+    }
+
+    #[test]
+    fn a_word_rewritten_to_the_owners_physical_tid_is_marked_and_woken() {
+        // The backend rewrote the owner's word to the TID Linux knows it by,
+        // ahead of the owner's native exit, which has not marked it yet.
+        for (physical, marked) in [(Some(PHYSICAL), true), (None, false)] {
+            let mut guest = FakeGuest {
+                physical_tid: physical,
+                ..FakeGuest::default()
+            };
+            guest.head(0x1000, 0x2020, 0);
+            guest.node(0x2020, 0x1000, FUTEX_WAITERS | PHYSICAL);
+
+            walk(&mut guest, 0x1000, OWNER);
+
+            if marked {
+                assert_eq!(
+                    guest.marks,
+                    vec![(
+                        0x2000,
+                        FUTEX_WAITERS | PHYSICAL,
+                        FUTEX_WAITERS | FUTEX_OWNER_DIED
+                    )]
+                );
+                assert_eq!(
+                    guest.wakes,
+                    vec![(0x2000, FUTEX_WAITERS | FUTEX_OWNER_DIED)]
+                );
+            } else {
+                assert!(guest.marks.is_empty());
+                assert!(guest.wakes.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn the_pending_slot_never_takes_the_physical_tid() {
+        // The pending slot may name a lock that was handed on, so only the
+        // owner's own TID counts there, as in Linux.
+        let mut guest = FakeGuest {
+            physical_tid: Some(PHYSICAL),
+            ..FakeGuest::default()
+        };
+        guest.head(0x1000, 0x1000, 0x2020);
+        guest.put_u32(0x2000, FUTEX_WAITERS | PHYSICAL);
+
+        walk(&mut guest, 0x1000, OWNER);
+
+        assert!(guest.marks.is_empty());
+        assert!(guest.wakes.is_empty());
+    }
+
+    #[test]
+    fn a_native_exit_wakes_nobody_without_waiters_or_for_a_live_owner() {
+        // No FUTEX_WAITERS: Linux wakes nobody either. A word naming another
+        // thread, or a free word, is not a native exit's store.
+        for word in [FUTEX_OWNER_DIED, FUTEX_WAITERS | 7, 0, FUTEX_WAITERS] {
+            let mut guest = FakeGuest {
+                physical_tid: Some(PHYSICAL),
+                ..FakeGuest::default()
+            };
+            guest.head(0x1000, 0x2020, 0);
+            guest.node(0x2020, 0x1000, word);
+
+            walk(&mut guest, 0x1000, OWNER);
+
+            assert!(guest.wakes.is_empty(), "word {word:#x}");
+            assert!(guest.marks.is_empty(), "word {word:#x}");
+        }
     }
 
     #[test]

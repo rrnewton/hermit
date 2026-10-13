@@ -659,8 +659,10 @@ mod tests {
             // ppoll_simulation tests (https://github.com/rrnewton/hermit/issues/4042),
             // plus the masked epoll_pwait test
             // (https://github.com/rrnewton/hermit/issues/4041), plus the
-            // epoll_pwait2 run test (https://github.com/rrnewton/hermit/issues/4228).
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "300");
+            // epoll_pwait2 run test (https://github.com/rrnewton/hermit/issues/4228),
+            // plus the three DBT robust-futex owner-death tests
+            // (https://github.com/rrnewton/hermit/issues/4238).
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "303");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

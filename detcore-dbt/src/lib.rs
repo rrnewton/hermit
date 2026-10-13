@@ -80,10 +80,11 @@ const RANDOM_FILL_CHUNK_BYTES: usize = 4096;
 const GETRANDOM_MAX_BYTES: usize = (i32::MAX as usize) & !4095;
 const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | libc::GRND_INSECURE;
 /// Version 6 adds the initialized native mode and returned startup status.
-/// Version 7 adds `reverie_dbt_runtime_signal_event`. The 48-byte callback
-/// layout and version-5 RDTSC entry remain unchanged.
-const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 7;
-const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 48;
+/// Version 7 adds `reverie_dbt_runtime_signal_event`. Version 8 appends the
+/// native client's atomic guest-word compare-and-exchange to the callbacks,
+/// growing them from 48 to 56 bytes; the version-5 RDTSC entry is unchanged.
+const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 8;
+const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 56;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review the inherited DBT report descriptor.
@@ -114,7 +115,19 @@ fn upgrade_runtime_callbacks_v1(
         emit_stdout: callbacks.emit_stdout,
         emit_evidence: callbacks.emit,
         evidence_log_level: 0,
+        compare_exchange_u32: unsupported_compare_exchange,
     }
+}
+
+/// Stands in for the compare-and-exchange that callbacks older than ABI
+/// version 8 do not carry. Only refusing initialization paths read those.
+unsafe extern "C" fn unsupported_compare_exchange(
+    _address: usize,
+    _expected: u32,
+    _desired: u32,
+    _observed: *mut u32,
+) -> i32 {
+    -libc::ENOSYS
 }
 
 fn runtime_callback_channels(
@@ -1175,6 +1188,10 @@ unsafe fn runtime_background_init(
     let image_generation = IMAGE_GENERATION.load(Ordering::SeqCst);
     let (emit_diagnostic, emit_evidence, protected_level) = runtime_callback_channels(callbacks);
     let _ = DBT_DIAGNOSTIC_EMITTER.set(emit_diagnostic);
+    // Guest memory's atomic compare-and-exchange, which Detcore uses to mark a
+    // dead robust-mutex owner's word itself
+    // (`BackendCapabilities::supports_guest_memory_compare_exchange`).
+    reverie_dbt::install_guest_compare_exchange(callbacks.compare_exchange_u32);
     DBT_EVIDENCE_LOG_LEVEL.store(protected_level, Ordering::Release);
     RUNTIME_SHUTDOWN.store(false, Ordering::Release);
     RUNTIME_PAUSE_REQUESTED.store(false, Ordering::Release);
@@ -3069,6 +3086,8 @@ mod tests {
         // whose typed capabilities would take precedence over their projection.
         sent.backend.tool_shares_guest_descriptor_table = false;
         sent.backend.rediscovers_descriptors_after_exec = false;
+        // Postdates the legacy keys, which read it back as false.
+        sent.backend.supports_guest_memory_compare_exchange = false;
         let json = detcore::to_legacy_backend_json(&sent).unwrap();
         let key = "\"backend_requires_thread_directed_process_signals\"";
         let edited = json.replacen(&format!("{key}:true"), &format!("{key}:false"), 1);
@@ -3110,7 +3129,7 @@ mod tests {
 
     #[test]
     fn exported_runtime_identity_matches_the_pinned_reverie_abi() {
-        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 7);
+        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 8);
         // The native client's dbt_signal_event_t (ABI version 7).
         assert_eq!(std::mem::size_of::<DbtSignalEvent>(), 200);
         assert_eq!(std::mem::align_of::<DbtSignalEvent>(), 8);
@@ -3166,6 +3185,7 @@ mod tests {
             emit_stdout: test_stdout,
             emit_evidence: test_emit_evidence,
             evidence_log_level: 3,
+            compare_exchange_u32: unsupported_compare_exchange,
         };
         let (diagnostic, evidence, level) = runtime_callback_channels(&callbacks);
 
