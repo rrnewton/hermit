@@ -1172,7 +1172,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 guest,
                 Syscall::Munmap(
                     syscalls::Munmap::new()
-                        .with_addr(Addr::<u8>::from_raw(address))
+                        .with_addr(Addr::<libc::c_void>::from_raw(address))
                         .with_len(SCRATCH_BYTES),
                 ),
             )

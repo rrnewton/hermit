@@ -143,7 +143,7 @@ struct SnapshotFacts {
 
 impl From<CurrentFdinfoSnapshotFacts> for SnapshotFacts {
     fn from(facts: CurrentFdinfoSnapshotFacts) -> Self {
-        let errno = |result: Result<(), Errno>| result.map_err(|error| error as i32);
+        let errno = |result: Result<(), Errno>| result.map_err(Errno::into_raw);
         Self {
             origin: facts.origin,
             fresh_render: facts.fresh_render,
@@ -283,7 +283,7 @@ impl From<CurrentFdinfoRead> for Observation {
                 facts: facts.into(),
             },
             CurrentFdinfoRead::ReadErrno { errno, facts } => Self::ReadErrno {
-                errno: errno as i32,
+                errno: errno.into_raw(),
                 facts: facts.into(),
             },
         }
@@ -684,21 +684,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         // All backend owners and the non-wire capture token have settled.
         // Use the same ordinary accounted pools as fstat/fdinfo, including
         // actual ResourceID policy for replacement files at descriptors 0–2.
-        let inode =
-            match deterministic_stdio_inode_for_resource(scope.target_fd, target.ofd.resource) {
-                Some(inode) => inode,
-                None => {
-                    determinize_inode_observing_mtime(
-                        guest,
-                        receipt.object.inode,
-                        None,
-                        ObservedMtime::Unobserved,
-                        InodeSighting::Descriptor,
-                    )
-                    .await
-                    .0
-                }
-            };
+        let inode = match deterministic_stdio_inode_for_resource(
+            scope.target_fd,
+            target.ofd.resource.clone(),
+        ) {
+            Some(inode) => inode,
+            None => {
+                determinize_inode_observing_mtime(
+                    guest,
+                    receipt.object.inode,
+                    None,
+                    ObservedMtime::Unobserved,
+                    InodeSighting::Descriptor,
+                )
+                .await
+                .0
+            }
+        };
         let mount_id = if receipt.object.mount_id == 0 {
             0
         } else {
