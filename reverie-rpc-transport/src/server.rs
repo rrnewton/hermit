@@ -157,6 +157,7 @@ pub struct RpcServer<G: GlobalTool> {
     connections: ConnectionMonitor,
     issues: Option<RpcIssueMonitor>,
     admission: Option<Arc<dyn ConnectionAdmission>>,
+    native_control: Option<crate::native_control::NativeControlHub>,
 }
 
 /// Actual connection failures, retained independently of the serving task.
@@ -407,6 +408,7 @@ where
             connections: ConnectionMonitor::new(),
             issues: None,
             admission: None,
+            native_control: None,
         })
     }
 
@@ -414,6 +416,13 @@ where
     /// see [`ConnectionAdmission`].
     pub fn set_connection_admission(&mut self, admission: Arc<dyn ConnectionAdmission>) {
         self.admission = Some(admission);
+    }
+
+    /// Selects the versioned native-control protocol for this endpoint. Peers
+    /// must explicitly opt in; it is never guessed from ordinary payload bytes.
+    pub fn with_native_control(mut self, hub: crate::native_control::NativeControlHub) -> Self {
+        self.native_control = Some(hub);
+        self
     }
 
     /// The filesystem path this coordinator is listening on. Guests connect
@@ -485,10 +494,23 @@ where
             };
             let retain_issues = self.issues.is_some();
             let admission = self.admission.clone();
+            let native_control = self.native_control.clone();
             connections.spawn(async move {
                 let _connection_guard = connection_guard;
                 let future = async move {
                     let admitted = admit_connection(admission.as_ref(), &stream)?;
+                    if let Some(hub) = native_control {
+                        return serve_native_connection(
+                            global,
+                            config,
+                            stream,
+                            hub,
+                            readiness,
+                            connection_readiness,
+                            admitted,
+                        )
+                        .await;
+                    }
                     serve_connection_inner(
                         global,
                         config,
@@ -530,6 +552,18 @@ where
         let (stream, _addr) = self.listener.accept().await?;
         let _connection_guard = self.connections.connected();
         let admitted = admit_connection(self.admission.as_ref(), &stream)?;
+        if let Some(hub) = &self.native_control {
+            return serve_native_connection(
+                self.global.clone(),
+                self.config.clone(),
+                stream,
+                hub.clone(),
+                self.readiness.clone(),
+                self.connection_readiness.clone(),
+                admitted,
+            )
+            .await;
+        }
         serve_connection_inner(
             self.global.clone(),
             self.config.clone(),
@@ -540,6 +574,42 @@ where
         )
         .await
     }
+}
+
+async fn serve_native_connection<G: GlobalTool>(
+    global: Arc<G>,
+    config: G::Config,
+    stream: UnixStream,
+    hub: crate::native_control::NativeControlHub,
+    readiness: Option<Arc<AtomicBool>>,
+    connection_readiness: Option<Arc<AtomicBool>>,
+    admitted: Option<Admitted>,
+) -> Result<(), RpcError> {
+    // Retain the kernel's connect-time process generation throughout the actor.
+    // SO_PEERCRED provides its numeric pid; neither is inferred from `from`.
+    let peer = Arc::new(peer_pidfd(&stream)?);
+    let pid = stream
+        .peer_cred()?
+        .pid()
+        .ok_or_else(|| crate::native_control::protocol_error("native peer has no process id"))?;
+    let connection = hub.connection()?;
+    crate::native_control::serve(
+        global,
+        config,
+        stream,
+        hub,
+        connection,
+        pid,
+        Some(crate::native_control::NativePeerIdentity {
+            connection,
+            pid,
+            pidfd: peer,
+        }),
+        readiness,
+        connection_readiness,
+        admitted.map(|value| value.process_id),
+    )
+    .await
 }
 
 struct ConnectionGuard(ConnectionMonitor);

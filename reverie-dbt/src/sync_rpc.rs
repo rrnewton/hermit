@@ -54,6 +54,13 @@ use std::sync::Mutex;
 use std::sync::TryLockError;
 
 use reverie::Tid;
+use reverie_rpc_transport::native_control::CallIdentity;
+use reverie_rpc_transport::native_control::ClientFrame;
+use reverie_rpc_transport::native_control::Hello;
+use reverie_rpc_transport::native_control::NativeControlOperation;
+use reverie_rpc_transport::native_control::NativeOwner;
+use reverie_rpc_transport::native_control::ServerFrame;
+use reverie_rpc_transport::native_control::{self as control};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -64,6 +71,14 @@ use crate::SyscallInvoker;
 /// before launching the guest. DynamoRIO hides it from the guest and passes it
 /// to followed exec children; the client keeps its own copy across `fork`.
 pub const RPC_SOCKET_ENV: &str = "HERMIT_DBT_RPC_SOCKET";
+
+fn control_enabled() -> bool {
+    std::env::var_os(control::ENV).is_some_and(|value| value == "1")
+}
+
+fn control_io(error: impl std::fmt::Display) -> io::Error {
+    io::Error::other(error.to_string())
+}
 
 /// Mirror of [`reverie_rpc_transport::codec::DEFAULT_MAX_FRAME_LEN`] (16 MiB).
 const MAX_FRAME_LEN: usize = 16 * (1 << 20);
@@ -169,6 +184,46 @@ impl From<InitialConfigFailure> for InitialConfigError {
 /// The socket is retired with one close attempt before either result returns;
 /// close is not retried, including on Linux `EINTR`.
 pub fn read_initial_config<C: DeserializeOwned>(path: &Path) -> Result<C, InitialConfigError> {
+    read_initial_config_with_transport(path).map(|initial| initial.config)
+}
+
+/// Coordinator transport proved by a completely decoded startup handshake.
+///
+/// This is run-level transport state, not evidence that any child-exit capture
+/// transaction is active or complete. An environment hint or a registered
+/// native executor alone does not establish this state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InitialConfigTransport {
+    /// The coordinator sent its existing unwrapped configuration frame.
+    Legacy,
+    /// The coordinator sent a valid native-control Hello and configuration.
+    NativeControl,
+}
+
+/// Configuration and transport returned only after the startup socket closes.
+#[derive(Debug)]
+pub struct InitialConfig<C> {
+    /// Complete authoritative coordinator configuration.
+    pub config: C,
+    /// Validated transport for this initialized image.
+    pub transport: InitialConfigTransport,
+}
+
+/// Receives the configuration and preserves its validated transport kind.
+///
+/// The launch hint selects the expected framing; it is never a fallback rule.
+/// A malformed Hello, incomplete configuration or failed socket close returns
+/// an error rather than a legacy configuration or native-control authority.
+pub fn read_initial_config_with_transport<C: DeserializeOwned>(
+    path: &Path,
+) -> Result<InitialConfig<C>, InitialConfigError> {
+    read_initial_config_for_transport(path, control_enabled())
+}
+
+fn read_initial_config_for_transport<C: DeserializeOwned>(
+    path: &Path,
+    expect_native_control: bool,
+) -> Result<InitialConfig<C>, InitialConfigError> {
     // Validate all address bytes before creating any descriptor. In particular,
     // an embedded NUL must not silently select a different filesystem socket.
     if path.as_os_str().as_bytes().contains(&0) {
@@ -194,14 +249,15 @@ pub fn read_initial_config<C: DeserializeOwned>(path: &Path) -> Result<C, Initia
     let result = if connected < 0 {
         Err(InitialConfigFailure::Connect(io::Error::last_os_error()))
     } else {
-        receive_initial_config(&mut stream)
+        receive_initial_config(&mut stream, expect_native_control)
     };
     finish_initial_config(stream, result, close_initial_socket)
 }
 
 fn receive_initial_config<C: DeserializeOwned>(
     stream: &mut UnixStream,
-) -> Result<C, InitialConfigFailure> {
+    expect_native_control: bool,
+) -> Result<InitialConfig<C>, InitialConfigFailure> {
     let mut header = [0_u8; 4];
     stream
         .read_exact(&mut header)
@@ -214,12 +270,22 @@ fn receive_initial_config<C: DeserializeOwned>(
     stream
         .read_exact(&mut payload)
         .map_err(InitialConfigFailure::Read)?;
+    let (payload, transport) = if expect_native_control {
+        (
+            Hello::decode(&payload)
+                .map_err(|error| InitialConfigFailure::Read(control_io(error)))?
+                .config,
+            InitialConfigTransport::NativeControl,
+        )
+    } else {
+        (payload, InitialConfigTransport::Legacy)
+    };
     let (config, consumed) = bincode::serde::decode_from_slice(&payload, bincode::config::legacy())
         .map_err(InitialConfigFailure::Decode)?;
     if consumed != payload.len() {
         return Err(InitialConfigFailure::TrailingBytes);
     }
-    Ok(config)
+    Ok(InitialConfig { config, transport })
 }
 
 fn close_initial_socket(fd: RawFd) -> io::Result<()> {
@@ -299,6 +365,10 @@ struct Connection {
 
 impl Connection {
     fn connect(path: &Path, pid: u32) -> Self {
+        assert!(
+            !control_enabled(),
+            "native control RPC requires a live native application callback"
+        );
         let mut stream = UnixStream::connect(path).unwrap_or_else(|error| {
             panic!("reverie-dbt sync_rpc: failed to connect to coordinator at {path:?}: {error}")
         });
@@ -406,9 +476,16 @@ where
                 );
             }
             let connection = slot
-                .as_ref()
+                .as_mut()
                 .expect("reverie-dbt sync_rpc: guest connection initialization failed");
-            guest_round_trip(context, invoke_syscall, connection.fd, &request_bytes)
+            let response = guest_round_trip(context, invoke_syscall, connection, &request_bytes);
+            if response.is_err() {
+                // NativeLease has already cancelled before this return. Never
+                // retain a partially consumed/failed protocol stream for reuse.
+                let failed = slot.take().unwrap();
+                close_guest(context, invoke_syscall, failed.fd);
+            }
+            response
         }
         Err(TryLockError::Poisoned(poisoned)) => {
             let mut slot = poisoned.into_inner();
@@ -416,19 +493,25 @@ where
             if let Some(connection) = slot.take() {
                 close_guest(context, invoke_syscall, connection.fd);
             }
-            let connection = connect_guest(context, invoke_syscall, &path, pid)
+            let mut connection = connect_guest(context, invoke_syscall, &path, pid)
                 .expect("reverie-dbt sync_rpc: failed to recover guest connection");
-            let response = guest_round_trip(context, invoke_syscall, connection.fd, &request_bytes);
-            *slot = Some(connection);
+            let response =
+                guest_round_trip(context, invoke_syscall, &mut connection, &request_bytes);
+            if response.is_ok() {
+                *slot = Some(connection);
+            } else {
+                close_guest(context, invoke_syscall, connection.fd);
+            }
             response
         }
         Err(TryLockError::WouldBlock) => {
             // A fork child can inherit this mutex while another parent thread
             // owns it. The inherited lock can never be released in that child,
             // so use an uncached connection instead of waiting forever.
-            let connection = connect_guest(context, invoke_syscall, &path, std::process::id())
+            let mut connection = connect_guest(context, invoke_syscall, &path, std::process::id())
                 .expect("reverie-dbt sync_rpc: failed to connect contended guest socket");
-            let response = guest_round_trip(context, invoke_syscall, connection.fd, &request_bytes);
+            let response =
+                guest_round_trip(context, invoke_syscall, &mut connection, &request_bytes);
             close_guest(context, invoke_syscall, connection.fd);
             response
         }
@@ -441,6 +524,12 @@ struct GuestConnection {
     pid: u32,
     path: PathBuf,
     fd: i32,
+    control: Option<ControlConnection>,
+}
+
+struct ControlConnection {
+    connection: u64,
+    sequence: u64,
 }
 
 static GUEST_CLIENT: Mutex<Option<GuestConnection>> = Mutex::new(None);
@@ -492,11 +581,21 @@ fn connect_guest(
                 0,
             ],
         )?;
-        let _config = read_frame_from_guest(context, invoke_syscall, fd)?;
+        let config = read_frame_from_guest(context, invoke_syscall, fd)?;
+        let control = if control_enabled() {
+            let hello = Hello::decode(&config).map_err(control_io)?;
+            Some(ControlConnection {
+                connection: hello.connection,
+                sequence: 0,
+            })
+        } else {
+            None
+        };
         Ok(GuestConnection {
             pid,
             path: path.to_path_buf(),
             fd,
+            control,
         })
     })();
     if result.is_err() {
@@ -508,11 +607,123 @@ fn connect_guest(
 fn guest_round_trip(
     context: usize,
     invoke_syscall: SyscallInvoker,
-    fd: i32,
+    connection: &mut GuestConnection,
     request: &[u8],
 ) -> std::io::Result<Vec<u8>> {
-    write_frame_from_guest(context, invoke_syscall, fd, request)?;
-    read_frame_from_guest(context, invoke_syscall, fd)
+    let fd = connection.fd;
+    let Some(control) = &mut connection.control else {
+        write_frame_from_guest(context, invoke_syscall, fd, request)?;
+        return read_frame_from_guest(context, invoke_syscall, fd);
+    };
+    control.sequence = control
+        .sequence
+        .checked_add(1)
+        .ok_or_else(|| control_io("native request generation exhausted"))?;
+    let description = crate::native_control::describe(context)?;
+    if description.status != 0
+        || !matches!(description.phase, 0 | 3)
+        || description.observation_error != 0
+    {
+        return Err(control_io(
+            "native callback owner is unavailable for a new control RPC",
+        ));
+    }
+    let call = CallIdentity {
+        connection: control.connection,
+        request: control.sequence,
+        owner: description.owner,
+    };
+    let frame = encode(&ClientFrame::Request {
+        call,
+        payload: request.to_vec(),
+    });
+    let mut lease = NativeLease {
+        context,
+        owner: call.owner,
+        active: None,
+    };
+    write_frame_from_guest(context, invoke_syscall, fd, &frame)?;
+    let mut sequence = 0u64;
+    loop {
+        let bytes = read_frame_from_guest(context, invoke_syscall, fd)?;
+        match control::decode_exact::<ServerFrame>(&bytes).map_err(control_io)? {
+            ServerFrame::OrdinaryReply {
+                call: reply_call,
+                payload,
+            } => {
+                if reply_call != call || lease.active.is_some() {
+                    return Err(control_io(
+                        "ordinary reply overtook native release intent or changed owner",
+                    ));
+                }
+                return Ok(payload);
+            }
+            ServerFrame::Control {
+                call: command_call,
+                operation,
+                command,
+            } => {
+                sequence = sequence
+                    .checked_add(1)
+                    .ok_or_else(|| control_io("native operation generation exhausted"))?;
+                if command_call != call || operation != sequence {
+                    return Err(control_io(
+                        "stale, duplicate, or foreign native control frame",
+                    ));
+                }
+                let reply = crate::native_control::execute(context, call.owner, command)?;
+                if reply.owner != call.owner {
+                    return Err(control_io(
+                        "native executor owner changed during a borrowed RPC",
+                    ));
+                }
+                // Status never erases ownership. A post-operation observation
+                // failure is separate, and all live phases retain the actual
+                // handle for terminal cleanup before any error unwinds.
+                match reply.phase {
+                    1 | 2 => {
+                        lease.active = Some(if reply.publication.handle.interval != 0 {
+                            NativeControlOperation::PublicationCancel {
+                                handle: reply.publication.handle,
+                            }
+                        } else {
+                            NativeControlOperation::Cancel {
+                                handle: reply.handle,
+                            }
+                        });
+                    }
+                    0 | 3 => lease.active = None,
+                    _ => return Err(control_io("invalid native executor phase")),
+                }
+                let frame = encode(&ClientFrame::ControlReply {
+                    call,
+                    operation,
+                    reply,
+                });
+                write_frame_from_guest(context, invoke_syscall, fd, &frame)?;
+            }
+        }
+    }
+}
+
+/// A transport failure or unwind consumes the native cancellation intent while
+/// the real callback/Runtime is still borrowed. It does not need the socket,
+/// Tool, GlobalTool future or GUEST_CLIENT lock to make that progress.
+struct NativeLease {
+    context: usize,
+    owner: NativeOwner,
+    active: Option<NativeControlOperation>,
+}
+
+impl Drop for NativeLease {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.active.take() {
+            let cancelled = crate::native_control::execute(self.context, self.owner, cancel);
+            if !matches!(cancelled, Ok(reply) if reply.status == 0 && reply.phase == 3) {
+                crate::native_control::terminate(self.context, self.owner);
+            }
+        }
+    }
 }
 
 fn close_guest(context: usize, invoke_syscall: SyscallInvoker, fd: i32) {
@@ -705,6 +916,85 @@ mod initial_config_tests {
         let result = read_initial_config(&path);
         server.join().unwrap();
         result
+    }
+
+    fn with_transport_server(
+        bytes: Vec<u8>,
+        expect_native_control: bool,
+    ) -> Result<InitialConfig<Config>, InitialConfigError> {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("transport.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            socket.write_all(&bytes).unwrap();
+            socket.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut request = [0_u8; 1];
+            assert_eq!(socket.read(&mut request).unwrap(), 0);
+        });
+        let result = read_initial_config_for_transport(&path, expect_native_control);
+        server.join().unwrap();
+        result
+    }
+
+    fn hello(config: Vec<u8>) -> Vec<u8> {
+        // The exact native-control V2 Hello wire layout, including a nonzero
+        // connection identity. The decoder validates every one of these fields.
+        encode(&(0x5245_5643_5452_4c31_u64, 2_u32, 1_u64, config))
+    }
+
+    #[test]
+    fn startup_transport_requires_the_complete_selected_handshake() {
+        let payload = encode(&config());
+        let legacy = with_transport_server(framed(&payload), false).unwrap();
+        assert_eq!(legacy.config, config());
+        assert_eq!(legacy.transport, InitialConfigTransport::Legacy);
+
+        let native = with_transport_server(framed(&hello(payload.clone())), true).unwrap();
+        assert_eq!(native.config, config());
+        assert_eq!(native.transport, InitialConfigTransport::NativeControl);
+
+        let mut trailing_config = payload.clone();
+        trailing_config.push(0);
+        let mut truncated_config = payload.clone();
+        truncated_config.pop();
+        let mut trailing_hello = hello(payload.clone());
+        trailing_hello.push(0);
+        for malformed in [
+            payload.clone(), // Expected Hello must not downgrade to legacy.
+            encode(&(0_u64, 2_u32, 1_u64, payload.clone())),
+            encode(&(0x5245_5643_5452_4c31_u64, 1_u32, 1_u64, payload.clone())),
+            encode(&(0x5245_5643_5452_4c31_u64, 2_u32, 0_u64, payload)),
+            trailing_hello,
+            hello(trailing_config),
+            hello(truncated_config),
+        ] {
+            let error = with_transport_server(framed(&malformed), true).unwrap_err();
+            assert!(error.primary.is_some());
+            assert!(error.close.is_none());
+        }
+    }
+
+    #[test]
+    fn decoded_native_transport_is_not_returned_after_a_close_failure() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let initial = InitialConfig {
+            config: config(),
+            transport: InitialConfigTransport::NativeControl,
+        };
+        let mut closes = 0;
+        let error = finish_initial_config(stream, Ok(initial), |fd| {
+            closes += 1;
+            close_initial_socket(fd).unwrap();
+            Err(io::Error::from_raw_os_error(libc::EINTR))
+        })
+        .unwrap_err();
+        assert_eq!(closes, 1);
+        assert!(error.primary.is_none());
+        assert_eq!(error.close.unwrap().raw_os_error(), Some(libc::EINTR));
     }
 
     #[test]

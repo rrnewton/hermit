@@ -45,6 +45,8 @@
 mod counter1_exact;
 #[path = "../../reverie-examples/counter2_tool.rs"]
 mod counter2_exact;
+pub mod native_control_probe;
+pub mod owned_signal_publication_probe;
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -1346,6 +1348,8 @@ impl Tool for ChaosTool {
 
 /// The observation tool selected by the environment, if any.
 enum ActiveTool {
+    OwnedSignalPublicationProbe,
+    NativeControlProbe,
     Strace,
     Counter,
     SharedCounter,
@@ -1362,7 +1366,17 @@ enum ActiveTool {
     Chaos,
 }
 
+pub(crate) fn owned_signal_publication_probe_active() -> bool {
+    env_flag("HERMIT_DBT_TEST_OWNED_SIGNAL_PUBLICATION")
+}
+
 fn active_tool() -> Option<ActiveTool> {
+    if owned_signal_publication_probe_active() {
+        return Some(ActiveTool::OwnedSignalPublicationProbe);
+    }
+    if env_flag("HERMIT_DBT_TEST_NATIVE_CONTROL") {
+        return Some(ActiveTool::NativeControlProbe);
+    }
     if *TEST_REWRITE_EXIT_ENABLED {
         Some(ActiveTool::RewriteExit)
     } else if *TEST_INJECT_INVALID_CLONE_ENABLED {
@@ -1700,6 +1714,34 @@ pub(crate) fn run_active_tool(
         ),
     );
     let result = match tool {
+        ActiveTool::OwnedSignalPublicationProbe => crate::run_tool_syscall(
+            &owned_signal_publication_probe::OwnedSignalPublicationProbeTool,
+            context,
+            Pid::from_raw(tid),
+            Pid::from_raw(pid),
+            branches,
+            &mut (),
+            &owned_signal_publication_probe::OwnedSignalPublicationProbeGlobal,
+            &(),
+            syscall,
+            invoke_syscall,
+            read_registers,
+            write_registers,
+        ),
+        ActiveTool::NativeControlProbe => crate::run_tool_syscall(
+            &native_control_probe::NativeControlProbeTool,
+            context,
+            Pid::from_raw(tid),
+            Pid::from_raw(pid),
+            branches,
+            &mut (),
+            &native_control_probe::NativeControlProbeGlobal,
+            &(),
+            syscall,
+            invoke_syscall,
+            read_registers,
+            write_registers,
+        ),
         ActiveTool::Strace => dispatch(
             &StraceTool,
             context,

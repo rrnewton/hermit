@@ -150,6 +150,17 @@ pub trait GlobalTool: Send + Sync + Default {
         Ok(crate::BackendSignalControlMode::Unchanged)
     }
 
+    /// Offer a narrow authentic child-exit capture transaction before any
+    /// guest callback. This is separate from synchronous signal publication
+    /// and changes no static backend capability. A false result keeps the
+    /// backend's previous routing and transport.
+    fn install_backend_child_exit_capture(
+        &self,
+        _control: std::sync::Arc<dyn crate::BackendChildExitCapture>,
+    ) -> Result<bool, Error> {
+        Ok(false)
+    }
+
     /// Whether this run observes signal dequeues through
     /// [`Tool::handle_signal_dequeue`], given the mode that
     /// [`Self::install_backend_signal_control`] returned.

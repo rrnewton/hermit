@@ -37,6 +37,7 @@
 #include "drx.h"
 #include "reverie_vdso_symbols.h"
 #include "virtual_identity.h"
+#include "native_callback_scope.h"
 
 #ifndef X86_64
 #error "The Reverie DynamoRIO prototype currently requires x86-64"
@@ -274,7 +275,52 @@ static const cpuid_result_t extended_cpuid[] = {
 // exit, and app-level writes re-enter the syscall interception path.
 typedef void (*reverie_emit_fn_t)(const char* buf, size_t len);
 typedef void (*reverie_idle_fn_t)(void);
-#define REVERIE_DBT_RUNTIME_ABI_VERSION 7u
+#define REVERIE_DBT_RUNTIME_ABI_VERSION 9u
+typedef struct {
+  int32_t pid;
+  int32_t tid;
+  uint64_t image_epoch;
+  uint64_t callback_epoch;
+} native_control_owner_t;
+typedef struct {
+  uint32_t operation;
+  uint32_t reserved;
+  native_control_owner_t owner;
+  uint64_t owner_epoch;
+  dr_signal_capture_handle_t handle;
+  dr_signal_capture_receipt_t receipt;
+  dr_signal_publication_request_t publication_request;
+  dr_signal_publication_handle_t publication_handle;
+  dr_signal_publication_receipt_t publication_receipt;
+} native_control_request_t;
+typedef struct {
+  int32_t status;
+  uint32_t phase;
+  native_control_owner_t owner;
+  dr_signal_capture_handle_t handle;
+  dr_signal_capture_receipt_t receipt;
+  uint64_t saved_physical_mask;
+  uint64_t current_physical_mask;
+  int32_t observation_error;
+  uint32_t reserved;
+  dr_signal_domain_snapshot_t domain;
+  dr_signal_publication_receipt_t publication;
+  int64_t publication_wait_result;
+  uint64_t publication_wait_siginfo_words[16];
+} native_control_reply_t;
+typedef void (*native_control_fn_t)(uintptr_t, const native_control_request_t*,
+                                    native_control_reply_t*);
+static void runtime_native_control(uintptr_t, const native_control_request_t*,
+                                   native_control_reply_t*);
+_Static_assert(sizeof(native_control_owner_t) == 24, "native owner ABI");
+_Static_assert(sizeof(dr_signal_capture_handle_t) == 24, "capture handle ABI");
+_Static_assert(sizeof(dr_signal_capture_receipt_t) == 208, "capture receipt ABI");
+_Static_assert(sizeof(dr_signal_publication_owner_t) == 32, "publication owner ABI");
+_Static_assert(sizeof(dr_signal_domain_snapshot_t) == 696, "signal domain ABI");
+_Static_assert(sizeof(dr_signal_publication_handle_t) == 80, "publication handle ABI");
+_Static_assert(sizeof(dr_signal_publication_receipt_t) == 392, "publication receipt ABI");
+_Static_assert(sizeof(native_control_request_t) == 808, "native request ABI");
+_Static_assert(sizeof(native_control_reply_t) == 1512, "native reply ABI");
 #define REVERIE_DBT_STARTUP_STANDALONE 1u
 #define REVERIE_DBT_STARTUP_COORDINATED 2u
 // TODO-HUMAN-REVIEW(PR-162): Review the additive stdout-emit runtime callback
@@ -295,7 +341,9 @@ typedef struct {
   reverie_emit_fn_t emit_evidence;
   // DbtEvidenceLogLevel discriminant: off/error/warn/info/debug/trace = 0..5.
   int32_t evidence_log_level;
+  native_control_fn_t native_control;
 } runtime_callbacks_t;
+_Static_assert(sizeof(runtime_callbacks_t) == 56, "version 8 callbacks ABI");
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#90): Confirm diagnostic fd ownership across exec.
 // Inherited from the launcher so guest stderr redirections cannot capture it.
@@ -580,6 +628,7 @@ static runtime_callbacks_page_t runtime_callbacks_page
                 .emit_stdout = reverie_dbt_emit_stdout,
                 .emit_evidence = reverie_dbt_emit,
                 .evidence_log_level = 0,
+                .native_control = runtime_native_control,
             },
 };
 typedef struct {
@@ -605,6 +654,22 @@ static _Thread_local uint32_t evidence_callback_depth;
 // Unlike the evidence tag, this is consulted by the admission ownership gate
 // before any new signal callback can acquire runtime/thread-state references.
 static _Thread_local uint32_t native_runtime_entries;
+// Each application-to-Tool borrow has a fresh identity, independently of whether
+// its native callback can own an SDK publication interval. Phase 3 is release
+// intent only; ordinary cleanup callbacks must not pretend to retire the SDK
+// guard before the next original syscall or owned-signal boundary.
+_Static_assert((uint32_t)NATIVE_CALLBACK_SYSCALL == (uint32_t)DR_SIGNAL_PUBLICATION_SYSCALL,
+               "syscall callback kind must match SDK");
+_Static_assert((uint32_t)NATIVE_CALLBACK_OWNED == (uint32_t)DR_SIGNAL_PUBLICATION_OWNED,
+               "owned callback kind must match SDK");
+static _Thread_local native_callback_scope_t native_callback_scope;
+static _Thread_local uint64_t native_control_last_owner_epoch;
+static _Thread_local uint64_t native_control_saved_mask;
+static _Thread_local dr_signal_capture_handle_t native_control_handle;
+static _Thread_local dr_signal_publication_handle_t native_publication_handle;
+
+static bool runtime_callback_enter(uint32_t kind);
+static void runtime_callback_leave(void);
 
 static bool evidence_is_enabled(void) {
   return evidence_config_page.value.enabled != 0;
@@ -1742,7 +1807,7 @@ static uint64_t guest_tsc(void* drcontext, bool with_aux, uint32_t* aux) {
     while (!reverie_dbt_runtime_ready(
         atomic_load_explicit(&image_generation, memory_order_acquire)))
       dr_sleep(1);
-    evidence_callback_enter();
+    if (!runtime_callback_enter(NATIVE_CALLBACK_ORDINARY)) return 0;
     answered = reverie_dbt_runtime_rdtsc(
         drcontext,
         counters,
@@ -1756,7 +1821,7 @@ static uint64_t guest_tsc(void* drcontext, bool with_aux, uint32_t* aux) {
         reverie_dbt_emit,
         &tsc,
         &runtime_aux);
-    evidence_callback_leave();
+    runtime_callback_leave();
     if (answered == 1) {
       *aux = runtime_aux;
       return tsc;
@@ -1937,7 +2002,7 @@ static void try_start_pending_thread(void) {
   int32_t init_result = 0;
   if (!has_copied_runtime() ||
       (runtime_uses_external_global() && !is_copied_vfork_process())) {
-    evidence_callback_enter();
+    if (!runtime_callback_enter(NATIVE_CALLBACK_ORDINARY)) return;
     init_result = reverie_dbt_runtime_thread_init(
         counters,
         drcontext,
@@ -1949,7 +2014,7 @@ static void try_start_pending_thread(void) {
         invoke_syscall,
         read_registers,
         write_registers);
-    evidence_callback_leave();
+    runtime_callback_leave();
   }
   // TODO-HUMAN-REVIEW(PR-134): Confirm retryable native child startup.
   if (init_result > 0) {
@@ -2515,6 +2580,230 @@ invoke_raw_syscall(uintptr_t context, int64_t sysnum, const uint64_t* args) {
 }
 
 static bool is_exec_syscall(int sysnum);
+
+// Fixed read-only native query. Returning app injection deliberately refuses
+// rt_sigprocmask while a lease owns the mask; this must observe the physical
+// mask without entering that guest/Tool path or writing a mask.
+static bool native_control_read_mask(uint64_t* mask) {
+  register long size __asm__("r10") = 8;
+  long result;
+  __asm__ volatile("syscall" : "=a"(result)
+                   : "0"((long)SYS_rt_sigprocmask), "D"((long)SIG_SETMASK),
+                     "S"((const void*)NULL), "d"(mask), "r"(size)
+                   : "rcx", "r11", "cc", "memory");
+  return result == 0;
+}
+
+static dr_signal_publication_owner_t native_publication_owner(void* drcontext) {
+  prototype_counters_t* counters = drmgr_get_tls_field(drcontext, thread_state_index);
+  dr_signal_publication_owner_t owner = {0};
+  owner.image_epoch = atomic_load_explicit(&image_generation, memory_order_acquire);
+  owner.callback_epoch = native_callback_scope.epoch;
+  owner.callback_kind = native_callback_scope.kind;
+  if (owner.callback_kind == DR_SIGNAL_PUBLICATION_OWNED && counters != NULL)
+    owner.admission_token = counters->signal_token;
+  return owner;
+}
+
+static bool runtime_callback_enter(uint32_t kind) {
+  if (!native_callback_scope_enter(&native_callback_scope, kind, native_runtime_entries)) {
+    dr_fprintf(diagnostic_file, "reverie-dbt: native control callback ownership leaked\n");
+    exit_runtime_tree(101);
+    return false;
+  }
+  evidence_callback_enter();
+  return true;
+}
+
+static void runtime_callback_leave(void) {
+  if (!native_callback_scope_leave(&native_callback_scope, native_runtime_entries)) {
+    dr_fprintf(diagnostic_file, "reverie-dbt: live native control at callback return\n");
+    exit_runtime_tree(101);
+    return;
+  }
+  evidence_callback_leave();
+}
+
+static void runtime_native_control(
+    uintptr_t context, const native_control_request_t* request,
+    native_control_reply_t* reply) {
+  memset(reply, 0, sizeof(*reply));
+  reply->status = DR_SIGNAL_CAPTURE_UNAVAILABLE;
+  void* drcontext = dr_get_current_drcontext();
+  if (drcontext == NULL || context != (uintptr_t)drcontext ||
+      !native_callback_scope_describable(&native_callback_scope, native_runtime_entries))
+    return;
+  reply->owner.pid = (int32_t)dr_get_process_id();
+  reply->owner.tid = (int32_t)dr_get_thread_id(drcontext);
+  reply->owner.image_epoch = atomic_load_explicit(&image_generation, memory_order_acquire);
+  reply->owner.callback_epoch = native_callback_scope.epoch;
+  reply->phase = native_callback_scope.phase;
+  if (request->reserved != 0 || request->operation > 10) return;
+  if (request->operation != 0 &&
+      memcmp(&request->owner, &reply->owner, sizeof(reply->owner)) != 0) {
+    reply->status = DR_SIGNAL_CAPTURE_STALE;
+    return;
+  }
+  if (request->operation == 5) {
+    // A failed cancellation cannot return into a borrowed callback and let it
+    // continue with an unresolved SDK guard. This fixed failure endpoint is
+    // not a wire operation and executes no Tool code.
+    exit_runtime_tree(101);
+    return;
+  }
+  uint64_t physical = 0;
+  if (!native_control_read_mask(&physical)) {
+    reply->status = DR_SIGNAL_CAPTURE_ERROR;
+    return;
+  }
+  reply->current_physical_mask = physical;
+  uint64_t before = physical;
+  reply->saved_physical_mask = native_callback_scope.phase == 0 ? before : native_control_saved_mask;
+  dr_signal_publication_owner_t publication_owner = native_publication_owner(drcontext);
+  const dr_signal_publication_owner_t* expected = NULL;
+  if (request->operation == 7)
+    expected = &request->publication_request.owner;
+  else if (request->operation == 8 || request->operation == 10)
+    expected = &request->publication_handle.request.owner;
+  else if (request->operation == 9)
+    expected = &request->publication_receipt.handle.request.owner;
+  if (expected != NULL && memcmp(expected, &publication_owner, sizeof(*expected)) != 0) {
+    reply->status = DR_SIGNAL_CAPTURE_STALE;
+    return;
+  }
+  if (native_callback_scope.kind == NATIVE_CALLBACK_ORDINARY &&
+      request->operation != 0) {
+    // These are authentic application RPC owners, but are not SDK pre-syscall
+    // or detached signal-admission frames. Refuse domain/Arm before
+    // any SDK call or physical-mask mutation. Preserve the observed phase and
+    // saved/current masks, including a preceding callback's release intent.
+    reply->status = request->operation == 1 || request->operation == 6 ||
+            request->operation == 7
+        ? DR_SIGNAL_CAPTURE_UNAVAILABLE : DR_SIGNAL_CAPTURE_STALE;
+    // This names the refused callback, not a pending-domain census. domain==0
+    // remains unavailable: no queued/active/return count has been observed.
+    reply->domain.owner = publication_owner;
+    reply->domain.owner_pid = reply->owner.pid;
+    reply->domain.owner_tid = reply->owner.tid;
+    return;
+  }
+  switch (request->operation) {
+    case 0:
+      reply->status = DR_SIGNAL_CAPTURE_OK;
+      break;
+    case 1:
+      if (native_callback_scope.publication_active || native_callback_scope.phase != 0 || request->owner_epoch == 0 ||
+          request->owner_epoch <= native_control_last_owner_epoch)
+        break;
+      reply->status = dr_signal_capture_begin(
+          drcontext, request->owner_epoch, &reply->handle);
+      if (reply->status == DR_SIGNAL_CAPTURE_OK) {
+        native_control_saved_mask = physical;
+        native_control_handle = reply->handle;
+        native_control_last_owner_epoch = request->owner_epoch;
+        native_callback_scope.phase = 1;
+      }
+      break;
+    case 2:
+      // For this authenticated live handle the SDK enters HELD before its
+      // restore/snapshot, including a later ERROR or invalidated-domain STALE.
+      if ((native_callback_scope.phase == 1 || native_callback_scope.phase == 2) &&
+          memcmp(&request->handle, &native_control_handle,
+                 sizeof(native_control_handle)) == 0)
+        native_callback_scope.phase = 2;
+      reply->status = dr_signal_capture_close(drcontext, &request->handle, &reply->receipt);
+      break;
+    case 3:
+      reply->status = dr_signal_capture_release(drcontext, &request->receipt);
+      if (reply->status == DR_SIGNAL_CAPTURE_OK) native_callback_scope.phase = 3;
+      break;
+    case 4:
+      reply->status = dr_signal_capture_cancel(drcontext, &request->handle);
+      if (reply->status == DR_SIGNAL_CAPTURE_OK) native_callback_scope.phase = 3;
+      break;
+    case 6:
+      reply->status = dr_signal_domain_observe(drcontext, &publication_owner, &reply->domain);
+      break;
+    case 7:
+      if (native_callback_scope.publication_active || native_callback_scope.phase == 1 || native_callback_scope.phase == 2)
+        break;
+      reply->status = dr_signal_publication_arm(
+          drcontext, &request->publication_request, &reply->publication.handle);
+      if (reply->status == DR_SIGNAL_CAPTURE_OK) {
+        native_publication_handle = reply->publication.handle;
+        native_callback_scope.publication_active = true;
+        native_control_saved_mask = before;
+        native_callback_scope.phase = 1;
+      }
+      break;
+    case 8: {
+      reply->publication_wait_result = -EAGAIN;
+      if (!native_callback_scope.publication_active ||
+          memcmp(&request->publication_handle, &native_publication_handle,
+                 sizeof(native_publication_handle)) != 0) {
+        reply->status = DR_SIGNAL_CAPTURE_STALE;
+        break;
+      }
+      // The fixed parent endpoint consumes a parent-namespace PID; passing it
+      // through invoke_syscall would translate that physical identity twice.
+      // No reaping, arbitrary injection or Tool re-entry is allowed here.
+      siginfo_t published = {0};
+      const uint64_t wait_args[6] = {
+          P_PID, (uint64_t)(uint32_t)native_publication_handle.request.child_pid,
+          (uint64_t)(uintptr_t)&published, WEXITED | WNOHANG | WNOWAIT, 0, 0};
+      reply->publication_wait_result = invoke_raw_syscall(context, SYS_waitid, wait_args);
+      memcpy(reply->publication_wait_siginfo_words, &published, sizeof(published));
+      if (reply->publication_wait_result != 0 || published.si_pid == 0) {
+        reply->status = reply->publication_wait_result == 0
+            ? DR_SIGNAL_CAPTURE_NO_RECORD : DR_SIGNAL_CAPTURE_ERROR;
+        break;
+      }
+      if (published.si_pid != native_publication_handle.request.child_pid ||
+          (published.si_code != CLD_EXITED && published.si_code != CLD_KILLED &&
+           published.si_code != CLD_DUMPED)) {
+        reply->status = DR_SIGNAL_CAPTURE_ERROR;
+        break;
+      }
+      // Close transitions into restored/held even if its later receipt is
+      // indeterminate. Keep that state distinct from its returned status.
+      native_callback_scope.phase = 2;
+      reply->status = dr_signal_publication_close(drcontext, &native_publication_handle,
+          (const byte*)&published, &reply->publication);
+      break;
+    }
+    case 9:
+      reply->status = dr_signal_publication_release(drcontext, &request->publication_receipt);
+      if (reply->status == DR_SIGNAL_CAPTURE_OK) {
+        native_callback_scope.publication_active = false;
+        native_callback_scope.phase = 3;
+      }
+      break;
+    case 10:
+      reply->status = dr_signal_publication_cancel(drcontext, &request->publication_handle);
+      if (reply->status == DR_SIGNAL_CAPTURE_OK) {
+        native_callback_scope.publication_active = false;
+        native_callback_scope.phase = 3;
+      }
+      break;
+  }
+  if (request->operation >= 7) {
+    // This is an observation of the current SDK state, not evidence that the
+    // preceding operation succeeded. Preserve its literal operation status.
+    dr_signal_capture_status_t observed =
+        dr_signal_domain_observe(drcontext, &publication_owner, &reply->domain);
+    if (observed != DR_SIGNAL_CAPTURE_OK) reply->observation_error = 2;
+    else if (native_callback_scope.publication_active) native_callback_scope.phase = reply->domain.phase;
+  }
+  if (native_callback_scope.publication_active || (request->operation >= 7 && native_callback_scope.phase == 3))
+    reply->publication.handle = native_publication_handle;
+  reply->phase = native_callback_scope.phase;
+  if (native_callback_scope.phase != 0) reply->handle = native_control_handle;
+  reply->saved_physical_mask = native_callback_scope.phase == 0 ? before : native_control_saved_mask;
+  physical = 0;
+  if (!native_control_read_mask(&physical))
+    reply->observation_error = 1;
+  reply->current_physical_mask = physical;
+}
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-411): Review close_range splitting around the internal
@@ -4406,7 +4695,7 @@ static void post_syscall(void* drcontext, int sysnum) {
     if (host_syscall_result == 0 &&
         (counters->pending_process_clone_flags & CLONE_THREAD) == 0)
       evidence_initialize_fork_child_thread(counters);
-    evidence_callback_enter();
+    if (!runtime_callback_enter(NATIVE_CALLBACK_ORDINARY)) return;
     int32_t registration = reverie_dbt_runtime_process_clone_result(
         counters,
         drcontext,
@@ -4422,7 +4711,7 @@ static void post_syscall(void* drcontext, int sysnum) {
         invoke_syscall,
         read_registers,
         write_registers);
-    evidence_callback_leave();
+    runtime_callback_leave();
     counters->pending_process_clone_flags = 0;
     counters->pending_process_clone_ctid = 0;
     counters->pending_process_clone_exit_signal = 0;
@@ -4471,7 +4760,7 @@ static void post_syscall(void* drcontext, int sysnum) {
 
   if (counters->pending_thread_clone != 0) {
     if (host_syscall_result >= 0) {
-      evidence_callback_enter();
+      if (!runtime_callback_enter(NATIVE_CALLBACK_ORDINARY)) return;
       int32_t registration = reverie_dbt_runtime_thread_created_v2(
           counters,
           drcontext,
@@ -4485,7 +4774,7 @@ static void post_syscall(void* drcontext, int sysnum) {
           invoke_syscall,
           read_registers,
           write_registers);
-      evidence_callback_leave();
+      runtime_callback_leave();
       if (registration < 0) {
         dr_fprintf(
             diagnostic_file, "reverie-dbt: child thread registration failed\n");
@@ -4496,9 +4785,9 @@ static void post_syscall(void* drcontext, int sysnum) {
     counters->pending_thread_clone = 0;
   }
   if (is_exec_syscall(sysnum)) {
-    evidence_callback_enter();
+    if (!runtime_callback_enter(NATIVE_CALLBACK_ORDINARY)) return;
     reverie_dbt_runtime_exec_failed(counters, (int32_t)dr_get_process_id());
-    evidence_callback_leave();
+    runtime_callback_leave();
     return;
   }
 
@@ -4973,14 +5262,14 @@ static bool pre_syscall(void* drcontext, int sysnum) {
     // The private syscall is a safe entry boundary, never a Tool syscall or
     // extra scheduler turn. Drop all Rust ownership before the native commit.
     counters->signal_phase = 2;
-    evidence_callback_enter();
+    if (!runtime_callback_enter(DR_SIGNAL_PUBLICATION_OWNED)) return false;
     counters->signal_action = reverie_dbt_runtime_signal_event(
         drcontext, counters, (int32_t)dr_get_thread_id(drcontext),
         (int32_t)dr_get_process_id(), counters->signal_image_generation,
         atomic_load_explicit(&branch_count, memory_order_relaxed),
         &counters->signal_event, invoke_syscall, read_registers, write_registers,
         read_memory, write_memory, reverie_dbt_emit);
-    evidence_callback_leave();
+    runtime_callback_leave();
     if (counters->signal_action < 0 || counters->signal_action > 2 ||
         native_runtime_entries != 0) {
       exit_runtime_tree(101);
@@ -5102,7 +5391,7 @@ static bool pre_syscall(void* drcontext, int sysnum) {
   if (has_copied_runtime() && runtime_uses_external_global() &&
       !copied_vfork_clone && !is_copied_vfork_process() &&
       copied_process_runtime_pid != dr_get_process_id()) {
-    evidence_callback_enter();
+    if (!runtime_callback_enter(NATIVE_CALLBACK_ORDINARY)) return false;
     int32_t initialized = reverie_dbt_runtime_thread_init(
         counters,
         drcontext,
@@ -5114,7 +5403,7 @@ static bool pre_syscall(void* drcontext, int sysnum) {
         invoke_syscall,
         read_registers,
         write_registers);
-    evidence_callback_leave();
+    runtime_callback_leave();
     if (initialized != 0) {
       dr_fprintf(
           diagnostic_file,
@@ -5227,7 +5516,7 @@ static bool pre_syscall(void* drcontext, int sysnum) {
 
   int64_t deferred_sysnum = sysnum;
   uint64_t deferred_args[6] = {0};
-  evidence_callback_enter();
+  if (!runtime_callback_enter(DR_SIGNAL_PUBLICATION_SYSCALL)) return false;
   int32_t action = reverie_dbt_runtime_pre_syscall(
       drcontext,
       counters,
@@ -5246,7 +5535,7 @@ static bool pre_syscall(void* drcontext, int sysnum) {
       read_memory,
       write_memory,
       reverie_dbt_emit);
-  evidence_callback_leave();
+  runtime_callback_leave();
   DR_ASSERT(evidence_callback_depth == 0);
   if (counters->syscall_interruption != 0) {
     uint64_t token = counters->syscall_interruption;
@@ -5440,10 +5729,10 @@ static void complete_runtime_thread_exit(
   owns_runtime = !has_copied_runtime() ||
       (runtime_uses_external_global() && !is_copied_vfork_process());
   if (owns_runtime) {
-    evidence_callback_enter();
+    if (!runtime_callback_enter(NATIVE_CALLBACK_ORDINARY)) return;
     reverie_dbt_runtime_thread_exit(
         counters, drcontext, dr_get_thread_id(drcontext), invoke_syscall);
-    evidence_callback_leave();
+    runtime_callback_leave();
     if (test_thread_exit_evidence && explicit_exit && evidence_is_enabled() &&
         counters->evidence_thread_process == dr_get_process_id()) {
       static const char record[] =

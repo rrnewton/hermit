@@ -58,6 +58,7 @@ mod backend;
 pub mod backend_stats;
 mod backtrace;
 mod capabilities;
+mod child_exit_capture;
 mod dispatch_stats;
 mod error;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -141,4 +142,5 @@ pub use reverie_syscalls as syscalls;
 pub type Never = never_say_never::Never;
 
 // Run-owned process signal control; no borrowed Guest is retained.
+pub use child_exit_capture::*;
 pub use process_signal_control::*;

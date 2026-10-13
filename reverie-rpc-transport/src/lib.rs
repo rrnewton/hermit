@@ -66,12 +66,14 @@
 mod blocking_client;
 pub mod codec;
 
+pub mod child_exit_capture;
 mod client;
 mod envelope;
 mod error;
 /// Ordered capture for trusted cooperating processes using socket lifetime endpoints.
 #[cfg(target_os = "linux")]
 pub mod guest_log;
+pub mod native_control;
 mod server;
 
 #[cfg(target_os = "linux")]

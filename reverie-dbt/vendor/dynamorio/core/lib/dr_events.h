@@ -1472,6 +1472,227 @@ DR_API
 bool dr_unregister_signal_event(dr_signal_action_t (*func)(void *drcontext,
                                                            dr_siginfo_t *siginfo));
 
+/** Result of a bounded owner-thread SIGCHLD capture operation. */
+typedef enum {
+    DR_SIGNAL_CAPTURE_OK,
+    DR_SIGNAL_CAPTURE_UNAVAILABLE, /**< Refused without arming a new lease. */
+    DR_SIGNAL_CAPTURE_STALE,       /**< Wrong owner/epoch or changed domain. */
+    DR_SIGNAL_CAPTURE_NO_RECORD,   /**< No retained raw-to-linked effect observed. */
+    DR_SIGNAL_CAPTURE_KERNEL_BLOCKED, /**< Original physical mask remains blocked. */
+    DR_SIGNAL_CAPTURE_ERROR,       /**< Physical-mask operation failed. */
+    DR_SIGNAL_CAPTURE_UNSUPPORTED, /**< Publication only: proven structural exclusion.
+                                    * UNAVAILABLE is not permission to fall back. */
+} dr_signal_capture_status_t;
+
+/** Caller and DR generations together identify one owner-thread transaction.
+ * owner_epoch must be nonzero and never reused by the client across its image or
+ * request lifetimes. It is not a PID, pending pointer, or admission token. */
+typedef struct _dr_signal_capture_handle_t {
+    uint64 owner_epoch;
+    uint64 token;
+    int owner_pid;
+    int owner_tid;
+} dr_signal_capture_handle_t;
+
+/** Value snapshot of the existing logical SIGCHLD pending domain. The version
+ * changes on raw arrival and pending-domain mutation. It is checked again by
+ * release: a copied siginfo is never ownership of an allocation. No field counts
+ * kernel publications or promises one signal per child. */
+typedef struct _dr_signal_capture_receipt_t {
+    dr_signal_capture_handle_t handle;
+    uint64 version;
+    uint64 raw_entries;
+    uint64 linked;
+    uint64 coalesced;
+    uint64 guest_mask;
+    uint64 saved_physical_mask;
+    uint64 pending_records;
+    byte siginfo[128]; /**< First retained record, authentic current provenance. */
+} dr_signal_capture_receipt_t;
+
+DR_API
+/** Arm SIGCHLD capture from a safe native callback on the owning application
+ * thread, without entering Tool. Linux x86-64 only. This initial substrate
+ * conservatively requires one DR thread and one physical task, effective
+ * interception, no existing
+ * SIGCHLD pending/in-flight record and no active admission/sigsuspend owner.
+ * The client must keep its pre-syscall callback/continuation alive (its admission
+ * selector must return WAIT), publish no new thread or
+ * image, and use an independently progressing child/control channel. This API
+ * establishes no scheduler or child-publication capability. This first contract
+ * requires the callback to complete the original operation and return false;
+ * executing that operation after return could change masks/topology or block
+ * before the dispatcher. Violating this tail contract terminates the process.
+ * On success the exact physical mask is saved and SIGCHLD is physically blocked;
+ * the virtual guest mask/action are unchanged. Refusal does not leave a lease.
+ */
+dr_signal_capture_status_t dr_signal_capture_begin(
+    void *drcontext, uint64 owner_epoch, dr_signal_capture_handle_t *handle);
+
+DR_API
+/** Restore the saved physical mask under forced delayed capture and snapshot an
+ * actual retained pending-domain effect. Does not enter Tool, execute a guest
+ * handler, reap a child, wait for a signal, or certify publication. The caller
+ * separately establishes its closed publication premise. NO_RECORD is literal;
+ * it is never proof of no notification. KERNEL_BLOCKED preserves the saved mask.
+ * Close may be repeated to refresh a receipt after a legal domain mutation.
+ */
+dr_signal_capture_status_t dr_signal_capture_close(
+    void *drcontext, const dr_signal_capture_handle_t *handle,
+    dr_signal_capture_receipt_t *receipt);
+
+DR_API
+/** Validate and release a captured domain to ordinary pending admission at the
+ * next safe dispatcher boundary. A stale version refuses without consuming the
+ * lease. The existing native callback must unwind normally; this call does not
+ * transfer or abandon its frame. Guest blocking remains effective. Release or
+ * Cancel is required before the callback returns. A successful call consumes
+ * the handle, so duplicate public operations return STALE.
+ */
+dr_signal_capture_status_t dr_signal_capture_release(
+    void *drcontext, const dr_signal_capture_receipt_t *receipt);
+
+DR_API
+/** Cancel one live lease, restoring the exact physical mask and preserving all
+ * authentic pending records for the existing dispatcher. Never drops a record.
+ * Fork-child reset and terminal teardown retire only that owner's copied lease.
+ */
+dr_signal_capture_status_t dr_signal_capture_cancel(
+    void *drcontext, const dr_signal_capture_handle_t *handle);
+
+/** Publication controls use an existing native callback, never a second Tool
+ * invocation. Epochs are authenticated, nonzero, non-reused client identities;
+ * DR also checks the physical owner and the actual detached admission token. */
+typedef enum {
+    DR_SIGNAL_PUBLICATION_SYSCALL = 1,
+    DR_SIGNAL_PUBLICATION_OWNED = 2,
+} dr_signal_publication_callback_t;
+typedef struct _dr_signal_publication_owner_t {
+    uint64 image_epoch;
+    uint64 callback_epoch;
+    uint64 admission_token; /**< Zero for SYSCALL; exact live token for OWNED. */
+    uint callback_kind;
+    uint reserved;
+} dr_signal_publication_owner_t;
+
+typedef enum {
+    DR_SIGNAL_DOMAIN_QUEUED = 1,
+    DR_SIGNAL_DOMAIN_ACTIVE = 2,
+    DR_SIGNAL_DOMAIN_RETURN = 3,
+} dr_signal_domain_ownership_t;
+typedef struct _dr_signal_domain_record_t {
+    uint64 generation; /**< Allocation identity, preserved across ownership moves. */
+    uint ownership;
+    uint reserved;
+    byte siginfo[128];
+} dr_signal_domain_record_t;
+
+/** Read-only value snapshot. Four slots cover the existing two queued non-RT
+ * records plus active and return ownership. Excess/unknown ownership refuses;
+ * it is never truncated. Domain identity survives empty queues and phase 3
+ * through this thread image; fork/exec creates another identity. last_retired
+ * is a tombstone, not a claim that every older allocation has retired. */
+typedef struct _dr_signal_domain_snapshot_t {
+    dr_signal_publication_owner_t owner;
+    uint64 domain;
+    uint64 version;
+    uint64 last_retired;
+    uint64 retirements;
+    uint64 guest_mask;
+    uint64 interval;
+    uint64 admission_token;
+    int owner_pid;
+    int owner_tid;
+    uint phase; /**< 0 idle, 1 excluded, 2 restored/held, 3 release intent. */
+    uint queued;
+    uint active;
+    uint returning;
+    uint record_count;
+    uint reserved;
+    dr_signal_domain_record_t records[4];
+} dr_signal_domain_snapshot_t;
+
+typedef struct _dr_signal_publication_request_t {
+    dr_signal_publication_owner_t owner;
+    uint64 domain; /**< Exact observed domain; zero permits first attachment. */
+    uint64 reservation;
+    uint64 child_generation; /**< Caller-authenticated retained child identity. */
+    int child_pid; /**< Actual child's PID in the physical parent's namespace. */
+    uint reserved;
+} dr_signal_publication_request_t;
+typedef struct _dr_signal_publication_handle_t {
+    dr_signal_publication_request_t request;
+    uint64 interval;
+    int owner_pid;
+    int owner_tid;
+} dr_signal_publication_handle_t;
+typedef enum {
+    DR_SIGNAL_PUBLICATION_NONE,
+    DR_SIGNAL_PUBLICATION_LINKED,
+    DR_SIGNAL_PUBLICATION_COALESCED,
+    DR_SIGNAL_PUBLICATION_REPLACED,
+    DR_SIGNAL_PUBLICATION_INDETERMINATE,
+} dr_signal_publication_outcome_t;
+typedef struct _dr_signal_publication_receipt_t {
+    dr_signal_publication_handle_t handle;
+    uint64 version;
+    uint64 raw_entries;
+    uint outcome;
+    uint reserved;
+    uint64 allocation;
+    uint64 victim;
+    uint64 guest_mask;
+    uint64 saved_physical_mask;
+    byte incoming_siginfo[128];
+    byte victim_siginfo[128];
+} dr_signal_publication_receipt_t;
+
+DR_API
+/** Snapshot the SIGCHLD domain of an authenticated callback. An exact live
+ * owned callback for another signal returns UNSUPPORTED before mutation;
+ * stale or unauthenticated ownership never authorizes fallback. */
+dr_signal_capture_status_t dr_signal_domain_observe(
+    void *drcontext, const dr_signal_publication_owner_t *owner,
+    dr_signal_domain_snapshot_t *snapshot);
+
+DR_API
+/** Attach an interval without clearing existing queued/active/return records.
+ * Requires one application recipient, only authenticated DR client contexts
+ * outside its TGID, default SIGCHLD/no NOCLDWAIT, a WAIT-owned callback, and no
+ * prior kernel-pending SIGCHLD. A previous release-intent interval may be
+ * replaced. Refusal before arming leaves the physical mask and queue unchanged.
+ * The caller must reserve its ordinary reply and exclude image/topology changes
+ * until Release/Cancel, then finish the existing skipped-original callback.
+ */
+dr_signal_capture_status_t dr_signal_publication_arm(
+    void *drcontext, const dr_signal_publication_request_t *request,
+    dr_signal_publication_handle_t *handle);
+
+DR_API
+/** Restore under forced delay and report this interval's actual raw-to-pending
+ * outcome. published_siginfo is the fixed native caller's positive, exact-child
+ * nonreaping waitid result; DR compares its terminal PID/code/status with the
+ * authentic incoming record, but does not itself establish kernel publication.
+ * Missing, multiple, forged, rerouted or unmatched input refuses. Close can
+ * refresh a stale domain version without inventing another incoming event.
+ */
+dr_signal_capture_status_t dr_signal_publication_close(
+    void *drcontext, const dr_signal_publication_handle_t *handle,
+    const byte published_siginfo[128], dr_signal_publication_receipt_t *receipt);
+
+DR_API
+/** Consume the exact current receipt. Phase 3 keeps the borrowed continuation
+ * safe until the existing dispatcher; metadata/allocations remain observable.
+ * This ACK is not Tool completion or dispatcher retirement. */
+dr_signal_capture_status_t dr_signal_publication_release(
+    void *drcontext, const dr_signal_publication_receipt_t *receipt);
+
+DR_API
+/** Restore the mask and relinquish the interval without deleting any signal.
+ * Cancel is never a successful publication/capture receipt. */
+dr_signal_capture_status_t dr_signal_publication_cancel(
+    void *drcontext, const dr_signal_publication_handle_t *handle);
+
 /** The readiness decision for an owned pending-signal continuation. */
 typedef enum {
     DR_SIGNAL_ADMISSION_BYPASS, /**< Use the ordinary DR signal path. */

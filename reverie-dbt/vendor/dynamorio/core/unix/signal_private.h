@@ -353,6 +353,10 @@ typedef struct _sigpending_t {
     /* Was this unblocked at receive time? */
     bool unblocked_at_receipt;
     struct _sigpending_t *next;
+    /* Never a pointer identity: follows this SIGCHLD allocation through queued,
+     * owned admission and the private kernel-return backing. Zero for others. */
+    uint64 publication_generation;
+    kernel_siginfo_t publication_siginfo; /* Original frame at pending insertion. */
     /* The detached pending allocation owns both continuations. Keep the ordinary
      * context out of thread_sig_info_t: clone_record_t copies that structure onto
      * the bootstrap stack and must leave room for get_clone_record()'s caller.
@@ -531,6 +535,29 @@ typedef struct _thread_sig_info_t {
     kernel_sigset_t admission_pre_mask;
     bool admission_in_sigsuspend;
     kernel_sigset_t admission_sigsuspend_mask;
+
+    /* Optional native capture substrate, idle unless a client explicitly arms
+     * it. The queue remains sigpending[SIGCHLD], with its normal coalescing.
+     * phase: 0 idle, 1 physically blocked, 2 restored/held, 3 released until the
+     * client's ordinary callback can reach the existing dispatcher. */
+    struct {
+        int phase;
+        bool invalidated;
+        uint64 owner_epoch;
+        uint64 token;
+        int owner_pid;
+        int owner_tid;
+        kernel_sigset_t saved_mask;
+        kernel_sigset_t guest_mask;
+        uint64 version;
+        uint64 raw_entries;
+        uint64 linked;
+        uint64 coalesced;
+    } capture;
+
+    /* Out-of-line fixed accounting avoids growing clone_record_t's bootstrap
+     * stack copy. It owns no signal allocation and contains no second queue. */
+    struct _signal_publication_state_t *publication;
 
     /* This thread's application signal mask: the set of blocked signals.
      * We need to keep this in sync with the thread-group-shared

@@ -21,10 +21,10 @@ pub mod counter;
 mod counter2_global;
 mod evidence;
 mod launcher;
+pub mod native_control;
 pub mod sync_rpc;
 #[cfg(feature = "prototype-runtime")]
 mod tools;
-
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::c_void;
@@ -84,6 +84,10 @@ use reverie_memory::LocalMemory;
 use reverie_memory::MemoryAccess;
 use serde::Deserialize;
 use serde::Serialize;
+#[cfg(feature = "prototype-runtime")]
+pub use tools::native_control_probe;
+#[cfg(feature = "prototype-runtime")]
+pub use tools::owned_signal_publication_probe;
 
 /// Native callback used to issue a syscall with DynamoRIO bookkeeping.
 pub type SyscallInvoker = unsafe extern "C" fn(usize, i64, *const u64) -> i64;
@@ -126,7 +130,10 @@ pub type RuntimeIdler = unsafe extern "C" fn();
 /// admitted initialization routes.
 /// Version 7 also requires `reverie_dbt_runtime_signal_event`, entered only from
 /// the native owned signal continuation.
-pub const DBT_RUNTIME_ABI_VERSION: u32 = 7;
+/// Version 8 appends a fixed native-control executor (56-byte callback layout).
+/// Version 9 requires its owned pending-domain/publication operations; the
+/// callback layout remains 56 bytes.
+pub const DBT_RUNTIME_ABI_VERSION: u32 = 9;
 
 /// Initialized native execution mode supplied by the version-6 startup bridge.
 ///
@@ -204,6 +211,8 @@ pub struct DbtRuntimeCallbacks {
     pub emit_evidence: RuntimeEmitter,
     /// Protected [`DbtEvidenceLogLevel`] discriminant selected by the launcher.
     pub evidence_log_level: i32,
+    /// Version 8: fixed owner-thread capture executor, independent of Tool.
+    pub native_control: Option<native_control::NativeControlInvoker>,
 }
 
 /// Reports the exact native-client/external-runtime ABI version.
@@ -2167,21 +2176,39 @@ pub unsafe extern "C" fn reverie_dbt_runtime_signal_event(
     }
     let event = unsafe { &mut *event };
     tools::set_emitter(emit);
-    let result = run_tool_signal_with_memory_reader(
-        &PROTOTYPE_TOOL,
-        context as usize,
-        Pid::from_raw(tid),
-        Pid::from_raw(pid),
-        branches,
-        unsafe { &mut *counters.cast::<PrototypeCounters>() },
-        &GLOBAL_STATE,
-        &CONFIG,
-        event,
-        invoke_syscall,
-        read_registers,
-        write_registers,
-        read_memory,
-    );
+    let result = if tools::owned_signal_publication_probe_active() {
+        run_tool_signal_with_memory_reader(
+            &tools::owned_signal_publication_probe::OwnedSignalPublicationProbeTool,
+            context as usize,
+            Pid::from_raw(tid),
+            Pid::from_raw(pid),
+            branches,
+            &mut (),
+            &tools::owned_signal_publication_probe::OwnedSignalPublicationProbeGlobal,
+            &(),
+            event,
+            invoke_syscall,
+            read_registers,
+            write_registers,
+            read_memory,
+        )
+    } else {
+        run_tool_signal_with_memory_reader(
+            &PROTOTYPE_TOOL,
+            context as usize,
+            Pid::from_raw(tid),
+            Pid::from_raw(pid),
+            branches,
+            unsafe { &mut *counters.cast::<PrototypeCounters>() },
+            &GLOBAL_STATE,
+            &CONFIG,
+            event,
+            invoke_syscall,
+            read_registers,
+            write_registers,
+            read_memory,
+        )
+    };
     match result {
         Ok(DbtSignalOutcome::Deliver(_)) => 0,
         Ok(DbtSignalOutcome::Suppress) => 1,
@@ -2463,6 +2490,10 @@ pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v3(
         return 1;
     }
     let callbacks = unsafe { &*(argument as *const DbtRuntimeCallbacks) };
+    if let Err(error) = native_control::register(callbacks.native_control) {
+        unsafe { (callbacks.emit)(error.as_ptr(), error.len()) };
+        return 1;
+    }
     let control = std::env::var_os(sync_rpc::RPC_SOCKET_ENV);
     if let Err(error) = prototype_initial_config(native_mode, control.as_deref()) {
         let message = format!("reverie-dbt: startup refused: {error}\n");
@@ -2779,11 +2810,11 @@ mod tests {
 
     #[test]
     fn startup_abi_preserves_layout_and_requires_initialized_native_mode() {
-        assert_eq!(reverie_dbt_runtime_abi_version(), 7);
+        assert_eq!(reverie_dbt_runtime_abi_version(), 9);
         assert_eq!(std::mem::size_of::<DbtSignalEvent>(), 200);
         assert_eq!(std::mem::align_of::<DbtSignalEvent>(), 8);
-        assert_eq!(reverie_dbt_runtime_callbacks_size(), 48);
-        assert_eq!(std::mem::size_of::<DbtRuntimeCallbacks>(), 48);
+        assert_eq!(reverie_dbt_runtime_callbacks_size(), 56);
+        assert_eq!(std::mem::size_of::<DbtRuntimeCallbacks>(), 56);
         assert_eq!(
             DbtStartupMode::try_from(1).unwrap(),
             DbtStartupMode::Standalone

@@ -5937,6 +5937,13 @@ dr_invoke_syscall_as_app(void *drcontext, int sysnum, int arg_count, ...)
     dcontext_t *dcontext = (dcontext_t *)drcontext;
     if (dcontext == GLOBAL_DCONTEXT)
         return -EINVAL;
+#ifdef LINUX
+    /* Preserve legacy idle behavior, but neither returning API may change an
+     * explicitly owned capture transaction's mask, image, or recipient set. */
+    if (signal_capture_is_active(dcontext) &&
+        !signal_injection_permitted(dcontext, sysnum))
+        return -EINVAL;
+#endif
     priv_mcontext_t *mc = get_mcontext(dcontext);
 #define MAX_PARAM_COUNT 6
     if (arg_count > MAX_PARAM_COUNT)
@@ -7647,6 +7654,16 @@ handle_clone_pre(dcontext_t *dcontext)
 bool
 pre_system_call(dcontext_t *dcontext)
 {
+#ifdef LINUX
+    if (signal_capture_is_active(dcontext) &&
+        !dcontext->client_data->skip_client_syscall_events) {
+        /* The initial capture contract completes the original operation inside
+         * its pre-callback and returns false. A non-ignorable original syscall
+         * could otherwise clone, change masks, or block before ready dispatch. */
+        CLIENT_ASSERT(false, "native capture callback must complete its syscall");
+        os_terminate(dcontext, TERMINATE_PROCESS);
+    }
+#endif
     priv_mcontext_t *mc = get_mcontext(dcontext);
     bool execute_syscall = true;
     dr_where_am_i_t old_whereami = dcontext->whereami;
@@ -11324,6 +11341,38 @@ ptrace_takeover_record_present(thread_id_t tid)
     }
     return false;
 }
+
+#ifdef LINUX
+/* Called only at a safe native boundary before a capture transaction. DR's own
+ * thread count alone does not rule out an unmanaged signal recipient. Refuse
+ * an unreadable task directory rather than treating unknown topology as one. */
+bool
+os_current_process_is_single_thread(void)
+{
+    file_t dir = os_open_directory("/proc/self/task", OS_OPEN_READ);
+    if (dir == INVALID_FILE)
+        return false;
+    char owner[32];
+    snprintf(owner, sizeof(owner), "%u", d_r_get_thread_id());
+    NULL_TERMINATE_BUFFER(owner);
+    dir_iterator_t iter;
+    os_dir_iterator_start(&iter, dir);
+    bool found = false;
+    bool unique = true;
+    while (os_dir_iterator_next(&iter)) {
+        if (strcmp(iter.name, ".") == 0 || strcmp(iter.name, "..") == 0)
+            continue;
+        if (found || strcmp(iter.name, owner) != 0) {
+            unique = false;
+            break;
+        }
+        found = true;
+    }
+    bool complete = iter.end == 0;
+    os_close(dir);
+    return complete && unique && found;
+}
+#endif
 
 thread_id_t *
 os_list_threads_by_pid(dcontext_t *dcontext, process_id_t pid, uint *num_threads_out)

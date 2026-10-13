@@ -26,6 +26,84 @@ fn bounded_with_status(command: &mut Command, expected: i32) -> Output {
 }
 
 #[test]
+fn native_child_capture_preserves_pending_ownership_and_masks() {
+    // New native API contract coverage. The existing fork-tree divergence is
+    // the product's failing-first evidence; absence of this API on an older
+    // library is not a behavioral regression test.
+    let directory = tempfile::tempdir().expect("native capture fixture directory");
+    let source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/signal_admission_state");
+    let cmake = std::env::var_os("CMAKE").unwrap_or_else(|| "cmake".into());
+    bounded(
+        Command::new(&cmake)
+            .arg("-S")
+            .arg(source)
+            .arg("-B")
+            .arg(directory.path())
+            .arg("-DCMAKE_BUILD_TYPE=Release")
+            .arg(format!(
+                "-DDynamoRIO_DIR={}",
+                reverie_dbt::bundled_dynamorio_cmake_dir().display()
+            )),
+    );
+    bounded(
+        Command::new(&cmake)
+            .arg("--build")
+            .arg(directory.path())
+            .args(["--target", "signal_capture_client", "signal_capture_guest"])
+            .args(["--parallel", "2"]),
+    );
+    let guest = directory.path().join("signal_capture_guest");
+    let client = directory.path().join("libsignal_capture_client.so");
+    for case in [
+        "release",
+        "caught",
+        "cancel",
+        "premature",
+        "stale-domain",
+        "coalescing",
+        "guest-blocked",
+        "physical-blocked",
+        "no-notification",
+        "ignore-refused",
+        "autoreap-refused",
+    ] {
+        let output = bounded(
+            Command::new(reverie_dbt::bundled_drrun_path())
+                .arg("-c")
+                .arg(&client)
+                .arg(case)
+                .arg("--")
+                .arg(&guest)
+                .arg(case),
+        );
+        let stdout = String::from_utf8(output.stdout).expect("capture stdout");
+        let expected = match case {
+            "stale-domain" => 2,
+            "no-notification" | "ignore-refused" | "autoreap-refused" => 0,
+            _ => 1,
+        };
+        assert!(stdout.contains(&format!("capture guest completed case={case} ")));
+        assert!(stdout.contains(&format!(
+            "capture client completed case={case} ordinary={expected} admissions={expected} commits={expected}"
+        )));
+    }
+    let output = bounded_with_status(
+        Command::new(reverie_dbt::bundled_drrun_path())
+            .arg("-c")
+            .arg(client)
+            .arg("terminal")
+            .arg("--")
+            .arg(guest)
+            .arg("terminal"),
+        31,
+    );
+    let stdout = String::from_utf8(output.stdout).expect("terminal capture stdout");
+    assert!(stdout.contains("capture terminal retained=1 admissions=0 status=31"));
+    assert!(!stdout.contains("capture guest completed"));
+}
+
+#[test]
 fn owned_signal_preserves_native_fp_restart_and_masks() {
     let directory = tempfile::tempdir().expect("native state fixture directory");
     let source =

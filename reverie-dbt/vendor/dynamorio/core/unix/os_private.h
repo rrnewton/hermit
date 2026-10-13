@@ -381,6 +381,10 @@ handle_post_sigsuspend(dcontext_t *dcontext);
 bool
 signal_begin_injected_sigsuspend(dcontext_t *dcontext);
 bool
+os_current_process_is_single_thread(void);
+bool
+signal_capture_is_active(dcontext_t *dcontext);
+bool
 signal_injection_permitted(dcontext_t *dcontext, int sysnum);
 reg_t
 signal_wait_injected_sigsuspend(dcontext_t *dcontext);

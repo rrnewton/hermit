@@ -637,6 +637,14 @@ impl DbtRunner {
             .tempdir_in("/tmp")?;
         let socket = directory.path().join("coordinator.sock");
         let mut global = Arc::new(G::init_global_state(&config).await);
+        let capture_hub = reverie_rpc_transport::native_control::NativeControlHub::new();
+        let capture_enabled = global
+            .install_backend_child_exit_capture(Arc::new(
+                reverie_rpc_transport::child_exit_capture::NativeChildExitCapture::new(
+                    capture_hub.clone(),
+                ),
+            ))
+            .map_err(|error| io::Error::other(error.to_string()))?;
         let requested = Arc::new(AtomicBool::new(false));
         let server = RpcServer::bind_with_readiness(
             &socket,
@@ -645,6 +653,11 @@ impl DbtRunner {
             Arc::clone(&requested),
         )
         .map_err(|error| io::Error::other(error.to_string()))?;
+        let server = if capture_enabled {
+            server.with_native_control(capture_hub)
+        } else {
+            server
+        };
 
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-247): Review native external-global capability propagation.
@@ -663,6 +676,11 @@ impl DbtRunner {
         };
         let mut command = runner.command(guest, environment);
         command.env(crate::sync_rpc::RPC_SOCKET_ENV, &socket);
+        if capture_enabled {
+            command.env(reverie_rpc_transport::native_control::ENV, "1");
+        } else {
+            command.env_remove(reverie_rpc_transport::native_control::ENV);
+        }
         match &input {
             CoordinatedInput::Null => {
                 command.stdin(Stdio::null());
