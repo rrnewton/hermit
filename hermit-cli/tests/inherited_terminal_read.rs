@@ -118,6 +118,20 @@ impl Stream {
 }
 
 fn run(backend: Backend, exec: bool) {
+    run_guest(
+        backend,
+        if exec { "exec" } else { "direct" },
+        if exec {
+            "pty-failed-exec-ok\npty-successful-exec-ok\n"
+        } else {
+            ""
+        },
+        "inherited_terminal_read.c",
+    );
+}
+
+fn run_guest(backend: Backend, mode: &str, prefix: &str, guest_source: &str) {
+    let exec = mode == "exec";
     let root = tempfile::Builder::new()
         .prefix("inherited-terminal-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
@@ -128,7 +142,7 @@ fn run(backend: Backend, exec: bool) {
     let guest = root.join("inherited_terminal_read");
     let compiled = Command::new(std::env::var_os("CC").unwrap_or_else(|| "cc".into()))
         .args(["-O2", "-g", "-std=c11", "-Wall", "-Wextra", "-Werror"])
-        .arg(repository.join("tests/c/inherited_terminal_read.c"))
+        .arg(repository.join("tests/c").join(guest_source))
         .arg("-o")
         .arg(&guest)
         .output()
@@ -157,9 +171,7 @@ fn run(backend: Backend, exec: bool) {
             "--",
         ]);
     }
-    command
-        .arg(&guest)
-        .arg(if exec { "exec" } else { "direct" });
+    command.arg(&guest).arg(mode);
     if matches!(backend, Backend::Dbt) {
         hermit_binary::configure_guest_execution(&mut command);
     }
@@ -188,11 +200,6 @@ fn run(backend: Backend, exec: bool) {
     let mut out = Stream::new(&root.join("guest.stdout"));
     let mut err = Stream::new(&root.join("guest.stderr"));
     let ready = b"pty-parent-ready\n";
-    let prefix = if exec {
-        "pty-failed-exec-ok\npty-successful-exec-ok\n"
-    } else {
-        ""
-    };
     let before_input = format!("{prefix}pty-parent-ready\n").into_bytes();
     let mut input_sent = false;
     let mut controller_error = None;
@@ -314,4 +321,24 @@ fn dbt_inherited_terminal_short_read_allows_parent_progress() {
 #[test]
 fn dbt_terminal_alias_survives_failed_and_successful_exec() {
     run(Backend::Dbt, true);
+}
+
+#[test]
+fn native_terminal_read_observes_peer_cleared_nonblocking_after_exec() {
+    run_guest(
+        Backend::Native,
+        "peer-flags",
+        "pty-peer-reader-restored\npty-peer-cleared\n",
+        "inherited_terminal_peer_flags.c",
+    );
+}
+
+#[test]
+fn dbt_terminal_read_observes_peer_cleared_nonblocking_after_exec() {
+    run_guest(
+        Backend::Dbt,
+        "peer-flags",
+        "pty-peer-reader-restored\npty-peer-cleared\n",
+        "inherited_terminal_peer_flags.c",
+    );
 }
