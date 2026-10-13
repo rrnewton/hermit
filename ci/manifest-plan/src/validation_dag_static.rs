@@ -111,6 +111,7 @@ impl StructuredResultProducerKind {
 }
 
 pub(super) const NEXTEST_RESULT_PRODUCERS: &[&str] = &[
+    "test.inherited_terminal_read",
     "test.isolated_dbt_workdir",
     "test.isolated_detcore_workdir",
     "privileged-only-test.cli_kvm",
@@ -280,6 +281,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run_dbt_binds_in_a_user_namespace_of_its_own retains both prior
     // identities: 2 + 1 = 3.
     ("test.isolated_dbt_workdir", 3),
+    // Inherited-terminal regressions: native and DBT direct, exec, and peer-flags
+    // cases. The authored target has six identities; it is separate from CLI.
+    ("test.inherited_terminal_read", 6),
     ("test.isolated_detcore_workdir", 1),
     // Prepared inventories retain all prior identities and add four reporting
     // tests to regular crates and nine to Hermit's library/binary selection.
@@ -2067,7 +2071,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (Claude re-check of https://github.com/rrnewton/hermit/pull/4249): 1528, by listing.
     // And the five FIFO peer-scan tests (https://github.com/rrnewton/hermit/issues/4200): 1533, by listing.
     // And the two raw-exit ChildExit tests (https://github.com/rrnewton/hermit/issues/3895): 1535.
-    ("test.detcore_unit", 1535),
+    // And the four inherited-terminal discovery/alias/provenance/initialization
+    // regressions: 1539 (source projection pending the prepared population).
+    ("test.detcore_unit", 1539),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3337,7 +3343,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the get_mempolicy output-error test: 1528, by listing.
     // And the five FIFO peer-scan tests: 1533, by listing.
     // And the two raw-exit ChildExit tests: 1535.
-    ("test.detcore_unit_on_host", 1535),
+    // And the same four inherited-terminal regressions as the local shared
+    // selection: 1539; integration-target tests are not counted here.
+    ("test.detcore_unit_on_host", 1539),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6225,6 +6233,39 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         engine_only: false,
         timeout: 1200,
         cpu_timeout: 7200,
+        jobs_flag: None,
+        jobs_env: None,
+    },
+    StaticStepSpec {
+        group: r########"test"########,
+        job: r########"inherited_terminal_read"########,
+        desc: r########"Run all six inherited-terminal native and DBT regressions"########,
+        description: r########"Runs the complete inherited_terminal_read integration target once and serially: native and genuine Detcore DBT direct progress, failed/successful exec alias carry, and peer-cleared nonblocking behavior. The original guest assertions, per-guest 30-second timeout, exact short reads, EAGAIN and stream-EOF checks remain unchanged. DBT uses strict mode at DEBUG without relaxations; these are causal single-run tests, not paired canonical verification. The full profile's shared workspace preparation supplies this exact Nextest selection, and build.e2e_artifact plus check.dbt_runtime_abi supplies the matching published CLI and installed DBT resources. The counted runner requires six tests with no skips or retries and uses its existing per-attempt owned-cgroup cleanup. Initial node limits retain the reviewed focused native envelope (8 CPUs, 16 GiB, 2400 CPU seconds, 900 wall seconds). The combined maintained-node duration and RSS calibration remain unmeasured; no timing value is inferred from the prior separately contained cases."########,
+        labels: &[r########"full"########],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test inherited_terminal_read -j 1"########,
+        cmdtype: CmdType::Unknown,
+        manifest: None,
+        integration_test_binaries: Some(&[r########"inherited_terminal_read"########]),
+        deps: &[
+            r########"build.e2e_artifact"########,
+            r########"check.dbt_runtime_abi"########,
+            r########"setup.nextest"########,
+        ],
+        env: &[],
+        hint: HintSpec {
+            resources: &[],
+            est_duration_s: 0.0,
+            rss_baseline_bytes: Some(17179869184),
+            hard_mem_max_bytes: Some(17179869184),
+            classification: StepClass::LatencyBound,
+            preferred_inner_jobs: Some(8),
+            measured_effective_cores: None,
+            measured_cpu_utilization: None,
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 900,
+        cpu_timeout: 2400,
         jobs_flag: None,
         jobs_env: None,
     },

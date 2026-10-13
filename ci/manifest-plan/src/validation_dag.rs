@@ -453,6 +453,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "test.liteinst_allocator",
     "test.liteinst_stacks",
     "test.isolated_dbt_workdir",
+    "test.inherited_terminal_read",
     "test.isolated_detcore_workdir",
     "test.sabre_examples",
     "test.hermit_modes",
@@ -578,9 +579,10 @@ const PROFILES: [Profile; 11] = [
     // its hosted twin: 89/90 before. portable and hosted-portable are
     // unchanged because the node carries only the full label.
     Profile {
+        // The six inherited-terminal regressions add one full-only node.
         label: "full",
-        direct_steps: 93,
-        selected_steps: 94,
+        direct_steps: 94,
+        selected_steps: 95,
     },
     Profile {
         label: "portable",
@@ -3891,9 +3893,10 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // https://github.com/rrnewton/hermit/issues/4276).
     // 433 since the super run type's four generated compat.<row> nodes became
     // the one static supercompat.manifest_compat (436 - 4 + 1; same issue).
-    if cfg.steps.len() != 433 {
+    // One full-profile counted target owns the six inherited-terminal regressions.
+    if cfg.steps.len() != 434 {
         return Err(format!(
-            "superset has {} steps, expected 433",
+            "superset has {} steps, expected 434",
             cfg.steps.len()
         ));
     }
@@ -6285,7 +6288,8 @@ sys.exit(37)
         // nodes). 90 since build.liteinst_allocator_fixtures and
         // test.liteinst_allocator joined full (93 full nodes).
         // 91 with the additive required M2 stack node (94 full nodes).
-        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 91);
+        // The inherited-terminal target stays required beside the Buck cells.
+        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 92);
 
         fn twin(cfg: &mut DagConfig) -> &mut Step {
             cfg.steps
