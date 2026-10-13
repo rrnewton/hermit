@@ -1487,7 +1487,15 @@ fi
 # tree, third-party/, the root Cargo.toml and rust-toolchain.toml are unchanged.
 # The fixture raises the reverie-dbt inventory from 949 to 950. No new timing
 # sample is claimed.
-expected_pin=60a68e8bce0630c06e9c6cb453fc005467250d80
+# DBT SHARED-RPC ABI8 SDK-BUDGET CARRY (2026-10-13):
+# Bind Reverie 77adca53c50b810cce3a20b5d28c805e0adaac56, based on 62ce9e128be065591e6cf543f55a3f93401812b6.
+# Since the preceding pin, shared vDSO rewriting moves into core and D1 shares
+# the DBT RPC client. SDK build.rs, DynamoRIO, third-party inputs, the root and
+# DBT manifests, toolchain, and ABI8 native client are unchanged. Retain the
+# budget numbers without a new timing claim; the DBT inventory rises 950 to 951.
+# Rust runtime artifacts still require a new build, and an ABI7 client cannot
+# be reused as the ABI8 client. Current client identity remains a build check.
+expected_pin=77adca53c50b810cce3a20b5d28c805e0adaac56
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
