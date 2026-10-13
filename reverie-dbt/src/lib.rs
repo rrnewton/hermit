@@ -121,7 +121,7 @@ pub type RuntimeIdler = unsafe extern "C" fn();
 /// `reverie_dbt_runtime_abi_version`, `reverie_dbt_runtime_callbacks_size`,
 /// `reverie_dbt_runtime_thread_created_v2`,
 /// `reverie_dbt_runtime_process_clone_result`,
-/// `reverie_dbt_runtime_background_init_v3`, and (from version 5)
+/// `reverie_dbt_runtime_background_init_v4`, and (from version 5)
 /// `reverie_dbt_runtime_rdtsc`. Advancing a consumer's Reverie revision without
 /// those matching exports is an incomplete cross-repository update and fails at
 /// link or at the pre-callback ABI check.
@@ -133,7 +133,30 @@ pub type RuntimeIdler = unsafe extern "C" fn();
 /// Version 8 appends a fixed native-control executor (56-byte callback layout).
 /// Version 9 requires its owned pending-domain/publication operations; the
 /// callback layout remains 56 bytes.
-pub const DBT_RUNTIME_ABI_VERSION: u32 = 9;
+/// Version 10 requires the actual immutable native preemption quantum in V4
+/// startup. Native-control capture with a nonzero quantum refuses before READY;
+/// legacy startup keeps its existing native preemption behavior. Missing V4
+/// input is not an implicit zero and must not pass a pin-only compatibility check.
+pub const DBT_RUNTIME_ABI_VERSION: u32 = 10;
+
+/// Checks the newly combined capture/preemption configuration after complete
+/// authoritative Hello + Config decoding and startup socket closure.
+///
+/// This does not disable, reset, or coarsen native preemption. The legacy route
+/// accepts every existing quantum. The generated capture continuation currently
+/// supports only the maintained native-preemption-disabled configuration.
+pub fn validate_native_capture_preemption(
+    transport: sync_rpc::InitialConfigTransport,
+    native_preemption_quantum: u64,
+) -> Result<(), &'static str> {
+    if transport == sync_rpc::InitialConfigTransport::NativeControl
+        && native_preemption_quantum != 0
+    {
+        Err("native-control capture requires native preemption quantum zero")
+    } else {
+        Ok(())
+    }
+}
 
 /// Initialized native execution mode supplied by the version-6 startup bridge.
 ///
@@ -226,31 +249,76 @@ pub extern "C" fn reverie_dbt_runtime_abi_version() -> u32 {
 /// written when the runtime's tool answers it, 0 to leave it to the native
 /// client's fixed-stride counter, negative on failure.
 ///
-/// The prototype tools observe syscalls and do not virtualize time, so this
-/// runtime leaves every read to the client, as before version 5. A runtime
-/// whose tool owns the guest's clock (Detcore, in hermit) answers here instead.
+/// Ordinary prototype tools leave TSC reads to the existing client counter.
+/// The separately selected owned-TSC test probe drives a real Tool/RPC borrow
+/// only after its parent identity marker. Its explicit host-supplied result is
+/// a test oracle, not a production clock or a claim of Detcore semantics.
 ///
 /// # Safety
-///
-/// Never dereferences its arguments.
+/// For the selected probe, pointers/callbacks must be valid for this application
+/// event, output pointers writable, and counters exclusively owned until return.
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "prototype-runtime")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn reverie_dbt_runtime_rdtsc(
-    _context: *mut c_void,
-    _counters: *mut PrototypeCounters,
-    _tid: i32,
-    _pid: i32,
-    _branches: u64,
-    _with_aux: i32,
-    _invoke_syscall: SyscallInvoker,
-    _read_registers: RegisterReader,
-    _write_registers: RegisterWriter,
-    _emit: tools::Emitter,
-    _tsc: *mut u64,
-    _aux: *mut u32,
+    context: *mut c_void,
+    counters: *mut PrototypeCounters,
+    tid: i32,
+    pid: i32,
+    branches: u64,
+    with_aux: i32,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+    write_registers: RegisterWriter,
+    emit: tools::Emitter,
+    tsc: *mut u64,
+    aux: *mut u32,
 ) -> i32 {
-    0
+    if !tools::owned_signal_publication_probe::tsc_probe_ready() {
+        return 0;
+    }
+    if context.is_null()
+        || counters.is_null()
+        || tsc.is_null()
+        || aux.is_null()
+        || !sync_rpc::is_active()
+    {
+        return -1;
+    }
+    tools::set_emitter(emit);
+    let mut state = ();
+    let mut guest =
+        DbtGuest::<tools::owned_signal_publication_probe::OwnedSignalPublicationProbeTool>::new(
+            context as usize,
+            Pid::from_raw(tid),
+            Pid::from_raw(pid),
+            current_ppid(),
+            branches,
+            &mut state,
+            &tools::owned_signal_publication_probe::OwnedSignalPublicationProbeGlobal,
+            &(),
+            invoke_syscall,
+            read_registers,
+            write_registers,
+        );
+    let tail_result = Arc::clone(&guest.tail_inject_result);
+    let request = if with_aux == 0 {
+        reverie::Rdtsc::Tsc
+    } else {
+        reverie::Rdtsc::Tscp
+    };
+    let tool = tools::owned_signal_publication_probe::OwnedSignalPublicationProbeTool;
+    match run_ready(tool.handle_rdtsc_event(&mut guest, request), &tail_result) {
+        Some(Ok(result)) => {
+            unsafe {
+                tsc.write(result.tsc);
+                aux.write(result.aux.unwrap_or(0));
+            }
+            1
+        }
+        // No local/global fallback may impersonate a completed host reply.
+        Some(Err(_)) | None => -1,
+    }
 }
 
 /// Reports the exact callback-structure size for the current ABI version.
@@ -273,8 +341,9 @@ pub enum DbtSyscallOutcome {
 /// Owned signal payload exchanged with the native admission continuation.
 ///
 /// No pointer into DynamoRIO's pending queue crosses the runtime boundary.
-/// Version 7 adds this 200-byte, 8-byte-aligned wire object without changing
-/// [`DbtRuntimeCallbacks`]. The caller initializes all fields before entry.
+/// ABI 10 appends authenticated admission identity to the original payload:
+/// 232 bytes, aligned to 8, with existing offsets unchanged. This requires the
+/// paired native/runtime ABI; the caller initializes every field before entry.
 #[repr(C)]
 pub struct DbtSignalEvent {
     /// Signal reported by the kernel.
@@ -291,6 +360,39 @@ pub struct DbtSignalEvent {
     pub deferred_sysnum: i64,
     /// Deferred native syscall arguments.
     pub deferred_args: [u64; 6],
+    /// Current image of the actual native SIGCHLD admission, or zero if unknown.
+    pub admission_image_epoch: u64,
+    /// Actual pending-domain identity; all four identity fields are zero or set.
+    pub admission_domain: u64,
+    /// Detached native allocation generation, not an incoming child identity.
+    pub admission_allocation: u64,
+    /// Live native token for this exact Tool callback.
+    pub admission_token: u64,
+}
+
+// Metadata is accepted only as one complete native identity. Unknown identity
+// preserves the ordinary hook; it never selects a bypass or earns capture credit.
+fn signal_admission_identity(
+    event: &DbtSignalEvent,
+) -> Result<Option<reverie::ChildExitSignalAdmission>, Errno> {
+    let identity = [
+        event.admission_image_epoch,
+        event.admission_domain,
+        event.admission_allocation,
+        event.admission_token,
+    ];
+    if identity == [0; 4] {
+        Ok(None)
+    } else if event.signal == Signal::SIGCHLD as i32 && identity.iter().all(|value| *value != 0) {
+        Ok(Some(reverie::ChildExitSignalAdmission {
+            image_epoch: identity[0],
+            domain: identity[1],
+            allocation: identity[2],
+            token: identity[3],
+        }))
+    } else {
+        Err(Errno::EINVAL)
+    }
 }
 
 /// Result of the real Tool signal hook after its future and Guest borrow end.
@@ -345,6 +447,7 @@ where
     tail_inject_result: Arc<TailInjectResult>,
     signal_info: Option<[u8; reverie::SIGNAL_INFO_SIZE]>,
     signal_info_replacement: Option<[u8; reverie::SIGNAL_INFO_SIZE]>,
+    child_exit_signal_admission: Option<reverie::ChildExitSignalAdmission>,
 }
 
 impl<'a, T> DbtGuest<'a, T>
@@ -382,6 +485,7 @@ where
             tail_inject_result: Arc::new(TailInjectResult::default()),
             signal_info: None,
             signal_info_replacement: None,
+            child_exit_signal_admission: None,
         }
     }
 
@@ -515,6 +619,10 @@ where
 
     fn signal_info(&self) -> Option<[u8; reverie::SIGNAL_INFO_SIZE]> {
         self.signal_info_replacement.or(self.signal_info)
+    }
+
+    fn child_exit_signal_admission(&self) -> Option<reverie::ChildExitSignalAdmission> {
+        self.child_exit_signal_admission
     }
 
     fn set_signal_info(&mut self, info: [u8; reverie::SIGNAL_INFO_SIZE]) -> Result<(), Errno> {
@@ -1815,6 +1923,7 @@ pub fn run_tool_signal_with_memory_reader<T: Tool>(
     {
         return Err(Errno::EINVAL.into());
     }
+    let admission = signal_admission_identity(event)?;
     event.signal_info_changed = 0;
     event.delivered_signal = event.signal;
     let mut guest = DbtGuest::new(
@@ -1832,6 +1941,7 @@ pub fn run_tool_signal_with_memory_reader<T: Tool>(
     )
     .with_memory_reader(read_memory);
     guest.signal_info = Some(event.signal_info);
+    guest.child_exit_signal_admission = admission;
     let tail_result = Arc::clone(&guest.tail_inject_result);
     let result = run_ready(tool.handle_signal_event(&mut guest, signal), &tail_result);
     match result {
@@ -1926,12 +2036,21 @@ static TOTAL_REWRITTEN: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "prototype-runtime")]
 static IMAGE_GENERATION: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "prototype-runtime")]
+static PROTOTYPE_READY_GENERATION: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "prototype-runtime")]
+static PROTOTYPE_STARTUP_FAILED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "prototype-runtime")]
+static PROTOTYPE_STARTUP_CONTRACT: Mutex<Option<(u64, u32, u64)>> = Mutex::new(None);
+#[cfg(feature = "prototype-runtime")]
 static PROCESS_CLONE_RESULT_PROBE: AtomicBool = AtomicBool::new(false);
 
 /// Begins a new DynamoRIO application image and returns its generation.
 #[cfg(feature = "prototype-runtime")]
 #[unsafe(no_mangle)]
 pub extern "C" fn reverie_dbt_runtime_image_init() -> u64 {
+    PROTOTYPE_READY_GENERATION.store(0, Ordering::Release);
+    PROTOTYPE_STARTUP_FAILED.store(false, Ordering::Release);
+    *PROTOTYPE_STARTUP_CONTRACT.lock().unwrap() = None;
     IMAGE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
 }
 
@@ -2482,41 +2601,110 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
 // TODO-HUMAN-REVIEW(PR-162): Review the stdout-emitter init delivery.
 #[cfg(feature = "prototype-runtime")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v3(
+pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v4(
     argument: *mut c_void,
     native_mode: u32,
+    native_preemption_quantum: u64,
 ) -> i32 {
-    if argument.is_null() {
-        return 1;
+    PROTOTYPE_READY_GENERATION.store(0, Ordering::Release);
+    let result = (|| -> Result<u64, String> {
+        if argument.is_null() || PROTOTYPE_STARTUP_FAILED.load(Ordering::Acquire) {
+            return Err("missing callbacks or terminal startup failure".into());
+        }
+        let image = IMAGE_GENERATION.load(Ordering::Acquire);
+        if image == 0 {
+            return Err("native image was not initialized".into());
+        }
+        let contract = (image, native_mode, native_preemption_quantum);
+        if let Some(previous) = *PROTOTYPE_STARTUP_CONTRACT.lock().unwrap() {
+            return if previous == contract {
+                Ok(image)
+            } else {
+                Err("native startup contract changed within an image".into())
+            };
+        }
+        let callbacks = unsafe { &*(argument as *const DbtRuntimeCallbacks) };
+        native_control::register(callbacks.native_control).map_err(str::to_string)?;
+        let control = std::env::var_os(sync_rpc::RPC_SOCKET_ENV);
+        prototype_initial_config_with_quantum(
+            native_mode,
+            control.as_deref(),
+            native_preemption_quantum,
+        )?;
+        tools::set_stdout_emitter(callbacks.emit_stdout);
+        PROCESS_CLONE_RESULT_PROBE.store(
+            std::env::var_os("REVERIE_DBT_TEST_PROCESS_CLONE_RESULTS").is_some(),
+            Ordering::Release,
+        );
+        if IMAGE_GENERATION.load(Ordering::Acquire) != image {
+            return Err("native image changed during startup".into());
+        }
+        let mut saved = PROTOTYPE_STARTUP_CONTRACT.lock().unwrap();
+        if saved.is_some_and(|old| old != contract) {
+            return Err("conflicting native startup completion".into());
+        }
+        *saved = Some(contract);
+        Ok(image)
+    })();
+    match result {
+        Ok(image) => {
+            PROTOTYPE_READY_GENERATION.store(image, Ordering::Release);
+            0
+        }
+        Err(error) => {
+            PROTOTYPE_STARTUP_FAILED.store(true, Ordering::Release);
+            if !argument.is_null() {
+                let callbacks = unsafe { &*(argument as *const DbtRuntimeCallbacks) };
+                let message = format!("reverie-dbt: startup refused: {error}\n");
+                unsafe { (callbacks.emit)(message.as_ptr(), message.len()) };
+            }
+            1
+        }
     }
-    let callbacks = unsafe { &*(argument as *const DbtRuntimeCallbacks) };
-    if let Err(error) = native_control::register(callbacks.native_control) {
-        unsafe { (callbacks.emit)(error.as_ptr(), error.len()) };
-        return 1;
-    }
-    let control = std::env::var_os(sync_rpc::RPC_SOCKET_ENV);
-    if let Err(error) = prototype_initial_config(native_mode, control.as_deref()) {
-        let message = format!("reverie-dbt: startup refused: {error}\n");
-        unsafe { (callbacks.emit)(message.as_ptr(), message.len()) };
-        return 1;
-    }
-    tools::set_stdout_emitter(callbacks.emit_stdout);
-    PROCESS_CLONE_RESULT_PROBE.store(
-        std::env::var_os("REVERIE_DBT_TEST_PROCESS_CLONE_RESULTS").is_some(),
-        Ordering::Release,
-    );
-    0
 }
 
+/// Retained symbol for the former startup bridge. It cannot supply the actual
+/// quantum and therefore refuses before initialization, without guessing zero.
+///
+/// # Safety
+/// `argument` must be null or a valid callback table for the call.
 #[cfg(feature = "prototype-runtime")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v3(
+    argument: *mut c_void,
+    _native_mode: u32,
+) -> i32 {
+    PROTOTYPE_READY_GENERATION.store(0, Ordering::Release);
+    PROTOTYPE_STARTUP_FAILED.store(true, Ordering::Release);
+    if !argument.is_null() {
+        let callbacks = unsafe { &*(argument as *const DbtRuntimeCallbacks) };
+        let message = b"reverie-dbt: initialization requires ABI-10 native quantum bridge\n";
+        unsafe { (callbacks.emit)(message.as_ptr(), message.len()) };
+    }
+    1
+}
+
+#[cfg(all(feature = "prototype-runtime", test))]
 fn prototype_initial_config(
     native_mode: u32,
     control: Option<&std::ffi::OsStr>,
 ) -> Result<(), String> {
+    prototype_initial_config_with_quantum(native_mode, control, 0)
+}
+
+#[cfg(feature = "prototype-runtime")]
+fn prototype_initial_config_with_quantum(
+    native_mode: u32,
+    control: Option<&std::ffi::OsStr>,
+    native_preemption_quantum: u64,
+) -> Result<(), String> {
     let mode = DbtStartupMode::try_from(native_mode).map_err(|error| error.to_string())?;
     match control {
         Some(path) => {
-            sync_rpc::read_initial_config::<()>(Path::new(path)).map_err(|error| error.to_string())
+            let initial = sync_rpc::read_initial_config_with_transport::<()>(Path::new(path))
+                .map_err(|error| error.to_string())?;
+            validate_native_capture_preemption(initial.transport, native_preemption_quantum)
+                .map_err(str::to_string)
         }
         None if mode == DbtStartupMode::Coordinated => {
             Err("coordinated startup requires a coordinator socket".into())
@@ -2598,8 +2786,13 @@ pub extern "C" fn reverie_dbt_runtime_process_exit() {
 /// Reports whether the built-in prototype runtime is ready for callbacks.
 #[cfg(feature = "prototype-runtime")]
 #[unsafe(no_mangle)]
-pub extern "C" fn reverie_dbt_runtime_ready(_image_generation: u64) -> i32 {
-    1
+pub extern "C" fn reverie_dbt_runtime_ready(image_generation: u64) -> i32 {
+    i32::from(
+        image_generation != 0
+            && IMAGE_GENERATION.load(Ordering::Acquire) == image_generation
+            && !PROTOTYPE_STARTUP_FAILED.load(Ordering::Acquire)
+            && PROTOTYPE_READY_GENERATION.load(Ordering::Acquire) == image_generation,
+    )
 }
 
 /// Returns the name of the built-in DBT runtime for native summary evidence.
@@ -2681,6 +2874,20 @@ mod tests {
             assert_eq!(signal, Signal::SIGCHLD);
             let original = guest.signal_info().expect("owned authentic payload");
             assert_eq!(original[24], 0x91);
+            let admission = guest.child_exit_signal_admission();
+            if self.0 == 5 {
+                assert_eq!(
+                    admission,
+                    Some(reverie::ChildExitSignalAdmission {
+                        image_epoch: 11,
+                        domain: 22,
+                        allocation: 33,
+                        token: 44,
+                    })
+                );
+            } else {
+                assert_eq!(admission, None);
+            }
             // Exercise the actual async Tool driver, including a suspended poll.
             let mut first = true;
             std::future::poll_fn(|cx| {
@@ -2700,8 +2907,9 @@ mod tests {
             replacement[..4].copy_from_slice(&(Signal::SIGUSR1 as i32).to_ne_bytes());
             assert_eq!(guest.set_signal_info(replacement), Err(Errno::EINVAL));
             assert_eq!(guest.signal_info().unwrap()[24], 0x72);
+            assert_eq!(guest.child_exit_signal_admission(), admission);
             match self.0 {
-                0 => Ok(Some(signal)),
+                0 | 5 => Ok(Some(signal)),
                 1 => Ok(None),
                 2 => Ok(Some(Signal::SIGUSR1)),
                 3 => Err(Errno::EIO),
@@ -2727,6 +2935,10 @@ mod tests {
             reserved: 0,
             deferred_sysnum: 0,
             deferred_args: [0; 6],
+            admission_image_epoch: 0,
+            admission_domain: 0,
+            admission_allocation: 0,
+            admission_token: 0,
         }
     }
 
@@ -2764,6 +2976,37 @@ mod tests {
         assert_eq!(event.signal_info_changed, 1);
         assert_eq!(event.signal_info[24], 0x72);
         assert_eq!(event.delivered_signal, Signal::SIGCHLD as i32);
+    }
+
+    #[test]
+    fn actual_tool_hook_carries_allocation_identity_independent_of_siginfo() {
+        let mut event = signal_event();
+        event.admission_image_epoch = 11;
+        event.admission_domain = 22;
+        event.admission_allocation = 33;
+        event.admission_token = 44;
+        assert_eq!(
+            probe_signal(5, &mut event).unwrap(),
+            DbtSignalOutcome::Deliver(Signal::SIGCHLD)
+        );
+        // The Tool may alter siginfo, but cannot change this admission identity.
+        assert_eq!(event.signal_info[24], 0x72);
+        assert_eq!(event.admission_allocation, 33);
+        assert_eq!(event.admission_token, 44);
+    }
+
+    #[test]
+    fn admission_identity_refuses_partial_or_wrong_signal_metadata() {
+        let mut event = signal_event();
+        assert_eq!(signal_admission_identity(&event).unwrap(), None);
+        event.admission_image_epoch = 11;
+        assert_eq!(signal_admission_identity(&event), Err(Errno::EINVAL));
+        event.admission_domain = 22;
+        event.admission_allocation = 33;
+        event.admission_token = 44;
+        assert!(signal_admission_identity(&event).unwrap().is_some());
+        event.signal = Signal::SIGUSR1 as i32;
+        assert_eq!(signal_admission_identity(&event), Err(Errno::EINVAL));
     }
 
     #[test]
@@ -2810,8 +3053,13 @@ mod tests {
 
     #[test]
     fn startup_abi_preserves_layout_and_requires_initialized_native_mode() {
-        assert_eq!(reverie_dbt_runtime_abi_version(), 9);
-        assert_eq!(std::mem::size_of::<DbtSignalEvent>(), 200);
+        assert_eq!(reverie_dbt_runtime_abi_version(), 10);
+        assert_eq!(std::mem::size_of::<DbtSignalEvent>(), 232);
+        assert_eq!(
+            std::mem::offset_of!(DbtSignalEvent, admission_image_epoch),
+            200
+        );
+        assert_eq!(std::mem::offset_of!(DbtSignalEvent, deferred_args), 152);
         assert_eq!(std::mem::align_of::<DbtSignalEvent>(), 8);
         assert_eq!(reverie_dbt_runtime_callbacks_size(), 56);
         assert_eq!(std::mem::size_of::<DbtRuntimeCallbacks>(), 56);
@@ -2831,6 +3079,107 @@ mod tests {
             unsafe { reverie_dbt_runtime_background_init_v3(std::ptr::null_mut(), 1) },
             0
         );
+    }
+
+    #[test]
+    fn native_capture_requires_zero_quantum_without_changing_legacy_preemption() {
+        use sync_rpc::InitialConfigTransport::Legacy;
+        use sync_rpc::InitialConfigTransport::NativeControl;
+        assert!(validate_native_capture_preemption(NativeControl, 0).is_ok());
+        for quantum in [1, 1000, u64::MAX] {
+            assert_eq!(
+                validate_native_capture_preemption(NativeControl, quantum),
+                Err("native-control capture requires native preemption quantum zero")
+            );
+            assert!(validate_native_capture_preemption(Legacy, quantum).is_ok());
+        }
+        assert!(validate_native_capture_preemption(Legacy, 0).is_ok());
+    }
+
+    #[cfg(feature = "prototype-runtime")]
+    #[test]
+    fn prototype_ready_requires_success_and_current_unchanged_image() {
+        const CHILD: &str = "REVERIE_DBT_TEST_STARTUP_READY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::prototype_ready_requires_success_and_current_unchanged_image",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env_remove(sync_rpc::RPC_SOCKET_ENV)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"));
+            return;
+        }
+        unsafe extern "C" fn emit(_: *const u8, _: usize) {}
+        unsafe extern "C" fn idle() {}
+        unsafe extern "C" fn control(
+            _: usize,
+            _: *const native_control::NativeControlRequest,
+            _: *mut reverie_rpc_transport::native_control::NativeControlReply,
+        ) {
+        }
+        let mut callbacks = DbtRuntimeCallbacks {
+            emit,
+            idle,
+            panic_on_unsupported_syscalls: 0,
+            unsupported_report_fd: 0,
+            emit_stdout: emit,
+            emit_evidence: emit,
+            evidence_log_level: 0,
+            native_control: Some(control),
+        };
+        let argument = (&mut callbacks as *mut DbtRuntimeCallbacks).cast();
+        let first = reverie_dbt_runtime_image_init();
+        assert_eq!(reverie_dbt_runtime_ready(first), 0);
+        // Missing coordinated authority must not publish READY or permit retry.
+        assert_ne!(
+            unsafe { reverie_dbt_runtime_background_init_v4(argument, 2, 0) },
+            0
+        );
+        assert_eq!(reverie_dbt_runtime_ready(first), 0);
+        assert_ne!(
+            unsafe { reverie_dbt_runtime_background_init_v4(argument, 1, 0) },
+            0
+        );
+        let second = reverie_dbt_runtime_image_init();
+        assert_eq!(
+            unsafe { reverie_dbt_runtime_background_init_v4(argument, 1, 0) },
+            0
+        );
+        assert_eq!(reverie_dbt_runtime_ready(second), 1);
+        assert_eq!(reverie_dbt_runtime_ready(first), 0);
+        assert_eq!(
+            unsafe { reverie_dbt_runtime_background_init_v4(argument, 1, 0) },
+            0
+        );
+        assert_ne!(
+            unsafe { reverie_dbt_runtime_background_init_v4(argument, 1, 1) },
+            0
+        );
+        assert_eq!(reverie_dbt_runtime_ready(second), 0);
+        let third = reverie_dbt_runtime_image_init();
+        assert_eq!(reverie_dbt_runtime_ready(second), 0);
+        assert_eq!(reverie_dbt_runtime_ready(third), 0);
+        // Legacy/no-capture nonzero quantum stays valid on a fresh image.
+        assert_eq!(
+            unsafe { reverie_dbt_runtime_background_init_v4(argument, 1, 17) },
+            0
+        );
+        assert_eq!(reverie_dbt_runtime_ready(third), 1);
+        assert_ne!(
+            unsafe { reverie_dbt_runtime_background_init_v3(argument, 1) },
+            0
+        );
+        assert_eq!(reverie_dbt_runtime_ready(third), 0);
     }
 
     #[cfg(feature = "prototype-runtime")]

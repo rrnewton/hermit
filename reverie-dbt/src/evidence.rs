@@ -2880,7 +2880,7 @@ mod tests {
             .find("evidence_emit_image_initialization();")
             .unwrap();
         let background_runtime = background
-            .find("reverie_dbt_runtime_background_init_v3(\n      &runtime_callbacks_page.value, native_mode);")
+            .find("reverie_dbt_runtime_background_init_v4(\n      &runtime_callbacks_page.value, native_mode, preemption_quantum);")
             .unwrap();
         let background_callback_leave = background_runtime
             + background[background_runtime..]
@@ -2944,7 +2944,7 @@ mod tests {
         let first_runtime_callback = main.find("reverie_dbt_runtime_image_init()").unwrap();
         assert!(version_check < first_runtime_callback);
         assert!(source.contains("reverie_dbt_runtime_thread_created_v2("));
-        assert!(source.contains("reverie_dbt_runtime_background_init_v3("));
+        assert!(source.contains("reverie_dbt_runtime_background_init_v4("));
     }
 
     #[test]
@@ -3129,7 +3129,7 @@ mod tests {
         ));
         assert!(
             source
-                .contains("reverie_dbt_runtime_background_init_v3(\n      &runtime_callbacks_page.value, native_mode);")
+                .contains("reverie_dbt_runtime_background_init_v4(\n      &runtime_callbacks_page.value, native_mode, preemption_quantum);")
         );
 
         let main = source

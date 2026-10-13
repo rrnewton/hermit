@@ -17,3 +17,12 @@ target_compile_options(signal_capture_client PRIVATE -Werror=implicit-function-d
 add_executable(signal_capture_guest EXCLUDE_FROM_ALL capture_guest.c)
 target_compile_options(signal_capture_guest PRIVATE -Wall -Wextra -Werror -fno-stack-protector)
 target_link_options(signal_capture_guest PRIVATE -rdynamic)
+
+# Separate real publication-wait finalizer contract; no existing target changes.
+add_library(signal_wait_finalizer_client SHARED EXCLUDE_FROM_ALL wait_finalizer_client.c)
+configure_DynamoRIO_client(signal_wait_finalizer_client)
+use_DynamoRIO_extension(signal_wait_finalizer_client drmgr)
+target_compile_options(signal_wait_finalizer_client PRIVATE -Werror=implicit-function-declaration)
+add_executable(signal_wait_finalizer_guest EXCLUDE_FROM_ALL wait_finalizer_guest.c)
+target_compile_options(signal_wait_finalizer_guest PRIVATE -Wall -Wextra -Werror -fno-stack-protector)
+target_link_options(signal_wait_finalizer_guest PRIVATE -rdynamic)

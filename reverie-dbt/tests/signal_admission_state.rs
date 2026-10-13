@@ -342,3 +342,110 @@ fn owned_signal_preserves_native_fp_restart_and_masks() {
     assert!(stdout.contains("returning injections entries=1 completions=1"));
     assert!(stdout.contains("signals=1 admissions=1 commits=1 restart_contexts=0"));
 }
+
+/// Real SDK contract coverage; the C readiness callback does not substitute
+/// for the separate genuine Detcore A/B Rust-borrow and handler regressions.
+#[test]
+fn native_wait_finalizer_authenticates_original_context_and_last_callback() {
+    let directory = tempfile::tempdir()
+        .expect("native finalizer directory")
+        .keep();
+    println!("native wait finalizer retained {}", directory.display());
+    let source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/signal_admission_state");
+    let cmake = std::env::var_os("CMAKE").unwrap_or_else(|| "cmake".into());
+    bounded(
+        Command::new(&cmake)
+            .arg("-S")
+            .arg(source)
+            .arg("-B")
+            .arg(&directory)
+            .arg("-DCMAKE_BUILD_TYPE=Release")
+            .arg(format!(
+                "-DDynamoRIO_DIR={}",
+                reverie_dbt::bundled_dynamorio_cmake_dir().display()
+            )),
+    );
+    bounded(
+        Command::new(&cmake)
+            .arg("--build")
+            .arg(&directory)
+            .args([
+                "--target",
+                "signal_wait_finalizer_client",
+                "signal_wait_finalizer_guest",
+            ])
+            .args(["--parallel", "2"]),
+    );
+    for case in [
+        "wait4-release",
+        "waitid-cancel",
+        "wait4-suppress",
+        "cancel-empty",
+        "late-arg",
+        "late-skip",
+        "late-readiness",
+    ] {
+        let output = Command::new("timeout")
+            .args(["--signal=TERM", "--kill-after=2s", "30s"])
+            .arg(reverie_dbt::bundled_drrun_path())
+            .arg("-c")
+            .arg(directory.join("libsignal_wait_finalizer_client.so"))
+            .arg(case)
+            .arg("--")
+            .arg(directory.join("signal_wait_finalizer_guest"))
+            .arg(case)
+            .output()
+            .expect("one bounded native finalizer case");
+        std::fs::write(directory.join(format!("{case}.stdout")), &output.stdout).unwrap();
+        std::fs::write(directory.join(format!("{case}.stderr")), &output.stderr).unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        println!(
+            "native wait finalizer case={case} status={:?} stdout={stdout:?} stderr={stderr:?}",
+            output.status
+        );
+        let terminal = case.starts_with("late-");
+        // This targets the retained Release SDK: os_terminate(...,-1) exits255.
+        // Require the exact all-client boundary below: another SDK exit255,
+        // timeout, signal, fixture failure41/43, or crash is not credit.
+        assert_eq!(output.status.code(), Some(if terminal { 255 } else { 0 }));
+        let refusals = if case == "cancel-empty" { 16 } else { 17 };
+        assert!(stdout.contains(&format!(
+            "wait finalizer staged case={case} refusals={refusals} captured={}",
+            i32::from(case != "cancel-empty")
+        )));
+        assert!(!stderr.contains("wait finalizer client failure"));
+        assert!(!stderr.contains("wait finalizer guest failure"));
+        assert!(!stderr.contains("forbidden application continuation"));
+        let finalizer_refusal = "native wait finalizer refused at all-client completion";
+        assert_eq!(
+            stderr
+                .lines()
+                .filter(|line| *line == finalizer_refusal)
+                .count(),
+            usize::from(terminal),
+            "only the actual all-client completion refusal earns terminal credit"
+        );
+        if terminal {
+            let mutation = match case {
+                "late-arg" => "arg5",
+                "late-skip" => "execute=false",
+                "late-readiness" => "readiness=WAIT",
+                _ => unreachable!(),
+            };
+            assert!(stdout.contains(&format!(
+                "wait finalizer late mutation {mutation}; required terminal before kernel"
+            )));
+            assert!(!stdout.contains("wait finalizer guest completed"));
+            assert!(!stdout.contains("wait finalizer client completed"));
+        } else {
+            assert!(stdout.contains(&format!(
+                "wait finalizer guest completed case={case} child_status=31 reaps=1"
+            )));
+            assert!(stdout.contains(&format!(
+                "wait finalizer client completed case={case} admissions=1 commits=1 continuations=1"
+            )));
+        }
+    }
+}

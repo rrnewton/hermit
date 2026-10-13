@@ -1566,7 +1566,43 @@ dr_signal_capture_status_t dr_signal_capture_cancel(
 typedef enum {
     DR_SIGNAL_PUBLICATION_SYSCALL = 1,
     DR_SIGNAL_PUBLICATION_OWNED = 2,
+    /** Only inside dr_insert_signal_publication_tsc's generated scope. */
+    DR_SIGNAL_PUBLICATION_TSC = 4,
 } dr_signal_publication_callback_t;
+
+/** Optional observation-only callback for the generated TSC test seam.
+ * disposition=-1 prepares decoded geometry before emulation (mc is NULL);
+ * disposition=0 or1 observes the actual cache/dispatcher decision and committed
+ * application context after emulation. No capture authority is granted by it.
+ * NULL preserves the normal path without diagnostic context reads. */
+typedef void (*dr_signal_publication_tsc_observer_t)(
+    void *drcontext, app_pc pc, app_pc next_pc, bool with_aux,
+    int disposition, const dr_mcontext_t *mc);
+
+DR_API
+/**
+ * Insert an x86-64 Linux RDTSC/RDTSCP emulation clean call with an authenticated
+ * publication return boundary. The original decoded instruction is inspected
+ * now; no instr_t pointer survives translation. The callback emulates exactly
+ * once, committing EDX:EAX (and ECX for RDTSCP) through dr_set_mcontext().
+ *
+ * All GP/flags/valid SIMD and x87/MMX state are saved before the callback.
+ * Without an armed publication, the ordinary generated restore returns to the
+ * cache. After Release or Cancel, the complete application continuation is
+ * restored and sent to the existing dispatcher before another app instruction.
+ * Original pending allocations, raw siginfo and saved kernel-frame backing
+ * remain SDK-owned; normal delivery overlays the genuine app execution context.
+ *
+ * native_preemption_quantum is the actual immutable client configuration.
+ * A nonzero value preserves ordinary execution but cannot own publication.
+ * Capture transport with nonzero native preemption must refuse before READY.
+ * This API does not add rights to arbitrary clean calls or post-syscall events.
+ */
+bool dr_insert_signal_publication_tsc(
+    void *drcontext, instrlist_t *ilist, instr_t *where,
+    instr_t *original, void (*emulate)(bool with_aux),
+    uint64 native_preemption_quantum,
+    dr_signal_publication_tsc_observer_t observer);
 typedef struct _dr_signal_publication_owner_t {
     uint64 image_epoch;
     uint64 callback_epoch;
@@ -1658,11 +1694,23 @@ dr_signal_capture_status_t dr_signal_domain_observe(
 DR_API
 /** Attach an interval without clearing existing queued/active/return records.
  * Requires one application recipient, only authenticated DR client contexts
- * outside its TGID, default SIGCHLD/no NOCLDWAIT, a WAIT-owned callback, and no
- * prior kernel-pending SIGCHLD. A previous release-intent interval may be
- * replaced. Refusal before arming leaves the physical mask and queue unchanged.
+ * outside its TGID, and no prior kernel-pending SIGCHLD. The existing default
+ * SIGCHLD/no NOCLDWAIT domain is retained. A persistent caught handler may use
+ * only SA_RESTART and SA_RESTORER (either or neither), with its ordinary action
+ * mask. SIG_IGN, caught NOCLDWAIT/NODEFER/RESETHAND/ONSTACK/SIGINFO and other caught
+ * flags remain unsupported. Existing guest-mask and in-handler exclusions hold.
+ * A previous release-intent interval may be replaced. Refusal before arming
+ * leaves the physical mask and queue unchanged.
+ *
  * The caller must reserve its ordinary reply and exclude image/topology changes
- * until Release/Cancel, then finish the existing skipped-original callback.
+ * until Release/Cancel. An authenticated syscall callback still must finish the
+ * existing skipped-original operation; SA_RESTART is not permission to execute
+ * a blocking tail syscall before pending admission. An authenticated TSC uses
+ * dr_insert_signal_publication_tsc()'s complete application return boundary.
+ * Normal DR frame construction applies the unchanged action mask and restorer;
+ * the owned allocation is retired before application handler execution. This
+ * contract neither selects a handler restorer nor retains a private allocation
+ * across application handler return, longjmp, exec or exit.
  */
 dr_signal_capture_status_t dr_signal_publication_arm(
     void *drcontext, const dr_signal_publication_request_t *request,
@@ -1693,6 +1741,28 @@ DR_API
 dr_signal_capture_status_t dr_signal_publication_cancel(
     void *drcontext, const dr_signal_publication_handle_t *handle);
 
+DR_API
+/** Stage the single original wait4/waitid continuation after the top-level
+ * Tool future has actually retired. The caller supplies the exact Arm owner
+ * and original guest number, post-syscall PC and all six guest operands; the
+ * SDK compares them to its own Arm-time application context. Caller must have
+ * retired translated-wait bookkeeping, restored guest operands and ended its
+ * runtime borrow. Nested injections, other operations and duplicate staging
+ * refuse. No mask/phase changes occur here.
+ *
+ * Only the SDK's end-of-all-pre-callbacks boundary consumes this permission,
+ * rechecking final execute/number/PC/operands and actual admission readiness.
+ * It restores the literal mask and uses ordinary ignorable-wait pending
+ * dispatch before the kernel instruction. Release must retain its actual
+ * queued allocation; Cancel is only a request to inspect real pending state.
+ * Neither is delivery, and no signal/frame/notification is manufactured.
+ * Other phase3 run-original operations retain their existing terminal guard.
+ * Actual app signal return chooses continuation; no private wait replay is kept.
+ */
+dr_signal_capture_status_t dr_signal_publication_stage_wait_return(
+    void *drcontext, const dr_signal_publication_owner_t *owner, int sysnum,
+    app_pc post_pc, const reg_t args[6]);
+
 /** The readiness decision for an owned pending-signal continuation. */
 typedef enum {
     DR_SIGNAL_ADMISSION_BYPASS, /**< Use the ordinary DR signal path. */
@@ -1706,6 +1776,12 @@ typedef struct _dr_signal_admission_t {
     int sig;     /**< Kernel-reported signal number. */
     byte siginfo[128]; /**< Authentic Linux siginfo_t bytes. */
     const dr_mcontext_t *mcontext; /**< Prepared delivery context (may restart a syscall). */
+    /* All zero without a publication-domain identity. Otherwise these name the
+     * actual detached SIGCHLD allocation, not the newest incoming interval or
+     * the siginfo's PID. Raw siginfo and token retain their original meanings. */
+    uint64 publication_image_epoch;
+    uint64 publication_domain;
+    uint64 publication_allocation;
 } dr_signal_admission_t;
 
 /**

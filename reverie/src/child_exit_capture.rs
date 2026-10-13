@@ -57,8 +57,63 @@ pub enum ChildExitCaptureEffect {
     Replaced,
 }
 
-/// The backend authenticated both publication and this interval's exact input.
+/// Identity of the actual owned SIGCHLD Tool admission. This is not a capture
+/// receipt or a routing predicate; it may credit only the matching real hook.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    serde::Serialize,
+    serde::Deserialize
+)]
+pub struct ChildExitSignalAdmission {
+    /// Authenticated backend image, changed by successful exec or fork reset.
+    pub image_epoch: u64,
+    /// Stable native pending-domain identity within the image.
+    pub domain: u64,
+    /// The detached allocation, including an older coalescence target.
+    pub allocation: u64,
+    /// Exact live native admission token for this Tool borrow.
+    pub token: u64,
+}
+
+/// The current owner of one authentic pending allocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChildExitAllocationState {
+    /// Pending in the native queue.
+    Queued,
+    /// Detached for the current Tool admission.
+    Active,
+    /// Retained by the native return continuation.
+    Returning,
+}
+
+/// One live allocation, identified without exporting an address.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChildExitCaptureAllocation {
+    /// Never-reused native allocation generation.
+    pub generation: u64,
+    /// Exact owner at the protected snapshot boundary.
+    pub state: ChildExitAllocationState,
+}
+
+/// A complete protected native-domain observation after Release acknowledgement.
+/// It is a later observation, not an assertion that acknowledgement and snapshot
+/// are simultaneous. Absence never proves delivery of an unresolved obligation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildExitCaptureSnapshot {
+    /// Authenticated backend image containing this domain.
+    pub image_epoch: u64,
+    /// Monotonic mutation version, not a count of delivered signals.
+    pub version: u64,
+    /// All queued, active and returning allocations; no truncation is permitted.
+    pub allocations: Vec<ChildExitCaptureAllocation>,
+}
+
+/// The backend authenticated both publication and this interval's exact input.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChildExitCaptureOutcome {
     /// The original selected grant, not a host PID or current scheduler turn.
     pub request: ChildExitCaptureRequest,
@@ -70,6 +125,10 @@ pub struct ChildExitCaptureOutcome {
     pub allocation: u64,
     /// Existing pending-queue outcome, not a promise of one hook per child.
     pub effect: ChildExitCaptureEffect,
+    /// Exact removed victim for Replaced only; never inferred from absence.
+    pub replaced_allocation: Option<u64>,
+    /// Complete post-Release ownership while the ordinary reply remains held.
+    pub snapshot: ChildExitCaptureSnapshot,
 }
 
 /// Synchronous reservation is called under the scheduler mutex. It must only
@@ -89,8 +148,13 @@ pub trait ReservedChildExitCapture: Send + Debug {
     /// Arm before exposing the child's Exit response.
     async fn arm(&mut self) -> Result<ChildExitCaptureArm, Error>;
 
-    /// After the child may exit, authenticate its publication, account for the
-    /// genuine incoming native record, and consume Release intent. This must
-    /// not wait for Tool admission or parent callback completion.
-    async fn finish(self: Box<Self>) -> Result<ChildExitCaptureOutcome, Error>;
+    /// After the child may exit, authenticate publication and consume native
+    /// Release intent while retaining the ordinary parent reply reservation.
+    /// Called once; neither waits for Tool admission nor completes that reply.
+    async fn capture(&mut self) -> Result<ChildExitCaptureOutcome, Error>;
+
+    /// Release the ordinary parent reply only after the shared Tool accounts
+    /// for the authentic outcome. Called outside its scheduler mutex. A failed
+    /// capture or abandoned transaction must abort through Drop, not release.
+    fn release(self: Box<Self>) -> Result<(), Error>;
 }

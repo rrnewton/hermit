@@ -5935,20 +5935,25 @@ reg_t
 dr_invoke_syscall_as_app(void *drcontext, int sysnum, int arg_count, ...)
 {
     dcontext_t *dcontext = (dcontext_t *)drcontext;
-    if (dcontext == GLOBAL_DCONTEXT)
+    if (dcontext == NULL || dcontext == GLOBAL_DCONTEXT)
         return -EINVAL;
+#define MAX_PARAM_COUNT 6
+    if (arg_count < 0 || arg_count > MAX_PARAM_COUNT)
+        return -EINVAL;
+    reg_t args[MAX_PARAM_COUNT] = {};
+    va_list ap;
+    va_start(ap, arg_count);
+    for (int i = 0; i < MAX_PARAM_COUNT && i < arg_count; ++i)
+        args[i] = va_arg(ap, reg_t);
+    va_end(ap);
 #ifdef LINUX
-    /* Preserve legacy idle behavior, but neither returning API may change an
-     * explicitly owned capture transaction's mask, image, or recipient set. */
+    /* Validate the normalized arguments before touching the app frame or
+     * syscall scratch. The legacy idle path retains its existing behavior. */
     if (signal_capture_is_active(dcontext) &&
-        !signal_injection_permitted(dcontext, sysnum))
+        !signal_injection_permitted(dcontext, sysnum, arg_count, args))
         return -EINVAL;
 #endif
     priv_mcontext_t *mc = get_mcontext(dcontext);
-#define MAX_PARAM_COUNT 6
-    if (arg_count > MAX_PARAM_COUNT)
-        return -EINVAL;
-    reg_t args[MAX_PARAM_COUNT] = {};
     /* We need to save the mcontext app values so we can place this syscall's
      * values into the mcontext for pre_system_call() to examine them.
      * We also need to save registers the kernel will clobber: but on our
@@ -5960,17 +5965,11 @@ dr_invoke_syscall_as_app(void *drcontext, int sysnum, int arg_count, ...)
      */
     reg_t saved_sysnum = MCXT_SYSNUM_REG(mc);
     reg_t saved_res = MCXT_SYSCALL_RES(mc);
-    va_list ap;
-    va_start(ap, arg_count);
-    /* In some builds, Werror=array-bounds complains about saved[i] despite our
-     * arg_count check above: so we add "&& i < MAX_PARAM_COUNT" to avoid the warning.
-     */
+    /* Keep the explicit bound for compilers' array-bounds analysis. */
     for (int i = 0; i < MAX_PARAM_COUNT && i < arg_count; ++i) {
-        args[i] = va_arg(ap, reg_t);
         saved[i] = sys_param(dcontext, i);
         set_syscall_param(dcontext, i, args[i]);
     }
-    va_end(ap);
     MCXT_SYSNUM_REG(mc) = sysnum;
     reg_t res;
     /* Skip client syscall events. */
@@ -6006,10 +6005,13 @@ dr_invoke_syscall_as_app_with_result(void *drcontext, int sysnum, int arg_count,
         dcontext != get_thread_private_dcontext() || result == NULL ||
         arg_count < 0 || arg_count > 6 || (arg_count != 0 && args == NULL))
         return false;
+    reg_t input_args[6] = { 0 };
+    for (int i = 0; i < arg_count; ++i)
+        input_args[i] = args[i];
+    if (!signal_injection_permitted(dcontext, sysnum, arg_count, input_args))
+        return false;
     priv_mcontext_t *mc = get_mcontext(dcontext);
     bool suspend = sysnum == SYS_rt_sigsuspend;
-    if (!signal_injection_permitted(dcontext, sysnum))
-        return false;
     if (suspend && (!dcontext->client_data->in_pre_syscall ||
                     !signal_begin_injected_sigsuspend(dcontext)))
         return false;
@@ -6024,7 +6026,7 @@ dr_invoke_syscall_as_app_with_result(void *drcontext, int sysnum, int arg_count,
     for (int i = 0; i < 6; ++i) {
         saved_args[i] = sys_param(dcontext, i);
         if (i < arg_count)
-            set_syscall_param(dcontext, i, args[i]);
+            set_syscall_param(dcontext, i, input_args[i]);
     }
     MCXT_SYSNUM_REG(mc) = sysnum;
     dcontext->client_data->skip_client_syscall_events = true;

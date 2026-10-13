@@ -9,6 +9,7 @@
 //! The three signal checkpoints exercise transport ownership, not Detcore's
 //! prehook/InboundSignal/posthook policy. The separate CLI test uses Detcore.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -73,6 +74,17 @@ pub enum OwnedSignalPublicationProbeRequest {
         /// Complete authentic Linux siginfo bytes supplied by the real Guest.
         siginfo: Vec<u8>,
     },
+    /// One real application TSC borrow in the separately selected native probe.
+    Tsc {
+        /// Distinguishes architectural RDTSC and RDTSCP output requirements.
+        request: reverie::Rdtsc,
+        /// Monotonic probe call ordinal; the host checks exact expected count.
+        ordinal: u64,
+        /// Real Tool borrow depth, never a native owner/permission token.
+        callback_depth: u32,
+        /// Prior owned callbacks; the host checks the declared path ordering.
+        completed_signals: u64,
+    },
 }
 
 /// Local fallback deliberately cannot impersonate the external controller.
@@ -88,6 +100,15 @@ impl GlobalTool for OwnedSignalPublicationProbeGlobal {
     async fn receive_rpc(&self, _from: Tid, _request: Self::Request) -> i64 {
         -(libc::ENOTCONN as i64)
     }
+}
+
+static TSC_PROBE_ENABLED: AtomicBool = AtomicBool::new(false);
+static TSC_PROBE_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// Test selection only. Native transport owner, SDK scope and publication
+/// authority still come from the real framed RPC and host control receipts.
+pub(crate) fn tsc_probe_ready() -> bool {
+    super::owned_tsc_capture_probe_selected() && TSC_PROBE_ENABLED.load(Ordering::Acquire)
 }
 
 static CALLBACK_DEPTH: AtomicU32 = AtomicU32::new(0);
@@ -176,10 +197,45 @@ impl Tool for OwnedSignalPublicationProbeTool {
                     })
                     .await;
                 assert_eq!(CALLBACK_DEPTH.load(Ordering::Acquire), 1);
+                if super::owned_tsc_capture_probe_selected() {
+                    // The sibling guest forks before Marker1. Loader/child TSC
+                    // reads therefore keep the ordinary prototype path. This
+                    // flag selects observations; it grants no capture rights.
+                    TSC_PROBE_ENABLED.store(ordinal == 1, Ordering::Release);
+                }
                 return Ok(response);
             }
         }
         guest.tail_inject(syscall).await
+    }
+
+    async fn handle_rdtsc_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        request: reverie::Rdtsc,
+    ) -> Result<reverie::RdtscResult, Errno> {
+        assert!(
+            tsc_probe_ready(),
+            "TSC probe entered outside explicit selection"
+        );
+        let _lease = CallbackLease::enter();
+        let ordinal = TSC_PROBE_CALLS.fetch_add(1, Ordering::AcqRel) + 1;
+        let reply = guest
+            .send_rpc(OwnedSignalPublicationProbeRequest::Tsc {
+                request,
+                ordinal,
+                callback_depth: CALLBACK_DEPTH.load(Ordering::Acquire),
+                completed_signals: COMPLETED_SIGNALS.load(Ordering::Acquire),
+            })
+            .await;
+        assert_eq!(CALLBACK_DEPTH.load(Ordering::Acquire), 1);
+        if reply < 0 {
+            return Err(Errno::ENOTCONN);
+        }
+        Ok(reverie::RdtscResult {
+            tsc: reply as u64,
+            aux: (request == reverie::Rdtsc::Tscp).then_some(0xd15e_a5e1),
+        })
     }
 
     async fn handle_signal_event<G: Guest<Self>>(

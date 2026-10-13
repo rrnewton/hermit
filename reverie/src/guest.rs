@@ -376,6 +376,13 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
         None
     }
 
+    /// Authenticated allocation identity of this actual SIGCHLD Tool admission.
+    /// `None` outside the hook or without native ownership evidence. Absence
+    /// never permits bypassing a hook or discharging a required capture.
+    fn child_exit_signal_admission(&self) -> Option<crate::ChildExitSignalAdmission> {
+        None
+    }
+
     /// From inside [`Tool::handle_signal_event`], replaces the siginfo that the
     /// reported signal is delivered with, if the callback returns it to be
     /// delivered. A later call replaces an earlier one. Fails, and changes
@@ -868,6 +875,9 @@ where
     }
     fn set_signal_info(&mut self, info: [u8; crate::SIGNAL_INFO_SIZE]) -> Result<(), Errno> {
         self.inner.set_signal_info(info)
+    }
+    fn child_exit_signal_admission(&self) -> Option<crate::ChildExitSignalAdmission> {
+        self.inner.child_exit_signal_admission()
     }
     fn signal_task_identity(&self) -> Option<crate::SignalTaskIdentity> {
         self.inner.signal_task_identity()

@@ -32,7 +32,7 @@ int main(void) {
   refused_leave(&state, 1);
   refused_entry(&state, NATIVE_CALLBACK_ORDINARY, 1);
   refused_entry(&state, 0, 0);
-  refused_entry(&state, 4, 0);
+  refused_entry(&state, 5, 0); /* TSC4 is now a defined frame kind. */
 
   /* A first instruction/registration can own RPC without a prior syscall. */
   assert(native_callback_scope_enter(&state, NATIVE_CALLBACK_ORDINARY, 0));
@@ -68,6 +68,20 @@ int main(void) {
   assert(native_callback_scope_enter(&state, NATIVE_CALLBACK_OWNED, 0));
   assert(state.epoch == 4 && state.phase == 0);
   assert(native_callback_scope_leave(&state, 1));
+
+  /* This tests framing lifetime only. Actual SDK-generated scope and pending
+   * admission require separate native publication regression coverage. */
+  assert(native_callback_scope_enter(&state, NATIVE_CALLBACK_TSC, 0));
+  assert(state.epoch == 5 && state.kind == NATIVE_CALLBACK_TSC && state.phase == 0);
+  refused_entry(&state, NATIVE_CALLBACK_TSC, 0);
+  state.phase = 1;
+  refused_leave(&state, 1);
+  state.phase = 2;
+  refused_leave(&state, 1);
+  state.phase = 3;
+  assert(native_callback_scope_leave(&state, 1));
+  assert(state.phase == 3 && !state.active && state.kind == 0);
+  assert(!native_callback_scope_describable(&state, 1));
 
   /* A stale copied live lease cannot become fresh merely by having no borrow. */
   state.phase = 1;

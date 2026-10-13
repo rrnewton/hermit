@@ -63,6 +63,7 @@
 #ifdef UNIX
 #    include <sys/time.h>       /* ITIMER_* */
 #    include "../unix/module.h" /* redirect_* functions */
+#    include "../unix/os_private.h" /* generated publication scopes */
 #endif
 
 /* in utils.c, not exported to everyone */
@@ -2119,6 +2120,19 @@ instrument_pre_syscall(dcontext_t *dcontext, int sysnum)
         dcontext->whereami = old_whereami;
     }
     dcontext->client_data->in_pre_syscall = false;
+#ifdef LINUX
+    /* The only new permission is staged by a retired, authenticated original
+     * managed wait. Nested injections returned above, before client callbacks.
+     * The ordinary pre_system_call phase3 guard remains unchanged. */
+    if (!signal_publication_finish_pre_syscall(dcontext, sysnum, exec)) {
+        /* Keep the terminal boundary observable in Release, where CLIENT_ASSERT
+         * is compiled out. This does not grant or retry the original syscall. */
+        print_file(STDERR, "native wait finalizer refused at all-client completion\n");
+        CLIENT_ASSERT(false, "invalid captured wait callback completion");
+        os_terminate(dcontext, TERMINATE_PROCESS);
+        return false;
+    }
+#endif
     return exec;
 }
 
@@ -5275,10 +5289,10 @@ cleanup_after_call_ex(dcontext_t *dcontext, clean_call_info_t *cci, instrlist_t 
  * instrumentation layout, changes to the clean call instrumentation may break
  * dr_insert_cbr_instrumentation.
  */
-void
-dr_insert_clean_call_ex_varg(void *drcontext, instrlist_t *ilist, instr_t *where,
-                             void *callee, dr_cleancall_save_t save_flags, uint num_args,
-                             opnd_t *args)
+static void
+insert_clean_call_ex_varg(void *drcontext, instrlist_t *ilist, instr_t *where,
+                         void *callee, dr_cleancall_save_t save_flags, uint num_args,
+                         opnd_t *args, bool publication_tsc)
 {
     dcontext_t *dcontext = (dcontext_t *)drcontext;
     uint dstack_offs, pad = 0;
@@ -5324,7 +5338,12 @@ dr_insert_clean_call_ex_varg(void *drcontext, instrlist_t *ilist, instr_t *where
     }
 #endif
     /* analyze the clean call, return true if clean call can be inlined. */
-    if (analyze_clean_call(dcontext, &cci, insert_at, callee, save_fpstate,
+    if (publication_tsc) {
+        /* The non-returning publication finalizer needs the complete saved app
+         * frame. Do not derive preservation from analysis of its C callee. */
+        clean_call_info_init(&cci, callee, true, num_args);
+        cci.out_of_line_swap = true;
+    } else if (analyze_clean_call(dcontext, &cci, insert_at, callee, save_fpstate,
                            TEST(DR_CLEANCALL_ALWAYS_OUT_OF_LINE, save_flags), num_args,
                            args) &&
         !TEST(DR_CLEANCALL_ALWAYS_OUT_OF_LINE, save_flags)) {
@@ -5412,6 +5431,15 @@ dr_insert_clean_call_ex_varg(void *drcontext, instrlist_t *ilist, instr_t *where
                                opnd_create_base_disp(REG_XSP, REG_NULL, 0, 0, OPSZ_512));
     }
 
+    if (publication_tsc) {
+        /* This is the exact buffer just emitted above, relative to this clean
+         * call's dstack top. No client or runtime guessed stack offset survives
+         * an independent change to prepare_for_call_ex. */
+        CLIENT_ASSERT(save_fpstate && num_args == 7,
+                      "invalid generated TSC publication call");
+        args[4] = OPND_CREATE_INTPTR(dstack_offs + pad + buf_sz);
+    }
+
     /* PR 302951: restore state if clean call args reference app memory.
      * We use a hack here: this is the only instance insert_at we mark as our-mangling
      * but do not have a translation target set, which indicates to the restore
@@ -5437,6 +5465,108 @@ dr_insert_clean_call_ex_varg(void *drcontext, instrlist_t *ilist, instr_t *where
     cleanup_after_call_ex(dcontext, &cci, ilist, insert_at, 0, encode_pc);
     MINSERT(ilist, insert_at, label);
     instrlist_set_auto_predicate(ilist, auto_pred);
+}
+
+void
+dr_insert_clean_call_ex_varg(void *drcontext, instrlist_t *ilist, instr_t *where,
+                            void *callee, dr_cleancall_save_t save_flags, uint num_args,
+                            opnd_t *args)
+{
+    insert_clean_call_ex_varg(drcontext, ilist, where, callee, save_flags, num_args, args,
+                             false);
+}
+
+#if defined(LINUX) && defined(X86) && defined(X64)
+static void
+publication_tsc_call(void (*emulate)(bool), app_pc pc, app_pc next_pc, bool with_aux,
+                     ptr_uint_t fp_offset, uint64 native_preemption_quantum,
+                     dr_signal_publication_tsc_observer_t observer)
+{
+    dcontext_t *dc = get_thread_private_dcontext();
+    /* The generator supplies a complete, aligned save area in the current
+     * clean-call frame. This pointer is valid only through this call. */
+    byte *fpstate = NULL;
+    if (dc != NULL && dc->dstack != NULL &&
+        fp_offset >= proc_fpstate_save_size() && fp_offset <= DYNAMO_OPTION(stack_size))
+        fpstate = (byte *)dc->dstack - fp_offset;
+    if (fpstate == NULL || !ALIGNED(fpstate, 16) ||
+        !signal_publication_tsc_enter(dc, pc, next_pc, fpstate,
+                                      native_preemption_quantum == 0)) {
+        CLIENT_ASSERT(false, "invalid generated TSC entry");
+        os_terminate(dc, TERMINATE_PROCESS);
+        return;
+    }
+
+    /* Detcore evaluates its existing pre/read/post hooks exactly once. Only
+     * after they return does emulate commit EDX:EAX and (for RDTSCP) ECX. */
+    if (observer != NULL)
+        observer(dc, pc, next_pc, with_aux, -1, NULL);
+    emulate(with_aux);
+    int disposition = signal_publication_tsc_leave(dc, pc, next_pc, fpstate);
+    dr_mcontext_t mc;
+    mc.size = sizeof(mc);
+    mc.flags = DR_MC_ALL;
+    bool have_mc = false;
+    if (observer != NULL && (disposition == 0 || disposition == 1)) {
+        have_mc = dr_get_mcontext(dc, &mc);
+        if (!have_mc) {
+            CLIENT_ASSERT(false, "TSC observation lacks committed app context");
+            os_terminate(dc, TERMINATE_PROCESS);
+            return;
+        }
+        observer(dc, pc, next_pc, with_aux, disposition, &mc);
+    }
+    if (disposition == 0)
+        return; /* Original cache continuation and generated restore, unchanged. */
+    if (disposition == 1) {
+        if (have_mc || dr_get_mcontext(dc, &mc)) {
+            mc.pc = next_pc;
+            /* dr_redirect_execution discards the ordinary clean-call restore.
+             * Follow its full-context + explicit FP restore contract. The
+             * signal queue retains the original raw siginfo/full kernel frame;
+             * the dispatcher supplies this genuine app continuation to delivery. */
+            proc_restore_fpstate(fpstate);
+            dr_redirect_execution(&mc);
+        }
+    }
+    CLIENT_ASSERT(false, "invalid generated TSC completion");
+    os_terminate(dc, TERMINATE_PROCESS);
+}
+#endif
+
+DR_API
+bool
+dr_insert_signal_publication_tsc(void *drcontext, instrlist_t *ilist, instr_t *where,
+                                  instr_t *original, void (*emulate)(bool),
+                                  uint64 native_preemption_quantum,
+                                  dr_signal_publication_tsc_observer_t observer)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    if (drcontext == NULL || ilist == NULL || where == NULL || original == NULL ||
+        emulate == NULL)
+        return false;
+    int opcode = instr_get_opcode(original);
+    app_pc pc = instr_get_app_pc(original);
+    uint length = instr_length(drcontext, original);
+    if ((opcode != OP_rdtsc && opcode != OP_rdtscp) || pc == NULL || length == 0 ||
+        length > 15 || (ptr_uint_t)pc > (ptr_uint_t)-1 - length)
+        return false;
+    opnd_t args[7] = {
+        OPND_CREATE_INTPTR(emulate), OPND_CREATE_INTPTR(pc),
+        OPND_CREATE_INTPTR(pc + length), OPND_CREATE_INT32(opcode == OP_rdtscp),
+        OPND_CREATE_INTPTR(0), /* Patched from the actual generated save layout. */
+        OPND_CREATE_INTPTR(native_preemption_quantum),
+        OPND_CREATE_INTPTR(observer),
+    };
+    insert_clean_call_ex_varg(
+        drcontext, ilist, where, (void *)publication_tsc_call,
+        DR_CLEANCALL_SAVE_FLOAT | DR_CLEANCALL_READS_APP_CONTEXT |
+            DR_CLEANCALL_WRITES_APP_CONTEXT | DR_CLEANCALL_ALWAYS_OUT_OF_LINE,
+        BUFFER_SIZE_ELEMENTS(args), args, true);
+    return true;
+#else
+    return false;
+#endif
 }
 
 void

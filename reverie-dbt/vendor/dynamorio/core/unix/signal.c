@@ -283,9 +283,25 @@ typedef struct _signal_publication_state_t {
     int phase;
     bool invalidated;
     bool close_verified;
+    bool released_record;
+    /* The original guest wait is captured at Arm, never reconstructed from
+     * translated physical operands. Completion is one-shot within the same
+     * actual pre-syscall invocation; no state survives into the app handler. */
+    bool wait_original_valid;
+    bool wait_return_staged;
+    int wait_sysnum;
+    app_pc wait_post_pc;
+    reg_t wait_args[6];
     kernel_sigset_t saved_mask;
     kernel_sigset_t guest_mask;
     dr_signal_publication_receipt_t receipt;
+    /* Valid only inside the SDK-generated TSC call. Never copied to the
+     * client, inherited as a live owner, or inferred from a callback enum. */
+    bool tsc_active;
+    bool tsc_capture_allowed;
+    app_pc tsc_pc;
+    app_pc tsc_next_pc;
+    byte *tsc_fpstate;
 } signal_publication_state_t;
 
 static void publication_changed(thread_sig_info_t *info, int sig);
@@ -1571,6 +1587,82 @@ capture_current_owner(void *drcontext)
     return info;
 }
 
+static thread_sig_info_t *
+tsc_current_thread(dcontext_t *dc)
+{
+    if (dc == NULL || dc == GLOBAL_DCONTEXT || dc != get_thread_private_dcontext() ||
+        dc->client_data == NULL || IS_CLIENT_THREAD(dc) || dc->is_exiting ||
+        dc->currently_stopped || dc->client_data->in_pre_syscall ||
+        dc->client_data->in_post_syscall || dc->client_data->mcontext_in_dcontext ||
+        dc->client_data->cur_mc != NULL ||
+        !is_os_cxt_ptr_null(dc->client_data->os_cxt))
+        return NULL;
+    thread_sig_info_t *info = (thread_sig_info_t *)dc->signal_field;
+    os_thread_data_t *ostd = (os_thread_data_t *)dc->os_field;
+    if (info == NULL || info->publication == NULL || !info->fully_initialized ||
+        info->accessing_sigpending || ostd == NULL || ostd->processing_signal != 0)
+        return NULL;
+    return info;
+}
+
+/* Only the generated call's real frame grants this additional publication
+ * scope. The older pre-syscall capture API deliberately keeps its old guard. */
+static thread_sig_info_t *
+publication_current_owner(void *drcontext)
+{
+    thread_sig_info_t *info = capture_current_owner(drcontext);
+    if (info != NULL)
+        return info;
+    info = tsc_current_thread((dcontext_t *)drcontext);
+    return info != NULL && info->publication->tsc_active &&
+            info->publication->tsc_capture_allowed
+        ? info : NULL;
+}
+
+bool
+signal_publication_tsc_enter(dcontext_t *dc, app_pc pc, app_pc next_pc,
+                             byte *fpstate, bool capture_allowed)
+{
+    thread_sig_info_t *info = tsc_current_thread(dc);
+    if (info == NULL || pc == NULL || next_pc <= pc || next_pc - pc > 15 ||
+        fpstate == NULL || !ALIGNED(fpstate, 16))
+        return false;
+    signal_publication_state_t *p = info->publication;
+    if (p->tsc_active || p->phase != CAPTURE_IDLE ||
+        info->capture.phase != CAPTURE_IDLE)
+        return false;
+    p->tsc_pc = pc;
+    p->tsc_next_pc = next_pc;
+    p->tsc_fpstate = fpstate;
+    p->tsc_capture_allowed = capture_allowed;
+    p->tsc_active = true;
+    return true;
+}
+
+int
+signal_publication_tsc_leave(dcontext_t *dc, app_pc pc, app_pc next_pc, byte *fpstate)
+{
+    thread_sig_info_t *info = tsc_current_thread(dc);
+    if (info == NULL)
+        return -1;
+    signal_publication_state_t *p = info->publication;
+    if (!p->tsc_active || p->tsc_pc != pc || p->tsc_next_pc != next_pc ||
+        p->tsc_fpstate != fpstate || info->capture.phase != CAPTURE_IDLE ||
+        (p->phase != CAPTURE_IDLE && p->phase != CAPTURE_RELEASED) ||
+        (p->phase == CAPTURE_RELEASED &&
+         (!p->tsc_capture_allowed || p->receipt.handle.request.owner.callback_kind !=
+                                      DR_SIGNAL_PUBLICATION_TSC)))
+        return -1;
+    int disposition = p->phase == CAPTURE_RELEASED ? 1 : 0;
+    p->tsc_active = false;
+    p->tsc_capture_allowed = false;
+    p->tsc_pc = p->tsc_next_pc = NULL;
+    p->tsc_fpstate = NULL;
+    /* Keep CAPTURE_RELEASED until receive_pending_signal runs the genuine
+     * admission probe. This is neither an admission ACK nor allocation retirement. */
+    return disposition;
+}
+
 static bool
 capture_handle_matches(thread_sig_info_t *info,
                        const dr_signal_capture_handle_t *handle)
@@ -1786,7 +1878,11 @@ publication_owner_matches(thread_sig_info_t *info,
          info->publication->image_epoch != owner->image_epoch))
         return false;
     if (owner->callback_kind == DR_SIGNAL_PUBLICATION_SYSCALL)
-        return owner->admission_token == 0 && info->active_admission == NULL;
+        return owner->admission_token == 0 && info->active_admission == NULL &&
+            !info->publication->tsc_active;
+    if (owner->callback_kind == DR_SIGNAL_PUBLICATION_TSC)
+        return owner->admission_token == 0 && info->active_admission == NULL &&
+            info->publication->tsc_active && info->publication->tsc_capture_allowed;
     return owner->callback_kind == DR_SIGNAL_PUBLICATION_OWNED &&
         info->active_admission != NULL &&
         owner->admission_token != 0 && owner->admission_token == info->admission_token;
@@ -1843,9 +1939,20 @@ static bool
 publication_disposition_supported(thread_sig_info_t *info)
 {
     kernel_sigaction_t *action = info->sighand->action[SIGCHLD];
-    return info->sighand->we_intercept[SIGCHLD] &&
-        (action == NULL || (action->handler == (handler_t)SIG_DFL &&
-                           !TEST(SA_NOCLDWAIT, action->flags)));
+    if (!info->sighand->we_intercept[SIGCHLD])
+        return false;
+    /* Preserve the existing default-action domain. Caught support is narrower:
+     * a persistent ordinary handler with its unchanged mask/restorer contract.
+     * No reset, recursive, alternate-stack, siginfo or autoreap rights follow
+     * from this predicate. Arm/Close/Release retain their owner, topology and
+     * guest-mask checks, including exclusion while an app handler is active. */
+    if (action == NULL || action->handler == (handler_t)SIG_DFL)
+        return action == NULL || !TEST(SA_NOCLDWAIT, action->flags);
+    /* SA_RESTART describes the unchanged app action; it does not permit a
+     * captured pre-syscall callback to execute an original blocking syscall.
+     * That still requires a separately authenticated return continuation. */
+    return action->handler != (handler_t)SIG_IGN &&
+        (((uint64)action->flags & ~(uint64)(SA_RESTART | SA_RESTORER)) == 0);
 }
 
 static bool
@@ -1890,7 +1997,7 @@ dr_signal_domain_observe(void *drcontext, const dr_signal_publication_owner_t *o
 {
 #if defined(LINUX) && defined(X86) && defined(X64)
     dcontext_t *dc = (dcontext_t *)drcontext;
-    thread_sig_info_t *info = capture_current_owner(drcontext);
+    thread_sig_info_t *info = publication_current_owner(drcontext);
     if (info == NULL || snapshot == NULL || !publication_owner_matches(info, owner))
         return DR_SIGNAL_CAPTURE_STALE;
     /* An authentic callback for another signal is a structural exclusion,
@@ -1931,6 +2038,56 @@ dr_signal_domain_observe(void *drcontext, const dr_signal_publication_owner_t *o
 #endif
 }
 
+#if defined(LINUX) && defined(X86) && defined(X64)
+/* Linux x86-64 syscall register order. This is the real application context
+ * used by the current pre-syscall event, not client-provided scratch. */
+static void
+publication_wait_arguments(dcontext_t *dc, reg_t args[6])
+{
+    priv_mcontext_t *mc = get_mcontext(dc);
+    args[0] = mc->xdi; args[1] = mc->xsi; args[2] = mc->xdx;
+    args[3] = mc->r10; args[4] = mc->r8; args[5] = mc->r9;
+}
+
+static bool
+publication_wait_context_matches(dcontext_t *dc, signal_publication_state_t *p)
+{
+    reg_t args[6];
+    byte opcode[2];
+    priv_mcontext_t *mc = get_mcontext(dc);
+    if (!p->wait_original_valid || get_at_syscall(dc) ||
+        (p->wait_sysnum != SYS_wait4 && p->wait_sysnum != SYS_waitid) ||
+        mc->xax != (reg_t)p->wait_sysnum || mc->pc != p->wait_post_pc ||
+        dc->next_tag != p->wait_post_pc || (ptr_uint_t)p->wait_post_pc < 2 ||
+        !d_r_safe_read(p->wait_post_pc - 2, sizeof(opcode), opcode) ||
+        opcode[0] != 0x0f || opcode[1] != 0x05)
+        return false;
+    publication_wait_arguments(dc, args);
+    return memcmp(args, p->wait_args, sizeof(args)) == 0;
+}
+
+/* Called with physical SIGCHLD excluded. Release and Cancel are different
+ * outcomes. Cancel may request a dispatcher check but never proves a record. */
+static bool
+publication_wait_release_valid(thread_sig_info_t *info)
+{
+    signal_publication_state_t *p = info->publication;
+    if (!p->released_record)
+        return true;
+    if (!p->close_verified || p->receipt.raw_entries != 1 ||
+        p->receipt.allocation == 0 ||
+        p->receipt.outcome < DR_SIGNAL_PUBLICATION_LINKED ||
+        p->receipt.outcome > DR_SIGNAL_PUBLICATION_REPLACED)
+        return false;
+    for (sigpending_t *q = info->sigpending[SIGCHLD]; q != NULL; q = q->next) {
+        if (q->publication_generation == p->receipt.allocation)
+            return true;
+    }
+    return false;
+}
+
+#endif
+
 DR_API
 dr_signal_capture_status_t
 dr_signal_publication_arm(void *drcontext,
@@ -1939,7 +2096,7 @@ dr_signal_publication_arm(void *drcontext,
 {
 #if defined(LINUX) && defined(X86) && defined(X64)
     dcontext_t *dc = (dcontext_t *)drcontext;
-    thread_sig_info_t *info = capture_current_owner(drcontext);
+    thread_sig_info_t *info = publication_current_owner(drcontext);
     if (info == NULL || request == NULL || handle == NULL || request->reserved != 0 ||
         request->reservation == 0 || request->child_generation == 0 ||
         request->child_pid <= 0 || !publication_owner_matches(info, &request->owner))
@@ -1976,6 +2133,18 @@ dr_signal_publication_arm(void *drcontext,
     }
     memset(&p->receipt, 0, sizeof(p->receipt));
     p->close_verified = false;
+    p->released_record = false;
+    p->wait_original_valid = false;
+    p->wait_return_staged = false;
+    if (request->owner.callback_kind == DR_SIGNAL_PUBLICATION_SYSCALL &&
+        !dc->client_data->skip_client_syscall_events && !get_at_syscall(dc)) {
+        priv_mcontext_t *mc = get_mcontext(dc);
+        p->wait_sysnum = (int)mc->xax;
+        p->wait_post_pc = mc->pc;
+        publication_wait_arguments(dc, p->wait_args);
+        p->wait_original_valid = true;
+        p->wait_original_valid = publication_wait_context_matches(dc, p);
+    }
     p->receipt.handle.request = *request;
     p->receipt.handle.request.domain = p->domain;
     p->receipt.handle.interval = interval;
@@ -2003,7 +2172,7 @@ dr_signal_publication_close(void *drcontext,
 {
 #if defined(LINUX) && defined(X86) && defined(X64)
     dcontext_t *dc = (dcontext_t *)drcontext;
-    thread_sig_info_t *info = capture_current_owner(drcontext);
+    thread_sig_info_t *info = publication_current_owner(drcontext);
     if (info == NULL || receipt == NULL || published_siginfo == NULL ||
         !publication_handle_matches(info, handle))
         return DR_SIGNAL_CAPTURE_STALE;
@@ -2058,7 +2227,7 @@ dr_signal_publication_release(void *drcontext,
 {
 #if defined(LINUX) && defined(X86) && defined(X64)
     dcontext_t *dc = (dcontext_t *)drcontext;
-    thread_sig_info_t *info = capture_current_owner(drcontext);
+    thread_sig_info_t *info = publication_current_owner(drcontext);
     if (info == NULL || receipt == NULL ||
         !publication_handle_matches(info, &receipt->handle) ||
         info->publication->phase != CAPTURE_HELD)
@@ -2075,6 +2244,7 @@ dr_signal_publication_release(void *drcontext,
         publication_disposition_supported(info) &&
         publication_single_recipient(dc, info) == DR_SIGNAL_CAPTURE_OK &&
         memcmp(&p->guest_mask, &info->app_sigblocked, sizeof(p->guest_mask)) == 0) {
+        p->released_record = true;
         p->phase = CAPTURE_RELEASED;
         dc->signals_pending = 1;
         status = DR_SIGNAL_CAPTURE_OK;
@@ -2093,10 +2263,11 @@ dr_signal_publication_cancel(void *drcontext,
 {
 #if defined(LINUX) && defined(X86) && defined(X64)
     dcontext_t *dc = (dcontext_t *)drcontext;
-    thread_sig_info_t *info = capture_current_owner(drcontext);
+    thread_sig_info_t *info = publication_current_owner(drcontext);
     if (info == NULL || !publication_handle_matches(info, handle))
         return DR_SIGNAL_CAPTURE_STALE;
     signal_publication_state_t *p = info->publication;
+    p->released_record = false;
     p->phase = CAPTURE_RELEASED;
     __asm__ __volatile__("" : : : "memory");
     capture_restore(dc, &p->saved_mask);
@@ -2104,6 +2275,91 @@ dr_signal_publication_cancel(void *drcontext,
     return DR_SIGNAL_CAPTURE_OK;
 #else
     return DR_SIGNAL_CAPTURE_UNAVAILABLE;
+#endif
+}
+
+DR_API
+dr_signal_capture_status_t
+dr_signal_publication_stage_wait_return(
+    void *drcontext, const dr_signal_publication_owner_t *owner, int sysnum,
+    app_pc post_pc, const reg_t args[6])
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    dcontext_t *dc = (dcontext_t *)drcontext;
+    thread_sig_info_t *info = capture_current_owner(drcontext);
+    if (info == NULL || IS_CLIENT_THREAD(dc) || owner == NULL || args == NULL ||
+        dc->client_data->skip_client_syscall_events || dc->client_data->in_post_syscall)
+        return DR_SIGNAL_CAPTURE_STALE;
+    signal_publication_state_t *p = info->publication;
+    if (p->phase != CAPTURE_RELEASED || p->invalidated || p->wait_return_staged ||
+        info->capture.phase != CAPTURE_IDLE || info->active_admission != NULL ||
+        info->admission_return != NULL || p->tsc_active ||
+        owner->callback_kind != DR_SIGNAL_PUBLICATION_SYSCALL ||
+        !publication_owner_matches(info, owner) ||
+        memcmp(owner, &p->receipt.handle.request.owner, sizeof(*owner)) != 0 ||
+        p->receipt.handle.owner_pid != get_process_id() ||
+        p->receipt.handle.owner_tid != d_r_get_thread_id() ||
+        sysnum != p->wait_sysnum || post_pc != p->wait_post_pc ||
+        memcmp(args, p->wait_args, sizeof(p->wait_args)) != 0 ||
+        !publication_wait_context_matches(dc, p) ||
+        instrument_signal_admission(dc, NULL, NULL) != DR_SIGNAL_ADMISSION_START)
+        return DR_SIGNAL_CAPTURE_STALE;
+    /* This only stages permission: the real SDK completion occurs after every
+     * registered client pre-callback has unwound. */
+    p->wait_return_staged = true;
+    return DR_SIGNAL_CAPTURE_OK;
+#else
+    return DR_SIGNAL_CAPTURE_UNAVAILABLE;
+#endif
+}
+
+bool
+signal_publication_finish_pre_syscall(dcontext_t *dc, int original_sysnum,
+                                       bool execute)
+{
+#if defined(LINUX) && defined(X86) && defined(X64)
+    thread_sig_info_t *info = (thread_sig_info_t *)dc->signal_field;
+    if (info == NULL || info->publication == NULL ||
+        !info->publication->wait_return_staged)
+        return true; /* All original paths, including the phase3 refusal. */
+    signal_publication_state_t *p = info->publication;
+    p->wait_return_staged = false; /* Consume once, including terminal failure. */
+    if (!execute || dc != get_thread_private_dcontext() || IS_CLIENT_THREAD(dc) ||
+        dc->is_exiting || dc->currently_stopped ||
+        dc->client_data->in_pre_syscall || dc->client_data->in_post_syscall ||
+        dc->client_data->skip_client_syscall_events ||
+        p->phase != CAPTURE_RELEASED || p->invalidated || p->tsc_active ||
+        info->capture.phase != CAPTURE_IDLE || info->active_admission != NULL ||
+        info->admission_return != NULL || info->accessing_sigpending ||
+        info->injected_sigsuspend.phase != INJECTED_SUSPEND_NONE ||
+        ((os_thread_data_t *)dc->os_field)->processing_signal != 0 ||
+        p->receipt.handle.owner_pid != get_process_id() ||
+        p->receipt.handle.owner_tid != d_r_get_thread_id() ||
+        p->receipt.handle.request.owner.callback_kind != DR_SIGNAL_PUBLICATION_SYSCALL ||
+        original_sysnum != p->wait_sysnum || !publication_wait_context_matches(dc, p) ||
+        instrument_signal_admission(dc, NULL, NULL) != DR_SIGNAL_ADMISSION_START)
+        return false;
+    kernel_sigset_t saved;
+    if (capture_exclude(&saved) != 0)
+        return false;
+    bool valid = memcmp(&saved, &p->saved_mask, sizeof(saved)) == 0 &&
+        memcmp(&info->app_sigblocked, &p->guest_mask, sizeof(p->guest_mask)) == 0 &&
+        publication_disposition_supported(info) && publication_wait_release_valid(info);
+    if (!valid) {
+        capture_restore(dc, &saved);
+        return false;
+    }
+    /* No record or required-delivery obligation is consumed. Keep forced
+     * deferral while restoring the exact mask, then end only the retired
+     * native continuation guard. Ordinary ignorable-wait fcache entry must
+     * abort to the dispatcher before any kernel wait or app instruction. */
+    capture_restore(dc, &p->saved_mask);
+    p->wait_original_valid = false;
+    p->phase = CAPTURE_IDLE;
+    dc->signals_pending = 1;
+    return true;
+#else
+    return true;
 #endif
 }
 
@@ -3718,9 +3974,26 @@ signal_capture_is_active(dcontext_t *dcontext)
 }
 
 bool
-signal_injection_permitted(dcontext_t *dcontext, int sysnum)
+signal_injection_permitted(dcontext_t *dcontext, int sysnum, int arg_count,
+                           const reg_t *args)
 {
     thread_sig_info_t *info = (thread_sig_info_t *)dcontext->signal_field;
+#if defined(X86) && defined(X64)
+    /* A shared wait may inspect the existing disposition after native Release
+     * but before its ordinary borrow returns. Admit exactly that read-only
+     * Linux operation, through normal DR pre/post handling. This is not rights
+     * for mutation, a new mask, malformed inputs, or any other callback owner. */
+    if (sysnum == SYS_rt_sigaction && arg_count >= 4 && arg_count <= 6 && args != NULL &&
+        args[0] == SIGCHLD && args[1] == 0 && args[3] == sizeof(kernel_sigset_t) &&
+        publication_current_owner(dcontext) == info && info != NULL &&
+        info->publication->phase == CAPTURE_RELEASED &&
+        !info->publication->invalidated &&
+        info->publication->receipt.handle.owner_pid == get_process_id() &&
+        info->publication->receipt.handle.owner_tid == d_r_get_thread_id() &&
+        publication_owner_matches(info,
+            &info->publication->receipt.handle.request.owner))
+        return true;
+#endif
     if (capture_defers_signal(info, SIGCHLD)) {
         switch (sysnum) {
         case SYS_rt_sigprocmask:
@@ -4796,27 +5069,21 @@ get_sigcontext_from_app_frame(thread_sig_info_t *info, int sig, void *frame)
     return sc;
 }
 
-static sigcontext_t *
-get_sigcontext_from_pending(thread_sig_info_t *info, int sig)
-{
-    ASSERT(info->sigpending[sig] != NULL);
-    return get_sigcontext_from_rt_frame(&info->sigpending[sig]->rt_frame);
-}
-
 /* Returns the address on the appropriate signal stack where we should copy
  * the frame.
- * If frame is NULL, assumes signal happened while in DR and has been delayed,
- * and thus we need to provide fpstate regardless of whether the original
- * had it.  If frame is non-NULL, matches frame's amount of fpstate.
- * dcontext can be NULL if frame is non-NULL.
+ * If frame is NULL, use the genuine stored application continuation and
+ * reserve full delayed-delivery fpstate. The caller may own a detached pending
+ * allocation: this path neither reads nor requires a queue head. In particular,
+ * owned admission has already removed its allocation from sigpending.
+ * If frame is non-NULL, use that interrupted frame's stack and fpstate extent.
+ * dcontext can be NULL only if frame is non-NULL.
  */
 static byte *
 get_sigstack_frame_ptr(dcontext_t *dcontext, thread_sig_info_t *info, int sig,
                        sigframe_rt_t *frame)
 {
     ASSERT(dcontext != NULL || frame != NULL);
-    sigcontext_t *sc = (frame == NULL) ? get_sigcontext_from_pending(info, sig)
-                                       : get_sigcontext_from_rt_frame(frame);
+    sigcontext_t *sc = frame == NULL ? NULL : get_sigcontext_from_rt_frame(frame);
     byte *sp;
 
     if (frame != NULL) {
@@ -9047,6 +9314,7 @@ receive_pending_signal(dcontext_t *dcontext)
     if (info->active_admission != NULL) {
         dr_mcontext_t delivery, redirect;
         dr_signal_admission_t event;
+        memset(&event, 0, sizeof(event));
         dr_mcontext_init(&delivery);
         dr_mcontext_init(&redirect);
         ucontext_to_mcontext(dr_mcontext_as_priv_mcontext(&delivery),
@@ -9059,6 +9327,20 @@ receive_pending_signal(dcontext_t *dcontext)
         memcpy(event.siginfo, &info->active_admission->rt_frame.info,
                sizeof(event.siginfo));
         event.mcontext = &delivery;
+        if (event.sig == SIGCHLD && info->publication->image_epoch != 0) {
+            /* This exact allocation has moved queue -> active. Coalescence
+             * preserves the older allocation and its original siginfo; do not
+             * substitute the last publication receipt's incoming identity. */
+            if (info->publication->invalidated || info->publication->domain == 0 ||
+                info->active_admission->publication_generation == 0) {
+                CLIENT_ASSERT(false, "SIGCHLD admission lost publication identity");
+                os_terminate(dcontext, TERMINATE_PROCESS);
+            }
+            event.publication_image_epoch = info->publication->image_epoch;
+            event.publication_domain = info->publication->domain;
+            event.publication_allocation =
+                info->active_admission->publication_generation;
+        }
         /* Private stub/injected syscalls must not consume the interrupted
          * application's restore-mask or sigsuspend bookkeeping. */
         info->pre_syscall_app_sigprocmask_valid = false;

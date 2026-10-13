@@ -1370,6 +1370,11 @@ pub(crate) fn owned_signal_publication_probe_active() -> bool {
     env_flag("HERMIT_DBT_TEST_OWNED_SIGNAL_PUBLICATION")
 }
 
+/// Selects only the additional native/prototype TSC-state witness.
+pub(crate) fn owned_tsc_capture_probe_selected() -> bool {
+    owned_signal_publication_probe_active() && env_flag("HERMIT_DBT_TEST_OWNED_TSC_CAPTURE")
+}
+
 fn active_tool() -> Option<ActiveTool> {
     if owned_signal_publication_probe_active() {
         return Some(ActiveTool::OwnedSignalPublicationProbe);

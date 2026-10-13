@@ -291,7 +291,43 @@ struct PendingState {
     sender: mpsc::Sender<Command>,
     reply_reservation: Option<u64>,
     reservation_aborted: bool,
+    reservation_abort_cause: Option<ReservationAbortCause>,
     lease_active: bool,
+}
+
+/// Host-only diagnostic metadata: never serialized into native frames or guest
+/// observations, and never used to decide reply/publication eligibility.
+struct ReservationAbortCause {
+    operation: &'static str,
+    detail: String,
+}
+
+impl PendingState {
+    fn record_abort_cause(&mut self, operation: &'static str, detail: &str) {
+        if self.reservation_abort_cause.is_none() {
+            // Error text is diagnostic only; bound its retention independently
+            // of any guest or canonical observation. First cause wins.
+            let mut chars = detail.chars();
+            let mut detail: String = chars.by_ref().take(4096).collect();
+            if chars.next().is_some() {
+                detail.push_str(" [diagnostic truncated]");
+            }
+            self.reservation_abort_cause = Some(ReservationAbortCause { operation, detail });
+        }
+    }
+
+    fn reservation_abort_error(&self) -> Option<RpcError> {
+        if !self.reservation_aborted {
+            return None;
+        }
+        Some(protocol_error(&match &self.reservation_abort_cause {
+            Some(cause) => format!(
+                "native publication reply reservation was aborted: operation={}; cause={}",
+                cause.operation, cause.detail
+            ),
+            None => "native publication reply reservation was aborted".into(),
+        }))
+    }
 }
 
 /// A handle to exactly one authenticated connection/request, not a PID mailbox.
@@ -385,6 +421,15 @@ pub struct NativeReplyReservation {
 }
 
 impl NativeReplyReservation {
+    /// Retain the first error before this reservation's existing terminal Drop.
+    /// This does not finish/abort a reply, notify an actor, or change eligibility.
+    pub(crate) fn record_failure(&self, operation: &'static str, detail: &str) {
+        let mut state = self.call.state.lock().unwrap();
+        if state.open && state.reply_reservation == Some(self.sequence) {
+            state.record_abort_cause(operation, detail);
+        }
+    }
+
     pub fn call(&self) -> &PendingNativeCall {
         &self.call
     }
@@ -400,6 +445,12 @@ impl NativeReplyReservation {
                 || state.lease_active
                 || state.reply_reservation != Some(self.sequence)
             {
+                if state.open && state.reply_reservation == Some(self.sequence) {
+                    state.record_abort_cause(
+                        "ReplyFinish",
+                        "native reply reservation changed before completion",
+                    );
+                }
                 return Err("native reply reservation changed before completion".into());
             }
             state.reply_reservation = None;
@@ -466,6 +517,7 @@ impl NativeControlHub {
                 sender,
                 reply_reservation: None,
                 reservation_aborted: false,
+                reservation_abort_cause: None,
                 lease_active: false,
             })),
             changed: Arc::new(Notify::new()),
@@ -511,10 +563,8 @@ impl PendingGuard {
         cancel: Option<NativeControlOperation>,
     ) -> Result<ReplyReadiness, RpcError> {
         let mut state = self.pending.state.lock().unwrap();
-        if state.reservation_aborted {
-            return Err(protocol_error(
-                "native publication reply reservation was aborted",
-            ));
+        if let Some(error) = state.reservation_abort_error() {
+            return Err(error);
         }
         match receiver.try_recv() {
             Ok(command) => Ok(ReplyReadiness::Command(command)),
@@ -637,10 +687,14 @@ where
                     }
                 }
             } else {
-                if guard.pending.state.lock().unwrap().reservation_aborted {
-                    return Err(protocol_error(
-                        "native publication reply reservation was aborted",
-                    ));
+                if let Some(error) = guard
+                    .pending
+                    .state
+                    .lock()
+                    .unwrap()
+                    .reservation_abort_error()
+                {
+                    return Err(error);
                 }
                 tokio::select! {
                     value = &mut future => { response = Some(encode(&value)?); continue; }
@@ -1132,5 +1186,90 @@ mod tests {
             Err(RpcError::Closed)
         ));
         assert!(pending.reserve_reply(2).is_err());
+    }
+    #[tokio::test]
+    async fn native_refusal_cause_survives_reserved_reply_abort_without_success() {
+        let (mut client, _global, pending, task) = start().await;
+        let reservation = pending.reserve_reply(91).unwrap();
+        let command = tokio::spawn({
+            let pending = pending.clone();
+            async move { pending.command(NativeControlOperation::DomainObserve).await }
+        });
+        let frame = read_message(&mut client, DEFAULT_MAX_FRAME_LEN)
+            .await
+            .unwrap();
+        assert!(matches!(decode_exact::<ServerFrame>(&frame).unwrap(),
+            ServerFrame::Control { call, operation: 1, command: NativeControlOperation::DomainObserve }
+                if call == pending.identity));
+        let mut refused = reply(pending.identity, 0);
+        refused.status = 6;
+        write_message(
+            &mut client,
+            &encode(&ClientFrame::ControlReply {
+                call: pending.identity,
+                operation: 1,
+                reply: refused,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(command.await.unwrap().unwrap(), refused);
+        let cause = "DomainObserve status=6 phase=0 callback_kind=1; required publication domain unsupported";
+        reservation.record_failure("DomainObserve", cause);
+        reservation.record_failure("Cleanup", "later cleanup must not replace first cause");
+        assert!(!pending.state.lock().unwrap().reservation_aborted);
+        drop(reservation);
+        let error = task.await.unwrap().unwrap_err().to_string();
+        assert!(error.contains("operation=DomainObserve"), "{error}");
+        assert!(error.contains(cause), "{error}");
+        assert!(!error.contains("later cleanup"), "{error}");
+        pending.closed().await;
+        assert!(matches!(
+            read_message(&mut client, DEFAULT_MAX_FRAME_LEN).await,
+            Err(RpcError::Closed)
+        ));
+        assert!(pending.reserve_reply(92).is_err());
+    }
+
+    #[tokio::test]
+    async fn ready_reply_abort_keeps_first_cause_and_unexplained_drop_stays_generic() {
+        let hub = NativeControlHub::new();
+        let call = CallIdentity {
+            connection: 1,
+            request: 1,
+            owner: NativeOwner {
+                pid: 7,
+                tid: 7,
+                image_epoch: 1,
+                callback_epoch: 10,
+            },
+        };
+        let (guard, mut outbox) = hub.register(Tid::from_raw(3), call, None).unwrap();
+        let reservation = guard.pending.reserve_reply(93).unwrap();
+        reservation.record_failure("PublicationArm", "exact first refusal");
+        reservation.record_failure("PublicationCancel", "secondary teardown");
+        drop(reservation);
+        // This is the actor's actual response-ready branch, with no scheduling
+        // assumption about when a separate Tool future happens to be polled.
+        let error = match guard.finish_if_empty(&mut outbox, None) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("aborted reservation must never authorize a reply"),
+        };
+        assert!(
+            error.contains("operation=PublicationArm; cause=exact first refusal"),
+            "{error}"
+        );
+        assert!(!error.contains("secondary teardown"));
+        drop(guard);
+        let (mut client, _global, pending, task) = start().await;
+        drop(pending.reserve_reply(94).unwrap());
+        let error = task.await.unwrap().unwrap_err().to_string();
+        assert!(error.contains("native publication reply reservation was aborted"));
+        assert!(!error.contains("operation="));
+        assert!(matches!(
+            read_message(&mut client, DEFAULT_MAX_FRAME_LEN).await,
+            Err(RpcError::Closed)
+        ));
     }
 }

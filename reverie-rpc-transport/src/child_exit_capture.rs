@@ -15,10 +15,13 @@ use std::os::unix::fs::MetadataExt;
 
 use async_trait::async_trait;
 use reverie::BackendChildExitCapture;
+use reverie::ChildExitAllocationState;
+use reverie::ChildExitCaptureAllocation;
 use reverie::ChildExitCaptureArm;
 use reverie::ChildExitCaptureEffect;
 use reverie::ChildExitCaptureOutcome;
 use reverie::ChildExitCaptureRequest;
+use reverie::ChildExitCaptureSnapshot;
 use reverie::Error;
 use reverie::ReservedChildExitCapture;
 use tokio::io::unix::AsyncFd;
@@ -64,6 +67,9 @@ struct Transaction {
     reservation: Option<NativeReplyReservation>,
     armed: Option<PublicationHandle>,
     arm_attempted: bool,
+    capture_attempted: bool,
+    captured: bool,
+    diagnostic_operation: &'static str,
 }
 
 impl fmt::Debug for Transaction {
@@ -133,6 +139,9 @@ impl BackendChildExitCapture for NativeChildExitCapture {
             reservation: Some(reservation),
             armed: None,
             arm_attempted: false,
+            capture_attempted: false,
+            captured: false,
+            diagnostic_operation: "Reserve",
         }))
     }
 }
@@ -200,9 +209,16 @@ impl Transaction {
     }
 
     async fn command(
-        &self,
+        &mut self,
         operation: NativeControlOperation,
     ) -> Result<NativeControlReply, Error> {
+        self.diagnostic_operation = match &operation {
+            NativeControlOperation::DomainObserve => "DomainObserve",
+            NativeControlOperation::PublicationArm { .. } => "PublicationArm",
+            NativeControlOperation::PublicationClose { .. } => "PublicationClose",
+            NativeControlOperation::PublicationRelease { .. } => "PublicationRelease",
+            _ => "NativeControl",
+        };
         // Peer death need not finish the original Tool future or retire its
         // registry entry. Cancel only this controller wait; the actor retains
         // its uninterrupted frame I/O. The enclosing transaction then drops
@@ -360,13 +376,68 @@ fn validate_capture(
     }
 }
 
-#[async_trait]
-impl ReservedChildExitCapture for Transaction {
-    async fn arm(&mut self) -> Result<ChildExitCaptureArm, Error> {
+/// The native operation and the later protected observation are separate
+/// boundaries. A newer version is legal, but losing this capture's queued
+/// allocation before its reply is released is not successful accounting.
+fn validate_release(
+    released: &NativeControlReply,
+    captured: &NativeControlReply,
+    handle: PublicationHandle,
+) -> Result<ChildExitCaptureSnapshot, Error> {
+    validate_domain(&released.domain)?;
+    let domain = &released.domain;
+    if released.status != 0
+        || released.phase != 3
+        || domain.phase != 3
+        || released.publication.handle != handle
+        || domain.domain != handle.request.domain
+        || domain.owner != handle.request.owner
+        || domain.owner_pid != handle.owner_pid
+        || domain.owner_tid != handle.owner_tid
+        || domain.interval != handle.interval
+        || domain.version < captured.publication.version
+        || domain.guest_mask != captured.publication.guest_mask
+        || released.saved_physical_mask != captured.publication.saved_physical_mask
+        || released.current_physical_mask != captured.publication.saved_physical_mask
+    {
+        return Err(failure(
+            "native publication Release or post-operation snapshot is invalid",
+        ));
+    }
+    let records = &domain.records[..domain.record_count as usize];
+    if !records
+        .iter()
+        .any(|record| record.generation == captured.publication.allocation && record.ownership == 1)
+    {
+        return Err(failure(
+            "captured allocation is absent from the post-Release queue",
+        ));
+    }
+    Ok(ChildExitCaptureSnapshot {
+        image_epoch: domain.owner.image_epoch,
+        version: domain.version,
+        allocations: records
+            .iter()
+            .map(|record| ChildExitCaptureAllocation {
+                generation: record.generation,
+                state: match record.ownership {
+                    1 => ChildExitAllocationState::Queued,
+                    2 => ChildExitAllocationState::Active,
+                    3 => ChildExitAllocationState::Returning,
+                    _ => unreachable!("validate_domain authenticated every ownership value"),
+                },
+            })
+            .collect(),
+    })
+}
+
+impl Transaction {
+    async fn arm_inner(&mut self) -> Result<ChildExitCaptureArm, Error> {
         if self.arm_attempted || self.reservation.is_none() {
             return Err(failure("child publication Arm was already attempted"));
         }
         self.arm_attempted = true;
+        self.diagnostic_operation = "ArmPeerValidation";
         self.validate_namespace_and_liveness()?;
         let observed = self.command(NativeControlOperation::DomainObserve).await?;
         if observed.status == 1 && observed.domain.owner.callback_kind == 3 {
@@ -409,7 +480,10 @@ impl ReservedChildExitCapture for Transaction {
                 "selected child Exit refused: parent syscall callback lacks the required completed WaitChild tail",
             ));
         }
-        if !matches!(domain.owner.callback_kind, 1 | 2)
+        // Kind4 is accepted only after the SDK has authenticated the live full-
+        // save TSC scope and its immutable zero-quantum contract. Kind3 remains
+        // unavailable; enum membership alone never bypasses DomainObserve/Arm.
+        if !matches!(domain.owner.callback_kind, 1 | 2 | 4)
             || (domain.owner.callback_kind == 2
                 && (domain.active != 1 || domain.owner.admission_token != domain.admission_token))
         {
@@ -456,10 +530,15 @@ impl ReservedChildExitCapture for Transaction {
         Ok(ChildExitCaptureArm::Armed)
     }
 
-    async fn finish(mut self: Box<Self>) -> Result<ChildExitCaptureOutcome, Error> {
+    async fn capture_inner(&mut self) -> Result<ChildExitCaptureOutcome, Error> {
+        if self.capture_attempted || self.reservation.is_none() {
+            return Err(failure("child publication capture was already attempted"));
+        }
+        self.capture_attempted = true;
         let handle = self
             .armed
-            .ok_or_else(|| failure("unarmed child publication cannot finish"))?;
+            .ok_or_else(|| failure("unarmed child publication cannot capture"))?;
+        self.diagnostic_operation = "AwaitChildPublication";
         self.await_child().await?;
         let captured = self
             .command(NativeControlOperation::PublicationClose { handle })
@@ -470,25 +549,63 @@ impl ReservedChildExitCapture for Transaction {
                 receipt: captured.publication,
             })
             .await?;
-        if released.status != 0
-            || released.phase != 3
-            || released.domain.phase != 3
-            || released.publication.handle != handle
-            || released.domain.domain != handle.request.domain
-            || released.current_physical_mask != captured.publication.saved_physical_mask
-        {
-            return Err(failure(
-                "native publication Release intent was not acknowledged",
-            ));
-        }
-        self.reservation.take().unwrap().finish().map_err(failure)?;
+        let snapshot = validate_release(&released, &captured, handle)?;
+        // The native phase3 ACK and complete post-operation snapshot have not
+        // released the ordinary Tool reply. Shared accounting must happen first.
+        self.captured = true;
         Ok(ChildExitCaptureOutcome {
             request: self.request,
             domain: handle.request.domain,
             interval: handle.interval,
             allocation: captured.publication.allocation,
             effect,
+            replaced_allocation: (effect == ChildExitCaptureEffect::Replaced)
+                .then_some(captured.publication.victim),
+            snapshot,
         })
+    }
+
+    fn release_inner(&mut self) -> Result<(), Error> {
+        self.diagnostic_operation = "ReplyRelease";
+        if !self.captured {
+            return Err(failure(
+                "ordinary reply cannot release before authenticated capture",
+            ));
+        }
+        self.reservation
+            .take()
+            .ok_or_else(|| failure("ordinary capture reply reservation is absent"))?
+            .finish()
+            .map_err(failure)
+    }
+}
+
+#[async_trait]
+impl ReservedChildExitCapture for Transaction {
+    async fn arm(&mut self) -> Result<ChildExitCaptureArm, Error> {
+        let result = self.arm_inner().await;
+        self.retain_failure(&result);
+        result
+    }
+
+    async fn capture(&mut self) -> Result<ChildExitCaptureOutcome, Error> {
+        let result = self.capture_inner().await;
+        self.retain_failure(&result);
+        result
+    }
+
+    fn release(mut self: Box<Self>) -> Result<(), Error> {
+        let result = self.release_inner();
+        self.retain_failure(&result);
+        result
+    }
+}
+
+impl Transaction {
+    fn retain_failure<T>(&self, result: &Result<T, Error>) {
+        if let (Err(error), Some(reservation)) = (result, &self.reservation) {
+            reservation.record_failure(self.diagnostic_operation, &error.to_string());
+        }
     }
 }
 
@@ -614,6 +731,58 @@ mod tests {
         reply.domain.queued = 0;
         reply.domain.active = 1;
         reply.domain.admission_token = 11;
+        assert!(validate_capture(&reply, handle).is_err());
+    }
+
+    #[test]
+    fn release_requires_complete_current_ownership_without_claiming_hook_delivery() {
+        let (captured, handle) = linked();
+        let mut released = captured;
+        released.phase = 3;
+        released.domain.phase = 3;
+        let snapshot = validate_release(&released, &captured, handle).unwrap();
+        assert_eq!(snapshot.image_epoch, handle.request.owner.image_epoch);
+        assert_eq!(
+            snapshot.allocations,
+            vec![ChildExitCaptureAllocation {
+                generation: 7,
+                state: ChildExitAllocationState::Queued,
+            }]
+        );
+        // A distinct protected post-ACK observation may include a newer arrival.
+        released.domain.version += 1;
+        assert!(validate_release(&released, &captured, handle).is_ok());
+        let mut bad = released;
+        bad.domain.version = captured.publication.version - 1;
+        assert!(validate_release(&bad, &captured, handle).is_err());
+        bad = released;
+        bad.domain.owner.image_epoch += 1;
+        assert!(validate_release(&bad, &captured, handle).is_err());
+        bad = released;
+        bad.domain.records[0].ownership = 2;
+        bad.domain.queued = 0;
+        bad.domain.active = 1;
+        bad.domain.admission_token = 11;
+        assert!(validate_release(&bad, &captured, handle).is_err());
+        bad = released;
+        bad.domain.record_count = 0;
+        bad.domain.queued = 0;
+        assert!(validate_release(&bad, &captured, handle).is_err());
+    }
+
+    #[test]
+    fn replacement_requires_exact_absent_victim_and_distinct_retained_allocation() {
+        let (mut reply, handle) = linked();
+        reply.publication.outcome = 3;
+        reply.publication.victim = 6;
+        assert_eq!(
+            validate_capture(&reply, handle).unwrap(),
+            ChildExitCaptureEffect::Replaced
+        );
+        reply.domain.records[1] = reply.domain.records[0];
+        reply.domain.records[1].generation = 6;
+        reply.domain.record_count = 2;
+        reply.domain.queued = 2;
         assert!(validate_capture(&reply, handle).is_err());
     }
 

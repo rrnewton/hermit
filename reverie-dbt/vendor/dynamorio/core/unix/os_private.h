@@ -385,7 +385,20 @@ os_current_process_is_single_thread(void);
 bool
 signal_capture_is_active(dcontext_t *dcontext);
 bool
-signal_injection_permitted(dcontext_t *dcontext, int sysnum);
+signal_publication_finish_pre_syscall(dcontext_t *dcontext, int original_sysnum,
+                                      bool execute);
+
+/* Internal generated-clean-call boundary, not a client-declared callback kind.
+ * fpstate is derived by the clean-call generator from its actual save layout. */
+bool
+signal_publication_tsc_enter(dcontext_t *dcontext, app_pc pc, app_pc next_pc,
+                             byte *fpstate, bool capture_allowed);
+int
+signal_publication_tsc_leave(dcontext_t *dcontext, app_pc pc, app_pc next_pc,
+                             byte *fpstate);
+bool
+signal_injection_permitted(dcontext_t *dcontext, int sysnum, int arg_count,
+                           const reg_t *args);
 reg_t
 signal_wait_injected_sigsuspend(dcontext_t *dcontext);
 struct _dr_syscall_invoke_result_t;

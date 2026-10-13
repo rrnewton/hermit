@@ -18,6 +18,9 @@ enum {
   NATIVE_CALLBACK_SYSCALL = 1,
   NATIVE_CALLBACK_OWNED = 2,
   NATIVE_CALLBACK_ORDINARY = 3,
+  /* The SDK must independently authenticate its generated TSC clean-call
+   * scope. This value alone grants no native publication right. */
+  NATIVE_CALLBACK_TSC = 4,
 };
 
 typedef struct {
@@ -36,11 +39,12 @@ static inline bool native_callback_scope_enter(
       scope->phase == 2 || scope->publication_active ||
       scope->epoch == UINT64_MAX ||
       (kind != NATIVE_CALLBACK_ORDINARY && kind != NATIVE_CALLBACK_SYSCALL &&
-       kind != NATIVE_CALLBACK_OWNED))
+       kind != NATIVE_CALLBACK_OWNED && kind != NATIVE_CALLBACK_TSC))
     return false;
-  /* Only the original syscall/owned entry has supplied the existing dispatcher
-   * retirement opportunity. Ordinary cleanup preserves phase-3 release intent;
-   * this mirror never retires the SDK's physical guard itself. */
+  /* Syscall/owned entry follows the existing dispatcher boundary. TSC entry
+   * independently requires the generated SDK scope to find physical phase IDLE.
+   * Ordinary cleanup preserves phase-3 intent; this mirror never retires the
+   * SDK guard itself. */
   if (kind != NATIVE_CALLBACK_ORDINARY)
     scope->phase = 0;
   scope->kind = kind;

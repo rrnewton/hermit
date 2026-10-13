@@ -94,8 +94,12 @@ typedef struct {
   uint32_t reserved;
   int64_t deferred_sysnum;
   uint64_t deferred_args[6];
+  uint64_t admission_image_epoch;
+  uint64_t admission_domain;
+  uint64_t admission_allocation;
+  uint64_t admission_token;
 } dbt_signal_event_t;
-_Static_assert(sizeof(dbt_signal_event_t) == 200, "DBT signal ABI size");
+_Static_assert(sizeof(dbt_signal_event_t) == 232, "DBT signal ABI size");
 
 typedef struct {
   uint64_t branches;
@@ -275,7 +279,7 @@ static const cpuid_result_t extended_cpuid[] = {
 // exit, and app-level writes re-enter the syscall interception path.
 typedef void (*reverie_emit_fn_t)(const char* buf, size_t len);
 typedef void (*reverie_idle_fn_t)(void);
-#define REVERIE_DBT_RUNTIME_ABI_VERSION 9u
+#define REVERIE_DBT_RUNTIME_ABI_VERSION 10u
 typedef struct {
   int32_t pid;
   int32_t tid;
@@ -417,9 +421,10 @@ extern int32_t reverie_dbt_runtime_process_clone_result(
     syscall_invoker_t invoke_syscall,
     register_reader_t read_registers,
     register_writer_t write_registers);
-extern int32_t reverie_dbt_runtime_background_init_v3(
+extern int32_t reverie_dbt_runtime_background_init_v4(
     void* argument,
-    uint32_t native_mode);
+    uint32_t native_mode,
+    uint64_t native_preemption_quantum);
 extern int32_t reverie_dbt_runtime_ready(uint64_t image_generation);
 extern void reverie_dbt_runtime_process_exit(void);
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -501,6 +506,7 @@ static bool test_reused_tid;
 static bool test_thread_clone_process_exit;
 static bool test_thread_start_write;
 static bool test_stalled_thread_start;
+static bool test_tsc_state_observer;
 static uint64_t test_thread_start_write_address;
 static _Atomic bool test_reused_tid_exercised;
 static _Atomic bool test_reused_tid_waited;
@@ -523,8 +529,7 @@ static char stats_path[4096];
 // branches so a running guest thread returns control to Detcore's scheduler
 // between syscalls. Both default to the disabled state, so guests run unchanged
 // unless the quantum is supplied.
-static bool preemption_enabled;
-static uint64_t preemption_quantum;
+// Actual quantum is initialized once in the sealed runtime callback page below.
 // When true, preemption is delivered only at PCs in the guest's main executable
 // (see `pc_in_main_executable`). Default true (conservative). Set to false via
 // the `HERMIT_DBT_PREEMPT_ANYPC` environment variable to allow delivery at any
@@ -604,6 +609,10 @@ static evidence_config_page_t evidence_config_page
     __attribute__((aligned(EVIDENCE_CONFIG_PAGE_SIZE)));
 typedef union {
   runtime_callbacks_t value;
+  struct {
+    runtime_callbacks_t callbacks;
+    uint64_t native_preemption_quantum;
+  } startup;
   unsigned char page[EVIDENCE_CONFIG_PAGE_SIZE];
 } runtime_callbacks_page_t;
 _Static_assert(
@@ -631,6 +640,11 @@ static runtime_callbacks_page_t runtime_callbacks_page
                 .native_control = runtime_native_control,
             },
 };
+// One immutable value drives both existing preemption and startup admission.
+// It is sealed with the callbacks before any application instruction executes.
+#define preemption_quantum (runtime_callbacks_page.startup.native_preemption_quantum)
+#define preemption_enabled (preemption_quantum != 0)
+
 typedef struct {
   process_id_t process;
   uint64_t start_time;
@@ -662,7 +676,22 @@ _Static_assert((uint32_t)NATIVE_CALLBACK_SYSCALL == (uint32_t)DR_SIGNAL_PUBLICAT
                "syscall callback kind must match SDK");
 _Static_assert((uint32_t)NATIVE_CALLBACK_OWNED == (uint32_t)DR_SIGNAL_PUBLICATION_OWNED,
                "owned callback kind must match SDK");
+_Static_assert((uint32_t)NATIVE_CALLBACK_TSC == (uint32_t)DR_SIGNAL_PUBLICATION_TSC,
+               "generated TSC callback kind must match SDK");
 static _Thread_local native_callback_scope_t native_callback_scope;
+/* Test-only snapshots, never consulted by capture or admission decisions. */
+static _Thread_local struct {
+  bool prepared;
+  bool owner_valid;
+  bool with_aux;
+  app_pc pc;
+  app_pc next_pc;
+  int32_t pid;
+  int32_t tid;
+  uint64_t image;
+  uint64_t epoch;
+  uint32_t kind;
+} tsc_observation;
 static _Thread_local uint64_t native_control_last_owner_epoch;
 static _Thread_local uint64_t native_control_saved_mask;
 static _Thread_local dr_signal_capture_handle_t native_control_handle;
@@ -1784,6 +1813,68 @@ static int32_t write_registers(
     const struct user_regs_struct* in);
 
 static void ensure_runtime_background(void);
+// Emission covers every actual generated TSC runtime borrow while the explicit
+// test observer is enabled. A fixture joins its selected owners; loader records
+// are retained rather than mistaken for additional selected probe requests.
+static void log_tsc_state(void* drcontext, bool returning, int disposition,
+                          const dr_mcontext_t* mc) {
+  if (!test_tsc_state_observer || !tsc_observation.owner_valid) return;
+  const char* phase = returning ? "return" : "entry";
+  const char* opcode = tsc_observation.with_aux ? "tscp" : "tsc";
+  const char* xmm = dr_mcontext_xmm_fields_valid() ? "true" : "false";
+  const char* zmm = dr_mcontext_zmm_fields_valid() ? "true" : "false";
+  const char* avx = proc_avx_enabled() ? "true" : "false";
+  const char* avx512 = proc_avx512_enabled() ? "true" : "false";
+#define TSC_OBSERVER_BASE \
+  "native-tsc-state {\"phase\":\"%s\",\"pid\":%d,\"tid\":%d," \
+  "\"image_epoch\":%llu,\"callback_epoch\":%llu,\"callback_kind\":%u," \
+  "\"opcode\":\"%s\",\"pc\":%llu,\"fallthrough\":%llu," \
+  "\"xmm_valid\":%s,\"zmm_valid\":%s,\"avx_enabled\":%s," \
+  "\"avx512_enabled\":%s,\"simd_count\":%d,\"simd_saved_count\":%d," \
+  "\"opmask_count\":%d,\"fp_bytes\":%llu,\"branch_count\":%llu"
+#define TSC_OBSERVER_ARGS \
+  phase, tsc_observation.pid, tsc_observation.tid, \
+  (unsigned long long)tsc_observation.image, \
+  (unsigned long long)tsc_observation.epoch, tsc_observation.kind, opcode, \
+  (unsigned long long)(uintptr_t)tsc_observation.pc, \
+  (unsigned long long)(uintptr_t)tsc_observation.next_pc, xmm, zmm, avx, avx512, \
+  proc_num_simd_registers(), proc_num_simd_saved(), proc_num_opmask_registers(), \
+  (unsigned long long)proc_fpstate_save_size(), \
+  (unsigned long long)atomic_load_explicit(&branch_count, memory_order_relaxed)
+  if (!returning) {
+    dr_fprintf(diagnostic_file, TSC_OBSERVER_BASE "}\n", TSC_OBSERVER_ARGS);
+  } else {
+    dr_fprintf(diagnostic_file, TSC_OBSERVER_BASE
+        ",\"publication_phase\":%u,\"path\":\"%s\","
+        "\"rax\":%llu,\"rdx\":%llu,\"rcx\":%llu}\n",
+        TSC_OBSERVER_ARGS, native_callback_scope.phase,
+        disposition == 0 ? "cache" : "dispatcher",
+        (unsigned long long)mc->xax, (unsigned long long)mc->xdx,
+        (unsigned long long)mc->xcx);
+  }
+#undef TSC_OBSERVER_ARGS
+#undef TSC_OBSERVER_BASE
+  (void)drcontext;
+}
+
+static void observe_tsc_return(void* drcontext, app_pc pc, app_pc next_pc,
+                               bool with_aux, int disposition,
+                               const dr_mcontext_t* mc) {
+  if (disposition == -1) {
+    memset(&tsc_observation, 0, sizeof(tsc_observation));
+    tsc_observation.prepared = true;
+    tsc_observation.pc = pc;
+    tsc_observation.next_pc = next_pc;
+    tsc_observation.with_aux = with_aux;
+    return;
+  }
+  if (tsc_observation.prepared && tsc_observation.pc == pc &&
+      tsc_observation.next_pc == next_pc && tsc_observation.with_aux == with_aux &&
+      mc != NULL && (disposition == 0 || disposition == 1))
+    log_tsc_state(drcontext, true, disposition, mc);
+  memset(&tsc_observation, 0, sizeof(tsc_observation));
+}
+
 // The TSC an rdtsc or rdtscp returns. A runtime whose tool answers it is asked
 // first: under Detcore that is Detcore's virtual clock, charged and logged as
 // under ptrace, so the guest's TSC names the same instant as its
@@ -1807,7 +1898,20 @@ static uint64_t guest_tsc(void* drcontext, bool with_aux, uint32_t* aux) {
     while (!reverie_dbt_runtime_ready(
         atomic_load_explicit(&image_generation, memory_order_acquire)))
       dr_sleep(1);
-    if (!runtime_callback_enter(NATIVE_CALLBACK_ORDINARY)) return 0;
+    // Only the SDK-generated entry owns a TSC frame. A nonzero native
+    // quantum retains its old preemption path and has no new capture rights.
+    if (!runtime_callback_enter(preemption_quantum == 0
+            ? NATIVE_CALLBACK_TSC : NATIVE_CALLBACK_ORDINARY)) return 0;
+    if (test_tsc_state_observer && tsc_observation.prepared &&
+        tsc_observation.with_aux == with_aux) {
+      tsc_observation.owner_valid = true;
+      tsc_observation.pid = (int32_t)dr_get_process_id();
+      tsc_observation.tid = (int32_t)dr_get_thread_id(drcontext);
+      tsc_observation.image = atomic_load_explicit(&image_generation, memory_order_acquire);
+      tsc_observation.epoch = native_callback_scope.epoch;
+      tsc_observation.kind = native_callback_scope.kind;
+      log_tsc_state(drcontext, false, -1, NULL);
+    }
     answered = reverie_dbt_runtime_rdtsc(
         drcontext,
         counters,
@@ -1834,34 +1938,23 @@ static uint64_t guest_tsc(void* drcontext, bool with_aux, uint32_t* aux) {
   return next_virtual_tsc();
 }
 
-// Emulate rdtsc: return the 64-bit TSC in EDX:EAX, leaving all other
-// registers (notably ECX) untouched, exactly as the hardware rdtsc does.
-static void emulate_rdtsc(void) {
+// The SDK wrapper finalizes only after these existing Tool hooks return and
+// their outputs are committed once. RDTSC preserves RCX; RDTSCP writes ECX.
+static void emulate_tsc(bool with_aux) {
   void* drcontext = dr_get_current_drcontext();
   dr_mcontext_t registers = {sizeof(registers), DR_MC_INTEGER};
   uint32_t aux;
-  uint64_t tsc = guest_tsc(drcontext, false, &aux);
-
-  DR_ASSERT(dr_get_mcontext(drcontext, &registers));
+  uint64_t tsc = guest_tsc(drcontext, with_aux, &aux);
+  if (!dr_get_mcontext(drcontext, &registers)) {
+    exit_runtime_tree(101);
+    return;
+  }
   registers.xax = (reg_t)(tsc & UINT32_C(0xFFFFFFFF));
   registers.xdx = (reg_t)((tsc >> 32) & UINT32_C(0xFFFFFFFF));
-  DR_ASSERT(dr_set_mcontext(drcontext, &registers));
-}
-
-// Emulate rdtscp: like rdtsc, but also set ECX to the TSC_AUX value: the
-// runtime's (Detcore's, for its single virtual CPU), or 0 with the
-// fixed-stride counter, so a deterministic run reports a stable processor id.
-static void emulate_rdtscp(void) {
-  void* drcontext = dr_get_current_drcontext();
-  dr_mcontext_t registers = {sizeof(registers), DR_MC_INTEGER};
-  uint32_t aux;
-  uint64_t tsc = guest_tsc(drcontext, true, &aux);
-
-  DR_ASSERT(dr_get_mcontext(drcontext, &registers));
-  registers.xax = (reg_t)(tsc & UINT32_C(0xFFFFFFFF));
-  registers.xdx = (reg_t)((tsc >> 32) & UINT32_C(0xFFFFFFFF));
-  registers.xcx = (reg_t)aux;
-  DR_ASSERT(dr_set_mcontext(drcontext, &registers));
+  if (with_aux)
+    registers.xcx = (reg_t)aux;
+  if (!dr_set_mcontext(drcontext, &registers))
+    exit_runtime_tree(101);
 }
 
 // Replace rdtsc and rdtscp instructions with a marker nop, mirroring
@@ -2328,25 +2421,22 @@ static dr_emit_flags_t instrument_instruction(
     return DR_EMIT_DEFAULT;
   }
   if (instr_is_app(instruction) &&
-      (ptr_uint_t)instr_get_note(instruction) == rdtsc_marker_note) {
-    dr_insert_clean_call_ex(
-        drcontext,
-        bb,
-        instruction,
-        (void*)emulate_rdtsc,
-        DR_CLEANCALL_READS_APP_CONTEXT | DR_CLEANCALL_WRITES_APP_CONTEXT,
-        0);
-    return DR_EMIT_DEFAULT;
-  }
-  if (instr_is_app(instruction) &&
-      (ptr_uint_t)instr_get_note(instruction) == rdtscp_marker_note) {
-    dr_insert_clean_call_ex(
-        drcontext,
-        bb,
-        instruction,
-        (void*)emulate_rdtscp,
-        DR_CLEANCALL_READS_APP_CONTEXT | DR_CLEANCALL_WRITES_APP_CONTEXT,
-        0);
+      ((ptr_uint_t)instr_get_note(instruction) == rdtsc_marker_note ||
+       (ptr_uint_t)instr_get_note(instruction) == rdtscp_marker_note)) {
+    const emulated_instr_t* emulated = NULL;
+    const int expected = (ptr_uint_t)instr_get_note(instruction) == rdtsc_marker_note
+        ? OP_rdtsc : OP_rdtscp;
+    // drmgr owns the original decoded instruction through this insertion
+    // region, including legal prefixes. Consume it now, never re-decode guest
+    // memory or assume a two/three-byte fallthrough at execution time.
+    if (!drmgr_in_emulation_region(drcontext, &emulated) || emulated == NULL ||
+        emulated->instr == NULL || instr_get_opcode(emulated->instr) != expected ||
+        !dr_insert_signal_publication_tsc(drcontext, bb, instruction,
+            emulated->instr, emulate_tsc, preemption_quantum,
+            test_tsc_state_observer ? observe_tsc_return : NULL)) {
+      dr_fprintf(diagnostic_file, "reverie-dbt: invalid TSC emulation frame\n");
+      exit_runtime_tree(101);
+    }
     return DR_EMIT_DEFAULT;
   }
   if (!instr_is_app(instruction) || !is_counted_branch(instruction))
@@ -2685,6 +2775,14 @@ static void runtime_native_control(
     reply->domain.owner = publication_owner;
     reply->domain.owner_pid = reply->owner.pid;
     reply->domain.owner_tid = reply->owner.tid;
+    return;
+  }
+  if (native_callback_scope.kind == NATIVE_CALLBACK_TSC &&
+      request->operation >= 1 && request->operation <= 4) {
+    // The generated scope authorizes publication only. Do not widen the older
+    // pre-syscall capture protocol merely because this callback owns a frame.
+    reply->status = request->operation == 1
+        ? DR_SIGNAL_CAPTURE_UNAVAILABLE : DR_SIGNAL_CAPTURE_STALE;
     return;
   }
   switch (request->operation) {
@@ -5516,7 +5614,14 @@ static bool pre_syscall(void* drcontext, int sysnum) {
 
   int64_t deferred_sysnum = sysnum;
   uint64_t deferred_args[6] = {0};
+  dr_mcontext_t original_wait_context = {sizeof(original_wait_context), DR_MC_CONTROL};
+  bool original_is_wait = sysnum == SYS_wait4 || sysnum == SYS_waitid;
+  if (original_is_wait && !dr_get_mcontext(drcontext, &original_wait_context)) {
+    exit_runtime_tree(101);
+    return false;
+  }
   if (!runtime_callback_enter(DR_SIGNAL_PUBLICATION_SYSCALL)) return false;
+  dr_signal_publication_owner_t original_owner = native_publication_owner(drcontext);
   int32_t action = reverie_dbt_runtime_pre_syscall(
       drcontext,
       counters,
@@ -5574,6 +5679,39 @@ static bool pre_syscall(void* drcontext, int sysnum) {
     result = virtualize_identity_result(counters, sysnum, result);
     dr_syscall_set_result(drcontext, (reg_t)result);
     return false;
+  }
+  if (action == 2 && native_callback_scope.phase == 3) {
+    /* Tail injection dropped the real Rust future before returning here.
+     * Do not translate guest wait operands: pending dispatch must observe the
+     * original application continuation in both its delivery and ordinary
+     * contexts, and no physical kernel wait may execute on this branch. */
+    bool exact = original_is_wait && deferred_sysnum == sysnum &&
+        memcmp(deferred_args, args, sizeof(deferred_args)) == 0 &&
+        native_runtime_entries == 0 && !native_callback_scope.active &&
+        !native_callback_scope.publication_active &&
+        native_callback_scope.epoch == original_owner.callback_epoch &&
+        atomic_load_explicit(&image_generation, memory_order_acquire) ==
+            original_owner.image_epoch &&
+        !counters->translated_child_wait.pending;
+    if (!exact) {
+      dr_fprintf(diagnostic_file, "reverie-dbt: captured wait tail ownership refused\n");
+      exit_runtime_tree(101);
+      return false;
+    }
+    clear_translated_child_wait(&counters->translated_child_wait);
+    dr_syscall_set_sysnum(drcontext, sysnum);
+    reg_t original_args[6];
+    for (int i = 0; i != 6; ++i) {
+      original_args[i] = (reg_t)args[i];
+      dr_syscall_set_param(drcontext, i, original_args[i]);
+    }
+    if (dr_signal_publication_stage_wait_return(drcontext, &original_owner,
+            sysnum, original_wait_context.pc, original_args) != DR_SIGNAL_CAPTURE_OK) {
+      dr_fprintf(diagnostic_file, "reverie-dbt: captured wait SDK completion refused\n");
+      exit_runtime_tree(101);
+      return false;
+    }
+    return true;
   }
   if (action == 2) {
     uint64_t clone_flags = 0;
@@ -6030,6 +6168,20 @@ static dr_signal_admission_status_t signal_admission_event(
   counters->signal_event.signal = event->sig;
   counters->signal_event.delivered_signal = event->sig;
   memcpy(counters->signal_event.signal_info, event->siginfo, sizeof(event->siginfo));
+  if (event->publication_image_epoch != 0 || event->publication_domain != 0 ||
+      event->publication_allocation != 0) {
+    if (event->sig != SIGCHLD || event->publication_domain == 0 ||
+        event->publication_allocation == 0 ||
+        event->publication_image_epoch != counters->signal_image_generation) {
+      dr_fprintf(diagnostic_file, "reverie-dbt: signal allocation identity refused\n");
+      exit_runtime_tree(101);
+      return DR_SIGNAL_ADMISSION_WAIT;
+    }
+    counters->signal_event.admission_image_epoch = event->publication_image_epoch;
+    counters->signal_event.admission_domain = event->publication_domain;
+    counters->signal_event.admission_allocation = event->publication_allocation;
+    counters->signal_event.admission_token = event->token;
+  }
   redirect->pc = signal_stub;
   redirect->xax = SYS_gettid;
   return DR_SIGNAL_ADMISSION_START;
@@ -6101,8 +6253,8 @@ static void runtime_background_init(void* argument) {
   uint32_t native_mode = runtime_uses_external_global()
       ? REVERIE_DBT_STARTUP_COORDINATED
       : REVERIE_DBT_STARTUP_STANDALONE;
-  int32_t startup_status = reverie_dbt_runtime_background_init_v3(
-      &runtime_callbacks_page.value, native_mode);
+  int32_t startup_status = reverie_dbt_runtime_background_init_v4(
+      &runtime_callbacks_page.value, native_mode, preemption_quantum);
   evidence_callback_leave();
   if (startup_status != 0) {
     dr_fprintf(diagnostic_file, "reverie-dbt: runtime startup was refused\n");
@@ -6187,6 +6339,8 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
 
   keep_private_environment();
   diagnostic_file = STDERR;
+  const char* tsc_observer = getenv("HERMIT_DBT_TEST_TSC_STATE_OBSERVER");
+  test_tsc_state_observer = tsc_observer != NULL && strcmp(tsc_observer, "1") == 0;
   for (int i = 1; i < argc; ++i) {
     if (strcmp(argv[i], "-external-global") == 0)
       external_global = true;
@@ -6354,7 +6508,6 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
       DR_ASSERT(++i < argc);
       DR_ASSERT(dr_sscanf(argv[i], "%llu", &quantum) == 1);
       preemption_quantum = (uint64_t)quantum;
-      preemption_enabled = quantum > 0;
     }
   }
 

@@ -103,3 +103,41 @@ Building this crate compiles the curated DynamoRIO source and links the host's
 build prerequisites. The vendored copyright, license, and acknowledgement files
 are included under `vendor/dynamorio`; see those files and the repository
 [`NOTICE`](../NOTICE) for attribution and distribution obligations.
+
+## Native child-exit capture and preemption
+
+The native-control capture startup contract requires an actual native preemption
+quantum of zero. A nonzero `-preemption-quantum` together with an authenticated
+native-control Hello is refused before the runtime reports READY. A legacy
+startup without that transport retains its existing nonzero-quantum behavior;
+this check does not disable preemption, suppress a scheduling event, or modify
+Detcore's continuous virtual clock.
+
+ABI 10 supplies the quantum from the native client's sealed configuration through
+`reverie_dbt_runtime_background_init_v4`. An external runtime must independently
+validate the completed startup transport and reject a changed same-image
+contract. Missing V4 input cannot be treated as zero. Updating the native client
+without a matching external runtime is incompatible and must keep the fixed ABI
+mismatch refusal.
+
+The SDK-generated RDTSC/RDTSCP entry is a distinct publication context. Its
+ordinary callback kind or an earlier readiness report grants no capture rights.
+An unarmed instruction uses its ordinary cache return. A released or cancelled
+capture restores the saved application state and decoded fallthrough through
+the dispatcher before application execution. This is not general support for
+other ordinary callbacks, multi-recipient signal topologies, or arbitrary
+SIGCHLD dispositions; the existing eligibility refusals remain in force.
+
+The same private ABI10 draft appends four authenticated SIGCHLD admission fields
+to the runtime signal event (232 bytes; existing payload offsets unchanged).
+They describe the actual detached native allocation and token, including an older
+coalescence target. They never select which signals enter the Tool. The shared
+Guest accessor is absent outside that actual callback. Unknown identity still
+runs the ordinary hook and earns no captured-allocation credit.
+
+A native publication transaction now captures and observes complete ownership
+while holding its ordinary reply. Shared accounting precedes explicit reply
+release. A post-Release snapshot is a separate protected observation; its missing
+records do not certify delivery. Replaced receipts name their actual victim.
+This interface requires the paired shared ledger and real-hook envelope changes;
+phase3 and callback return are not substitutes for those observations.
