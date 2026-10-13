@@ -1608,9 +1608,21 @@ async fn generated_tsc_capture_preserves_architectural_state_and_returns_once() 
     println!("native-tsc-state retained-fixture {}", directory.display());
     let fixture = compile_tsc_guest(&directory);
     let launcher = directory.join("bounded-tsc-launcher");
-    std::fs::write(&launcher,r#"#!/usr/bin/env python3
+    std::fs::write(
+        &launcher,
+        r#"#!/usr/bin/env python3
 import os, signal, subprocess, sys
-child = subprocess.Popen([os.environ["REVERIE_DBT_TEST_PROGRAM"], *sys.argv[1:]], start_new_session=True)
+arguments = sys.argv[1:]
+positions = [index for index, value in enumerate(arguments) if value == "-diagnostic_fd"]
+if len(positions) != 1 or positions[0] + 1 >= len(arguments):
+    raise SystemExit("TSC fixture requires one declared native diagnostic descriptor")
+fd_text = arguments[positions[0] + 1]
+if not fd_text.isascii() or not fd_text.isdecimal() or int(fd_text) <= 2:
+    raise SystemExit("TSC fixture requires a non-stdio native diagnostic descriptor")
+diagnostic_fd = int(fd_text)
+os.fstat(diagnostic_fd)
+child = subprocess.Popen([os.environ["REVERIE_DBT_TEST_PROGRAM"], *arguments],
+                         start_new_session=True, pass_fds=(diagnostic_fd,))
 try:
     try:
         result = child.wait(timeout=30)
@@ -1631,7 +1643,9 @@ finally:
         pass
     child.wait()
 sys.exit(result)
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
     // Six declared cases, each with separate x87 and MMX state images and two
     // real publishers. They are not retries; the first failed case stops.
