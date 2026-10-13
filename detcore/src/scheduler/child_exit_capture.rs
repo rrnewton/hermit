@@ -578,7 +578,7 @@ impl Scheduler {
         })
     }
 
-    pub(super) fn fail_native_child_capture(&mut self, child: DetTid, error: &str) {
+    pub(crate) fn fail_native_child_capture(&mut self, child: DetTid, error: &str) {
         tracing::error!("authentic child-exit capture failed for child {child}: {error}");
         if let Some(wake) = self.report_backend_failure(reverie::BackendFailure {
             pid: reverie::Pid::from_raw(child.as_raw()),
