@@ -1600,6 +1600,111 @@ fn compile_tsc_guest(directory: &Path) -> TscGuest {
     }
 }
 
+/// CPU/OS capability selection is measured outside instrumentation. The native
+/// client deliberately exposes a synthetic CPUID table to applications, so a
+/// guest-side CPUID query would neither measure this host nor exercise the
+/// widest supported state. This probe selects the fixture; it changes no product
+/// CPUID or clock behavior and cannot replace the SDK marker/state oracles.
+fn native_tsc_vector_level(guest: &Path, directory: &Path) -> u32 {
+    let arguments = ["--native-capabilities"];
+    std::fs::write(
+        directory.join("native-capabilities.command.json"),
+        json!({"program":guest,"arguments":arguments,"execution":"direct native; no DbtRunner"})
+            .to_string(),
+    )
+    .unwrap();
+    let output = Command::new(guest)
+        .args(arguments)
+        .output()
+        .expect("native CPU/OS capability probe");
+    std::fs::write(directory.join("native-capabilities.stdout"), &output.stdout).unwrap();
+    std::fs::write(directory.join("native-capabilities.stderr"), &output.stderr).unwrap();
+    std::fs::write(
+        directory.join("native-capabilities.result.json"),
+        json!({"status":output.status.code(),"stdout":String::from_utf8_lossy(&output.stdout),"stderr":String::from_utf8_lossy(&output.stderr)}).to_string(),
+    ).unwrap();
+    assert!(
+        output.status.success(),
+        "native capability probe failed: {output:?}"
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "native capability probe stderr: {output:?}"
+    );
+    let text = std::str::from_utf8(&output.stdout).expect("native capability UTF-8");
+    let line = text
+        .strip_suffix('\n')
+        .expect("complete native capability line");
+    assert!(!line.contains('\n'), "one native capability report");
+    let report: serde_json::Value = serde_json::from_str(
+        line.strip_prefix("native-tsc-capabilities ")
+            .expect("native capability prefix"),
+    )
+    .expect("native capability JSON");
+    let fields = report.as_object().expect("native capability object");
+    let expected = [
+        "basic_max",
+        "extended_max",
+        "leaf1_ecx",
+        "leaf1_edx",
+        "leaf7_ebx",
+        "extended1_edx",
+        "xcr0",
+        "vector_level",
+        "rdtscp",
+    ];
+    assert_eq!(fields.len(), expected.len());
+    assert!(expected.iter().all(|key| fields.contains_key(*key)));
+    let number = |key: &str| report[key].as_u64().expect("native capability integer");
+    for key in [
+        "basic_max",
+        "extended_max",
+        "leaf1_ecx",
+        "leaf1_edx",
+        "leaf7_ebx",
+        "extended1_edx",
+        "vector_level",
+    ] {
+        assert!(number(key) <= u32::MAX as u64, "32-bit CPUID field {key}");
+    }
+    assert!(number("basic_max") >= 1);
+    assert_eq!(
+        number("leaf1_edx") & ((1 << 24) | (1 << 26)),
+        (1 << 24) | (1 << 26),
+        "native FXSAVE/SSE2"
+    );
+    let rdtscp = number("extended_max") >= 0x8000_0001 && number("extended1_edx") & (1 << 27) != 0;
+    assert_eq!(report["rdtscp"].as_bool(), Some(rdtscp));
+    assert!(
+        rdtscp,
+        "native CPU does not report RDTSCP: fixture requirement unmet, no skip: {report}"
+    );
+    let xcr0 = number("xcr0");
+    let leaf1 = number("leaf1_ecx");
+    if leaf1 & ((1 << 26) | (1 << 27)) != (1 << 26) | (1 << 27) {
+        assert_eq!(xcr0, 0, "XGETBV only measured with XSAVE/OSXSAVE");
+    }
+    if number("basic_max") < 7 {
+        assert_eq!(number("leaf7_ebx"), 0);
+    }
+    let level = if leaf1 & (1 << 28) == 0 || xcr0 & 6 != 6 {
+        0
+    } else if number("leaf7_ebx") & (1 << 16) == 0 || xcr0 & 0xe6 != 0xe6 {
+        1
+    } else if number("leaf7_ebx") & (1 << 30) == 0 {
+        2
+    } else {
+        3
+    };
+    assert_eq!(
+        number("vector_level"),
+        level,
+        "highest native CPU+OS supported fixture width"
+    );
+    println!("native-tsc-state native-capabilities {report}");
+    level as u32
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires actual ABI10 native prototype, generated TSC SDK, and native state observer; run explicitly with --ignored"]
 async fn generated_tsc_capture_preserves_architectural_state_and_returns_once() {
@@ -1607,6 +1712,7 @@ async fn generated_tsc_capture_preserves_architectural_state_and_returns_once() 
     let directory = tempfile::tempdir().expect("TSC fixture directory").keep();
     println!("native-tsc-state retained-fixture {}", directory.display());
     let fixture = compile_tsc_guest(&directory);
+    let native_level = native_tsc_vector_level(&fixture.path, &directory);
     let launcher = directory.join("bounded-tsc-launcher");
     std::fs::write(
         &launcher,
@@ -1669,6 +1775,8 @@ sys.exit(result)
             let mut guest = Command::new(&fixture.path);
             guest
                 .arg(opcode)
+                .arg(native_level.to_string())
+                .arg("1") // Native probe above required RDTSCP; no synthetic guest CPUID.
                 .env(RPC_SOCKET_ENV, socket)
                 .env(ENV, "1")
                 .env("HERMIT_DBT_TEST_OWNED_SIGNAL_PUBLICATION", "1")
@@ -1719,13 +1827,15 @@ sys.exit(result)
                 output.status.success(),
                 "actual TSC guest failed: {output:?}"
             );
-            let level = (0..=3)
-                .find(|level| {
-                    output.stdout==format!(
-                "native TSC state opcode={opcode} vector_level={level} x87=ok mmx=ok once=2\n"
-            ).as_bytes()
-                })
-                .expect("exact guest state/oracle output");
+            let level = native_level;
+            assert_eq!(
+                output.stdout,
+                format!(
+                    "native TSC state opcode={opcode} vector_level={level} x87=ok mmx=ok once=2\n"
+                )
+                .as_bytes(),
+                "exact guest state/oracle output at the native-selected width"
+            );
             validate_native_tsc_markers(
                 &output.stderr,
                 &owners,

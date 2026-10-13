@@ -8,6 +8,7 @@
 #include "state.h"
 #include <cpuid.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -47,25 +48,59 @@ static ssize_t read_retry(int fd, void *buffer, size_t size) {
   return result;
 }
 
-/* CPU+OS availability selects instructions only. The host independently
- * requires the actual DR validity/count marker for this chosen vector level. */
-static unsigned vector_level(void) {
+/* This branch is executed directly by the host test before DBT launch. Guest
+ * CPUID is intentionally synthetic and cannot establish physical CPU/OS state
+ * support. The host retains this report and supplies its selection explicitly;
+ * the instrumented rounds still require the actual SDK validity observations. */
+struct native_capabilities {
+  unsigned basic_max, extended_max, leaf1_ecx, leaf1_edx, leaf7_ebx;
+  unsigned extended1_edx;
+  uint64_t xcr0;
+  unsigned level;
+  int rdtscp;
+};
+
+static struct native_capabilities native_capabilities(void) {
+  struct native_capabilities caps = {0};
   unsigned a, b, c, d;
-  require(__get_cpuid(1, &a, &b, &c, &d), "CPUID leaf1");
-  require((d & bit_FXSAVE) && (d & bit_SSE2), "x86-64 FXSAVE/SSE2");
-  if (!(c & bit_AVX) || !(c & bit_OSXSAVE))
-    return 0;
-  unsigned lo, hi;
-  __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
-  uint64_t xcr0 = ((uint64_t)hi << 32) | lo;
-  if ((xcr0 & 6) != 6)
-    return 0;
-  if (__get_cpuid_max(0, NULL) < 7)
-    return 1;
-  __cpuid_count(7, 0, a, b, c, d);
-  if (!(b & bit_AVX512F) || (xcr0 & 0xe6) != 0xe6)
-    return 1;
-  return (b & bit_AVX512BW) ? 3 : 2;
+  caps.basic_max = __get_cpuid_max(0, NULL);
+  caps.extended_max = __get_cpuid_max(0x80000000, NULL);
+  require(caps.basic_max >= 1, "native CPUID leaf1");
+  __cpuid(1, a, b, c, d);
+  caps.leaf1_ecx = c;
+  caps.leaf1_edx = d;
+  require((d & bit_FXSAVE) && (d & bit_SSE2), "native x86-64 FXSAVE/SSE2");
+  if (caps.extended_max >= 0x80000001) {
+    __cpuid(0x80000001, a, b, c, d);
+    caps.extended1_edx = d;
+    caps.rdtscp = (d & (1u << 27)) != 0;
+  }
+  if (caps.basic_max >= 7) {
+    __cpuid_count(7, 0, a, b, c, d);
+    caps.leaf7_ebx = b;
+  }
+  if ((caps.leaf1_ecx & bit_XSAVE) && (caps.leaf1_ecx & bit_OSXSAVE)) {
+    unsigned lo, hi;
+    __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+    caps.xcr0 = ((uint64_t)hi << 32) | lo;
+  }
+  if ((caps.leaf1_ecx & bit_AVX) && (caps.xcr0 & 6) == 6) {
+    caps.level = 1;
+    if ((caps.leaf7_ebx & bit_AVX512F) && (caps.xcr0 & 0xe6) == 0xe6)
+      caps.level = (caps.leaf7_ebx & bit_AVX512BW) ? 3 : 2;
+  }
+  return caps;
+}
+
+static void print_native_capabilities(void) {
+  const struct native_capabilities caps = native_capabilities();
+  printf("native-tsc-capabilities {\"basic_max\":%u,\"extended_max\":%u,"
+         "\"leaf1_ecx\":%u,\"leaf1_edx\":%u,\"leaf7_ebx\":%u,"
+         "\"extended1_edx\":%u,\"xcr0\":%" PRIu64 ",\"vector_level\":%u,"
+         "\"rdtscp\":%s}\n",
+         caps.basic_max, caps.extended_max, caps.leaf1_ecx, caps.leaf1_edx,
+         caps.leaf7_ebx, caps.extended1_edx, caps.xcr0, caps.level,
+         caps.rdtscp ? "true" : "false");
 }
 
 static void prepare_seed(int mmx) {
@@ -165,15 +200,19 @@ static void reap(pid_t pid, int expected) {
 }
 
 int main(int argc, char **argv) {
-  require(argc == 2 && (!strcmp(argv[1], "tsc") || !strcmp(argv[1], "tscp")),
-          "exact opcode argument");
-  int tscp = !strcmp(argv[1], "tscp");
-  if (tscp) {
-    unsigned a, b, c, d;
-    require(__get_cpuid(0x80000001, &a, &b, &c, &d) && (d & (1u << 27)),
-            "RDTSCP architectural availability");
+  if (argc == 2 && !strcmp(argv[1], "--native-capabilities")) {
+    print_native_capabilities();
+    return 0;
   }
-  unsigned level = vector_level();
+  require(argc == 4 && (!strcmp(argv[1], "tsc") || !strcmp(argv[1], "tscp")),
+          "exact opcode and native capability arguments");
+  require(strlen(argv[2]) == 1 && argv[2][0] >= '0' && argv[2][0] <= '3' &&
+              strlen(argv[3]) == 1 && (argv[3][0] == '0' || argv[3][0] == '1'),
+          "exact native CPU/OS capability selection");
+  int tscp = !strcmp(argv[1], "tscp");
+  if (tscp)
+    require(argv[3][0] == '1', "RDTSCP architectural availability");
+  unsigned level = (unsigned)(argv[2][0] - '0');
   void (*functions[2][4])(void) = {
       {tsc_xmm, tsc_ymm, tsc_zmm16, tsc_zmm64},
       {tscp_xmm, tscp_ymm, tscp_zmm16, tscp_zmm64}};
