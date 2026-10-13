@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 4085,
-      "applicable": 1707,
-      "selectable": 1405,
+      "applicable": 1708,
+      "selectable": 1406,
       "population": 2775,
-      "population_candidate_selected": 1405,
+      "population_candidate_selected": 1406,
       "population_candidate_not_selected": 258,
-      "population_candidate_disabled": 1112
+      "population_candidate_disabled": 1111
     },
     "by_backend": {
       "dbt": {
@@ -37,12 +37,12 @@
       },
       "kvm": {
         "cells": 817,
-        "applicable": 340,
-        "selectable": 336,
+        "applicable": 341,
+        "selectable": 337,
         "population": 555,
-        "population_candidate_selected": 336,
+        "population_candidate_selected": 337,
         "population_candidate_not_selected": 3,
-        "population_candidate_disabled": 216
+        "population_candidate_disabled": 215
       },
       "liteinst": {
         "cells": 817,
@@ -4082,7 +4082,7 @@
     {"test_id":"system-utils/procfs-sanitized-paths","backend":"sabre","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: The procfs read sanitizers are backend-independent; ptrace is the required CI witness and no other backend is CI-qualified"},
     {"test_id":"system-utils/ps-proc-table","backend":"dbt","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: Established on ptrace first; other backends ratchet against this shared entry"},
     {"test_id":"system-utils/ps-proc-table","backend":"in-guest-trap","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
-    {"test_id":"system-utils/ps-proc-table","backend":"kvm","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: KVM requires the privileged runner and does not start on the validation host"},
+    {"test_id":"system-utils/ps-proc-table","backend":"kvm","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"system-utils/ps-proc-table","backend":"liteinst","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Established on ptrace first; other backends ratchet against this shared entry"},
     {"test_id":"system-utils/ps-proc-table","backend":"sabre","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Established on ptrace first; other backends ratchet against this shared entry"},
     {"test_id":"system-utils/random-device","backend":"dbt","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: DBT coverage is owned by its backend parity partition"},

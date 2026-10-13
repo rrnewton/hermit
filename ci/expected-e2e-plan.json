@@ -36426,6 +36426,25 @@
       ],
       "test": "system-utils/proc-random-uuid",
       "timeout_seconds": 57
+    },
+    {
+      "backend": "kvm",
+      "category": "system-utils",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "requires_host_capabilities": [
+        "kvm"
+      ],
+      "test": "system-utils/ps-proc-table",
+      "timeout_seconds": 57
     }
   ],
   "schema": 1
