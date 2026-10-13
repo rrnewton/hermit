@@ -453,6 +453,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "test.liteinst_allocator",
     "test.liteinst_stacks",
     "test.isolated_dbt_workdir",
+    "test.inherited_terminal_read",
     "test.isolated_detcore_workdir",
     "test.sabre_examples",
     "test.hermit_modes",
@@ -578,9 +579,10 @@ const PROFILES: [Profile; 12] = [
     // its hosted twin: 89/90 before. portable and hosted-portable are
     // unchanged because the node carries only the full label.
     Profile {
+        // The six inherited-terminal regressions add one full-only node.
         label: "full",
-        direct_steps: 93,
-        selected_steps: 94,
+        direct_steps: 94,
+        selected_steps: 95,
     },
     Profile {
         label: "portable",
@@ -3886,9 +3888,10 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // external_signal_interrupt ptrace cases that need the PMU timer (434 + 1).
     // M1 adds one diagnostic pinned producer and one required local consumer.
     // M2 adds one consumer of the same producer; all 437 prior nodes remain.
-    if cfg.steps.len() != 438 {
+    // One full-profile counted target owns the six inherited-terminal regressions.
+    if cfg.steps.len() != 439 {
         return Err(format!(
-            "superset has {} steps, expected 438",
+            "superset has {} steps, expected 439",
             cfg.steps.len()
         ));
     }
@@ -6275,7 +6278,8 @@ sys.exit(37)
         // nodes). 90 since build.liteinst_allocator_fixtures and
         // test.liteinst_allocator joined full (93 full nodes).
         // 91 with the additive required M2 stack node (94 full nodes).
-        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 91);
+        // The inherited-terminal target stays required beside the Buck cells.
+        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 92);
 
         fn twin(cfg: &mut DagConfig) -> &mut Step {
             cfg.steps
