@@ -9,21 +9,33 @@
 //! Scheduler locks protect reservations, never native control awaits.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 
 use reverie::BackendChildExitCapture;
+use reverie::ChildExitAllocationState;
 use reverie::ChildExitCaptureArm;
+use reverie::ChildExitCaptureEffect;
+use reverie::ChildExitCaptureOutcome;
 use reverie::ChildExitCaptureRequest;
+use reverie::ChildExitSignalAdmission;
 use reverie::ReservedChildExitCapture;
 
+use super::SchedResponse;
 use super::Scheduler;
 use super::parked::NextTurnOwner;
+use super::parked::ResourceOrigin;
 use super::parked::RpcOrigin;
+use crate::ivar::Ivar;
+use crate::resources::Permission;
 use crate::resources::ResourceID;
+use crate::resources::Resources;
+use crate::types::ChildWaitSpec;
 use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::MmId;
+use crate::types::SigWrapper;
 
 #[derive(Debug, Default)]
 pub(super) struct CaptureState {
@@ -31,6 +43,9 @@ pub(super) struct CaptureState {
     sequence: u64,
     pub(super) holds: BTreeMap<DetTid, Hold>,
     aborted: Vec<Box<dyn ReservedChildExitCapture>>,
+    coverage: BTreeMap<DetTid, Coverage>,
+    /// Required allocations cancelled by terminal parent lifetime, not delivered.
+    terminal_cancellations: u64,
 }
 
 #[derive(Debug)]
@@ -38,7 +53,239 @@ pub(super) struct Hold {
     request: ChildExitCaptureRequest,
     parent_mm: MmId,
     child_mm: MmId,
+    parent_turn: ParentTurn,
     transaction: Option<Box<dyn ReservedChildExitCapture>>,
+}
+
+/// The ordinary reply remains reserved until receipt accounting is committed.
+/// A signal drain may replace its request, but must not replace its response,
+/// epoch or RPC incarnation. No extra parent turn is introduced.
+#[derive(Clone, Debug)]
+struct ParentTurn {
+    response: Ivar<SchedResponse>,
+    epoch: u64,
+    origin: ResourceOrigin,
+    wait: Option<ChildWaitSpec>,
+}
+
+#[derive(Clone, Debug)]
+struct AllocationCoverage {
+    state: ChildExitAllocationState,
+    notified: bool,
+    /// A real RW InboundSignal request, not a wake or Release intent.
+    hook_token: Option<u64>,
+    required: bool,
+    /// Obligations transferred by actual native replacement receipts. They
+    /// remain owed by this allocation; replacement is not an observed hook.
+    superseded: u64,
+}
+
+/// At most the complete native live allocation set. Missing allocations may
+/// shed dedup memory only after their required hook was actually observed.
+/// Snapshot absence never means delivery, nor does it authorize suppression.
+#[derive(Clone, Debug)]
+struct Coverage {
+    mm: MmId,
+    image_epoch: u64,
+    domain: u64,
+    version: u64,
+    interval: u64,
+    reservation: u64,
+    highest_generation: u64,
+    allocations: BTreeMap<u64, AllocationCoverage>,
+}
+
+impl Coverage {
+    fn from_receipt(mm: MmId, outcome: &ChildExitCaptureOutcome) -> Result<Self, String> {
+        let mut coverage = Self {
+            mm,
+            image_epoch: outcome.snapshot.image_epoch,
+            domain: outcome.domain,
+            version: 0,
+            interval: 0,
+            reservation: 0,
+            highest_generation: 0,
+            allocations: BTreeMap::new(),
+        };
+        coverage.observe(outcome)?;
+        Ok(coverage)
+    }
+
+    fn observe(&mut self, outcome: &ChildExitCaptureOutcome) -> Result<(), String> {
+        let snapshot = &outcome.snapshot;
+        if snapshot.image_epoch == 0
+            || snapshot.image_epoch != self.image_epoch
+            || outcome.domain == 0
+            || outcome.domain != self.domain
+            || outcome.interval <= self.interval
+            || outcome.request.reservation <= self.reservation
+            || snapshot.version <= self.version
+            || snapshot.allocations.len() > 4
+        {
+            return Err("capture domain snapshot changed identity or regressed".into());
+        }
+        let live: BTreeSet<_> = snapshot.allocations.iter().map(|r| r.generation).collect();
+        let queued = snapshot
+            .allocations
+            .iter()
+            .filter(|a| a.state == ChildExitAllocationState::Queued)
+            .count();
+        let active = snapshot
+            .allocations
+            .iter()
+            .filter(|a| a.state == ChildExitAllocationState::Active)
+            .count();
+        let returning = snapshot
+            .allocations
+            .iter()
+            .filter(|a| a.state == ChildExitAllocationState::Returning)
+            .count();
+        if live.len() != snapshot.allocations.len()
+            || live.contains(&0)
+            || queued > 2
+            || active > 1
+            || returning > 1
+            || !snapshot.allocations.iter().any(|r| {
+                r.generation == outcome.allocation && r.state == ChildExitAllocationState::Queued
+            })
+        {
+            return Err("capture snapshot is not a complete queued-allocation witness".into());
+        }
+        match (outcome.effect, outcome.replaced_allocation) {
+            (ChildExitCaptureEffect::Replaced, Some(victim))
+                if victim != 0 && victim != outcome.allocation && !live.contains(&victim) => {}
+            (ChildExitCaptureEffect::Linked | ChildExitCaptureEffect::Coalesced, None) => {}
+            _ => return Err("capture replacement lacks its exact native victim".into()),
+        }
+        let mut superseded = 0_u64;
+        let mut transferred_notification = false;
+        for (generation, old) in &self.allocations {
+            if !live.contains(generation) && old.required && old.hook_token.is_none() {
+                if outcome.replaced_allocation != Some(*generation) {
+                    return Err(
+                        "required captured allocation vanished without its real Tool hook".into(),
+                    );
+                }
+                superseded = old
+                    .superseded
+                    .checked_add(1)
+                    .ok_or("captured replacement obligation count exhausted")?;
+                // Replacing an undelivered pending allocation transfers its
+                // notification ownership too. It must not interrupt the same
+                // borrowed wait a second time merely by changing allocation.
+                transferred_notification = old.notified;
+            }
+        }
+        let mut next = BTreeMap::new();
+        for allocation in &snapshot.allocations {
+            let mut entry = if let Some(old) = self.allocations.get(&allocation.generation) {
+                if matches!(
+                    (old.state, allocation.state),
+                    (
+                        ChildExitAllocationState::Active,
+                        ChildExitAllocationState::Queued
+                    ) | (
+                        ChildExitAllocationState::Returning,
+                        ChildExitAllocationState::Queued | ChildExitAllocationState::Active
+                    )
+                ) {
+                    return Err("captured allocation ownership moved backwards".into());
+                }
+                old.clone()
+            } else {
+                // Every prior observation is complete. Monotonic, never-reused
+                // native generations therefore cannot reappear below this mark.
+                if allocation.generation <= self.highest_generation {
+                    return Err("retired native allocation generation reappeared".into());
+                }
+                AllocationCoverage {
+                    state: allocation.state,
+                    notified: false,
+                    hook_token: None,
+                    required: false,
+                    superseded: 0,
+                }
+            };
+            entry.state = allocation.state;
+            if allocation.generation == outcome.allocation {
+                entry.required = true;
+                entry.notified |= transferred_notification;
+                entry.superseded = entry
+                    .superseded
+                    .checked_add(superseded)
+                    .ok_or("captured replacement obligation count exhausted")?;
+            }
+            next.insert(allocation.generation, entry);
+        }
+        self.highest_generation = live
+            .last()
+            .copied()
+            .unwrap_or(0)
+            .max(self.highest_generation);
+        self.allocations = next;
+        self.version = snapshot.version;
+        self.interval = outcome.interval;
+        self.reservation = outcome.request.reservation;
+        Ok(())
+    }
+}
+
+fn managed_child_wait(parent: DetTid, resources: &Resources) -> Option<ChildWaitSpec> {
+    if resources.tid != parent || resources.resources.len() != 1 {
+        return None;
+    }
+    resources
+        .resources
+        .iter()
+        .find_map(|(resource, permission)| match resource {
+            ResourceID::WaitChild {
+                parent: owner,
+                spec,
+            } if *owner == parent && *permission == Permission::R => Some(*spec),
+            _ => None,
+        })
+}
+
+impl ParentTurn {
+    fn validate(&self, sched: &Scheduler, parent: DetTid) -> Result<bool, String> {
+        let turn = sched
+            .next_turns
+            .get(&parent)
+            .ok_or("captured parent turn disappeared")?;
+        let origin = turn
+            .protocol
+            .origin
+            .ok_or("captured parent RPC origin disappeared")?;
+        if turn.resp != self.response
+            || turn.protocol.epoch != self.epoch
+            || turn.protocol.owner != NextTurnOwner::Ordinary
+            || origin.rpc != self.origin.rpc
+            || origin.mm != self.origin.mm
+            || turn.resp.try_read().is_some()
+        {
+            return Err("capture receipt no longer owns the reserved parent reply".into());
+        }
+        let Some(spec) = self.wait else {
+            return Ok(false);
+        };
+        let resources = turn
+            .req
+            .try_read()
+            .and_then(Result::ok)
+            .ok_or("captured wait has no pending resource request")?;
+        let same_wait = managed_child_wait(parent, &resources) == Some(spec);
+        // Another authentic signal may already have been drained for this
+        // exact response/epoch. Its rewrite is still this same waiting borrow.
+        let signaled_wait = resources.resources.len() == 1
+            && resources.signal_interrupt_errno().is_none()
+            && resources.resources.iter().any(|(resource, permission)| {
+                matches!(resource, ResourceID::WaitidSignals(_)) && *permission == Permission::W
+            });
+        if !same_wait && !signaled_wait {
+            return Err("capture receipt no longer owns its managed child wait".into());
+        }
+        Ok(true)
+    }
 }
 
 /// A committed reservation survives clear_nextturn and the child's consuming
@@ -62,6 +309,35 @@ impl Scheduler {
             if let Some(transaction) = hold.transaction.take() {
                 self.native_child_capture.aborted.push(transaction);
             }
+        }
+    }
+
+    /// The caller proves this process incarnation will execute no further
+    /// visible instructions. An exec teardown is not that proof: pending signals
+    /// may survive exec, so that path must retain or explicitly transfer coverage.
+    pub(super) fn retire_native_capture_parent(&mut self, parent: DetTid, mm: MmId) {
+        if self
+            .native_child_capture
+            .coverage
+            .get(&parent)
+            .is_some_and(|c| c.mm == mm)
+        {
+            let retired = self.native_child_capture.coverage.remove(&parent).unwrap();
+            let cancelled = retired
+                .allocations
+                .values()
+                .filter(|a| a.required && a.hook_token.is_none())
+                .count() as u64;
+            self.native_child_capture.terminal_cancellations = self
+                .native_child_capture
+                .terminal_cancellations
+                .checked_add(cancelled)
+                .expect("capture terminal accounting overflow");
+            tracing::debug!(
+                "[child-exit-capture] parent-terminal parent={} cancelled-required={}",
+                parent,
+                cancelled
+            );
         }
     }
 
@@ -167,9 +443,17 @@ impl Scheduler {
             .try_read()
             .and_then(Result::ok)
             .ok_or("selected Exit overtook parent's ordinary RPC quiescence")?;
-        let allow_syscall_callback = resources.resources.keys().any(|resource| {
-            matches!(resource, ResourceID::WaitChild { parent: owner, .. } if *owner == parent)
-        });
+        let wait = managed_child_wait(parent, &resources);
+        let allow_syscall_callback = wait.is_some();
+        if turn.resp.try_read().is_some() {
+            return Err("capture parent ordinary response was already granted".into());
+        }
+        let parent_turn = ParentTurn {
+            response: turn.resp.clone(),
+            epoch: turn.protocol.epoch,
+            origin,
+            wait,
+        };
         let (parent_identity_mm, parent_pid, parent_tid, _) = self
             .physical_thread_pidfds
             .get(&parent)
@@ -212,6 +496,7 @@ impl Scheduler {
                 request,
                 parent_mm,
                 child_mm,
+                parent_turn,
                 transaction: Some(transaction),
             },
         );
@@ -221,6 +506,67 @@ impl Scheduler {
             parent,
             child
         );
+        Ok(())
+    }
+
+    /// Account only an actual signal-hook resource. Identity is not a resource
+    /// key, does not affect conflict ordering, and never requests another wake.
+    pub(crate) fn observe_child_signal_hook(
+        &mut self,
+        parent: DetTid,
+        mm: MmId,
+        resources: &Resources,
+        admission: Option<ChildExitSignalAdmission>,
+    ) -> Result<(), String> {
+        let real_hook = resources.tid == parent
+            && resources.resources.len() == 1
+            && resources
+                .resources
+                .get(&ResourceID::InboundSignal(SigWrapper::from(
+                    nix::sys::signal::Signal::SIGCHLD,
+                )))
+                == Some(&Permission::RW);
+        if !real_hook {
+            return if admission.is_some() {
+                Err("native child admission attached to a non-delivery resource".into())
+            } else {
+                Ok(())
+            };
+        }
+        let Some(admission) = admission else {
+            return if self.native_child_capture.coverage.contains_key(&parent) {
+                Err("native child signal hook omitted its allocation identity".into())
+            } else {
+                Ok(())
+            };
+        };
+        if admission.image_epoch == 0
+            || admission.domain == 0
+            || admission.allocation == 0
+            || admission.token == 0
+            || self.thread_mm(parent) != Some(mm)
+        {
+            return Err("native child signal hook has no current identity".into());
+        }
+        let Some(coverage) = self.native_child_capture.coverage.get_mut(&parent) else {
+            // Real unqualified signals still traverse the unchanged hook. They
+            // acquire no publication credit from merely carrying an identity.
+            return Ok(());
+        };
+        if coverage.mm != mm
+            || coverage.image_epoch != admission.image_epoch
+            || coverage.domain != admission.domain
+        {
+            return Err("native child signal hook changed captured incarnation/domain".into());
+        }
+        let Some(allocation) = coverage.allocations.get_mut(&admission.allocation) else {
+            return Ok(());
+        };
+        if allocation.hook_token.is_some() {
+            return Err("native allocation reported more than one actual Tool hook".into());
+        }
+        allocation.hook_token = Some(admission.token);
+        allocation.state = ChildExitAllocationState::Active;
         Ok(())
     }
 
@@ -302,6 +648,58 @@ struct GrantGuard {
 }
 
 impl GrantGuard {
+    fn account(&self, outcome: &ChildExitCaptureOutcome) -> Result<(), String> {
+        let mut sched = self.scheduler.lock().unwrap();
+        let child = DetTid::from_raw(self.request.child.as_raw());
+        let parent = DetTid::from_raw(self.request.parent.as_raw());
+        let hold = sched
+            .native_child_capture
+            .holds
+            .get(&child)
+            .ok_or("capture hold disappeared before receipt accounting")?;
+        if outcome.request != self.request
+            || hold.request != self.request
+            || sched.thread_mm(parent) != Some(hold.parent_mm)
+            || sched.thread_mm(child).is_some_and(|mm| mm != hold.child_mm)
+            || sched.backend_failed()
+        {
+            return Err("capture receipt changed its grant or incarnation".into());
+        }
+        let notify_wait = hold.parent_turn.validate(&sched, parent)?;
+        let parent_mm = hold.parent_mm;
+        // Validate and reconcile a private copy before publishing any ledger
+        // or notification state. All native awaits and reply release are outside
+        // this lock; the run-wide hold stays live until release succeeds.
+        let mut coverage = if let Some(old) = sched.native_child_capture.coverage.get(&parent) {
+            if old.mm != parent_mm {
+                return Err("capture ledger belongs to a retired parent incarnation".into());
+            }
+            let mut next = old.clone();
+            next.observe(outcome)?;
+            next
+        } else {
+            Coverage::from_receipt(parent_mm, outcome)?
+        };
+        let allocation = coverage
+            .allocations
+            .get_mut(&outcome.allocation)
+            .expect("validated queued capture allocation");
+        let notify_wait = notify_wait && !allocation.notified;
+        if notify_wait {
+            allocation.notified = true;
+        }
+        sched.native_child_capture.coverage.insert(parent, coverage);
+        if notify_wait {
+            // This only posts the existing deferred metadata wake. The regular
+            // wait code decides readiness, mask, disposition and restart; the
+            // actual signal resource and handler have not happened here.
+            sched
+                .notify_signal_pending(parent, SigWrapper::from(nix::sys::signal::Signal::SIGCHLD));
+            sched.wake_control_waiter();
+        }
+        Ok(())
+    }
+
     fn complete(&mut self) -> Result<(), String> {
         let mut sched = self.scheduler.lock().unwrap();
         let child = DetTid::from_raw(self.request.child.as_raw());
@@ -394,7 +792,7 @@ pub(crate) async fn arm_selected(
         request.child
     );
     Ok(Some(async move {
-        match super::until_backend_failure(&scheduler, selected.transaction.finish()).await {
+        match super::until_backend_failure(&scheduler, selected.transaction.capture()).await {
             Ok(Ok(outcome)) if outcome.request == request => {
                 tracing::debug!(
                     "[child-exit-capture] captured reservation={} parent={} child={} domain={} interval={} allocation={} effect={:?}",
@@ -406,6 +804,27 @@ pub(crate) async fn arm_selected(
                     outcome.allocation,
                     outcome.effect
                 );
+                if let Some(victim) = outcome.replaced_allocation {
+                    tracing::debug!(
+                        "[child-exit-capture] replacement reservation={} parent={} domain={} victim={} allocation={}",
+                        request.reservation,
+                        request.parent,
+                        outcome.domain,
+                        victim,
+                        outcome.allocation
+                    );
+                }
+                if let Err(error) = guard.account(&outcome) {
+                    tracing::error!("child-exit capture accounting failed: {error}");
+                    return;
+                }
+                // Consumes the transport reservation only after the ledger and
+                // notification are visible. A failed release remains terminal;
+                // its Drop and every endpoint lock occur outside scheduler.lock.
+                if let Err(error) = selected.transaction.release() {
+                    tracing::error!("child-exit capture reply release failed: {error}");
+                    return;
+                }
                 if let Err(error) = guard.complete() {
                     tracing::error!("child-exit capture completion failed: {error}");
                     return;
@@ -430,7 +849,13 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
+    use reverie::ChildExitCaptureAllocation;
+    use reverie::ChildExitCaptureEffect;
+    use reverie::ChildExitCaptureSnapshot;
+
     use super::*;
+    use crate::types::ChildWaitExitClass;
+    use crate::types::ChildWaitSelector;
 
     #[derive(Debug)]
     struct ReservedProbe {
@@ -444,10 +869,12 @@ mod tests {
             unreachable!("failure test must not send a native Arm")
         }
 
-        async fn finish(
-            self: Box<Self>,
-        ) -> Result<reverie::ChildExitCaptureOutcome, reverie::Error> {
+        async fn capture(&mut self) -> Result<reverie::ChildExitCaptureOutcome, reverie::Error> {
             unreachable!("failure test must not fabricate capture")
+        }
+
+        fn release(self: Box<Self>) -> Result<(), reverie::Error> {
+            unreachable!("failure test must not release the parent reply")
         }
     }
 
@@ -483,11 +910,389 @@ mod tests {
                 request,
                 parent_mm: MmId::initial(parent),
                 child_mm: MmId::initial(child),
+                parent_turn: ParentTurn {
+                    response: Ivar::new(),
+                    epoch: 1,
+                    origin: ResourceOrigin {
+                        rpc: RpcOrigin::DirectRequestResources,
+                        mm: MmId::initial(parent),
+                        control: super::super::parked::ControlCapability::None,
+                    },
+                    wait: None,
+                },
                 transaction: None,
             },
         );
         drop(sched);
         (scheduler, request)
+    }
+
+    fn setup_wait_for_b() -> (Arc<Mutex<Scheduler>>, ChildExitCaptureRequest) {
+        let (scheduler, request) = setup();
+        let parent = DetTid::from_raw(1);
+        let spec = ChildWaitSpec {
+            selector: ChildWaitSelector::Exact(DetPid::from_raw(3)),
+            owner: None,
+            exit_class: ChildWaitExitClass::Sigchld,
+        };
+        let mut sched = scheduler.lock().unwrap();
+        super::super::test::register_known_thread_for(&mut sched, parent);
+        let mut waiting = Resources::new(parent);
+        waiting.insert(ResourceID::WaitChild { parent, spec }, Permission::R);
+        let origin = ResourceOrigin {
+            rpc: RpcOrigin::DirectRequestResources,
+            mm: MmId::initial(parent),
+            control: super::super::parked::ControlCapability::None,
+        };
+        let turn = sched.next_turns.get_mut(&parent).unwrap();
+        turn.req = Ivar::full(Ok(waiting));
+        turn.protocol.origin = Some(origin);
+        turn.protocol.epoch = 11;
+        let parent_turn = ParentTurn {
+            response: turn.resp.clone(),
+            epoch: 11,
+            origin,
+            wait: Some(spec),
+        };
+        sched
+            .native_child_capture
+            .holds
+            .get_mut(&DetTid::from_raw(2))
+            .unwrap()
+            .parent_turn = parent_turn;
+        sched.blocked.child_waiters.insert(parent, (parent, spec));
+        drop(sched);
+        (scheduler, request)
+    }
+
+    fn receipt(request: ChildExitCaptureRequest, generation: u64) -> ChildExitCaptureOutcome {
+        ChildExitCaptureOutcome {
+            request,
+            domain: 50,
+            interval: 60,
+            allocation: generation,
+            effect: ChildExitCaptureEffect::Linked,
+            replaced_allocation: None,
+            snapshot: ChildExitCaptureSnapshot {
+                image_epoch: 1,
+                version: 2,
+                allocations: vec![ChildExitCaptureAllocation {
+                    generation,
+                    state: ChildExitAllocationState::Queued,
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn captured_a_notifies_exact_b_wait_once_across_coalesced_intervals() {
+        let (scheduler, request) = setup_wait_for_b();
+        let mut guard = GrantGuard {
+            scheduler: scheduler.clone(),
+            request,
+            finished: false,
+        };
+        let mut captured = receipt(request, 61);
+        guard.account(&captured).unwrap();
+        {
+            let mut sched = scheduler.lock().unwrap();
+            assert_eq!(
+                sched.pending_cross_task_signals[&DetTid::from_raw(1)].len(),
+                1
+            );
+            sched.drain_pending_cross_task_signals();
+            assert!(sched.blocked.child_waiters.is_empty());
+            assert_eq!(
+                sched.inbound_signals(DetTid::from_raw(1)),
+                vec![SigWrapper::from(nix::sys::signal::Signal::SIGCHLD)]
+            );
+            assert_eq!(
+                sched
+                    .run_queue
+                    .tids()
+                    .filter(|tid| **tid == DetTid::from_raw(1))
+                    .count(),
+                1
+            );
+            // A new genuine publication can coalesce onto the still-queued A.
+            // It has a new interval and reservation, but not a second signal.
+            captured.request.reservation += 1;
+            captured.interval += 2;
+            captured.snapshot.version += 2;
+            captured.effect = ChildExitCaptureEffect::Coalesced;
+            sched
+                .native_child_capture
+                .holds
+                .get_mut(&DetTid::from_raw(2))
+                .unwrap()
+                .request = captured.request;
+        }
+        guard.request = captured.request;
+        guard.account(&captured).unwrap();
+        {
+            let sched = scheduler.lock().unwrap();
+            assert!(
+                sched.pending_cross_task_signals.is_empty(),
+                "draining does not erase allocation dedup ownership"
+            );
+            assert!(
+                sched.native_child_capture.coverage[&DetTid::from_raw(1)].allocations[&61]
+                    .hook_token
+                    .is_none(),
+                "a wake is not the real Tool hook"
+            );
+        }
+        guard.complete().unwrap();
+    }
+
+    #[test]
+    fn snapshot_absence_cannot_discharge_required_hook_and_cannot_reuse_generation() {
+        let (_, request) = setup();
+        let old = receipt(request, 61);
+        let mut coverage =
+            Coverage::from_receipt(MmId::initial(DetTid::from_raw(1)), &old).unwrap();
+        let mut next = receipt(request, 71);
+        next.request.reservation += 1;
+        next.interval = 70;
+        next.snapshot.version = 7;
+        assert!(coverage.observe(&next).is_err(), "absence is not delivery");
+        assert_eq!(
+            coverage.interval, old.interval,
+            "failed reconciliation is inert"
+        );
+        coverage.allocations.get_mut(&61).unwrap().hook_token = Some(81);
+        coverage.observe(&next).unwrap();
+        assert!(!coverage.allocations.contains_key(&61));
+        let mut replay = receipt(next.request, 61);
+        replay.request.reservation += 1;
+        replay.interval = 90;
+        replay.snapshot.version = 9;
+        coverage.allocations.get_mut(&71).unwrap().hook_token = Some(91);
+        assert!(
+            coverage.observe(&replay).is_err(),
+            "eviction must not permit old generation replay"
+        );
+    }
+
+    #[test]
+    fn exact_replacement_transfers_obligation_and_notification_without_delivery() {
+        let (_, request) = setup();
+        let mut coverage =
+            Coverage::from_receipt(MmId::initial(DetTid::from_raw(1)), &receipt(request, 61))
+                .unwrap();
+        coverage.allocations.get_mut(&61).unwrap().notified = true;
+        let mut replacement = receipt(request, 71);
+        replacement.request.reservation += 1;
+        replacement.interval += 2;
+        replacement.snapshot.version += 2;
+        replacement.effect = ChildExitCaptureEffect::Replaced;
+        replacement.replaced_allocation = Some(62);
+        assert!(
+            coverage.observe(&replacement).is_err(),
+            "wrong victim is no retirement proof"
+        );
+        replacement.replaced_allocation = Some(61);
+        coverage.observe(&replacement).unwrap();
+        assert!(!coverage.allocations.contains_key(&61));
+        let allocation = &coverage.allocations[&71];
+        assert!(allocation.required && allocation.notified);
+        assert_eq!(allocation.superseded, 1);
+        assert!(
+            allocation.hook_token.is_none(),
+            "replacement is not delivery"
+        );
+        let mut disappearance = receipt(replacement.request, 81);
+        disappearance.request.reservation += 1;
+        disappearance.interval = 90;
+        disappearance.snapshot.version = 9;
+        assert!(
+            coverage.observe(&disappearance).is_err(),
+            "transferred obligation stays owed"
+        );
+    }
+
+    #[test]
+    fn terminal_parent_cancellation_requires_the_exact_incarnation() {
+        let (scheduler, request) = setup_wait_for_b();
+        let parent = DetTid::from_raw(1);
+        let mm = MmId::initial(parent);
+        let mut guard = GrantGuard {
+            scheduler: scheduler.clone(),
+            request,
+            finished: false,
+        };
+        guard.account(&receipt(request, 61)).unwrap();
+        guard.complete().unwrap();
+        let mut sched = scheduler.lock().unwrap();
+        sched.retire_native_capture_parent(parent, mm.for_exec(parent));
+        assert!(sched.native_child_capture.coverage.contains_key(&parent));
+        assert_eq!(sched.native_child_capture.terminal_cancellations, 0);
+        sched.retire_native_capture_parent(parent, mm);
+        assert!(!sched.native_child_capture.coverage.contains_key(&parent));
+        assert_eq!(sched.native_child_capture.terminal_cancellations, 1);
+    }
+
+    #[test]
+    fn leader_thread_exit_cannot_cancel_a_live_process_obligation() {
+        let (_, request) = setup();
+        let leader = DetTid::from_raw(1);
+        let worker = DetTid::from_raw(4);
+        let mm = MmId::initial(leader);
+        let mut sched = Scheduler::new(&crate::Config::default());
+        sched.thread_tree.add_child(leader, leader, true);
+        sched.thread_tree.add_child(leader, worker, false);
+        for tid in [leader, worker] {
+            super::super::test::register_known_thread_for(&mut sched, tid);
+            sched.record_thread_mm(tid, mm);
+        }
+        sched.native_child_capture.coverage.insert(
+            leader,
+            Coverage::from_receipt(mm, &receipt(request, 61)).unwrap(),
+        );
+        sched.logically_kill_thread(&leader, &leader, mm);
+        assert!(sched.native_child_capture.coverage.contains_key(&leader));
+        assert_eq!(sched.native_child_capture.terminal_cancellations, 0);
+        sched.logically_kill_thread(&worker, &leader, mm);
+        assert!(!sched.native_child_capture.coverage.contains_key(&leader));
+        assert_eq!(sched.native_child_capture.terminal_cancellations, 1);
+    }
+
+    #[test]
+    fn only_exact_real_hook_identity_accounts_capture_without_another_wake() {
+        let (scheduler, request) = setup_wait_for_b();
+        let mut guard = GrantGuard {
+            scheduler: scheduler.clone(),
+            request,
+            finished: false,
+        };
+        guard.account(&receipt(request, 61)).unwrap();
+        let parent = DetTid::from_raw(1);
+        let mm = MmId::initial(parent);
+        let mut hook = Resources::new(parent);
+        hook.insert(
+            ResourceID::InboundSignal(SigWrapper::from(nix::sys::signal::Signal::SIGCHLD)),
+            Permission::RW,
+        );
+        let admission = ChildExitSignalAdmission {
+            image_epoch: 1,
+            domain: 50,
+            allocation: 61,
+            token: 81,
+        };
+        {
+            let mut sched = scheduler.lock().unwrap();
+            sched.pending_cross_task_signals.clear();
+            let mut wrong = admission;
+            wrong.domain += 1;
+            assert!(
+                sched
+                    .observe_child_signal_hook(parent, mm, &hook, Some(wrong))
+                    .is_err()
+            );
+            assert!(
+                sched
+                    .observe_child_signal_hook(parent, mm.for_exec(parent), &hook, Some(admission))
+                    .is_err()
+            );
+            sched
+                .observe_child_signal_hook(parent, mm, &hook, Some(admission))
+                .unwrap();
+            assert!(sched.pending_cross_task_signals.is_empty());
+            assert_eq!(
+                sched.native_child_capture.coverage[&parent].allocations[&61].hook_token,
+                Some(81)
+            );
+            assert!(
+                sched
+                    .observe_child_signal_hook(parent, mm, &hook, Some(admission))
+                    .is_err(),
+                "duplicate actual hook is not another publication"
+            );
+        }
+        guard.complete().unwrap();
+    }
+
+    #[test]
+    fn new_parent_response_cannot_receive_old_capture_notification() {
+        let (scheduler, request) = setup_wait_for_b();
+        let guard = GrantGuard {
+            scheduler: scheduler.clone(),
+            request,
+            finished: false,
+        };
+        scheduler
+            .lock()
+            .unwrap()
+            .next_turns
+            .get_mut(&DetTid::from_raw(1))
+            .unwrap()
+            .resp = Ivar::new();
+        assert!(guard.account(&receipt(request, 61)).is_err());
+        assert!(
+            scheduler
+                .lock()
+                .unwrap()
+                .pending_cross_task_signals
+                .is_empty()
+        );
+        drop(guard);
+        assert!(scheduler.lock().unwrap().backend_failed());
+    }
+
+    #[tokio::test]
+    async fn receipt_accounting_precedes_outside_lock_reply_release() {
+        #[derive(Debug)]
+        struct CapturedProbe {
+            reservation: ReservedProbe,
+            outcome: ChildExitCaptureOutcome,
+        }
+        #[async_trait::async_trait]
+        impl ReservedChildExitCapture for CapturedProbe {
+            async fn arm(&mut self) -> Result<ChildExitCaptureArm, reverie::Error> {
+                Ok(ChildExitCaptureArm::Armed)
+            }
+            async fn capture(&mut self) -> Result<ChildExitCaptureOutcome, reverie::Error> {
+                Ok(self.outcome.clone())
+            }
+            fn release(self: Box<Self>) -> Result<(), reverie::Error> {
+                let scheduler = self.reservation.scheduler.upgrade().unwrap();
+                let sched = scheduler
+                    .try_lock()
+                    .expect("reply released under scheduler lock");
+                let parent = DetTid::from_raw(1);
+                assert!(
+                    sched
+                        .native_child_capture
+                        .holds
+                        .contains_key(&DetTid::from_raw(2))
+                );
+                assert!(sched.native_child_capture.coverage[&parent].allocations[&61].notified);
+                assert_eq!(sched.pending_cross_task_signals[&parent].len(), 1);
+                drop(sched);
+                Ok(())
+            }
+        }
+        let (scheduler, request) = setup_wait_for_b();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let selected = SelectedCapture {
+            request,
+            transaction: Box::new(CapturedProbe {
+                reservation: ReservedProbe {
+                    scheduler: Arc::downgrade(&scheduler),
+                    dropped: dropped.clone(),
+                },
+                outcome: receipt(request, 61),
+            }),
+        };
+        arm_selected(scheduler.clone(), selected)
+            .await
+            .unwrap()
+            .unwrap()
+            .await;
+        let sched = scheduler.lock().unwrap();
+        assert!(!sched.backend_failed());
+        assert!(sched.native_child_capture.holds.is_empty());
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -503,10 +1308,14 @@ mod tests {
                 Ok(ChildExitCaptureArm::Unsupported)
             }
 
-            async fn finish(
-                self: Box<Self>,
+            async fn capture(
+                &mut self,
             ) -> Result<reverie::ChildExitCaptureOutcome, reverie::Error> {
                 panic!("unsupported capture must never finish as publication")
+            }
+
+            fn release(self: Box<Self>) -> Result<(), reverie::Error> {
+                panic!("unsupported capture must never release its parent reply")
             }
         }
 

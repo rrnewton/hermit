@@ -278,6 +278,24 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/dbt_sigchld_wait_handler.S",
+      "runner": "hermit-cli/tests/dbt_sigchld_wait_interruption.rs",
+      "why": "Raw wait-syscall and one-argument signal-handler entry companion for dbt_sigchld_wait_handler.c. The owning integration target inspects the actual kernel frame, original registers and decoded continuation; this assembly companion is not an independently runnable guest."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/dbt_sigchld_wait_handler.c",
+      "runner": "hermit-cli/tests/dbt_sigchld_wait_interruption.rs",
+      "why": "The dedicated integration target compares real handler-frame and control-transfer semantics under ptrace and DBT using live PTY barriers and authenticated native capture. Longjmp, exec and exit must not resume the abandoned wait; this is not a generic manifest or CI calibration claim."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/dbt_sigchld_wait_interruption.c",
+      "runner": "hermit-cli/tests/dbt_sigchld_wait_interruption.rs",
+      "why": "The dedicated Detcore integration target owns the live PTY release, parked WaitChild(B), authenticated A capture and real SIGCHLD hook assertions for flags0 and SA_RESTART. A generic manifest exit/output check cannot assert this causal interruption protocol."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/dbt_sigchld_wait_later_child.c",
       "runner": "hermit-cli/tests/dbt_owned_signal_publication.rs",
       "why": "The dedicated genuine Detcore integration test owns the live stdin release protocol and DEBUG transaction-order assertions while the parent waits for a later child. A standalone manifest exit/output check cannot assert the authenticated capture, release and shared Tool-hook sequence."

@@ -1542,8 +1542,13 @@ fi
 # This retains the hard budget, not the public-main SDK identity or validation.
 # Callback framing and paired ABI9/56 require fresh build/runtime evidence.
 # Caught-handler and ordinary-callback publication support remains incomplete.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 10bb779a790dbd10510e302994d44a4f045f502c ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 10bb779a790dbd10510e302994d44a4f045f502c (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# PRIVATE ABI10 SUCCESSOR TO 30afa0a620bfc95a9c11fde705a368bb1577f962:
+# The generated TSC scope, caught-frame and wait-finalizer SDK source changed.
+# Retain existing numeric hard budgets without claiming unchanged recipe bytes
+# or a new cold calibration. Fresh paired ABI10/232 compile and runtime
+# evidence is required; the private successor is not publication-ready.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 30afa0a620bfc95a9c11fde705a368bb1577f962 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 30afa0a620bfc95a9c11fde705a368bb1577f962 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

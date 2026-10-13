@@ -2276,7 +2276,16 @@ impl GlobalState {
                 return (None, R::ThreadExited);
             }
 
-            GlobalRequest::RequestResources(rs, pid) => {
+            GlobalRequest::RequestResources(rs, pid, admission) => {
+                let accounting = {
+                    let mut sched = self.lock_rpc_scheduler(false).await;
+                    sched.observe_child_signal_hook(dtid, request_mm, &rs, admission.map(|a| a.0))
+                };
+                if let Err(error) = accounting {
+                    let mut sched = self.sched.lock().unwrap();
+                    sched.fail_native_child_capture(dtid, &error);
+                    return (None, R::ThreadExited);
+                }
                 let (response, _endtime) = self
                     .recv_request_resources(from, pid, rs, Some(request_mm))
                     .await;
@@ -4419,6 +4428,18 @@ pub enum SigalrmControl {
     EntryDeliveryUnfaithful,
 }
 
+/// Native accounting metadata carried by the existing InboundSignal RPC.
+/// Its Debug form intentionally omits backend identities: they do not belong
+/// in canonical event payloads and have no resource ordering semantics.
+#[derive(PartialEq, Eq, Clone, Serialize, Deserialize)]
+pub struct NativeChildSignalAdmission(reverie::ChildExitSignalAdmission);
+
+impl std::fmt::Debug for NativeChildSignalAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NativeChildSignalAdmission")
+    }
+}
+
 /// Messages to the global object.
 ///
 /// This is public only so it can be used in the `GlobalTool` trait.
@@ -4433,7 +4454,7 @@ pub enum GlobalRequest {
     WithForwardedCount(u64, Box<GlobalRequest>),
     /// Lock the resources
     /// Also contains the `DetPid` of the process containing the thread requesting resources.
-    RequestResources(Resources, DetPid),
+    RequestResources(Resources, DetPid, Option<NativeChildSignalAdmission>),
     ParkedRequest(Resources, DetPid, ControlCapability),
     ResumeParkedRequest {
         ticket: ResumeTicket,
@@ -5347,8 +5368,21 @@ where
             "[detcore, dtid {}] BLOCKING on resource_request rpc... {:?}",
             &dettid, r
         );
-        let resp =
-            send_and_update_time(guest, GlobalRequest::RequestResources(r.clone(), detpid)).await;
+        // Admission identity is accounting on the existing real signal RPC,
+        // never a resource/conflict key or a scheduler-generated wake. Other
+        // backends return None and keep precisely their ordinary request path.
+        let admission = (r.resources.len() == 1
+            && r.resources.get(&ResourceID::InboundSignal(SigWrapper::from(
+                Signal::SIGCHLD,
+            ))) == Some(&Permission::RW))
+        .then(|| guest.child_exit_signal_admission())
+        .flatten()
+        .map(NativeChildSignalAdmission);
+        let resp = send_and_update_time(
+            guest,
+            GlobalRequest::RequestResources(r.clone(), detpid, admission),
+        )
+        .await;
         match resp.1 {
             GlobalResponse::RequestResources(x) => {
                 trace!(
@@ -9139,7 +9173,7 @@ mod tests {
             (
                 first_clock,
                 first_mm,
-                GlobalRequest::RequestResources(resources, first_tid),
+                GlobalRequest::RequestResources(resources, first_tid, None),
             ),
         ));
         assert!(futures::poll!(&mut work).is_pending());
@@ -9201,7 +9235,7 @@ mod tests {
             (
                 parent_clock,
                 mm,
-                GlobalRequest::RequestResources(resources, parent_pid),
+                GlobalRequest::RequestResources(resources, parent_pid, None),
             ),
         ));
         assert!(futures::poll!(&mut blocking).is_pending());
@@ -9423,7 +9457,7 @@ mod tests {
                 (
                     worker_clock.clone(),
                     old_mm,
-                    GlobalRequest::RequestResources(Resources::new(leader), detpid),
+                    GlobalRequest::RequestResources(Resources::new(leader), detpid, None),
                 ),
             )
             .await;
@@ -9726,7 +9760,7 @@ mod tests {
                 (
                     leader_clock.clone(),
                     old_mm,
-                    GlobalRequest::RequestResources(Resources::new(leader), detpid),
+                    GlobalRequest::RequestResources(Resources::new(leader), detpid, None),
                 ),
             )
             .await;
@@ -10361,7 +10395,7 @@ mod tests {
                 (
                     late_time,
                     MmId::initial(dettid),
-                    GlobalRequest::RequestResources(Resources::new(dettid), detpid),
+                    GlobalRequest::RequestResources(Resources::new(dettid), detpid, None),
                 ),
             )
             .await;

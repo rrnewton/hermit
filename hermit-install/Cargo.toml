@@ -10,5 +10,5 @@ publish = false
 path = "src/lib.rs"
 
 [build-dependencies]
-reverie-dbt = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "10bb779a790dbd10510e302994d44a4f045f502c", default-features = false }
-reverie-sabre = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "10bb779a790dbd10510e302994d44a4f045f502c" }
+reverie-dbt = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "30afa0a620bfc95a9c11fde705a368bb1577f962", default-features = false }
+reverie-sabre = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "30afa0a620bfc95a9c11fde705a368bb1577f962" }

@@ -80,8 +80,10 @@ const RANDOM_FILL_CHUNK_BYTES: usize = 4096;
 const GETRANDOM_MAX_BYTES: usize = (i32::MAX as usize) & !4095;
 const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | libc::GRND_INSECURE;
 /// Version 8 appends a fixed native-control executor; version 9 requires its
-/// owned pending-domain/publication operations. Both use 56-byte callbacks.
-const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 9;
+/// owned pending-domain/publication operations. Version 10 seals the actual
+/// native quantum at V4 startup and appends owned admission identity to signal
+/// events. All retain the 56-byte callback structure.
+const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 10;
 const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 56;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -659,11 +661,45 @@ struct Runtime {
 struct RuntimeStartup {
     image_generation: u64,
     transport: reverie_dbt::sync_rpc::InitialConfigTransport,
+    native_mode: reverie_dbt::DbtStartupMode,
+    native_preemption_quantum: u64,
 }
 
 impl RuntimeStartup {
+    /// Construct only after the complete authoritative startup frame and close.
+    /// This seals the actual native argument, never an inferred or reset quantum.
+    fn new(
+        image_generation: u64,
+        transport: reverie_dbt::sync_rpc::InitialConfigTransport,
+        native_mode: reverie_dbt::DbtStartupMode,
+        native_preemption_quantum: u64,
+    ) -> Result<Self, String> {
+        if image_generation == 0 {
+            return Err("runtime startup requires an initialized image".into());
+        }
+        reverie_dbt::validate_native_capture_preemption(transport, native_preemption_quantum)
+            .map_err(str::to_string)?;
+        Ok(Self {
+            image_generation,
+            transport,
+            native_mode,
+            native_preemption_quantum,
+        })
+    }
+
     fn matches_image(self, image_generation: u64) -> bool {
         image_generation != 0 && self.image_generation == image_generation
+    }
+
+    fn matches_native_contract(
+        self,
+        image_generation: u64,
+        native_mode: reverie_dbt::DbtStartupMode,
+        native_preemption_quantum: u64,
+    ) -> bool {
+        self.matches_image(image_generation)
+            && self.native_mode == native_mode
+            && self.native_preemption_quantum == native_preemption_quantum
     }
 }
 
@@ -1226,6 +1262,7 @@ unsafe fn runtime_background_init(
     callbacks: &reverie_dbt::DbtRuntimeCallbacks,
     abi: RuntimeAbi,
     mode: reverie_dbt::DbtStartupMode,
+    native_preemption_quantum: u64,
 ) -> Result<(), String> {
     let image_generation = IMAGE_GENERATION.load(Ordering::SeqCst);
     if image_generation == 0 {
@@ -1272,6 +1309,10 @@ unsafe fn runtime_background_init(
             // The reader consumes its temporary owner before returning here,
             // before GlobalState/Runtime/READY. Application RPC is unchanged.
             let (mut config, source, transport) = initial_dbt_config(mode, control.as_deref())?;
+            // Refuse unsupported capture/preemption before GlobalState, Runtime
+            // or READY. Legacy/no-capture keeps its actual nonzero quantum.
+            let startup =
+                RuntimeStartup::new(image_generation, transport, mode, native_preemption_quantum)?;
             match source {
                 ConfigSource::RpcHandshake => emit_lifecycle_marker(
                     emit_diagnostic,
@@ -1327,21 +1368,23 @@ unsafe fn runtime_background_init(
             emit_lifecycle_marker(emit_diagnostic, b"detcore-dbt: GlobalState initialized\n");
             *slot = Some(Arc::new(Runtime {
                 abi,
-                startup: RuntimeStartup {
-                    image_generation,
-                    transport,
-                },
+                startup,
                 config,
                 global,
                 tool: OnceLock::new(),
                 next_child_ordinal: AtomicU64::new(1),
             }));
         } else if slot.as_ref().is_some_and(|runtime| {
-            runtime.abi != abi || !runtime.startup.matches_image(image_generation)
+            runtime.abi != abi
+                || !runtime.startup.matches_native_contract(
+                    image_generation,
+                    mode,
+                    native_preemption_quantum,
+                )
         }) {
             emit_marker(
                 emit_diagnostic,
-                b"detcore-dbt: ERROR runtime ABI or image changed after initialization\n",
+                b"detcore-dbt: ERROR runtime ABI, image or native contract changed after initialization\n",
             );
             unsafe { libc::_exit(reverie_dbt::CLIENT_THREAD_START_FAILURE_EXIT_CODE) };
         }
@@ -1382,13 +1425,16 @@ unsafe fn runtime_background_init(
 /// # Safety
 ///
 /// `argument` must be null or point to valid [`reverie_dbt::DbtRuntimeCallbacks`]
-/// for the call. `native_mode` must be the initialized state admitted by ABI 6.
+/// for the call. `native_mode` and `native_preemption_quantum` must be the
+/// initialized, immutable native state admitted by the paired ABI-10 client.
 #[unsafe(no_mangle)]
 // TODO-HUMAN-REVIEW(PR-587): Confirm external scheduler callback and restart semantics.
-pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v3(
+pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v4(
     argument: *mut c_void,
     native_mode: u32,
+    native_preemption_quantum: u64,
 ) -> i32 {
+    READY_IMAGE.store(0, Ordering::Release);
     if argument.is_null() {
         return 1;
     }
@@ -1399,13 +1445,40 @@ pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v3(
     }
     let startup = reverie_dbt::DbtStartupMode::try_from(native_mode)
         .map_err(|error| error.to_string())
-        .and_then(|mode| unsafe { runtime_background_init(callbacks, RuntimeAbi::Current, mode) });
+        .and_then(|mode| unsafe {
+            runtime_background_init(
+                callbacks,
+                RuntimeAbi::Current,
+                mode,
+                native_preemption_quantum,
+            )
+        });
     if let Err(error) = startup {
         let message = format!("detcore-dbt: startup refused: {error}\n");
         unsafe { (callbacks.emit)(message.as_ptr(), message.len()) };
         return 1;
     }
     0
+}
+
+/// Retained version-3 entry, unadmitted without the actual native quantum.
+///
+/// Missing startup input is a refusal, never an inferred zero or a fallback.
+///
+/// # Safety
+/// `argument` must be null or point to valid [`reverie_dbt::DbtRuntimeCallbacks`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reverie_dbt_runtime_background_init_v3(
+    argument: *mut c_void,
+    _native_mode: u32,
+) -> i32 {
+    READY_IMAGE.store(0, Ordering::Release);
+    if !argument.is_null() {
+        let callbacks = unsafe { &*argument.cast::<reverie_dbt::DbtRuntimeCallbacks>() };
+        let message = b"detcore-dbt: startup refused: ABI-10 actual native quantum is required\n";
+        unsafe { (callbacks.emit)(message.as_ptr(), message.len()) };
+    }
+    1
 }
 
 /// Retained version-2 entry, unadmitted without native mode and startup status.
@@ -3227,6 +3300,8 @@ mod tests {
         let original = RuntimeStartup {
             image_generation: 7,
             transport: InitialConfigTransport::NativeControl,
+            native_mode: reverie_dbt::DbtStartupMode::Coordinated,
+            native_preemption_quantum: 0,
         };
         // Fork and a failed exec retain the same Runtime. Neither may downgrade
         // its transport when a later transaction fails. A new image cannot use
@@ -3239,13 +3314,48 @@ mod tests {
     }
 
     #[test]
+    fn startup_native_quantum_is_validated_and_retained_before_ready() {
+        use reverie_dbt::DbtStartupMode::Coordinated;
+        use reverie_dbt::DbtStartupMode::Standalone;
+        use reverie_dbt::sync_rpc::InitialConfigTransport::Legacy;
+        use reverie_dbt::sync_rpc::InitialConfigTransport::NativeControl;
+
+        for mode in [Standalone, Coordinated] {
+            let captured = RuntimeStartup::new(7, NativeControl, mode, 0).unwrap();
+            assert!(captured.matches_native_contract(7, mode, 0));
+            assert!(!captured.matches_native_contract(7, mode, 1));
+            assert!(!captured.matches_native_contract(8, mode, 0));
+            for quantum in [1, 1000, u64::MAX] {
+                assert!(RuntimeStartup::new(7, NativeControl, mode, quantum).is_err());
+                let legacy = RuntimeStartup::new(7, Legacy, mode, quantum).unwrap();
+                assert!(legacy.matches_native_contract(7, mode, quantum));
+                assert!(!legacy.matches_native_contract(7, mode, 0));
+            }
+        }
+        let legacy = RuntimeStartup::new(7, Legacy, Standalone, 1000).unwrap();
+        assert!(!legacy.matches_native_contract(7, Coordinated, 1000));
+        assert!(RuntimeStartup::new(0, Legacy, Standalone, 0).is_err());
+        assert!(RuntimeStartup::new(0, NativeControl, Coordinated, 0).is_err());
+    }
+
+    #[test]
     fn exported_runtime_identity_matches_the_pinned_reverie_abi() {
-        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 9);
-        assert_eq!(std::mem::size_of::<DbtSignalEvent>(), 200);
+        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 10);
+        assert_eq!(std::mem::size_of::<DbtSignalEvent>(), 232);
         assert_eq!(std::mem::align_of::<DbtSignalEvent>(), 8);
         assert_eq!(std::mem::offset_of!(DbtSignalEvent, signal_info), 8);
         assert_eq!(std::mem::offset_of!(DbtSignalEvent, deferred_sysnum), 144);
         assert_eq!(std::mem::offset_of!(DbtSignalEvent, deferred_args), 152);
+        assert_eq!(
+            std::mem::offset_of!(DbtSignalEvent, admission_image_epoch),
+            200
+        );
+        assert_eq!(std::mem::offset_of!(DbtSignalEvent, admission_domain), 208);
+        assert_eq!(
+            std::mem::offset_of!(DbtSignalEvent, admission_allocation),
+            216
+        );
+        assert_eq!(std::mem::offset_of!(DbtSignalEvent, admission_token), 224);
         assert_eq!(
             reverie_dbt::DBT_RUNTIME_ABI_VERSION,
             IMPLEMENTED_DBT_RUNTIME_ABI_VERSION
