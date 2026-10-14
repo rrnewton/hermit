@@ -475,6 +475,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "privileged-test.pmu_ptrace_completion_cases",
     "privileged-test.pmu_cli_cases",
     "privileged-test.pmu_detcore_time_cases",
+    "privileged-cpuid.cpu_profile_v3",
     "test.pmu_integration_cases",
     "privileged-test.cli_kvm",
     "privileged-only-cpuid.faulting",
@@ -580,9 +581,11 @@ const PROFILES: [Profile; 11] = [
     // unchanged because the node carries only the full label.
     Profile {
         // The six inherited-terminal regressions add one full-only node.
+        // privileged-cpuid.cpu_profile_v3 adds another
+        // (https://github.com/rrnewton/hermit/issues/4243).
         label: "full",
-        direct_steps: 94,
-        selected_steps: 95,
+        direct_steps: 95,
+        selected_steps: 96,
     },
     Profile {
         label: "portable",
@@ -2566,9 +2569,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // 137 with supercompat.manifest_compat, which runs the super run type's
     // heavy compat rows from compat.yaml (same issue).
     // test.inherited_terminal_read adds one producer for the six terminal regressions.
-    if expected.len() != 138 {
+    // 139 with privileged-cpuid.cpu_profile_v3, the must-qualify x86-64-v3
+    // CLI cases (https://github.com/rrnewton/hermit/issues/4243).
+    if expected.len() != 139 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 138",
+            "structured result producer registry has {} entries, expected 139",
             expected.len()
         ));
     }
@@ -2586,9 +2591,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // The M1 seven-identity and M2 eleven-identity targets each add one
     // registry entry without altering existing CLI counts.
     // The six-case inherited-terminal target adds one independently counted population.
-    if expected_counts.len() != 46 {
+    // 47 with privileged-cpuid.cpu_profile_v3
+    // (https://github.com/rrnewton/hermit/issues/4243).
+    if expected_counts.len() != 47 {
         return Err(format!(
-            "Nextest expected-count registry has {} entries, expected 46",
+            "Nextest expected-count registry has {} entries, expected 47",
             expected_counts.len()
         ));
     }
@@ -2730,7 +2737,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // (https://github.com/rrnewton/hermit/issues/4276), and 56 with
     // supercompat.manifest_compat (same issue).
     // test.inherited_terminal_read adds the 73rd Nextest writer; other groups are unchanged.
-    if actual_group_counts != [73, 56, 7, 2] {
+    // privileged-cpuid.cpu_profile_v3 adds the 74th
+    // (https://github.com/rrnewton/hermit/issues/4243).
+    if actual_group_counts != [74, 56, 7, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -3897,9 +3906,12 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // 433 since the super run type's four generated compat.<row> nodes became
     // the one static supercompat.manifest_compat (436 - 4 + 1; same issue).
     // One full-profile counted target owns the six inherited-terminal regressions.
-    if cfg.steps.len() != 434 {
+    // 435 with privileged-cpuid.cpu_profile_v3, which runs the x86-64-v3 CLI
+    // cases on a host that must qualify (434 + 1;
+    // https://github.com/rrnewton/hermit/issues/4243).
+    if cfg.steps.len() != 435 {
         return Err(format!(
-            "superset has {} steps, expected 434",
+            "superset has {} steps, expected 435",
             cfg.steps.len()
         ));
     }
@@ -4023,6 +4035,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
         if binary == "cli" {
             expected.insert("test.isolated_dbt_workdir".into(), 1);
             expected.insert("privileged-test.pmu_cli_cases".into(), 1);
+            expected.insert("privileged-cpuid.cpu_profile_v3".into(), 1);
         }
         let actual = cfg
             .steps
@@ -6301,7 +6314,9 @@ sys.exit(37)
         // test.liteinst_allocator joined full (93 full nodes).
         // 91 with the additive required M2 stack node (94 full nodes).
         // The inherited-terminal target stays required beside the Buck cells.
-        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 92);
+        // 93 with privileged-cpuid.cpu_profile_v3 (96 full nodes;
+        // https://github.com/rrnewton/hermit/issues/4243).
+        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 93);
 
         fn twin(cfg: &mut DagConfig) -> &mut Step {
             cfg.steps
