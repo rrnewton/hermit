@@ -35,6 +35,10 @@ use crate::resources::SigalrmSleepDisposition;
 use crate::scheduler::HostTimedSignalScope;
 use crate::scheduler::OwnProcessSignalInputs;
 use crate::scheduler::SiblingSignalState;
+use crate::scheduler::discarded_at_send::DiscardToken;
+use crate::scheduler::discarded_at_send::DiscardedSignalAnswer;
+use crate::scheduler::discarded_at_send::DiscardedSignalControl;
+use crate::scheduler::discarded_at_send::QueueId;
 use crate::scheduler::pid_namespaces::GuestPidAnswer;
 use crate::syscalls::helpers::REAL_TIME_SIGNALS;
 use crate::syscalls::helpers::act_on_pending_real_time;
@@ -456,6 +460,65 @@ where
     let mut bytes = [0u8; 128];
     mem.read_exact_at(&mut bytes, info.as_raw() as u64).ok()?;
     Some(bytes)
+}
+
+/// What the guest's buffers `extents` (address, length) hold, in order, up to
+/// `limit` bytes, read before a signalfd read writes them, so a record that
+/// read drops can leave them as they were (`apply_signalfd_answers`). `None`
+/// when they cannot be read, or for more than a page of records, where a
+/// dropped record's bytes are zeroed instead.
+pub(crate) fn capture_signalfd_buffer<T, G: Guest<Detcore<T>>>(
+    guest: &mut G,
+    extents: &[(usize, usize)],
+    limit: usize,
+) -> Option<Vec<u8>>
+where
+    T: RecordOrReplay,
+{
+    const CAPTURED: usize = 4096;
+    let total: usize = extents.iter().map(|(_, len)| *len).sum();
+    let len = total.min(limit);
+    if len > CAPTURED {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(len);
+    for (address, length) in signalfd_extent_pieces(extents, len) {
+        let mut piece = vec![0u8; length];
+        let address = AddrMut::<u8>::from_raw(address)?;
+        guest.memory().read_exact(address, &mut piece).ok()?;
+        bytes.extend_from_slice(&piece);
+    }
+    Some(bytes)
+}
+
+/// Put back, in the guest's siginfo buffer at `info`, the bytes that differ
+/// from `before`, its contents before a take whose copy is dropped. Only the
+/// bytes the kernel wrote differ, and it wrote only what user mode could, so
+/// no write reaches a page user mode could not write.
+fn restore_changed_bytes<T, G: Guest<Detcore<T>>>(
+    guest: &mut G,
+    info: AddrMut<libc::siginfo_t>,
+    before: &[u8; 128],
+) where
+    T: RecordOrReplay,
+{
+    let Some(now) = read_siginfo(guest, info) else {
+        return;
+    };
+    let mut at = 0;
+    while at < before.len() {
+        if now[at] == before[at] {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        while at < before.len() && now[at] != before[at] {
+            at += 1;
+        }
+        if let Some(address) = AddrMut::<u8>::from_raw(info.as_raw() + start) {
+            let _ = guest.memory().write_exact(address, &before[start..at]);
+        }
+    }
 }
 
 /// The thread a process-directed signal goes to. `zombie` is the process's
@@ -893,6 +956,20 @@ impl<T: RecordOrReplay> Detcore<T> {
                 refuse_sigalrm(guest, SigalrmControl::HandlerToDefault).await?;
             }
         }
+        // Whether this call moves the signal from `SIG_IGN` to an action that
+        // does not ignore it, read before the change: Linux then re-queues a
+        // periodic POSIX timer's ignored expiry (`posixtimer_sig_unignore`,
+        // <https://github.com/rrnewton/hermit/issues/4293>).
+        let unignores = crate::scheduler::discarded_at_send::records(guest.config())
+            && (1..32).contains(&call.signum())
+            && kernel_action.is_some_and(|action| {
+                action.handler != libc::SIG_IGN as u64
+                    && !(action.handler == libc::SIG_DFL as u64
+                        && [libc::SIGCONT, libc::SIGCHLD, libc::SIGWINCH, libc::SIGURG]
+                            .contains(&call.signum()))
+            })
+            && crate::syscalls::threads::read_kernel_signal_state(guest.pid(), guest.tid())
+                .is_ok_and(|state| state.ignored & kernel_sigset_bit(call.signum()) != 0);
         let result = if let Some(kernel_action) = kernel_action {
             // The kernel treats `action` as input. Sanitize a private copy instead
             // of writing through the guest pointer: the input may be read-only,
@@ -984,6 +1061,29 @@ impl<T: RecordOrReplay> Detcore<T> {
             && crate::scheduler::timer_copies_recorded()
         {
             crate::tool_global::forget_thread_timer_copies(guest, call.signum()).await;
+        }
+        // The flush takes every pending copy of the signal from every queue of
+        // the process, so none of them is one Linux discarded any more; and an
+        // unignore makes a still-current periodic timer expiry a kept one
+        // (`scheduler::discarded_at_send`).
+        if crate::scheduler::discarded_at_send::records(guest.config())
+            && (result.is_ok() || matches!(result, Err(Errno::EFAULT)))
+            && (1..32).contains(&call.signum())
+        {
+            let signal = call.signum();
+            if kernel_action.is_some_and(|action| ignored(action.handler)) {
+                crate::tool_global::discarded_signal(
+                    guest,
+                    DiscardedSignalControl::Flushed { signal },
+                )
+                .await;
+            } else if unignores {
+                crate::tool_global::discarded_signal(
+                    guest,
+                    DiscardedSignalControl::Unignored { signal },
+                )
+                .await;
+            }
         }
         Ok(result?)
     }
@@ -1146,8 +1246,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         // Linux writes the siginfo only for a signal it returns. A dropped
         // copy's siginfo is replaced by what the buffer held before.
+        let records = crate::scheduler::discarded_at_send::records(guest.config());
         let before = match call.info() {
-            Some(info) if self.cfg.backend.reports_child_exit_publication => {
+            Some(info) if self.cfg.backend.reports_child_exit_publication || records => {
                 read_siginfo(guest, info)
             }
             _ => None,
@@ -1158,14 +1259,20 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .await;
             // A consumed child-exit copy that the notification ledger drops
             // is not returned: the wait goes on, to the same deadline.
-            if self
+            let stands = self
                 .synchronous_sigchld_stands(guest, call, waited, &result)
-                .await
-            {
+                .await;
+            // Nor is a copy Linux discarded when it was sent, which Linux never
+            // dequeues (https://github.com/rrnewton/hermit/issues/4293). The
+            // take went into the guest's own buffer, so the kernel made the
+            // copy-out with its own partial-write and EFAULT rules for a kept
+            // copy; for a dropped one, the bytes it changed are put back.
+            let discarded = records && self.took_a_discarded_copy(guest, waited, &result).await;
+            if stands && !discarded {
                 break result;
             }
             if let (Some(info), Some(bytes)) = (call.info(), before.as_ref()) {
-                let _ = guest.memory().write_value(info.cast::<[u8; 128]>(), bytes);
+                restore_changed_bytes(guest, info, bytes);
             }
         };
         if waited.is_some() {
@@ -1182,6 +1289,46 @@ impl<T: RecordOrReplay> Detcore<T> {
         result
     }
 
+    /// Whether the take that ended this thread's `rt_sigtimedwait` for the
+    /// signals `waited` with `result` took a copy Linux discarded when it was
+    /// sent (`DiscardedSignalControl::Take`, and, for an EFAULT, which names no
+    /// signal, `DiscardedSignalControl::TakeFaulted` from the queues after it).
+    async fn took_a_discarded_copy<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        waited: Option<u64>,
+        result: &Result<i64, Error>,
+    ) -> bool {
+        match result {
+            Ok(signal) if (1..32).contains(&(*signal as i32)) => {
+                crate::syscalls::helpers::take_was_discarded(guest, *signal as i32).await
+            }
+            Err(Error::Errno(Errno::EFAULT)) => {
+                let Some(set) = waited else {
+                    return false;
+                };
+                let Ok(state) =
+                    crate::syscalls::threads::read_kernel_signal_state(guest.pid(), guest.tid())
+                else {
+                    return false;
+                };
+                matches!(
+                    crate::tool_global::discarded_signal(
+                        guest,
+                        DiscardedSignalControl::TakeFaulted {
+                            set,
+                            thread_pending: state.thread_pending,
+                            shared_pending: state.shared_pending,
+                        },
+                    )
+                    .await,
+                    DiscardedSignalAnswer::Discarded(true)
+                )
+            }
+            _ => false,
+        }
+    }
+
     /// The `signalfd_siginfo` records a successful signalfd `read` returned,
     /// `len` bytes at `buf`, reconciled with the child-exit ledger
     /// (`reconcile_signalfd_extents`). Returns the bytes kept.
@@ -1190,8 +1337,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         buf: AddrMut<'_, u8>,
         len: usize,
+        before: Option<&[u8]>,
     ) -> usize {
-        self.reconcile_signalfd_extents(guest, &[(buf.as_raw(), len)], len)
+        self.reconcile_signalfd_extents(guest, &[(buf.as_raw(), len)], len, before)
             .await
     }
 
@@ -1212,6 +1360,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         extents: &[(usize, usize)],
         read: usize,
+        before: Option<&[u8]>,
     ) -> usize {
         let len = read - read % SIGNALFD_RECORD;
         let pieces = signalfd_extent_pieces(extents, len);
@@ -1242,7 +1391,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                 None => None,
             });
         }
-        let Some(rewritten) = apply_signalfd_answers(&bytes, &answers) else {
+        // A record of a copy Linux discarded when it was sent is dropped, as a
+        // duplicate is: the guest never sees it
+        // (`crate::syscalls::helpers::take_was_discarded`,
+        // <https://github.com/rrnewton/hermit/issues/4293>).
+        if crate::scheduler::discarded_at_send::records(guest.config()) {
+            for (record, answer) in bytes.chunks(SIGNALFD_RECORD).zip(answers.iter_mut()) {
+                let signal = signalfd_field(record, 0) as i32;
+                if (1..32).contains(&signal)
+                    && crate::syscalls::helpers::take_was_discarded(guest, signal).await
+                {
+                    *answer = Some(
+                        crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer::Claimed(true),
+                    );
+                }
+            }
+        }
+        let Some(rewritten) = apply_signalfd_answers(&bytes, &answers, before) else {
             return len;
         };
         let mut offset = 0;
@@ -1488,7 +1653,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             (call.pid(), None)
         };
         if Self::own_namespace_init_drops(own_init_caught, call.sig()) {
-            return Ok(self.record_or_replay(guest, call).await?);
+            let task = DetTid::from_raw(named);
+            return self
+                .send_to_own_init(guest, call, task, QueueId::Process(task), call.sig())
+                .await;
         }
 
         // Linux's `kill_something_info` answers ESRCH for pid INT_MIN before
@@ -1595,7 +1763,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             OwnProcessSend::Admitted => {
                 return self
-                    .forward_own_process_signal(guest, call.sig(), call)
+                    .forward_own_process_signal(guest, call.sig(), call, DetTid::from_raw(tgid))
                     .await;
             }
             OwnProcessSend::Refused(answer) => return answer,
@@ -1630,6 +1798,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 call.sig(),
                 Some(DetPid::from_raw(process)),
                 false,
+                DetTid::from_raw(tgid),
             )
             .await?
         } else {
@@ -1644,6 +1813,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 call.sig(),
                 Some(DetPid::from_raw(process)),
                 false,
+                DetTid::from_raw(tgid),
             )
             .await?
         };
@@ -1784,17 +1954,90 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         sig: libc::c_int,
         call: C,
+        named: DetTid,
     ) -> Result<i64, Error>
     where
         C: Into<syscalls::Syscall>,
         syscalls::Syscall: From<C>,
     {
+        let token = self
+            .discard_pre_send(guest, named, QueueId::Process(self.detpid), sig)
+            .await;
         guest.thread_state_mut().own_signal_turn_hold = Some(sig);
         let result = self.record_or_replay(guest, call).await;
         if result.is_err() {
             guest.thread_state_mut().own_signal_turn_hold = None;
+        } else {
+            self.discard_sent(guest, token).await;
         }
         Ok(result?)
+    }
+
+    /// Forward a signal to a task of the caller's own PID namespace's init
+    /// that the kernel drops (`own_namespace_init_drops`), recording, around
+    /// the send, the copy that ptrace still queues (`discard_pre_send`).
+    async fn send_to_own_init<G: Guest<Self>, C>(
+        &self,
+        guest: &mut G,
+        call: C,
+        named: DetTid,
+        queue: QueueId,
+        sig: libc::c_int,
+    ) -> Result<i64, Error>
+    where
+        C: Into<syscalls::Syscall>,
+        syscalls::Syscall: From<C>,
+    {
+        let token = self.discard_pre_send(guest, named, queue, sig).await;
+        let result = self.record_or_replay(guest, call).await;
+        if result.is_ok() {
+            self.discard_sent(guest, token).await;
+        }
+        Ok(result?)
+    }
+
+    /// Classify, in the sender's turn and before the physical send, a guest's
+    /// send of `raw_signal` into `queue` naming `named`, and read the queue
+    /// (`scheduler::discarded_at_send`, <https://github.com/rrnewton/hermit/issues/4293>).
+    /// `None` where Detcore does not sequentialize threads, or for a signal
+    /// the record does not track.
+    pub(crate) async fn discard_pre_send<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        named: DetTid,
+        queue: QueueId,
+        raw_signal: i32,
+    ) -> Option<DiscardToken> {
+        if !crate::scheduler::discarded_at_send::records(guest.config())
+            || !(1..32).contains(&raw_signal)
+        {
+            return None;
+        }
+        match crate::tool_global::discarded_signal(
+            guest,
+            DiscardedSignalControl::PreSend {
+                named,
+                queue,
+                signal: raw_signal,
+            },
+        )
+        .await
+        {
+            DiscardedSignalAnswer::Token(token) => Some(token),
+            _ => None,
+        }
+    }
+
+    /// Record a send `token` classified (`discard_pre_send`) once the send
+    /// succeeded.
+    pub(crate) async fn discard_sent<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        token: Option<DiscardToken>,
+    ) {
+        if let Some(token) = token {
+            crate::tool_global::discarded_signal(guest, DiscardedSignalControl::Sent(token)).await;
+        }
     }
 
     /// What an `rt_sigqueueinfo` whose `siginfo_t` Hermit may not be able to
@@ -2094,7 +2337,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 NamedGuestPid::Answer(answer) => return answer,
             };
             if Self::own_namespace_init_drops(own_init_caught, call.sig()) {
-                return Ok(self.record_or_replay(guest, call).await?);
+                return self
+                    .send_to_own_init(guest, call, tid, QueueId::Thread(tid), call.sig())
+                    .await;
             }
             (tgid.as_raw(), tid.as_raw())
         } else {
@@ -2141,6 +2386,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 call.sig(),
                 None,
                 true,
+                DetTid::from_raw(tid),
             )
             .await?;
         // `pthread_kill` lowers to `tgkill`, so this is the ordinary way one
@@ -2174,7 +2420,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     own_init_caught,
                 } => {
                     if Self::own_namespace_init_drops(own_init_caught, call.sig()) {
-                        return Ok(self.record_or_replay(guest, call).await?);
+                        return self
+                            .send_to_own_init(guest, call, task, QueueId::Thread(task), call.sig())
+                            .await;
                     }
                     task.as_raw()
                 }
@@ -2217,6 +2465,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 call.sig(),
                 None,
                 true,
+                DetTid::from_raw(tid),
             )
             .await?;
         // Same wakeup obligation as `tgkill`; `tkill` is the older two-argument
@@ -2283,7 +2532,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// could record it afterwards (the Claude re-check of
     /// https://github.com/rrnewton/hermit/pull/4131). `thread_directed`: the
     /// send names one thread (`tkill`, `tgkill`, `rt_tgsigqueueinfo`, a
-    /// thread-scoped `pidfd_send_signal`).
+    /// thread-scoped `pidfd_send_signal`). `named`: the task Linux reads to
+    /// decide whether it discards the signal (`kill`'s pid, `tgkill`'s tid),
+    /// which the discarded-at-send record classifies the send against
+    /// (`discard_pre_send`).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each argument is one fact about the send the kernel call cannot tell"
+    )]
     pub(crate) async fn send_guest_signal<G, S>(
         &self,
         guest: &mut G,
@@ -2292,6 +2548,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         raw_signal: i32,
         target_process: Option<DetPid>,
         thread_directed: bool,
+        named: DetTid,
     ) -> Result<i64, Error>
     where
         G: Guest<Self>,
@@ -2335,11 +2592,29 @@ impl<T: RecordOrReplay> Detcore<T> {
                 });
             }
         }
+        // Without a process, or on a backend that sends process signals to a
+        // thread, the copy joins the target's private queue.
+        let queue = match target_process {
+            Some(process)
+                if !thread_directed
+                    && !guest
+                        .config()
+                        .backend
+                        .requires_thread_directed_process_signals =>
+            {
+                QueueId::Process(process)
+            }
+            _ => QueueId::Thread(target),
+        };
+        let token = self.discard_pre_send(guest, named, queue, raw_signal).await;
         let result = self.record_or_replay(guest, syscall).await;
         if result.is_err()
             && let Some(undo) = undo
         {
             crate::tool_global::child_exit_sigchld(guest, undo).await;
+        }
+        if result.is_ok() {
+            self.discard_sent(guest, token).await;
         }
         Ok(result?)
     }
@@ -2440,7 +2715,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     own_init_caught,
                 } => {
                     if Self::own_namespace_init_drops(own_init_caught, call.sig()) {
-                        return Ok(self.record_or_replay(guest, call).await?);
+                        return self
+                            .send_to_own_init(guest, call, task, QueueId::Thread(task), call.sig())
+                            .await;
                     }
                     task.as_raw()
                 }
@@ -2476,6 +2753,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 call.sig(),
                 None,
                 true,
+                DetTid::from_raw(tid),
             )
             .await?;
         // Thread-directed like `tgkill`, so it carries the same wakeup
@@ -2537,7 +2815,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     own_init_caught,
                 } => {
                     if Self::own_namespace_init_drops(own_init_caught, call.sig()) {
-                        return Ok(self.record_or_replay(guest, call).await?);
+                        return self
+                            .send_to_own_init(guest, call, task, QueueId::Process(task), call.sig())
+                            .await;
                     }
                     task.as_raw()
                 }
@@ -2626,7 +2906,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             OwnProcessSend::Admitted => {
                 return self
-                    .forward_own_process_signal(guest, call.sig(), call)
+                    .forward_own_process_signal(guest, call.sig(), call, DetTid::from_raw(tgid))
                     .await;
             }
             OwnProcessSend::Refused(answer) => return answer,
@@ -2682,6 +2962,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 call.sig(),
                 Some(DetPid::from_raw(process)),
                 false,
+                DetTid::from_raw(tgid),
             )
             .await?
         } else {
@@ -2697,6 +2978,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 call.sig(),
                 Some(DetPid::from_raw(process)),
                 false,
+                DetTid::from_raw(tgid),
             )
             .await?
         };
@@ -2912,6 +3194,12 @@ where
         if !stops_end_it && before_park {
             ending &= !(state.default_job_control_stops() | kernel_sigset_bit(libc::SIGSTOP));
         }
+        // A copy Linux discarded when it was sent ends nothing, except a
+        // signal the scheduler committed at the wake, which is kept
+        // (<https://github.com/rrnewton/hermit/issues/4293>).
+        let committed = if before_park { 0 } else { deciding };
+        let ending =
+            crate::syscalls::threads::without_discarded(guest, &state, ending, committed).await;
         if ending != 0 {
             return Ok(SleepSignal::Pending);
         }
@@ -3137,8 +3425,9 @@ pub(crate) fn signalfd_extent_pieces(
 /// Signalfd records rewritten by the child-exit ledger's answers.
 #[derive(Debug, PartialEq, Eq)]
 struct RewrittenSignalfdRecords {
-    /// The buffer to write back: the kept records in order, then zeros over
-    /// the bytes of dropped ones, so no dropped record stays readable.
+    /// The buffer to write back: the kept records in order, then what the
+    /// buffer held before the read (or zeros) over the bytes of dropped ones,
+    /// so no dropped record stays readable.
     bytes: Vec<u8>,
     /// How many bytes the read returns.
     kept: usize,
@@ -3152,6 +3441,7 @@ struct RewrittenSignalfdRecords {
 fn apply_signalfd_answers(
     bytes: &[u8],
     answers: &[Option<crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer>],
+    before: Option<&[u8]>,
 ) -> Option<RewrittenSignalfdRecords> {
     use crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
     use crate::scheduler::child_exit_sigchld::OwnCopy;
@@ -3188,7 +3478,15 @@ fn apply_signalfd_answers(
         return None;
     }
     let kept_len = kept.len();
-    kept.resize(bytes.len() - bytes.len() % SIGNALFD_RECORD, 0);
+    let len = bytes.len() - bytes.len() % SIGNALFD_RECORD;
+    // The bytes past the kept records are those the caller's buffer held
+    // before the read, when they were captured: a dropped record must leave
+    // the buffer as Linux, which never queued it, leaves it
+    // (https://github.com/rrnewton/hermit/issues/4293). Otherwise zeros.
+    match before {
+        Some(before) if before.len() >= len => kept.extend_from_slice(&before[kept_len..len]),
+        _ => kept.resize(len, 0),
+    }
     Some(RewrittenSignalfdRecords {
         bytes: kept,
         kept: kept_len,
@@ -3204,6 +3502,40 @@ mod signalfd_record_tests {
     use crate::scheduler::child_exit_sigchld::OwnCopy;
 
     const TRACER: u32 = 4242;
+
+    /// `apply_signalfd_answers` with no captured buffer: a dropped record's
+    /// bytes are zeroed.
+    fn apply_without_capture(
+        bytes: &[u8],
+        answers: &[Option<ChildExitSigchldAnswer>],
+    ) -> Option<RewrittenSignalfdRecords> {
+        apply_signalfd_answers(bytes, answers, None)
+    }
+
+    /// A dropped record's bytes get what the buffer held before the read.
+    #[test]
+    fn a_dropped_record_leaves_the_captured_bytes() {
+        let record = |signo: u32| {
+            let mut bytes = vec![0u8; SIGNALFD_RECORD];
+            bytes[0..4].copy_from_slice(&signo.to_ne_bytes());
+            bytes
+        };
+        let bytes = [record(10), record(12)].concat();
+        let before = vec![0xa5u8; 2 * SIGNALFD_RECORD];
+        let rewritten = apply_signalfd_answers(
+            &bytes,
+            &[Some(ChildExitSigchldAnswer::Claimed(true)), None],
+            Some(&before),
+        )
+        .unwrap();
+        assert_eq!(rewritten.kept, SIGNALFD_RECORD);
+        assert_eq!(&rewritten.bytes[..SIGNALFD_RECORD], &record(12)[..]);
+        assert!(
+            rewritten.bytes[SIGNALFD_RECORD..]
+                .iter()
+                .all(|byte| *byte == 0xa5)
+        );
+    }
 
     fn record(signo: i32, code: i32, pid: u32, status: i32) -> Vec<u8> {
         let mut record = vec![0u8; SIGNALFD_RECORD];
@@ -3301,7 +3633,7 @@ mod signalfd_record_tests {
         let second = record(libc::SIGCHLD, libc::SI_USER, TRACER, 0);
         let third = record(libc::SIGCHLD, libc::CLD_KILLED, 33, libc::SIGKILL);
         let bytes = [first, second, third].concat();
-        let rewritten = apply_signalfd_answers(
+        let rewritten = apply_without_capture(
             &bytes,
             &[
                 Some(ChildExitSigchldAnswer::Claimed(true)),
@@ -3342,7 +3674,7 @@ mod signalfd_record_tests {
         marked[48..56].fill(9);
         marked[20..40].fill(5);
         marked[72..].fill(6);
-        let rewritten = apply_signalfd_answers(
+        let rewritten = apply_without_capture(
             &marked,
             &[Some(ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(
                 ChildExitSiginfo {
@@ -3389,7 +3721,7 @@ mod signalfd_record_tests {
             record(libc::SIGCHLD, libc::SI_USER, TRACER, 0),
         ]
         .concat();
-        let rewritten = apply_signalfd_answers(
+        let rewritten = apply_without_capture(
             &bytes,
             &[
                 Some(ChildExitSigchldAnswer::Claimed(true)),
@@ -3400,7 +3732,7 @@ mod signalfd_record_tests {
         assert_eq!(rewritten.kept, 0);
         assert!(rewritten.bytes.iter().all(|byte| *byte == 0));
         assert_eq!(
-            apply_signalfd_answers(
+            apply_without_capture(
                 &bytes,
                 &[
                     Some(ChildExitSigchldAnswer::Claimed(false)),
@@ -4870,6 +5202,7 @@ mod before_park_tests {
                     interrupting,
                     held,
                     host_timed,
+                    0,
                 )
                 .await,
             );
@@ -4942,6 +5275,7 @@ mod before_park_tests {
                 &kernel,
                 interrupting,
                 held,
+                0,
                 0,
             )
             .await;
@@ -5019,6 +5353,7 @@ mod before_park_tests {
                     state.pending_interrupting(state.blocked, false),
                     held,
                     0,
+                    committed_wake,
                 )
                 .await,
             );

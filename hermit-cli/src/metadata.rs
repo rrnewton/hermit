@@ -503,7 +503,16 @@ impl RecordVersion {
 // (https://github.com/rrnewton/hermit/issues/4266). An older recording ran at
 // `standard` without saying so, and would replay at `minimal`, where the
 // standard level's names are missing.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x153);
+// 0x153 -> 0x154 (taken at land time, as the reservation file's land-time
+// numbering rule gives a ready change HIGHEST_SHIPPED + 1): a standard
+// signal Linux discards when it is sent (ignored, default-ignored with no
+// handler, or uncaught to a PID namespace's init) no longer ends a futex wait,
+// a sleep, a waitid, or an rt_sigtimedwait or signalfd take once a handler is
+// installed, though ptrace still queues its copy; the scheduler records each
+// send's fate in its turn (https://github.com/rrnewton/hermit/issues/4293).
+// Replay recomputes these results, so an older recording of such a send would
+// replay with the wait ended early: a successful replay with different output.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x154);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -528,7 +537,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x153);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x153;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x154;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1444,6 +1453,17 @@ mod tests {
     fn record_version_rejects_streams_from_before_a_woken_futex_waiter_takes_its_sigchld() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x14d)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x14b)));
+    }
+
+    /// A recording older than 0x154 was made when a copy Linux discarded at
+    /// its send ended a wait once a handler was installed
+    /// (https://github.com/rrnewton/hermit/issues/4293).
+    #[test]
+    fn record_version_rejects_streams_from_before_discarded_sends_are_recorded() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x151)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x152)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x153)));
+        assert!(RECORD_VERSION.compatible_with(&RecordVersion(0x154)));
     }
 
     #[test]
