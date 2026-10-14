@@ -1039,7 +1039,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Four retained LiteInst initial-image wire and policy tests: 1092.
     // And detcore-model's CpuProfile name test
     // (https://github.com/rrnewton/hermit/issues/4243): 1093, listed.
-    ("test.regular_crates", 1093),
+    // And detcore-model's the_cpu_profile_never_enters_the_legacy_form: 1094, listed.
+    ("test.regular_crates", 1094),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1501,7 +1502,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/issues/4275): 1046, listed.
     // And the eleven xstate_probe tests of the x86-64-v3 qualification
     // (https://github.com/rrnewton/hermit/issues/4243): 1057, listed.
-    ("test.hermit_unit", 1057),
+    // And the four cpu_profile_admission tests: 1061, listed.
+    ("test.hermit_unit", 1061),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2178,7 +2180,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // syscalls::signal::tests::a_claimed_sigchld_stays_claimed_while_pending
     // (https://github.com/rrnewton/hermit/issues/4229): 1620, listed.
     // And +3 from 8475d18e: 1623.
-    ("test.detcore_unit", 1623),
+    // And the three x86-64-v3 table tests in cpuid.rs
+    // (https://github.com/rrnewton/hermit/issues/4243): 1626, listed.
+    ("test.detcore_unit", 1626),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3571,7 +3575,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the host pipe-capacity ceiling test: 1617, by listing. (Race probes reverted: -3.)
     // And the three claimed-delivery tests (https://github.com/rrnewton/hermit/issues/4229): 1620.
     // And +3 from 8475d18e: 1623.
-    ("test.detcore_unit_on_host", 1623),
+    // And the three x86-64-v3 table tests: 1626.
+    ("test.detcore_unit_on_host", 1626),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3765,7 +3770,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the robust-word record-version test: 1043.
     // And the same three verify_inputs unit tests: 1046.
     // And the eleven xstate_probe tests: 1057.
-    ("test.hermit_unit_on_host", 1057),
+    // And the four cpu_profile_admission tests: 1061.
+    ("test.hermit_unit_on_host", 1061),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -3896,7 +3902,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from 843b8e10: 1088.
     // Four retained LiteInst initial-image wire and policy tests: 1092.
     // And the CpuProfile name test: 1093.
-    ("test.regular_crates_on_host", 1093),
+    // And the cpu_profile legacy-form test: 1094.
+    ("test.regular_crates_on_host", 1094),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
