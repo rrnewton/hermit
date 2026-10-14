@@ -1487,7 +1487,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And -58 from e4508c8d: 1033.
     // And the fixed-kernel-tables record-version test (B2b,
     // https://github.com/rrnewton/hermit/issues/4266): 1034.
-    ("test.hermit_unit", 1034),
+    // Six common DBT verification facts/ownership regressions: 1040, measured
+    // with the maintained third-party features and unchanged skip filters.
+    ("test.hermit_unit", 1040),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2133,7 +2135,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (the_long_tables_are_well_formed_and_count_nothing,
     // the_tables_describe_the_machine_consistently): 1560.
     // And only_a_descriptor_opened_for_reading_reads_procfs: 1561.
-    ("test.detcore_unit", 1561),
+    // Eight authenticated inherited-input OFD/root/read-direction/flags
+    // regressions retain the prior population: 1569, all executed by Nextest.
+    ("test.detcore_unit", 1569),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2953,7 +2957,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4275): 378, by listing.
     // And record_replay_reads_procfs_files_through_a_symbolic_link (B2b,
     // https://github.com/rrnewton/hermit/issues/4266): 379.
-    ("test.cli", 379),
+    // DBT verification byte/EOF replay and held-open input completion add
+    // two cases: 381, listed with the maintained features and skip filters.
+    ("test.cli", 381),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3262,7 +3268,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the paired recording-and-replay test: 314.
     // So does record_replay_reads_procfs_files_through_a_symbolic_link
     // (B2b): 315.
-    ("test.cli_on_host", 315),
+    // The same two DBT input verification cases: 317, independently listed
+    // with the maintained hosted exclusion expression and skip filters.
+    ("test.cli_on_host", 317),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3464,7 +3472,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the six adopted replay-fence tests: 1576.
     // B2b: eighteen sanitizer tests go, two table tests come: 1560.
     // And the procfs read-access test: 1561.
-    ("test.detcore_unit_on_host", 1561),
+    // The same eight inherited-input regressions: 1569, measured by the
+    // complete shared Detcore lib/bin selection.
+    ("test.detcore_unit_on_host", 1569),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3646,7 +3656,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the logged-vfork-rejoin record-epoch test: 1091.
     // And -58 from e4508c8d: 1033.
     // And the fixed-kernel-tables record-version test (B2b): 1034.
-    ("test.hermit_unit_on_host", 1034),
+    // The same six common DBT verification regressions: 1040; identical
+    // maintained lib/bin selection, measured without changing its skips.
+    ("test.hermit_unit_on_host", 1040),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
