@@ -351,8 +351,11 @@ manifest row are byte-identical between that focused run and Hermit main
 `538ddb26bb2ce92d9cc9bf4303d4e0f9602517a5`. No fresh guest run was taken for
 this documentation update while another full validate owned the machine.
 
-The following 27 candidates fail SaBRe's `Stripped` comparison or its timeout
-and remain disabled:
+The following 24 candidates fail SaBRe's `Stripped` comparison or its timeout
+and remain disabled. (Three more were removed from the manifests: the
+`qemu_init.c`, `qemu_net_init.c` and `qemu_exec_init.c` fixtures are a guest
+kernel's PID-1 init, booted by the `tests/qemu-boot` scripts, and cannot run
+as ordinary Hermit guests; https://github.com/rrnewton/hermit/issues/2102.)
 
 ```text
 bin-c/robust-futex-test
@@ -377,10 +380,7 @@ c-programs/thread-sync-determinism
 c-programs/vforkexec
 c-programs/writev-determinism
 determinism-stress-c/thread-contention
-shared-futex-c/qemu-exec-init
 shared-futex-c/qemu-hello
-shared-futex-c/qemu-init
-shared-futex-c/qemu-net-init
 util-c/pmu-skid
 ```
 

@@ -12,6 +12,7 @@
 //!   cargo run -p hermit-manifest-plan -- --format matrix-json
 //!   cargo run -p hermit-manifest-plan -- --format harness-json
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::path::PathBuf;
@@ -762,6 +763,7 @@ fn validate_test_inventory(
 
     let mut paths = Vec::with_capacity(files.len());
     let mut inventory_manifest_tests = BTreeSet::new();
+    let mut dispositions = BTreeMap::new();
     for (index, entry) in files.iter().enumerate() {
         let location = format!("{TEST_INVENTORY}: files[{index}]");
         let entry_object = entry
@@ -788,6 +790,7 @@ fn validate_test_inventory(
         if disposition == "manifest-test" {
             inventory_manifest_tests.insert(path.to_string());
         }
+        dispositions.insert(path.to_string(), disposition.to_string());
         paths.push(path.to_string());
     }
 
@@ -835,6 +838,96 @@ fn validate_test_inventory(
             "manifest programs and disposition=manifest-test inventory entries differ; missing={missing:?}, stale={stale:?}"
         ));
     }
+
+    let misregistered = misregistered_qemu_inits(
+        &qemu_boot_init_sources(repo_root),
+        manifest_programs,
+        &dispositions,
+    );
+    if !misregistered.is_empty() {
+        die(format!(
+            "these files are the PID-1 init of a guest kernel a tests/qemu-boot script boots in \
+             QEMU, which an ordinary Hermit guest cannot run (it powers the machine off), so each \
+             must be disposition=special-driver and not a manifest program \
+             (https://github.com/rrnewton/hermit/issues/2102): {misregistered:?}"
+        ));
+    }
+}
+
+/// The directory of the scripts that boot a guest kernel in QEMU under
+/// Hermit, each with a fixture as its init.
+const QEMU_BOOT_DIR: &str = "tests/qemu-boot";
+
+/// The fixtures the `tests/qemu-boot` scripts compile as a guest kernel's
+/// PID-1 init: the `$repo_root/tests/...` path each script assigns to
+/// `init_source` or `launcher_source`, with or without a `${VAR:-...}`
+/// override, keyed by path with the scripts that boot it.
+fn qemu_boot_init_sources(repo_root: &Path) -> BTreeMap<String, BTreeSet<String>> {
+    let mut sources = BTreeMap::<String, BTreeSet<String>>::new();
+    let directory = repo_root.join(QEMU_BOOT_DIR);
+    let Ok(entries) = std::fs::read_dir(&directory) else {
+        return sources;
+    };
+    for entry in entries {
+        let path = entry
+            .unwrap_or_else(|error| die(format!("cannot read {}: {error}", directory.display())))
+            .path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("sh") {
+            continue;
+        }
+        let script = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| die(format!("cannot read {}: {error}", path.display())));
+        let name = format!(
+            "{QEMU_BOOT_DIR}/{}",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+        );
+        for init in init_sources_in(&script) {
+            sources.entry(init).or_default().insert(name.clone());
+        }
+    }
+    sources
+}
+
+/// The `$repo_root/tests/...` paths `script` assigns to `init_source` or
+/// `launcher_source`.
+fn init_sources_in(script: &str) -> Vec<String> {
+    script
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("init_source=") || line.starts_with("launcher_source="))
+        .filter_map(|line| line.split_once("$repo_root/").map(|(_, rest)| rest))
+        .map(|rest| {
+            rest.split(|c: char| c == '}' || c == '"' || c.is_whitespace())
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .filter(|path| path.starts_with("tests/"))
+        .collect()
+}
+
+/// The QEMU init fixtures in `inits` that are registered as manifest programs
+/// or carry a disposition other than `special-driver`, each with why.
+fn misregistered_qemu_inits(
+    inits: &BTreeMap<String, BTreeSet<String>>,
+    manifest_programs: &BTreeSet<String>,
+    dispositions: &BTreeMap<String, String>,
+) -> Vec<String> {
+    inits
+        .iter()
+        .filter_map(|(path, scripts)| {
+            let disposition = dispositions.get(path).map(String::as_str);
+            (manifest_programs.contains(path) || disposition != Some("special-driver")).then(|| {
+                format!(
+                    "{path} (booted by {}; disposition {})",
+                    scripts.iter().cloned().collect::<Vec<_>>().join(", "),
+                    disposition.unwrap_or("none")
+                )
+            })
+        })
+        .collect()
 }
 
 /// The `tests/` population Git reports: tracked files plus untracked files that
@@ -3228,6 +3321,64 @@ mod runtime_root_tests {
         assert!(
             std::panic::catch_unwind(|| load_defaults(&missing)).is_err(),
             "an unavailable selected root must not fall back to the compiled checkout"
+        );
+    }
+
+    /// A tests/qemu-boot script's init fixture is a guest kernel's PID 1 and
+    /// powers the machine off, so it is refused as a manifest program or with
+    /// any disposition but `special-driver`
+    /// (https://github.com/rrnewton/hermit/issues/2102). The repository's own
+    /// scripts name the three such fixtures, and the inventory agrees.
+    #[test]
+    fn qemu_init_fixtures_are_special_driver_files_and_not_manifest_guests() {
+        let script = r#"
+repo_root=$(cd "$(dirname "$0")/../.." && pwd)
+init_source=$repo_root/tests/shared-futex-verify/qemu_init.c
+init_source=${INIT_SOURCE:-$repo_root/tests/shared-futex-verify/qemu_net_init.c}
+  launcher_source=$repo_root/tests/shared-futex-verify/qemu_exec_init.c
+hello_source=$repo_root/tests/shared-futex-verify/qemu_hello.c
+"#;
+        assert_eq!(
+            init_sources_in(script),
+            [
+                "tests/shared-futex-verify/qemu_init.c",
+                "tests/shared-futex-verify/qemu_net_init.c",
+                "tests/shared-futex-verify/qemu_exec_init.c",
+            ]
+        );
+
+        let inits = BTreeMap::from([(
+            "tests/a/init.c".to_string(),
+            BTreeSet::from(["tests/qemu-boot/boot.sh".to_string()]),
+        )]);
+        let special =
+            BTreeMap::from([("tests/a/init.c".to_string(), "special-driver".to_string())]);
+        assert!(misregistered_qemu_inits(&inits, &BTreeSet::new(), &special).is_empty());
+        let manifest = BTreeSet::from(["tests/a/init.c".to_string()]);
+        assert_eq!(
+            misregistered_qemu_inits(&inits, &manifest, &special).len(),
+            1
+        );
+        let guest = BTreeMap::from([("tests/a/init.c".to_string(), "manifest-test".to_string())]);
+        let refused = misregistered_qemu_inits(&inits, &BTreeSet::new(), &guest);
+        assert_eq!(
+            refused,
+            ["tests/a/init.c (booted by tests/qemu-boot/boot.sh; disposition manifest-test)"]
+        );
+        assert_eq!(
+            misregistered_qemu_inits(&inits, &BTreeSet::new(), &BTreeMap::new()).len(),
+            1
+        );
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let found = qemu_boot_init_sources(&root);
+        assert_eq!(
+            found.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "tests/shared-futex-verify/qemu_exec_init.c",
+                "tests/shared-futex-verify/qemu_init.c",
+                "tests/shared-futex-verify/qemu_net_init.c",
+            ]
         );
     }
 }

@@ -4279,10 +4279,10 @@
       "why": "tests/shared-futex-verify/node_worker.js is owned by Hermit shared-futex integration targets: The `node_worker.js` guest exercises shared futexes through its managed runtime. The owning integration target starts the runtime and compares Hermit behavior; the generic manifest builder does not compile Java or coordinate Node workers."
     },
     {
-      "disposition": "manifest-test",
+      "disposition": "special-driver",
       "path": "tests/shared-futex-verify/qemu_exec_init.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/shared-futex-c.yaml (explicit mode selection; ci=false)",
-      "why": "tests/shared-futex-verify/qemu_exec_init.c is owned by target/debug/test-harness via tests/e2e/manifests/shared-futex-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "tests/qemu-boot/strict_l2_userspace_test.sh",
+      "why": "tests/shared-futex-verify/qemu_exec_init.c is the PID-1 init of a guest kernel that tests/qemu-boot/strict_l2_userspace_test.sh boots in QEMU under Hermit: it ends by powering the virtual machine off, which an ordinary Hermit guest cannot do, so it is never registered as a direct manifest guest (https://github.com/rrnewton/hermit/issues/2102)."
     },
     {
       "disposition": "manifest-test",
@@ -4291,16 +4291,16 @@
       "why": "tests/shared-futex-verify/qemu_hello.c is owned by target/debug/test-harness via tests/e2e/manifests/shared-futex-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
-      "disposition": "manifest-test",
+      "disposition": "special-driver",
       "path": "tests/shared-futex-verify/qemu_init.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/shared-futex-c.yaml (explicit mode selection; ci=false)",
-      "why": "tests/shared-futex-verify/qemu_init.c is owned by target/debug/test-harness via tests/e2e/manifests/shared-futex-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "tests/qemu-boot/strict_l2_test.sh and tests/qemu-boot/smoke_test.sh",
+      "why": "tests/shared-futex-verify/qemu_init.c is the PID-1 init of a guest kernel that tests/qemu-boot/strict_l2_test.sh and tests/qemu-boot/smoke_test.sh boot in QEMU under Hermit: it ends by powering the virtual machine off, which an ordinary Hermit guest cannot do, so it is never registered as a direct manifest guest (https://github.com/rrnewton/hermit/issues/2102)."
     },
     {
-      "disposition": "manifest-test",
+      "disposition": "special-driver",
       "path": "tests/shared-futex-verify/qemu_net_init.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/shared-futex-c.yaml (explicit mode selection; ci=false)",
-      "why": "tests/shared-futex-verify/qemu_net_init.c is owned by target/debug/test-harness via tests/e2e/manifests/shared-futex-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+      "runner": "tests/qemu-boot/strict_l2_network_test.sh",
+      "why": "tests/shared-futex-verify/qemu_net_init.c is the PID-1 init of a guest kernel that tests/qemu-boot/strict_l2_network_test.sh boots in QEMU under Hermit: it ends by powering the virtual machine off, which an ordinary Hermit guest cannot do, so it is never registered as a direct manifest guest (https://github.com/rrnewton/hermit/issues/2102)."
     },
     {
       "disposition": "guest-fixture",

@@ -99,9 +99,6 @@ language-runtimes/ruby-random naked -
 language-runtimes/ruby-random verify kvm
 language-runtimes/rust-hashmap-iteration naked -
 language-runtimes/tcl-rand-clock naked -
-shared-futex-c/qemu-exec-init verify ptrace
-shared-futex-c/qemu-init verify ptrace
-shared-futex-c/qemu-net-init verify ptrace
 system-utils/date-nanoseconds naked -
 system-utils/example-devrand verify sabre
 system-utils/mcookie-random naked -
