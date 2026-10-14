@@ -1537,7 +1537,11 @@ fi
 # The added commits change only reverie-kvm (src/executor.rs); every SDK recipe
 # input, build.rs and the vendored DynamoRIO tree are unchanged, and no
 # reverie-dbt file is added (inventory 950), so the budgets above carry.
-expected_pin=b99a5584a49d72710de78ddc8a1ef698121990ff
+# KVM SLICE 4a SDK-BUDGET CARRY (2026-10-14): advance from b99a5584 to 2abc36517cdcedd071077d888bab5c241fa21d3f.
+# The added commits change only reverie-kvm (src/clock.rs); every SDK recipe
+# input, build.rs and the vendored DynamoRIO tree are unchanged, and no
+# reverie-dbt file is added (inventory 950), so the budgets above carry.
+expected_pin=2abc36517cdcedd071077d888bab5c241fa21d3f
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
