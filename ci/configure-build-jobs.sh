@@ -1587,8 +1587,14 @@ fi
 # The added commits change only reverie-kvm (bootstrap.rs); every SDK recipe
 # input, build.rs and the vendored DynamoRIO tree are unchanged, and no
 # reverie-dbt file is added (inventory 950), so the budgets above carry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 9d2eaaf69a7dfa39824a8b9ec50b45b51a17a216 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 9d2eaaf69a7dfa39824a8b9ec50b45b51a17a216 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# SHARED RPC CLIENT SDK-BUDGET CARRY (2026-10-14):
+# 9d2eaaf69a7dfa39824a8b9ec50b45b51a17a216 -> 4e8fae52ce142dc37645822cb713e152134abf04.
+# Only Rust RPC clients, shared codec code and their tests change. build.rs,
+# native/ (including CMake), the DynamoRIO/vendor and third-party trees, root
+# and DBT manifests, and toolchain are identical. Inventory rises 950 -> 951.
+# Existing SDK budgets carry; no new build timing or runtime artifact is claimed.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 4e8fae52ce142dc37645822cb713e152134abf04 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 4e8fae52ce142dc37645822cb713e152134abf04 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
