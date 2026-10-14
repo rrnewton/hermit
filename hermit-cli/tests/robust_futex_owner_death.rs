@@ -1161,7 +1161,7 @@ fn ptrace_records_a_self_aliased_word_woken_once_and_refuses_older_recordings() 
     );
     assert_nonempty_canonical_l2(&verify_json, &verified.stdout, &verified.stderr);
 
-    // A kept recording, replayed as made and then relabelled 0x14f.
+    // A kept recording, replayed as made and then relabelled 0x150.
     let data_dir = build_root.join("recording");
     let _ = fs::remove_dir_all(&data_dir);
     fs::create_dir_all(&data_dir).expect("failed to create the recording directory");
@@ -1231,29 +1231,29 @@ fn ptrace_records_a_self_aliased_word_woken_once_and_refuses_older_recordings() 
     )
     .expect("recording metadata is not JSON");
     assert_eq!(
-        metadata["version"], 0x150,
+        metadata["version"], 0x151,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
-    metadata["version"] = serde_json::json!(0x14f);
+    metadata["version"] = serde_json::json!(0x150);
     fs::write(
         &metadata_path,
         serde_json::to_vec(&metadata).expect("failed to serialize the metadata"),
     )
     .expect("failed to rewrite the recording metadata");
     let refused = replay(
-        "replay of the recording relabelled 0x14f",
-        "replay-0x14f",
+        "replay of the recording relabelled 0x150",
+        "replay-0x150",
         false,
     );
     assert!(
         refused.stderr.contains("Version mismatch"),
-        "a 0x14f recording was not refused by the version gate\nstdout:\n{}\nstderr:\n{}",
+        "a 0x150 recording was not refused by the version gate\nstdout:\n{}\nstderr:\n{}",
         refused.stdout,
         refused.stderr,
     );
     assert!(
         !refused.stdout.contains("BOUNDARY:"),
-        "the 0x14f recording's guest ran before the refusal\nstdout:\n{}",
+        "the 0x150 recording's guest ran before the refusal\nstdout:\n{}",
         refused.stdout,
     );
 }

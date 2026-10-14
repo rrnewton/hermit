@@ -481,7 +481,12 @@ impl RecordVersion {
 // successor, was woken again, waking a second waiter Linux leaves to time out.
 // Replay recomputes the wakes, so an older recording of such an exit would
 // replay with one wake fewer: a successful replay with different output.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x150);
+// 0x150 -> 0x151: a recording can carry the x86-64-v3 CPU profile and the
+// host xstate facts its guest's CPUID leaf 0xD and XCOMP answers came from
+// (https://github.com/rrnewton/hermit/issues/4243). An older replayer would
+// ignore them and replay a v3 recording against the v2 table, so its guest
+// would see a different CPU.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x151);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -506,7 +511,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x150);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x150;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x151;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -572,6 +577,18 @@ pub struct Metadata {
     /// interfaces and ports they were recorded against.
     #[serde(default)]
     pub local_networking: Option<bool>,
+    /// The CPU the guest saw (<https://github.com/rrnewton/hermit/issues/4243>).
+    /// Absent means x86-64-v2.
+    #[serde(default)]
+    pub cpu_profile: detcore_model::cpu_profile::CpuProfile,
+    /// Under x86-64-v3, the host facts the guest's leaf 0xD and XCOMP answers
+    /// came from. Replay refuses a host where any of them differs.
+    #[serde(default)]
+    pub cpu_profile_host: Option<detcore_model::cpu_profile::HostXstate>,
+    /// Under x86-64-v3, the hex SHA-256 of the full CPUID table and the bound
+    /// host facts (`detcore::virtual_cpuid_digest`). Replay recomputes it.
+    #[serde(default)]
+    pub cpu_table_digest: Option<String>,
 }
 
 impl Metadata {
@@ -627,6 +644,9 @@ impl Metadata {
             mountinfo_mount_ids_captured: false,
             mount_id_assignment_order: Vec::new(),
             local_networking: None,
+            cpu_profile: Default::default(),
+            cpu_profile_host: None,
+            cpu_table_digest: None,
         })
     }
 
@@ -1437,6 +1457,14 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_from_before_mask_aware_timer_targets() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x14e)));
+    }
+
+    /// A replayer older than 0x151 ignores a recording's CPU profile and would
+    /// replay an x86-64-v3 guest against the v2 table
+    /// (<https://github.com/rrnewton/hermit/issues/4243>).
+    #[test]
+    fn record_version_rejects_streams_from_before_cpu_profiles() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x150)));
     }
 
     #[test]
