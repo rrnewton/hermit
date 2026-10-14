@@ -2185,7 +2185,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +3 from 8475d18e: 1623.
     // And +1 from 4afd3a3e: 1624.
     // And +7 from bd38bb81: 1631.
-    ("test.detcore_unit", 1631),
+    // And detlog::tests::counts_are_untouched_until_the_first_record: 1632.
+    ("test.detcore_unit", 1632),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3589,7 +3590,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +3 from 8475d18e: 1623.
     // And +1 from 4afd3a3e: 1624.
     // And +7 from bd38bb81: 1631.
-    ("test.detcore_unit_on_host", 1631),
+    // And detlog::tests::counts_are_untouched_until_the_first_record: 1632.
+    ("test.detcore_unit_on_host", 1632),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
