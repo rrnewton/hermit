@@ -544,6 +544,15 @@ given both; the comparison refuses directories that differ in either. Where
 status is not one `--verify-allow` admits), the second directory need not
 exist.
 
+The two runs above differ in one way their guest can see. Hermit is the
+guest's PID 1, so a guest that reads `/proc/1/cmdline` (as `ps aux` does)
+sees `run1` in one and `run2` in the other. A guest that reads its own
+descriptor paths, such as `readlink /proc/self/fd/1`, likewise sees each run's
+own output file. To compare such a guest, give both runs the same paths: run
+them one after the other with one `--verify-run` directory, moved aside after
+each run, or give each run a private mount namespace in which a fresh tmpfs
+holds that path. The test harness does the first.
+
 ### Record And Replay
 
 Record/replay is experimental. Unlike deterministic `run`, record mode captures
