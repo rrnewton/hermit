@@ -150,6 +150,9 @@
         lua5_4 gnum4 nodejs openssh ruby tcl util-linux procps
         # These outputs are not implied by their runtime libraries.
         bzip2.bin curl.bin glibc.bin hostname
+        # sysfs_rtc_determinism reads the RTC through zsh, one of the shells
+        # whose view it checks (https://github.com/rrnewton/hermit/issues/4355).
+        zsh
       ];
 
       # The CLI replay tests run GDB outside Hermit and execute Python commands.
@@ -167,6 +170,12 @@
       # not on LIBRARY_PATH, which made the link fail with
       # `unable to find library -llzma`.
       nativeLibs = with pkgs; [ libunwind elfutils zlib openssl xz ];
+      # Static glibc for tests that compile a static guest, such as
+      # kvm_info_log_determinism's kvm_memory_hashes_repeat_for_a_static_guest
+      # (https://github.com/rrnewton/hermit/issues/4355). It is only on
+      # LIBRARY_PATH, after the compiler wrapper's own glibc, so a dynamic link
+      # still finds libc.so first and only `-static` uses libc.a.
+      staticLibs = [ pkgs.glibc.static ];
       # ⚠️ unixtools.xxd IS A BUILD DEPENDENCY, NOT A CONVENIENCE. e9patch's Makefile
       # generates two C sources by running `xxd -i` over its loader binaries
       # (Makefile:73 and :79). Without it the build dies at `Error 127` -- command not
@@ -191,7 +200,7 @@
           # Fixed timestamp: a build whose output moves with the wall clock
           # cannot be checked for reproducibility.
           created = "1970-01-01T00:00:01Z";
-          contents = guestTools ++ buildTools ++ testTools ++ [
+          contents = guestTools ++ buildTools ++ testTools ++ staticLibs ++ [
             pkgs.dockerTools.binSh
             pkgs.dockerTools.usrBinEnv
             pkgs.dockerTools.caCertificates
@@ -230,7 +239,7 @@
               "HERMIT_CARGO_NEXTEST_VERSION=${cargoNextestVersion}"
               "PKG_CONFIG_PATH=${pkgs.lib.makeSearchPathOutput "dev" "lib/pkgconfig" nativeLibs}"
               "CPATH=${pkgs.lib.makeSearchPathOutput "dev" "include" nativeLibs}"
-              "LIBRARY_PATH=${pkgs.lib.makeLibraryPath nativeLibs}"
+              "LIBRARY_PATH=${pkgs.lib.makeLibraryPath (nativeLibs ++ staticLibs)}"
               "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
               # The run is offline by construction; make a stray fetch fail loudly
               # rather than silently reach a network that a rebuild will not have.
