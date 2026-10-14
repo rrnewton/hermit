@@ -1552,7 +1552,11 @@ fi
 # KVM RDPMC SDK-BUDGET CARRY (2026-10-14): advance from e1ecaeb3 to 16ffab7c558c47c78c43aa8e0e4242eb2deeeb3d (the KVM lane's rdpmc counter
 # reads, re-parented by the coordinator onto DBT D3). The added commit changes only reverie-kvm; no SDK
 # recipe input, build.rs or vendored DynamoRIO file changes and no reverie-dbt file is added.
-expected_pin=16ffab7c558c47c78c43aa8e0e4242eb2deeeb3d
+# KVM K-DUP SDK-BUDGET CARRY (2026-10-14): advance from 16ffab7c to eeeb87dc47142c1359b22495ea00b3015df50923.
+# The added commit changes only reverie-kvm (src/executor.rs, src/bootstrap.rs and tests/static_elf.rs); every SDK
+# recipe input, build.rs and the vendored DynamoRIO tree are unchanged, and no reverie-dbt file is added
+# (inventory 952), so the budgets above carry.
+expected_pin=eeeb87dc47142c1359b22495ea00b3015df50923
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
