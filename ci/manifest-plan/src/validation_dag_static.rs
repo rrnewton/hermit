@@ -1037,7 +1037,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retain all 1085: 1087.
     // And +1 from 843b8e10: 1088.
     // Four retained LiteInst initial-image wire and policy tests: 1092.
-    ("test.regular_crates", 1092),
+    // And detcore-model's CpuProfile name test
+    // (https://github.com/rrnewton/hermit/issues/4243): 1093, listed.
+    ("test.regular_crates", 1093),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1497,7 +1499,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4238): 1043.
     // And the three verify_inputs unit tests (the native-exec pairing seam,
     // https://github.com/rrnewton/hermit/issues/4275): 1046, listed.
-    ("test.hermit_unit", 1046),
+    // And the eleven xstate_probe tests of the x86-64-v3 qualification
+    // (https://github.com/rrnewton/hermit/issues/4243): 1057, listed.
+    ("test.hermit_unit", 1057),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3760,7 +3764,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the mask-aware timer target record-epoch test: 1042.
     // And the robust-word record-version test: 1043.
     // And the same three verify_inputs unit tests: 1046.
-    ("test.hermit_unit_on_host", 1046),
+    // And the eleven xstate_probe tests: 1057.
+    ("test.hermit_unit_on_host", 1057),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -3890,7 +3895,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // counter: 1087.
     // And +1 from 843b8e10: 1088.
     // Four retained LiteInst initial-image wire and policy tests: 1092.
-    ("test.regular_crates_on_host", 1092),
+    // And the CpuProfile name test: 1093.
+    ("test.regular_crates_on_host", 1093),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
