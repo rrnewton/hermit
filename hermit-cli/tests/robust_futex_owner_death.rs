@@ -1161,7 +1161,7 @@ fn ptrace_records_a_self_aliased_word_woken_once_and_refuses_older_recordings() 
     );
     assert_nonempty_canonical_l2(&verify_json, &verified.stdout, &verified.stderr);
 
-    // A kept recording, replayed as made and then relabelled 0x14f.
+    // A kept recording, replayed as made and then relabelled 0x154.
     let data_dir = build_root.join("recording");
     let _ = fs::remove_dir_all(&data_dir);
     fs::create_dir_all(&data_dir).expect("failed to create the recording directory");
@@ -1231,32 +1231,33 @@ fn ptrace_records_a_self_aliased_word_woken_once_and_refuses_older_recordings() 
     )
     .expect("recording metadata is not JSON");
     // 0x150 made this change; later changes moved the version on (0x154 is
-    // https://github.com/rrnewton/hermit/pull/4314), and a recording from
+    // https://github.com/rrnewton/hermit/pull/4314, 0x155
+    // https://github.com/rrnewton/hermit/pull/4351), and a recording from
     // before the change, 0x14f, is still refused by the exact-match gate.
     assert_eq!(
-        metadata["version"], 0x154,
+        metadata["version"], 0x155,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
-    metadata["version"] = serde_json::json!(0x14f);
+    metadata["version"] = serde_json::json!(0x154);
     fs::write(
         &metadata_path,
         serde_json::to_vec(&metadata).expect("failed to serialize the metadata"),
     )
     .expect("failed to rewrite the recording metadata");
     let refused = replay(
-        "replay of the recording relabelled 0x14f",
-        "replay-0x14f",
+        "replay of the recording relabelled 0x154",
+        "replay-0x154",
         false,
     );
     assert!(
         refused.stderr.contains("Version mismatch"),
-        "a 0x14f recording was not refused by the version gate\nstdout:\n{}\nstderr:\n{}",
+        "a 0x154 recording was not refused by the version gate\nstdout:\n{}\nstderr:\n{}",
         refused.stdout,
         refused.stderr,
     );
     assert!(
         !refused.stdout.contains("BOUNDARY:"),
-        "the 0x14f recording's guest ran before the refusal\nstdout:\n{}",
+        "the 0x154 recording's guest ran before the refusal\nstdout:\n{}",
         refused.stdout,
     );
 }

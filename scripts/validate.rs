@@ -17377,7 +17377,7 @@ mod nextest_timeout_tests {
             "privileged-only-test.cli_kvm_on_host",
         ] {
             let step = config.steps.iter().find(|step| step.tag() == tag).unwrap();
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "78");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "79");
             // Unwrap the pinned-root shell argument when present, then exercise
             // the actual committed jq predicate without opening /dev/kvm.
             let mut words = shell_words::split(&step.cmd).unwrap();
@@ -17408,10 +17408,12 @@ mod nextest_timeout_tests {
         // run_kvm_fifo_with_a_host_peer_waits_in_the_kernel_as_on_linux
         // (https://github.com/rrnewton/hermit/pull/4318): 76. And
         // run_kvm_costs_one_host_syscall_per_guest_syscall
-        // (https://github.com/rrnewton/hermit/issues/4287): 77.
+        // (https://github.com/rrnewton/hermit/issues/4287): 77. And
+        // run_kvm_rt_sigtimedwait_writes_its_siginfo_as_ptrace_does
+        // (https://github.com/rrnewton/hermit/issues/4293): 78.
         assert_eq!(
             names.len(),
-            77,
+            78,
             "update the exact CI inventory with new KVM tests"
         );
         let required_cases = [
@@ -17425,6 +17427,7 @@ mod nextest_timeout_tests {
             "run_kvm_a_parked_sleep_carries_the_deadline_cap",
             "run_kvm_fifo_with_a_host_peer_waits_in_the_kernel_as_on_linux",
             "run_kvm_costs_one_host_syscall_per_guest_syscall",
+            "run_kvm_rt_sigtimedwait_writes_its_siginfo_as_ptrace_does",
         ];
         for required in required_cases {
             assert!(names.iter().any(|name| name == required));
@@ -18471,7 +18474,10 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // declarations, 77 selected.
         // run_kvm_costs_one_host_syscall_per_guest_syscall
         // (https://github.com/rrnewton/hermit/issues/4287): 77 declarations, 78 selected.
-        ("privileged-only-test.cli_kvm", 78usize),
+        // run_kvm_rt_sigtimedwait_writes_its_siginfo_as_ptrace_does
+        // (https://github.com/rrnewton/hermit/issues/4293): 78 declarations,
+        // 79 selected.
+        ("privileged-only-test.cli_kvm", 79usize),
     ] {
         let step = privileged
             .steps
