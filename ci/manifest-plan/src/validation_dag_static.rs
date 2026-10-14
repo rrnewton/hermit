@@ -1468,7 +1468,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // library's a_manifest_only_recording_can_be_removed;
     // https://github.com/rrnewton/hermit/issues/4271): 1080, listed with this
     // node's arguments.
-    ("test.hermit_unit", 1080),
+    // And the three network and syscall-recording manifest unit tests
+    // (manifest::tests::a_network_manifest_names_and_checks_its_trace,
+    // manifest::tests::pruning_spares_recordings_the_user_asked_for,
+    // run_config::tests::from_a_network_manifest_replays_its_trace;
+    // https://github.com/rrnewton/hermit/issues/4271 slice 2): 1083, listed
+    // with this node's arguments.
+    ("test.hermit_unit", 1083),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3535,7 +3541,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the virtual-cpuinfo record-epoch test: 1068.
     // And the hermit-dap --listen address test: 1069.
     // And the eleven run-manifest unit tests: 1080.
-    ("test.hermit_unit_on_host", 1080),
+    // And the three network and syscall-recording manifest unit tests: 1083.
+    ("test.hermit_unit_on_host", 1083),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
