@@ -465,7 +465,13 @@ impl RecordVersion {
 // (https://github.com/rrnewton/hermit/issues/4304). Replay recomputes the
 // schedule and futex results, so an older recording of such an exit would
 // replay with the handler in another thread and a different futex result.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x14e);
+// 0x14e -> 0x14f: a pause or nanosleep that a child-exit SIGCHLD from the
+// scheduler wakes is resumed first, as a woken futex waiter is, so the sleeper,
+// not a running sibling, takes the signal and returns EINTR
+// (https://github.com/rrnewton/hermit/issues/4333). Replay recomputes the
+// schedule, so an older recording of such an exit would replay with the
+// handler in another thread and the sleep still asleep.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x14f);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -490,7 +496,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x14e);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x14e;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x14f;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1370,6 +1376,16 @@ mod tests {
     /// thread-directed SIGCHLD did not end a precise futex wait, or, before
     /// https://github.com/rrnewton/hermit/pull/4177 (at 0x148), an emulated
     /// pause or nanosleep (https://github.com/rrnewton/hermit/issues/4132).
+    /// A recording older than 0x14f was made when a `pause` or `nanosleep` a
+    /// child-exit `SIGCHLD` from the scheduler woke could follow a running
+    /// sibling, which then took the signal
+    /// (https://github.com/rrnewton/hermit/issues/4333).
+    #[test]
+    fn record_version_rejects_streams_from_before_a_woken_sleep_takes_its_sigchld() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x14e)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x14d)));
+    }
+
     /// A recording older than 0x14e was made when a child-exit `SIGCHLD` the
     /// scheduler sent a parked futex waiter could be deferred behind a
     /// runnable sibling, which then took it
