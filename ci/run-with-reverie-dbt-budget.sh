@@ -1518,7 +1518,11 @@ fi
 # The added commits change only reverie-kvm (runtime.rs, vm.rs and a test); every SDK recipe
 # input, build.rs and the vendored DynamoRIO tree are unchanged, and no
 # reverie-dbt file is added (inventory 950), so the budgets above carry.
-expected_pin=bb8c1d6b66c79f1dd6fb3b387a55b133de44c6f4
+# KVM OWNER-CHANGE SDK-BUDGET CARRY (2026-10-14): advance from bb8c1d6b to 3ce79a486c8333469874963686487da3bd9b8228.
+# The added commits change only reverie-kvm (entry/owner.rs); every SDK recipe
+# input, build.rs and the vendored DynamoRIO tree are unchanged, and no
+# reverie-dbt file is added (inventory 950), so the budgets above carry.
+expected_pin=3ce79a486c8333469874963686487da3bd9b8228
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
