@@ -1638,8 +1638,9 @@ fi
 # KVM IMMEDIATE-EXIT SDK-BUDGET CARRY (2026-10-14): advance from 193968de to d60812b68751ef4b11ba8ae222c38781fda98cde (KVM entries stop with immediate_exit instead of per-entry signal syscalls; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
 # KVM CHEAP-COPY SDK-BUDGET CARRY (2026-10-14): advance from d60812b6 to 502bea229f32ce7bdb50d73c7b8d2572bdf2688a (cheaper KVM guest-memory copies and entry checks; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
 # ALLOCATOR-CHECKER CARRY (2026-10-14): advance from 502bea22 to 370eb86a01ec9fa316d90699bd64992906efade0 (LiteInst M1 checker admits the measured 0x128 Detcore TLS layout; changes only scripts/m1_artifact.rs, inventory unchanged), so the budgets above carry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 370eb86a01ec9fa316d90699bd64992906efade0 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 370eb86a01ec9fa316d90699bd64992906efade0 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# KVM EMPTY-SIGNAL-BOUNDARY SDK-BUDGET CARRY (2026-10-14): advance from 370eb86a to 4b633f7ff9df174f05bdeac9dc7f31cba08a4b73 (KVM lazily registers wakes and can skip empty signal boundaries for an opted-in Tool; changes reverie-kvm and adds one GlobalTool method defaulting to false in reverie, reverie-dbt sources and inventory unchanged), so the budgets above carry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 4b633f7ff9df174f05bdeac9dc7f31cba08a4b73 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 4b633f7ff9df174f05bdeac9dc7f31cba08a4b73 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
