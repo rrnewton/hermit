@@ -1529,7 +1529,13 @@ fi
 # the coordinator onto DBT D1). The added commit changes only reverie-kvm (guest-memory
 # deferred-failure check); every SDK recipe input, build.rs and the vendored DynamoRIO tree are
 # unchanged, and no reverie-dbt file is added, so the budgets above carry.
-expected_pin=ea20a636c2999320d4d31979f3a6d04577273bae
+# INHERITED INPUT SDK-BUDGET CARRY (2026-10-14):
+# ea20a636c2999320d4d31979f3a6d04577273bae -> 7034c358130eed9054e03c08487afe18fcdfbfa8.
+# Shared Rust startup/input ownership and launcher tests change; build.rs,
+# native/CMake, vendor/DynamoRIO, manifests and toolchain inputs are unchanged.
+# The added launcher test raises the tracked DBT inventory 951 -> 952.
+# Existing SDK budgets carry; no matching native/Rust artifact or timing is claimed.
+expected_pin=7034c358130eed9054e03c08487afe18fcdfbfa8
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
