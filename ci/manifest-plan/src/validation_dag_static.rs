@@ -3033,7 +3033,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the four cpu_profile_v3 tests
     // (https://github.com/rrnewton/hermit/issues/4243): 395, listed with this
     // node's arguments.
-    ("test.cli", 395),
+    // And cpu_profile_v3_lazy_binding_xsave_is_identical_on_the_hashed_stack and
+    // cpu_profile_v3_replay_refuses_a_recording_from_a_different_cpu: 397.
+    ("test.cli", 397),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3362,7 +3364,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two verify_inputs CLI tests: 326.
     // And the inherited-pipe capacity test: 327, by listing.
     // And the four cpu_profile_v3 tests: 331, listed with this node's arguments.
-    ("test.cli_on_host", 331),
+    // And the lazy-binding XSAVE stack test and the v3 replay-refusal test: 333.
+    ("test.cli_on_host", 333),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
