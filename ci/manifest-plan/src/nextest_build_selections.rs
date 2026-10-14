@@ -799,8 +799,10 @@ mod tests {
             // plus the 67 tests of the 55 binaries no node ran before that pass on the
             // host and in the pinned root
             // (https://github.com/rrnewton/hermit/issues/2791), plus the 32
-            // tests of the six DBT binaries that now take the hermetic workdir.
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "400");
+            // tests of the six DBT binaries that now take the hermetic workdir,
+            // plus the four DBT and ptrace exec owner-death tests
+            // (https://github.com/rrnewton/hermit/issues/4268).
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "404");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

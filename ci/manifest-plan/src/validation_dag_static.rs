@@ -2169,7 +2169,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_signal_to_a_thread_with_a_deferred_sigchld_delivery_readmits_it and
     // syscalls::signal::tests::a_claimed_sigchld_stays_claimed_while_pending
     // (https://github.com/rrnewton/hermit/issues/4229): 1620, listed.
-    ("test.detcore_unit", 1620),
+    // And the exec reconnect's robust-wake delivery, drop and terminal-exec
+    // tests (https://github.com/rrnewton/hermit/issues/4268): 1623, listed.
+    ("test.detcore_unit", 1623),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2405,7 +2407,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // pinned root (dbt_copied_tty, random_determinism, proc_fd_link_determinism,
     // socket_timestamp_determinism, socket_ioctl_timestamp_determinism,
     // waitid_signal_interrupt): 32 more tests, 400, listed.
-    ("test.hermit_integration", 400),
+    // And the two DBT exec owner-death tests and the DBT and ptrace
+    // one-waiter-per-word exec tests
+    // (https://github.com/rrnewton/hermit/issues/4268): 404.
+    ("test.hermit_integration", 404),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -3561,7 +3566,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the 22 ITIMER_REAL coalescing tests: 1616, by listing.
     // And the host pipe-capacity ceiling test: 1617, by listing. (Race probes reverted: -3.)
     // And the three claimed-delivery tests (https://github.com/rrnewton/hermit/issues/4229): 1620.
-    ("test.detcore_unit_on_host", 1620),
+    // And the three exec robust-wake tests: 1623, by listing.
+    ("test.detcore_unit_on_host", 1623),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3613,7 +3619,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the ptrace shared-alias and self-alias record tests: 301.
     // And the same 55 newly registered binaries: 368.
     // And the same six DBT binaries: 400.
-    ("test.hermit_integration_on_host", 400),
+    // And the four DBT and ptrace exec owner-death tests: 404.
+    ("test.hermit_integration_on_host", 404),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
