@@ -1614,8 +1614,14 @@ fi
 # afa7e5e191d8561fd9e4fd0c2231d49d07eb45dc. The added commits change reverie-inguest, reverie-liteinst, scripts/m1_artifact.rs,
 # reverie-process (tokio 1.53.3 lint fixes) and one line of reverie-dbt/src/launcher.rs; no SDK recipe
 # input, build.rs or vendored DynamoRIO file changes and no reverie-dbt file is added, so the budgets carry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != afa7e5e191d8561fd9e4fd0c2231d49d07eb45dc ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie afa7e5e191d8561fd9e4fd0c2231d49d07eb45dc (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# INHERITED-INPUT SDK-BUDGET CARRY (2026-10-14): advance from afa7e5e1 to
+# 0d054e2abd05e0572bf080c88307072a44ebb0c7. The shared GlobalTool hook and DBT Reader pipe
+# ownership affect host Rust code and tests only. build.rs, native CMake,
+# the vendored DynamoRIO source, dependencies and toolchain are unchanged.
+# Tracked reverie-dbt inventory is 952. Existing budgets carry; this is not
+# a new SDK timing sample or a claim of new runtime artifact validation.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 0d054e2abd05e0572bf080c88307072a44ebb0c7 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 0d054e2abd05e0572bf080c88307072a44ebb0c7 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
