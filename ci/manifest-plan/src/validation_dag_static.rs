@@ -1485,7 +1485,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And metadata::tests::record_version_rejects_streams_from_before_logged_vfork_rejoins
     // (https://github.com/rrnewton/hermit/issues/4211): 1091, listed.
     // And -58 from e4508c8d: 1033.
-    ("test.hermit_unit", 1033),
+    // Six common DBT verification facts/ownership regressions: 1039, measured
+    // with the maintained third-party features and unchanged skip filters.
+    ("test.hermit_unit", 1039),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2125,7 +2127,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/pull/4298 (replay_fires_due_timers_one_per_turn_*
     // three times, replay_refuses_a_due_rejoin_once_the_stall_valve_passes,
     // replay_refuses_at_once_*, record_and_run_are_never_fenced): 1572, listed.
-    ("test.detcore_unit", 1576),
+    // Eight authenticated inherited-input OFD/root/read-direction/flags
+    // regressions retain the prior population: 1584, all executed by Nextest.
+    ("test.detcore_unit", 1584),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2937,7 +2941,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4132): 377.
     // And the paired recording-and-replay test
     // (https://github.com/rrnewton/hermit/issues/4275): 378, by listing.
-    ("test.cli", 378),
+    // DBT verification byte/EOF replay and held-open input completion add
+    // two cases: 380, listed with the maintained features and skip filters.
+    ("test.cli", 380),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3244,7 +3250,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // So do the four guest SIGCHLD futex-wait tests
     // (https://github.com/rrnewton/hermit/issues/4132): 313.
     // And the paired recording-and-replay test: 314.
-    ("test.cli_on_host", 314),
+    // The same two DBT input verification cases: 316, independently listed
+    // with the maintained hosted exclusion expression and skip filters.
+    ("test.cli_on_host", 316),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -3443,7 +3451,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // complete Cargo nextest lib/bin selection; integration cases are separate.
     // And the five vfork-rejoin scheduler tests: 1566.
     // And the six adopted replay-fence tests: 1576.
-    ("test.detcore_unit_on_host", 1576),
+    // The same eight inherited-input regressions: 1584, measured by the
+    // complete shared Detcore lib/bin selection.
+    ("test.detcore_unit_on_host", 1584),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -3623,7 +3633,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // command line (https://github.com/rrnewton/hermit/issues/4271): 1090.
     // And the logged-vfork-rejoin record-epoch test: 1091.
     // And -58 from e4508c8d: 1033.
-    ("test.hermit_unit_on_host", 1033),
+    // The same six common DBT verification regressions: 1039; identical
+    // maintained lib/bin selection, measured without changing its skips.
+    ("test.hermit_unit_on_host", 1039),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
