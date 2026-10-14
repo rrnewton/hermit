@@ -1545,7 +1545,11 @@ fi
 # The added commits change only reverie-kvm (src/entry.rs, src/entry/signal.rs, src/clock.rs, README.md and tests); every SDK recipe
 # input, build.rs and the vendored DynamoRIO tree are unchanged, and no
 # reverie-dbt file is added (inventory 950), so the budgets above carry.
-expected_pin=6dd1d62bf71ae171945feed82154a43aedf555bf
+# KVM RDPMC SDK-BUDGET CARRY (2026-10-14): advance from 6dd1d62b to db45771340ae766f146fdcaab2ffe21b81bef959.
+# The added commits change only reverie-kvm (src/clock.rs and its tests); every SDK recipe
+# input, build.rs and the vendored DynamoRIO tree are unchanged, and no
+# reverie-dbt file is added (inventory 950), so the budgets above carry.
+expected_pin=db45771340ae766f146fdcaab2ffe21b81bef959
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
