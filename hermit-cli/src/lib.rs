@@ -2517,8 +2517,11 @@ async fn run_sabre(
                     path.display()
                 )
             })?;
-        serde_json::to_writer(&mut file, &supervised.path_evidence)?;
-        writeln!(file)?;
+        // One write per line: the two runs of a verify pair can append to
+        // the same file at once, and Linux keeps a single append whole.
+        let mut line = serde_json::to_vec(&supervised.path_evidence)?;
+        line.push(b'\n');
+        file.write_all(&line)?;
     }
     let output = Output {
         status: supervised.status.into(),

@@ -3232,9 +3232,17 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     let mut cell_cpu_usage_usec = Some(0u64);
     let mut cpu_measurements = 0usize;
     let expected = cells.len();
+    let cell_capacity = context.cell_capacity();
+    if context.runs_pairs_at_once() {
+        eprintln!(
+            "test-harness: a verify pair's two runs execute at once where its inputs allow; up to {} of {} cell(s) at a time",
+            cell_capacity.workers_for(expected),
+            expected
+        );
+    }
     for_each_parallel(
         expected,
-        capacity,
+        cell_capacity,
         |index, emit| {
             let cell = &cells[index];
             if let Some(imported) = &imported {

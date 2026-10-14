@@ -2656,6 +2656,10 @@ pub struct CellRunSpec {
     attempt: String,
     #[serde(skip)]
     fixed_workdir_source: PathBuf,
+    /// For a separate pair ([`VERIFY_SEPARATE_PAIR_NAME`]), each entry of
+    /// [`VERIFY_RUN_INPUTS_DIR`] and the cell directory it links to.
+    #[serde(skip)]
+    separate_inputs: Vec<(&'static str, PathBuf)>,
 }
 
 /// The existing pressure-test result vocabulary for one executed cell.
@@ -3502,6 +3506,26 @@ impl RunContext {
     ) -> Self {
         self.scheduled_worker_capacity = scheduled_worker_capacity;
         self
+    }
+
+    /// Whether a separate pair's two runs execute at once
+    /// ([`VERIFY_CONCURRENT_PAIR_NAME`]): only as root, where each can have a
+    /// private mount namespace, and only with room for two runs.
+    pub fn runs_pairs_at_once(&self) -> bool {
+        self.scheduled_worker_capacity.configured() >= 2 && unsafe { libc::geteuid() } == 0
+    }
+
+    /// How many cells run at once. Where a pair's two runs execute at once,
+    /// half as many cells as `--jobs`, so no more Hermit runs execute at once
+    /// than one run per job, within the memory and CPU the jobs were sized
+    /// for.
+    pub fn cell_capacity(&self) -> ScheduledWorkerCapacity {
+        let configured = self.scheduled_worker_capacity.configured();
+        if self.runs_pairs_at_once() {
+            ScheduledWorkerCapacity::new(configured / 2)
+        } else {
+            self.scheduled_worker_capacity
+        }
     }
 }
 
@@ -4399,16 +4423,24 @@ fn verify_attempt_invocation_error(
     // The paired program ([`VERIFY_PAIR_SCRIPT`]): the comparison, then the
     // run command.
     let paired = &attempt.argv;
-    let program = ["bash", "-c", VERIFY_PAIR_SCRIPT, VERIFY_PAIR_NAME];
+    let program = ["bash", "-c", VERIFY_PAIR_SCRIPT];
     if paired
         .get(..program.len())
         .is_none_or(|words| words.iter().map(String::as_str).ne(program))
+        || !paired.get(program.len()).is_some_and(|name| {
+            [
+                VERIFY_PAIR_NAME,
+                VERIFY_SEPARATE_PAIR_NAME,
+                VERIFY_CONCURRENT_PAIR_NAME,
+            ]
+            .contains(&name.as_str())
+        })
     {
         return Err("is not the paired verification program the executor runs".into());
     }
     // Both commands start with the Hermit binary; the run starts at its
     // second appearance, as the script finds it.
-    let commands = &paired[program.len()..];
+    let commands = &paired[program.len() + 1..];
     let run_start = commands
         .iter()
         .skip(1)
@@ -5019,6 +5051,33 @@ pub fn build_spec(
     let mut verification_log_dir = None;
     let verify_runs = matches!(cell.id.mode.as_str(), "verify" | "chaos" | "replay")
         .then(|| dir.join("verify-runs").join(attempt));
+    // A verify cell whose every writable input is per run, the equalized
+    // inputs and either the hermetic tmpfs or the bound per-attempt workdir,
+    // can give each run its own copy of them ([`VERIFY_SEPARATE_PAIR_NAME`]).
+    // A manifest workdir is a host directory the two runs would share, and so
+    // is one a guest argument names below the harness's own trees (the compat
+    // corpus hands its scripts work directories under target/).
+    let separate_inputs = match (&verify_runs, cell.id.mode.as_str()) {
+        (Some(_), "verify")
+            if equalized_inputs
+                && (isolated || cell_workdir(cell).is_none())
+                && !names_harness_path(context, &guest_argv) =>
+        {
+            let mut inputs: Vec<(&'static str, PathBuf)> = EQUALIZED_INPUTS
+                .iter()
+                .map(|input| (input.cell_subdir, dir.join(input.cell_subdir)))
+                .collect();
+            if !isolated {
+                inputs.push((VERIFY_RUN_WORKDIR_INPUT, fixed_workdir_source.clone()));
+            }
+            inputs
+        }
+        _ => Vec::new(),
+    };
+    let separate_root = verify_runs
+        .as_deref()
+        .filter(|_| !separate_inputs.is_empty())
+        .map(|runs| runs.join(VERIFY_RUN_ROOT_DIR));
     let (argv, verdict_path) = match cell.id.mode.as_str() {
         "naked" => (guest_argv.clone(), None),
         mode @ ("verify" | "replay" | "chaos") => {
@@ -5046,6 +5105,7 @@ pub fn build_spec(
                 verdict: &verdict,
                 verification_log_dir: verification_log_dir.as_deref(),
                 verify_runs: verify_runs.as_deref(),
+                separate_root: separate_root.as_deref(),
                 bound_workdir_source,
                 equalized_inputs_dir: equalized_inputs.then_some(dir.as_path()),
                 env: &env,
@@ -5106,6 +5166,7 @@ pub fn build_spec(
         },
         attempt: attempt.into(),
         fixed_workdir_source,
+        separate_inputs,
     })
 }
 
@@ -5132,6 +5193,9 @@ struct VerifiedInvocationArgs<'a> {
     /// The attempt's `verify-runs/<attempt>` directory, for a verify or chaos
     /// attempt ([`VERIFY_PAIR_SCRIPT`]).
     verify_runs: Option<&'a Path>,
+    /// For a separate pair, the path below which each run finds its own copy
+    /// of the inputs, which are bound from there.
+    separate_root: Option<&'a Path>,
     bound_workdir_source: Option<&'a Path>,
     /// The cell directory whose inputs are bound at their guest paths, for an
     /// equalized cell.
@@ -5195,11 +5259,7 @@ fn probe_relaxation(cell: &SelectedCell, backend: &str) -> Option<&'static str> 
 /// when a run leaves no
 /// record (Hermit refused it before it started) the attempt ends with that
 /// run's status and output, after the comparison has stamped its report. Each
-/// run's own stderr is passed on, run 1's first. The two runs execute one
-/// after the other, on the same workdir and inputs, as `run --verify`'s do: a
-/// bind source's host path is visible to the guest in /proc/self/mountinfo,
-/// so two concurrent runs could not each have their own without the guest
-/// seeing the difference.
+/// run's own stderr is passed on, run 1's first.
 ///
 /// Each run also writes to the same path, `run` beside the two directories,
 /// which is moved to its own directory once the run has ended. Hermit is
@@ -5209,6 +5269,24 @@ fn probe_relaxation(cell: &SelectedCell, backend: &str) -> Option<&'static str> 
 /// guests, and compat/ps, compat/pgrep and compat/pkill diverged on exactly
 /// that. `run --verify` gave its two runs one command line; this gives them
 /// one too.
+///
+/// Run as [`VERIFY_PAIR_NAME`], the two runs execute one after the other on
+/// the cell's own inputs, as `run --verify`'s do, so run 2 sees what run 1
+/// left there. Run as [`VERIFY_SEPARATE_PAIR_NAME`], for a verify cell whose
+/// inputs are all bound from below [`VERIFY_RUN_ROOT_DIR`], each run gets its
+/// own copy of them at that one path: the entries of
+/// [`VERIFY_RUN_INPUTS_DIR`], symbolic links to the cell's directories, are
+/// copied there before the run, and the run's evidence is written below it
+/// too; the runs execute one after the other, each from a fresh copy. Run as
+/// [`VERIFY_CONCURRENT_PAIR_NAME`], where `unshare --mount` can give each run
+/// a private mount namespace with a fresh tmpfs at that path, the two runs
+/// execute at once, each in its own, and one after the other where it cannot.
+/// Either way the two guests read one command line, one working
+/// directory, one path for every file Hermit holds open, and one mount table,
+/// which they could not if each run's files had their own host path: a
+/// guest's `readlink /proc/self/fd/1` prints its stdout file's host path. A
+/// run 2 that the allowance would not have started has its evidence
+/// discarded, so the comparison reads what a sequential pair leaves.
 const VERIFY_PAIR_SCRIPT: &str = r#"set -u
 for ((start = 2; start <= $#; start++)); do
   [[ ${!start} == "$1" ]] && break
@@ -5220,9 +5298,40 @@ allow=success
 for word in "${comparison[@]}"; do
   case $word in --verify-allow=*) allow=${word#--verify-allow=} ;; esac
 done
-staging=${directories[0]%/*}/run
+runs=${directories[0]%/*}
+staging=$runs/run
+separation=shared
+if [[ $0 == hermit-verify-separate-pair || $0 == hermit-verify-concurrent-pair ]]; then
+  staging=$runs/root/run
+  mkdir -p "$runs/root"
+  separation=copy
+  if [[ $0 == hermit-verify-concurrent-pair ]] &&
+    unshare --mount --propagation private mount -t tmpfs hermit-verify-run "$runs/root" 2>/dev/null; then
+    separation=namespace
+  fi
+fi
+execute() {
+  local directory=$1 status
+  case $separation in
+    namespace) mount -t tmpfs hermit-verify-run "$runs/root" || return 125 ;;
+    copy) { rm -rf "$runs/root" && mkdir "$runs/root"; } || return 125 ;;
+  esac
+  if [[ $separation != shared ]]; then
+    cp -a -H "$runs/inputs"/* "$runs/root"/ || return 125
+  fi
+  "${words[@]}" >"$staging.stdout" 2>"$staging.stderr"
+  status=$?
+  mv "$staging.stdout" "$directory.stdout"
+  mv "$staging.stderr" "$directory.stderr"
+  if [[ -e $staging ]]; then
+    mv "$staging" "$directory"
+  fi
+  [[ $separation == copy ]] && rm -rf "$runs/root"
+  return "$status"
+}
 verify_run() {
-  local directory=$1 status word words=()
+  local directory=$1 word
+  words=()
   for word in "${run[@]}"; do
     if [[ $word == @VERIFY_REPLAY_OF@ ]]; then
       [[ $directory == "${directories[1]}" ]] && words+=(--verify-replay-of "${directories[0]}")
@@ -5231,40 +5340,102 @@ verify_run() {
     [[ $word == @VERIFY_RUN_DIR@ ]] && word=$staging
     words+=("$word")
   done
-  "${words[@]}" >"$staging.stdout" 2>"$staging.stderr"
-  status=$?
-  mv "$staging.stdout" "$directory.stdout"
-  mv "$staging.stderr" "$directory.stderr"
-  if [[ -e $staging ]]; then
-    mv "$staging" "$directory"
+  if [[ $separation == namespace ]]; then
+    unshare --mount --propagation private "$BASH" -c \
+      "$(declare -p runs staging separation words); $(declare -f execute); execute \"\$1\"" \
+      hermit-verify-run "$directory"
+  else
+    execute "$directory"
   fi
-  return "$status"
 }
 end_without_comparison() {
   cat "$1.stdout"
   "${comparison[@]}" >/dev/null 2>&1
   exit "$2"
 }
-verify_run "${directories[0]}"
-status=$?
+discard() {
+  rm -rf "$1" "$1.stdout" "$1.stderr"
+}
+if [[ $separation == namespace ]]; then
+  verify_run "${directories[0]}" &
+  first=$!
+  verify_run "${directories[1]}" &
+  second=$!
+  wait "$first"
+  status=$?
+  wait "$second"
+  second_status=$?
+else
+  verify_run "${directories[0]}"
+  status=$?
+fi
 cat "${directories[0]}.stderr" >&2
-[[ -e ${directories[0]}/verify-run.json ]] || end_without_comparison "${directories[0]}" "$status"
+if [[ ! -e ${directories[0]}/verify-run.json ]]; then
+  discard "${directories[1]}"
+  end_without_comparison "${directories[0]}" "$status"
+fi
 case $allow in
   success) admitted=$((status == 0)) ;;
   failure) admitted=$((status != 0)) ;;
   *) admitted=1 ;;
 esac
 if ((admitted)); then
-  verify_run "${directories[1]}"
-  status=$?
+  if [[ $separation != namespace ]]; then
+    verify_run "${directories[1]}"
+    second_status=$?
+  fi
   cat "${directories[1]}.stderr" >&2
-  [[ -e ${directories[1]}/verify-run.json ]] || end_without_comparison "${directories[1]}" "$status"
+  [[ -e ${directories[1]}/verify-run.json ]] || end_without_comparison "${directories[1]}" "$second_status"
+else
+  discard "${directories[1]}"
 fi
 exec "${comparison[@]}"
 "#;
 
-/// `$0` of [`VERIFY_PAIR_SCRIPT`], which names it in the shell's own messages.
+/// `$0` of [`VERIFY_PAIR_SCRIPT`], which names it in the shell's own messages,
+/// for a pair whose runs share the cell's inputs.
 const VERIFY_PAIR_NAME: &str = "hermit-verify-pair";
+
+/// `$0` of [`VERIFY_PAIR_SCRIPT`] for a pair whose runs each get their own
+/// copy of the inputs, one after the other.
+const VERIFY_SEPARATE_PAIR_NAME: &str = "hermit-verify-separate-pair";
+
+/// `$0` of [`VERIFY_PAIR_SCRIPT`] for a separate pair whose runs execute at
+/// once, each in a private mount namespace, where `unshare --mount` can give
+/// them one ([`RunContext::runs_pairs_at_once`]).
+const VERIFY_CONCURRENT_PAIR_NAME: &str = "hermit-verify-concurrent-pair";
+
+/// Whether a guest argument names a path below the harness's checkout
+/// `target/`, result root or build root, which two runs at once would share.
+fn names_harness_path(context: &RunContext, guest_argv: &[String]) -> bool {
+    let roots = [
+        context.root.join("target"),
+        context.result_root.clone(),
+        context.build_root.clone(),
+    ];
+    let roots: Vec<String> = roots
+        .iter()
+        .map(|root| root.to_string_lossy().into_owned())
+        .collect();
+    guest_argv
+        .iter()
+        .skip(1)
+        .any(|arg| roots.iter().any(|root| arg.contains(root.as_str())))
+}
+
+/// The directory below an attempt's `verify-runs/<attempt>` directory where a
+/// separate pair's run finds its own copy of the inputs, and writes its
+/// evidence ([`VERIFY_PAIR_SCRIPT`]).
+const VERIFY_RUN_ROOT_DIR: &str = "root";
+
+/// The directory below an attempt's `verify-runs/<attempt>` directory whose
+/// entries, symbolic links to the cell's input directories, a separate pair
+/// copies into [`VERIFY_RUN_ROOT_DIR`] for each run.
+const VERIFY_RUN_INPUTS_DIR: &str = "inputs";
+
+/// The entry of [`VERIFY_RUN_INPUTS_DIR`] for the per-attempt workdir a cell
+/// outside the hermetic path binds at [`FIXED_GUEST_WORKDIR`].
+const VERIFY_RUN_WORKDIR_INPUT: &str = "workdir";
 
 /// The word of a paired run command that `VERIFY_PAIR_SCRIPT` replaces with
 /// the one path both executions write their `--verify-run` directory at.
@@ -5298,6 +5469,7 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
         verdict,
         verification_log_dir,
         verify_runs,
+        separate_root,
         bound_workdir_source,
         equalized_inputs_dir,
         env,
@@ -5404,16 +5576,17 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
             .iter()
             .map(|directory| directory.to_string_lossy().into_owned()),
     );
+    let separate_workdir = separate_root.map(|root| root.join(VERIFY_RUN_WORKDIR_INPUT));
     append_execution_root_args(
         &mut argv,
         backend,
         context.isolated_workdir.as_deref(),
         cell_workdir(cell).as_deref(),
-        bound_workdir_source,
+        separate_workdir.as_deref().or(bound_workdir_source),
     );
     let isolated = context.isolated_workdir.is_some();
     if let Some(cell_dir) = equalized_inputs_dir {
-        append_equalized_input_binds(&mut argv, cell_dir);
+        append_equalized_input_binds(&mut argv, separate_root.unwrap_or(cell_dir));
         append_guest_env_args(&mut argv, &equalized_guest_env(env), isolated);
     } else {
         append_guest_env_args(&mut argv, env, isolated);
@@ -5423,7 +5596,12 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
     }
     argv.push("--".into());
     argv.extend(guest_argv.iter().cloned());
-    paired_verification_argv(comparison, argv)
+    let name = match separate_root {
+        Some(_) if context.runs_pairs_at_once() => VERIFY_CONCURRENT_PAIR_NAME,
+        Some(_) => VERIFY_SEPARATE_PAIR_NAME,
+        None => VERIFY_PAIR_NAME,
+    };
+    pair_argv(name, comparison, argv)
 }
 
 /// The argv of `VERIFY_PAIR_SCRIPT` comparing two executions of the `run`
@@ -5431,11 +5609,16 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
 /// verified attempt. `run` carries `--verify-run @VERIFY_RUN_DIR@`; the last
 /// two words of `comparison` are the attempt's run1 and run2 directories.
 pub fn paired_verification_argv(comparison: Vec<String>, run: Vec<String>) -> Vec<String> {
+    pair_argv(VERIFY_PAIR_NAME, comparison, run)
+}
+
+/// The argv of `VERIFY_PAIR_SCRIPT` run as `name`.
+fn pair_argv(name: &str, comparison: Vec<String>, run: Vec<String>) -> Vec<String> {
     let mut paired = vec![
         "bash".into(),
         "-c".into(),
         VERIFY_PAIR_SCRIPT.into(),
-        VERIFY_PAIR_NAME.into(),
+        name.into(),
     ];
     paired.extend(comparison);
     paired.extend(run);
@@ -5657,6 +5840,17 @@ fn execute_spec_until(
         }
         fs::create_dir_all(verify_runs)
             .map_err(|e| format!("cannot create {}: {e}", verify_runs.display()))?;
+        if !spec.separate_inputs.is_empty() {
+            let inputs = verify_runs.join(VERIFY_RUN_INPUTS_DIR);
+            fs::create_dir(&inputs)
+                .map_err(|e| format!("cannot create {}: {e}", inputs.display()))?;
+            for (name, target) in &spec.separate_inputs {
+                std::os::unix::fs::symlink(target, inputs.join(name))
+                    .map_err(|e| format!("cannot link {}: {e}", inputs.join(name).display()))?;
+            }
+            let root = verify_runs.join(VERIFY_RUN_ROOT_DIR);
+            fs::create_dir(&root).map_err(|e| format!("cannot create {}: {e}", root.display()))?;
+        }
     }
     let captures = spec.cell_dir.join("captures");
     fs::create_dir_all(&captures).map_err(|e| e.to_string())?;
@@ -11047,6 +11241,265 @@ esac
         assert_eq!(output.status.code(), Some(122));
     }
 
+    /// Run as [`VERIFY_SEPARATE_PAIR_NAME`] or [`VERIFY_CONCURRENT_PAIR_NAME`],
+    /// every run gets a fresh copy of the inputs at the one path the run
+    /// command binds them from, and writes its evidence below that path; the
+    /// cell's own inputs are never written. The concurrent pair's runs execute
+    /// at once where this test is root, each in a private mount namespace, so
+    /// only what both orders agree on is asserted.
+    #[test]
+    fn a_separate_pair_gives_each_run_a_fresh_copy_of_its_inputs_at_one_path() {
+        let root_dir = std::env::temp_dir().join(format!(
+            "hermit-runner-separate-pair-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root_dir);
+        fs::create_dir_all(&root_dir).unwrap();
+        struct Root(PathBuf);
+        impl Drop for Root {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Root(root_dir.clone());
+        let as_root = Command::new("id")
+            .arg("-u")
+            .output()
+            .is_ok_and(|output| output.stdout == b"0\n");
+        let hermit = root_dir.join("hermit");
+        // `$FAKE_RUN` is both runs' behaviour, as in the paired program's test.
+        // Each run logs its --verify-run path, whether its HOME copy already
+        // held a mark, and the input it read, then leaves a mark there.
+        fs::write(
+            &hermit,
+            r#"#!/bin/sh
+log="$(dirname "$0")/calls"
+if [ "$1" = log-diff ]; then
+  printf 'compare %s\n' "$*" >> "$log"
+  echo "comparison stdout"
+  echo "comparison stderr" >&2
+  exit 9
+fi
+while [ "$#" -gt 0 ]; do
+  case $1 in
+    --verify-run) directory=$2 ;;
+    --bind=*:/tmp/e2e/home) home=${1#--bind=}; home=${home%:/tmp/e2e/home} ;;
+  esac
+  shift
+done
+mark=fresh
+[ -e "$home/mark" ] && mark=marked
+printf 'run %s %s %s\n' "$directory" "$mark" "$(cat "$home/input")" >> "$log"
+: > "$home/mark"
+echo "run stderr" >&2
+case $FAKE_RUN in
+  refuse) echo "HERMIT_POLICY_REFUSAL class=policy-refusal" >&2; exit 122 ;;
+  record:*) mkdir "$directory"; : > "$directory/verify-run.json"; exit "${FAKE_RUN#record:}" ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&hermit, fs::Permissions::from_mode(0o755)).unwrap();
+        let hermit = hermit.to_string_lossy().into_owned();
+        let cell_home = root_dir.join("home");
+        fs::create_dir(&cell_home).unwrap();
+        fs::write(cell_home.join("input"), "cell input").unwrap();
+        let pair = |name: &str, label: &str, behaviour: &str| {
+            let runs_dir = root_dir.join(format!("{name}-{label}"));
+            let inputs = runs_dir.join(VERIFY_RUN_INPUTS_DIR);
+            fs::create_dir_all(&inputs).unwrap();
+            std::os::unix::fs::symlink(&cell_home, inputs.join("home")).unwrap();
+            let run_root = runs_dir.join(VERIFY_RUN_ROOT_DIR);
+            let [first, second] = verify_run_directories(&runs_dir);
+            let argv = [
+                "-c".to_string(),
+                VERIFY_PAIR_SCRIPT.into(),
+                name.into(),
+                hermit.clone(),
+                "log-diff".into(),
+                "--verify-json".into(),
+                "report.json".into(),
+                first.to_string_lossy().into_owned(),
+                second.to_string_lossy().into_owned(),
+                hermit.clone(),
+                "run".into(),
+                "--verify-run".into(),
+                VERIFY_RUN_DIR_PLACEHOLDER.into(),
+                format!("--bind={}/home:/tmp/e2e/home", run_root.display()),
+                "--".into(),
+                "guest".into(),
+            ];
+            let _ = fs::remove_file(root_dir.join("calls"));
+            let output = Command::new("bash")
+                .args(argv)
+                .env("FAKE_RUN", behaviour)
+                .output()
+                .unwrap();
+            let calls = fs::read_to_string(root_dir.join("calls")).unwrap();
+            (output, calls, run_root, first, second)
+        };
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+        let runs = |calls: &str| {
+            calls
+                .lines()
+                .filter(|line| line.starts_with("run "))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+
+        for (name, at_once) in [
+            (VERIFY_SEPARATE_PAIR_NAME, false),
+            (VERIFY_CONCURRENT_PAIR_NAME, as_root),
+        ] {
+            // Both runs read the cell's input from a copy at one path that no
+            // other run marked, and the cell's own directory stays unwritten.
+            let (output, calls, run_root, first, second) = pair(name, "both", "record:0");
+            assert_eq!(output.status.code(), Some(9), "{}", text(&output.stderr));
+            assert_eq!(text(&output.stdout), "comparison stdout\n");
+            assert_eq!(
+                text(&output.stderr),
+                "run stderr\nrun stderr\ncomparison stderr\n"
+            );
+            let line = format!("run {}/run fresh cell input", run_root.display());
+            assert_eq!(runs(&calls), [line.clone(), line], "{name}");
+            assert!(!cell_home.join("mark").exists());
+            assert!(
+                first.join("verify-run.json").exists() && second.join("verify-run.json").exists()
+            );
+            assert!(!run_root.join("run").exists() && !run_root.join("home").exists());
+
+            // A status the allowance refuses leaves no run 2 for the
+            // comparison, whether or not run 2 executed.
+            let (output, calls, _, first, second) = pair(name, "rejected", "record:3");
+            assert_eq!(output.status.code(), Some(9));
+            assert_eq!(runs(&calls).len(), if at_once { 2 } else { 1 }, "{name}");
+            assert!(first.exists() && !second.exists());
+            assert!(!second.with_extension("stderr").exists());
+
+            // A run 1 that leaves no record ends the attempt with its own
+            // status and stderr alone.
+            let (output, ..) = pair(name, "refused", "refuse");
+            assert_eq!(output.status.code(), Some(122));
+            assert_eq!(
+                text(&output.stderr),
+                "run stderr\nHERMIT_POLICY_REFUSAL class=policy-refusal\n"
+            );
+        }
+        drop(root);
+    }
+
+    /// A verify cell whose guest argument names a directory below the
+    /// harness's own trees, as the compat corpus hands its scripts work
+    /// directories under target/, keeps the pair on shared inputs: its two
+    /// runs would otherwise both write that one host directory at once.
+    #[test]
+    fn a_verify_cell_naming_a_harness_path_keeps_its_runs_on_shared_inputs() {
+        let root = PathBuf::from("/repo");
+        let cell = ptrace_cell("verify");
+        let context = run_context(&root);
+        let spec_for = |guest: Vec<String>| {
+            build_spec(
+                &context,
+                &cell,
+                root.join("results/cell"),
+                guest,
+                "1",
+                None,
+                cell.timeout_seconds,
+            )
+            .unwrap()
+        };
+        let shared = spec_for(vec![
+            "/repo/tests/compat/complex_shell_workload.sh".into(),
+            "/repo/target/validation/run-1/strict-compat/shell-build".into(),
+        ]);
+        assert_eq!(shared.argv[3], VERIFY_PAIR_NAME);
+        assert!(shared.separate_inputs.is_empty());
+        assert!(
+            shared
+                .argv
+                .iter()
+                .any(|arg| arg == "--bind=/repo/results/cell/home:/tmp/e2e/home")
+        );
+        // The program itself may live there; only its arguments decide.
+        let separate = spec_for(vec!["/repo/target/debug/guest".into(), "plain".into()]);
+        assert_ne!(separate.argv[3], VERIFY_PAIR_NAME);
+        assert!(!separate.separate_inputs.is_empty());
+    }
+
+    /// Without room for two runs, or not as root, a separate pair's runs
+    /// execute one after the other and every job runs a cell.
+    #[test]
+    fn pairs_run_at_once_only_as_root_with_room_for_both_runs() {
+        let root = PathBuf::from("/repo");
+        let one =
+            run_context(&root).with_scheduled_worker_capacity(ScheduledWorkerCapacity::new(1));
+        assert!(!one.runs_pairs_at_once());
+        assert_eq!(one.cell_capacity(), ScheduledWorkerCapacity::new(1));
+        let eight =
+            run_context(&root).with_scheduled_worker_capacity(ScheduledWorkerCapacity::new(8));
+        let as_root = unsafe { libc::geteuid() } == 0;
+        assert_eq!(eight.runs_pairs_at_once(), as_root);
+        assert_eq!(
+            eight.cell_capacity(),
+            ScheduledWorkerCapacity::new(if as_root { 4 } else { 8 })
+        );
+    }
+
+    /// The executor lays out a separate pair's inputs before the attempt: one
+    /// link per input to the cell directory, and the empty path each run's
+    /// copy goes to.
+    #[test]
+    fn a_separate_pair_attempt_links_each_input_from_its_verify_runs_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-separate-inputs-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let cell_dir = root.join("cell");
+        let cell = ptrace_cell("verify");
+        let context = run_context(&root);
+        let mut spec = build_spec(
+            &context,
+            &cell,
+            cell_dir.clone(),
+            vec!["/bin/true".into()],
+            "1",
+            None,
+            cell.timeout_seconds,
+        )
+        .unwrap();
+        assert!(
+            [VERIFY_SEPARATE_PAIR_NAME, VERIFY_CONCURRENT_PAIR_NAME]
+                .contains(&spec.argv[3].as_str())
+        );
+        let runs = spec.verify_runs.clone().unwrap();
+        let layout = root.join("layout");
+        spec.argv = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            r#"cd "$1/inputs" && for input in *; do printf '%s %s\n' "$input" "$(readlink "$input")"; done > "$2"; ls -A "$1/root" | wc -l >> "$2""#.into(),
+            "sh".into(),
+            runs.to_string_lossy().into_owned(),
+            layout.to_string_lossy().into_owned(),
+        ];
+        let _ = execute_spec(&spec);
+        let at = |name: &str| format!("{name} {}", cell_dir.join(name).display());
+        assert_eq!(
+            fs::read_to_string(&layout).unwrap(),
+            format!(
+                "{}\n{}\nworkdir {}\n{}\n0\n",
+                at("fixtures"),
+                at("home"),
+                cell_dir.join("workdir/1").display(),
+                at("xdg-config"),
+            )
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn a_verify_cell_carries_its_hermit_args_env_and_comparator() {
         let strict = extended_verify_spec(None);
@@ -11713,7 +12166,9 @@ esac
     }
 
     /// The guest of an equalized verify cell names only guest paths, and each
-    /// of the cell's input directories is bound at the path it names.
+    /// of the cell's input directories is bound at the path it names: from
+    /// the copy each run of attempt 1's separate pair gets of it, or from the
+    /// cell directory for a pair on shared inputs.
     fn assert_equalized_guest_env(argv: &[String], dir: &str, tmp: &str, jobs: &str) {
         assert_minimal_base_env(argv);
         assert_eq!(
@@ -11735,12 +12190,18 @@ esac
             .filter(|arg| arg.starts_with("--bind=") && arg.contains(EQUALIZED_INPUT_ROOT))
             .cloned()
             .collect::<Vec<_>>();
+        // A cell whose arguments name a harness path keeps shared inputs.
+        let root = if argv[3] == VERIFY_PAIR_NAME {
+            dir.to_string()
+        } else {
+            format!("{dir}/verify-runs/1/{VERIFY_RUN_ROOT_DIR}")
+        };
         assert_eq!(
             binds,
             [
-                format!("--bind={dir}/home:/tmp/e2e/home"),
-                format!("--bind={dir}/xdg-config:/tmp/e2e/xdg-config"),
-                format!("--bind={dir}/fixtures:/tmp/e2e/fixtures"),
+                format!("--bind={root}/home:/tmp/e2e/home"),
+                format!("--bind={root}/xdg-config:/tmp/e2e/xdg-config"),
+                format!("--bind={root}/fixtures:/tmp/e2e/fixtures"),
             ],
             "{argv:?}"
         );
@@ -11967,6 +12428,15 @@ esac
             })
             .expect("default workdir bind is present");
         PathBuf::from(bind)
+    }
+
+    /// The cell directory a separate pair's input `name` links to.
+    fn separate_input(spec: &CellRunSpec, name: &str) -> PathBuf {
+        spec.separate_inputs
+            .iter()
+            .find(|(input, _)| *input == name)
+            .map(|(_, target)| target.clone())
+            .unwrap_or_else(|| panic!("no separate input {name}: {:?}", spec.separate_inputs))
     }
 
     #[test]
@@ -12633,6 +13103,7 @@ esac
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: root.join("workdir/1"),
+            separate_inputs: Vec::new(),
         };
 
         // This is the exact boundary reached when the aggregate execution
@@ -13805,6 +14276,7 @@ esac
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: root.join(label).join("workdir/1"),
+            separate_inputs: Vec::new(),
         }
     }
 
@@ -16800,9 +17272,14 @@ backends_disabled:
         )
         .unwrap();
         assert_eq!(
-            bound_workdir_source(&spec),
+            separate_input(&spec, VERIFY_RUN_WORKDIR_INPUT),
             cell_dir.join("workdir/1"),
             "the ordinary supported path must retain hermit-132's per-attempt bind"
+        );
+        assert_eq!(
+            bound_workdir_source(&spec),
+            cell_dir.join("verify-runs/1/root/workdir"),
+            "each run binds its own copy of that workdir"
         );
         assert_eq!(
             spec.guest_argv[1],
@@ -17052,6 +17529,8 @@ backends_disabled:
                     "{name}"
                 );
             }
+            // Its embedded cell paths keep this cell's pair on shared inputs.
+            assert_eq!(reference.argv[3], VERIFY_PAIR_NAME);
             if isolated.is_none() {
                 assert_eq!(
                     bound_workdir_source(&reference),
@@ -18845,6 +19324,7 @@ exit "$(cat "$PWD/exit-status")"
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
+            separate_inputs: Vec::new(),
         };
         let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -18894,6 +19374,7 @@ exit "$(cat "$PWD/exit-status")"
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
+            separate_inputs: Vec::new(),
         };
         let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -21081,6 +21562,7 @@ exit "$(cat "$PWD/exit-status")"
             comparator,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
+            separate_inputs: Vec::new(),
         };
         let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -22286,6 +22768,7 @@ cp "{}" "$verdict"
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
+            separate_inputs: Vec::new(),
         };
         let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -23206,6 +23689,7 @@ cp "{}" "$verdict"
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
+            separate_inputs: Vec::new(),
         };
         let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -24085,11 +24569,17 @@ cp "{}" "$verdict"
                 cell.timeout_seconds,
             )
             .unwrap();
-            bound_workdir_source(&spec)
+            (
+                bound_workdir_source(&spec),
+                separate_input(&spec, VERIFY_RUN_WORKDIR_INPUT),
+            )
         };
+        // Each run binds its own copy of its attempt's workdir.
         let sources = [source_for("1"), source_for("2")];
-        assert_eq!(sources[0], cell_dir.join("workdir/1"));
-        assert_eq!(sources[1], cell_dir.join("workdir/2"));
+        assert_eq!(sources[0].0, cell_dir.join("verify-runs/1/root/workdir"));
+        assert_eq!(sources[1].0, cell_dir.join("verify-runs/2/root/workdir"));
+        assert_eq!(sources[0].1, cell_dir.join("workdir/1"));
+        assert_eq!(sources[1].1, cell_dir.join("workdir/2"));
         assert_ne!(sources[0], sources[1]);
         fs::remove_dir_all(root).unwrap();
     }
