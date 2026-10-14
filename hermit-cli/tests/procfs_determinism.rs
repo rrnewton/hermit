@@ -1026,6 +1026,27 @@ fn proc_self_mountinfo_shows_a_user_bind_over_private_tmp_at_its_target() {
     );
 }
 
+/// A bind-mount target outside /tmp that exists in every root these tests run
+/// in. Hermit installs a mount whose target is outside its private /tmp on the
+/// host's own tree, where it creates nothing, and mount(2) refuses a target that
+/// does not exist (ENOENT). `/mnt`, which these tests named before, is absent
+/// from the pinned validate root (https://github.com/rrnewton/hermit/issues/4326).
+fn bind_target_outside_tmp(name: &str) -> String {
+    let target = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("procfs-bind-targets")
+        .join(name);
+    fs::create_dir_all(&target).expect("create a bind target");
+    assert!(
+        !target.starts_with("/tmp"),
+        "the bind target {} must be outside /tmp, which Hermit replaces",
+        target.display()
+    );
+    target
+        .to_str()
+        .expect("the bind target path should be UTF-8")
+        .to_owned()
+}
+
 /// Two runs whose user binds have different host sources see the same
 /// mountinfo, byte for byte: every row of each bind, including a layer a
 /// later bind covers and a copy staged under Hermit's private /tmp, shows the
@@ -1043,13 +1064,14 @@ fn user_binds_with_different_sources_show_identical_mountinfo() {
             fs::create_dir_all(sources.path().join(name)).expect("create a bind source");
         }
     }
+    let outside = bind_target_outside_tmp("different-sources");
     let targets = [
         "/tmp/e2e/home",
         "/tmp/e2e/sub",
         "/tmp/e2e/again",
         "/tmp/e2e/layer",
         "/tmp/e2e/mounted",
-        "/mnt",
+        outside.as_str(),
     ];
     let read = |sources: &tempfile::TempDir| {
         let source = |name: &str| sources.path().join(name).display().to_string();
@@ -1065,7 +1087,7 @@ fn user_binds_with_different_sources_show_identical_mountinfo() {
                     source("staged")
                 ))
                 .arg(format!(
-                    "--mount=type=bind,source={},target=/mnt",
+                    "--mount=type=bind,source={},target={outside}",
                     source("data")
                 ));
         })
@@ -1094,9 +1116,9 @@ fn user_binds_with_different_sources_show_identical_mountinfo() {
                 "mountinfo has no row at {target}:\n{text}"
             );
             // Under /tmp, Hermit's private /tmp holds only these binds, so
-            // every row at the target is one of them. /mnt may also be a host
-            // mountpoint, whose own row the bind covers: there the top row is
-            // the bind's.
+            // every row at the target is one of them. Outside /tmp the target
+            // may also be a host mountpoint, whose own row the bind covers:
+            // there the top row is the bind's.
             let checked = if target.starts_with("/tmp/") {
                 &rows[..]
             } else {
@@ -1119,18 +1141,20 @@ fn user_binds_with_different_sources_show_identical_mountinfo() {
 }
 
 /// A user bind rewrites only its own rows. Host /tmp is the root of a btrfs
-/// subvolume here (`/tmpvol`), as other host mounts are; binding it at /mnt
-/// must not change the root of any other row.
+/// subvolume here (`/tmpvol`), as other host mounts are; binding it at a
+/// target outside /tmp must not change the root of any other row.
 #[test]
 fn a_user_bind_changes_no_other_rows_root() {
     let _guard = hermit_run_lock();
+    let target = bind_target_outside_tmp("no-other-rows");
+    let below = format!("{target}/");
     // Every row's root, in order, per mountpoint, covered layers included,
-    // outside /mnt (where the bind and the submounts it copies sit).
+    // outside the target (where the bind and the submounts it copies sit).
     let roots = |text: &str| {
         let mut roots = std::collections::BTreeMap::<String, Vec<String>>::new();
         for line in text.lines() {
             let fields = line.split(' ').collect::<Vec<_>>();
-            if fields[4] != "/mnt" && !fields[4].starts_with("/mnt/") {
+            if fields[4] != target && !fields[4].starts_with(&below) {
                 roots
                     .entry(fields[4].to_owned())
                     .or_default()
@@ -1143,7 +1167,7 @@ fn a_user_bind_changes_no_other_rows_root() {
         || {
             let plain = read_procfs_with("/proc/self/mountinfo", None, |_| {});
             let bound = read_procfs_with("/proc/self/mountinfo", None, |command| {
-                command.arg("--mount=type=bind,source=/tmp,target=/mnt");
+                command.arg(format!("--mount=type=bind,source=/tmp,target={target}"));
             });
             (plain, bound)
         },
@@ -1154,26 +1178,28 @@ fn a_user_bind_changes_no_other_rows_root() {
     assert_eq!(
         roots(bound),
         roots(plain),
-        "binding /tmp at /mnt changed another row:\n{bound}"
+        "binding /tmp at {target} changed another row:\n{bound}"
     );
-    let mnt = bound
+    let top = bound
         .lines()
-        .rfind(|line| line.split(' ').nth(4) == Some("/mnt"))
-        .unwrap_or_else(|| panic!("mountinfo has no row at /mnt:\n{bound}"));
-    assert_eq!(mnt.split(' ').nth(3), Some("/mnt"), "{mnt}");
+        .rfind(|line| line.split(' ').nth(4) == Some(target.as_str()))
+        .unwrap_or_else(|| panic!("mountinfo has no row at {target}:\n{bound}"));
+    assert_eq!(top.split(' ').nth(3), Some(target.as_str()), "{top}");
 }
 
 /// User mounts are installed in order, so an earlier one can change what a
 /// later one's source names (review of the mountinfo bind change,
 /// https://github.com/rrnewton/hermit/issues/4266). The first bind, whose
 /// source is a symbolic link, covers /var/tmp; the second binds /var/tmp at
-/// /mnt, which then mounts the first bind's source, not the host's /var/tmp.
+/// a target outside /tmp, which then mounts the first bind's source, not the
+/// host's /var/tmp.
 /// Both show their targets as roots and never the host source. A tmpfs then
 /// mounted at /var/tmp keeps its own root, `/`, above the bind it covers.
 #[test]
 fn user_binds_show_their_targets_whatever_earlier_mounts_did() {
     let _guard = hermit_run_lock();
     let sources = tempfile::tempdir().expect("create bind sources");
+    let outside = bind_target_outside_tmp("earlier-mounts");
     fs::create_dir_all(sources.path().join("real")).expect("create a link target");
     std::os::unix::fs::symlink("real", sources.path().join("link")).expect("create a link");
     let (plain, text) = assert_runs_equal_while_host_mountinfo_stable(
@@ -1185,7 +1211,9 @@ fn user_binds_show_their_targets_whatever_earlier_mounts_did() {
                         "--mount=type=bind,source={},target=/var/tmp",
                         sources.path().join("link").display()
                     ))
-                    .arg("--mount=type=bind,source=/var/tmp,target=/mnt")
+                    .arg(format!(
+                        "--mount=type=bind,source=/var/tmp,target={outside}"
+                    ))
                     .arg("--mount=type=tmpfs,target=/var/tmp");
             });
             (plain, bound)
@@ -1196,7 +1224,7 @@ fn user_binds_show_their_targets_whatever_earlier_mounts_did() {
     let text = std::str::from_utf8(&text).expect("mountinfo should be UTF-8");
     // The host's own rows at those mountpoints keep their roots: the binds
     // only add layers above them.
-    for target in ["/var/tmp", "/mnt"] {
+    for target in ["/var/tmp", outside.as_str()] {
         let roots = |text: &str| {
             text.lines()
                 .filter(|line| line.split(' ').nth(4) == Some(target))
@@ -1214,10 +1242,10 @@ fn user_binds_show_their_targets_whatever_earlier_mounts_did() {
         !text.contains(name),
         "a host source reached the guest:\n{text}"
     );
-    // Above the host's rows: at /mnt the bind; at /var/tmp the bind, then
-    // the tmpfs over it.
+    // Above the host's rows: at the outside target the bind; at /var/tmp the
+    // bind, then the tmpfs over it.
     for (target, added) in [
-        ("/mnt", &["/mnt"][..]),
+        (outside.as_str(), &[outside.as_str()][..]),
         ("/var/tmp", &["/var/tmp", "/"][..]),
     ] {
         let roots = text
