@@ -153,6 +153,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "key_users_determinism",
             "--test",
+            "kvm_info_log_determinism",
+            "--test",
             "kvm_lifecycle_timing_log_level",
             "--test",
             "leveldb",
@@ -268,6 +270,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "syscall_file_metadata",
             "--test",
             "syscall_quick_wins",
+            "--test",
+            "sysfs_rtc_determinism",
             "--test",
             "sysv_legacy_fallbacks",
             "--test",
@@ -813,8 +817,10 @@ mod tests {
             // plus cppc_feedback_determinism's and meminfo_determinism's one each
             // (https://github.com/rrnewton/hermit/issues/4355), plus redis_strict's
             // three, plus kvm_lifecycle_timing_log_level's and sqlite_veryquick's
-            // one each (https://github.com/rrnewton/hermit/issues/4321).
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "407");
+            // one each (https://github.com/rrnewton/hermit/issues/4321), plus
+            // sysfs_rtc_determinism's two and kvm_info_log_determinism's six
+            // (https://github.com/rrnewton/hermit/issues/4355).
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "415");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

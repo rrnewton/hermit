@@ -35,13 +35,13 @@ use sha2::Sha256;
 
 const PROVENANCE: &str = "ci/hermetic/image.provenance.json";
 const PIN: &str = "ci/hermetic/image.digest";
-const METHOD: &str = "two-clean-isolated-nix-stores-v1";
-const SUPERSEDED_REFERENCE: &str = "localhost/hermit-hermetic-validate@sha256:d4e585cb6baebf51ef3e52a3488f8fa6c1401379f2c0aa5e5e5a17121092ec95";
+const METHOD: &str = "two-clean-isolated-nix-stores-signed-substitution-v1";
+const SUPERSEDED_REFERENCE: &str = "localhost/hermit-hermetic-validate@sha256:29a8d19be045a4a14e9eeeb7b1bafcb9d6d44cb8cd2b2c120e6724763e63cf14";
 const SUPERSEDED_ARCHIVE_SHA256: &str =
-    "085b605dd6d17c59795ccc92b5cbd761424810ab156520a10474dc9e4a3c57d0";
-/// The replaced d4e5 root lacked the curl executable; the rationale must name
-/// the executable whose absence this repin repairs.
-const RATIONALE_MARKER: &str = "curl";
+    "7aeffce338a79d601c7352c80acd1ceca67547efcc02fd44e169ac465be6cd39";
+/// The replaced 29a8 root lacked zsh (and static glibc); the rationale must
+/// name the executable whose absence this repin repairs.
+const RATIONALE_MARKER: &str = "zsh";
 /// Both isolated builds recorded `nix --version` before building.
 const RECORDED_NIX_VERSION: &str = "nix (Nix) 2.35.2";
 const INPUT_PATHS: [&str; 4] = [
@@ -50,12 +50,14 @@ const INPUT_PATHS: [&str; 4] = [
     "ci/hermetic/flake.nix",
     "ci/hermetic/guest-paths.txt",
 ];
-const EVIDENCE_LIMITATIONS: [&str; 6] = [
-    "Each service ran with the systemd user manager's environment plus PATH and HOME; only those variable names were recorded, not their values.",
-    "Neither build used the network. Each new store could substitute only from the build host's default Nix store, and only paths signed with the cache.nixos.org key, the one key trusted, or content-addressed (derivation files and fixed-output sources, which Nix checks by hash); substituted paths are trusted by Nix signature or content hash and NAR hash, not rebuilt. Every unsigned path in the closure, including rust-script, cargo-nextest and coreutils, was rebuilt in each store.",
+const EVIDENCE_LIMITATIONS: [&str; 8] = [
+    "Each service ran with the systemd user manager's environment plus PATH, HOME and NIX_SSL_CERT_FILE; only those variable names were recorded, not their values.",
+    "Both builds used the network, only through the build host's forward proxy. Each new store substituted only paths signed with the cache.nixos.org key, the one key trusted, from https://cache.nixos.org, and downloaded fixed-output sources, which Nix checks by hash; substituted paths are trusted by Nix signature or content hash and NAR hash, not rebuilt. Every unsigned path in the closure, including rust-script, cargo-nextest and coreutils, was rebuilt in each store.",
+    "The two locked flake input sources, nixpkgs and rust-overlay, were copied into each new store from the build host's default Nix store before its build; both are content-addressed, and their NAR hashes equal the lock's.",
+    "The 29a8 receipt's method, substituting only from the build host's default store, was not repeatable on this build host: a local store used as a substituter handed over unsigned paths despite require-sigs, so a build against a warmed host store would copy those paths rather than rebuild them. This receipt substitutes only from cache.nixos.org instead.",
     "Both builds ran in the Nix build sandbox with /bin/sh bound to the static busybox at /nix/store/yysvxw5iwwijaci7ggrnms4mavwcjnpk-busybox-1.37.0 (NAR hash sha256-Qlx+BoVIaa3RubvM7Lr733QAcJpy4XZPFDX0d5XN9WA=), because the build host's /bin/sh links to a dynamically linked bash; that shell is unsigned and is not in the image.",
     "Build logs, unit records and Nix path-info records were retained only on the build host; this receipt does not authenticate them.",
-    "The superseded d4e5 archive was not rebuilt for this receipt; its 085b60 SHA-256 is carried from the d4e5 receipt.",
+    "The superseded 29a8 archive was not rebuilt for this receipt; its 7aeffc SHA-256 is carried from the 29a8 receipt.",
     "The recorded build-source commit and tree are historical review evidence. Rebases can rewrite their ancestry; live verification establishes equivalence only for the four enumerated image input files, not the complete source tree or archive.",
 ];
 
@@ -70,20 +72,20 @@ struct ExpectedRun {
 
 const EXPECTED_RUNS: [ExpectedRun; 2] = [
     ExpectedRun {
-        run_id: "hermetic-b898-a-curl.service",
-        source_snapshot_identity: "source-a.git-archive.tar@47:1981730721",
-        nix_store_identity: "build-a/nix-root/nix@47:1981733241",
+        run_id: "hermetic-cb74-a-zsh-signed.service",
+        source_snapshot_identity: "source-a.git-archive.tar@48:3111565669",
+        nix_store_identity: "build-a/nix-root/nix@48:3115490943",
         podman_store_identity: "build-a/podman-data",
-        memory_peak_bytes: 7_528_996_864,
-        cpu_nanoseconds: 1_180_895_998_000,
+        memory_peak_bytes: 6_800_330_752,
+        cpu_nanoseconds: 1_305_321_511_000,
     },
     ExpectedRun {
-        run_id: "hermetic-b898-b-curl.service",
-        source_snapshot_identity: "source-b.git-archive.tar@47:1981733239",
-        nix_store_identity: "build-b/nix-root/nix@47:1981735766",
+        run_id: "hermetic-cb74-b-zsh-signed.service",
+        source_snapshot_identity: "source-b.git-archive.tar@48:3111569960",
+        nix_store_identity: "build-b/nix-root/nix@48:3115514071",
         podman_store_identity: "build-b/podman-data",
-        memory_peak_bytes: 7_536_754_688,
-        cpu_nanoseconds: 1_179_648_165_000,
+        memory_peak_bytes: 6_780_776_448,
+        cpu_nanoseconds: 1_308_559_093_000,
     },
 ];
 
@@ -507,18 +509,18 @@ fn validate_semantics(root: &Value) -> Result<(), String> {
     let new = string(repin, "replacement_reference", "repin")?;
     if old != SUPERSEDED_REFERENCE {
         return Err(format!(
-            "repin.superseded_reference must retain the replaced d4e5 reference {SUPERSEDED_REFERENCE:?}"
+            "repin.superseded_reference must retain the replaced 29a8 reference {SUPERSEDED_REFERENCE:?}"
         ));
     }
     let old_archive = string(repin, "superseded_archive_sha256", "repin")?;
     if old_archive != SUPERSEDED_ARCHIVE_SHA256 {
         return Err(format!(
-            "repin.superseded_archive_sha256 must retain the d4e5 receipt's 085b60 archive SHA-256 {SUPERSEDED_ARCHIVE_SHA256:?}"
+            "repin.superseded_archive_sha256 must retain the 29a8 receipt's 7aeffc archive SHA-256 {SUPERSEDED_ARCHIVE_SHA256:?}"
         ));
     }
     if old == new || !string(repin, "rationale", "repin")?.contains(RATIONALE_MARKER) {
         return Err(format!(
-            "repin must explain the real change: its rationale must name {RATIONALE_MARKER}, the executable the d4e5 root lacked"
+            "repin must explain the real change: its rationale must name {RATIONALE_MARKER}, the executable the 29a8 root lacked"
         ));
     }
     for (reference, context) in [
@@ -955,7 +957,7 @@ mod tests {
         assert!(
             validate_semantics(&reference)
                 .unwrap_err()
-                .contains("must retain the replaced d4e5 reference")
+                .contains("must retain the replaced 29a8 reference")
         );
 
         let mut archive = record();
@@ -963,7 +965,7 @@ mod tests {
         assert!(
             validate_semantics(&archive)
                 .unwrap_err()
-                .contains("must retain the d4e5 receipt's 085b60 archive SHA-256")
+                .contains("must retain the 29a8 receipt's 7aeffc archive SHA-256")
         );
     }
 
@@ -1010,7 +1012,7 @@ mod tests {
         assert!(
             validate_semantics(&rationale)
                 .unwrap_err()
-                .contains("rationale must name curl")
+                .contains("rationale must name zsh")
         );
     }
 

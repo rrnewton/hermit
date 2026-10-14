@@ -1,184 +1,186 @@
 {
-  "schema_version": 1,
-  "method": "two-clean-isolated-nix-stores-v1",
-  "claim_scope": {
-    "same_host_reproducible": true,
-    "cross_host_reproducible": false,
-    "note": "Two independent same-host builds agreed byte-for-byte. This does not establish cross-host reproducibility."
-  },
-  "repin": {
-    "superseded_reference": "localhost/hermit-hermetic-validate@sha256:d4e585cb6baebf51ef3e52a3488f8fa6c1401379f2c0aa5e5e5a17121092ec95",
-    "superseded_archive_sha256": "085b605dd6d17c59795ccc92b5cbd761424810ab156520a10474dc9e4a3c57d0",
-    "replacement_reference": "localhost/hermit-hermetic-validate@sha256:29a8d19be045a4a14e9eeeb7b1bafcb9d6d44cb8cd2b2c120e6724763e63cf14",
-    "rationale": "The d4e5 root held libcurl as a dependency but no curl executable, so test.record_replay's network_trace::curl_recording_replays_offline_with_identical_logs, which finds curl on PATH, could not run there and was skipped (https://github.com/rrnewton/hermit/issues/3786). This replacement adds nixpkgs' curl.bin to guestTools and /usr/bin/curl to guest-paths.txt, so the build-dependency preflight requires it. Two new independent physical stores reproduced archive 7aeffc byte-for-byte and loaded as 29a8."
-  },
-  "source": {
-    "repository": "https://github.com/rrnewton/hermit",
-    "git_commit": "b8981f6ac8da871ab68b4cb75a9736dd810b0af0",
-    "git_tree": "0300b5988abfb3d8d8a8c71542f846a2cab0c811",
-    "clean": true,
-    "git_archive_sha256": "a431f8f28d009ae7a2496b7af0f6c0c6c6d5d5d42cf4f0bc23d3e1d97133a979",
-    "git_archive_size_bytes": 42035200,
-    "inputs": [
-      {
-        "path": "ci/hermetic/build-image.sh",
-        "sha256": "3ec72f28dc107e7553db1d5baade454faac06c526e5d0c7c70838269fe4aafe9",
-        "size_bytes": 4310
-      },
-      {
-        "path": "ci/hermetic/flake.nix",
-        "sha256": "105a8c1fa9b38bac7390f02c774e7352084b0fb1bc4af910e6fc06314a53027c",
-        "size_bytes": 13204
-      },
-      {
-        "path": "ci/hermetic/flake.lock",
-        "sha256": "4dd3d1f5e3eb8162627729bef5e334895671eda44f94bab2cf5d80a28c0cf8e0",
-        "size_bytes": 1193
-      },
-      {
-        "path": "ci/hermetic/guest-paths.txt",
-        "sha256": "1aa9f2021ed7c10f76d4f31a54ded0ceb9ac9aa741478eb11d06a5459dacb6e3",
-        "size_bytes": 1302
-      }
-    ]
-  },
-  "nix": {
-    "version": "nix (Nix) 2.35.2",
-    "system": "x86_64-linux",
-    "derivation_path": "/nix/store/c84lqv5wb1ki5jlkwj88gmiba8yqdglz-hermit-hermetic-validate.tar.gz.drv",
-    "derivation_sha256": "7741dc7ff353885dd090e2f7d1e8100ac6bda7d531e8a822e8150da2497537a9",
-    "output_path": "/nix/store/2ywmbjkhsnl6jais9i6hcr53kvgydgwg-hermit-hermetic-validate.tar.gz",
-    "output_nar_hash": "sha256-uMsZ15flMLjg7/aiz1urTzYnKIr6UtfQNbedzD8GHlU=",
-    "output_nar_size_bytes": 860705768,
-    "locked_inputs": [
-      {
-        "name": "nixpkgs",
-        "revision": "56c02bc00adcf003215cc4bd996d6efaf4cff188",
-        "nar_hash": "sha256-9i/VTdusq/+NM/tz+J1Re+ojkMB8MBf0QshnYfzHz30="
-      },
-      {
-        "name": "rust-overlay",
-        "revision": "ab450d47a3f906d19de1b332915bfc6e5b29c853",
-        "nar_hash": "sha256-48/4bbmK3W3Av3YPnrFb/tVQXPvBwU6kyM3Pb13VVD8="
-      }
-    ],
-    "realized_inputs": [
-      {
-        "name": "cargo-nextest",
-        "path": "/nix/store/1vaaxcd5msxf2qvr701q2rs7p6f4s9nv-cargo-nextest-0.9.100",
-        "nar_hash": "sha256-GKAyv4sewbum6mLzMKqK9Jf/l7lcxIPBAZu8Z8L78e4=",
-        "nar_size_bytes": 20967640
-      },
-      {
-        "name": "rust-script",
-        "path": "/nix/store/njyv6xyg8ymb1rnzjc4bapfwp3h1ccnj-rust-script-0.36.0",
-        "nar_hash": "sha256-Zgx2YHYxjZeKu2FXSNIUxjB0njP7nFkbpcAwEDM87Ks=",
-        "nar_size_bytes": 3523528
-      },
-      {
-        "name": "coreutils",
-        "path": "/nix/store/8lhm9rlwqq3p3rfn02m87bqhw2yrdm4i-coreutils-9.11",
-        "nar_hash": "sha256-mn40qYRmXDV0KBG+2j8dQaysvrMZI+GBHHTJYl4CzP0=",
-        "nar_size_bytes": 1806984
-      }
-    ]
-  },
-  "evidence_limitations": [
-    "Each service ran with the systemd user manager's environment plus PATH and HOME; only those variable names were recorded, not their values.",
-    "Neither build used the network. Each new store could substitute only from the build host's default Nix store, and only paths signed with the cache.nixos.org key, the one key trusted, or content-addressed (derivation files and fixed-output sources, which Nix checks by hash); substituted paths are trusted by Nix signature or content hash and NAR hash, not rebuilt. Every unsigned path in the closure, including rust-script, cargo-nextest and coreutils, was rebuilt in each store.",
-    "Both builds ran in the Nix build sandbox with /bin/sh bound to the static busybox at /nix/store/yysvxw5iwwijaci7ggrnms4mavwcjnpk-busybox-1.37.0 (NAR hash sha256-Qlx+BoVIaa3RubvM7Lr733QAcJpy4XZPFDX0d5XN9WA=), because the build host's /bin/sh links to a dynamically linked bash; that shell is unsigned and is not in the image.",
-    "Build logs, unit records and Nix path-info records were retained only on the build host; this receipt does not authenticate them.",
-    "The superseded d4e5 archive was not rebuilt for this receipt; its 085b60 SHA-256 is carried from the d4e5 receipt.",
-    "The recorded build-source commit and tree are historical review evidence. Rebases can rewrite their ancestry; live verification establishes equivalence only for the four enumerated image input files, not the complete source tree or archive."
-  ],
-  "runs": [
-    {
-      "run_id": "hermetic-b898-a-curl.service",
-      "source_snapshot_identity": "source-a.git-archive.tar@47:1981730721",
-      "nix_store_identity": "build-a/nix-root/nix@47:1981733241",
-      "podman_store_identity": "build-a/podman-data",
-      "full_rebuild_observed": true,
-      "resource_bound": {
-        "wall_seconds": 2400,
-        "cpu_quota_cores": 2,
-        "memory_max_bytes": 8589934592,
-        "swap_max_bytes": 0
-      },
-      "result": {
-        "service_result": "success",
-        "exit_status": 0,
-        "oom_kills": 0,
-        "last_observed_memory_peak_bytes": 7528996864,
-        "last_observed_cpu_nanoseconds": 1180895998000
-      },
-      "artifact": {
-        "archive_sha256": "7aeffce338a79d601c7352c80acd1ceca67547efcc02fd44e169ac465be6cd39",
-        "archive_size_bytes": 860705654,
-        "loaded_reference": "localhost/hermit-hermetic-validate@sha256:29a8d19be045a4a14e9eeeb7b1bafcb9d6d44cb8cd2b2c120e6724763e63cf14",
-        "manifest_media_type": "application/vnd.docker.distribution.manifest.v2+json",
-        "manifest_digest": "sha256:29a8d19be045a4a14e9eeeb7b1bafcb9d6d44cb8cd2b2c120e6724763e63cf14",
-        "manifest_size_bytes": 598,
-        "config_digest": "sha256:1d79b3893b26e83b69811194788a0c085747b897872dea1f027a7942a1f088ab",
-        "config_size_bytes": 19103,
-        "layers": [
-          {
-            "digest": "sha256:cf2452e83003001c91fe95bd49b54d8adfc325eaec636ccbdbb50dd007d367d7",
-            "size_bytes": 3265822720
-          },
-          {
-            "digest": "sha256:61c0a183637e71593ae5afd97a5d9da6874141dd27b6f75b3fc081ab11a66616",
-            "size_bytes": 129034240
-          }
-        ],
-        "diff_ids": [
-          "sha256:cf2452e83003001c91fe95bd49b54d8adfc325eaec636ccbdbb50dd007d367d7",
-          "sha256:61c0a183637e71593ae5afd97a5d9da6874141dd27b6f75b3fc081ab11a66616"
-        ]
-      }
-    },
-    {
-      "run_id": "hermetic-b898-b-curl.service",
-      "source_snapshot_identity": "source-b.git-archive.tar@47:1981733239",
-      "nix_store_identity": "build-b/nix-root/nix@47:1981735766",
-      "podman_store_identity": "build-b/podman-data",
-      "full_rebuild_observed": true,
-      "resource_bound": {
-        "wall_seconds": 2400,
-        "cpu_quota_cores": 2,
-        "memory_max_bytes": 8589934592,
-        "swap_max_bytes": 0
-      },
-      "result": {
-        "service_result": "success",
-        "exit_status": 0,
-        "oom_kills": 0,
-        "last_observed_memory_peak_bytes": 7536754688,
-        "last_observed_cpu_nanoseconds": 1179648165000
-      },
-      "artifact": {
-        "archive_sha256": "7aeffce338a79d601c7352c80acd1ceca67547efcc02fd44e169ac465be6cd39",
-        "archive_size_bytes": 860705654,
-        "loaded_reference": "localhost/hermit-hermetic-validate@sha256:29a8d19be045a4a14e9eeeb7b1bafcb9d6d44cb8cd2b2c120e6724763e63cf14",
-        "manifest_media_type": "application/vnd.docker.distribution.manifest.v2+json",
-        "manifest_digest": "sha256:29a8d19be045a4a14e9eeeb7b1bafcb9d6d44cb8cd2b2c120e6724763e63cf14",
-        "manifest_size_bytes": 598,
-        "config_digest": "sha256:1d79b3893b26e83b69811194788a0c085747b897872dea1f027a7942a1f088ab",
-        "config_size_bytes": 19103,
-        "layers": [
-          {
-            "digest": "sha256:cf2452e83003001c91fe95bd49b54d8adfc325eaec636ccbdbb50dd007d367d7",
-            "size_bytes": 3265822720
-          },
-          {
-            "digest": "sha256:61c0a183637e71593ae5afd97a5d9da6874141dd27b6f75b3fc081ab11a66616",
-            "size_bytes": 129034240
-          }
-        ],
-        "diff_ids": [
-          "sha256:cf2452e83003001c91fe95bd49b54d8adfc325eaec636ccbdbb50dd007d367d7",
-          "sha256:61c0a183637e71593ae5afd97a5d9da6874141dd27b6f75b3fc081ab11a66616"
-        ]
-      }
-    }
+ "schema_version": 1,
+ "method": "two-clean-isolated-nix-stores-signed-substitution-v1",
+ "claim_scope": {
+  "same_host_reproducible": true,
+  "cross_host_reproducible": false,
+  "note": "Two independent same-host builds agreed byte-for-byte. This does not establish cross-host reproducibility."
+ },
+ "repin": {
+  "superseded_reference": "localhost/hermit-hermetic-validate@sha256:29a8d19be045a4a14e9eeeb7b1bafcb9d6d44cb8cd2b2c120e6724763e63cf14",
+  "superseded_archive_sha256": "7aeffce338a79d601c7352c80acd1ceca67547efcc02fd44e169ac465be6cd39",
+  "replacement_reference": "localhost/hermit-hermetic-validate@sha256:dd70c74876063dff703a83e13e7a97783ceadee2161abfb9e4479d6b4b59cbdb",
+  "rationale": "The 29a8 root had no zsh and no static glibc, so sysfs_rtc_determinism, which reads the RTC through zsh among other shells, and kvm_info_log_determinism, whose kvm_memory_hashes_repeat_for_a_static_guest compiles a static guest, could not run in test.hermit_integration (https://github.com/rrnewton/hermit/issues/4355). This replacement adds nixpkgs' zsh to guestTools and glibc.static to the image, with its lib directory on LIBRARY_PATH after the compiler wrapper's own glibc. Two new independent physical stores reproduced archive 9d5d40 byte-for-byte and loaded as dd70."
+ },
+ "source": {
+  "repository": "https://github.com/rrnewton/hermit",
+  "git_commit": "cb748820f83a2756a49915f095e0750d95848b58",
+  "git_tree": "ea1b7032ef1f455ce322cb9de30fa9763a59cc8e",
+  "clean": true,
+  "git_archive_sha256": "95eb428542c80f3b01a62139dffc7ad7209ea20f6977751854aa9893cade045f",
+  "git_archive_size_bytes": 51855360,
+  "inputs": [
+   {
+    "path": "ci/hermetic/build-image.sh",
+    "sha256": "3ec72f28dc107e7553db1d5baade454faac06c526e5d0c7c70838269fe4aafe9",
+    "size_bytes": 4310
+   },
+   {
+    "path": "ci/hermetic/flake.lock",
+    "sha256": "4dd3d1f5e3eb8162627729bef5e334895671eda44f94bab2cf5d80a28c0cf8e0",
+    "size_bytes": 1193
+   },
+   {
+    "path": "ci/hermetic/flake.nix",
+    "sha256": "5424c534c29a91510322fdc37a62af2228aaaadc8daba156c7a475b8bc0e1a30",
+    "size_bytes": 13811
+   },
+   {
+    "path": "ci/hermetic/guest-paths.txt",
+    "sha256": "1aa9f2021ed7c10f76d4f31a54ded0ceb9ac9aa741478eb11d06a5459dacb6e3",
+    "size_bytes": 1302
+   }
   ]
+ },
+ "nix": {
+  "version": "nix (Nix) 2.35.2",
+  "system": "x86_64-linux",
+  "derivation_path": "/nix/store/gs7bx20sz7i44x20bmd78xalb3gf3mbh-hermit-hermetic-validate.tar.gz.drv",
+  "derivation_sha256": "025508830c58b85bde9344e9bde3b4256d41efb0ef3c6baefb740fb7e7c6118e",
+  "output_path": "/nix/store/kpymmbvmqdaml8pgmz306gw0z02w42kr-hermit-hermetic-validate.tar.gz",
+  "output_nar_hash": "sha256-7TfaGbCkFLlOmbExOqS7xUCxT3793DpwM08YG7bdBCY=",
+  "output_nar_size_bytes": 866006024,
+  "locked_inputs": [
+   {
+    "name": "nixpkgs",
+    "revision": "56c02bc00adcf003215cc4bd996d6efaf4cff188",
+    "nar_hash": "sha256-9i/VTdusq/+NM/tz+J1Re+ojkMB8MBf0QshnYfzHz30="
+   },
+   {
+    "name": "rust-overlay",
+    "revision": "ab450d47a3f906d19de1b332915bfc6e5b29c853",
+    "nar_hash": "sha256-48/4bbmK3W3Av3YPnrFb/tVQXPvBwU6kyM3Pb13VVD8="
+   }
+  ],
+  "realized_inputs": [
+   {
+    "name": "cargo-nextest",
+    "path": "/nix/store/1vaaxcd5msxf2qvr701q2rs7p6f4s9nv-cargo-nextest-0.9.100",
+    "nar_hash": "sha256-GKAyv4sewbum6mLzMKqK9Jf/l7lcxIPBAZu8Z8L78e4=",
+    "nar_size_bytes": 20967640
+   },
+   {
+    "name": "rust-script",
+    "path": "/nix/store/njyv6xyg8ymb1rnzjc4bapfwp3h1ccnj-rust-script-0.36.0",
+    "nar_hash": "sha256-Zgx2YHYxjZeKu2FXSNIUxjB0njP7nFkbpcAwEDM87Ks=",
+    "nar_size_bytes": 3523528
+   },
+   {
+    "name": "coreutils",
+    "path": "/nix/store/8lhm9rlwqq3p3rfn02m87bqhw2yrdm4i-coreutils-9.11",
+    "nar_hash": "sha256-mn40qYRmXDV0KBG+2j8dQaysvrMZI+GBHHTJYl4CzP0=",
+    "nar_size_bytes": 1806984
+   }
+  ]
+ },
+ "evidence_limitations": [
+  "Each service ran with the systemd user manager's environment plus PATH, HOME and NIX_SSL_CERT_FILE; only those variable names were recorded, not their values.",
+  "Both builds used the network, only through the build host's forward proxy. Each new store substituted only paths signed with the cache.nixos.org key, the one key trusted, from https://cache.nixos.org, and downloaded fixed-output sources, which Nix checks by hash; substituted paths are trusted by Nix signature or content hash and NAR hash, not rebuilt. Every unsigned path in the closure, including rust-script, cargo-nextest and coreutils, was rebuilt in each store.",
+  "The two locked flake input sources, nixpkgs and rust-overlay, were copied into each new store from the build host's default Nix store before its build; both are content-addressed, and their NAR hashes equal the lock's.",
+  "The 29a8 receipt's method, substituting only from the build host's default store, was not repeatable on this build host: a local store used as a substituter handed over unsigned paths despite require-sigs, so a build against a warmed host store would copy those paths rather than rebuild them. This receipt substitutes only from cache.nixos.org instead.",
+  "Both builds ran in the Nix build sandbox with /bin/sh bound to the static busybox at /nix/store/yysvxw5iwwijaci7ggrnms4mavwcjnpk-busybox-1.37.0 (NAR hash sha256-Qlx+BoVIaa3RubvM7Lr733QAcJpy4XZPFDX0d5XN9WA=), because the build host's /bin/sh links to a dynamically linked bash; that shell is unsigned and is not in the image.",
+  "Build logs, unit records and Nix path-info records were retained only on the build host; this receipt does not authenticate them.",
+  "The superseded 29a8 archive was not rebuilt for this receipt; its 7aeffc SHA-256 is carried from the 29a8 receipt.",
+  "The recorded build-source commit and tree are historical review evidence. Rebases can rewrite their ancestry; live verification establishes equivalence only for the four enumerated image input files, not the complete source tree or archive."
+ ],
+ "runs": [
+  {
+   "run_id": "hermetic-cb74-a-zsh-signed.service",
+   "source_snapshot_identity": "source-a.git-archive.tar@48:3111565669",
+   "nix_store_identity": "build-a/nix-root/nix@48:3115490943",
+   "podman_store_identity": "build-a/podman-data",
+   "full_rebuild_observed": true,
+   "resource_bound": {
+    "wall_seconds": 2400,
+    "cpu_quota_cores": 2,
+    "memory_max_bytes": 8589934592,
+    "swap_max_bytes": 0
+   },
+   "result": {
+    "service_result": "success",
+    "exit_status": 0,
+    "oom_kills": 0,
+    "last_observed_memory_peak_bytes": 6800330752,
+    "last_observed_cpu_nanoseconds": 1305321511000
+   },
+   "artifact": {
+    "archive_sha256": "9d5d40344998fdd44a48294e73c66c26f67eefd21303d765190fe84b0315c79a",
+    "archive_size_bytes": 866005906,
+    "loaded_reference": "localhost/hermit-hermetic-validate@sha256:dd70c74876063dff703a83e13e7a97783ceadee2161abfb9e4479d6b4b59cbdb",
+    "manifest_media_type": "application/vnd.docker.distribution.manifest.v2+json",
+    "manifest_digest": "sha256:dd70c74876063dff703a83e13e7a97783ceadee2161abfb9e4479d6b4b59cbdb",
+    "manifest_size_bytes": 598,
+    "config_digest": "sha256:9803cecc94e7010267936031b99769a5a2f9b03c6c715482fac00ed613653b20",
+    "config_size_bytes": 19297,
+    "layers": [
+     {
+      "digest": "sha256:832ca8d6e125489524f46269af71fc68f25fbeadf3ba376d0e005ab005462866",
+      "size_bytes": 3285493760
+     },
+     {
+      "digest": "sha256:6f1e913232696a224e8b2d3fcc93e92a62912449d36bdcd422dbd62653c20209",
+      "size_bytes": 129802240
+     }
+    ],
+    "diff_ids": [
+     "sha256:832ca8d6e125489524f46269af71fc68f25fbeadf3ba376d0e005ab005462866",
+     "sha256:6f1e913232696a224e8b2d3fcc93e92a62912449d36bdcd422dbd62653c20209"
+    ]
+   }
+  },
+  {
+   "run_id": "hermetic-cb74-b-zsh-signed.service",
+   "source_snapshot_identity": "source-b.git-archive.tar@48:3111569960",
+   "nix_store_identity": "build-b/nix-root/nix@48:3115514071",
+   "podman_store_identity": "build-b/podman-data",
+   "full_rebuild_observed": true,
+   "resource_bound": {
+    "wall_seconds": 2400,
+    "cpu_quota_cores": 2,
+    "memory_max_bytes": 8589934592,
+    "swap_max_bytes": 0
+   },
+   "result": {
+    "service_result": "success",
+    "exit_status": 0,
+    "oom_kills": 0,
+    "last_observed_memory_peak_bytes": 6780776448,
+    "last_observed_cpu_nanoseconds": 1308559093000
+   },
+   "artifact": {
+    "archive_sha256": "9d5d40344998fdd44a48294e73c66c26f67eefd21303d765190fe84b0315c79a",
+    "archive_size_bytes": 866005906,
+    "loaded_reference": "localhost/hermit-hermetic-validate@sha256:dd70c74876063dff703a83e13e7a97783ceadee2161abfb9e4479d6b4b59cbdb",
+    "manifest_media_type": "application/vnd.docker.distribution.manifest.v2+json",
+    "manifest_digest": "sha256:dd70c74876063dff703a83e13e7a97783ceadee2161abfb9e4479d6b4b59cbdb",
+    "manifest_size_bytes": 598,
+    "config_digest": "sha256:9803cecc94e7010267936031b99769a5a2f9b03c6c715482fac00ed613653b20",
+    "config_size_bytes": 19297,
+    "layers": [
+     {
+      "digest": "sha256:832ca8d6e125489524f46269af71fc68f25fbeadf3ba376d0e005ab005462866",
+      "size_bytes": 3285493760
+     },
+     {
+      "digest": "sha256:6f1e913232696a224e8b2d3fcc93e92a62912449d36bdcd422dbd62653c20209",
+      "size_bytes": 129802240
+     }
+    ],
+    "diff_ids": [
+     "sha256:832ca8d6e125489524f46269af71fc68f25fbeadf3ba376d0e005ab005462866",
+     "sha256:6f1e913232696a224e8b2d3fcc93e92a62912449d36bdcd422dbd62653c20209"
+    ]
+   }
+  }
+ ]
 }

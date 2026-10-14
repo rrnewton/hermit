@@ -63,7 +63,33 @@ checker is read-only and does not build, load, inspect, or silently repair an
 image. Both `-h` and `--help` describe this interface; its unit tests run with
 `rust-script --test ci/hermetic/check-image-provenance.rs`.
 
-The current 29a8 pin supersedes d4e5, whose root had no `curl` executable, so
+The current dd70 pin supersedes 29a8, whose root had no `zsh` and no static
+glibc, so `sysfs_rtc_determinism` (which reads the RTC through zsh) and
+`kvm_info_log_determinism` (whose `kvm_memory_hashes_repeat_for_a_static_guest`
+compiles a static guest) could not run in `test.hermit_integration`
+(https://github.com/rrnewton/hermit/issues/4355). The replacement adds `zsh` to
+`guestTools` and `glibc.static` to the image, with its lib directory on
+`LIBRARY_PATH` after the compiler wrapper's own glibc, so dynamic links still use
+`libc.so` and only `-static` uses `libc.a`. Two builds from commit
+`cb748820f83a2756a49915f095e0750d95848b58`, each from its own source snapshot,
+new physical Nix store and Podman store, produced archive
+`9d5d40344998fdd44a48294e73c66c26f67eefd21303d765190fe84b0315c79a` byte for
+byte and loaded the same dd70 image; their rebuilt rust-script, cargo-nextest
+and coreutils have the NAR hashes the 29a8 receipt records.
+
+That repin used a different substitution source than 29a8's. On the build
+host the host-store method could not be repeated faithfully: a
+local Nix store used as a substituter handed over unsigned paths despite
+`require-sigs`, so a build against a warmed host store copies them instead of
+rebuilding them. So each dd70 build substituted only from
+`https://cache.nixos.org`, through the host's forward proxy, and only paths
+signed with its key; fixed-output sources were downloaded and checked by hash,
+and every unsigned path was rebuilt in each store. The two locked flake input
+sources were copied into each new store from the host store; both are
+content-addressed and match the lock's NAR hashes. The receipt's method is
+`two-clean-isolated-nix-stores-signed-substitution-v1`.
+
+The earlier 29a8 pin superseded d4e5, whose root had no `curl` executable, so
 `test.record_replay` skipped
 `network_trace::curl_recording_replays_offline_with_identical_logs`, the only
 pinned-root test that runs curl
@@ -80,8 +106,8 @@ https://github.com/rrnewton/reverie/pull/942; d809
 (https://github.com/rrnewton/hermit/pull/3172), an image built from a reused,
 mixed Nix store.
 
-This proves same-host reproducibility for the recorded method only; it makes no
-cross-host reproducibility claim. Each build ran as a systemd user service
+Each receipt proves same-host reproducibility for its recorded method only; it
+makes no cross-host reproducibility claim. Each 29a8 build ran as a systemd user service
 bounded to 2 CPUs (`CPUQuota=200%`), 8 GiB of memory with no swap and 2400
 seconds of wall time, running `nix --store <build-root>/nix-root build .#image`
 without network access: the new store could substitute only from the build
@@ -93,7 +119,8 @@ environment's values, the build logs and path-info records, and the superseded
 d4e5 archive bytes. `build-image.sh` remains useful for a local one-off build,
 but one such build is not sufficient evidence for another reviewed repin. A
 future repin must replace the digest and provenance together with two new
-agreeing isolated builds.
+agreeing isolated builds, and move `check-image-provenance.rs`'s receipt
+constants with them.
 
 `setup.pinned_root_fetch` fetches Cargo dependencies; it does not prepare the OCI
 image. Prepare that image explicitly with `build-image.sh` when needed. Each
