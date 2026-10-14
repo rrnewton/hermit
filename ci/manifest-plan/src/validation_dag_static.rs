@@ -3030,7 +3030,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/issues/4275): 390, listed.
     // And an_inherited_pipe_reads_the_same_capacity_whatever_the_host_gave_it
     // (the F_GETPIPE_SZ host-capacity leak): 391, by listing.
-    ("test.cli", 391),
+    // And the four cpu_profile_v3 tests
+    // (https://github.com/rrnewton/hermit/issues/4243): 395, listed with this
+    // node's arguments.
+    ("test.cli", 395),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3358,7 +3361,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the armer-blocks and sleeper timer tests: 324.
     // And the same two verify_inputs CLI tests: 326.
     // And the inherited-pipe capacity test: 327, by listing.
-    ("test.cli_on_host", 327),
+    // And the four cpu_profile_v3 tests: 331, listed with this node's arguments.
+    ("test.cli_on_host", 331),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
