@@ -4922,9 +4922,10 @@ fn detcore_answers_its_procfs_links_on_every_backend() {
     );
 }
 
-/// Detcore renders `/proc/sys/kernel/random/uuid` and `/proc/sys/kernel/pty/nr`
-/// without the backend opening them (https://github.com/rrnewton/hermit/issues/4213).
-/// Every backend gives the guest Linux's answers for both files, which the
+/// Detcore renders `/proc/sys/kernel/random/uuid`, `/proc/sys/kernel/pty/nr`
+/// and `/proc/uptime` without the backend opening them
+/// (https://github.com/rrnewton/hermit/issues/4213).
+/// Every backend gives the guest Linux's answers for these files, which the
 /// memfd standing in for each could not give, reaches bitwise parity, and
 /// shows the same identity: Detcore's procfs device and the inode each path
 /// names. Linux's own answers are checked natively first. A backend that is
@@ -5076,10 +5077,11 @@ fn detcore_renders_its_procfs_files_on_every_backend() {
             .and_then(|line| line.strip_prefix(prefix))
             .unwrap_or_else(|| panic!("line {index} is not {prefix:?}: {first}"))
     };
-    assert_eq!(lines.len(), 10, "{first}");
+    assert_eq!(lines.len(), 11, "{first}");
     for (index, path) in [
         (6, "/proc/sys/kernel/random/uuid"),
         (7, "/proc/sys/kernel/pty/nr"),
+        (8, "/proc/uptime"),
     ] {
         let identity = line(index, &format!("{path} dev=0xf000ff ino="));
         let ino: u64 = identity
@@ -5112,9 +5114,9 @@ fn detcore_renders_its_procfs_files_on_every_backend() {
     let forked = format!("{}{}", line(2, "fork child: "), line(3, "fork parent: "));
     assert!(uuid_shape(&forked), "{first}");
     assert_eq!(forked, line(4, "fork whole: "), "{first}");
-    let execed = format!("{}{}", line(5, "before exec: "), line(8, "after exec: "));
+    let execed = format!("{}{}", line(5, "before exec: "), line(9, "after exec: "));
     assert!(uuid_shape(&execed), "{first}");
-    assert_eq!(execed, line(9, "exec whole: "), "{first}");
+    assert_eq!(execed, line(10, "exec whole: "), "{first}");
     for (backend, identity) in &identities {
         assert_eq!(
             identity, first,

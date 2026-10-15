@@ -2273,7 +2273,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // scheduler::test::a_group_exit_decided_in_a_turn_is_granted_before_any_other_thread_runs
     // (https://github.com/rrnewton/hermit/issues/4278): 1704, listed.
     // And +1 from e45ad547: 1705.
-    ("test.detcore_unit", 1705),
+    // And a_seq_file_refuses_mappings_and_positioned_writes_as_linux (https://github.com/rrnewton/hermit/issues/4213): 1706.
+    ("test.detcore_unit", 1706),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3855,7 +3856,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the process-cgroup test (https://github.com/rrnewton/hermit/issues/4378): 1702.
     // And the default-action classification and group-exit selection tests: 1704.
     // And +1 from e45ad547: 1705.
-    ("test.detcore_unit_on_host", 1705),
+    // And a_seq_file_refuses_mappings_and_positioned_writes_as_linux (https://github.com/rrnewton/hermit/issues/4213): 1706.
+    ("test.detcore_unit_on_host", 1706),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

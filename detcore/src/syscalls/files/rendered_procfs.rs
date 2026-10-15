@@ -142,8 +142,11 @@ pub(crate) fn placeholder_identity(dev: u64, ino: u64) -> Option<&'static Path> 
 
 /// The procfs files Detcore renders from its run state, as opposed to the
 /// fixed files of `procfs::fixed`.
-const DYNAMIC_PATHS: [&std::ffi::CStr; 2] =
-    [c"/proc/sys/kernel/random/uuid", c"/proc/sys/kernel/pty/nr"];
+const DYNAMIC_PATHS: [&std::ffi::CStr; 3] = [
+    c"/proc/sys/kernel/random/uuid",
+    c"/proc/sys/kernel/pty/nr",
+    c"/proc/uptime",
+];
 
 /// The paths of every procfs file Detcore renders.
 pub(crate) fn rendered_paths() -> impl Iterator<Item = &'static std::ffi::CStr> {
@@ -560,9 +563,11 @@ pub(super) fn open_flags_refused(flags: OFlag) -> Option<Errno> {
         .then_some(Errno::EINVAL)
 }
 
-/// Linux's answer to mapping a procfs sysctl file, which has no `mmap`
-/// method, in `do_mmap`'s order. `noexec` says whether procfs is mounted
-/// `noexec`.
+/// Linux's answer to mapping a procfs file Detcore renders, in `do_mmap`'s
+/// order: a sysctl file has no `mmap` method (`ENODEV`); a `seq_file` has
+/// `proc_reg_mmap`, which finds no method behind it (`EIO`) once every check
+/// before it passed (`procfs::rendered_path_is_seq_file`). `noexec` says
+/// whether procfs is mounted `noexec`.
 fn rendered_mmap_answer(
     addr: usize,
     len: usize,
@@ -570,6 +575,7 @@ fn rendered_mmap_answer(
     prot: ProtFlags,
     flags: MapFlags,
     noexec: bool,
+    seq_file: bool,
 ) -> Result<i64, Errno> {
     // `ksys_mmap_pgoff` refuses MAP_HUGETLB for a file that is not on
     // hugetlbfs before `do_mmap` looks at anything.
@@ -632,7 +638,24 @@ fn rendered_mmap_answer(
     if noexec && prot.contains(ProtFlags::PROT_EXEC) {
         return Err(Errno::EPERM);
     }
-    Err(Errno::ENODEV)
+    Err(if seq_file { Errno::EIO } else { Errno::ENODEV })
+}
+
+/// Linux's answer to a positioned write of a rendered `seq_file`, which is
+/// opened without `FMODE_PWRITE` (`seq_open`): a negative position is
+/// `EINVAL`, then `ESPIPE`, before the descriptor's access mode is looked at.
+/// `None` for `pwritev2` at position -1, which writes at the file position
+/// as `writev` does and is refused by the read-only placeholder as Linux
+/// refuses it (`EBADF`).
+fn rendered_seq_file_pwrite_answer(sysno: Sysno, position: i64) -> Option<Result<i64, Errno>> {
+    if sysno == Sysno::pwritev2 && position == -1 {
+        return None;
+    }
+    Some(Err(if position < 0 {
+        Errno::EINVAL
+    } else {
+        Errno::ESPIPE
+    }))
 }
 
 /// Linux's answer to setting the extended attribute `name` of a procfs file,
@@ -1098,13 +1121,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             .expect("an opened rendered procfs file has a path");
         // The snapshot this open takes, which its placeholder's name carries,
         // so that every backend has it after `exec`; a fixed file's is
-        // rendered again there.
+        // rendered again there. A file Linux renders when it is read takes
+        // none until its first read (`ProcfsFile::snapshot_at_first_read`).
         let procfs = target.procfs.into_rendered();
-        let snapshot = self.render_snapshot(guest, &procfs);
-        let carried: &[u8] = if procfs.snapshot_is_fixed() {
-            &[]
-        } else {
-            &snapshot
+        let snapshot =
+            (!procfs.snapshot_at_first_read()).then(|| self.render_snapshot(guest, &procfs));
+        let carried: &[u8] = match &snapshot {
+            Some(snapshot) if !procfs.snapshot_is_fixed() => snapshot,
+            _ => &[],
         };
         let fd = self
             .inject_placeholder(guest, path, carried, reopen)
@@ -1117,7 +1141,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             FdType::Regular,
             Some(rendered_stat(path, epoch_time(guest.config().epoch), owner)),
         )?;
-        let procfs = procfs.with_rendered_snapshot(snapshot);
+        let procfs = match snapshot {
+            Some(snapshot) => procfs.with_rendered_snapshot(snapshot),
+            None => procfs,
+        };
         guest.thread_state().with_detfd(fd, |detfd| {
             detfd.set_path(path);
             detfd.set_procfs(procfs.clone());
@@ -1527,7 +1554,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let (sysno, args) = call.into_parts();
         let fd = match sysno {
             Sysno::mmap => args.arg4 as i32,
-            Sysno::fsync
+            Sysno::pwrite64
+            | Sysno::pwritev
+            | Sysno::pwritev2
+            | Sysno::fsync
             | Sysno::fdatasync
             | Sysno::fchmod
             | Sysno::fgetxattr
@@ -1538,17 +1568,30 @@ impl<T: RecordOrReplay> Detcore<T> {
             | Sysno::fcntl => args.arg0 as i32,
             _ => return None,
         };
-        let status_flags = guest
+        let (path, status_flags) = guest
             .thread_state()
             .with_detfd(fd, |detfd| {
-                detfd.procfs_rendered_path().map(|_| detfd.status_flags())
+                detfd
+                    .procfs_rendered_path()
+                    .map(|path| (path, detfd.status_flags()))
             })
             .ok()
             .flatten()?;
         if status_flags & libc::O_PATH != 0 {
             return None;
         }
+        let seq_file = crate::procfs::rendered_path_is_seq_file(path);
         let answer = match call {
+            // A sysctl file's placeholder refuses a positioned write as the
+            // sysctl does: it is read-only (EBADF), or the position is
+            // negative (EINVAL).
+            Syscall::Pwrite64(_) | Syscall::Pwritev(_) | Syscall::Pwritev2(_) if !seq_file => {
+                return None;
+            }
+            Syscall::Pwrite64(_) | Syscall::Pwritev(_) | Syscall::Pwritev2(_) => {
+                return rendered_seq_file_pwrite_answer(sysno, args.arg3 as i64)
+                    .map(|answer| answer.map_err(Error::from));
+            }
             Syscall::Mmap(c) => {
                 if c.flags().contains(MapFlags::MAP_ANONYMOUS) {
                     return None;
@@ -1564,6 +1607,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     c.prot(),
                     c.flags(),
                     noexec,
+                    seq_file,
                 )
             }
             Syscall::Fsync(_) | Syscall::Fdatasync(_) => Err(Errno::EINVAL),
@@ -2388,8 +2432,13 @@ mod tests {
             crate::procfs::placeholder_link(format!("/memfd:{name} (deleted)").as_bytes()),
             Some((Path::new("/proc/sys/kernel/pty/nr"), b"12\n".to_vec()))
         );
+        // A file Linux renders at read: its placeholder carries no snapshot.
+        assert_eq!(
+            crate::procfs::placeholder_link(b"/memfd:hermit-procfs:/proc/uptime@ (deleted)"),
+            Some((Path::new("/proc/uptime"), Vec::new()))
+        );
         for link in [
-            b"/memfd:hermit-procfs:/proc/uptime@30 (deleted)".as_slice(),
+            b"/memfd:hermit-procfs:/proc/stat@30 (deleted)".as_slice(),
             b"/memfd:hermit-procfs:/proc/sys/kernel/random/uuid (deleted)",
             b"/memfd:hermit-procfs:/proc/sys/kernel/random/uuid@3 (deleted)",
             b"/memfd:hermit-procfs:/proc/sys/kernel/random/uuid@zz (deleted)",
@@ -2403,7 +2452,11 @@ mod tests {
             rendered_path_within(Path::new("/sys/kernel/random/uuid")),
             Some(Path::new("/proc/sys/kernel/random/uuid"))
         );
-        assert_eq!(rendered_path_within(Path::new("/uptime")), None);
+        assert_eq!(
+            rendered_path_within(Path::new("/uptime")),
+            Some(Path::new("/proc/uptime"))
+        );
+        assert_eq!(rendered_path_within(Path::new("/stat")), None);
     }
 
     #[test]
@@ -2449,8 +2502,9 @@ mod tests {
         let read = ProtFlags::PROT_READ;
         let write = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
         let exec = ProtFlags::PROT_READ | ProtFlags::PROT_EXEC;
-        let answer =
-            |len, offset, prot, flags| rendered_mmap_answer(0, len, offset, prot, flags, true);
+        let answer = |len, offset, prot, flags| {
+            rendered_mmap_answer(0, len, offset, prot, flags, true, false)
+        };
         assert_eq!(answer(0, 0, read, private), Err(Errno::EINVAL));
         assert_eq!(answer(4096, 1, read, private), Err(Errno::EINVAL));
         assert_eq!(answer(4096, 0, write, shared), Err(Errno::EACCES));
@@ -2458,7 +2512,7 @@ mod tests {
         assert_eq!(answer(4096, 0, write, private), Err(Errno::ENODEV));
         assert_eq!(answer(4096, 0, read, shared), Err(Errno::ENODEV));
         assert_eq!(
-            rendered_mmap_answer(0, 4096, 0, exec, private, false),
+            rendered_mmap_answer(0, 4096, 0, exec, private, false, false),
             Err(Errno::ENODEV)
         );
         // `file_mmap_ok`: an offset past the largest file offset, taken
@@ -2475,22 +2529,73 @@ mod tests {
         // A fixed mapping that would end above TASK_SIZE.
         let fixed = MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED;
         assert_eq!(
-            rendered_mmap_answer(0x7fff_ffff_f000, 4096, 0, read, fixed, false),
+            rendered_mmap_answer(0x7fff_ffff_f000, 4096, 0, read, fixed, false, false),
             Err(Errno::ENOMEM)
         );
         assert_eq!(
-            rendered_mmap_answer(0x7fff_ffff_e000, 4096, 0, read, fixed, false),
+            rendered_mmap_answer(0x7fff_ffff_e000, 4096, 0, read, fixed, false, false),
             Err(Errno::ENODEV)
         );
         assert_eq!(
-            rendered_mmap_answer(0x1001, 4096, 0, read, fixed, false),
+            rendered_mmap_answer(0x1001, 4096, 0, read, fixed, false, false),
             Err(Errno::EINVAL)
         );
         // Below vm.mmap_min_addr, after the alignment check.
         assert_eq!(
-            rendered_mmap_answer(0x1000, 4096, 0, read, fixed, false),
+            rendered_mmap_answer(0x1000, 4096, 0, read, fixed, false, false),
             Err(Errno::EPERM)
         );
+    }
+
+    /// A rendered `seq_file` (every procfs file outside `/proc/sys`) refuses
+    /// a mapping as `proc_reg_mmap` does, with `EIO` where a sysctl file
+    /// gives `ENODEV`, after the same earlier checks; and a positioned write
+    /// with `ESPIPE`, after a negative position's `EINVAL`, except
+    /// `pwritev2` at -1, which writes at the file position (measured on
+    /// Linux 7.1 for /proc/uptime, /proc/loadavg, /proc/meminfo and
+    /// /proc/version against /proc/sys/kernel/osrelease).
+    #[test]
+    fn a_seq_file_refuses_mappings_and_positioned_writes_as_linux() {
+        let read = ProtFlags::PROT_READ;
+        let write = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
+        let private = MapFlags::MAP_PRIVATE;
+        let shared = MapFlags::MAP_SHARED;
+        let seq = |prot, flags| rendered_mmap_answer(0, 4096, 0, prot, flags, false, true);
+        assert_eq!(seq(read, private), Err(Errno::EIO));
+        assert_eq!(seq(read, shared), Err(Errno::EIO));
+        assert_eq!(seq(write, shared), Err(Errno::EACCES));
+        assert_eq!(
+            rendered_mmap_answer(0, 0, 0, read, private, false, true),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            rendered_mmap_answer(0, 4096, 0, read, private, false, false),
+            Err(Errno::ENODEV)
+        );
+        assert!(crate::procfs::rendered_path_is_seq_file(Path::new(
+            "/proc/uptime"
+        )));
+        assert!(crate::procfs::rendered_path_is_seq_file(Path::new(
+            "/proc/meminfo"
+        )));
+        assert!(!crate::procfs::rendered_path_is_seq_file(Path::new(
+            "/proc/sys/kernel/osrelease"
+        )));
+        for sysno in [Sysno::pwrite64, Sysno::pwritev, Sysno::pwritev2] {
+            assert_eq!(
+                rendered_seq_file_pwrite_answer(sysno, 0),
+                Some(Err(Errno::ESPIPE))
+            );
+            assert_eq!(
+                rendered_seq_file_pwrite_answer(sysno, -2),
+                Some(Err(Errno::EINVAL))
+            );
+        }
+        assert_eq!(
+            rendered_seq_file_pwrite_answer(Sysno::pwrite64, -1),
+            Some(Err(Errno::EINVAL))
+        );
+        assert_eq!(rendered_seq_file_pwrite_answer(Sysno::pwritev2, -1), None);
     }
 
     #[test]
