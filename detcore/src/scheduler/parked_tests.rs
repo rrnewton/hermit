@@ -3870,6 +3870,116 @@ fn backends_without_signal_control_never_enter_the_controlled_loop() {
     }
 }
 
+/// Both live turn implementations must sample all current process watches at
+/// their fixed maintenance boundary, without an async readiness notification.
+#[tokio::test]
+async fn both_turn_routes_drain_observed_death_before_grant() {
+    if !exec_teardown_tests::in_isolated_log_test(
+        module_path!(),
+        "both_turn_routes_drain_observed_death_before_grant",
+    ) {
+        return;
+    }
+    use std::os::unix::process::ExitStatusExt;
+    struct Reap(std::process::Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    for controlled in [false, true] {
+        let mut child = Reap(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        let physical = child.0.id() as i32;
+        let (mut s, _) = fixture_with_control(controlled);
+        s.enable_process_exit_observation();
+        s.install_process_exit_cleanup(crate::tool_global::ProcessExitCleanup::default());
+        let (victim, mm, _) = add(&mut s, 41, 41);
+        s.record_thread_mm(victim, mm);
+        s.register_physical_thread(victim, mm, physical, physical)
+            .unwrap();
+        let watch = s.process_exit_watches[&victim].clone();
+        // Ordinary deregistration has accounted this exit. Sampling must
+        // finish its cleanup without adding an unscheduled-exit loss.
+        s.logically_kill_thread(&victim, &victim, mm);
+        child.0.kill().unwrap();
+        tokio::time::timeout(Duration::from_secs(3), watch.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        let (survivor, _, _) = add(&mut s, 100, 100);
+        s.next_turns[&survivor]
+            .req
+            .put(Ok(Resources::new(survivor)));
+        s.runqueue_push_back(survivor);
+        let sched = Arc::new(Mutex::new(s));
+        let time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        let result = do_a_turn_blocking(sched.clone(), time, &Ok(Resources::new(survivor)))
+            .now_or_never()
+            .expect("quiescent turn must not wait")
+            .unwrap();
+        assert_eq!(result.tid, survivor);
+        let s = sched.lock().unwrap();
+        assert_eq!(s.turn, 1);
+        assert_eq!(s.controlled_turn_entries, u64::from(controlled));
+        assert!(!s.process_exit_watch_is_current(&watch));
+        assert!(crate::detlog::determinism_loss().is_none());
+        assert_eq!(child.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+    }
+}
+
+/// A broken sampled descriptor must refuse before either route can grant.
+#[tokio::test]
+async fn both_turn_routes_refuse_process_sample_errors_before_grant() {
+    for controlled in [false, true] {
+        let (mut s, _) = fixture_with_control(controlled);
+        s.enable_process_exit_observation();
+        s.install_process_exit_cleanup(crate::tool_global::ProcessExitCleanup::default());
+        let (tid, mm, _) = add(&mut s, 41, 41);
+        s.record_thread_mm(tid, mm);
+        // A pipe writer with no reader supplies POLLERR without invalidating
+        // an OwnedFd or depending on another task's descriptor lifetime.
+        let mut pipe = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let reader = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+        let writer = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+        drop(reader);
+        s.process_exit_watches.insert(
+            tid,
+            Arc::new(ProcessExitWatch {
+                process: tid,
+                mm,
+                physical_pid: std::process::id() as i32,
+                pidfd: writer,
+            }),
+        );
+        s.next_turns[&tid].req.put(Ok(Resources::new(tid)));
+        s.runqueue_push_back(tid);
+        let sched = Arc::new(Mutex::new(s));
+        let time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        assert!(
+            do_a_turn_blocking(sched.clone(), time, &Ok(Resources::new(tid)))
+                .now_or_never()
+                .expect("sample error must not leave a wait")
+                .is_err()
+        );
+        let s = sched.lock().unwrap();
+        assert!(s.backend_failed());
+        assert_eq!(s.turn, 0);
+        assert!(!s.run_queue.tentative_pop_in_progress());
+        assert_eq!(s.controlled_turn_entries, u64::from(controlled));
+        assert!(s.next_turns[&tid].resp.is_empty());
+    }
+}
+
 /// Where a real timer goes is decided by the installed control alone. Without
 /// one, Detcore's alarm model serves it, whatever the backend's capabilities.
 /// A backend with process signal control never runs a sequentialized guest

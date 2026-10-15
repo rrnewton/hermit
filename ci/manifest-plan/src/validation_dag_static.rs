@@ -2279,7 +2279,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from e45ad547: 1705.
     // And scheduler::test::a_background_reads_descriptor_replaced_before_it_runs_may_take_sigchld
     // (https://github.com/rrnewton/hermit/issues/4410): 1706, listed.
-    ("test.detcore_unit", 1706),
+    // Restore the four #4241 process-observation/clear-TID regressions, plus
+    // observed_death_leaves_a_live_senders_sigkill_notification_intact,
+    // maintenance_observes_death_without_an_async_notification,
+    // observed_death_waits_for_the_senders_existing_physical_fence,
+    // both_turn_routes_drain_observed_death_before_grant, and
+    // both_turn_routes_refuse_process_sample_errors_before_grant: 1715, listed.
+    ("test.detcore_unit", 1715),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3865,7 +3871,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the default-action classification and group-exit selection tests: 1704.
     // And +1 from e45ad547: 1705.
     // And the 4410 replaced-descriptor test: 1706, listed.
-    ("test.detcore_unit_on_host", 1706),
+    // The same four restored #4241 tests and five observer-order/maintenance
+    // regressions named at test.detcore_unit: 1715, listed with this selection.
+    ("test.detcore_unit_on_host", 1715),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

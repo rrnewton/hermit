@@ -49,6 +49,8 @@ use detcore_model::summary::RunSummary;
 use detcore_model::summary::TimesliceStats;
 pub(crate) use exec_identity::reconnect_exec;
 pub(crate) use exec_identity::retire_exec;
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use nix::sys::signal;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
@@ -1081,7 +1083,7 @@ pub struct GlobalState {
     // The canonical models of open file descriptions that several guest
     // processes share (see `crate::shared_open_files`). Locked after `sched`,
     // never before it.
-    shared_open_files: Mutex<SharedOpenFileStore>,
+    shared_open_files: Arc<Mutex<SharedOpenFileStore>>,
 
     // Optional append-only sink shared by DBT fork descendants.
     unsupported_syscall_report_fd: Option<Mutex<File>>,
@@ -1104,15 +1106,15 @@ pub struct GlobalState {
     // TODO-HUMAN-REVIEW(PR-1154): Review the SaBRe exec descriptor-status handoff.
     /// Pre-exec identity and descriptor state awaiting a successful image transition.
     // TODO-HUMAN-REVIEW(PR-1173): Review SaBRe exec incarnation fencing.
-    pending_exec_states: Mutex<BTreeMap<DetPid, PendingExecState>>,
+    pending_exec_states: Arc<Mutex<BTreeMap<DetPid, PendingExecState>>>,
     /// Successful identity transfers whose RPC acknowledgment may still be in flight.
     /// Nesting either exec map with global_time requires holding sched first;
-    /// the scheduler mutex serializes their inner lock orders. Standalone
-    /// process cleanup drops each map guard before acquiring sched.
-    completed_exec_transfers: Mutex<BTreeMap<DetPid, exec_identity::ExecTransferReceipt>>,
+    /// the scheduler mutex serializes their inner lock orders. Process
+    /// cleanup also holds sched before acquiring these stores.
+    completed_exec_transfers: Arc<Mutex<BTreeMap<DetPid, exec_identity::ExecTransferReceipt>>>,
 
     /// Descriptor state retained after the one-shot scheduler transition is consumed.
-    post_exec_fd_blocking: Mutex<BTreeMap<DetTid, ExecFdState>>,
+    post_exec_fd_blocking: Arc<Mutex<BTreeMap<DetTid, ExecFdState>>>,
 
     sched_handle: Option<tokio::task::JoinHandle<()>>,
 
@@ -1139,6 +1141,122 @@ pub struct GlobalState {
     /// trace mode is configured. Every operation reads global time under this
     /// lock, so an input's release point is fixed by the schedule alone.
     network: Option<Mutex<NetworkEngine>>,
+}
+
+/// Shared with the internal scheduler's lifetime observer, never a second
+/// GlobalState or an independently spawned task.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ProcessExitCleanup {
+    shared_open_files: Arc<Mutex<SharedOpenFileStore>>,
+    pending_exec_states: Arc<Mutex<BTreeMap<DetPid, PendingExecState>>>,
+    completed_exec_transfers: Arc<Mutex<BTreeMap<DetPid, exec_identity::ExecTransferReceipt>>>,
+    post_exec_fd_blocking: Arc<Mutex<BTreeMap<DetTid, ExecFdState>>>,
+}
+
+impl ProcessExitCleanup {
+    pub(crate) fn complete_observed_locked(
+        &self,
+        sched: &mut Scheduler,
+        watch: &Arc<crate::scheduler::ProcessExitWatch>,
+    ) -> Option<(bool, Option<String>)> {
+        if !sched.process_exit_watch_is_current(watch)
+            || sched.defer_process_exit_to_maintenance(watch)
+        {
+            return None;
+        }
+        sched.finish_process_exit_watch(watch);
+        Some(self.complete_locked(sched, watch.process, true))
+    }
+
+    fn complete_locked(
+        &self,
+        sched: &mut Scheduler,
+        process: DetPid,
+        consume_unreported: bool,
+    ) -> (bool, Option<String>) {
+        let loss = (consume_unreported && sched.has_unreported_exit(process)).then(|| {
+            let reason = format!(
+                "process {process} exited without deregistering; its exit was not scheduled"
+            );
+            // Publish refusal before cancellation can wake a request. Normal
+            // deregistration and this entire operation share the sched lock.
+            crate::detlog::record_determinism_loss(&reason);
+            reason
+        });
+        self.pending_exec_states.lock().unwrap().remove(&process);
+        self.completed_exec_transfers
+            .lock()
+            .unwrap()
+            .remove(&process);
+        self.post_exec_fd_blocking.lock().unwrap().remove(&process);
+        if consume_unreported {
+            let consumed = sched.consume_unreported_exit(process);
+            debug_assert_eq!(consumed, loss.is_some());
+        }
+        self.shared_open_files
+            .lock()
+            .unwrap()
+            .end_leases_of(process);
+        (sched.complete_physical_process_exit(process), loss)
+    }
+
+    async fn observe(&self, sched: Arc<Mutex<Scheduler>>) {
+        loop {
+            let (watches, changed) = sched.lock().unwrap().process_exit_watches();
+            let mut waiting: FuturesUnordered<_> = watches
+                .into_iter()
+                .map(|watch| async move {
+                    let result = watch.wait().await;
+                    (watch, result)
+                })
+                .collect();
+            let (watch, result) = tokio::select! {
+                _ = changed.get() => continue,
+                observed = waiting.next(), if !waiting.is_empty() => {
+                    observed.expect("a nonempty watch set has a result")
+                }
+            };
+            let (loss, failure, deferred) = {
+                let mut sched = sched.lock().unwrap();
+                // A pidfd is authoritative only for the registration that
+                // installed it. Exec/PID reuse cannot clear replacement state.
+                if !sched.process_exit_watch_is_current(&watch) {
+                    continue;
+                }
+                if let Err(error) = result {
+                    error!(
+                        "cannot observe registered process {} exit: {error}",
+                        watch.process
+                    );
+                    let wake = sched.report_backend_failure(reverie::BackendFailure {
+                        pid: reverie::Pid::from_raw(watch.process.as_raw()),
+                        tid: Tid::from_raw(watch.process.as_raw()),
+                        phase: "registered process exit observation",
+                    });
+                    (None, wake, sched.take_signal_failure_wakes())
+                } else {
+                    let loss = self
+                        .complete_observed_locked(&mut sched, &watch)
+                        .and_then(|(_, loss)| loss);
+                    (loss, None, Vec::new())
+                }
+            };
+            for wake in deferred {
+                let _ = wake.send(());
+            }
+            if let Some(wake) = failure {
+                let _ = wake.send(());
+            }
+            if let Some(loss) = loss {
+                crate::detlog::write_loss_notice(&loss);
+            }
+            if sched.lock().unwrap().backend_failed() {
+                // The existing failure wake finishes sched_loop, which drops
+                // this observer. Do not spin on a failed readiness descriptor.
+                std::future::pending::<()>().await;
+            }
+        }
+    }
 }
 
 impl Default for GlobalState {
@@ -1223,9 +1341,16 @@ impl GlobalState {
     }
 
     fn initialize(cfg: &Config, spawn_scheduler: bool) -> Self {
-        let sched = Arc::new(Mutex::new(Scheduler::new(cfg)));
+        let owns_scheduler = cfg.sequentialize_threads && spawn_scheduler;
+        let mut sched = Scheduler::new(cfg);
+        let process_exit_cleanup = ProcessExitCleanup::default();
+        if owns_scheduler {
+            sched.enable_process_exit_observation();
+            sched.install_process_exit_cleanup(process_exit_cleanup.clone());
+        }
+        let sched = Arc::new(Mutex::new(sched));
         let global_time = Arc::new(Mutex::new(GlobalTime::new(cfg)));
-        let handle = if cfg.sequentialize_threads && spawn_scheduler {
+        let handle = if owns_scheduler {
             // Announce before spawning, not from inside the spawned task. The
             // task's first poll is unordered with respect to the rest of this
             // bootstrap, so emitting there raced the root thread's seeding
@@ -1233,7 +1358,17 @@ impl GlobalState {
             // sequences it: `Scheduler::new`'s SCHEDRAND line above, then this,
             // then the root `ThreadState::new` seeding lines.
             info!("[scheduler] daemon task starting up, waiting for guest thread start..");
-            Some(tokio::spawn(sched_loop(sched.clone(), global_time.clone())))
+            let task_sched = sched.clone();
+            let task_time = global_time.clone();
+            let cleanup = process_exit_cleanup.clone();
+            Some(tokio::spawn(async move {
+                // Both futures belong to this existing handle. Completion or
+                // cancellation drops every watch; no detached observer survives.
+                tokio::select! {
+                    _ = sched_loop(task_sched.clone(), task_time) => {},
+                    _ = cleanup.observe(task_sched.clone()) => {},
+                }
+            }))
         } else {
             None
         };
@@ -1276,7 +1411,7 @@ impl GlobalState {
             unsupported_syscalls: Mutex::new(BTreeSet::new()),
             host_inputs: Mutex::new(Vec::new()),
             host_mutations: Mutex::new(BTreeSet::new()),
-            shared_open_files: Mutex::new(SharedOpenFileStore::default()),
+            shared_open_files: process_exit_cleanup.shared_open_files,
             unsupported_syscall_report_fd,
             port_start_range: AtomicU16::new(range[0]),
             port_end_range: AtomicU16::new(range[1]),
@@ -1284,9 +1419,9 @@ impl GlobalState {
             past_first_execve: AtomicBool::new(false),
             initial_descriptor_image_complete: AtomicBool::new(false),
             inherited_input: Mutex::new(None),
-            pending_exec_states: Mutex::new(BTreeMap::new()),
-            completed_exec_transfers: Mutex::new(BTreeMap::new()),
-            post_exec_fd_blocking: Mutex::new(BTreeMap::new()),
+            pending_exec_states: process_exit_cleanup.pending_exec_states,
+            completed_exec_transfers: process_exit_cleanup.completed_exec_transfers,
+            post_exec_fd_blocking: process_exit_cleanup.post_exec_fd_blocking,
             inodes: Arc::new(Mutex::new(InodePool::new())),
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping state.
@@ -1404,20 +1539,13 @@ impl GlobalState {
     /// chose, so the run must not be compared.
     pub fn complete_physical_process_exit(&self, raw_pid: i32) {
         let detpid = DetPid::from_raw(raw_pid);
-        self.pending_exec_states.lock().unwrap().remove(&detpid);
-        self.completed_exec_transfers
-            .lock()
-            .unwrap()
-            .remove(&detpid);
-        self.post_exec_fd_blocking.lock().unwrap().remove(&detpid);
-        let (completed, consumed) = {
+        let (completed, loss) = {
             let mut sched = self.sched.lock().unwrap();
-            let consumed = self.cfg.backend.process_exits_complete_asynchronously
-                && sched.consume_unreported_exit(detpid);
-            // In the same locked step as the retirement: a dead process's
-            // leases end, and their unpublished changes are discarded.
-            self.shared_open_files.lock().unwrap().end_leases_of(detpid);
-            (sched.complete_physical_process_exit(detpid), consumed)
+            self.process_exit_cleanup().complete_locked(
+                &mut sched,
+                detpid,
+                self.cfg.backend.process_exits_complete_asynchronously,
+            )
         };
         if completed {
             trace!(
@@ -1425,10 +1553,17 @@ impl GlobalState {
                 detpid
             );
         }
-        if consumed {
-            crate::detlog::write_loss_notice(&format!(
-                "process {detpid} exited without deregistering; its exit was not scheduled"
-            ));
+        if let Some(loss) = loss {
+            crate::detlog::write_loss_notice(&loss);
+        }
+    }
+
+    fn process_exit_cleanup(&self) -> ProcessExitCleanup {
+        ProcessExitCleanup {
+            shared_open_files: self.shared_open_files.clone(),
+            pending_exec_states: self.pending_exec_states.clone(),
+            completed_exec_transfers: self.completed_exec_transfers.clone(),
+            post_exec_fd_blocking: self.post_exec_fd_blocking.clone(),
         }
     }
 
@@ -5592,7 +5727,7 @@ fn wake_exec_robust_waiters(sched: &mut Scheduler, wakes: &[(DetTid, FutexID)], 
 
 /// A process pidfd for the host process `pid` (`pidfd_open` with no flags),
 /// which reports exit only once the whole thread group has exited.
-fn open_process_pidfd(pid: i32) -> Option<std::os::fd::OwnedFd> {
+pub(crate) fn open_process_pidfd(pid: i32) -> Option<std::os::fd::OwnedFd> {
     // SAFETY: pidfd_open takes no pointers.
     let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
     if raw < 0 {
@@ -8007,8 +8142,34 @@ mod tests {
         assert_eq!(pool.determinize(0, None), Some(0));
     }
 
-    #[test]
-    fn completing_an_unreported_exit_retires_it_and_records_determinism_loss() {
+    #[tokio::test]
+    async fn completing_an_unreported_exit_retires_it_and_records_determinism_loss() {
+        if !crate::scheduler::exec_teardown_tests::in_isolated_log_test(
+            module_path!(),
+            "completing_an_unreported_exit_retires_it_and_records_determinism_loss",
+        ) {
+            return;
+        }
+        use std::os::unix::process::ExitStatusExt;
+
+        use super::open_process_pidfd;
+        use super::process_pidfd_reports_exit_within;
+
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Reap(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        let physical_pid = child.0.id() as i32;
+        let pidfd = open_process_pidfd(physical_pid).expect("a live child has a process pidfd");
         let config = Config {
             sequentialize_threads: true,
             ..Config::default()
@@ -8019,9 +8180,15 @@ mod tests {
         });
         let state = GlobalState::initialize(&config, false);
         let dettid = DetTid::from_raw(41);
-        {
+        let mm = MmId::initial(dettid);
+        assert_ne!(dettid.as_raw(), physical_pid);
+        let pending_request = {
             let mut sched = state.sched.lock().unwrap();
             sched.thread_tree.add_child(dettid, dettid, true);
+            sched.record_thread_mm(dettid, mm);
+            sched
+                .register_physical_thread(dettid, mm, physical_pid, physical_pid)
+                .unwrap();
             sched.next_turns.insert(
                 dettid,
                 crate::scheduler::ThreadNextTurn {
@@ -8032,14 +8199,396 @@ mod tests {
                     protocol: Default::default(),
                 },
             );
-        }
-        // The process died without deregistering (no exit hook ran).
-        state.complete_physical_process_exit(41);
+            sched.next_turns[&dettid].req.clone()
+        };
+        assert!(pending_request.is_empty());
+        child.0.kill().unwrap();
+        assert!(process_pidfd_reports_exit_within(pidfd, Duration::from_secs(5)).await);
+
+        // Physical readiness authenticates death, but cleanup takes the
+        // registered logical process ID and must not reap the parent's child.
+        state.complete_physical_process_exit(dettid.as_raw());
+        assert!(pending_request.get().await.is_err());
         let sched = state.sched.lock().unwrap();
         assert!(!sched.next_turns.contains_key(&dettid));
         assert!(sched.process_physically_gone(DetPid::from_raw(41)));
+        assert!(!sched.process_physically_gone(DetPid::from_raw(physical_pid)));
         drop(sched);
-        assert!(crate::detlog::determinism_loss().is_some());
+        assert_eq!(
+            crate::detlog::determinism_loss().as_deref(),
+            Some("process 41 exited without deregistering; its exit was not scheduled")
+        );
+        let status = child
+            .0
+            .wait()
+            .expect("cleanup must leave the kernel status for the parent");
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert_eq!(status.code(), None);
+    }
+
+    /// An uncatchable physical death cannot run the Tool's exit hook. The
+    /// coordinator must cancel its pending request without stealing the
+    /// application parent's wait status (#4241).
+    #[tokio::test]
+    async fn registered_unreported_exit_wakes_the_internal_scheduler() {
+        if !crate::scheduler::exec_teardown_tests::in_isolated_log_test(
+            module_path!(),
+            "registered_unreported_exit_wakes_the_internal_scheduler",
+        ) {
+            return;
+        }
+        use std::os::unix::process::ExitStatusExt;
+
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Reap(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        let physical_pid = child.0.id() as i32;
+        let config = Config {
+            sequentialize_threads: true,
+            backend: reverie::BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        assert!(!config.backend.process_exits_complete_asynchronously);
+        let mut state = GlobalState::initialize(&config, true);
+        let process = DetPid::from_raw(41);
+        let mm = MmId::initial(process);
+        assert_ne!(process.as_raw(), physical_pid);
+        let pending = {
+            let mut sched = state.sched.lock().unwrap();
+            sched.thread_tree.add_child(process, process, true);
+            sched.record_thread_mm(process, mm);
+            sched.priorities.insert(process, DEFAULT_PRIORITY);
+            sched.next_turns.insert(
+                process,
+                ThreadNextTurn {
+                    dettid: process,
+                    child_tid_addr: 0,
+                    req: Ivar::new(),
+                    resp: Ivar::new(),
+                    protocol: Default::default(),
+                },
+            );
+            sched
+                .register_physical_thread(process, mm, physical_pid, physical_pid)
+                .unwrap();
+            sched.runqueue_push_back(process);
+            sched.set_running_for_test(process);
+            assert!(sched.holds_serial_grant(process));
+            sched.started_up.put(());
+            sched.next_turns[&process].req.clone()
+        };
+        tokio::task::yield_now().await;
+        assert!(pending.is_empty(), "a live process must retain its request");
+        child.0.kill().unwrap();
+        let observed = tokio::time::timeout(Duration::from_secs(3), pending.get()).await;
+        state.cancel_internal_scheduler().await;
+        let status = child
+            .0
+            .wait()
+            .expect("the parent must retain the real wait status");
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(
+            matches!(observed, Ok(Err(_))),
+            "physical death left the registered request pending"
+        );
+        assert!(
+            !state
+                .sched
+                .lock()
+                .unwrap()
+                .next_turns
+                .contains_key(&process)
+        );
+        assert_eq!(
+            crate::detlog::determinism_loss().as_deref(),
+            Some("process 41 exited without deregistering; its exit was not scheduled")
+        );
+    }
+
+    #[tokio::test]
+    async fn observed_death_leaves_a_live_senders_sigkill_notification_intact() {
+        if !crate::scheduler::exec_teardown_tests::in_isolated_log_test(
+            module_path!(),
+            "observed_death_leaves_a_live_senders_sigkill_notification_intact",
+        ) {
+            return;
+        }
+        observed_death_notification_case(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn maintenance_observes_death_without_an_async_notification() {
+        if !crate::scheduler::exec_teardown_tests::in_isolated_log_test(
+            module_path!(),
+            "maintenance_observes_death_without_an_async_notification",
+        ) {
+            return;
+        }
+        observed_death_notification_case(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn observed_death_waits_for_the_senders_existing_physical_fence() {
+        if !crate::scheduler::exec_teardown_tests::in_isolated_log_test(
+            module_path!(),
+            "observed_death_waits_for_the_senders_existing_physical_fence",
+        ) {
+            return;
+        }
+        observed_death_notification_case(true, true).await;
+    }
+
+    async fn observed_death_notification_case(
+        observe_before_notification_finishes: bool,
+        fence_before_death: bool,
+    ) {
+        use std::os::unix::process::ExitStatusExt;
+
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Reap(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        let physical_pid = child.0.id() as i32;
+        let config = Config {
+            sequentialize_threads: true,
+            backend: reverie::BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let sender = DetPid::from_raw(3);
+        let victim = DetPid::from_raw(41);
+        let victim_mm = MmId::initial(victim);
+        {
+            let mut sched = state.sched.lock().unwrap();
+            sched.enable_process_exit_observation();
+            sched.install_process_exit_cleanup(state.process_exit_cleanup());
+            sched.thread_tree.add_child(sender, sender, true);
+            sched.thread_tree.add_child(sender, victim, true);
+            sched.record_thread_mm(sender, MmId::initial(sender));
+            sched.record_thread_mm(victim, victim_mm);
+        }
+        for tid in [sender, victim] {
+            install_test_registration(&state, tid, Ivar::new());
+        }
+        let watch = {
+            let mut sched = state.sched.lock().unwrap();
+            sched
+                .register_physical_thread(victim, victim_mm, physical_pid, physical_pid)
+                .unwrap();
+            sched.set_running_for_test(sender);
+            assert!(sched.holds_serial_grant(sender));
+            sched.process_exit_watches().0.pop().unwrap()
+        };
+        let notification = state.receive_rpc(
+            Tid::from_raw(sender.as_raw()),
+            (
+                DetTime::new(&config),
+                MmId::initial(sender),
+                GlobalRequest::NotifySignalPending(victim, SigWrapper(libc::SIGKILL), Some(victim)),
+            ),
+        );
+        futures::pin_mut!(notification);
+        if fence_before_death {
+            assert!(futures::poll!(notification.as_mut()).is_pending());
+        }
+        child.0.kill().unwrap();
+        tokio::time::timeout(Duration::from_secs(3), watch.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        if observe_before_notification_finishes {
+            let mut sched = state.sched.lock().unwrap();
+            assert!(
+                state
+                    .process_exit_cleanup()
+                    .complete_observed_locked(&mut sched, &watch)
+                    .is_none(),
+                "physical death must not consume the live sender's pending notification"
+            );
+            if !fence_before_death {
+                assert!(sched.physical_thread_identity(victim).is_some());
+                assert!(sched.next_turns.contains_key(&victim));
+            }
+        }
+        assert!(crate::detlog::determinism_loss().is_none());
+        let response = notification.await;
+        assert_eq!(response.1, GlobalResponse::NotifySignalPending(()));
+        {
+            let mut sched = state.sched.lock().unwrap();
+            assert!(!sched.next_turns.contains_key(&victim));
+            assert!(sched.next_turns.contains_key(&sender));
+            assert!(!sched.has_unreported_exit(victim));
+            // The sender files its next request only after Notify's existing
+            // physical fence. Maintenance then samples the pidfd regardless
+            // of whether the async observer ran first.
+            sched.next_turns[&sender]
+                .req
+                .put(Ok(Resources::new(sender)));
+            sched.step2_drain_prefix_for_test();
+            assert!(!sched.process_exit_watch_is_current(&watch));
+        }
+        assert!(crate::detlog::determinism_loss().is_none());
+        assert_eq!(child.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+    }
+
+    #[tokio::test]
+    async fn stale_process_exit_cannot_clear_replacement_and_normal_exit_adds_no_loss() {
+        if !crate::scheduler::exec_teardown_tests::in_isolated_log_test(
+            module_path!(),
+            "stale_process_exit_cannot_clear_replacement_and_normal_exit_adds_no_loss",
+        ) {
+            return;
+        }
+        use nix::fcntl::OFlag;
+
+        use super::open_process_pidfd;
+        use super::process_pidfd_reports_exit_within;
+        use crate::fd::DetFd;
+        use crate::fd::FdType;
+        use crate::shared_open_files::OpenFileControl;
+        use crate::types::OpenFileId;
+
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Reap(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        let physical_pid = child.0.id() as i32;
+        let pidfd = open_process_pidfd(physical_pid).unwrap();
+        let config = Config {
+            sequentialize_threads: true,
+            backend: reverie::BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let process = DetPid::from_raw(41);
+        let old_mm = MmId::initial(process);
+        let mm = old_mm.for_exec(process);
+        let (old, current) = {
+            let mut sched = state.sched.lock().unwrap();
+            sched.enable_process_exit_observation();
+            sched.thread_tree.add_child(process, process, true);
+            sched.record_thread_mm(process, old_mm);
+            sched.next_turns.insert(
+                process,
+                ThreadNextTurn {
+                    dettid: process,
+                    child_tid_addr: 0,
+                    req: Ivar::new(),
+                    resp: Ivar::new(),
+                    protocol: Default::default(),
+                },
+            );
+            sched
+                .register_physical_thread(process, old_mm, physical_pid, physical_pid)
+                .unwrap();
+            let old = sched.process_exit_watches().0.pop().unwrap();
+            sched.record_thread_mm(process, mm);
+            sched
+                .register_physical_thread(process, mm, physical_pid, physical_pid)
+                .unwrap();
+            let current = sched.process_exit_watches().0.pop().unwrap();
+            (old, current)
+        };
+        let pending = PendingExecState {
+            caller: process,
+            process,
+            mm,
+            fd_blocking: Default::default(),
+        };
+        state
+            .pending_exec_states
+            .lock()
+            .unwrap()
+            .insert(process, pending.clone());
+        state
+            .post_exec_fd_blocking
+            .lock()
+            .unwrap()
+            .insert(process, ExecFdState::default());
+        let id = OpenFileId::new(process, 0);
+        {
+            let mut files = state.shared_open_files.lock().unwrap();
+            files
+                .insert(DetFd::new(3, OFlag::O_RDWR, FdType::Regular, id).model_for_test())
+                .unwrap();
+            files
+                .handle(process, process, OpenFileControl::Take { id })
+                .unwrap();
+        }
+        child.0.kill().unwrap();
+        assert!(process_pidfd_reports_exit_within(pidfd, Duration::from_secs(5)).await);
+        let cleanup = state.process_exit_cleanup();
+        {
+            let mut sched = state.sched.lock().unwrap();
+            assert_eq!(cleanup.complete_observed_locked(&mut sched, &old), None);
+            assert!(sched.next_turns.contains_key(&process));
+            assert_eq!(
+                state.pending_exec_states.lock().unwrap().get(&process),
+                Some(&pending)
+            );
+            assert!(
+                state
+                    .post_exec_fd_blocking
+                    .lock()
+                    .unwrap()
+                    .contains_key(&process)
+            );
+            assert!(state.shared_open_files.lock().unwrap().is_leased(id));
+            assert_eq!(crate::detlog::determinism_loss(), None);
+
+            // Model the normal hook winning the same mutex before the
+            // readiness callback. Its later physical completion is no loss.
+            state.account_deregistered_thread(
+                &mut sched,
+                ThreadDeregistration {
+                    dettid: process,
+                    detpid: process,
+                    mm,
+                    thread_start_entered: true,
+                    timeslice_stats: TimesliceStats::default(),
+                    syscall_count: 0,
+                    chaos_epochs: Vec::new(),
+                },
+            );
+            assert_eq!(
+                cleanup.complete_observed_locked(&mut sched, &current),
+                Some((false, None))
+            );
+            assert_eq!(cleanup.complete_observed_locked(&mut sched, &current), None);
+        }
+        assert!(state.pending_exec_states.lock().unwrap().is_empty());
+        assert!(state.post_exec_fd_blocking.lock().unwrap().is_empty());
+        assert!(!state.shared_open_files.lock().unwrap().is_leased(id));
+        assert_eq!(crate::detlog::determinism_loss(), None);
+        assert!(child.0.wait().unwrap().code().is_none());
     }
 
     /// An admitted process can die before any registration names it. The
