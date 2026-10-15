@@ -1659,8 +1659,9 @@ fi
 # KVM LAZY-DONTNEED + ZERO-LAZILY-REFUSAL SDK-BUDGET CARRY (2026-10-15): advance from da4679f3 to 8f6e9b816ee502cd5a91b540439bbb674f95644e (reverie-kvm drops MADV_DONTNEED runs of 2 MiB or more lazily, and zero_lazily refuses retained shared views in every build; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
 # KVM MAP_FIXED_NOREPLACE SDK-BUDGET CARRY (2026-10-15): advance from 8f6e9b81 to 68e5db200dd63516fc779826069a086dd2b28b4b (KVM honours MAP_FIXED_NOREPLACE; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
 # KVM UPTIME-COPY-DELETION SDK-BUDGET CARRY (2026-10-15): advance from 68e5db20 to 361661a980278a363529b63246f173900d431fa6 (7858a5c3, the reverie-ptrace change ending the run on a guest syscall through the untraced private-page stub, changes only reverie-ptrace; 361661a9 deletes reverie-kvm's copies of /proc/uptime, which Detcore renders, and changes only reverie-kvm; inventory unchanged), so the budgets above carry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 361661a980278a363529b63246f173900d431fa6 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 361661a980278a363529b63246f173900d431fa6 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# DBT STATS-DIRECTORY SDK-BUDGET CARRY (2026-10-15): advance from 361661a980278a363529b63246f173900d431fa6 to aaa6a6ae470b29c6f1739409a9d54ea8d45abd38; only reverie-dbt/src/launcher.rs and its stats-capture tests change. vendor/dynamorio and build.rs are byte-identical, with the same CMake inputs, so the existing SDK budget and job clamp carry; this is not a new calibration.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != aaa6a6ae470b29c6f1739409a9d54ea8d45abd38 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie aaa6a6ae470b29c6f1739409a9d54ea8d45abd38 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
