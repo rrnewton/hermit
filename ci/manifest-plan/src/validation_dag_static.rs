@@ -1555,7 +1555,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And record_version_rejects_streams_from_before_uptime_is_rendered (https://github.com/rrnewton/hermit/issues/4213): 1088.
     // And metadata::tests::record_version_rejects_streams_from_before_reused_set_tid_is_refused
     // (https://github.com/rrnewton/hermit/issues/4370): 1089, listed.
-    ("test.hermit_unit", 1089),
+    // And error::tests::an_untraced_stub_syscall_is_a_policy_refusal
+    // (https://github.com/rrnewton/reverie/issues/1064): 1090, listed.
+    ("test.hermit_unit", 1090),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4132,7 +4134,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the 4427 synchronous log file test: 1087, listed.
     // And record_version_rejects_streams_from_before_uptime_is_rendered (https://github.com/rrnewton/hermit/issues/4213): 1088.
     // And the 4370 record-version test: 1089, listed.
-    ("test.hermit_unit_on_host", 1089),
+    // And the untraced-stub policy-refusal test: 1090, listed.
+    ("test.hermit_unit_on_host", 1090),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
