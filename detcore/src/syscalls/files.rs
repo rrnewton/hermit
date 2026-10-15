@@ -4576,7 +4576,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             })?;
         // A descriptor that cannot read (`O_PATH`, write-only, access mode 3)
         // reads nothing (EBADF), before its buffer is looked at, as Linux's
-        // `vfs_read` checks; a rendered file's snapshot exists from its open.
+        // `vfs_read` checks, whether or not a rendered file's snapshot is
+        // taken yet (`/proc/uptime`'s is taken at its first read).
         if serves_procfs_snapshot && cannot_read {
             return Err(Errno::EBADF.into());
         }
@@ -4799,7 +4800,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             })?;
         // A descriptor that cannot read (`O_PATH`, write-only, access mode 3)
         // reads nothing (EBADF), before its buffer is looked at, as Linux's
-        // `vfs_read` checks; a rendered file's snapshot exists from its open.
+        // `vfs_read` checks, whether or not a rendered file's snapshot is
+        // taken yet (`/proc/uptime`'s is taken at its first read).
         if serves_procfs_snapshot && cannot_read {
             return Err(Errno::EBADF.into());
         }

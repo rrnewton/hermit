@@ -51,6 +51,7 @@ use reverie::Error;
 use reverie::Guest;
 use reverie::Stack;
 use reverie::syscalls;
+use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::AtFlags;
 use reverie::syscalls::Errno;
@@ -563,20 +564,15 @@ pub(super) fn open_flags_refused(flags: OFlag) -> Option<Errno> {
         .then_some(Errno::EINVAL)
 }
 
-/// Linux's answer to mapping a procfs file Detcore renders, in `do_mmap`'s
-/// order: a sysctl file has no `mmap` method (`ENODEV`); a `seq_file` has
-/// `proc_reg_mmap`, which finds no method behind it (`EIO`) once every check
-/// before it passed (`procfs::rendered_path_is_seq_file`). `noexec` says
-/// whether procfs is mounted `noexec`.
-fn rendered_mmap_answer(
+/// The checks `do_mmap` makes of a mapping of a procfs file before it looks
+/// for a mapping the range overlaps (`MAP_FIXED_NOREPLACE`'s `EEXIST`), in
+/// its order: the arguments and the address. Returns the page-aligned length.
+fn rendered_mmap_address_checks(
     addr: usize,
     len: usize,
     offset: libc::off_t,
-    prot: ProtFlags,
     flags: MapFlags,
-    noexec: bool,
-    seq_file: bool,
-) -> Result<i64, Errno> {
+) -> Result<usize, Errno> {
     // `ksys_mmap_pgoff` refuses MAP_HUGETLB for a file that is not on
     // hugetlbfs before `do_mmap` looks at anything.
     if flags.contains(MapFlags::MAP_HUGETLB) || len == 0 || offset & 4095 != 0 {
@@ -614,31 +610,94 @@ fn rendered_mmap_answer(
             return Err(Errno::EPERM);
         }
     }
+    Ok(len)
+}
+
+/// The checks `do_mmap` and `mmap_region` make of a mapping of a procfs file
+/// Detcore renders after the overlap check, in their order, and the error the
+/// mapping ends with: a sysctl file has no `mmap` method (`ENODEV`); a
+/// `seq_file` has `proc_reg_mmap` (`procfs::rendered_path_is_seq_file`), so a
+/// growing-down mapping is refused (`EINVAL`) and otherwise the method finds
+/// nothing behind it (`EIO`). `len` is page aligned. `noexec` says whether
+/// procfs is mounted `noexec`.
+fn rendered_mmap_file_checks(
+    len: usize,
+    offset: libc::off_t,
+    prot: ProtFlags,
+    flags: MapFlags,
+    noexec: bool,
+    seq_file: bool,
+) -> Errno {
     // `file_mmap_ok`: the mapping must end within the largest offset a
     // regular file can have (`MAX_LFS_FILESIZE`), the offset taken unsigned.
     const MAX_LFS_FILESIZE: u64 = i64::MAX as u64;
     if offset as u64 / 4096 > (MAX_LFS_FILESIZE - len as u64) >> 12 {
-        return Err(Errno::EOVERFLOW);
+        return Errno::EOVERFLOW;
     }
     let map_type = flags.bits() & libc::MAP_TYPE;
     if map_type != libc::MAP_SHARED
         && map_type != libc::MAP_PRIVATE
         && map_type != libc::MAP_SHARED_VALIDATE
     {
-        return Err(Errno::EINVAL);
+        return Errno::EINVAL;
     }
-    // MAP_SHARED_VALIDATE refuses flags the file does not support, as
-    // MAP_SYNC on procfs.
-    if map_type == libc::MAP_SHARED_VALIDATE && flags.contains(MapFlags::MAP_SYNC) {
-        return Err(Errno::EOPNOTSUPP);
+    // MAP_SHARED_VALIDATE refuses every flag outside `LEGACY_MAP_MASK`, as
+    // procfs supports none (`mmap_supported_flags`): MAP_SYNC and
+    // MAP_FIXED_NOREPLACE among them.
+    if map_type == libc::MAP_SHARED_VALIDATE && flags.bits() & !LEGACY_MAP_MASK != 0 {
+        return Errno::EOPNOTSUPP;
     }
     if map_type != libc::MAP_PRIVATE && prot.contains(ProtFlags::PROT_WRITE) {
-        return Err(Errno::EACCES);
+        return Errno::EACCES;
     }
     if noexec && prot.contains(ProtFlags::PROT_EXEC) {
-        return Err(Errno::EPERM);
+        return Errno::EPERM;
     }
-    Err(if seq_file { Errno::EIO } else { Errno::ENODEV })
+    if !seq_file {
+        return Errno::ENODEV;
+    }
+    if flags.contains(MapFlags::MAP_GROWSDOWN) {
+        return Errno::EINVAL;
+    }
+    Errno::EIO
+}
+
+/// `include/linux/mman.h`'s `LEGACY_MAP_MASK`: the flags every file accepts
+/// under MAP_SHARED_VALIDATE, with the type bits.
+const LEGACY_MAP_MASK: libc::c_int = libc::MAP_SHARED
+    | libc::MAP_PRIVATE
+    | libc::MAP_FIXED
+    | libc::MAP_ANONYMOUS
+    | libc::MAP_DENYWRITE
+    | libc::MAP_EXECUTABLE
+    | 0x400_0000 // MAP_UNINITIALIZED
+    | libc::MAP_GROWSDOWN
+    | libc::MAP_LOCKED
+    | libc::MAP_NORESERVE
+    | libc::MAP_POPULATE
+    | libc::MAP_NONBLOCK
+    | libc::MAP_STACK
+    | libc::MAP_HUGETLB
+    | libc::MAP_32BIT
+    | 0x80 // MAP_ABOVE4G
+    | (0x3f << 26); // MAP_HUGE_MASK
+
+/// Linux's answer to mapping a procfs file Detcore renders, where the range
+/// overlaps no mapping (`MAP_FIXED_NOREPLACE` then has nothing to refuse):
+/// [`rendered_mmap_address_checks`], then [`rendered_mmap_file_checks`].
+fn rendered_mmap_answer(
+    addr: usize,
+    len: usize,
+    offset: libc::off_t,
+    prot: ProtFlags,
+    flags: MapFlags,
+    noexec: bool,
+    seq_file: bool,
+) -> Result<i64, Errno> {
+    let len = rendered_mmap_address_checks(addr, len, offset, flags)?;
+    Err(rendered_mmap_file_checks(
+        len, offset, prot, flags, noexec, seq_file,
+    ))
 }
 
 /// Linux's answer to a positioned write of a rendered `seq_file`, which is
@@ -1541,6 +1600,99 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Linux's answer to a mapping of a procfs file Detcore renders, which the
+    /// placeholder standing in for it (a memfd) would accept. In `do_mmap`'s
+    /// order: the arguments and the address; `MAP_FIXED_NOREPLACE` over a
+    /// mapping is `EEXIST`, found by asking the kernel for the same range
+    /// with nothing behind it; then the file's checks
+    /// (`rendered_mmap_file_checks`). A `seq_file`'s mapping reaches
+    /// `mmap_region`, which with `MAP_FIXED` unmaps whatever the range held
+    /// before `proc_reg_mmap` fails, so the range is unmapped here too.
+    pub(crate) async fn answer_rendered_procfs_mapping<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &Syscall,
+    ) -> Option<Result<i64, Error>> {
+        let Syscall::Mmap(c) = call else {
+            return None;
+        };
+        if c.flags().contains(MapFlags::MAP_ANONYMOUS) {
+            return None;
+        }
+        let path = guest
+            .thread_state()
+            .with_detfd(c.fd(), |detfd| {
+                (detfd.status_flags() & libc::O_PATH == 0)
+                    .then(|| detfd.procfs_rendered_path())
+                    .flatten()
+            })
+            .ok()
+            .flatten()?;
+        let seq_file = crate::procfs::rendered_path_is_seq_file(path);
+        let noexec = match GuestProcfs::statfs() {
+            Ok((_, flags)) => flags & libc::ST_NOEXEC != 0,
+            Err(errno) => return Some(Err(errno.into())),
+        };
+        let addr = c.addr().map_or(0, |addr| addr.as_raw());
+        let flags = c.flags();
+        let len = match rendered_mmap_address_checks(addr, c.len(), c.offset(), flags) {
+            Ok(len) => len,
+            Err(errno) => return Some(Err(errno.into())),
+        };
+        if flags.contains(MapFlags::MAP_FIXED_NOREPLACE) {
+            let probe = guest
+                .inject_with_retry(Syscall::Mmap(
+                    syscalls::Mmap::new()
+                        .with_addr(c.addr())
+                        .with_len(len)
+                        .with_prot(ProtFlags::PROT_NONE)
+                        .with_flags(
+                            MapFlags::MAP_PRIVATE
+                                | MapFlags::MAP_ANONYMOUS
+                                | MapFlags::MAP_FIXED_NOREPLACE,
+                        )
+                        .with_fd(-1)
+                        .with_offset(0),
+                ))
+                .await;
+            match probe {
+                Err(Errno::EEXIST) => return Some(Err(Errno::EEXIST.into())),
+                // A probe the kernel refused for another reason says nothing
+                // of an overlap; Linux's check would have found none.
+                Err(_) => {}
+                // Unmap the probe where it was placed. A backend that takes
+                // MAP_FIXED_NOREPLACE as a hint (KVM's executor) places it
+                // elsewhere when the range is occupied: that is the overlap.
+                Ok(placed) => {
+                    let placed_addr = Addr::<libc::c_void>::from_raw(placed as usize);
+                    if let Err(errno) = guest
+                        .inject_with_retry(Syscall::Munmap(
+                            syscalls::Munmap::new().with_addr(placed_addr).with_len(len),
+                        ))
+                        .await
+                    {
+                        return Some(Err(errno.into()));
+                    }
+                    if placed as usize != addr {
+                        return Some(Err(Errno::EEXIST.into()));
+                    }
+                }
+            }
+        }
+        let errno = rendered_mmap_file_checks(len, c.offset(), c.prot(), flags, noexec, seq_file);
+        if errno == Errno::EIO && flags.contains(MapFlags::MAP_FIXED) {
+            if let Err(unmapped) = guest
+                .inject_with_retry(Syscall::Munmap(
+                    syscalls::Munmap::new().with_addr(c.addr()).with_len(len),
+                ))
+                .await
+            {
+                return Some(Err(unmapped.into()));
+            }
+        }
+        Some(Err(errno.into()))
+    }
+
     /// Answer `call` if it must not reach the placeholder behind a rendered
     /// procfs descriptor: what a procfs sysctl file refuses, in the order
     /// Linux checks. The placeholder's read-only description already makes
@@ -1553,7 +1705,6 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Option<Result<i64, Error>> {
         let (sysno, args) = call.into_parts();
         let fd = match sysno {
-            Sysno::mmap => args.arg4 as i32,
             Sysno::pwrite64
             | Sysno::pwritev
             | Sysno::pwritev2
@@ -1591,24 +1742,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             Syscall::Pwrite64(_) | Syscall::Pwritev(_) | Syscall::Pwritev2(_) => {
                 return rendered_seq_file_pwrite_answer(sysno, args.arg3 as i64)
                     .map(|answer| answer.map_err(Error::from));
-            }
-            Syscall::Mmap(c) => {
-                if c.flags().contains(MapFlags::MAP_ANONYMOUS) {
-                    return None;
-                }
-                let noexec = match GuestProcfs::statfs() {
-                    Ok((_, flags)) => flags & libc::ST_NOEXEC != 0,
-                    Err(errno) => return Some(Err(errno.into())),
-                };
-                rendered_mmap_answer(
-                    c.addr().map_or(0, |addr| addr.as_raw()),
-                    c.len(),
-                    c.offset(),
-                    c.prot(),
-                    c.flags(),
-                    noexec,
-                    seq_file,
-                )
             }
             Syscall::Fsync(_) | Syscall::Fdatasync(_) => Err(Errno::EINVAL),
             Syscall::Fchmod(_) => Err(Errno::EPERM),
@@ -2564,6 +2697,46 @@ mod tests {
         assert_eq!(seq(read, private), Err(Errno::EIO));
         assert_eq!(seq(read, shared), Err(Errno::EIO));
         assert_eq!(seq(write, shared), Err(Errno::EACCES));
+        // A growing-down mapping is refused once the method exists.
+        assert_eq!(
+            seq(read, private | MapFlags::MAP_GROWSDOWN),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            rendered_mmap_answer(
+                0,
+                4096,
+                0,
+                read,
+                private | MapFlags::MAP_GROWSDOWN,
+                false,
+                false
+            ),
+            Err(Errno::ENODEV)
+        );
+        // MAP_SHARED_VALIDATE refuses MAP_FIXED_NOREPLACE and MAP_SYNC, which
+        // procfs does not support, on both kinds (a vacant range).
+        let validate = MapFlags::from_bits_retain(libc::MAP_SHARED_VALIDATE);
+        for seq_file in [false, true] {
+            for flag in [MapFlags::MAP_FIXED_NOREPLACE, MapFlags::MAP_SYNC] {
+                assert_eq!(
+                    rendered_mmap_answer(
+                        0x7000_0000_0000,
+                        4096,
+                        0,
+                        read,
+                        validate | flag,
+                        false,
+                        seq_file
+                    ),
+                    Err(Errno::EOPNOTSUPP)
+                );
+            }
+            assert_eq!(
+                rendered_mmap_answer(0, 4096, 0, read, validate, false, seq_file),
+                Err(if seq_file { Errno::EIO } else { Errno::ENODEV })
+            );
+        }
         assert_eq!(
             rendered_mmap_answer(0, 0, 0, read, private, false, true),
             Err(Errno::EINVAL)
