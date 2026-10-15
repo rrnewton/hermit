@@ -498,6 +498,21 @@ pub(crate) fn expand_argv(
     command: &Command,
     argv: &[OsString],
 ) -> Result<Option<Vec<OsString>>, Error> {
+    Ok(expand_argv_noting_manifest(command, argv)?.map(|(expanded, _)| expanded))
+}
+
+/// A rewritten command line, and the manifest it reruns if it came from
+/// `--from`.
+pub(crate) type Expansion = (Vec<OsString>, Option<PathBuf>);
+
+/// [`expand_argv`], also returning the manifest whose run the command line
+/// reruns, when the options came from `--from` rather than `--config`. The
+/// rewritten command line no longer names `--from`, so this is how the run
+/// learns it is a rerun.
+pub(crate) fn expand_argv_noting_manifest(
+    command: &Command,
+    argv: &[OsString],
+) -> Result<Option<Expansion>, Error> {
     let names = |long: &str| {
         let with_value = format!("{long}=");
         argv.iter()
@@ -580,7 +595,8 @@ pub(crate) fn expand_argv(
         expanded.push("--".into());
         expanded.extend(guest);
     }
-    Ok(Some(expanded))
+    let manifest = (!manifests.is_empty()).then_some(path);
+    Ok(Some((expanded, manifest)))
 }
 
 /// A copy of the `hermit` command that accepts every option of the global
@@ -977,6 +993,14 @@ mod tests {
         (
             "dap-gdb",
             &["--dap-listen=127.0.0.1:4711", "--dap-gdb=/usr/bin/gdb"],
+        ),
+        (
+            "preempt-at",
+            &["--preempt-at=square:2,thread=spawn:1,nth=3"],
+        ),
+        (
+            "preempt-at-list",
+            &["--preempt-at=square", "--preempt-at-list"],
         ),
         ("max-timeslice", &["--preemption-timeout=disabled"]),
         ("target-timeslice", &["--target-timeslice=5000"]),
