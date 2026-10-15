@@ -2199,7 +2199,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from 98cd5052: 1637.
     // And the exec reconnect's robust-wake delivery, drop and terminal-exec
     // tests (https://github.com/rrnewton/hermit/issues/4268): 1640, listed.
-    ("test.detcore_unit", 1640),
+    // And syscalls::files::guest_proc_visibility_tests: 1641.
+    ("test.detcore_unit", 1641),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3656,7 +3657,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the five last-band poller and waiting-signal tests: 1636.
     // And +1 from 98cd5052: 1637.
     // And the three exec robust-wake tests: 1640, by listing.
-    ("test.detcore_unit_on_host", 1640),
+    // And syscalls::files::guest_proc_visibility_tests: 1641.
+    ("test.detcore_unit_on_host", 1641),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
