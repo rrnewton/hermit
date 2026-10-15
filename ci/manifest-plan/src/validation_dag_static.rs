@@ -1532,7 +1532,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/issues/4266): 1079, listed.
     // And +1 from the discarded-at-send record (https://github.com/rrnewton/hermit/issues/4293): 1080, listed.
     // And the_peer_loop_runs_with_and_without_pkru_instructions: 1081, listed.
-    ("test.hermit_unit", 1081),
+    // And record_version_rejects_streams_from_before_loadavg_is_rendered (https://github.com/rrnewton/hermit/issues/4213): 1082.
+    ("test.hermit_unit", 1082),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4022,7 +4023,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the per-process-levels record-version test (B3a-1): 1079.
     // And +1 from the discarded-at-send record (https://github.com/rrnewton/hermit/issues/4293): 1080, listed.
     // And the peer-loop PKRU guard test: 1081.
-    ("test.hermit_unit_on_host", 1081),
+    // And record_version_rejects_streams_from_before_loadavg_is_rendered (https://github.com/rrnewton/hermit/issues/4213): 1082.
+    ("test.hermit_unit_on_host", 1082),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
