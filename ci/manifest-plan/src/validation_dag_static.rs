@@ -1550,7 +1550,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from e45ad547: 1085.
     // And metadata::tests::record_version_rejects_streams_from_before_replaced_read_descriptors_block_the_claim
     // (https://github.com/rrnewton/hermit/issues/4410): 1086, listed.
-    ("test.hermit_unit", 1086),
+    // And record_version_rejects_streams_from_before_uptime_is_rendered (https://github.com/rrnewton/hermit/issues/4213): 1087.
+    ("test.hermit_unit", 1087),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2278,7 +2279,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And scheduler::test::a_background_reads_descriptor_replaced_before_it_runs_may_take_sigchld
     // (https://github.com/rrnewton/hermit/issues/4410): 1706, listed.
     // And +4 from d8a99b5b: 1710.
-    ("test.detcore_unit", 1710),
+    // And a_seq_file_refuses_mappings_and_positioned_writes_as_linux (https://github.com/rrnewton/hermit/issues/4213): 1711.
+    ("test.detcore_unit", 1711),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3865,7 +3867,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from e45ad547: 1705.
     // And the 4410 replaced-descriptor test: 1706, listed.
     // And +4 from d8a99b5b: 1710.
-    ("test.detcore_unit_on_host", 1710),
+    // And a_seq_file_refuses_mappings_and_positioned_writes_as_linux (https://github.com/rrnewton/hermit/issues/4213): 1711.
+    ("test.detcore_unit_on_host", 1711),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4095,7 +4098,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the 4343 record-version test: 1085, listed.
     // And +1 from e45ad547: 1085.
     // And the 4410 record-version test: 1086, listed.
-    ("test.hermit_unit_on_host", 1086),
+    // And record_version_rejects_streams_from_before_uptime_is_rendered (https://github.com/rrnewton/hermit/issues/4213): 1087.
+    ("test.hermit_unit_on_host", 1087),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
