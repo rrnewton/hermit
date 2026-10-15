@@ -1545,7 +1545,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And metadata::tests::record_version_rejects_streams_from_before_the_process_cgroup_root
     // (https://github.com/rrnewton/hermit/issues/4378): 1083.
     // And record_version_rejects_streams_from_before_loadavg_is_rendered (https://github.com/rrnewton/hermit/issues/4213): 1084.
-    ("test.hermit_unit", 1084),
+    // And metadata::tests::record_version_rejects_streams_from_before_a_recorded_sleep_claims_its_sigchld
+    // (https://github.com/rrnewton/hermit/issues/4343): 1085, listed.
+    ("test.hermit_unit", 1085),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2266,7 +2268,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from a35a69ad: 1701.
     // And procfs::tests::a_process_cgroup_reads_as_the_root_cgroup
     // (https://github.com/rrnewton/hermit/issues/4378): 1702.
-    ("test.detcore_unit", 1702),
+    // And scheduler::test::window_unusable_waits_for_an_outside_call_that_may_take_sigchld
+    // (https://github.com/rrnewton/hermit/issues/4343): 1703, listed.
+    ("test.detcore_unit", 1703),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2704,7 +2708,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/2289): 199.
     // And record_vfork_child_waiting_for_another_thread
     // (https://github.com/rrnewton/hermit/issues/4194): 200.
-    ("test.record_replay", 200),
+    // And record_a_childs_sigchld_that_wakes_a_sleep
+    // (https://github.com/rrnewton/hermit/issues/4343): 201, listed.
+    ("test.record_replay", 201),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -3837,7 +3843,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the DBT SIGKILL group-retirement and fence tests: 1700.
     // And +1 from a35a69ad: 1701.
     // And the process-cgroup test (https://github.com/rrnewton/hermit/issues/4378): 1702.
-    ("test.detcore_unit_on_host", 1702),
+    // And the 4343 outside-call gate test: 1703, listed.
+    ("test.detcore_unit_on_host", 1703),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4063,7 +4070,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from a35a69ad: 1082.
     // And the process-cgroup record-epoch test: 1083.
     // And record_version_rejects_streams_from_before_loadavg_is_rendered (https://github.com/rrnewton/hermit/issues/4213): 1084.
-    ("test.hermit_unit_on_host", 1084),
+    // And the 4343 record-version test: 1085, listed.
+    ("test.hermit_unit_on_host", 1085),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
