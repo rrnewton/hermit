@@ -1579,7 +1579,8 @@ fi
 # KVM HYPERCALL-ADDRESS-MEMO SDK-BUDGET CARRY (2026-10-15): advance from 1c514b58 to a4d18df6d14a81ee6553ed4459f4172a92c7733a (KVM memoizes the syscall trampoline's hypercall offset per thread; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
 # KVM LOADAVG-COPY-DELETION SDK-BUDGET CARRY (2026-10-15): advance from a4d18df6 to b5ff4dce018027502490fa4d8990bec3b143460c (deletes reverie-kvm's copy of /proc/loadavg, which Detcore renders; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
 # KVM LAZY-ZERO + DESCRIPTOR-FACTS SDK-BUDGET CARRY (2026-10-15): advance from b5ff4dce to da4679f359d2397442c59453497cb2bf49bedac2 (542d8457 zeroes large new and unmapped guest ranges lazily; da4679f3 records each descriptor's access mode, file type and read capability once per entry; both change only reverie-kvm, inventory unchanged), so the budgets above carry.
-expected_pin=da4679f359d2397442c59453497cb2bf49bedac2
+# KVM MAP_FIXED_NOREPLACE SDK-BUDGET CARRY (2026-10-15): advance from da4679f3 to 62de81ba7fdd50b135e14091c90d1f2aa24230aa (c1525494 and 8f6e9b81: lazy zeroing refusals and MADV_DONTNEED runs; 62de81ba: KVM honours MAP_FIXED_NOREPLACE; all change only reverie-kvm, inventory unchanged), so the budgets above carry.
+expected_pin=62de81ba7fdd50b135e14091c90d1f2aa24230aa
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
