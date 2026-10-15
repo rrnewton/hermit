@@ -1558,7 +1558,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from R2b-1 of https://github.com/rrnewton/hermit/issues/4273: 1090, listed.
     // And +1 from 3fab1ec4: 1091.
     // The revert of 4273 R2b-1 (ade0e7dd) removes its tests: 1090.
-    ("test.hermit_unit", 1090),
+    // And record_version_rejects_streams_from_before_stat_is_rendered (https://github.com/rrnewton/hermit/issues/4213): 1091.
+    // And backend_guest_code_between_injections_is_explicit (https://github.com/rrnewton/hermit/issues/4213): 1092.
+    ("test.hermit_unit", 1092),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2292,7 +2294,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +4 from b909e36d: 1713.
     // And +7 from R2b-1 of https://github.com/rrnewton/hermit/issues/4273: 1720, listed.
     // The revert of 4273 R2b-1 (ade0e7dd) removes its tests: 1713.
-    ("test.detcore_unit", 1713),
+    // And a_placeholder_carries_the_uptime_of_the_first_read (https://github.com/rrnewton/hermit/issues/4213): 1714.
+    ("test.detcore_unit", 1714),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3911,7 +3914,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +4 from b909e36d: 1713.
     // And +7 from R2b-1 of https://github.com/rrnewton/hermit/issues/4273: 1720, listed.
     // The revert of 4273 R2b-1 (ade0e7dd) removes its tests: 1713.
-    ("test.detcore_unit_on_host", 1713),
+    // And a_placeholder_carries_the_uptime_of_the_first_read (https://github.com/rrnewton/hermit/issues/4213): 1714.
+    ("test.detcore_unit_on_host", 1714),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4151,7 +4155,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from R2b-1 of https://github.com/rrnewton/hermit/issues/4273: 1090, listed.
     // And +1 from 3fab1ec4: 1091.
     // The revert of 4273 R2b-1 (ade0e7dd) removes its tests: 1090.
-    ("test.hermit_unit_on_host", 1090),
+    // And record_version_rejects_streams_from_before_stat_is_rendered (https://github.com/rrnewton/hermit/issues/4213): 1091.
+    // And backend_guest_code_between_injections_is_explicit (https://github.com/rrnewton/hermit/issues/4213): 1092.
+    ("test.hermit_unit_on_host", 1092),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

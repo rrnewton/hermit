@@ -591,7 +591,17 @@ impl RecordVersion {
 // full-pipe case: 4096 of 4096+ written, Linux blocks and completes it). Pipe
 // calls woken by signals decide as they did at 0x15e; a 0x15f recording of
 // such a wake would replay to another result, so the version moves forward.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x160);
+// 0x160 -> 0x161 (taken at land time, as the reservation file's land-time
+// numbering rule gives a ready change HIGHEST_SHIPPED + 1; reserved as
+// 0x15f): /proc/stat is a procfs file Detcore renders
+// (https://github.com/rrnewton/hermit/issues/4213), and a /proc/stat the
+// kernel opened (under record and replay, after chroot) now takes Detcore's
+// rendered-file path for readv, preadv, preadv2 and lseek, as /proc/uptime
+// did at 0x15d. A vectored read of it records a capture where an older binary
+// refused it with ENOSYS, so an older recording containing one would replay
+// out of step; and every read of it shows Detcore's layout, not the host's
+// lines, so an older recording's guest saw other bytes.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x161);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -889,6 +899,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         // continuation posted (https://github.com/rrnewton/hermit/issues/3963).
         backend_supports_blocked_wait_signal_interruption: true,
         backend_delivers_timer_events: false,
+        backend_runs_guest_code_between_injections: false,
         // A constant, unlike `hermit run`: replay rebuilds this configuration
         // and must decide which signals end a wait exactly as the recording did,
         // whatever terminal replay itself runs under. `false` keeps Linux's rule
@@ -1595,6 +1606,19 @@ mod tests {
     #[test]
     fn record_version_rejects_streams_from_before_replaced_read_descriptors_block_the_claim() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x15b)));
+        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
+    }
+
+    /// A recording older than 0x161 refused a vectored read of a /proc/stat
+    /// the kernel opened (ENOSYS) where Detcore now captures it, and showed
+    /// the guest the host's lines, as Detcore now renders /proc/stat
+    /// (https://github.com/rrnewton/hermit/issues/4213).
+    #[test]
+    fn record_version_rejects_streams_from_before_stat_is_rendered() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x15d)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x15e)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x15f)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x160)));
         assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
     }
 
