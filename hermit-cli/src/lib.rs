@@ -42,6 +42,7 @@ pub mod liteinst_bootstrap;
 mod liteinst_constructor;
 pub mod liteinst_record;
 mod metadata;
+pub mod preempt_hints;
 pub mod xstate_probe;
 /// Diagnostic writes that never wait for a reader; they live in detcore, whose
 /// own stderr writer reads the same flag.

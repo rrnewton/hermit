@@ -1667,7 +1667,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and container::tests::installations_record_their_install_time_mountpoints
     // (https://github.com/rrnewton/hermit/issues/4213, K3a): 1160.
     // Five e9patch executable-publication inode and collision regressions: 1165.
-    ("test.hermit_unit", 1165),
+    // And the three preempt_hints tests (https://github.com/rrnewton/hermit/issues/4371): 1168, listed.
+    ("test.hermit_unit", 1168),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3617,7 +3618,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the DBT captured-stderr/controller-diagnostics regression: 539, listed.
     // And a_polled_read_signaled_again_and_again_is_interrupted
     // (https://github.com/rrnewton/hermit/issues/4504): 540, listed.
-    ("test.cli", 540),
+    // And the three --preempt-at tests (https://github.com/rrnewton/hermit/issues/4371): 543, listed.
+    ("test.cli", 543),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4074,7 +4076,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the three 4213 container-mount-table tests: 473.
     // And the same captured-stderr/controller-diagnostics regression: 474, listed.
     // And the same repeated-signal polled-read test: 475, listed.
-    ("test.cli_on_host", 475),
+    // And the three --preempt-at tests (https://github.com/rrnewton/hermit/issues/4371): 478, listed.
+    ("test.cli_on_host", 478),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4691,7 +4694,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the 4213 container-mount-table record-version, KVM table and
     // install-time mountpoint tests: 1160.
     // The same five e9patch executable-publication regressions: 1165.
-    ("test.hermit_unit_on_host", 1165),
+    // And the three preempt_hints tests (https://github.com/rrnewton/hermit/issues/4371): 1168, listed.
+    ("test.hermit_unit_on_host", 1168),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
