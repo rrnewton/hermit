@@ -63,6 +63,9 @@ struct LineRow {
     addr: u64,
     file: Option<String>,
     line: u32,
+    /// Whether the line program marks this row as a recommended breakpoint
+    /// location (`is_stmt`).
+    is_stmt: bool,
 }
 
 /// A resolved source location for introspection output.
@@ -181,6 +184,7 @@ impl DebugInfoResolver {
                     addr: row.address(),
                     file,
                     line: line.get() as u32,
+                    is_stmt: row.is_stmt(),
                 });
             }
         }
@@ -220,6 +224,49 @@ impl DebugInfoResolver {
             .filter(|r| extent.map(|f| f.contains(r.addr)).unwrap_or(true))
             .map(|r| r.addr)
             .min()
+    }
+
+    /// The `(address, size)` extent of a named function in the symbol table.
+    pub fn function_extent(&self, name: &str) -> Option<(u64, u64)> {
+        self.functions.get(name).map(|e| (e.addr, e.size))
+    }
+
+    /// Whether any line row names a source file whose basename is that of
+    /// `file`.
+    pub fn has_line_file(&self, file: &str) -> bool {
+        let want = basename(file);
+        self.lines
+            .iter()
+            .any(|r| r.file.as_deref() == Some(want.as_str()))
+    }
+
+    /// Every distinct address at which the line program marks `line` (of
+    /// `file`, when given) as a statement boundary (`is_stmt`), optionally
+    /// within a `(addr, size)` extent, in ascending order. Unlike
+    /// [`Self::line_addr`], which picks the lowest row, this returns every
+    /// copy of a line that inlining or loop rotation split.
+    pub fn stmt_line_addrs(
+        &self,
+        file: Option<&str>,
+        line: u32,
+        within: Option<(u64, u64)>,
+    ) -> Vec<u64> {
+        let file_base = file.map(basename);
+        let extent = within.map(|(addr, size)| FuncExtent { addr, size });
+        let mut addrs: Vec<u64> = self
+            .lines
+            .iter()
+            .filter(|r| r.is_stmt && r.line == line)
+            .filter(|r| match (&file_base, &r.file) {
+                (Some(want), Some(have)) => want == have,
+                (Some(_), None) => false,
+                (None, _) => true,
+            })
+            .filter(|r| extent.map(|f| f.contains(r.addr)).unwrap_or(true))
+            .map(|r| r.addr)
+            .collect();
+        addrs.dedup();
+        addrs
     }
 
     /// Resolve a [`CodeLocation`] to a concrete address, preferring

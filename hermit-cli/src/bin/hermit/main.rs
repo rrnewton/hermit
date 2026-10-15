@@ -683,16 +683,17 @@ fn main() {
     let argv = std::env::args_os().collect::<Vec<_>>();
     // `hermit run --config FILE` means the command line the file names, so
     // it is rewritten into that command line before anything is parsed.
-    let (argv, config_applied) = match run_config::expand_argv(&Args::command(), &argv) {
-        Ok(Some(expanded)) => (expanded, true),
-        Ok(None) => (argv, false),
-        Err(error) => Args::command()
-            .error(
-                clap::error::ErrorKind::ValueValidation,
-                format!("{error:#}"),
-            )
-            .exit(),
-    };
+    let (argv, config_applied, rerun_manifest) =
+        match run_config::expand_argv_noting_manifest(&Args::command(), &argv) {
+            Ok(Some((expanded, manifest))) => (expanded, true, manifest),
+            Ok(None) => (argv, false, None),
+            Err(error) => Args::command()
+                .error(
+                    clap::error::ErrorKind::ValueValidation,
+                    format!("{error:#}"),
+                )
+                .exit(),
+        };
     let matches = Args::command()
         .try_get_matches_from(&argv)
         .unwrap_or_else(|error| {
@@ -712,6 +713,9 @@ fn main() {
         mut command,
     } = args_from_matches_with_clock(&matches, std::time::SystemTime::now)
         .unwrap_or_else(|error| error.exit());
+    if let (Subcommand::Run(run), Some(manifest)) = (&mut command, rerun_manifest) {
+        run.set_rerun_manifest(manifest);
+    }
 
     // Open --log-file HERE, in the host's filename namespace, before any container
     // exists. This is the moment a shell would perform `> file`, and doing it later

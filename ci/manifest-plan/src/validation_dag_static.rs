@@ -1650,7 +1650,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +15 from 2447c8e8: 1153.
     // And metadata::tests::record_version_rejects_streams_from_before_received_directory_lookups
     // (https://github.com/rrnewton/hermit/issues/4213): 1154, executed.
-    ("test.hermit_unit", 1154),
+    // And the three preempt_hints tests (https://github.com/rrnewton/hermit/issues/4371): 1157, listed.
+    ("test.hermit_unit", 1157),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3561,7 +3562,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore_warns_from_inside_the_guest_once_per_run_on_every_backend:
     // 518.
     // And +3 from 77350e52: 521.
-    ("test.cli", 521),
+    // And the three --preempt-at tests (https://github.com/rrnewton/hermit/issues/4371): 524, listed.
+    ("test.cli", 524),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4007,7 +4009,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore_warns_from_inside_the_guest_once_per_run_on_every_backend:
     // 453.
     // And +3 from 77350e52: 456.
-    ("test.cli_on_host", 456),
+    // And the three --preempt-at tests (https://github.com/rrnewton/hermit/issues/4371): 459, listed.
+    ("test.cli_on_host", 459),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4608,7 +4611,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the reported-event log-file test: 1138.
     // And +15 from 2447c8e8: 1153.
     // And the 4213 received-directory record-version test: 1154.
-    ("test.hermit_unit_on_host", 1154),
+    // And the three preempt_hints tests (https://github.com/rrnewton/hermit/issues/4371): 1157, listed.
+    ("test.hermit_unit_on_host", 1157),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

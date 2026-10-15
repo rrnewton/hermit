@@ -1263,6 +1263,7 @@ mod tests {
                 "--preemption-stacktrace-log-file=requested.log",
                 "--preemption-stacktrace-log-file",
             ),
+            ("--preempt-at=main", "--preempt-at"),
         ] {
             let error = options(&[run_arg])
                 .refuse_outputs_trials_overwrite()
@@ -1408,6 +1409,11 @@ mod tests {
                 None,
                 "--preemption-stacktrace-log-file=requested.log",
                 "refuse --preemption-stacktrace-log-file in the run arguments",
+            ),
+            (
+                None,
+                "--preempt-at=main",
+                "refuse --preempt-at in the run arguments",
             ),
         ] {
             let mut argv = vec!["hermit"];
