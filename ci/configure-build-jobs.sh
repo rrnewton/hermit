@@ -1650,8 +1650,9 @@ fi
 # The rebase onto 69228e48 changes only KVM files, preserving these SDK inputs.
 # Keep the existing budgets and 16-job clamp. This single SDK observation
 # is not a full-profile calibration or whole-guest qualification.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != c18f07cb614ca404b34e131a8a912f4a7b62813c ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie c18f07cb614ca404b34e131a8a912f4a7b62813c (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# KVM RPC-KEPT-FAILURE SDK-BUDGET CARRY (2026-10-14): advance from c18f07cb to af4e4f827d0b987b6641fd4ddda3f8d2bec6a8de (4bfe8b8f: DBT robust-word rewrite for a non-leader exec caller, which changes reverie-dbt/native/client.c, its fixture and a live test; af4e4f82: KVM keeps one RPC failure wait per thread, which changes only reverie-kvm). reverie-dbt/build.rs and reverie-dbt/vendor are identical between the pins, so the source recipe key 7035b7a0... is unchanged; inventory stays 955. The budgets above carry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != af4e4f827d0b987b6641fd4ddda3f8d2bec6a8de ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie af4e4f827d0b987b6641fd4ddda3f8d2bec6a8de (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
