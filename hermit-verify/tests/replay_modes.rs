@@ -22,6 +22,14 @@
 //! exec target `pending-exec-check` and the deliberate deadlock
 //! `blocking-sigsuspend-no-signal` of `signal_determinism` do not.
 //!
+//! The internal `tests/rust` guests get the same three modes, with that
+//! matrix's exemptions: thread_random and poll_spin have no chaos replay;
+//! bind_connect_race, clock_total_order, exit_group, futex_and_print,
+//! futex_wake_some, poll_spin and thread_random have no trace replay; and the
+//! four print_*nanosleep*_race guests have no chaotic trace replay. They are
+//! this workspace's `rustbin_<name>` binaries (package
+//! hermetic_infra_hermit_tests), found beside `hermit-verify`.
+//!
 //! The Hermit binary is `HERMIT_BIN`, or the `hermit` built beside this
 //! package's `hermit-verify`. Both need the PMU and user and mount namespaces,
 //! as every Hermit integration test does.
@@ -112,12 +120,32 @@ fn compile_guest(guest: &str, directory: &Path) -> PathBuf {
     binary
 }
 
+/// The workspace's `rustbin_<guest>`, built beside `hermit-verify`.
+fn rust_guest(guest: &str) -> PathBuf {
+    let binary =
+        Path::new(env!("CARGO_BIN_EXE_hermit-verify")).with_file_name(format!("rustbin_{guest}"));
+    assert!(
+        binary.is_file(),
+        "{} is missing; build it with cargo build -p hermetic_infra_hermit_tests",
+        binary.display()
+    );
+    binary
+}
+
 fn run_replay_case(guest: &str, scenario: Option<&str>, mode: Mode) {
     let directory = tempfile::Builder::new()
         .prefix(&format!("replay-{guest}-"))
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("failed to create the guest build directory");
     let binary = compile_guest(guest, directory.path());
+    run_replay(&binary, scenario, mode);
+}
+
+fn run_rust_replay_case(guest: &str, mode: Mode) {
+    run_replay(&rust_guest(guest), None, mode);
+}
+
+fn run_replay(binary: &Path, scenario: Option<&str>, mode: Mode) {
     let mut command = Command::new("timeout");
     command
         .args(["--kill-after", "10s", VERIFY_TIMEOUT])
@@ -128,7 +156,7 @@ fn run_replay_case(guest: &str, scenario: Option<&str>, mode: Mode) {
         .args(mode.args())
         .arg("--hermit-arg=--base-env=empty")
         .arg("--")
-        .arg(&binary)
+        .arg(binary)
         .args(scenario);
     let rendered = format!("{command:?}");
     let output = command
@@ -139,6 +167,22 @@ fn run_replay_case(guest: &str, scenario: Option<&str>, mode: Mode) {
         "{rendered} did not replay its recording\n{}",
         render(&output)
     );
+}
+
+macro_rules! rust_replay_case {
+    (#[ignore = $reason:literal] $name:ident, $guest:literal, $mode:expr) => {
+        #[test]
+        #[ignore = $reason]
+        fn $name() {
+            run_rust_replay_case($guest, $mode);
+        }
+    };
+    ($name:ident, $guest:literal, $mode:expr) => {
+        #[test]
+        fn $name() {
+            run_rust_replay_case($guest, $mode);
+        }
+    };
 }
 
 macro_rules! replay_case {
@@ -1437,5 +1481,253 @@ replay_case!(
     trace_replay_chaos_writev_determinism,
     "writev_determinism",
     None,
+    Mode::TraceReplayChaos
+);
+
+// The internal tests/rust guests.
+rust_replay_case!(
+    chaos_replay_rust_bind_connect_race,
+    "bind_connect_race",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    chaos_replay_rust_clock_gettime,
+    "clock_gettime",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    trace_replay_rust_clock_gettime,
+    "clock_gettime",
+    Mode::TraceReplay
+);
+rust_replay_case!(
+    trace_replay_chaos_rust_clock_gettime,
+    "clock_gettime",
+    Mode::TraceReplayChaos
+);
+rust_replay_case!(
+    chaos_replay_rust_clock_total_order,
+    "clock_total_order",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    chaos_replay_rust_exit_group,
+    "exit_group",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    chaos_replay_rust_futex_and_print,
+    "futex_and_print",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    chaos_replay_rust_futex_timeout,
+    "futex_timeout",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    trace_replay_rust_futex_timeout,
+    "futex_timeout",
+    Mode::TraceReplay
+);
+rust_replay_case!(
+    trace_replay_chaos_rust_futex_timeout,
+    "futex_timeout",
+    Mode::TraceReplayChaos
+);
+rust_replay_case!(
+    chaos_replay_rust_futex_wait_child,
+    "futex_wait_child",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    trace_replay_rust_futex_wait_child,
+    "futex_wait_child",
+    Mode::TraceReplay
+);
+rust_replay_case!(
+    trace_replay_chaos_rust_futex_wait_child,
+    "futex_wait_child",
+    Mode::TraceReplayChaos
+);
+rust_replay_case!(
+    chaos_replay_rust_futex_wake_some,
+    "futex_wake_some",
+    Mode::ChaosReplay
+);
+rust_replay_case!(chaos_replay_rust_heap_ptrs, "heap_ptrs", Mode::ChaosReplay);
+rust_replay_case!(trace_replay_rust_heap_ptrs, "heap_ptrs", Mode::TraceReplay);
+rust_replay_case!(
+    trace_replay_chaos_rust_heap_ptrs,
+    "heap_ptrs",
+    Mode::TraceReplayChaos
+);
+rust_replay_case!(
+    chaos_replay_rust_interrogate_tty,
+    "interrogate_tty",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    trace_replay_rust_interrogate_tty,
+    "interrogate_tty",
+    Mode::TraceReplay
+);
+rust_replay_case!(
+    trace_replay_chaos_rust_interrogate_tty,
+    "interrogate_tty",
+    Mode::TraceReplayChaos
+);
+rust_replay_case!(chaos_replay_rust_mem_race, "mem_race", Mode::ChaosReplay);
+rust_replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    trace_replay_rust_mem_race,
+    "mem_race",
+    Mode::TraceReplay
+);
+rust_replay_case!(
+    trace_replay_chaos_rust_mem_race,
+    "mem_race",
+    Mode::TraceReplayChaos
+);
+rust_replay_case!(chaos_replay_rust_nanosleep, "nanosleep", Mode::ChaosReplay);
+rust_replay_case!(trace_replay_rust_nanosleep, "nanosleep", Mode::TraceReplay);
+rust_replay_case!(
+    trace_replay_chaos_rust_nanosleep,
+    "nanosleep",
+    Mode::TraceReplayChaos
+);
+rust_replay_case!(
+    chaos_replay_rust_network_hello_world,
+    "network_hello_world",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    trace_replay_rust_network_hello_world,
+    "network_hello_world",
+    Mode::TraceReplay
+);
+rust_replay_case!(
+    trace_replay_chaos_rust_network_hello_world,
+    "network_hello_world",
+    Mode::TraceReplayChaos
+);
+rust_replay_case!(
+    chaos_replay_rust_pipe_basics,
+    "pipe_basics",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    trace_replay_rust_pipe_basics,
+    "pipe_basics",
+    Mode::TraceReplay
+);
+rust_replay_case!(
+    trace_replay_chaos_rust_pipe_basics,
+    "pipe_basics",
+    Mode::TraceReplayChaos
+);
+rust_replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    chaos_replay_rust_poll,
+    "poll",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    trace_replay_rust_poll,
+    "poll",
+    Mode::TraceReplay
+);
+rust_replay_case!(trace_replay_chaos_rust_poll, "poll", Mode::TraceReplayChaos);
+rust_replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    chaos_replay_rust_print_clock_nanosleep_monotonic_abs_race,
+    "print_clock_nanosleep_monotonic_abs_race",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    trace_replay_rust_print_clock_nanosleep_monotonic_abs_race,
+    "print_clock_nanosleep_monotonic_abs_race",
+    Mode::TraceReplay
+);
+rust_replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    chaos_replay_rust_print_clock_nanosleep_monotonic_race,
+    "print_clock_nanosleep_monotonic_race",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    trace_replay_rust_print_clock_nanosleep_monotonic_race,
+    "print_clock_nanosleep_monotonic_race",
+    Mode::TraceReplay
+);
+rust_replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    chaos_replay_rust_print_clock_nanosleep_realtime_abs_race,
+    "print_clock_nanosleep_realtime_abs_race",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    trace_replay_rust_print_clock_nanosleep_realtime_abs_race,
+    "print_clock_nanosleep_realtime_abs_race",
+    Mode::TraceReplay
+);
+rust_replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    chaos_replay_rust_print_nanosleep_race,
+    "print_nanosleep_race",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
+    trace_replay_rust_print_nanosleep_race,
+    "print_nanosleep_race",
+    Mode::TraceReplay
+);
+rust_replay_case!(chaos_replay_rust_rdtsc, "rdtsc", Mode::ChaosReplay);
+rust_replay_case!(trace_replay_rust_rdtsc, "rdtsc", Mode::TraceReplay);
+rust_replay_case!(
+    trace_replay_chaos_rust_rdtsc,
+    "rdtsc",
+    Mode::TraceReplayChaos
+);
+rust_replay_case!(
+    chaos_replay_rust_sched_yield,
+    "sched_yield",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    trace_replay_rust_sched_yield,
+    "sched_yield",
+    Mode::TraceReplay
+);
+rust_replay_case!(
+    trace_replay_chaos_rust_sched_yield,
+    "sched_yield",
+    Mode::TraceReplayChaos
+);
+rust_replay_case!(
+    chaos_replay_rust_socketpair,
+    "socketpair",
+    Mode::ChaosReplay
+);
+rust_replay_case!(
+    trace_replay_rust_socketpair,
+    "socketpair",
+    Mode::TraceReplay
+);
+rust_replay_case!(
+    trace_replay_chaos_rust_socketpair,
+    "socketpair",
+    Mode::TraceReplayChaos
+);
+rust_replay_case!(chaos_replay_rust_stack_ptr, "stack_ptr", Mode::ChaosReplay);
+rust_replay_case!(trace_replay_rust_stack_ptr, "stack_ptr", Mode::TraceReplay);
+rust_replay_case!(
+    trace_replay_chaos_rust_stack_ptr,
+    "stack_ptr",
     Mode::TraceReplayChaos
 );
