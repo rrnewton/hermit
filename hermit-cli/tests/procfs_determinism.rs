@@ -930,6 +930,109 @@ fn proc_loadavg_uses_virtual_values() {
     }
 }
 
+/// A /proc name outside the run's level, reached relative to a /proc
+/// descriptor that was itself opened through a descriptor link
+/// (`openat(open("/proc/self/fd/<a /proc descriptor>"), "kallsyms")`, and the
+/// `/dev/fd/N` spelling), is refused under record and replay as the procfs
+/// name it is: ENOENT at `--proc=minimal`, before the open takes a scheduler
+/// turn or reaches the kernel, and the recording replays bit for bit. Before
+/// Detcore recorded such a descriptor as the path of the descriptor it
+/// reopens, the name was looked up below the link's spelling, which names no
+/// procfs file, so the open took a turn and reached the kernel before it was
+/// refused; that is why RECORD_VERSION moved to 0x164
+/// (https://github.com/rrnewton/hermit/issues/4213).
+#[test]
+fn a_name_outside_the_level_through_a_directory_alias_is_refused_before_its_turn() {
+    let _guard = hermit_run_lock();
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("create guest directory");
+    let guest = build.path().join("proc-directory-alias-level");
+    compile_c(
+        &Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli must be inside the repository")
+            .join("tests/c/proc_directory_alias_level.c"),
+        &guest,
+    );
+    let expected = "openat(/proc/self/fd/3, \"kallsyms\"): No such file or directory\n\
+                    openat(/dev/fd/3, \"kallsyms\"): No such file or directory\n";
+    let record = |data_dir: &Path, verify_json: Option<&Path>| {
+        let mut command = Command::new(hermit_test::hermit_binary());
+        command.args([
+            "--log=info",
+            "--backend=ptrace",
+            "record",
+            "start",
+            "--strict",
+            "--proc=minimal",
+            "--record-timeout=30",
+        ]);
+        if let Some(verdict) = verify_json {
+            command
+                .args(["--verify", "--verify-strict"])
+                .arg(format!("--verify-json={}", verdict.display()));
+        }
+        command
+            .arg(format!("--data-dir={}", data_dir.display()))
+            .arg("--")
+            .arg(&guest)
+            .stdin(Stdio::null());
+        let rendered = format!("{command:?}");
+        let output = command
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+        assert!(
+            output.status.success(),
+            "{rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            expected,
+            "{rendered}"
+        );
+        output
+    };
+
+    let data_dir =
+        tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("create recording directory");
+    let verdict = data_dir.path().join("verify.json");
+    record(&data_dir.path().join("verified"), Some(&verdict));
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&verdict).expect("record/replay wrote no verify JSON"))
+            .expect("record/replay verify JSON is not JSON");
+    assert_eq!(report["verdict"], serde_json::json!("matched"), "{report}");
+    assert_eq!(
+        report["bitwise_parity"],
+        serde_json::json!(true),
+        "{report}"
+    );
+    for side in ["left", "right"] {
+        assert!(
+            report["compared_log_messages"][side]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "no INFO messages compared on the {side}: {report}"
+        );
+    }
+
+    // The recording's own log: both opens are answered, and neither takes a
+    // scheduler turn for the name.
+    let output = record(&data_dir.path().join("logged"), None);
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        log.matches("\"kallsyms\", OFlag(O_CLOEXEC)) = Err(Errno(ENOENT))")
+            .count(),
+        2,
+        "the recording's log does not show both refusals:\n{log}"
+    );
+    assert!(
+        !log.contains("Path(\"kallsyms\")"),
+        "an alias-reached name outside the level took a scheduler turn:\n{log}"
+    );
+}
+
 /// /proc/uptime shows the virtual uptime, and the one of the read: opened,
 /// then read 5 seconds later, it shows the later uptime, as Linux renders it
 /// when it is read (https://github.com/rrnewton/hermit/issues/4213).

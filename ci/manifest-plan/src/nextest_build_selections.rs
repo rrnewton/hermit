@@ -854,6 +854,8 @@ mod tests {
             // fixtures without a Rust or Go guest less the ignored cat.test,
             // its completeness test, and its 57 fixtures with a Rust guest.
             // Plus signal_determinism's DBT thread-directed SIGKILL refusal test.
+            // Plus procfs_determinism's directory-alias record/replay test
+            // (https://github.com/rrnewton/hermit/issues/4213).
             // The local node runs in shards, which together execute the same.
             let executed = |tag: &str| -> u64 {
                 let step = graph.steps.iter().find(|step| step.tag() == tag).unwrap();
@@ -867,7 +869,7 @@ mod tests {
             } else {
                 executed(tag)
             };
-            assert_eq!(population, 566);
+            assert_eq!(population, 567);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

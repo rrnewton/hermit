@@ -1353,6 +1353,69 @@ fn names_descriptor_link(path: &Path) -> bool {
     }
 }
 
+/// Who opens a path that may be one of its descriptor links, for
+/// [`path_to_record_for_open`].
+#[derive(Debug, Clone, Copy)]
+struct DescriptorLinkOpener {
+    /// The caller's pid and tid as procfs names them, or `None` where
+    /// Detcore does not know those names (a nested PID namespace).
+    own: Option<(i32, i32)>,
+    /// Whether the descriptor table procfs reads for a process-level link
+    /// (`/proc/self/fd/N`, `/dev/fd/N`), the thread-group leader's, is
+    /// provably the caller's own. A thread cloned without `CLONE_FILES`
+    /// holds a table of its own.
+    holds_process_table: bool,
+}
+
+/// Whether an open of the absolute spelling `observed` with `flags` opens a
+/// descriptor link itself rather than the file it reaches: `O_NOFOLLOW`
+/// does not follow the last component (with `O_PATH` the link is opened,
+/// without it the open fails with `ELOOP`), unless the spelling follows it
+/// anyway with a trailing slash or `/.`.
+fn opens_the_link_itself(observed: &Path, flags: OFlag) -> bool {
+    let bytes = std::os::unix::ffi::OsStrExt::as_bytes(observed.as_os_str());
+    flags.contains(OFlag::O_NOFOLLOW) && !(bytes.ends_with(b"/") || bytes.ends_with(b"/."))
+}
+
+/// The path Detcore records for a descriptor the guest opened at the absolute
+/// spelling `observed` with `flags`. Opened through one of the caller's own
+/// descriptor links (`/proc/self/fd/N`, `/dev/fd/N`, ... see
+/// [`crate::syscalls::namespace::own_descriptor_link`]), the new descriptor
+/// is the file that descriptor `N` is, so it takes the path recorded for `N`
+/// (by `recorded`): a name relative to the new descriptor is then looked up
+/// below that file, as Linux looks it up, and not below the link's spelling,
+/// which names no procfs file of its own.
+///
+/// It keeps the spelling, as every other open does, wherever the recorded
+/// path could name another file than the one the kernel opened:
+/// - the open does not follow the link (`O_NOFOLLOW` without a trailing
+///   slash or `/.`), so it opened the link itself;
+/// - the link names the process's table, which is the thread-group
+///   leader's, and the caller is not proven to hold that table
+///   (`opener.holds_process_table`); `recorded` reads the caller's;
+/// - descriptor `N` has no recorded path, or a relative one;
+/// - `N`'s recorded path is resolved per caller (`/proc/self`,
+///   `/proc/thread-self`, `/dev/fd`, ... see
+///   [`crate::syscalls::namespace::names_through_caller_selector`]): `N` is
+///   the file its opener reached, which another process or thread that
+///   inherited or shares it would not reach by that path.
+fn path_to_record_for_open(
+    observed: &Path,
+    flags: OFlag,
+    opener: DescriptorLinkOpener,
+    recorded: impl FnOnce(RawFd) -> Option<PathBuf>,
+) -> PathBuf {
+    use crate::syscalls::namespace::DescriptorTable;
+    if opens_the_link_itself(observed, flags) {
+        return observed.to_path_buf();
+    }
+    crate::syscalls::namespace::own_descriptor_link(observed, opener.own)
+        .filter(|link| link.table == DescriptorTable::Thread || opener.holds_process_table)
+        .and_then(|link| recorded(link.fd))
+        .filter(|path| !crate::syscalls::namespace::names_through_caller_selector(path))
+        .unwrap_or_else(|| observed.to_path_buf())
+}
+
 /// Whether a stat call's own arguments are ones Linux accepts before it looks
 /// up any file: `newfstatat` refuses unknown flags (`vfs_fstatat`), except on
 /// the descriptor itself (`AT_EMPTY_PATH` with an empty path), which it
@@ -3487,8 +3550,44 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .thread_state()
                     .sigalrm_handled
                     .then(|| crate::sigalrm_phase1::kernel_provenance(guest.pid().as_raw(), fd));
+                // An open through one of the caller's descriptor links
+                // records the path of the descriptor it reopens, so that a
+                // name relative to it (`openat(fd, "stat")` with `fd` from
+                // `open("/proc/self/fd/<a /proc descriptor>")`) is the file
+                // Linux finds there (see `path_to_record_for_open`, which
+                // also keeps the spelling wherever the link may reach
+                // another file). Not after a `chroot`, where `/proc` and
+                // `/dev/fd` need not be what they are outside it.
+                let recorded_path = {
+                    let state = guest.thread_state();
+                    if state.changed_root.load(Ordering::SeqCst) {
+                        observed_path.clone()
+                    } else {
+                        let detpid = self.own_detpid(guest);
+                        // The leader holds the table procfs reads for
+                        // `/proc/self/fd`; so does a thread that shares the
+                        // table made for the leader. `unshare` is refused, so
+                        // a table changes only at clone and exec, and a table
+                        // made for the leader belongs to no other thread
+                        // group: a process cloned with `CLONE_FILES` has
+                        // another pid, and exec gives the exec'ing thread a
+                        // new table.
+                        let opener = DescriptorLinkOpener {
+                            own: (!state.nested_pid_namespace)
+                                .then(|| (detpid.as_raw(), state.dettid.as_raw())),
+                            holds_process_table: state.dettid == detpid
+                                || state.files_id().creator() == detpid,
+                        };
+                        path_to_record_for_open(&observed_path, call.flags(), opener, |target| {
+                            state
+                                .with_detfd(target, |detfd| detfd.path())
+                                .ok()
+                                .flatten()
+                        })
+                    }
+                };
                 guest.thread_state().with_detfd(fd, |detfd| {
-                    detfd.set_path(&observed_path);
+                    detfd.set_path(&recorded_path);
                     if let Some(procfs) = procfs.clone() {
                         detfd.set_procfs(procfs);
                     }
@@ -11288,6 +11387,128 @@ mod test {
     use super::terminal_can_become_controlling;
     use crate::test_pages::PAGE;
     use crate::test_pages::Pages;
+
+    /// A descriptor opened through one of the caller's descriptor links
+    /// records the path of the descriptor the link names, so a name relative
+    /// to it is the file Linux finds below that file: `/proc/stat` through a
+    /// reopened `/proc`, and through a reopened reopening. It keeps its
+    /// spelling wherever the recorded path could name another file: a link
+    /// opened itself (`O_NOFOLLOW` without a trailing slash), the process's
+    /// table where the caller holds a table of its own, a target without an
+    /// absolute recorded path, and a target that names a per-caller
+    /// selector. Every other open records its spelling.
+    #[test]
+    fn an_open_through_a_descriptor_link_records_the_targets_path() {
+        use std::path::Path;
+        use std::path::PathBuf;
+
+        use super::DescriptorLinkOpener;
+        use super::path_to_record_for_open;
+
+        let leader = DescriptorLinkOpener {
+            own: Some((3, 3)),
+            holds_process_table: true,
+        };
+        let read = OFlag::O_RDONLY | OFlag::O_DIRECTORY;
+        let table = |fd: i32| match fd {
+            4 => Some(PathBuf::from("/proc")),
+            6 => Some(PathBuf::from("relative/dir")),
+            8 => Some(PathBuf::from("/proc/self")),
+            9 => Some(PathBuf::from("/proc/thread-self")),
+            10 => Some(PathBuf::from("/dev/fd")),
+            11 => Some(PathBuf::from("/proc/12")),
+            _ => None,
+        };
+        for spelling in [
+            "/proc/self/fd/4",
+            "/dev/fd/4",
+            "/proc/thread-self/fd/4",
+            "/proc/3/fd/4",
+            "/proc/3/task/3/fd/4",
+        ] {
+            let recorded = path_to_record_for_open(Path::new(spelling), read, leader, table);
+            assert_eq!(recorded, Path::new("/proc"), "{spelling}");
+            // A dirfd-relative name below the new descriptor is then the
+            // rendered file's own path (`Detcore::observed_path`).
+            assert_eq!(recorded.join("stat"), Path::new("/proc/stat"));
+            assert_eq!(
+                recorded.join("sys/kernel/random/uuid"),
+                Path::new("/proc/sys/kernel/random/uuid")
+            );
+        }
+        // An alias of an alias: the second open finds the first's recorded
+        // path, already the target's.
+        let first = path_to_record_for_open(Path::new("/proc/self/fd/4"), read, leader, table);
+        let second = path_to_record_for_open(Path::new("/dev/fd/9"), read, leader, |fd| {
+            (fd == 9).then(|| first.clone())
+        });
+        assert_eq!(second, Path::new("/proc"));
+        // O_NOFOLLOW opens the link itself (O_PATH) unless a trailing slash
+        // or `/.` follows it.
+        let nofollow = OFlag::O_PATH | OFlag::O_NOFOLLOW;
+        assert_eq!(
+            path_to_record_for_open(Path::new("/proc/self/fd/4"), nofollow, leader, table),
+            Path::new("/proc/self/fd/4")
+        );
+        for spelling in ["/proc/self/fd/4/", "/proc/self/fd/4/.", "/dev/fd/4/"] {
+            assert_eq!(
+                path_to_record_for_open(Path::new(spelling), nofollow, leader, table),
+                Path::new("/proc"),
+                "{spelling}"
+            );
+        }
+        // A thread with a table of its own: the process's links name the
+        // leader's table, not the caller's, so they keep the spelling; its
+        // own thread links still name its table.
+        let split = DescriptorLinkOpener {
+            own: Some((3, 5)),
+            holds_process_table: false,
+        };
+        for spelling in ["/proc/self/fd/4", "/dev/fd/4", "/proc/3/fd/4"] {
+            assert_eq!(
+                path_to_record_for_open(Path::new(spelling), read, split, |_| {
+                    panic!("{spelling} names the leader's table, not the caller's")
+                }),
+                Path::new(spelling)
+            );
+        }
+        for spelling in ["/proc/thread-self/fd/4", "/proc/3/task/5/fd/4"] {
+            assert_eq!(
+                path_to_record_for_open(Path::new(spelling), read, split, table),
+                Path::new("/proc"),
+                "{spelling}"
+            );
+        }
+        // A target without a recorded path, with a relative one, or with one
+        // procfs resolves per caller, and another process's link, keep the
+        // spelling. A numeric /proc/<pid> target is not per caller.
+        for spelling in [
+            "/proc/self/fd/5",
+            "/proc/self/fd/6",
+            "/proc/self/fd/8",
+            "/proc/self/fd/9",
+            "/dev/fd/10",
+            "/proc/7/fd/4",
+        ] {
+            assert_eq!(
+                path_to_record_for_open(Path::new(spelling), read, leader, table),
+                Path::new(spelling)
+            );
+        }
+        assert_eq!(
+            path_to_record_for_open(Path::new("/dev/fd/11"), read, leader, table),
+            Path::new("/proc/12")
+        );
+        // So does every open that names no descriptor link.
+        for spelling in ["/proc/stat", "/proc/self/fd/4/stat", "/tmp/x"] {
+            assert_eq!(
+                path_to_record_for_open(Path::new(spelling), read, leader, |_| {
+                    panic!("{spelling} names no descriptor")
+                }),
+                Path::new(spelling)
+            );
+        }
+    }
 
     #[test]
     fn inherited_input_status_flags_remain_kernel_owned() {

@@ -31,7 +31,7 @@
  *                              [--kvm-local-procfs]
  *                              [--no-maps-or-chroot] [--chroot-only]
  *                              [--require-chroot] [--xattr-arguments-first]
- *                              [--detcore-xattr-order]
+ *                              [--detcore-xattr-order] [--alias-bytes]
  *        rendered_procfs_files --inherited <fd> <duplicate> <ino> <offset> <kvm>
  *                              <stat-fd> <stat-head> <uptime-fd>
  *
@@ -65,6 +65,11 @@
  *   --chroot-only runs only the process chroot checks, for a run that
  *     cannot verify them (see the previous option); not a thread's chroot,
  *     which hangs under DBT (https://github.com/rrnewton/hermit/issues/4254).
+ *   --alias-bytes requires a file opened relative to a /proc descriptor that
+ *     was itself opened through a descriptor link to read the bytes /proc's
+ *     own name reads at the same moment (check_directory_aliases), which
+ *     holds where Detcore renders the files; natively the host's files change
+ *     between reads, so only their identity and form are checked.
  *   --noreplace-overlap-eperm expects EPERM rather than EEXIST from
  *     MAP_FIXED_NOREPLACE over an existing mapping, as DBT answers it for
  *     every mapping (https://github.com/rrnewton/hermit/issues/4429); the
@@ -79,7 +84,9 @@
 #include <linux/fiemap.h>
 #include <linux/fs.h>
 #include <linux/stat.h>
+#include <linux/futex.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -122,6 +129,7 @@ static int chroot_only;
 static int require_chroot;
 static int xattr_arguments_first;
 static int detcore_xattr_order;
+static int alias_bytes;
 static const char* program;
 
 #define CHECK(condition, ...)                              \
@@ -304,8 +312,44 @@ static int is_stat(const char* text, size_t length) {
          numbers_line(text, length, &at, "softirq ", 11, 11) && at == length;
 }
 
+/* "<a>.<cc> <b>.<cc> <c>.<cc> <running>/<total> <last pid>\n", as
+ * /proc/loadavg reads. */
+static int is_loadavg(const char* text, size_t length) {
+  size_t i = 0;
+  for (int field = 0; field < 5; field++) {
+    size_t start = i;
+    while (i < length && text[i] >= '0' && text[i] <= '9') {
+      i++;
+    }
+    if (i == start || i >= length) {
+      return 0;
+    }
+    if (field < 3) {
+      if (length - i < 4 || text[i] != '.' || text[i + 1] < '0' || text[i + 1] > '9' ||
+          text[i + 2] < '0' || text[i + 2] > '9' || text[i + 3] != ' ') {
+        return 0;
+      }
+      i += 4;
+    } else if (field == 3) {
+      if (text[i] != '/') {
+        return 0;
+      }
+      i++;
+      start = i;
+      while (i < length && text[i] >= '0' && text[i] <= '9') {
+        i++;
+      }
+      if (i == start || i >= length || text[i] != ' ') {
+        return 0;
+      }
+      i++;
+    }
+  }
+  return i + 1 == length && text[i] == '\n';
+}
+
 /* The kinds of file this program checks. */
-enum kind { COUNT, UUID, UPTIME, STAT };
+enum kind { COUNT, UUID, UPTIME, STAT, LOADAVG };
 
 static int has_contents(enum kind kind, const char* text, size_t length) {
   switch (kind) {
@@ -315,6 +359,8 @@ static int has_contents(enum kind kind, const char* text, size_t length) {
       return is_uptime(text, length);
     case STAT:
       return is_stat(text, length);
+    case LOADAVG:
+      return is_loadavg(text, length);
     default:
       return is_count(text, length);
   }
@@ -323,7 +369,7 @@ static int has_contents(enum kind kind, const char* text, size_t length) {
 /* Whether the kind of file is a seq_file (every procfs file outside
  * /proc/sys) rather than a sysctl file. */
 static int is_seq_file(enum kind kind) {
-  return kind == UPTIME || kind == STAT;
+  return kind == UPTIME || kind == STAT || kind == LOADAVG;
 }
 
 /* Prints `label`, then `text` with each newline but its last shown as \n, so
@@ -1190,6 +1236,330 @@ static void check_fork_shares_the_position(void) {
   close(fd);
 }
 
+/* The whole file at `path` as one read returns it into `buffer`, or -1. */
+static ssize_t read_whole(const char* path, char* buffer) {
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return -1;
+  }
+  ssize_t length = read(fd, buffer, READ_CAPACITY);
+  close(fd);
+  return length;
+}
+
+/* The checks of one directory alias of /proc for check_directory_aliases:
+ * the descriptor `spelling` opens with `flags` is /proc, and `name` opened
+ * relative to it is /proc/<name> (`canonical`, whose identity is
+ * `by_path`). Returns the directory descriptor, or -1. */
+static int check_directory_alias(const char* spelling, int flags, const char* name,
+                                 const char* canonical, const struct stat* by_path,
+                                 enum kind kind) {
+  int directory = open(spelling, flags);
+  CHECK(directory >= 0, "open(%s) for %s: %s", spelling, canonical, strerror(errno));
+  if (directory < 0) {
+    return -1;
+  }
+  char* before = rest_buffer;
+  ssize_t before_length = alias_bytes ? read_whole(canonical, before) : 0;
+  int fd = openat(directory, name, O_RDONLY | O_CLOEXEC);
+  CHECK(fd >= 0, "openat(%s, \"%s\"): %s", spelling, name, strerror(errno));
+  if (fd >= 0) {
+    struct stat by_fd;
+    CHECK(fstat(fd, &by_fd) == 0 && by_fd.st_dev == by_path->st_dev &&
+              by_fd.st_ino == by_path->st_ino,
+          "openat(%s, \"%s\") identity %#llx:%llu, %s's %#llx:%llu", spelling, name,
+          (unsigned long long)by_fd.st_dev, (unsigned long long)by_fd.st_ino, canonical,
+          (unsigned long long)by_path->st_dev, (unsigned long long)by_path->st_ino);
+    char* aliased = contents_buffer;
+    ssize_t length = read(fd, aliased, READ_CAPACITY);
+    CHECK(length > 0 && has_contents(kind, aliased, length), "openat(%s, \"%s\") contents %.*s",
+          spelling, name, (int)(length > 0 ? length : 0), aliased);
+    close(fd);
+    if (alias_bytes && kind != UUID && length > 0) {
+      int same = before_length == length && memcmp(before, aliased, length) == 0;
+      if (!same) {
+        char* after = rest_buffer;
+        ssize_t after_length = read_whole(canonical, after);
+        same = after_length == length && memcmp(after, aliased, length) == 0;
+      }
+      CHECK(same, "openat(%s, \"%s\") read other bytes than %s: %.*s", spelling, name,
+            canonical, (int)length, aliased);
+    }
+  }
+  return directory;
+}
+
+/* A file below /proc opened relative to a descriptor for /proc that was
+ * itself opened through a descriptor link (/proc/self/fd/N or /dev/fd/N of a
+ * /proc descriptor, or such a link of such a descriptor) is the file below
+ * /proc: Linux follows the link to the directory, and the name is looked up
+ * there. So it has the identity and the contents of /proc/<name>, on every
+ * backend. With --alias-bytes, where Detcore renders the file as a function
+ * of virtual time, the bytes are also those an open of /proc/<name> reads
+ * just before or just after it (at most one tick of the file's clock can
+ * pass between three adjacent reads); natively the host's files change
+ * between reads. A UUID is new at every open, so only its form is
+ * compared. O_PATH|O_NOFOLLOW opens a link itself, but not where a trailing
+ * slash follows it: /proc/self/fd/N/ so opened is the directory too. */
+static void check_directory_aliases(const char* name, enum kind kind) {
+  char canonical[128];
+  snprintf(canonical, sizeof(canonical), "/proc/%s", name);
+  struct stat by_path;
+  CHECK(stat(canonical, &by_path) == 0, "stat(%s): %s", canonical, strerror(errno));
+  int proc = open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  CHECK(proc >= 0, "open(/proc): %s", strerror(errno));
+  if (proc < 0) {
+    return;
+  }
+  const int directory_flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC;
+  char spelling[64];
+  snprintf(spelling, sizeof(spelling), "/proc/self/fd/%d", proc);
+  int first_alias = check_directory_alias(spelling, directory_flags, name, canonical, &by_path,
+                                          kind);
+  snprintf(spelling, sizeof(spelling), "/dev/fd/%d", proc);
+  int directory = check_directory_alias(spelling, directory_flags, name, canonical, &by_path,
+                                        kind);
+  if (directory >= 0) {
+    close(directory);
+  }
+  if (!kvm_local_procfs) {
+    snprintf(spelling, sizeof(spelling), "/proc/self/fd/%d/", proc);
+    directory = check_directory_alias(spelling, O_PATH | O_NOFOLLOW | O_CLOEXEC, name, canonical,
+                                      &by_path, kind);
+    if (directory >= 0) {
+      close(directory);
+    }
+  }
+  if (first_alias >= 0) {
+    /* A descriptor link of the descriptor opened through the first. */
+    snprintf(spelling, sizeof(spelling), "/dev/fd/%d", first_alias);
+    directory = check_directory_alias(spelling, directory_flags, name, canonical, &by_path,
+                                      kind);
+    if (directory >= 0) {
+      close(directory);
+    }
+    close(first_alias);
+  }
+  close(proc);
+}
+
+/* The same aliases from a second thread, which shares the descriptor table
+ * of the thread-group leader (pthread_create shares it): /proc/self/fd/N
+ * is the leader's descriptor N, and so the caller's. */
+static void* directory_aliases_thread(void* unused) {
+  (void)unused;
+  check_directory_aliases("stat", STAT);
+  return NULL;
+}
+
+static void check_directory_aliases_in_a_thread(void) {
+  pthread_t thread;
+  CHECK(pthread_create(&thread, NULL, directory_aliases_thread, NULL) == 0 &&
+            pthread_join(thread, NULL) == 0,
+        "directory aliases in a thread");
+}
+
+/* The process's descriptor links (/proc/self/fd/N, /dev/fd/N) name the
+ * thread-group leader's descriptor table, which a thread cloned without
+ * CLONE_FILES does not share; /proc/thread-self/fd/N names the thread's
+ * own. In such a thread, where the leader's descriptor N is an empty
+ * directory and the thread's is /proc, /proc/self/fd/N opens the empty
+ * directory, where "stat" does not exist (to open, or to stat), and
+ * /proc/thread-self/fd/N opens /proc. (Not a rendered file below the
+ * thread's /proc: Detcore reopens its placeholder through the leader's
+ * table there, a separate defect.) */
+struct split_table {
+  int fd;
+  char process_link[64];
+  char thread_link[64];
+  int process_errno;
+  struct stat process_identity;
+  int process_stat_errno;
+  int process_fstatat_errno;
+  int thread_errno;
+  struct stat thread_identity;
+  volatile uint32_t running;
+};
+
+static int split_table_thread(void* argument) {
+  struct split_table* split = argument;
+  int proc = open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (proc < 0 || dup3(proc, split->fd, O_CLOEXEC) < 0) {
+    split->process_errno = split->thread_errno = errno;
+    return 0;
+  }
+  close(proc);
+  int directory = open(split->process_link, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  split->process_errno = directory < 0 ? errno : 0;
+  if (directory >= 0) {
+    fstat(directory, &split->process_identity);
+    int fd = openat(directory, "stat", O_RDONLY | O_CLOEXEC);
+    split->process_stat_errno = fd < 0 ? errno : 0;
+    if (fd >= 0) {
+      close(fd);
+    }
+    struct stat ignored;
+    split->process_fstatat_errno = fstatat(directory, "stat", &ignored, 0) == 0 ? 0 : errno;
+    close(directory);
+  }
+  directory = open(split->thread_link, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  split->thread_errno = directory < 0 ? errno : 0;
+  if (directory >= 0) {
+    fstat(directory, &split->thread_identity);
+    close(directory);
+  }
+  close(split->fd);
+  return 0;
+}
+
+static void check_split_table_aliases(void) {
+  static char stack[1 << 16] __attribute__((aligned(16)));
+  static struct split_table split;
+  char empty[] = "/tmp/rendered-procfs-split-XXXXXX";
+  CHECK(mkdtemp(empty) != NULL, "mkdtemp: %s", strerror(errno));
+  struct stat empty_identity;
+  struct stat proc_identity;
+  CHECK(stat(empty, &empty_identity) == 0 && stat("/proc", &proc_identity) == 0,
+        "stat for the split table: %s", strerror(errno));
+  split.fd = open(empty, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  CHECK(split.fd >= 0, "open(%s): %s", empty, strerror(errno));
+  if (split.fd < 0) {
+    rmdir(empty);
+    return;
+  }
+  snprintf(split.process_link, sizeof(split.process_link), "/proc/self/fd/%d", split.fd);
+  snprintf(split.thread_link, sizeof(split.thread_link), "/proc/thread-self/fd/%d", split.fd);
+  split.running = 1;
+  pid_t tid = clone(split_table_thread, stack + sizeof(stack),
+                    CLONE_VM | CLONE_THREAD | CLONE_SIGHAND | CLONE_CHILD_CLEARTID, &split, NULL,
+                    NULL, &split.running);
+  CHECK(tid > 0, "clone without CLONE_FILES: %s", strerror(errno));
+  while (tid > 0 && __atomic_load_n(&split.running, __ATOMIC_ACQUIRE) != 0) {
+    syscall(SYS_futex, &split.running, FUTEX_WAIT, 1, NULL, NULL, 0);
+  }
+  if (tid > 0) {
+    CHECK(split.process_errno == 0 && split.process_identity.st_dev == empty_identity.st_dev &&
+              split.process_identity.st_ino == empty_identity.st_ino,
+          "%s in a thread with its own table opened %#llx:%llu (%s), not the leader's %s",
+          split.process_link, (unsigned long long)split.process_identity.st_dev,
+          (unsigned long long)split.process_identity.st_ino, strerror(split.process_errno),
+          empty);
+    CHECK(split.process_errno == 0 && split.process_stat_errno == ENOENT,
+          "openat(%s, \"stat\") in a thread with its own table: %s, not ENOENT",
+          split.process_link, strerror(split.process_stat_errno));
+    CHECK(split.process_errno == 0 && split.process_fstatat_errno == ENOENT,
+          "fstatat(%s, \"stat\") in a thread with its own table: %s, not ENOENT",
+          split.process_link, strerror(split.process_fstatat_errno));
+    CHECK(split.thread_errno == 0 && split.thread_identity.st_dev == proc_identity.st_dev &&
+              split.thread_identity.st_ino == proc_identity.st_ino,
+          "%s in a thread with its own table opened %#llx:%llu (%s), not /proc",
+          split.thread_link, (unsigned long long)split.thread_identity.st_dev,
+          (unsigned long long)split.thread_identity.st_ino, strerror(split.thread_errno));
+  }
+  close(split.fd);
+  rmdir(empty);
+}
+
+/* The process (or task) whose /proc/<pid>/stat a "stat" opened relative to
+ * `directory` describes: its first field. -1 if it cannot be read. */
+static long stat_subject(int directory) {
+  char text[128];
+  int fd = openat(directory, "stat", O_RDONLY | O_CLOEXEC);
+  ssize_t length = fd < 0 ? -1 : read(fd, text, sizeof(text) - 1);
+  if (fd >= 0) {
+    close(fd);
+  }
+  if (length <= 0) {
+    return -1;
+  }
+  text[length] = '\0';
+  return strtol(text, NULL, 10);
+}
+
+/* A descriptor for /proc/self or /proc/thread-self is the directory of the
+ * process or thread that opened it, which another process that inherited
+ * it, or another thread, reaches through its descriptor link: a fork's
+ * child reopening its parent's /proc/self through /proc/self/fd/N finds
+ * the parent's "stat", and the leader reopening a thread's
+ * /proc/thread-self finds the thread's. */
+static void check_selector_aliases_from_a_fork(void) {
+  int self = open("/proc/self", O_RDONLY | O_DIRECTORY);
+  CHECK(self >= 0, "open(/proc/self): %s", strerror(errno));
+  if (self < 0) {
+    return;
+  }
+  fflush(stdout);
+  fflush(stderr);
+  pid_t child = fork();
+  if (child == 0) {
+    char spelling[64];
+    snprintf(spelling, sizeof(spelling), "/proc/self/fd/%d", self);
+    int directory = open(spelling, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    long subject = directory < 0 ? -2 : stat_subject(directory);
+    if (subject != (long)getppid()) {
+      fprintf(stderr, "FAIL: openat(%s, \"stat\") in a fork's child names %ld, not its parent %ld\n",
+              spelling, subject, (long)getppid());
+      _exit(1);
+    }
+    _exit(0);
+  }
+  int status = 0;
+  CHECK(child > 0 && waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+            WEXITSTATUS(status) == 0,
+        "the parent's /proc/self reopened by its child (status %d)", status);
+  close(self);
+}
+
+struct thread_self {
+  int fd;
+  long tid;
+  pthread_barrier_t opened;
+  pthread_barrier_t checked;
+};
+
+static void* thread_self_opener(void* argument) {
+  struct thread_self* shared = argument;
+  shared->fd = open("/proc/thread-self", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  shared->tid = (long)gettid();
+  pthread_barrier_wait(&shared->opened);
+  /* Alive until the leader has looked: an exited thread's directory is
+   * empty. */
+  pthread_barrier_wait(&shared->checked);
+  return NULL;
+}
+
+static void check_selector_aliases_from_a_thread(void) {
+  struct thread_self shared = {.fd = -1, .tid = -1};
+  pthread_barrier_init(&shared.opened, NULL, 2);
+  pthread_barrier_init(&shared.checked, NULL, 2);
+  pthread_t thread;
+  int created = pthread_create(&thread, NULL, thread_self_opener, &shared) == 0;
+  CHECK(created, "pthread_create for /proc/thread-self");
+  if (!created) {
+    return;
+  }
+  pthread_barrier_wait(&shared.opened);
+  CHECK(shared.fd >= 0, "open(/proc/thread-self) in a thread");
+  if (shared.fd >= 0) {
+    char spelling[64];
+    snprintf(spelling, sizeof(spelling), "/proc/self/fd/%d", shared.fd);
+    int directory = open(spelling, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    long subject = directory < 0 ? -2 : stat_subject(directory);
+    CHECK(subject == shared.tid, "openat(%s, \"stat\") names %ld, not the thread %ld", spelling,
+          subject, shared.tid);
+    if (directory >= 0) {
+      close(directory);
+    }
+  }
+  pthread_barrier_wait(&shared.checked);
+  pthread_join(thread, NULL);
+  if (shared.fd >= 0) {
+    close(shared.fd);
+  }
+  pthread_barrier_destroy(&shared.opened);
+  pthread_barrier_destroy(&shared.checked);
+}
+
 /* Print the file's contents, as one read returns them, on one line. */
 static void print_contents(const char* path) {
   char* contents = contents_buffer;
@@ -1320,6 +1690,8 @@ int main(int argc, char** argv) {
       detcore_xattr_order = 1;
     } else if (strcmp(argv[i], "--no-bypass-capabilities") == 0) {
       no_bypass_capabilities = 1;
+    } else if (strcmp(argv[i], "--alias-bytes") == 0) {
+      alias_bytes = 1;
     } else {
       program = NULL;
     }
@@ -1329,7 +1701,7 @@ int main(int argc, char** argv) {
             "usage: /path/to/rendered_procfs_files [--no-foreign-fd-links] "
             "[--kvm-local-procfs] [--no-maps-or-chroot] [--chroot-only] "
             "[--require-chroot] [--no-bypass-capabilities] [--xattr-arguments-first] "
-            "[--detcore-xattr-order]\n");
+            "[--detcore-xattr-order] [--alias-bytes]\n");
     return 2;
   }
   if (no_bypass_capabilities && !lacks_bypass_capabilities()) {
@@ -1397,6 +1769,19 @@ int main(int argc, char** argv) {
   check_file("/proc/sys/kernel/pty/nr", COUNT);
   check_file("/proc/uptime", UPTIME);
   check_file("/proc/stat", STAT);
+  check_directory_aliases("stat", STAT);
+  check_directory_aliases("uptime", UPTIME);
+  check_directory_aliases("loadavg", LOADAVG);
+  check_directory_aliases("sys/kernel/pty/nr", COUNT);
+  check_directory_aliases("sys/kernel/random/uuid", UUID);
+  check_directory_aliases_in_a_thread();
+  if (!kvm_local_procfs) {
+    check_split_table_aliases();
+  }
+  if (!no_foreign_fd_links) {
+    check_selector_aliases_from_a_fork();
+    check_selector_aliases_from_a_thread();
+  }
   if (!kvm_local_procfs && !no_maps_or_chroot) {
     check_chroot();
     check_thread_chroot();

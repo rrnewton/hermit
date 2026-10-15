@@ -613,7 +613,18 @@ impl RecordVersion {
 // refused it with ENOSYS, so an older recording containing one would replay
 // out of step; and every read of it shows Detcore's layout, not the host's
 // lines, so an older recording's guest saw other bytes.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x163);
+// 0x163 -> 0x164 (HIGHEST_SHIPPED + 1): a descriptor opened through one of
+// the guest's own descriptor links (/proc/self/fd/N, /dev/fd/N and their
+// thread and numeric spellings) records the path of descriptor N, not the
+// link's spelling, so a name relative to it is looked up below that file as
+// Linux looks it up (https://github.com/rrnewton/hermit/issues/4213,
+// https://github.com/rrnewton/hermit/issues/4485). Under record and replay
+// such a name is now classified, and checked against the --proc level, as
+// the procfs file it is (a name outside the level is answered as absent
+// before any open is recorded, where the alias spelling let the open reach
+// the kernel), so an older recording with such an open would replay out of
+// step.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x164);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -638,7 +649,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x163);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x163;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x164;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1625,6 +1636,19 @@ mod tests {
     /// the kernel opened (ENOSYS) where Detcore now captures it, and showed
     /// the guest the host's lines, as Detcore now renders /proc/stat
     /// (https://github.com/rrnewton/hermit/issues/4213).
+    /// A recording older than 0x164 looked a name relative to a descriptor
+    /// opened through a descriptor link up below the link's spelling, which
+    /// names no procfs file, where Detcore now looks it up below the file the
+    /// link reaches (https://github.com/rrnewton/hermit/issues/4213).
+    #[test]
+    fn record_version_rejects_streams_from_before_descriptor_links_record_their_target() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x160)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x161)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x162)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x163)));
+        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
+    }
+
     #[test]
     fn record_version_rejects_streams_from_before_stat_is_rendered() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x15d)));
