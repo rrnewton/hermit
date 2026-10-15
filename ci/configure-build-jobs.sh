@@ -1652,8 +1652,9 @@ fi
 # is not a full-profile calibration or whole-guest qualification.
 # NON-LEADER-EXEC ROBUST-OWNER SDK-BUDGET CARRY (2026-10-15): advance from c18f07cb to 4bfe8b8f44bd9992f6ae3f8f4df0fdfb4b334bfd (https://github.com/rrnewton/reverie/pull/1053: reverie-dbt native/client.c robust-owner rewrites and its tests only; vendor/dynamorio, the SDK build inputs, is unchanged, so the observation above carries).
 # KVM RPC-KEPT-FAILURE SDK-BUDGET CARRY (2026-10-15): advance from 4bfe8b8f to df6a4e5c30d7782141392e328e6a56bb368982ae (KVM keeps one RPC failure wait per thread instead of one per RPC; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != df6a4e5c30d7782141392e328e6a56bb368982ae ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie df6a4e5c30d7782141392e328e6a56bb368982ae (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# KVM HYPERCALL-ADDRESS-MEMO SDK-BUDGET CARRY (2026-10-15): advance from df6a4e5c to 64535b64ad2b7faef5000175de0494127cf2caf3 (KVM memoizes the syscall trampoline's hypercall offset per thread; changes only reverie-kvm, inventory unchanged), so the budgets above carry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 64535b64ad2b7faef5000175de0494127cf2caf3 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 64535b64ad2b7faef5000175de0494127cf2caf3 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

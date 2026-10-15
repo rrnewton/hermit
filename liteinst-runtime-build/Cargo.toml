@@ -17,7 +17,7 @@ crate-type = ["rlib"]
 allocator-fixture = []
 
 [build-dependencies]
-reverie-liteinst-artifact = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "df6a4e5c30d7782141392e328e6a56bb368982ae", default-features = false }
+reverie-liteinst-artifact = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "64535b64ad2b7faef5000175de0494127cf2caf3", default-features = false }
 serde_json = "1.0.151"
 
 [dev-dependencies]
