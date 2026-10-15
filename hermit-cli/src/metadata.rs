@@ -539,7 +539,14 @@ impl RecordVersion {
 // /proc/thread-self/fd/N (https://github.com/rrnewton/hermit/issues/4266). An
 // older recording holds a kernel readlink of the guest's own spelling for each
 // of those.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x158);
+// 0x158 -> 0x159 (taken at land time, as the reservation file's land-time
+// numbering rule gives a ready change HIGHEST_SHIPPED + 1; reserved as
+// 0x15a): /proc/loadavg is a fixed procfs file, whose bytes come from
+// Detcore's table with no kernel read, also under record/replay
+// (https://github.com/rrnewton/hermit/issues/4213). An older recording holds
+// the captured kernel read, which a new replay never takes, so it would go
+// out of step.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x159);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -564,7 +571,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x158);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x158;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x159;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1516,6 +1523,15 @@ mod tests {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x155)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x156)));
         assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
+    }
+
+    /// A recording older than 0x159 holds the sanitized kernel read of
+    /// /proc/loadavg, which Detcore now renders as a fixed file
+    /// (https://github.com/rrnewton/hermit/issues/4213).
+    #[test]
+    fn record_version_rejects_streams_from_before_loadavg_is_rendered() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x158)));
+        assert!(RECORD_VERSION.compatible_with(&RecordVersion(0x159)));
     }
 
     #[test]
