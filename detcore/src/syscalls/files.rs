@@ -5050,10 +5050,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             if status_flags & libc::O_PATH != 0 {
                 return Err(Errno::EBADF.into());
             }
-            let seq_file = rendered
-                .to_str()
-                .and_then(crate::procfs::FixedProcfsFile::from_path)
-                .is_some_and(crate::procfs::FixedProcfsFile::is_seq_file);
+            let seq_file = crate::procfs::rendered_path_is_seq_file(rendered);
             let requested = i128::from(call.offset());
             let new_offset = match call.whence() {
                 Whence::SEEK_SET => requested,
