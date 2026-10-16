@@ -1212,6 +1212,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             guest.inject(call).await
         };
+        super::signal_shadow::record_rt_sigaction(
+            guest,
+            call.signum(),
+            kernel_action.map(|action| KernelSigaction {
+                mask: without_perf_event_signal(action.mask),
+                ..action
+            }),
+            call.old_action(),
+            &result,
+        );
         // Publish the state the runtime now holds whenever the disposition may
         // have changed: from a handler, or to one the runtime did not refuse.
         // Any result counts, since an EFAULT copying the old action out comes
@@ -1395,7 +1405,36 @@ impl<T: RecordOrReplay> Detcore<T> {
         // The kernel checks sigsetsize before copying from either user pointer.
         validate_kernel_sigset_size(call.sigsetsize())?;
 
+        // Read before the call, which may write the old mask over an aliased
+        // set. A plain read, with no injection: the recorder trusts it only
+        // where the kernel validated the same set.
+        let shadow_set = match call.set() {
+            Some(set) if guest.thread_state().signal_shadow.is_some() => Some(
+                guest
+                    .memory()
+                    .read_value::<_, KernelSigset>(set.cast::<KernelSigset>())
+                    .ok(),
+            ),
+            _ => None,
+        };
         let result = self.rt_sigprocmask_inner(guest, call).await;
+        if guest.thread_state().signal_shadow.is_some() {
+            let errno_result = match &result {
+                Ok(value) => Some(Ok(*value)),
+                Err(Error::Errno(errno)) => Some(Err(*errno)),
+                Err(_) => None,
+            };
+            if let Some(errno_result) = errno_result {
+                super::signal_shadow::record_rt_sigprocmask(
+                    guest,
+                    call.how(),
+                    shadow_set.map(|set| set.map(without_perf_event_signal)),
+                    call.how() == libc::SIG_BLOCK || call.how() == libc::SIG_SETMASK,
+                    call.oldset(),
+                    &errno_result,
+                );
+            }
+        }
         if call.how() != libc::SIG_BLOCK && call.set().is_some() {
             // The new mask may unblock a pending real-time timer expiration
             // that every thread blocked when it expired, which the kernel then
@@ -3579,7 +3618,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 /// The offset of `uc_sigmask` in the x86-64 kernel `ucontext` that
 /// `rt_sigreturn` restores: after uc_flags (8), uc_link (8), uc_stack (24) and
 /// uc_mcontext (256 bytes).
-const UC_SIGMASK_OFFSET: usize = 8 + 8 + 24 + 256;
+pub(super) const UC_SIGMASK_OFFSET: usize = 8 + 8 + 24 + 256;
 
 fn should_notify_cross_task_signal(sender: DetTid, target: DetTid, raw_signal: i32) -> bool {
     raw_signal != 0 && target != sender
