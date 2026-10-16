@@ -385,6 +385,7 @@ use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 #[cfg(any(feature = "sabre", all(test, feature = "liteinst")))]
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::OsStringExt;
 #[cfg(feature = "sabre")]
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(any(feature = "sabre", feature = "liteinst"))]
@@ -2392,7 +2393,8 @@ async fn run_sabre(
         .map_or(program.as_path(), |staged| staged.path.as_path());
 
     let bootstrap_launch =
-        sabre_bootstrap::Launch::new(Path::new(&sabre), launch_program, &config)?;
+        sabre_bootstrap::Launch::new(Path::new(&sabre), launch_program, &config)?
+            .with_execfn(program.as_os_str().as_bytes());
 
     // This runs after Hermit enters the guest mount namespace, where `/tmp`
     // names the container-visible temporary filesystem. Do not inherit a
@@ -2432,10 +2434,24 @@ async fn run_sabre(
             )
         })?;
     first_bytes.truncate(read);
+    // The kernel puts the name it is asked to exec at the top of the initial
+    // stack and points AT_EXECFN at it. SaBRe's loader rebuilds the stack top
+    // for the guest's name, the one an exec of the guest itself gets
+    // (`program`, as the ptrace launch resolves it), and can only move the
+    // stack up, so SaBRe is exec'd by a name at least as long: its absolute
+    // path with extra slashes, which Linux resolves as one.
+    let execfn = program.as_os_str();
+    let sabre_exec = std::ffi::OsString::from_vec(reverie_sabre_stats::launch::padded_exec_path(
+        std::path::absolute(&sabre)
+            .map_err(|error| anyhow!("failed to make the SaBRe path absolute: {error}"))?
+            .as_os_str()
+            .as_bytes(),
+        execfn.len(),
+    ));
     let arg0 = command.get_arg0().to_owned();
     let client = match reverie_sabre_stats::launch::shebang(&first_bytes) {
         Some((interpreter, argument)) => {
-            command.program(&sabre);
+            command.program(&sabre_exec);
             command.arg0(OsStr::from_bytes(&interpreter));
             let mut words: Vec<&OsStr> = argument
                 .iter()
@@ -2446,7 +2462,7 @@ async fn run_sabre(
             PathBuf::from(OsStr::from_bytes(&interpreter))
         }
         None => {
-            command.program(&sabre);
+            command.program(&sabre_exec);
             command.arg0(&arg0);
             launch_program.to_path_buf()
         }
@@ -2460,6 +2476,7 @@ async fn run_sabre(
     };
     setting(SABRE_RPC_SOCKET_ENV, socket_path.as_os_str());
     command.env_remove(SABRE_RPC_SOCKET_ENV);
+    setting(reverie_sabre_stats::launch::EXECFN_SETTING, execfn);
     command.env_remove(sabre_bootstrap::ENVIRONMENT);
     if bootstrap_launch.initializes_random() {
         setting(sabre_bootstrap::ENVIRONMENT, OsStr::new("1"));

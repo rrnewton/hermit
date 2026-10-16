@@ -1074,6 +1074,65 @@ fn initial_arguments(pid: Pid, rows: &[Map], stack: usize) -> Result<Vec<Vec<u8>
     Ok(arguments)
 }
 
+/// Where the kernel would put AT_RANDOM for an exec named by a string of
+/// `execfn_len` bytes (NUL included), given the initial stack at `stack` that
+/// it built for SaBRe's own exec (fs/exec.c, create_elf_tables). From the top
+/// down the kernel lays out the exec name, then the environment and argv
+/// strings contiguously down to `argv[0]`; below an alignment to 16, the
+/// platform string; then the 16 AT_RANDOM bytes.
+fn relaid_random(
+    pid: Pid,
+    rows: &[Map],
+    stack: usize,
+    auxv: &[u8],
+    execfn_len: usize,
+) -> Result<usize> {
+    let row = containing(rows, stack, 16)?;
+    ensure!(
+        row.path == b"[stack]" && row.permissions.starts_with("rw"),
+        "initial stack is not the owned writable stack"
+    );
+    let argv0 = word(&remote_bytes(pid, stack + 8, 8)?, 0)?;
+    let (mut execfn, mut platform) = (None, None);
+    for pair in auxv.as_chunks::<16>().0 {
+        let (kind, value) = (word(pair, 0)?, word(pair, 8)?);
+        if kind == libc::AT_EXECFN as usize {
+            execfn = Some(value);
+        } else if kind == libc::AT_PLATFORM as usize {
+            platform = Some(value);
+        } else if kind == libc::AT_NULL as usize {
+            break;
+        }
+    }
+    let execfn = execfn.ok_or_else(|| anyhow!("initial kernel auxv has no AT_EXECFN"))?;
+    let string_length = |address: usize| -> Result<usize> {
+        ensure!(
+            row.contains(address, 1),
+            "initial auxv string leaves the stack"
+        );
+        let bytes = remote_bytes(pid, address, row.end - address)?;
+        let end = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or_else(|| anyhow!("unterminated initial auxv string"))?;
+        Ok(end + 1)
+    };
+    let old_len = string_length(execfn)?;
+    let platform_len = platform.map(string_length).transpose()?.unwrap_or(0);
+    ensure!(
+        row.contains(argv0, 1) && argv0 <= execfn,
+        "initial argv strings are not below the exec name"
+    );
+    ensure!(
+        execfn_len <= old_len,
+        "the guest's exec name is longer than the name SaBRe was run by"
+    );
+    let top = execfn + old_len;
+    let strings = (execfn - argv0) + execfn_len;
+    let aligned = (top - strings) & !15;
+    Ok(aligned - platform_len - 16)
+}
+
 /// The argv the guest's image must start with: SaBRe's own initial argv,
 /// unchanged. run_sabre execs SaBRe with the guest's argv, a script's already
 /// resolved to its interpreter as the kernel would, and passes the plugin and
@@ -1133,8 +1192,18 @@ pub(super) struct Launch {
     script: Option<HeldObject>,
     config: detcore::Config,
     layout: FrameLayout,
+    /// The guest's exec name, when the launch asks SaBRe's loader to rebuild
+    /// the initial stack top for it (`reverie_sabre_stats::launch::EXECFN_SETTING`).
+    execfn: Option<Vec<u8>>,
 }
 impl Launch {
+    /// Records that the launch sends `execfn` to SaBRe's loader, which then
+    /// moves AT_RANDOM to where the kernel puts it for that name.
+    pub(super) fn with_execfn(mut self, execfn: &[u8]) -> Self {
+        self.execfn = Some(execfn.to_vec());
+        self
+    }
+
     pub(super) fn new(loader: &Path, program: &Path, config: &detcore::Config) -> Result<Self> {
         let loader = HeldObject::open(loader)?;
         loader.symbol(bootstrap::SYSCALL_SYMBOL)?;
@@ -1161,6 +1230,7 @@ impl Launch {
             script,
             config: config.clone(),
             layout,
+            execfn: None,
         })
     }
 
@@ -1205,6 +1275,9 @@ pub(super) struct Bootstrap {
     taken: bool,
     sigill: Option<SigillOrigin>,
     initial_random: usize,
+    /// AT_RANDOM in the root's kernel auxv (`/proc/<pid>/auxv`), which a stack
+    /// relayout by the loader does not change; `initial_random` is the guest's.
+    kernel_random: usize,
     expected_arguments: Vec<Vec<u8>>,
     vdso: Option<VdsoSnapshot>,
     other_objects: Vec<HeldObject>,
@@ -1371,7 +1444,17 @@ impl Bootstrap {
                 })
             })
             .transpose()?;
-        let initial_random = auxv_random(&auxv)?;
+        let kernel_random = auxv_random(&auxv)?;
+        let mut initial_random = kernel_random;
+        if let (true, Some(execfn)) = (launch.initializes_random(), &launch.execfn) {
+            // SaBRe's loader rebuilds the stack top for the guest's exec name
+            // (loader.c, relayout_initial_stack), which moves AT_RANDOM. Its
+            // target is computed here from the kernel's own stack, not
+            // taken from the loader.
+            let registers = nix::sys::ptrace::getregs(root)?;
+            initial_random =
+                relaid_random(root, &rows, registers.rsp as usize, &auxv, execfn.len() + 1)?;
+        }
         ensure!(
             self::generation(root)? == generation,
             "initial process generation changed"
@@ -1388,6 +1471,7 @@ impl Bootstrap {
             taken: false,
             sigill: None,
             initial_random,
+            kernel_random,
             expected_arguments,
             vdso,
             other_objects: Vec::new(),
@@ -1966,7 +2050,7 @@ impl Bootstrap {
                     at_random: self.initial_random,
                 }
             };
-            self.check_current_auxv(pid, &rows, image)?;
+            self.check_current_auxv(pid, &rows, image, image.at_random)?;
             let state = if initial_static {
                 LoaderState::InitialStaticLegacy
             } else {
@@ -2037,7 +2121,7 @@ impl Bootstrap {
                     "invalid TAKE protocol shape"
                 );
                 let image = self.image.ok_or_else(|| anyhow!("TAKE before IMAGE"))?;
-                self.check_current_auxv(pid, &rows, image)?;
+                self.check_current_auxv(pid, &rows, image, self.kernel_random)?;
                 let at_random_value = self
                     .at_random_value
                     .ok_or_else(|| anyhow!("TAKE before the AT_RANDOM write"))?;
@@ -2172,11 +2256,20 @@ impl Bootstrap {
         )
     }
 
-    fn check_current_auxv(&self, pid: Pid, rows: &[Map], image: InitialImage) -> Result<()> {
+    /// `kernel_random` is the AT_RANDOM the kernel's saved auxv must still
+    /// hold: the image's own, unless the loader moved the guest's (the root
+    /// image of a launch that sends an exec name).
+    fn check_current_auxv(
+        &self,
+        pid: Pid,
+        rows: &[Map],
+        image: InitialImage,
+        kernel_random: usize,
+    ) -> Result<()> {
         ensure!(
             generation(pid)? == image.start_time_ticks
                 && pid.as_raw() == image.pid
-                && auxv_random(&read_path(format!("/proc/{pid}/auxv"), 4096)?)? == image.at_random,
+                && auxv_random(&read_path(format!("/proc/{pid}/auxv"), 4096)?)? == kernel_random,
             "loader handoff image or kernel auxv changed"
         );
         let row = containing(rows, image.at_random, 16)?;
@@ -2206,7 +2299,7 @@ impl Bootstrap {
                 start_time_ticks: generation(pid)?,
                 at_random: auxv_random(&read_path(format!("/proc/{pid}/auxv"), 4096)?)?,
             };
-            self.check_current_auxv(pid, &maps(pid)?, image)?;
+            self.check_current_auxv(pid, &maps(pid)?, image, image.at_random)?;
             if self.taken {
                 self.continuations.insert(pid, image);
                 return Ok(());
