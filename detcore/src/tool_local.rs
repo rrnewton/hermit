@@ -3538,6 +3538,14 @@ pub struct ThreadState<T> {
     /// tests set it.
     pub(crate) sigalrm_handled: bool,
 
+    /// Detcore's own copy of this thread's signal dispositions and masks
+    /// (audit step A5, step 1: recorded from the calls that change them and
+    /// checked against the kernel where it can be read, but read by no
+    /// decision yet). `None` until the first image seeds it, and wherever it
+    /// cannot be seeded: `None` means unknown, never default actions.
+    #[serde(default)]
+    pub(crate) signal_shadow: Option<crate::signal_state::SignalShadow>,
+
     /// The SIGALRM blocked bit this thread last published to the scheduler's
     /// ledger (signal phase 1). A handler's return changes the virtual mask
     /// without a syscall; the next syscall's entry compares the runtime's
@@ -4318,6 +4326,7 @@ impl<T> ThreadState<T> {
             parent_cpu_publication: None,
             restart_block: None,
             sigalrm_handled: false,
+            signal_shadow: None,
             sigalrm_blocked_published: false,
             handler_restore_rt_reported: 0,
             signal_register_projection: None,
