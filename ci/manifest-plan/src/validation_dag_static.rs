@@ -2411,7 +2411,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // procfs::tests::a_cpuinfo_placeholder_name_counts_only_where_the_session_renders_it and
     // file_metadata_tests::a_cpuinfo_placeholder_waits_for_the_sessions_answer
     // (https://github.com/rrnewton/hermit/issues/4213): 1926, executed.
-    ("test.detcore_unit", 1926),
+    // And the in-flight-dequeue regression of https://github.com/rrnewton/hermit/pull/4491:
+    // a_send_after_an_in_flight_dequeue_joins_the_emptied_list and
+    // a_send_after_an_in_flight_dequeue_with_an_entry_behind_is_refused: 1928, listed.
+    ("test.detcore_unit", 1928),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4182,7 +4185,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from a52129ba: 1921.
     // And the 4213 unrecorded-descriptor link test: 1922.
     // And the four 4213 rendered-cpuinfo tests: 1926, executed.
-    ("test.detcore_unit_on_host", 1926),
+    // And the same two in-flight-dequeue units: 1928.
+    ("test.detcore_unit_on_host", 1928),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
