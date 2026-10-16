@@ -1595,7 +1595,14 @@ fi
 # post-Tool override deletion and its regression. build.rs and vendor/dynamorio
 # are unchanged; the SDK budget carries. The added live test changes the
 # tracked reverie-dbt inventory from 955 to 956. No budget is increased.
-expected_pin=14bae9ad147c97b4d29f0cb8d49cdf772eb5bfce
+# ARCHITECTURE A9/A10 SDK-BUDGET CARRY (2026-10-15): advance
+# 14bae9ad147c97b4d29f0cb8d49cdf772eb5bfce to 544e8abd59936e23c389c1f36cc88552c3ddd203.
+# The interval deletes the unwired reverie-elf-loader crate, moves the LiteInst
+# census from reverie-ptrace into reverie-liteinst, and adds three
+# BackendCapabilities fields. No reverie-dbt source, build.rs, vendor SDK input
+# or native recipe changes; the reverie-dbt inventory stays 956 and the budget
+# carries.
+expected_pin=544e8abd59936e23c389c1f36cc88552c3ddd203
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
