@@ -1077,7 +1077,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And validation_dag's
     // pinned_root_wrapper_forwards_every_declared_width_channel (3d3e2d57):
     // 1590, listed.
-    ("test.regular_crates", 1590),
+    // And parity_outcomes' five unit tests: 1595, listed.
+    ("test.regular_crates", 1595),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -4412,7 +4413,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +13 from a3a9c83a: 1569.
     // And the same six chaos-stress tests, which need no PMU: 1575.
     // And the same width-channel test: 1576, listed.
-    ("test.regular_crates_on_host", 1576),
+    // And the same five parity_outcomes tests: 1581, listed.
+    ("test.regular_crates_on_host", 1581),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     ("test.rr_suite_contract_on_host", 191),
