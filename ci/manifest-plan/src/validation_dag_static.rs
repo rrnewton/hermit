@@ -2342,7 +2342,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4472): 1794, listed.
     // And scheduler::test::only_a_leader_retired_at_its_exit_names_a_retired_exited_leader
     // (https://github.com/rrnewton/hermit/issues/4445): 1795, listed.
-    ("test.detcore_unit", 1795),
+    // Shared own-getter dispatch regressions retain the existing selection:
+    // own_getters_dispatch_projects_the_current_thread_record and
+    // own_getters_dispatch_preserves_nested_answers_and_failures: 1797, listed.
+    ("test.detcore_unit", 1797),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2812,7 +2815,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And eight of the internal Buck matrix's nine unrecorded tests/rust
     // guests, record_rs_bind_connect_race through record_rs_socketpair; the
     // ninth, record_rs_futex_and_print, is ignored for its CPU budget: 211.
-    ("test.record_replay", 211),
+    // shared_own_getters_preserve_record_replay_stream retains the prior
+    // record/replay selection: 212 nonignored tests, freshly listed.
+    ("test.record_replay", 212),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -4003,7 +4008,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +69 from a3a9c83a: 1791.
     // And the three 4472 replay-priority tests: 1794.
     // And the 4445 retired-leader test: 1795.
-    ("test.detcore_unit_on_host", 1795),
+    // Shared own-getter dispatch regressions retain the existing selection:
+    // own_getters_dispatch_projects_the_current_thread_record and
+    // own_getters_dispatch_preserves_nested_answers_and_failures: 1797, listed.
+    ("test.detcore_unit_on_host", 1797),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
