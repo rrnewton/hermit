@@ -3340,7 +3340,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a_sigkill_to_an_exited_leader_leaves_its_group_running and
     // a_wait_after_a_sigkill_to_an_exited_leader_is_a_deadlock
     // (https://github.com/rrnewton/hermit/issues/4445): 450, listed.
-    ("test.cli", 450),
+    // And a_sigqueue_sigkill_is_retired_at_the_kill_turn (4445 follow-up): 451, listed.
+    ("test.cli", 451),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3734,7 +3735,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4472): 384, listed.
     // And the two 4445 exited-leader SIGKILL tests
     // (https://github.com/rrnewton/hermit/issues/4445): 386, listed.
-    ("test.cli_on_host", 386),
+    // And the 4445 follow-up rt_tgsigqueueinfo SIGKILL test: 387, listed.
+    ("test.cli_on_host", 387),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
