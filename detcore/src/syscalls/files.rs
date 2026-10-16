@@ -8,6 +8,10 @@
 
 //! System calls for dealing with the file system.
 
+#[cfg(test)]
+#[path = "files/timer_slack_target_tests.rs"]
+mod timer_slack_target_tests;
+
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
@@ -1488,7 +1492,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         let observed_identity = self
             .observe_timer_slack_identity(guest, binding.target)
             .await?;
-        let current = guest.inject(syscalls::Gettid::new()).await? as i32;
+        let current = if guest.thread_state().nested_pid_namespace {
+            guest.inject(syscalls::Gettid::new()).await? as i32
+        } else {
+            guest.thread_state().dettid.as_raw()
+        };
         classify_timer_slack_binding(binding, observed_identity, current).map_err(Into::into)
     }
 

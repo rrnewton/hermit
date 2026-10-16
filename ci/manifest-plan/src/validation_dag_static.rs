@@ -2345,7 +2345,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Shared own-getter dispatch regressions retain the existing selection:
     // own_getters_dispatch_projects_the_current_thread_record and
     // own_getters_dispatch_preserves_nested_answers_and_failures: 1797, listed.
-    ("test.detcore_unit", 1797),
+    // Four timer-slack actual-handler regressions preserve inode and nested-ID
+    // ordering while removing the ordinary injected-TID dependency: 1801, listed.
+    ("test.detcore_unit", 1801),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4011,7 +4013,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Shared own-getter dispatch regressions retain the existing selection:
     // own_getters_dispatch_projects_the_current_thread_record and
     // own_getters_dispatch_preserves_nested_answers_and_failures: 1797, listed.
-    ("test.detcore_unit_on_host", 1797),
+    // Four timer-slack actual-handler regressions preserve inode and nested-ID
+    // ordering while removing the ordinary injected-TID dependency: 1801, listed.
+    ("test.detcore_unit_on_host", 1801),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
