@@ -74,13 +74,6 @@ mod resources;
 mod scheduler;
 mod shared_open_files;
 mod sigalrm_phase1;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "A5 step 1a: the signal state lands before its recorders (step 1b)"
-    )
-)]
 mod signal_state;
 mod sock_diag;
 mod stat;
@@ -2481,6 +2474,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         {
             tool_global::discarded_signal(guest, control).await;
         }
+        if delivered.is_some() {
+            crate::syscalls::signal_shadow::record_delivery(guest, signal as i32);
+        }
         Ok(delivered.map(|_| signal))
     }
 
@@ -2495,6 +2491,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         let delivered = self
             .handle_inbound_signal(guest, SigWrapper(signal))
             .await?;
+        if delivered.is_some() {
+            crate::syscalls::signal_shadow::record_delivery(guest, signal);
+        }
         Ok(delivered.map(|signal| signal.raw()))
     }
 
@@ -2780,6 +2779,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     restart_block: None,
                     // A fork child inherits its parent's signal dispositions.
                     sigalrm_handled: pts.1.sigalrm_handled,
+                    signal_shadow: pts
+                        .1
+                        .signal_shadow
+                        .as_ref()
+                        .and_then(|shadow| shadow.for_clone(clone_flags.bits())),
+                    signal_shadow_lost: pts.1.signal_shadow_lost,
                     sigalrm_blocked_published: pts.1.sigalrm_blocked_published,
                     handler_restore_rt_reported: pts.1.handler_restore_rt_reported,
                     signal_register_projection: None,
@@ -2994,6 +2999,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .load(std::sync::atomic::Ordering::SeqCst);
         guest.thread_state_mut().changed_root =
             Arc::new(std::sync::atomic::AtomicBool::new(changed_root));
+        // Exec resets caught signals to their defaults, on a private copy of
+        // the actions; the first image seeds the copy instead.
+        crate::syscalls::signal_shadow::at_exec(guest);
         // The exec'ing thread is its process's only thread now, and leads
         // it, so the table it holds is the process's. (Where Detcore handles
         // the execve, `handle_execveat` already installed it; a backend that
@@ -3236,6 +3244,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // left mapped goes before this call runs (and, below, before a call
         // that was waiting returns).
         Self::unmap_orphaned_staging_pages(guest).await;
+        crate::syscalls::signal_shadow::at_syscall_entry(guest);
         // Signal phase 1: before this syscall's first scheduler request. A
         // delivery prepared here runs the guest's handler before the syscall,
         // which then starts again; what this returns is discarded.
@@ -4451,6 +4460,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // A pass-through whose restored mask may deliver a pending real-time
             // timer expiration (https://github.com/rrnewton/hermit/issues/4089).
             SyscallClassification::PassThrough if call.number() == Sysno::rt_sigreturn => {
+                crate::syscalls::signal_shadow::record_rt_sigreturn(guest).await;
                 self.observe_sigreturn_mask(guest).await;
                 self.passthrough(guest, call).await
             }
@@ -4502,6 +4512,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             self.note_fd_readied(guest, fd, wants).await;
         }
         Self::unmap_orphaned_staging_pages(guest).await;
+        crate::syscalls::signal_shadow::after_syscall(guest, &call, &res);
 
         // With asynchronous exit completion, a descriptor that would make this
         // guest serve another guest's exit ends the run before anything
