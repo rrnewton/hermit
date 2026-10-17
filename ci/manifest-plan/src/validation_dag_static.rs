@@ -2439,7 +2439,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_process_file_exists_for_exactly_the_tasks_the_table_lists,
     // a_process_file_is_owned_by_the_guest_and_named_by_path_calls}
     // (https://github.com/rrnewton/hermit/issues/4213): 1939, executed.
-    ("test.detcore_unit", 1939),
+    // And procfs::tests::{a_process_cgroup_is_rendered_for_the_task_its_path_names,
+    // a_rendered_process_cgroup_is_the_root_cgroup_and_only_once_opened_so,
+    // a_process_cgroup_placeholder_names_its_task}
+    // (https://github.com/rrnewton/hermit/issues/4213): 1942, executed.
+    ("test.detcore_unit", 1942),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3497,7 +3501,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +4 from 2447c8e8: 492.
     // And a_name_below_a_received_directory_is_looked_up_on_ptrace_dbt_and_kvm
     // (a relative name below a descriptor received over SCM_RIGHTS): 493.
-    ("test.cli", 493),
+    // And detcore_renders_process_cgroup_on_every_backend
+    // (https://github.com/rrnewton/hermit/issues/4213): 494.
+    ("test.cli", 494),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3922,7 +3928,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // A6 adds 4 explicit-refusal/configuration/timer controls; combined source count, listing pending.
     // And +4 from 2447c8e8: 427.
     // And the received-directory lookup test: 428.
-    ("test.cli_on_host", 428),
+    // And the 4213 process-cgroup test: 429.
+    ("test.cli_on_host", 429),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4227,7 +4234,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same five exec-record tests: 1932, executed.
     // And the 4213 received-directory task-position test: 1933, executed.
     // And the six 4213 per-process mechanism tests: 1939, executed.
-    ("test.detcore_unit_on_host", 1939),
+    // And the three 4213 process-cgroup tests: 1942, executed.
+    ("test.detcore_unit_on_host", 1942),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

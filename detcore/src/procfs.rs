@@ -1259,10 +1259,11 @@ impl ProcfsFile {
     }
 
     /// The per-process files Detcore renders, and their names.
-    const PER_PROCESS_KINDS: [(ProcfsKind, &'static str); 0] = [];
+    const PER_PROCESS_KINDS: [(ProcfsKind, &'static str); 1] =
+        [(ProcfsKind::ProcessCgroup, "cgroup")];
 
     /// The names of the per-process files Detcore renders.
-    pub(crate) const PER_PROCESS_NAMES: [&'static str; 0] = [];
+    pub(crate) const PER_PROCESS_NAMES: [&'static str; 1] = ["cgroup"];
 
     /// Bind the caller's spellings (`self`, `thread-self`) of a per-process
     /// file's task to the caller's process `pid` and thread `tid`, as Linux
@@ -1430,6 +1431,11 @@ impl ProcfsFile {
             ProcfsKind::Uptime => b"0.00 0.00\n",
             ProcfsKind::SystemStat => SYSTEM_STAT_TEMPLATE,
             ProcfsKind::Cpuinfo | ProcfsKind::Fixed(_) => b"",
+            // Linux's `proc_cgroup_show` for a task in the root cgroup of
+            // the cgroup v2 hierarchy, the only one Hermit's machine has
+            // (`/proc/cgroups` lists every controller on the unified hierarchy, 0);
+            // the sanitizer keeps it.
+            ProcfsKind::ProcessCgroup => b"0::/\n",
             _ => unreachable!("{:?} has no rendered path", self.kind),
         }
     }
@@ -7747,6 +7753,119 @@ total_commit_ms 0\n"
         assert_eq!(
             sanitize_process_cgroup(b"0::/user.slice/\xff\xfe.scope\n"),
             b"0::/\n"
+        );
+    }
+
+    /// A process's cgroup file is named, for rendering, by the task its path
+    /// names: `self` and `thread-self` bind to the caller's numbers at the
+    /// lookup, a number names itself, and a number Linux's `name_to_int`
+    /// refuses names no task. Every spelling of one task's file has one path,
+    /// the one its descriptor link shows, and so one inode; a thread's
+    /// `task/<tid>` file is another file.
+    #[test]
+    fn a_process_cgroup_is_rendered_for_the_task_its_path_names() {
+        let bound = |spelling: &str| {
+            let mut file = ProcfsFile::from_path(Path::new(spelling)).unwrap();
+            assert_eq!(file.per_process_name(), Some("cgroup"), "{spelling}");
+            file.bind_task(3, 5);
+            file.rendered_path(RenderedFiles::WITHOUT_CPUINFO)
+        };
+        for (spelling, path) in [
+            ("/proc/self/cgroup", Some("/proc/3/cgroup")),
+            ("/proc/3/cgroup", Some("/proc/3/cgroup")),
+            ("/proc/7/cgroup", Some("/proc/7/cgroup")),
+            ("/proc/thread-self/cgroup", Some("/proc/3/task/5/cgroup")),
+            ("/proc/self/task/5/cgroup", Some("/proc/3/task/5/cgroup")),
+            ("/proc/3/task/5/cgroup", Some("/proc/3/task/5/cgroup")),
+            ("/proc/7/task/9/cgroup", Some("/proc/7/task/9/cgroup")),
+            ("/proc/self/./cgroup", Some("/proc/3/cgroup")),
+            ("/proc/03/cgroup", None),
+            ("/proc/3/task/05/cgroup", None),
+            ("/proc/99999999999/cgroup", None),
+        ] {
+            assert_eq!(bound(spelling), path.map(Path::new), "{spelling}");
+        }
+        // Before the caller's spellings are bound there is no path.
+        let unbound = ProcfsFile::from_path(Path::new("/proc/self/cgroup")).unwrap();
+        assert_eq!(unbound.rendered_path(RenderedFiles::ALL), None);
+        assert_eq!(unbound.bound_task(), None);
+        // `thread-self` has no `task` below it, and other names are not the
+        // file.
+        assert!(ProcfsFile::from_path(Path::new("/proc/thread-self/task/5/cgroup")).is_none());
+        assert!(ProcfsFile::from_path(Path::new("/proc/self/cgroups")).is_none());
+        // The two tables of per-process files agree.
+        assert_eq!(
+            ProcfsFile::PER_PROCESS_KINDS.map(|(_, name)| name),
+            ProcfsFile::PER_PROCESS_NAMES
+        );
+        // One interned path per task.
+        let first = bound("/proc/self/cgroup").unwrap();
+        let second = bound("/proc/3/cgroup").unwrap();
+        assert!(std::ptr::eq(first, second));
+        assert!(rendered_path_is_per_process(first));
+        assert!(!rendered_path_is_per_process(Path::new("/proc/stat")));
+        assert!(!rendered_path_is_per_process(Path::new(
+            "/proc/sys/kernel/pty/nr"
+        )));
+    }
+
+    /// The bytes are the root cgroup of the cgroup v2 hierarchy, rendered
+    /// with no kernel object; a file the kernel opened (under record and
+    /// replay, after `chroot`) keeps being served from the kernel's bytes,
+    /// sanitized, even where its path names a task by number.
+    #[test]
+    fn a_rendered_process_cgroup_is_the_root_cgroup_and_only_once_opened_so() {
+        let kernel_opened = ProcfsFile::from_path(Path::new("/proc/3/cgroup")).unwrap();
+        assert_eq!(
+            kernel_opened.rendered_path(RenderedFiles::ALL),
+            Some(Path::new("/proc/3/cgroup"))
+        );
+        assert_eq!(kernel_opened.served_rendered_path(RenderedFiles::ALL), None);
+        assert_eq!(kernel_opened.opened_path(), None);
+        let mut rendered = kernel_opened.into_rendered();
+        assert_eq!(
+            rendered.served_rendered_path(RenderedFiles::WITHOUT_CPUINFO),
+            Some(Path::new("/proc/3/cgroup"))
+        );
+        assert_eq!(rendered.opened_path(), Some(Path::new("/proc/3/cgroup")));
+        let template = rendered.rendering_template().to_vec();
+        rendered.initialize(template, ProcfsSnapshotContext::default());
+        assert_eq!(rendered.rendered_snapshot(), Some(&b"0::/\n"[..]));
+        assert!(rendered.seeks_only_from_start_or_position());
+        // A system-wide file is served from its rendering whichever opened it.
+        let stat = ProcfsFile::from_path(Path::new("/proc/stat")).unwrap();
+        assert_eq!(
+            stat.served_rendered_path(RenderedFiles::ALL),
+            Some(Path::new("/proc/stat"))
+        );
+    }
+
+    /// A placeholder's name is trusted for a per-process file only where it
+    /// names the task by number, as Detcore names every one it makes: a name
+    /// with `self` names no file Detcore made.
+    #[test]
+    fn a_process_cgroup_placeholder_names_its_task() {
+        let name = placeholder_name(Path::new("/proc/3/cgroup"), b"0::/\n");
+        let link = format!("/memfd:{name} (deleted)");
+        assert_eq!(
+            placeholder_link(link.as_bytes(), RenderedFiles::WITHOUT_CPUINFO),
+            Some((Path::new("/proc/3/cgroup"), b"0::/\n".to_vec()))
+        );
+        let thread = placeholder_name(Path::new("/proc/3/task/5/cgroup"), b"");
+        assert_eq!(
+            placeholder_link_path(
+                format!("/memfd:{thread} (deleted)").as_bytes(),
+                RenderedFiles::ALL
+            ),
+            Some(Path::new("/proc/3/task/5/cgroup"))
+        );
+        let forged = placeholder_name(Path::new("/proc/self/cgroup"), b"");
+        assert_eq!(
+            placeholder_link_path(
+                format!("/memfd:{forged} (deleted)").as_bytes(),
+                RenderedFiles::ALL
+            ),
+            None
         );
     }
 }

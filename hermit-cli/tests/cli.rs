@@ -189,6 +189,7 @@ static VFORK_CHILD_WAITS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GET_MEMPOLICY_ONE_NODE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PID_NAMESPACE_NESTED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RENDERED_PROCFS_FILES_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static RENDERED_PROCESS_FILES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RECEIVED_DIRECTORY_OPENAT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCFS_LINKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCFS_LISTINGS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1431,6 +1432,31 @@ fn rendered_procfs_files_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "rendered-procfs-files guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn rendered_process_files_guest() -> &'static Path {
+    RENDERED_PROCESS_FILES_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("rendered-process-files");
+        fs::create_dir_all(&build_root).expect("failed to create rendered-process-files directory");
+        let guest = build_root.join("rendered_process_files");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/rendered_process_files.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile rendered-process-files guest");
+        assert!(
+            output.status.success(),
+            "rendered-process-files guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -4491,6 +4517,19 @@ const PROCFS_BACKENDS: [&str; 7] = [
 /// deliver the preemption timer yet.
 const PROCFS_NOT_YET: &[(&str, &str, &str)] = &[
     (
+        "detcore_renders_process_cgroup_on_every_backend",
+        "sabre",
+        "the guest's second thread ends in SIGSEGV at its exit; a program that only \
+         creates and joins one thread does the same under SaBRe (measured 2026-10-16 at \
+         548b2db5), the thread-join failure of https://github.com/rrnewton/hermit/issues/4007",
+    ),
+    (
+        "detcore_renders_process_cgroup_on_every_backend",
+        "liteinst, in-guest-trap",
+        "the in-guest backend refuses pthread_create (clone3) by name \
+         (https://github.com/rrnewton/hermit/issues/4450)",
+    ),
+    (
         "process_groups_and_sessions_answer_as_linux_on_every_backend (reaped)",
         "dbt, sabre",
         "a child of a process that ignores SIGCHLD is not reaped at its exit: waitpid(child) \
@@ -6336,6 +6375,123 @@ fn a_name_below_a_received_directory_is_looked_up_on_ptrace_dbt_and_kvm() {
                 .filter(|line| {
                     !line.starts_with("a received /proc/self/ns")
                         && !line.starts_with("a received /proc/self/fd")
+                })
+                .map(|line| format!("{line}\n"))
+                .collect::<String>();
+            assert_eq!(
+                output, &without_directories,
+                "{backend} differs from {first_backend}"
+            );
+        } else {
+            assert_eq!(output, first, "{backend} differs from {first_backend}");
+        }
+    }
+    eprintln!(
+        "{test} compared {:?}",
+        outputs
+            .iter()
+            .map(|(backend, _)| *backend)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Detcore renders a process's cgroup file, `/proc/<pid>/cgroup`, for every
+/// task its process table holds, without the backend opening a kernel object
+/// (package K slice K1 of https://github.com/rrnewton/hermit/issues/4213):
+/// every spelling (`self`, `thread-self`, a pid, a thread's `task/<tid>`, a
+/// thread's own `/proc/<tid>`, descriptor links, and names relative to
+/// `/proc`, `/proc/self`, `/proc/<pid>`, `/proc/self/task` and
+/// `/proc/thread-self` directories, also inherited across fork, reopened
+/// through a descriptor link and received over SCM_RIGHTS) reaches the file
+/// Linux reaches, and a pid or tid no task holds has none (ENOENT). Every
+/// backend reads the root of the cgroup v2 hierarchy, `0::/`, from
+/// Detcore's procfs device, reaches bitwise parity, and prints the same
+/// lines; before this, KVM refused every open of the file with EACCES and
+/// ptrace read the host's hierarchies, sanitized. The guest also checks the
+/// answers to its owner's calls, which follow its capabilities as `capget`
+/// reports them; under Hermit every backend gives the guest every
+/// capability in its namespace, which the test requires, so a write-mode
+/// open succeeds and every write through it is refused without changing the
+/// file. The guest checks the same relations natively first, where the
+/// file's bytes are the host's. Every backend that runs Detcore is compared
+/// (`procfs_backends`), but one not available here, named as not compared,
+/// and one `PROCFS_NOT_YET` lists, named with its issue.
+#[test]
+fn detcore_renders_process_cgroup_on_every_backend() {
+    let test = "detcore_renders_process_cgroup_on_every_backend";
+    let guest = rendered_process_files_guest();
+    let native = Command::new(guest)
+        .output()
+        .expect("run rendered-process-files natively");
+    assert!(native.status.success(), "native: {native:?}");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut outputs = Vec::new();
+    for backend in procfs_backends(test) {
+        let report = directory.path().join(format!("{backend}.json"));
+        let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+        let mut args = vec![
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            &report_arg,
+            "--epoch=2026-01-01T00:00:00Z",
+            "--base-env=minimal",
+            "--",
+            guest.to_str().expect("guest path is UTF-8"),
+            "--hermit",
+        ];
+        // KVM's own /proc cannot open a process's or a thread's directory
+        // yet (slice B3a-4 of https://github.com/rrnewton/hermit/issues/4266),
+        // so the names relative to one are not checked there.
+        if backend == "kvm" {
+            args.push("--no-process-directories");
+        }
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let verdict: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+                .expect("parse the verification report");
+        assert_eq!(verdict["bitwise_parity"], true, "{backend}: {verdict}");
+        let compared = &verdict["compared_log_messages"];
+        assert!(
+            compared["left"].as_u64().is_some_and(|count| count > 0)
+                && compared["left"] == compared["right"],
+            "{backend} compared no INFO messages: {verdict}"
+        );
+        outputs.push((backend, stdout(&output)));
+    }
+    assert!(
+        outputs.len() > 1 || !cfg!(feature = "dbt"),
+        "only ptrace was compared: {outputs:?}"
+    );
+    let (first_backend, first) = &outputs[0];
+    for line in [
+        "contents: 0::/\n",
+        "capabilities: dac_override=1 sys_admin=1\n",
+        "exec: the descriptor continues from its position, 2+3 bytes\n",
+    ] {
+        assert!(
+            first.contains(line),
+            "{first_backend} lacks {line:?}: {first}"
+        );
+    }
+    for (backend, output) in &outputs[1..] {
+        if *backend == "kvm" {
+            eprintln!(
+                "{test}: kvm: NOT CHECKED: names relative to a process's or a thread's /proc \
+                 directory, inherited across fork, reopened and received over SCM_RIGHTS (KVM's \
+                 own /proc cannot open those directories yet)"
+            );
+            let without_directories = first
+                .lines()
+                .filter(|line| {
+                    !line.starts_with("process directories:")
+                        && !line.starts_with("fork directories:")
+                        && !line.starts_with("scm_rights:")
                 })
                 .map(|line| format!("{line}\n"))
                 .collect::<String>();
