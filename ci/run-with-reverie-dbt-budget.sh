@@ -1831,7 +1831,15 @@ fi
 # src/lib.rs (two imports gated on prototype-runtime); no file is added
 # (inventory 961), and build.rs, vendor/, native/, the root Cargo.toml,
 # Cargo.lock and rust-toolchain.toml are unchanged, so the budget carries.
-expected_pin=bc301d042d8f871326c2b7d6168919aa99f0fa2d
+# CARRY TO 79ad73d6440e1f8ed77fd5d157b4a63ff2fffa2a (2026-10-17): from
+# bc301d042d8f871326c2b7d6168919aa99f0fa2d. Shared memory copies use the existing
+# callback syscall gate; the test-only source transaction and its catalog rows
+# change no DBT source or SDK recipe relative to that base. The DBT tree remains
+# 3225d775e537fa3e65ddc2a811aee5c9ba6eef75; inventory remains 961. Root Cargo.lock
+# only adds the inguest dependency on the existing syscalls 0.6.18 package.
+# The SDK recipe inputs, 16-job clamp and 1050 effective-job-second budget carry
+# unchanged. Fresh Rust/runtime validation is still required; no new timing claim.
+expected_pin=79ad73d6440e1f8ed77fd5d157b4a63ff2fffa2a
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
