@@ -8575,6 +8575,33 @@ impl Scheduler {
         crate::procfs::listing::ListingFacts { processes, threads }
     }
 
+    /// Whether the task a per-process `/proc` file names exists, and whether
+    /// the task it describes has exited without being reaped, for the
+    /// top-level number `named` and the thread `thread` below its `task`, as
+    /// the container's PID namespace numbers them: the lookup Linux makes of
+    /// `/proc/<named>` (a listed process, a zombie until it is reaped, or a
+    /// live thread of a listed process) and of its `task/<thread>`
+    /// (`procfs::listing::task_exists`). The task the file describes is the
+    /// thread, else the task `named` is; one that has exited (it has no turn
+    /// left, `thread_is_live`) while its file exists has no memory map in
+    /// Linux. Hermit's own init, pid 1 where no guest holds it, is live.
+    pub fn procfs_task(&self, named: DetTid, thread: Option<DetTid>) -> (bool, bool) {
+        let leader = self.signal_target_process(named);
+        let facts = self.procfs_listing(leader);
+        let task = crate::procfs::BoundTask {
+            process: named.as_raw(),
+            thread: thread.map(|thread| thread.as_raw()),
+        };
+        let exists =
+            crate::procfs::listing::task_exists(task, leader.map(|leader| leader.as_raw()), &facts);
+        if !exists {
+            return (false, false);
+        }
+        let described = thread.unwrap_or(named);
+        let hermit_init = described.as_raw() == 1 && leader.is_none();
+        (true, !hermit_init && !self.thread_is_live(described))
+    }
+
     /// The kernel's number for each of `ids`, a guest process or thread
     /// number as `/proc` spells it (`to_kernel`), or the guest's for each
     /// kernel number (`!to_kernel`), where the backend's host threads

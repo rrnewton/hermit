@@ -1396,7 +1396,7 @@ impl FileMetadata {
             )
         };
         let offset = usize::try_from(offset).unwrap_or(0);
-        let procfs = crate::procfs::ProcfsFile::from_path(path)
+        let procfs = crate::procfs::ProcfsFile::from_rendered_path(path)
             .expect("a rendered path is a procfs file")
             .into_rendered();
         let procfs = if snapshot.is_empty() {

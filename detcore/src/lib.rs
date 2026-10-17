@@ -3576,7 +3576,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 .transpose()
             {
                 Some(refusal) => Some(refusal),
-                None => match self.answer_rendered_procfs_operation(guest, &call) {
+                None => match self.answer_rendered_procfs_operation(guest, &call).await {
                     Some(answer) => Some(answer),
                     None => match self.answer_rendered_procfs_mapping(guest, &call).await {
                         Some(answer) => Some(answer),

@@ -196,6 +196,10 @@ struct InodePool {
     /// How many guest threads have been counted (see
     /// [`Self::count_incarnation`]).
     threads_counted: u64,
+    /// The state Linux keeps on a per-process `/proc` file's inode that
+    /// Detcore keeps for the files it renders, by their inode number (see
+    /// [`Self::rendered_file_state`]).
+    rendered_file_states: HashMap<u64, crate::procfs::listing::RenderedFileState>,
 }
 
 /// How a numbering request reached its file, which decides whether a retired
@@ -383,7 +387,37 @@ impl InodePool {
             procfs_keys: HashMap::new(),
             incarnations: HashMap::new(),
             threads_counted: 0,
+            rendered_file_states: HashMap::new(),
         }
+    }
+
+    /// How many guest threads have been given task ID `tid` in this run (see
+    /// [`Self::count_incarnation`]): the incarnation of the one holding it
+    /// now, 0 for an ID no guest thread has held.
+    fn incarnation(&self, tid: i32) -> u32 {
+        self.incarnations.get(&tid).map_or(0, |counted| {
+            u32::try_from(counted.len()).unwrap_or(u32::MAX)
+        })
+    }
+
+    /// Apply `change` to the state of the rendered per-process `/proc` file
+    /// numbered `inode`, and return the state. Every change comes in its
+    /// guest thread's turn, so their order is the scheduler's.
+    fn rendered_file_state(
+        &mut self,
+        inode: u64,
+        change: crate::procfs::listing::RenderedFileChange,
+    ) -> crate::procfs::listing::RenderedFileState {
+        use crate::procfs::listing::RenderedFileChange;
+        let state = self.rendered_file_states.entry(inode).or_default();
+        match change {
+            RenderedFileChange::Read => {}
+            RenderedFileChange::Mtime(seconds, nanoseconds) => {
+                state.mtime = Some((seconds, nanoseconds));
+            }
+            RenderedFileChange::WriteHint(hint) => state.write_hint = hint,
+        }
+        *state
     }
 
     /// The key to pool the procfs entry at host inode `host` under, given the
@@ -3389,6 +3423,25 @@ impl GlobalState {
                     .setpgid_decision(caller, pid, pgid)
                     .map_err(|errno| errno.into_raw()),
             ),
+            GlobalRequest::ProcfsTask(named, thread) => {
+                let (exists, without_mm) = self
+                    .lock_rpc_scheduler(false)
+                    .await
+                    .procfs_task(named, thread);
+                let inodes = self.inodes.lock().unwrap();
+                R::ProcfsTask(crate::procfs::listing::ProcfsTaskAnswer {
+                    exists,
+                    without_mm,
+                    process_incarnation: inodes.incarnation(named.as_raw()),
+                    thread_incarnation: thread.map(|thread| inodes.incarnation(thread.as_raw())),
+                })
+            }
+            GlobalRequest::RenderedFileState(inode, change) => R::RenderedFileState(
+                self.inodes
+                    .lock()
+                    .unwrap()
+                    .rendered_file_state(inode, change),
+            ),
             GlobalRequest::LocalPid(caller, task) => R::LocalPid(
                 self.lock_rpc_scheduler(false)
                     .await
@@ -5485,6 +5538,13 @@ pub enum GlobalRequest {
     /// process's exec (`crate::exec_record`), for its `/proc/<pid>/exe`
     /// link. Appended last.
     ProcessImage(DetPid),
+    /// Whether the task a per-process `/proc` file names exists, whether it
+    /// has exited unreaped, and the incarnation of its numbers
+    /// (`Scheduler::procfs_task`). Appended last.
+    ProcfsTask(DetTid, Option<DetTid>),
+    /// Change or read the state Detcore keeps on a rendered per-process
+    /// `/proc` file's inode (`InodePool::rendered_file_state`). Appended last.
+    RenderedFileState(u64, crate::procfs::listing::RenderedFileChange),
 }
 
 /// Responses from the global object
@@ -5663,6 +5723,10 @@ pub enum GlobalResponse {
     SetpgidDecision(Result<(DetPid, DetPid), i32>),
     /// Boxed, to keep the response small. Appended last.
     ProcessImage(Option<Box<crate::exec_record::ExecRecord>>),
+    /// Appended last.
+    ProcfsTask(crate::procfs::listing::ProcfsTaskAnswer),
+    /// Appended last.
+    RenderedFileState(crate::procfs::listing::RenderedFileState),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -7921,6 +7985,46 @@ where
     let response = send_and_update_time(guest, GlobalRequest::ProcfsListing(process)).await;
     match response.1 {
         GlobalResponse::ProcfsListing(facts) => facts,
+        _ => unreachable!(),
+    }
+}
+
+/// What Detcore's process table says of the task a per-process `/proc` file
+/// names (`Scheduler::procfs_task`), with the incarnation of its numbers.
+pub async fn procfs_task<G, T>(
+    guest: &mut G,
+    task: crate::procfs::BoundTask,
+) -> crate::procfs::listing::ProcfsTaskAnswer
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let request = GlobalRequest::ProcfsTask(
+        DetTid::from_raw(task.process),
+        task.thread.map(DetTid::from_raw),
+    );
+    let response = send_and_update_time(guest, request).await;
+    match response.1 {
+        GlobalResponse::ProcfsTask(answer) => answer,
+        _ => unreachable!(),
+    }
+}
+
+/// Change or read the state Detcore keeps on the rendered per-process `/proc`
+/// file numbered `inode` (`InodePool::rendered_file_state`).
+pub async fn rendered_file_state<G, T>(
+    guest: &mut G,
+    inode: u64,
+    change: crate::procfs::listing::RenderedFileChange,
+) -> crate::procfs::listing::RenderedFileState
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response =
+        send_and_update_time(guest, GlobalRequest::RenderedFileState(inode, change)).await;
+    match response.1 {
+        GlobalResponse::RenderedFileState(state) => state,
         _ => unreachable!(),
     }
 }

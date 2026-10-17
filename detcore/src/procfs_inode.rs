@@ -108,9 +108,73 @@ pub(crate) const VIRTUAL_PROC_DEVICE: u64 = 0x00f0_00ff;
 /// a function of its path alone, so that no other observation of the run can
 /// change it. It is in a range Detcore's inode pool, which counts up from a
 /// few thousand, never reaches.
+///
+/// A per-process file's path carries the task it belongs to
+/// (`procfs::per_process_name`), and its number is that task's
+/// ([`per_process_inode`]) rather than a hash of its text, so that no two
+/// tasks' files can share one.
 pub(crate) fn rendered_inode(path: &Path) -> u64 {
     const RENDERED_INODE_BASE: u64 = 0xf000_0000;
+    if let Some(name) = crate::procfs::per_process_name(path) {
+        return per_process_inode(name);
+    }
     RENDERED_INODE_BASE | (fnv1a(FNV_OFFSET_BASIS, path.as_os_str().as_bytes()) & 0x0fff_ffff)
+}
+
+/// The inode number of the per-process file `name`, on every backend: the
+/// fields of its identity laid out in 64 bits, so that two files share a
+/// number only if they are the same file of the same task. Bit 63 is set,
+/// which neither a system-wide rendered file's number (below 2^32, above) nor
+/// any number Detcore's inode pool mints (counting up from a few thousand)
+/// has. Then, from the high bits: the file's index among the per-process
+/// files Detcore renders (5 bits, from 1), the process (22 bits) and the
+/// thread below its `task` (22 bits, 0 for none), and the incarnation of
+/// each (7 bits each). Linux numbers tasks below `PID_MAX_LIMIT`, 2^22, so 22
+/// bits hold every pid and tid; an incarnation of 128 or more needs a pid to
+/// have been reused 127 times in one run. A value outside those bounds is
+/// refused loudly rather than wrapped into another file's number.
+pub(crate) fn per_process_inode(name: crate::procfs::PerProcessName) -> u64 {
+    const PID_BITS: u32 = 22;
+    const INCARNATION_BITS: u32 = 7;
+    let index = crate::procfs::ProcfsFile::PER_PROCESS_NAMES
+        .iter()
+        .position(|candidate| *candidate == name.filename)
+        .expect("a per-process file Detcore renders has an index")
+        + 1;
+    assert!(
+        index < 1 << 5,
+        "per-process file index {index} does not fit 5 bits"
+    );
+    let field = |value: i64, bits: u32, what: &str| -> u64 {
+        assert!(
+            (0..1_i64 << bits).contains(&value),
+            "{what} {value} of {} does not fit the {bits}-bit field of its inode number",
+            name.task.process
+        );
+        value as u64
+    };
+    let process = field(name.task.process.into(), PID_BITS, "pid");
+    let thread = field(name.task.thread.unwrap_or(0).into(), PID_BITS, "tid");
+    let incarnation = name.incarnation.unwrap_or(crate::procfs::TaskIncarnation {
+        process: 0,
+        thread: None,
+    });
+    let process_incarnation = field(
+        incarnation.process.into(),
+        INCARNATION_BITS,
+        "pid incarnation",
+    );
+    let thread_incarnation = field(
+        incarnation.thread.unwrap_or(0).into(),
+        INCARNATION_BITS,
+        "tid incarnation",
+    );
+    1 << 63
+        | (index as u64) << 58
+        | process << 36
+        | thread << 14
+        | process_incarnation << 7
+        | thread_incarnation
 }
 
 /// The bit every path key sets, which no 32-bit procfs inode number has.
@@ -881,17 +945,27 @@ impl DirectoryInodes {
     /// The inode number of the entry named `name` if it is a procfs file
     /// Detcore renders in this session (`files`), which names it by its path
     /// alone ([`rendered_inode`]).
+    ///
+    /// Not a per-process file, whose number depends on the task holding its
+    /// numbers (`Detcore::rendered_listed_inode`).
     pub(crate) fn rendered_entry_inode(
         &self,
         name: &[u8],
         files: crate::procfs::RenderedFiles,
     ) -> Option<u64> {
-        let within = self.procfs.as_ref()?.entry_path(name);
-        let relative = within.strip_prefix("/").unwrap_or(&within);
-        let path = Path::new("/proc").join(relative);
-        crate::procfs::ProcfsFile::from_path(&path)?
+        let path = self.entry_procfs_path(name)?;
+        crate::procfs::ProcfsFile::from_path(&path)
+            .filter(|file| file.per_process_name().is_none())?
             .rendered_path(files)
             .map(rendered_inode)
+    }
+
+    /// The absolute path, as `/proc/...`, of the entry named `name` in this
+    /// directory, when the directory is on procfs.
+    pub(crate) fn entry_procfs_path(&self, name: &[u8]) -> Option<PathBuf> {
+        let within = self.procfs.as_ref()?.entry_path(name);
+        let relative = within.strip_prefix("/").unwrap_or(&within);
+        Some(Path::new("/proc").join(relative))
     }
 
     /// The keys for the entry named `name`, which the host listed with inode

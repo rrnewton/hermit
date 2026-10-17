@@ -22,7 +22,12 @@
 //! reports the guest's status flags and a read-only descriptor link, as it
 //! does for the procfs file. Detcore answers the rest as Linux answers for a
 //! procfs file only global root may write (0444, or 0644 for the fixed
-//! tunables of `procfs::fixed`), to a process that is not global root:
+//! tunables of `procfs::fixed`), to a process that is not global root. A
+//! per-process file (`/proc/<pid>/...`, `procfs::ProcfsTask`) belongs instead
+//! to its process's owner, the guest's own identity, so the guest owns it and
+//! its capabilities decide write access (`FileAccess`); a placeholder it opens
+//! for writing is reopened writable, and Detcore answers every write through
+//! it. Either way Detcore answers:
 //!
 //! - opening it, including the flag errors Linux reports;
 //! - reads, from the procfs snapshot, as for every procfs file;
@@ -536,17 +541,87 @@ fn rendered_stat(path: &Path, epoch: Timespec, owner: (u32, u32)) -> DetStat {
     }
 }
 
-/// The metadata of the rendered file `path` under `epoch`, for a placeholder
-/// the kernel reached through a spelling Detcore did not resolve.
-pub(super) fn placeholder_stat(
-    path: &Path,
-    epoch: chrono::DateTime<chrono::Utc>,
-) -> Result<DetStat, Error> {
-    Ok(rendered_stat(
-        path,
-        epoch_time(epoch),
-        GuestProcfs::sysctl_owner()?,
-    ))
+/// The owner Linux reports for the rendered file `path`: a per-process file
+/// belongs to its process's owner (`task_dump_owner`), which for every guest
+/// process is Detcore's virtual root, 0 (the credential calls are emulated to
+/// it); a system-wide file to global root as the guest's user namespace sees
+/// it (`GuestProcfs::sysctl_owner`).
+fn rendered_owner(path: &Path) -> Result<(u32, u32), Errno> {
+    if crate::procfs::rendered_path_is_per_process(path) {
+        Ok((0, 0))
+    } else {
+        GuestProcfs::sysctl_owner()
+    }
+}
+
+/// What decides Linux's answer to a call that asks for write access to a
+/// rendered file, or for its owner: whether the caller owns it, and the
+/// capabilities that override its permissions.
+///
+/// A system-wide file belongs to global root, whom the guest's user
+/// namespace does not map, so no capability of the guest overrides its
+/// permissions and the guest is not its owner ([`FileAccess::GLOBAL_ROOT`]).
+/// A per-process file belongs to its process's owner, Detcore's virtual root,
+/// which is every guest's own identity, so the guest owns it, and
+/// `CAP_DAC_OVERRIDE` overrides its 0444 mode; `CAP_SYS_ADMIN` in procfs's
+/// user namespace decides a `security.` attribute. Both come from the
+/// guest's own capability sets, as `capget` reports them
+/// (`Detcore::rendered_file_access`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct FileAccess {
+    /// The caller owns the file.
+    owner: bool,
+    /// `CAP_DAC_OVERRIDE`: write access despite the mode.
+    dac_override: bool,
+    /// `CAP_SYS_ADMIN`: a `security.` attribute may be changed.
+    sys_admin: bool,
+}
+
+impl FileAccess {
+    /// A system-wide rendered file, owned by global root.
+    pub(super) const GLOBAL_ROOT: Self = Self {
+        owner: false,
+        dac_override: false,
+        sys_admin: false,
+    };
+
+    /// A per-process file, which the caller owns, with the capabilities
+    /// `capabilities` (a `capget` set) of the caller.
+    fn owned_with(capabilities: u64) -> Self {
+        Self {
+            owner: true,
+            dac_override: capabilities & (1 << CAP_DAC_OVERRIDE) != 0,
+            sys_admin: capabilities & (1 << CAP_SYS_ADMIN) != 0,
+        }
+    }
+
+    /// Whether the caller may write the file: every rendered file's mode
+    /// grants no one write access (0444; a fixed tunable's 0644 grants only
+    /// global root), so only `CAP_DAC_OVERRIDE` over an owner the caller's
+    /// namespace maps does.
+    fn may_write(&self) -> bool {
+        self.dac_override
+    }
+}
+
+/// `CAP_DAC_OVERRIDE`'s bit in a capability set.
+const CAP_DAC_OVERRIDE: u32 = 1;
+
+/// `CAP_SYS_ADMIN`'s bit in a capability set.
+const CAP_SYS_ADMIN: u32 = 21;
+
+/// `_LINUX_CAPABILITY_VERSION_3`, whose `capget` reports two 32-bit words of
+/// each set.
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+/// Which of the caller's capability sets a check uses: the effective set, or,
+/// for `access` and `faccessat` without `AT_EACCESS`, the set Linux checks
+/// with the real IDs (`access_override_creds`): for a real user ID of 0 in
+/// the caller's namespace, which every guest's is, the permitted set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CapabilitySet {
+    Effective,
+    Permitted,
 }
 
 /// The configured epoch as a stat time.
@@ -564,12 +639,16 @@ fn names_a_directory(path: &Path) -> bool {
     bytes.ends_with(b"/") || bytes.ends_with(b"/.")
 }
 
-/// Linux's answer to opening an existing rendered procfs file (owned by
-/// global root, writable by its owner at most) with `flags`, from a process
-/// that is not global root, before it opens anything: `build_open_flags`, then the lookup's `O_EXCL` and type
-/// checks, then `may_open` and `do_dentry_open`. On success, the flags the
-/// placeholder is reopened with.
-fn rendered_open_flags(flags: OFlag) -> Result<OFlag, Errno> {
+/// Linux's answer to opening an existing rendered procfs file (writable by
+/// no one but global root, `access`) with `flags`, from a process that is not
+/// global root, before it opens anything: `build_open_flags`, then the
+/// lookup's `O_EXCL` and type checks, then `may_open` and `do_dentry_open`.
+/// On success, the flags the placeholder is reopened with: read-only, or with
+/// the guest's access mode where it may write (a per-process file under
+/// `CAP_DAC_OVERRIDE`, whose writes Detcore then answers,
+/// `answer_rendered_procfs_operation`), never with `O_TRUNC`, which truncates
+/// nothing in procfs.
+fn rendered_open_flags(flags: OFlag, access: FileAccess) -> Result<OFlag, Errno> {
     if let Some(errno) = open_flags_refused(flags) {
         return Err(errno);
     }
@@ -590,15 +669,16 @@ fn rendered_open_flags(flags: OFlag) -> Result<OFlag, Errno> {
     if flags.contains(OFlag::O_DIRECTORY) {
         return Err(Errno::ENOTDIR);
     }
-    // Only the owner bits allow writing; `O_TRUNC` asks for write access.
-    if flags & OFlag::O_ACCMODE != OFlag::O_RDONLY || flags.contains(OFlag::O_TRUNC) {
+    // No mode bit allows writing; `O_TRUNC` asks for write access.
+    let writes = flags & OFlag::O_ACCMODE != OFlag::O_RDONLY || flags.contains(OFlag::O_TRUNC);
+    if writes && !access.may_write() {
         return Err(Errno::EACCES);
     }
     // `O_NOATIME` needs the file's owner.
-    if flags.contains(OFlag::O_NOATIME) {
+    if flags.contains(OFlag::O_NOATIME) && !access.owner {
         return Err(Errno::EPERM);
     }
-    // Procfs sysctl files cannot do direct I/O.
+    // Procfs files cannot do direct I/O.
     if flags.contains(OFlag::O_DIRECT) {
         return Err(Errno::EINVAL);
     }
@@ -607,9 +687,11 @@ fn rendered_open_flags(flags: OFlag) -> Result<OFlag, Errno> {
         | OFlag::O_CLOEXEC
         | OFlag::O_DSYNC
         | OFlag::O_LARGEFILE
+        | OFlag::O_NOATIME
         | OFlag::O_NONBLOCK
         | OFlag::O_SYNC;
-    Ok(OFlag::O_RDONLY | (flags & kept))
+    let mode = flags & OFlag::O_ACCMODE;
+    Ok(mode | (flags & kept))
 }
 
 /// What `build_open_flags` refuses with EINVAL before any path is looked up,
@@ -684,10 +766,13 @@ fn rendered_mmap_address_checks(
 /// The checks `do_mmap` and `mmap_region` make of a mapping of a procfs file
 /// Detcore renders after the overlap check, in their order, and the error the
 /// mapping ends with: a sysctl file has no `mmap` method (`ENODEV`); a
-/// `seq_file` has `proc_reg_mmap` (`procfs::rendered_path_is_seq_file`), so a
-/// growing-down mapping is refused (`EINVAL`) and otherwise the method finds
-/// nothing behind it (`EIO`). `len` is page aligned. `noexec` says whether
-/// procfs is mounted `noexec`.
+/// system-wide `seq_file` has `proc_reg_mmap` (`procfs::rendered_path_is_seq_file`),
+/// so a growing-down mapping is refused (`EINVAL`) and otherwise the method
+/// finds nothing behind it (`EIO`); a per-process file's operations have no
+/// `mmap` (`ENODEV`, `procfs::rendered_path_is_per_process`). `len` is page
+/// aligned. `noexec` says whether procfs is mounted `noexec`. `readable` and
+/// `writable` are the descriptor's access mode: only a per-process file's can
+/// be writable, or not readable.
 fn rendered_mmap_file_checks(
     len: usize,
     offset: libc::off_t,
@@ -695,6 +780,7 @@ fn rendered_mmap_file_checks(
     flags: MapFlags,
     noexec: bool,
     seq_file: bool,
+    (readable, writable): (bool, bool),
 ) -> Errno {
     // `file_mmap_ok`: the mapping must end within the largest offset a
     // regular file can have (`MAX_LFS_FILESIZE`), the offset taken unsigned.
@@ -715,7 +801,12 @@ fn rendered_mmap_file_checks(
     if map_type == libc::MAP_SHARED_VALIDATE && flags.bits() & !LEGACY_MAP_MASK != 0 {
         return Errno::EOPNOTSUPP;
     }
-    if map_type != libc::MAP_PRIVATE && prot.contains(ProtFlags::PROT_WRITE) {
+    if map_type != libc::MAP_PRIVATE && prot.contains(ProtFlags::PROT_WRITE) && !writable {
+        return Errno::EACCES;
+    }
+    // Every mapping needs a readable descriptor (`MAP_SHARED` falls through
+    // to `MAP_PRIVATE`'s check).
+    if !readable {
         return Errno::EACCES;
     }
     if noexec && prot.contains(ProtFlags::PROT_EXEC) {
@@ -767,7 +858,13 @@ fn rendered_mmap_answer(
 ) -> Result<i64, Errno> {
     let len = rendered_mmap_address_checks(addr, len, offset, flags)?;
     Err(rendered_mmap_file_checks(
-        len, offset, prot, flags, noexec, seq_file,
+        len,
+        offset,
+        prot,
+        flags,
+        noexec,
+        seq_file,
+        (true, false),
     ))
 }
 
@@ -793,11 +890,13 @@ fn rendered_seq_file_pwrite_answer(sysno: Sysno, position: i64) -> Option<Result
 /// guest's buffer cannot be read), or to removing it (`size` is `None`), in
 /// the kernel's order: the name, the size, the value, then the namespace.
 /// Measured against /proc/sys/kernel/random/uuid as a user its user namespace
-/// does not own.
+/// does not own ([`FileAccess::GLOBAL_ROOT`]), and against /proc/self/cgroup
+/// as its owner with and without the capabilities `access` names.
 fn xattr_change_answer(
     name: &[u8],
     size: Option<usize>,
     value: Option<&[u8]>,
+    access: FileAccess,
 ) -> Result<i64, Errno> {
     if name.is_empty() || name.len() > 255 {
         return Err(Errno::ERANGE);
@@ -822,13 +921,22 @@ fn xattr_change_answer(
         // The capability module parses the value first.
         Err(Errno::EINVAL)
     } else if name.starts_with(b"security.") {
-        // Changing a security attribute needs CAP_SYS_ADMIN.
-        Err(Errno::EPERM)
+        // Changing a security attribute needs CAP_SYS_ADMIN; procfs then has
+        // no way to keep it.
+        Err(if access.sys_admin {
+            Errno::EOPNOTSUPP
+        } else {
+            Errno::EPERM
+        })
     } else if name.starts_with(b"system.") {
         Err(Errno::EOPNOTSUPP)
     } else {
         // `user.` and unknown namespaces need write permission first.
-        Err(Errno::EACCES)
+        Err(if access.may_write() {
+            Errno::EOPNOTSUPP
+        } else {
+            Errno::EACCES
+        })
     }
 }
 
@@ -918,6 +1026,94 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// What Detcore's process table says now of the task the rendered
+    /// per-process path `path` names, and whether that is still the task the
+    /// path was bound to (it exists and its numbers have the incarnations
+    /// they had: no other task has taken them since). `None` for a path that
+    /// names no per-process file.
+    pub(super) async fn rendered_task_state<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        path: &Path,
+    ) -> Option<(crate::procfs::listing::ProcfsTaskAnswer, bool)> {
+        let name = crate::procfs::per_process_name(path)?;
+        let answer = crate::tool_global::procfs_task(guest, name.task).await;
+        let incarnation = crate::procfs::TaskIncarnation {
+            process: answer.process_incarnation,
+            thread: answer.thread_incarnation,
+        };
+        let current = answer.exists && name.incarnation == Some(incarnation);
+        Some((answer, current))
+    }
+
+    /// Linux's answer to taking a new snapshot of the rendered file open as
+    /// `fd`, where it is a per-process file: its `show` method finds its task
+    /// again (`get_proc_task`), and a task that is gone, or whose pid another
+    /// task now holds, is ESRCH. Linux takes a snapshot at a read with no
+    /// buffered bytes from the start, and at a read or seek to a position the
+    /// buffer does not hold (`traverse`).
+    pub(crate) async fn require_rendered_task<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<(), Errno> {
+        let Some(path) = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.procfs_rendered_path())
+            .ok()
+            .flatten()
+        else {
+            return Ok(());
+        };
+        match self.rendered_task_state(guest, path).await {
+            Some((_, false)) => Err(Errno::ESRCH),
+            _ => Ok(()),
+        }
+    }
+
+    /// The owner Linux reports for the rendered file `path`
+    /// ([`rendered_owner`]), for a per-process file from its task's lifecycle
+    /// in Detcore's process table: Detcore's virtual root while the task has
+    /// its memory map, and global root once it has exited (a zombie, whose
+    /// files Linux gives to global root) or is gone.
+    pub(super) async fn rendered_file_owner<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        path: &Path,
+    ) -> Result<(u32, u32), Errno> {
+        match self.rendered_task_state(guest, path).await {
+            Some((answer, true)) if !answer.without_mm => Ok((0, 0)),
+            Some(_) => GuestProcfs::sysctl_owner(),
+            None => rendered_owner(path),
+        }
+    }
+
+    /// The metadata of the rendered file `path` ([`rendered_stat`]), with its
+    /// owner ([`Self::rendered_file_owner`]) and, for a per-process file, the
+    /// modification time its owner set, which Detcore keeps in its global
+    /// tool for every alias of the file (`RenderedFileState`).
+    pub(super) async fn rendered_metadata<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        path: &Path,
+    ) -> Result<DetStat, Error> {
+        let owner = self.rendered_file_owner(guest, path).await?;
+        let epoch = epoch_time(guest.config().epoch);
+        let mut stat = rendered_stat(path, epoch, owner);
+        if crate::procfs::per_process_name(path).is_some() {
+            let state = crate::tool_global::rendered_file_state(
+                guest,
+                stat.inode,
+                crate::procfs::listing::RenderedFileChange::Read,
+            )
+            .await;
+            if let Some((tv_sec, tv_nsec)) = state.mtime {
+                stat.mtime = Timespec { tv_sec, tv_nsec };
+            }
+        }
+        Ok(stat)
+    }
+
     /// The procfs file Detcore renders that `path`, absolute in the guest's
     /// view, names: directly, or as this process's `/proc/*/fd/N` or
     /// `/dev/fd/N` link to a descriptor Detcore rendered. A spelling that
@@ -939,7 +1135,33 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Ok(None);
         }
-        if let Some(procfs) = ProcfsFile::from_path(path) {
+        if let Some(mut procfs) = ProcfsFile::from_path(path) {
+            // A per-process file belongs to the task its path names, which
+            // Detcore's process table decides exists, as Linux's lookup of
+            // `/proc/<pid>` and `task/<tid>` does: a task that is not there
+            // has no file (ENOENT), before any other check. In a nested PID
+            // namespace, whose numbers are its own, the kernel decides.
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(#4213): Review per-process rendered files: the
+            // task a spelling names, its existence and identity from Detcore's
+            // process table, and its owner's access (FileAccess).
+            if procfs.per_process_name().is_some() {
+                let Some((pid, tid)) = self.procfs_caller_ids(guest) else {
+                    return Ok(None);
+                };
+                procfs.bind_task(pid, tid);
+                let Some(task) = procfs.bound_task() else {
+                    return Err(Errno::ENOENT.into());
+                };
+                let answer = crate::tool_global::procfs_task(guest, task).await;
+                if !answer.exists {
+                    return Err(Errno::ENOENT.into());
+                }
+                procfs.set_task_incarnation(crate::procfs::TaskIncarnation {
+                    process: answer.process_incarnation,
+                    thread: answer.thread_incarnation,
+                });
+            }
             if procfs.rendered_path(self.rendered_files(guest)).is_none() {
                 return Ok(None);
             }
@@ -984,7 +1206,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_detfd(fd, |detfd| detfd.procfs_rendered_path())
             .ok()
             .flatten()
-            .and_then(ProcfsFile::from_path)
+            .and_then(ProcfsFile::from_rendered_path)
             .map(|procfs| RenderedTarget {
                 procfs: procfs.into_rendered(),
                 via_link: true,
@@ -1220,6 +1442,67 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await
     }
 
+    /// Who owns the rendered file `path` and what the caller may override
+    /// ([`FileAccess`]). A per-process file whose task has exited or is gone
+    /// belongs to global root. For a live task's file, the caller's capability set
+    /// `set` decides the overrides, asked of the kernel (or the provider that
+    /// answers `capget`, as it answers the guest's own) only where `needed`,
+    /// a call that asks for write access or a `security.` attribute: every
+    /// other call's answer depends on ownership alone, so a read pays nothing.
+    /// A set that cannot be read overrides nothing.
+    pub(super) async fn rendered_file_access<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        path: &Path,
+        needed: bool,
+        set: CapabilitySet,
+    ) -> FileAccess {
+        if !crate::procfs::rendered_path_is_per_process(path) {
+            return FileAccess::GLOBAL_ROOT;
+        }
+        // A task that has exited (a zombie), or is gone, has no memory map,
+        // and Linux gives its files to global root (`task_dump_owner`): then
+        // the caller owns nothing and no capability of its namespace applies.
+        match self.rendered_task_state(guest, path).await {
+            Some((answer, true)) if !answer.without_mm => {}
+            _ => return FileAccess::GLOBAL_ROOT,
+        }
+        let capabilities = if needed {
+            Self::inject_capget(guest, set).await.unwrap_or(0)
+        } else {
+            0
+        };
+        FileAccess::owned_with(capabilities)
+    }
+
+    /// The caller's capability set `set` (its low 64 bits), as `capget`
+    /// reports it for the calling thread.
+    async fn inject_capget<G: Guest<Self>>(guest: &mut G, set: CapabilitySet) -> Option<u64> {
+        let mut stack = guest.stack().await;
+        let header = stack.push([LINUX_CAPABILITY_VERSION_3, 0_u32]);
+        let data = stack.reserve::<[u32; 6]>();
+        let stack_guard = stack.commit().ok()?;
+        let result = guest
+            .inject(
+                syscalls::Capget::new()
+                    .with_header(AddrMut::from_raw(header.as_raw()))
+                    .with_data(AddrMut::from_raw(data.as_raw())),
+            )
+            .await;
+        let words = match result {
+            Ok(_) => guest.memory().read_value(data).ok(),
+            Err(_) => None,
+        };
+        drop(stack_guard);
+        // Each 32-bit word holds `effective`, `permitted`, `inheritable`.
+        let words = words?;
+        let word = match set {
+            CapabilitySet::Effective => 0,
+            CapabilitySet::Permitted => 1,
+        };
+        Some(u64::from(words[word]) | (u64::from(words[word + 3]) << 32))
+    }
+
     /// Open the rendered procfs file `target` names with the guest's `flags`.
     pub(super) async fn open_rendered_procfs<G: Guest<Self>>(
         &self,
@@ -1243,21 +1526,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         if target.via_link && flags.contains(OFlag::O_NOFOLLOW) {
             return Err(Errno::ELOOP.into());
         }
-        let reopen = rendered_open_flags(flags)?;
+        let procfs = target.procfs.into_rendered();
+        let path = procfs
+            .opened_path()
+            .expect("a file opened as rendered has a path");
+        let writes = flags & OFlag::O_ACCMODE != OFlag::O_RDONLY || flags.contains(OFlag::O_TRUNC);
+        let access = self
+            .rendered_file_access(guest, path, writes, CapabilitySet::Effective)
+            .await;
+        let reopen = rendered_open_flags(flags, access)?;
         GuestProcfs::remember();
         // Read before the placeholder exists, so that a failure leaves the
         // guest nothing open.
-        let owner = GuestProcfs::sysctl_owner()?;
+        let metadata = self.rendered_metadata(guest, path).await?;
         // The snapshot this open takes, which its placeholder's name carries,
         // so that every backend has it after `exec`; a file whose every
         // snapshot is the same is rendered again there
         // (`ProcfsFile::snapshot_is_rerendered`). A file Linux renders when it
         // is read takes none until its first read
         // (`ProcfsFile::snapshot_at_first_read`).
-        let procfs = target.procfs.into_rendered();
-        let path = procfs
-            .opened_path()
-            .expect("a file opened as rendered has a path");
         let snapshot =
             (!procfs.snapshot_at_first_read()).then(|| self.render_snapshot(guest, &procfs));
         let carried: &[u8] = match &snapshot {
@@ -1273,7 +1560,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             fd,
             reopen | (flags & OFlag::O_NOFOLLOW),
             FdType::Regular,
-            Some(rendered_stat(path, epoch_time(guest.config().epoch), owner)),
+            Some(metadata),
         )?;
         let procfs = match snapshot {
             Some(snapshot) => procfs.with_rendered_snapshot(snapshot),
@@ -1538,9 +1825,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// The inode number of the directory entry `name`, which the host listed
-    /// with inode `host_ino`, if it is a procfs file Detcore renders.
-    pub(super) fn rendered_listed_inode(
+    /// with inode `host_ino`, if it is a procfs file Detcore renders. A
+    /// per-process file is numbered for the task holding its numbers now (the
+    /// process table's incarnation, `Detcore::rendered_task_state`), as a stat
+    /// of it would be, and only where Detcore renders procfs files (not after
+    /// `chroot`, where the kernel's file is the file).
+    pub(super) async fn rendered_listed_inode<G: Guest<Self>>(
         &self,
+        guest: &mut G,
         inodes: &procfs_inode::DirectoryInodes,
         name: &[u8],
         host_ino: u64,
@@ -1548,6 +1840,24 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Option<u64> {
         if self.cfg.recordreplay_modes {
             return None;
+        }
+        if let Some(path) = inodes.entry_procfs_path(name)
+            && let Some(mut file) = ProcfsFile::from_path(&path)
+            && file.per_process_name().is_some()
+        {
+            if !self.renders_procfs(guest) {
+                return None;
+            }
+            let task = file.bound_task()?;
+            let answer = crate::tool_global::procfs_task(guest, task).await;
+            if !answer.exists {
+                return None;
+            }
+            file.set_task_incarnation(crate::procfs::TaskIncarnation {
+                process: answer.process_incarnation,
+                thread: answer.thread_incarnation,
+            });
+            return file.rendered_path(files).map(procfs_inode::rendered_inode);
         }
         // By kernel identity only for an entry named as a rendered file is,
         // which costs a stat for each rendered file of that name (at most
@@ -1685,11 +1995,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let Some(path) = path else {
             return Ok(None);
         };
-        Ok(Some(rendered_stat(
-            path,
-            epoch_time(guest.config().epoch),
-            GuestProcfs::sysctl_owner()?,
-        )))
+        Ok(Some(self.rendered_metadata(guest, path).await?))
     }
 
     /// Write the guest's procfs statistics, as `statfs` of a procfs file
@@ -1841,16 +2147,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         if c.flags().contains(MapFlags::MAP_ANONYMOUS) {
             return None;
         }
-        let path = guest
+        let (path, status_flags) = guest
             .thread_state()
             .with_detfd(c.fd(), |detfd| {
                 (detfd.status_flags() & libc::O_PATH == 0)
                     .then(|| detfd.procfs_rendered_path())
                     .flatten()
+                    .map(|path| (path, detfd.status_flags()))
             })
             .ok()
             .flatten()?;
-        let seq_file = crate::procfs::rendered_path_is_seq_file(path);
+        // A per-process file has no `mmap` method, as a sysctl file has none.
+        let seq_file = crate::procfs::rendered_path_is_seq_file(path)
+            && !crate::procfs::rendered_path_is_per_process(path);
+        let access_mode = status_flags & libc::O_ACCMODE;
+        // Exactly: access mode 3 can neither read nor write.
+        let mode = (
+            access_mode == libc::O_RDONLY || access_mode == libc::O_RDWR,
+            access_mode == libc::O_WRONLY || access_mode == libc::O_RDWR,
+        );
         let noexec = match GuestProcfs::statfs() {
             Ok((_, flags)) => flags & libc::ST_NOEXEC != 0,
             Err(errno) => return Some(Err(errno.into())),
@@ -1915,7 +2230,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
         }
-        let errno = rendered_mmap_file_checks(len, c.offset(), c.prot(), flags, noexec, seq_file);
+        let errno =
+            rendered_mmap_file_checks(len, c.offset(), c.prot(), flags, noexec, seq_file, mode);
         // MAP_FIXED_NOREPLACE implies MAP_FIXED in Linux, but its range is
         // vacant here, so there is nothing to unmap.
         let unmaps = sequentialized
@@ -1939,17 +2255,93 @@ impl<T: RecordOrReplay> Detcore<T> {
         Some(Err(errno.into()))
     }
 
+    /// Linux's answer to a call that writes through the descriptor it names
+    /// (`write`, `writev`, `pwritev2` at the file position, `ftruncate`,
+    /// `fallocate`, and `sendfile` or `splice` into it) when that descriptor
+    /// is a placeholder opened for writing, or with access mode 3, which only
+    /// a per-process file under `CAP_DAC_OVERRIDE` is (`rendered_open_flags`).
+    /// Detcore answers every such call, so none reaches the memfd. Linux opens such a
+    /// file without `FMODE_CAN_WRITE` (it has no write method), so a write is
+    /// `EINVAL` after the access mode is checked; `proc_setattr` accepts any
+    /// size and keeps none; and it has no `fallocate` method. A positioned
+    /// write is the `seq_file`'s `ESPIPE` (`answer_rendered_procfs_operation`).
+    /// Measured on Linux 7.1 against `/proc/self/cgroup` as its owner with
+    /// `CAP_DAC_OVERRIDE`.
+    fn answer_rendered_procfs_write<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        args: &reverie::syscalls::SyscallArgs,
+    ) -> Option<Result<i64, Errno>> {
+        let fd = match sysno {
+            Sysno::write | Sysno::writev | Sysno::ftruncate | Sysno::fallocate => args.arg0,
+            Sysno::pwritev2 if args.arg3 as i64 == -1 => args.arg0,
+            Sysno::sendfile => args.arg0,
+            Sysno::splice => args.arg2,
+            _ => return None,
+        } as RawFd;
+        let mode = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| {
+                (detfd.procfs_rendered_path().is_some() && detfd.status_flags() & libc::O_PATH == 0)
+                    .then(|| detfd.status_flags() & libc::O_ACCMODE)
+            })
+            .ok()
+            .flatten();
+        let writable = match mode {
+            None | Some(libc::O_RDONLY) => return None,
+            Some(mode) => mode == libc::O_WRONLY || mode == libc::O_RDWR,
+        };
+        // Access mode 3 (O_ACCMODE) asks for both permissions at the open and
+        // gives the description neither: it can neither read nor write
+        // (`FMODE_READ` and `FMODE_WRITE` unset), so a write is EBADF, and
+        // `ftruncate` the EINVAL of a description not open for writing.
+        if !writable {
+            return Some(match sysno {
+                Sysno::ftruncate => Err(Errno::EINVAL),
+                _ => Err(Errno::EBADF),
+            });
+        }
+        Some(match sysno {
+            Sysno::ftruncate if (args.arg1 as i64) < 0 => Err(Errno::EINVAL),
+            Sysno::ftruncate => Ok(0),
+            Sysno::fallocate if (args.arg2 as i64) < 0 || (args.arg3 as i64) <= 0 => {
+                Err(Errno::EINVAL)
+            }
+            Sysno::fallocate => Err(Errno::EOPNOTSUPP),
+            // The source descriptor is looked up first.
+            Sysno::sendfile | Sysno::splice => {
+                let source = if sysno == Sysno::sendfile {
+                    args.arg1
+                } else {
+                    args.arg0
+                } as RawFd;
+                match guest.thread_state().with_detfd(source, |_| ()) {
+                    Ok(()) => Err(Errno::EINVAL),
+                    Err(_) => Err(Errno::EBADF),
+                }
+            }
+            _ => Err(Errno::EINVAL),
+        })
+    }
+
     /// Answer `call` if it must not reach the placeholder behind a rendered
-    /// procfs descriptor: what a procfs sysctl file refuses, in the order
-    /// Linux checks. The placeholder's read-only description already makes
-    /// the kernel refuse writes and size changes, and an `O_PATH` one every
-    /// call but `fstat`, which Detcore answers.
-    pub(crate) fn answer_rendered_procfs_operation<G: Guest<Self>>(
+    /// procfs descriptor: what a procfs file refuses, in the order Linux
+    /// checks. A read-only placeholder's description already makes the kernel
+    /// refuse writes and size changes, and an `O_PATH` one every call but
+    /// `fstat`, which Detcore answers. A per-process file opened for writing
+    /// (`rendered_open_flags`) has a writable placeholder, so Detcore answers
+    /// every call that would write it ([`Self::answer_rendered_procfs_write`]):
+    /// none reaches the memfd, which KVM, without seals, would let change.
+    pub(crate) async fn answer_rendered_procfs_operation<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: &Syscall,
     ) -> Option<Result<i64, Error>> {
         let (sysno, args) = call.into_parts();
+        if let Some(answer) = self.answer_rendered_procfs_write(guest, sysno, &args) {
+            return Some(answer.map_err(Error::from));
+        }
         let fd = match sysno {
             Sysno::pwrite64
             | Sysno::pwritev
@@ -1978,6 +2370,31 @@ impl<T: RecordOrReplay> Detcore<T> {
             return None;
         }
         let seq_file = crate::procfs::rendered_path_is_seq_file(path);
+        let writable = matches!(
+            status_flags & libc::O_ACCMODE,
+            libc::O_WRONLY | libc::O_RDWR
+        );
+        let per_process = crate::procfs::rendered_path_is_per_process(path);
+        // Who owns the file matters only to the calls below that ask for the
+        // owner or for write access, and only an attribute change asks for
+        // the caller's capabilities; no other call pays for either.
+        let command = args.arg1 as libc::c_int;
+        let needs_access = matches!(sysno, Sysno::fsetxattr | Sysno::fremovexattr)
+            || (sysno == Sysno::fcntl
+                && (matches!(command, libc::F_SETLEASE | 1036)
+                    || (command == libc::F_SETFL
+                        && args.arg2 as libc::c_int & libc::O_NOATIME != 0)));
+        let access = if needs_access {
+            self.rendered_file_access(
+                guest,
+                path,
+                matches!(sysno, Sysno::fsetxattr | Sysno::fremovexattr),
+                CapabilitySet::Effective,
+            )
+            .await
+        } else {
+            FileAccess::GLOBAL_ROOT
+        };
         let answer = match call {
             // A sysctl file's placeholder refuses a positioned write as the
             // sysctl does: it is read-only (EBADF), or the position is
@@ -2007,12 +2424,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                     name.as_bytes(),
                     Some(c.size()),
                     read_value(&guest.memory(), args.arg2 as u64, c.size()).as_deref(),
+                    access,
                 ),
                 Some(Err(errno)) => Err(errno),
                 None => Err(Errno::EFAULT),
             },
             Syscall::Fremovexattr(c) => match c.name().map(|name| name.read(&guest.memory())) {
-                Some(Ok(name)) => xattr_change_answer(name.as_bytes(), None, None),
+                Some(Ok(name)) => xattr_change_answer(name.as_bytes(), None, None, access),
                 Some(Err(errno)) => Err(errno),
                 None => Err(Errno::EFAULT),
             },
@@ -2074,16 +2492,59 @@ impl<T: RecordOrReplay> Detcore<T> {
             Syscall::Fcntl(_) => match args.arg1 as libc::c_int {
                 // Adding seals needs a writable descriptor, before Linux
                 // looks for seals the file cannot have.
-                libc::F_ADD_SEALS => Err(Errno::EPERM),
-                libc::F_GET_SEALS => Err(Errno::EINVAL),
-                // A lease needs the file's owner, so the file never has one.
+                libc::F_ADD_SEALS if !writable => Err(Errno::EPERM),
+                libc::F_ADD_SEALS | libc::F_GET_SEALS => Err(Errno::EINVAL),
+                // A lease needs the file's owner, so a system-wide file never
+                // has one; its owner may ask, and procfs takes none.
+                libc::F_SETLEASE if access.owner => Err(Errno::EINVAL),
                 libc::F_SETLEASE => Err(Errno::EACCES),
-                // F_SET_RW_HINT needs the file's owner.
+                // F_SET_RW_HINT needs the file's owner, then reads and checks
+                // the hint (`rw_hint_valid`), which procfs keeps on the inode.
+                // Detcore keeps it, for every descriptor and reopening of a
+                // per-process file (`RenderedFileState`).
+                1036 if access.owner => {
+                    match Addr::<u64>::from_raw(args.arg2)
+                        .map(|hint| guest.memory().read_value(hint))
+                    {
+                        Some(Ok(hint)) if hint <= 5 => {
+                            crate::tool_global::rendered_file_state(
+                                guest,
+                                procfs_inode::rendered_inode(path),
+                                crate::procfs::listing::RenderedFileChange::WriteHint(hint),
+                            )
+                            .await;
+                            Ok(0)
+                        }
+                        Some(Ok(_)) => Err(Errno::EINVAL),
+                        _ => Err(Errno::EFAULT),
+                    }
+                }
                 1036 => Err(Errno::EPERM),
+                // F_GET_RW_HINT: the hint the inode keeps, which any
+                // descriptor reads. A system-wide file's is never set, and its
+                // placeholder answers 0 as the file does.
+                1035 if per_process => {
+                    let state = crate::tool_global::rendered_file_state(
+                        guest,
+                        procfs_inode::rendered_inode(path),
+                        crate::procfs::listing::RenderedFileChange::Read,
+                    )
+                    .await;
+                    match AddrMut::<u64>::from_raw(args.arg2) {
+                        Some(address) => guest
+                            .memory()
+                            .write_value(address, &state.write_hint)
+                            .map(|()| 0),
+                        None => Err(Errno::EFAULT),
+                    }
+                }
                 libc::F_GETLEASE => Ok(i64::from(libc::F_UNLCK)),
-                // `O_NOATIME` needs the file's owner, and procfs sysctl
-                // files cannot do direct I/O.
-                libc::F_SETFL if args.arg2 as libc::c_int & libc::O_NOATIME != 0 => {
+                // `O_NOATIME` needs the file's owner (the owner's reaches the
+                // placeholder, which the guest owns too), and procfs files
+                // cannot do direct I/O.
+                libc::F_SETFL
+                    if args.arg2 as libc::c_int & libc::O_NOATIME != 0 && !access.owner =>
+                {
                     Err(Errno::EPERM)
                 }
                 libc::F_SETFL if args.arg2 as libc::c_int & libc::O_DIRECT != 0 => {
@@ -2133,19 +2594,22 @@ enum PathRequest {
 }
 
 /// Linux's answer to `request` for a rendered procfs file (0444, or 0644 for
-/// a fixed tunable: only the owner may write either) owned by a user the
-/// guest's user namespace does not map, given the attribute `name` when it
-/// changes one.
+/// a fixed tunable: only global root may write either), owned and overridden
+/// as `access` says, given the attribute `name` when it changes one.
 fn path_request_answer(
     request: PathRequest,
     name: Option<&[u8]>,
     value: Option<&[u8]>,
+    access: FileAccess,
 ) -> Result<i64, Errno> {
     match request {
         PathRequest::Access { mode, flags } => {
             if access_arguments_invalid(mode, flags) {
                 Err(Errno::EINVAL)
-            } else if mode & (libc::W_OK | libc::X_OK) as u64 != 0 {
+            } else if mode & libc::X_OK as u64 != 0
+                || (mode & libc::W_OK as u64 != 0 && !access.may_write())
+            {
+                // No execute bit, which even CAP_DAC_OVERRIDE needs one of.
                 Err(Errno::EACCES)
             } else {
                 Ok(0)
@@ -2157,7 +2621,7 @@ fn path_request_answer(
             if flags & !(libc::XATTR_CREATE | libc::XATTR_REPLACE) as u64 != 0 {
                 return Err(Errno::EINVAL);
             }
-            xattr_change_answer(name.ok_or(Errno::EFAULT)?, size, value)
+            xattr_change_answer(name.ok_or(Errno::EFAULT)?, size, value, access)
         }
         PathRequest::Chmod { flags } => {
             if flags & !(libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH) as u64 != 0 {
@@ -2167,13 +2631,21 @@ fn path_request_answer(
             }
         }
         PathRequest::Truncate { length } if length < 0 => Err(Errno::EINVAL),
+        // procfs's `proc_setattr` accepts a size and keeps none.
+        PathRequest::Truncate { .. } if access.may_write() => Ok(0),
         PathRequest::Truncate { .. } => Err(Errno::EACCES),
         // Leaving both times alone changes nothing; the current time needs
-        // write permission, and any other time the owner.
+        // write permission or the owner, and any other time the owner.
+        // (`proc_setattr` keeps the owner's times on the inode until Linux
+        // drops it; Detcore's metadata of the file keeps the epoch.)
+        PathRequest::Times { explicit: None } if access.owner || access.may_write() => Ok(0),
         PathRequest::Times { explicit: None } => Err(Errno::EACCES),
         PathRequest::Times {
             explicit: Some(false),
         } => Ok(0),
+        PathRequest::Times {
+            explicit: Some(true),
+        } if access.owner => Ok(0),
         PathRequest::Times {
             explicit: Some(true),
         } => Err(Errno::EPERM),
@@ -2517,9 +2989,87 @@ impl<T: RecordOrReplay> Detcore<T> {
             Some((name, value)) => (Some(name), value),
             None => (None, None),
         };
-        path_request_answer(request, name.as_deref(), value.as_deref())
-            .map(Some)
-            .map_err(Into::into)
+        let rendered = rendered.expect("checked above");
+        // A request for write access (an access probe for it, a truncation,
+        // an attribute change) asks for the caller's capabilities; `access`
+        // and `faccessat` without `AT_EACCESS` check the real IDs' set.
+        let needs_capabilities = match request {
+            PathRequest::Access { mode, .. } => mode & libc::W_OK as u64 != 0,
+            PathRequest::Truncate { .. } | PathRequest::ChangeXattr { .. } => true,
+            _ => false,
+        };
+        let set = match request {
+            PathRequest::Access { flags, .. } if flags & libc::AT_EACCESS as u64 == 0 => {
+                CapabilitySet::Permitted
+            }
+            _ => CapabilitySet::Effective,
+        };
+        let access = self
+            .rendered_file_access(guest, rendered, needs_capabilities, set)
+            .await;
+        let answer = path_request_answer(request, name.as_deref(), value.as_deref(), access);
+        // A time set on a per-process file stays on its inode (`proc_setattr`
+        // keeps what `setattr_copy` copies), which every alias of the file
+        // shows: Detcore keeps the modification time in its global tool. The
+        // access and change times are the epoch for every rendered file, as
+        // Detcore's metadata shows them for every file it virtualizes.
+        if answer == Ok(0)
+            && matches!(request, PathRequest::Times { .. })
+            && access.owner
+            && crate::procfs::per_process_name(rendered).is_some()
+            && let Some((seconds, nanoseconds)) =
+                self.requested_mtime(guest, sysno, [a0, a1, a2]).await
+        {
+            crate::tool_global::rendered_file_state(
+                guest,
+                procfs_inode::rendered_inode(rendered),
+                crate::procfs::listing::RenderedFileChange::Mtime(seconds, nanoseconds),
+            )
+            .await;
+        }
+        answer.map(Some).map_err(Into::into)
+    }
+
+    /// The modification time a successful `utimensat`, `utime` or `utimes`
+    /// with arguments `args` sets: the given time, or the virtual time now for
+    /// a NULL `times` or `UTIME_NOW`; `None` where it leaves it alone
+    /// (`UTIME_OMIT`) or its times cannot be read.
+    async fn requested_mtime<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        [_, a1, a2]: [u64; 3],
+    ) -> Option<(i64, i64)> {
+        let times = if sysno == Sysno::utimensat { a2 } else { a1 };
+        let explicit = if times == 0 {
+            None
+        } else if sysno == Sysno::utimensat {
+            let [_, mtime] = read_pair::<libc::timespec, _>(&guest.memory(), times)
+                .ok()
+                .flatten()?;
+            match mtime.tv_nsec {
+                libc::UTIME_OMIT => return None,
+                libc::UTIME_NOW => None,
+                _ => Some((mtime.tv_sec, mtime.tv_nsec)),
+            }
+        } else if sysno == Sysno::utime {
+            let [_, modtime] = read_pair::<libc::time_t, _>(&guest.memory(), times)
+                .ok()
+                .flatten()?;
+            Some((modtime, 0))
+        } else {
+            let [_, mtime] = read_pair::<libc::timeval, _>(&guest.memory(), times)
+                .ok()
+                .flatten()?;
+            Some((mtime.tv_sec, mtime.tv_usec * 1000))
+        };
+        match explicit {
+            Some(time) => Some(time),
+            None => {
+                let now: Timespec = crate::tool_global::thread_observe_time(guest).await.into();
+                Some((now.tv_sec, now.tv_nsec))
+            }
+        }
     }
 }
 
@@ -2614,6 +3164,9 @@ fn could_name_rendered(path: &Path, files: RenderedFiles) -> bool {
     };
     let last = last.as_bytes();
     rendered_paths(files).any(|rendered| rendered_name(rendered) == last)
+        || ProcfsFile::PER_PROCESS_NAMES
+            .iter()
+            .any(|name| name.as_bytes() == last)
         || (!last.is_empty() && last.iter().all(u8::is_ascii_digit))
 }
 
@@ -2982,8 +3535,8 @@ mod tests {
 
     #[test]
     fn open_flags_follow_linux_for_a_read_only_sysctl_file() {
-        let ok = |flags| rendered_open_flags(flags).unwrap();
-        let err = |flags| rendered_open_flags(flags).unwrap_err();
+        let ok = |flags| rendered_open_flags(flags, FileAccess::GLOBAL_ROOT).unwrap();
+        let err = |flags| rendered_open_flags(flags, FileAccess::GLOBAL_ROOT).unwrap_err();
         assert_eq!(ok(OFlag::O_RDONLY), OFlag::O_RDONLY);
         assert_eq!(
             ok(OFlag::O_RDONLY | OFlag::O_APPEND | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC),
@@ -3188,7 +3741,9 @@ mod tests {
     #[test]
     fn extended_attribute_changes_follow_linux() {
         let one = Some(&b"1"[..]);
-        let change = |name: &[u8], size, value| xattr_change_answer(name, size, value);
+        let change = |name: &[u8], size, value| {
+            xattr_change_answer(name, size, value, FileAccess::GLOBAL_ROOT)
+        };
         assert_eq!(change(b"user.x", Some(1), one), Err(Errno::EACCES));
         assert_eq!(change(b"user.x", Some(1), None), Err(Errno::EFAULT));
         assert_eq!(change(b"foo.x", Some(1), one), Err(Errno::EACCES));
@@ -3264,6 +3819,7 @@ mod tests {
                 },
                 None,
                 None,
+                FileAccess::GLOBAL_ROOT,
             )
         };
         assert_eq!(access(libc::F_OK, 0), Ok(0));
@@ -3273,11 +3829,16 @@ mod tests {
         assert_eq!(access(8, 0), Err(Errno::EINVAL));
         assert_eq!(access(libc::R_OK, 0x10000), Err(Errno::EINVAL));
         assert_eq!(
-            path_request_answer(PathRequest::GetXattr, Some(b"user.x"), None),
+            path_request_answer(
+                PathRequest::GetXattr,
+                Some(b"user.x"),
+                None,
+                FileAccess::GLOBAL_ROOT
+            ),
             Err(Errno::EOPNOTSUPP)
         );
         assert_eq!(
-            path_request_answer(PathRequest::ListXattr, None, None),
+            path_request_answer(PathRequest::ListXattr, None, None, FileAccess::GLOBAL_ROOT),
             Ok(0)
         );
         let change = |name: &[u8], flags: i32| {
@@ -3289,24 +3850,40 @@ mod tests {
                 },
                 Some(name),
                 Some(&b"1"[..]),
+                FileAccess::GLOBAL_ROOT,
             )
         };
         assert_eq!(change(b"user.x", 0), Err(Errno::EACCES));
         assert_eq!(change(b"user.x", 4), Err(Errno::EINVAL));
         assert_eq!(
-            path_request_answer(PathRequest::Chmod { flags: 0 }, None, None),
+            path_request_answer(
+                PathRequest::Chmod { flags: 0 },
+                None,
+                None,
+                FileAccess::GLOBAL_ROOT
+            ),
             Err(Errno::EPERM)
         );
         assert_eq!(
-            path_request_answer(PathRequest::Truncate { length: 100 }, None, None),
+            path_request_answer(
+                PathRequest::Truncate { length: 100 },
+                None,
+                None,
+                FileAccess::GLOBAL_ROOT
+            ),
             Err(Errno::EACCES)
         );
         assert_eq!(
-            path_request_answer(PathRequest::Truncate { length: -1 }, None, None),
+            path_request_answer(
+                PathRequest::Truncate { length: -1 },
+                None,
+                None,
+                FileAccess::GLOBAL_ROOT
+            ),
             Err(Errno::EINVAL)
         );
         assert_eq!(
-            path_request_answer(PathRequest::Chdir, None, None),
+            path_request_answer(PathRequest::Chdir, None, None, FileAccess::GLOBAL_ROOT),
             Err(Errno::ENOTDIR)
         );
     }
@@ -3335,7 +3912,14 @@ mod tests {
             Some(true)
         );
         assert_eq!(utimens_request(at([0, libc::UTIME_OMIT])), Some(true));
-        let times = |explicit| path_request_answer(PathRequest::Times { explicit }, None, None);
+        let times = |explicit| {
+            path_request_answer(
+                PathRequest::Times { explicit },
+                None,
+                None,
+                FileAccess::GLOBAL_ROOT,
+            )
+        };
         assert_eq!(times(None), Err(Errno::EACCES));
         assert_eq!(times(Some(false)), Ok(0));
         assert_eq!(times(Some(true)), Err(Errno::EPERM));
@@ -3352,5 +3936,242 @@ mod tests {
         assert!(!names_a_directory(Path::new(
             "/proc/sys/kernel/random/uuid"
         )));
+    }
+
+    /// The two capability sets the per-process answers are measured under:
+    /// a guest's own under Hermit, every capability (ptrace, KVM), and the
+    /// file's owner without any (natively, as a user).
+    const ALL_CAPABILITIES: u64 = (1 << 41) - 1;
+
+    /// Linux's answers to opening a per-process file, which the caller owns,
+    /// measured on Linux 7.1 against /proc/self/cgroup with and without
+    /// CAP_DAC_OVERRIDE: writing needs the override, and then the placeholder
+    /// is reopened with the guest's access mode (never `O_TRUNC`); `O_NOATIME`
+    /// needs only the owner.
+    #[test]
+    fn open_flags_follow_linux_for_a_process_file_its_owner_opens() {
+        let with = FileAccess::owned_with(ALL_CAPABILITIES);
+        let without = FileAccess::owned_with(0);
+        assert_eq!(
+            rendered_open_flags(OFlag::O_WRONLY, with),
+            Ok(OFlag::O_WRONLY)
+        );
+        assert_eq!(
+            rendered_open_flags(OFlag::O_RDWR | OFlag::O_APPEND, with),
+            Ok(OFlag::O_RDWR | OFlag::O_APPEND)
+        );
+        assert_eq!(
+            rendered_open_flags(OFlag::O_RDONLY | OFlag::O_TRUNC, with),
+            Ok(OFlag::O_RDONLY)
+        );
+        assert_eq!(
+            rendered_open_flags(OFlag::O_RDONLY | OFlag::O_NOATIME, without),
+            Ok(OFlag::O_RDONLY | OFlag::O_NOATIME)
+        );
+        for flags in [
+            OFlag::O_WRONLY,
+            OFlag::O_RDWR,
+            OFlag::O_RDONLY | OFlag::O_TRUNC,
+        ] {
+            assert_eq!(rendered_open_flags(flags, without), Err(Errno::EACCES));
+        }
+        assert_eq!(
+            rendered_open_flags(OFlag::O_RDONLY | OFlag::O_DIRECT, with),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            rendered_open_flags(OFlag::O_CREAT | OFlag::O_EXCL, with),
+            Err(Errno::EEXIST)
+        );
+        // A system-wide file keeps its answers whatever the guest holds.
+        assert_eq!(
+            rendered_open_flags(OFlag::O_WRONLY, FileAccess::GLOBAL_ROOT),
+            Err(Errno::EACCES)
+        );
+        assert_eq!(
+            rendered_open_flags(OFlag::O_NOATIME, FileAccess::GLOBAL_ROOT),
+            Err(Errno::EPERM)
+        );
+    }
+
+    /// The path calls a per-process file's owner makes, measured on Linux 7.1
+    /// against /proc/self/cgroup under Hermit's ptrace backend (every
+    /// capability) and natively (none).
+    #[test]
+    fn path_calls_follow_linux_for_a_process_file_its_owner_names() {
+        for (capabilities, writes, xattr, security) in [
+            (
+                ALL_CAPABILITIES,
+                Ok(0),
+                Errno::EOPNOTSUPP,
+                Errno::EOPNOTSUPP,
+            ),
+            (0, Err(Errno::EACCES), Errno::EACCES, Errno::EPERM),
+        ] {
+            let access = FileAccess::owned_with(capabilities);
+            let answer = |request| path_request_answer(request, None, None, access);
+            let probe = |mode: i32| {
+                answer(PathRequest::Access {
+                    mode: mode as u64,
+                    flags: 0,
+                })
+            };
+            assert_eq!(probe(libc::R_OK), Ok(0));
+            assert_eq!(probe(libc::W_OK), writes);
+            assert_eq!(probe(libc::X_OK), Err(Errno::EACCES));
+            assert_eq!(answer(PathRequest::Truncate { length: 0 }), writes);
+            assert_eq!(
+                answer(PathRequest::Truncate { length: -1 }),
+                Err(Errno::EINVAL)
+            );
+            assert_eq!(answer(PathRequest::Chmod { flags: 0 }), Err(Errno::EPERM));
+            for explicit in [None, Some(false), Some(true)] {
+                assert_eq!(answer(PathRequest::Times { explicit }), Ok(0));
+            }
+            let change = |name: &[u8]| {
+                path_request_answer(
+                    PathRequest::ChangeXattr {
+                        size: Some(1),
+                        value: 0,
+                        flags: 0,
+                    },
+                    Some(name),
+                    Some(&b"1"[..]),
+                    access,
+                )
+            };
+            assert_eq!(change(b"user.x"), Err(xattr));
+            assert_eq!(change(b"security.x"), Err(security));
+            assert_eq!(change(b"trusted.x"), Err(Errno::EPERM));
+            assert_eq!(
+                xattr_change_answer(b"user.x", None, None, access),
+                Err(xattr)
+            );
+        }
+    }
+
+    /// A per-process file has no `mmap` method: a mapping is `ENODEV`, as for
+    /// a sysctl file, where a system-wide `seq_file` is `EIO`; and a
+    /// descriptor opened for writing may be mapped shared and writable up to
+    /// that answer, but one that cannot read may not be mapped at all.
+    #[test]
+    fn a_process_file_maps_as_a_file_without_mmap() {
+        let read = ProtFlags::PROT_READ;
+        let write = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
+        let check = |prot, flags, seq_file, mode| {
+            rendered_mmap_file_checks(4096, 0, prot, flags, false, seq_file, mode)
+        };
+        let private = MapFlags::MAP_PRIVATE;
+        let shared = MapFlags::MAP_SHARED;
+        assert_eq!(check(read, private, false, (true, false)), Errno::ENODEV);
+        assert_eq!(check(write, shared, false, (true, true)), Errno::ENODEV);
+        assert_eq!(check(write, shared, false, (true, false)), Errno::EACCES);
+        assert_eq!(check(read, private, false, (false, true)), Errno::EACCES);
+        assert_eq!(check(read, shared, false, (false, true)), Errno::EACCES);
+        assert_eq!(
+            check(read, private | MapFlags::MAP_GROWSDOWN, false, (true, true)),
+            Errno::ENODEV
+        );
+        assert_eq!(check(read, private, true, (true, false)), Errno::EIO);
+    }
+
+    /// Detcore's process table decides whether a per-process file's task
+    /// exists: a listed process (a zombie too), a live thread of a listed
+    /// process below its `task`, and the namespace's init with its one thread.
+    #[test]
+    fn a_process_file_exists_for_exactly_the_tasks_the_table_lists() {
+        use crate::procfs::BoundTask;
+        use crate::procfs::listing::ListingFacts;
+        let facts = ListingFacts {
+            processes: vec![1, 3, 7],
+            threads: vec![3, 5],
+        };
+        let task = |process, thread| BoundTask { process, thread };
+        assert!(crate::procfs::listing::task_exists(
+            task(3, None),
+            Some(3),
+            &facts
+        ));
+        assert!(crate::procfs::listing::task_exists(
+            task(3, Some(5)),
+            Some(3),
+            &facts
+        ));
+        assert!(!crate::procfs::listing::task_exists(
+            task(3, Some(6)),
+            Some(3),
+            &facts
+        ));
+        // A live non-leader thread's own directory, in its group.
+        assert!(crate::procfs::listing::task_exists(
+            task(5, None),
+            Some(3),
+            &facts
+        ));
+        assert!(crate::procfs::listing::task_exists(
+            task(5, Some(3)),
+            Some(3),
+            &facts
+        ));
+        // A reaped process (its leader is no longer listed), or an id that
+        // names no task.
+        assert!(!crate::procfs::listing::task_exists(
+            task(9, None),
+            Some(9),
+            &facts
+        ));
+        assert!(!crate::procfs::listing::task_exists(
+            task(11, None),
+            None,
+            &facts
+        ));
+        // Hermit's own init, when no guest holds pid 1.
+        let without_init = ListingFacts {
+            processes: vec![3],
+            threads: Vec::new(),
+        };
+        assert!(crate::procfs::listing::task_exists(
+            task(1, None),
+            None,
+            &without_init
+        ));
+        assert!(crate::procfs::listing::task_exists(
+            task(1, Some(1)),
+            None,
+            &without_init
+        ));
+        assert!(!crate::procfs::listing::task_exists(
+            task(1, Some(2)),
+            None,
+            &without_init
+        ));
+    }
+
+    /// A per-process file belongs to the guest's own identity, with Linux's
+    /// mode and an inode its path names.
+    #[test]
+    fn a_process_file_is_owned_by_the_guest_and_named_by_path_calls() {
+        assert_eq!(rendered_owner(Path::new("/proc/3/cgroup")), Ok((0, 0)));
+        assert_eq!(
+            rendered_owner(Path::new("/proc/3/task/5/cgroup")),
+            Ok((0, 0))
+        );
+        let stat = rendered_stat(
+            Path::new("/proc/3/cgroup"),
+            Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            (0, 0),
+        );
+        assert_eq!(stat.mode, libc::S_IFREG | 0o444);
+        assert_eq!(
+            stat.inode,
+            procfs_inode::rendered_inode(Path::new("/proc/3/cgroup"))
+        );
+        assert_ne!(
+            stat.inode,
+            procfs_inode::rendered_inode(Path::new("/proc/3/task/3/cgroup"))
+        );
     }
 }
