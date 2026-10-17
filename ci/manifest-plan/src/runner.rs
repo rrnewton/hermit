@@ -6951,8 +6951,37 @@ fn process_cgroup(pid: u32) -> Result<Option<String>, String> {
 /// process-group scan finds them: every numeric `/proc` entry whose `stat`
 /// names `pgid` as its process group. A process that exits during the scan
 /// is skipped.
+///
+/// Linux cannot list a process group's members, so every scan walks every
+/// PID on the host; reading every PID's `stat` each time made one scan cost
+/// as much as the host has processes, and an invocation is checked at every
+/// CPU poll and at its exit ([`check_cgroup_membership`]). Under a loaded host
+/// that turned a 15 s test into a 57 s timeout. So, as `dagrun::proccpu`
+/// does, the scan remembers each PID's session ([`SESSION_CENSUS`]) and skips
+/// a PID that cannot be a member: a process joins a group only within its own
+/// session, and changes session only through `setsid`, which makes its session
+/// its own PID. A PID is read when its cached session or the PID itself is the
+/// group's session, when its session is unknown, or when the kernel may have
+/// handed its number to a new task since it was cached. Without the group's
+/// session (its leader is gone and no earlier scan saw it), every PID is read.
 fn process_group_members(pgid: u32) -> Result<Vec<u32>, String> {
+    let mut census = SESSION_CENSUS
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| "session census lock poisoned".to_string())?;
+    census.begin(PidAllocator::read(), read_pid_max());
+    let group_session = match read_process_stat(pgid)? {
+        StatRead::Bytes(stat) if stat_process_group(&stat) == Some(pgid) => {
+            let session = stat_session(&stat);
+            if let Some(session) = session {
+                census.group_sessions.insert(pgid, session);
+            }
+            session
+        }
+        _ => census.group_sessions.get(&pgid).copied(),
+    };
     let mut members = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for entry in fs::read_dir("/proc").map_err(|error| format!("/proc: {error}"))? {
         let entry = entry.map_err(|error| format!("/proc: {error}"))?;
         let Some(pid) = entry
@@ -6963,11 +6992,149 @@ fn process_group_members(pgid: u32) -> Result<Vec<u32>, String> {
         else {
             continue;
         };
-        if member_process_group(pid, read_process_stat, process_exists)? == Some(pgid) {
+        seen.insert(pid);
+        if group_session.is_some_and(|session| census.skip(pid, session)) {
+            continue;
+        }
+        let mut session = None;
+        let group = member_process_group(
+            pid,
+            |pid| {
+                let read = read_process_stat(pid)?;
+                if let StatRead::Bytes(stat) = &read {
+                    session = stat_session(stat);
+                }
+                Ok(read)
+            },
+            process_exists,
+        )?;
+        if let Some(session) = session {
+            census.sessions.insert(pid, session);
+        }
+        if group == Some(pgid) {
             members.push(pid);
         }
     }
+    census.sessions.retain(|pid, _| seen.contains(pid));
     Ok(members)
+}
+
+/// The session of each host PID an earlier [`process_group_members`] scan
+/// read, and the session of each process group it scanned for, valid while
+/// the kernel cannot have reused those PIDs (judged by [`PidAllocator`]).
+static SESSION_CENSUS: std::sync::OnceLock<std::sync::Mutex<SessionCensus>> =
+    std::sync::OnceLock::new();
+
+#[derive(Default)]
+struct SessionCensus {
+    sessions: std::collections::HashMap<u32, u32>,
+    group_sessions: std::collections::HashMap<u32, u32>,
+    at: Option<PidAllocator>,
+}
+
+impl SessionCensus {
+    /// Starts a scan at allocator position `now`, dropping each entry whose
+    /// PID the allocator may have handed out since the previous scan began.
+    fn begin(&mut self, now: Option<PidAllocator>, pid_max: Option<u32>) {
+        match (self.at, now, pid_max) {
+            (Some(previous), Some(now), Some(pid_max)) => {
+                let reused = |pid: &u32| previous.may_have_reused(now, pid_max, *pid);
+                self.sessions.retain(|pid, _| !reused(pid));
+                self.group_sessions.retain(|pid, _| !reused(pid));
+            }
+            _ => {
+                self.sessions.clear();
+                self.group_sessions.clear();
+            }
+        }
+        self.at = now;
+    }
+
+    /// Whether `pid` cannot be in a process group of session `session`.
+    fn skip(&self, pid: u32, session: u32) -> bool {
+        pid != session
+            && self
+                .sessions
+                .get(&pid)
+                .is_some_and(|cached| *cached != session)
+    }
+}
+
+/// Where the kernel's PID allocator stands: the last PID it handed out and the
+/// number of live tasks (`/proc/loadavg`), and the tasks created since boot
+/// (`processes` in `/proc/stat`). Threads take their IDs from the same space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PidAllocator {
+    last_pid: u32,
+    tasks: u64,
+    forks: u64,
+}
+
+/// PIDs below this are never handed out again after the allocator wraps
+/// (Linux `RESERVED_PIDS`).
+const RESERVED_PIDS: u64 = 300;
+
+impl PidAllocator {
+    fn read() -> Option<Self> {
+        let loadavg = fs::read_to_string("/proc/loadavg").ok()?;
+        let fields: Vec<_> = loadavg.split_whitespace().collect();
+        let (_, tasks) = fields.get(3)?.split_once('/')?;
+        let stat = fs::read_to_string("/proc/stat").ok()?;
+        let forks = stat
+            .lines()
+            .find_map(|line| line.strip_prefix("processes "))?
+            .trim()
+            .parse()
+            .ok()?;
+        Some(Self {
+            last_pid: fields.get(4)?.parse().ok()?,
+            tasks: tasks.parse().ok()?,
+            forks,
+        })
+    }
+
+    /// Whether the allocator may have handed out `pid` again on its way from
+    /// `self` to `to`. It walks the PID space in a circle, so every PID it
+    /// handed out lies on the arc after `self.last_pid` up to `to.last_pid`,
+    /// unless it may have gone the whole way round.
+    fn may_have_reused(self, to: PidAllocator, pid_max: u32, pid: u32) -> bool {
+        let Some(created) = to.forks.checked_sub(self.forks) else {
+            return true;
+        };
+        let lap = u64::from(pid_max).saturating_sub(RESERVED_PIDS);
+        if created.saturating_add(self.tasks.max(to.tasks)) >= lap {
+            return true;
+        }
+        if created == 0 {
+            return false;
+        }
+        let (start, end) = (self.last_pid, to.last_pid);
+        if start < end {
+            start < pid && pid <= end
+        } else {
+            pid > start || pid <= end
+        }
+    }
+}
+
+fn read_pid_max() -> Option<u32> {
+    fs::read_to_string("/proc/sys/kernel/pid_max")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// The session in the bytes of a `/proc/<pid>/stat` file: the field after the
+/// process group (see [`stat_process_group`]).
+fn stat_session(stat: &[u8]) -> Option<u32> {
+    let close = stat.iter().rposition(|&byte| byte == b')')?;
+    std::str::from_utf8(&stat[close + 1..])
+        .ok()?
+        .split_whitespace()
+        .nth(3)?
+        .parse()
+        .ok()
 }
 
 /// One read of a `/proc/<pid>/stat` file: its bytes, or that the process
@@ -9627,6 +9794,72 @@ fn execute_observed_until(
 
 #[cfg(test)]
 mod tests {
+    /// The session is the field after the process group, whatever bytes the
+    /// command name holds.
+    #[test]
+    fn stat_session_reads_past_any_command_name() {
+        assert_eq!(stat_session(b"42 (a) b) S 1 40 41 0"), Some(41));
+        assert_eq!(stat_process_group(b"42 (a) b) S 1 40 41 0"), Some(40));
+        assert_eq!(stat_session(b"42 (x"), None);
+    }
+
+    /// A PID is suspect when the allocator passed it since the census was
+    /// taken, including across a wrap, and every PID is once a lap may have
+    /// been completed.
+    #[test]
+    fn the_census_drops_only_pids_the_allocator_may_have_reused() {
+        let at = |last_pid, forks| PidAllocator {
+            last_pid,
+            tasks: 1000,
+            forks,
+        };
+        let pid_max = 100_000;
+        assert!(!at(500, 10).may_have_reused(at(500, 10), pid_max, 400));
+        assert!(at(500, 10).may_have_reused(at(510, 20), pid_max, 505));
+        assert!(!at(500, 10).may_have_reused(at(510, 20), pid_max, 400));
+        assert!(!at(500, 10).may_have_reused(at(510, 20), pid_max, 511));
+        // Wrapped from 99_990 to 310: both ends of the arc are suspect.
+        assert!(at(99_990, 10).may_have_reused(at(310, 40), pid_max, 99_995));
+        assert!(at(99_990, 10).may_have_reused(at(310, 40), pid_max, 305));
+        assert!(!at(99_990, 10).may_have_reused(at(310, 40), pid_max, 5_000));
+        // Enough new tasks to go round the whole space: everything is suspect.
+        assert!(at(500, 10).may_have_reused(at(400, 200_000), pid_max, 450));
+        // A counter that went backwards proves nothing.
+        assert!(at(500, 10).may_have_reused(at(510, 5), pid_max, 400));
+    }
+
+    /// A PID is skipped only when its cached session can no longer be the
+    /// group's: not the group's session, and not the PID itself (setsid).
+    #[test]
+    fn the_census_skips_only_pids_that_cannot_join_the_group() {
+        let mut census = SessionCensus::default();
+        census.sessions.insert(10, 7);
+        census.sessions.insert(11, 9);
+        assert!(census.skip(10, 9));
+        assert!(!census.skip(11, 9));
+        assert!(!census.skip(12, 9), "an unknown PID is read");
+        assert!(!census.skip(9, 9), "the session leader is read");
+    }
+
+    /// The census-backed scan still finds a real process group's members,
+    /// on a first scan and on a later one that skips what it cached.
+    #[test]
+    fn the_process_group_scan_finds_members_with_and_without_the_census() {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = child.id();
+        let first = process_group_members(pgid).unwrap();
+        let second = process_group_members(pgid).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(first, vec![pgid]);
+        assert_eq!(second, vec![pgid]);
+    }
+
     use super::*;
     use crate::ci_selection::BackendCiDisabledReason;
 
