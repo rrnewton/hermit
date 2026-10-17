@@ -103,8 +103,9 @@ corpus:
   # sabre-compat-only rows (df-direct, lua-direct and perl-direct) too. Each
   # row left off names the failure class of its first run in the second
   # survey; the 27 sabre-compat-only rows that survey did not run keep the
-  # first survey's result. python3 stays off by coordinator ruling (its
-  # `disabled` entries say why).
+  # first survey's result. python3 stayed off by coordinator ruling until
+  # the 2026-10-17 test audit deleted its row (language-runtimes/
+  # example-python-random runs /usr/bin/python3 on these backends).
   additional:
     - backend: liteinst
       hermit_args: [--max-timeslice=disabled]
@@ -221,11 +222,6 @@ corpus:
           of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): a
           guest process exited without deregistering from the in-guest runtime
           (determinism loss) (https://github.com/rrnewton/hermit/issues/3745)
-        python3: >-
-          Kept off by coordinator ruling: in-guest-trap diverged in 1 of 10
-          runs before the in-guest start-up heap-layout fix; the second local
-          survey of 2026-10-08, at the fixed tree 81f3e50d, passed 10 of 10 on
-          both backends (https://github.com/rrnewton/hermit/issues/3745)
         git: >-
           Its first verify run on liteinst failed in the second local survey
           of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
@@ -337,21 +333,6 @@ corpus:
           execve of a further program image returned EOPNOTSUPP (exec refused)
           (https://github.com/rrnewton/hermit/issues/3745)
         gcov: >-
-          Its first verify run on liteinst failed in the second local survey
-          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
-          execve of a further program image returned EOPNOTSUPP (exec refused)
-          (https://github.com/rrnewton/hermit/issues/3745)
-        bzip2: >-
-          Its first verify run on liteinst failed in the second local survey
-          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
-          execve of a further program image returned EOPNOTSUPP (exec refused)
-          (https://github.com/rrnewton/hermit/issues/3745)
-        gzip: >-
-          Its first verify run on liteinst failed in the second local survey
-          of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
-          execve of a further program image returned EOPNOTSUPP (exec refused)
-          (https://github.com/rrnewton/hermit/issues/3745)
-        xz: >-
           Its first verify run on liteinst failed in the second local survey
           of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
           execve of a further program image returned EOPNOTSUPP (exec refused)
@@ -888,11 +869,6 @@ corpus:
           survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
           prepared): Hermit refused the run because no guest process reported
           LiteInst statistics (https://github.com/rrnewton/hermit/issues/3745)
-        python3: >-
-          Kept off by coordinator ruling: in-guest-trap diverged in 1 of 10
-          runs before the in-guest start-up heap-layout fix; the second local
-          survey of 2026-10-08, at the fixed tree 81f3e50d, passed 10 of 10 on
-          both backends (https://github.com/rrnewton/hermit/issues/3745)
         git: >-
           Its first verify run on in-guest-trap failed in the second local
           survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
@@ -1004,21 +980,6 @@ corpus:
           prepared): execve of a further program image returned EOPNOTSUPP
           (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
         gcov: >-
-          Its first verify run on in-guest-trap failed in the second local
-          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
-          prepared): execve of a further program image returned EOPNOTSUPP
-          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
-        bzip2: >-
-          Its first verify run on in-guest-trap failed in the second local
-          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
-          prepared): execve of a further program image returned EOPNOTSUPP
-          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
-        gzip: >-
-          Its first verify run on in-guest-trap failed in the second local
-          survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
-          prepared): execve of a further program image returned EOPNOTSUPP
-          (exec refused) (https://github.com/rrnewton/hermit/issues/3745)
-        xz: >-
           Its first verify run on in-guest-trap failed in the second local
           survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
           prepared): execve of a further program image returned EOPNOTSUPP
@@ -1476,21 +1437,21 @@ corpus:
       rows:
         [
           addr2line, ar, arch, as, awk, b2sum, base32, base64, basename,
-          basenc, bash, bc, bracket, bzip2, bzip2-roundtrip, "c++filt", cal,
+          basenc, bash, bc, bracket, bzip2-roundtrip, "c++filt", cal,
           cargo, cat, chmod, chown, chrt, cksum, clang, cmake, cmp, col, colrm,
           column, comm, cp, cpio-roundtrip, cpp, crc32, cscope, csplit, curl,
           curl-localhost, cut, date, dc, dd, df, df-direct, diff, diff3,
           dirname, dos2unix, du, echo, egrep, elfedit, env, envsubst, expand,
           expr, factor, fallocate, fgrep, file, find, findmnt, flex,
           fmt, fold, free, "g++", gcc, gcov, getconf, getopt, git, gprof, grep,
-          groups, gzip, gzip-roundtrip, head, hexdump, hostname, iconv, id,
+          groups, gzip-roundtrip, head, hexdump, hostname, iconv, id,
           install, ionice, iostat, ip, join, jq, ld, ln, logger, logname, ls,
           lscpu, lua, lua-direct, m4, make, md5sum, mkdir, mkfifo, mktemp,
           mpstat-softirqs, msgfmt, msgunfmt, mv, namei, netlink-route,
           netlink-sock-diag, nice, nl, nm, node, nohup, nproc, numactl-hardware,
           numastat, numfmt, objcopy, objdump, od, openssl, paste, patch,
           pathchk, perl, perl-direct, pidstat-disk, pinky, pkg-config, pr,
-          printenv, printf, ptx, pwd, python3, ranlib, readelf, readlink,
+          printenv, printf, ptx, pwd, ranlib, readelf, readlink,
           realpath, rev, rm, rmdir, ruby, sar-resource-tables, sed, seq,
           setfacl, setfattr, sha1sum, sha224sum, sha256sum, sha384sum,
           sha512sum, shell-build, shred, shuf, size, sleep, sort, split,
@@ -1498,7 +1459,7 @@ corpus:
           tar-roundtrip, taskset, tcl, tee, test, time, timeout, top, touch, tr,
           "true", truncate, tsort, tty, uname, unexpand, uniq, uptime, users,
           uuidgen, vmstat, wc, wc-lines, wget-localhost, whoami, xmllint, xxd,
-          xz, xz-roundtrip, "yes", zip-unzip, zstd, zstd-roundtrip
+          xz-roundtrip, "yes", zip-unzip, zstd, zstd-roundtrip
         ]
       disabled_reason: >-
         Not in the 2026-10-13 KVM survey: its KVM verify cell was not green
@@ -1534,12 +1495,12 @@ corpus:
         (trusted_shared_object_sites > 0)
       rows:
         [
-          addr2line, ar, as, awk, basenc, bc, bzip2, bzip2-roundtrip, "c++filt",
+          addr2line, ar, as, awk, basenc, bc, bzip2-roundtrip, "c++filt",
           cargo, chmod, chown, chrt, cmake, cmp, col, colrm, column, comm, cp,
           cpio-roundtrip, cpp, crc32, cscope, csplit, curl-localhost, cut, dc,
           dd, df, diff, diff3, dos2unix, egrep, elfedit, env, envsubst, expand,
           factor, fallocate, fgrep, file, find, flex, flock, fmt, fold, "g++",
-          gcc, gcov, getconf, git, gprof, grep, gzip, gzip-roundtrip, hexdump,
+          gcc, gcov, getconf, git, gprof, grep, gzip-roundtrip, hexdump,
           iconv, install, ionice, ip, javac, join, jq, ld, ln, logname, lscpu,
           lua, m4, mkdir, mkfifo, mktemp, mountpoint, msgfmt, msgunfmt, mv,
           namei, nice, nl, nm, nohup, objcopy, objdump, od, paste, patch,
@@ -1548,7 +1509,7 @@ corpus:
           setfattr, shred, shuf, size, sort, split, sqlite3, ss, stdbuf,
           strings, strip, sync, tac, tar, tar-roundtrip, taskset, tcl, tee,
           time, timeout, top, touch, tr, truncate, tsort, tty, unexpand, uniq,
-          uuidgen, wget-localhost, xargs, xmllint, xxd, xz, xz-roundtrip, "yes",
+          uuidgen, wget-localhost, xargs, xmllint, xxd, xz-roundtrip, "yes",
           zip-unzip, zstd, zstd-roundtrip
         ]
     - backend: sabre
@@ -1695,7 +1656,6 @@ corpus:
     - {label: "cargo", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "cargo"]}
     - {label: "clang", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "clang"]}
     - {label: "ruby", argv: ["/usr/bin/ruby", "--disable-gems", "-e", "values = (1..5).map { |value| value * value }; raise \"unexpected squares\" unless values == [1, 4, 9, 16, 25]; puts values.join(\",\")"]}
-    - {label: "python3", argv: ["/usr/bin/python3", "-c", "print(42)"]}
     - {label: "curl", argv: ["/usr/bin/curl", "--fail", "--silent", "--show-error", "file:///etc/hostname"]}
     - {label: "git", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "git"]}
     - {label: "cmake", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "cmake"]}
@@ -1720,9 +1680,6 @@ corpus:
     - {label: "gprof", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "gprof"]}
     - {label: "cpp", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "cpp"]}
     - {label: "gcov", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "gcov"]}
-    - {label: "bzip2", argv: ["bash", "-c", "set -euo pipefail; bzip2 -c \"$1\" | sha256sum", "compat-bzip2", "{{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures/README.md"]}
-    - {label: "gzip", argv: ["bash", "-c", "set -euo pipefail; gzip -cn \"$1\" | sha256sum", "compat-gzip", "{{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures/README.md"]}
-    - {label: "xz", argv: ["bash", "-c", "set -euo pipefail; xz -c \"$1\" | sha256sum", "compat-xz", "{{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures/README.md"]}
     - {label: "zstd", argv: ["bash", "-c", "set -euo pipefail; zstd -q -c \"$1\" | sha256sum", "compat-zstd", "{{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures/README.md"]}
     - {label: "gzip-roundtrip", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "gzip-roundtrip"]}
     - {label: "bzip2-roundtrip", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "bzip2-roundtrip"]}

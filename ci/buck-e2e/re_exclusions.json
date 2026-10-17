@@ -237,26 +237,6 @@
    ],
    "reason": "exceeds its budget on RE (cell exceeded 60 wall s backstop (59 s CPU budget))"
   },
-  "compat/xz": {
-   "cells": [
-    "compat/xz/verify@ptrace"
-   ],
-   "evidence": [
-    {
-     "cell": "compat/xz/verify@ptrace",
-     "local_run": "m2-local-1",
-     "re_error_kind": null,
-     "re_reason": "verify exited with status 125 before producing a terminal comparison",
-     "re_runs": [
-      "m3-hybrid-pmu-1"
-     ],
-     "re_verdicts": [
-      "FAIL"
-     ]
-    }
-   ],
-   "reason": "a command it runs is not installed on RE (exit 127)"
-  },
   "compat/xz-roundtrip": {
    "cells": [
     "compat/xz-roundtrip/verify@ptrace"

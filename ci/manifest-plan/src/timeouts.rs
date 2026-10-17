@@ -155,8 +155,10 @@ pub const STRICT_COMPAT_FOLD_2026_10_01_EVIDENCE_SHA: &str =
 /// Since 2026-10-13 the full run also selects the ptrace verify cells of 25
 /// rows that were sabre-compat-only, with the same 59/60 s bounds, so that
 /// parity compares them (<https://github.com/rrnewton/hermit/issues/4269>):
-/// 189 + 25.
-pub const STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT: usize = 214;
+/// 189 + 25. The 2026-10-17 test audit deleted four rows whose checks
+/// stronger manifest tests carry on the same backends (python3, gzip, bzip2,
+/// xz): 214 - 4 = 210.
+pub const STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT: usize = 210;
 /// Ptrace replay cells selected when
 /// <https://github.com/rrnewton/hermit/pull/3580> taught the recorder and
 /// replayer `select` and `pselect6`. Before it, replay of both programs
