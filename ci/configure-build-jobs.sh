@@ -1884,8 +1884,13 @@ fi
 # /proc/self/exe readlink emulation deleted; the loader's mallopt moved
 # ahead of read_launch_spec). reverie-dbt tree, root Cargo.toml, Cargo.lock
 # and rust-toolchain.toml are unchanged, so the budget carries unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != f818f0b4fa105fbe1a5d9aad077a5ea5691bdc4d ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie f818f0b4fa105fbe1a5d9aad077a5ea5691bdc4d (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 730db8b2892d55203fffd2fd0513ab90d75ede40 (2026-10-17): from
+# f818f0b4fa105fbe1a5d9aad077a5ea5691bdc4d through A5 step 2's UnreportedSignal change (realtime
+# signals shown to Tool::filter_unreported_signal; reverie-core and
+# reverie-ptrace only). reverie-dbt tree, root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml are unchanged, so the budget carries unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 730db8b2892d55203fffd2fd0513ab90d75ede40 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 730db8b2892d55203fffd2fd0513ab90d75ede40 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
