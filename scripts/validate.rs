@@ -32861,11 +32861,25 @@ mod submodule_service_tests {
         assert_submodule_fixture_source(&root, &copied, &changed_pin).unwrap();
     }
 
+    /// The isolation half of 24b0da36b8f: a fixture child started under an
+    /// enclosing run never sees that run's VALIDATE_RUN_STATE or its scope
+    /// re-exec marker, and nothing in the spawn path writes into its state.
+    ///
+    /// Both children go through the real `spawn_with_cache_base` and
+    /// `SubmoduleFixtureChild::command`, against a stub `scripts/validate.rs`
+    /// that records the two values it was given. This test used to run the
+    /// whole bracket instead, so the no-submodules child compiled this script
+    /// in release from an empty cache (161 s serial, 2026-10-17 test audit)
+    /// to show the same thing. The real missing-rr diagnosis of both children
+    /// is still exercised end to end by `self_test()`'s
+    /// `SubmoduleServiceBracket`, which in validation runs under the
+    /// enclosing run's inherited VALIDATE_RUN_STATE.
     #[test]
-    fn independent_fixture_keeps_missing_submodule_diagnosis_with_outer_run_state() {
+    fn fixture_children_never_see_or_touch_the_enclosing_run_state() {
         const CHILD: &str = "HERMIT_SUBMODULE_SERVICE_RUN_STATE_TEST_CHILD";
         const SENTINEL: &[u8] = b"outer run state must remain unchanged";
-        const COMPLETED: &str = "independent submodule fixture completed both original diagnoses";
+        const COMPLETED: &str = "both fixture children ran without the enclosing run state";
+        use std::os::unix::fs::PermissionsExt;
         if std::env::var_os(CHILD).as_deref() == Some(OsStr::new("1")) {
             let outer = PathBuf::from(std::env::var_os("VALIDATE_RUN_STATE").unwrap());
             assert_eq!(
@@ -32873,23 +32887,52 @@ mod submodule_service_tests {
                 Some(outer.as_os_str())
             );
             assert_eq!(std::fs::read(outer.join("sentinel")).unwrap(), SENTINEL);
-            let detail = submodule_failure_service_result_bracket(&test_source_root()).unwrap();
-            println!("{COMPLETED}: {detail}");
+            let work = tempdir_outside_cargo_workspaces();
+            let ledger = work.path().join("ledger");
+            std::fs::write(&ledger, b"").unwrap();
+            for (name, prepared) in [("compiling", false), ("prepared", true)] {
+                let stub = work.path().join(name);
+                let scripts = stub.join("scripts");
+                std::fs::create_dir_all(&scripts).unwrap();
+                let script = scripts.join("validate.rs");
+                std::fs::write(
+                    &script,
+                    format!(
+                        "#!/bin/sh\n\
+                         here=$(dirname \"$0\")\n\
+                         printf '%s\\n%s\\n' \"${{VALIDATE_RUN_STATE-unset}}\" \
+                         \"${{{RUN_STATE_SCOPE_REEXEC_ENV}-unset}}\" > \"$here/record.tmp\"\n\
+                         mv \"$here/record.tmp\" \"$here/record\"\n\
+                         exit 1\n"
+                    ),
+                )
+                .unwrap();
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+                let checkout = if prepared {
+                    let checkout = work.path().join(format!("{name}-checkout"));
+                    std::fs::create_dir(&checkout).unwrap();
+                    checkout
+                } else {
+                    stub.clone()
+                };
+                let child = SubmoduleFixtureChild::spawn_with_cache_base(
+                    &checkout,
+                    prepared.then_some(stub.as_path()),
+                    &work.path().join(format!("{name}-result.json")),
+                    &ledger,
+                    Some(work.path().join("cache-base")),
+                )
+                .unwrap();
+                assert_eq!(child.wait().unwrap().status.code(), Some(1), "{name}");
+                assert_eq!(
+                    std::fs::read_to_string(scripts.join("record")).unwrap(),
+                    "unset\nunset\n",
+                    "the {name} fixture child inherited the enclosing run state"
+                );
+            }
+            println!("{COMPLETED}");
             return;
         }
-
-        // The fixture populates its own agent-utils from this checkout's
-        // submodule (`populate only agent-utils`). A checkout without it, such
-        // as a fresh `git worktree add`, otherwise failed only in the child, as
-        // a git clone error about a repository that does not exist.
-        let agent_utils = test_source_root().join("agent-utils");
-        assert!(
-            agent_utils.join(".git").exists(),
-            "precondition not met: the source checkout's agent-utils submodule is not \
-             initialized at {}; this test populates its fixture from it. Run \
-             `git submodule update --init agent-utils` in the checkout, then rerun.",
-            agent_utils.display()
-        );
 
         // Seed both ownership values in a separate process: the test never
         // mutates the test harness's global environment or borrows its state.
@@ -32900,7 +32943,7 @@ mod submodule_service_tests {
         let output = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "submodule_service_tests::independent_fixture_keeps_missing_submodule_diagnosis_with_outer_run_state",
+                "submodule_service_tests::fixture_children_never_see_or_touch_the_enclosing_run_state",
                 "--nocapture",
             ])
             .current_dir(test_source_root())
