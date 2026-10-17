@@ -1,0 +1,60 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Name a host file that changed during one verification run."><title>hermit::host_input_change - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="hermit" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module host_input_change</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../hermit/index.html">hermit</a><span class="version">0.4.1</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module host_<wbr>input_<wbr>change</a></h2><h3><a href="#structs">Module Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate hermit</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">hermit</a></div><h1>Module <span>host_<wbr>input_<wbr>change</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/hermit/host_input_change.rs.html#9-659">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Name a host file that changed during one verification run.</p>
+<p>Each run of <code>hermit run --verify</code> records the host identity of every file
+the guest opens, in order, with the open that found it (see
+<code>detcore_model::host_input</code>). A file that a run opens several times shows a
+PATTERN of identities: each open finds an identity it has found at that
+path before, or a new one. A file the guest itself creates, rewrites or
+replaces changes at the same opens in both runs, even though its host inode
+numbers and times differ between them. So the two runs’ patterns agree
+unless something outside the guest changed a file underneath one run: that
+run finds a new identity at an open where the other run found a known one.</p>
+<p>Only one kind of change is named: the file was REPLACED, so the open found
+a different host inode (<code>dev</code>, <code>ino</code>). Hermit mints deterministic inodes in
+the order it first sees host inodes, so a replacement gives that run one
+more inode and shifts every later deterministic inode number, whatever the
+guest does with the file. A change of size or time alone is not named.</p>
+<p>A pattern difference is evidence of a host change only if the runs had not
+diverged yet. A guest that behaves differently in the two runs can, for
+example, replace a file in one run only, and then the patterns differ too,
+but that behaviour shows in the compared log before the open. So the
+difference names the cause of a divergence only when the comparison
+compared everything (one strict enough for bitwise parity) and the open
+that found it is recorded, in BOTH runs’ logs, before the first divergent
+record (<a href="fn.explains_divergence.html" title="fn hermit::host_input_change::explains_divergence"><code>explains_divergence</code></a>): up to that record both runs did the same
+things, so the guest did not cause the difference.</p>
+<p>Positions are records in the log, not times. On a backend whose log is not
+one stream in time order, such as SaBRe, which appends the records its
+guest forwards after the coordinator’s own, each part is still in time
+order, and the comparator reports the first difference in the earliest
+part. An open in a later part than that difference is therefore refused,
+and an open before it in the same part did happen before it.</p>
+<p>Nor is a change named when the guest itself rebound that path, or a
+directory above it, in either run: renamed to or from it, linked or
+unlinked it, or created something there. Those operations can replace the
+file without the compared log showing any difference (a rename onto a name
+that already names the same file succeeds and changes nothing), so a
+replacement there may be the guest’s own.</p>
+<p>Nothing else is concluded. The walk stops at the first open whose path,
+thread or syscall differs between the runs and at the first difference that
+is not a replacement, an incomplete log names nothing, an open whose finish
+record a log does not show exactly once is not placed, and paths below
+<code>/proc</code>, <code>/sys</code> and <code>/dev</code> are skipped: those are kernel objects whose
+metadata is not file content and which Hermit virtualizes separately.</p>
+</div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.HostInputs.html" title="struct hermit::host_input_change::HostInputs">Host<wbr>Inputs</a></dt><dd>One run’s host-input log.</dd><dt><a class="struct" href="struct.PatternDifference.html" title="struct hermit::host_input_change::PatternDifference">Pattern<wbr>Difference</a></dt><dd>A pattern difference between the runs: in <code>run</code>, the open that thread
+<code>dtid</code> made as its syscall number <code>syscall</code> found <code>path</code> changed from
+<code>before</code> to <code>after</code>, while the other run found a known identity there.</dd></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.explains_divergence.html" title="fn hermit::host_input_change::explains_divergence">explains_<wbr>divergence</a></dt><dd>Whether a pattern difference explains a divergence: the comparison was one
+strict enough for bitwise parity (<code>complete_comparison</code>), and the open that
+found the difference (placed by <a href="fn.open_position.html" title="fn hermit::host_input_change::open_position"><code>open_position</code></a> in each run’s log) is
+recorded before the first divergent record in both logs
+(<code>first_divergent_positions</code>, the comparator’s positions of that record),
+so the two runs had done the same things up to that open. Without every
+position nothing is attributed.</dd><dt><a class="fn" href="fn.find_pattern_difference.html" title="fn hermit::host_input_change::find_pattern_difference">find_<wbr>pattern_<wbr>difference</a></dt><dd>The first open, in order, at which exactly one run found an identity it
+had not found at that path before while the other run found one it had,
+when that identity is a different host inode.</dd><dt><a class="fn" href="fn.open_position.html" title="fn hermit::host_input_change::open_position">open_<wbr>position</a></dt><dd>Where an open sits in a run’s log (<code>contents</code>): the position, as the
+comparator counts records (<code>detcore::logdiff::log_record_events</code>), of the
+record on which thread <code>dtid</code> finished its syscall number <code>syscall</code>, an
+open. <code>None</code> when the log does not show that record exactly once: a log
+without it says nothing, and a thread number and syscall count can repeat
+(a thread that execs from a non-leader thread takes the leader’s number and
+keeps its own count), so a repeated one is ambiguous; also <code>None</code> for a log
+the comparator could not read either.</dd><dt><a class="fn" href="fn.read_host_inputs.html" title="fn hermit::host_input_change::read_host_inputs">read_<wbr>host_<wbr>inputs</a></dt><dd>Read one run’s log. A missing or empty file is an incomplete log.</dd></dl></section></div></main></body></html>

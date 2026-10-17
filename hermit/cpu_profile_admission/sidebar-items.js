@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["admit","check_host_cpuid","check_kernel","check_request","first_difference","kernel_version","precheck_replay","qualify_host","record_or_replay_request","refuse_unadmitted_launch"],"struct":["AdmissionRequest","CpuProfileRefusal","NativeCpuid"],"trait":["HostCpuid"],"type":["AdmissionRefusal"]};

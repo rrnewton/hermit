@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["HEADER_LEN","MAGIC","MAX_PACKET_LEN","VERSION"],"enum":["PacketError"],"fn":["config_violation","decode","encode"],"struct":["Packet"]};

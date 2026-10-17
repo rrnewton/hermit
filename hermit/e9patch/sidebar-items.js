@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["E9PATCH_BACKEND_ENV","E9TOOL_ENV"],"fn":["prepare","unavailable_reason"],"struct":["E9patchPatchShapeSnapshot","E9patchPatchShapeSource","PreparedBinary"]};

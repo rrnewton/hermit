@@ -1,0 +1,410 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `detcore/src/nonwaiting_write.rs`."><title>nonwaiting_write.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="detcore" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../../static.files/src-script-813739b1.js"></script><script defer src="../../src-files.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1><div class="sub-heading">detcore/</div>nonwaiting_write.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-3"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="comment">/*
+<a href=#2 id=2 data-nosnippet>2</a> * Copyright (c) Meta Platforms, Inc. and affiliates.
+<a href=#3 id=3 data-nosnippet>3</a> * All rights reserved.
+<a href=#4 id=4 data-nosnippet>4</a> *
+<a href=#5 id=5 data-nosnippet>5</a> * This source code is licensed under the BSD-style license found in the
+<a href=#6 id=6 data-nosnippet>6</a> * LICENSE file in the root directory of this source tree.
+<a href=#7 id=7 data-nosnippet>7</a> */
+<a href=#8 id=8 data-nosnippet>8</a>
+<a href=#9 id=9 data-nosnippet>9</a></span><span class="doccomment">//! Diagnostic writes that never wait for the reader of a descriptor.
+<a href=#10 id=10 data-nosnippet>10</a>//!
+<a href=#11 id=11 data-nosnippet>11</a>//! While `--max-log-bytes` is in force, termination of a run must not depend
+<a href=#12 id=12 data-nosnippet>12</a>//! on any diagnostic write (review of
+<a href=#13 id=13 data-nosnippet>13</a>//! &lt;https://github.com/rrnewton/hermit/pull/3686&gt;). A plain `write(2)` to a
+<a href=#14 id=14 data-nosnippet>14</a>//! blocking stderr whose reader stopped reading waits forever, so every
+<a href=#15 id=15 data-nosnippet>15</a>//! hermit diagnostic that can run in a capped run before the cap or the 123
+<a href=#16 id=16 data-nosnippet>16</a>//! classification goes through [`write_without_waiting`] once
+<a href=#17 id=17 data-nosnippet>17</a>//! [`forbid_waiting_diagnostics`] has been called.
+<a href=#18 id=18 data-nosnippet>18</a>//!
+<a href=#19 id=19 data-nosnippet>19</a>//! [`crate::util::RetryingStderr`] reads the same flag: while it is set, its
+<a href=#20 id=20 data-nosnippet>20</a>//! writes go through [`write_without_waiting_for_a_reader`] and wait only
+<a href=#21 id=21 data-nosnippet>21</a>//! within its bounded deadline, never inside `write(2)`.
+<a href=#22 id=22 data-nosnippet>22</a>//!
+<a href=#23 id=23 data-nosnippet>23</a>//! This lives in detcore, below the `hermit` library and binary, because
+<a href=#24 id=24 data-nosnippet>24</a>//! detcore's own stderr writer reads the flag, and because `hermit`'s
+<a href=#25 id=25 data-nosnippet>25</a>//! `proc_mount` writes its warning from the namespace-only `pre_exec` callback,
+<a href=#26 id=26 data-nosnippet>26</a>//! after `fork`, and from the container init: every function here except
+<a href=#27 id=27 data-nosnippet>27</a>//! [`write_without_waiting_for_a_reader`] makes only syscalls and signal-set
+<a href=#28 id=28 data-nosnippet>28</a>//! operations, without allocation, stdio locks or formatting.
+<a href=#29 id=29 data-nosnippet>29</a>
+<a href=#30 id=30 data-nosnippet>30</a></span><span class="kw">use </span>std::io;
+<a href=#31 id=31 data-nosnippet>31</a><span class="kw">use </span>std::mem;
+<a href=#32 id=32 data-nosnippet>32</a><span class="kw">use </span>std::os::fd::RawFd;
+<a href=#33 id=33 data-nosnippet>33</a><span class="kw">use </span>std::sync::atomic::AtomicBool;
+<a href=#34 id=34 data-nosnippet>34</a><span class="kw">use </span>std::sync::atomic::Ordering;
+<a href=#35 id=35 data-nosnippet>35</a>
+<a href=#36 id=36 data-nosnippet>36</a><span class="doccomment">/// Set once, before any fork, by the `hermit` binary when `--max-log-bytes`
+<a href=#37 id=37 data-nosnippet>37</a>/// is in force. A forked child (the container init, a `pre_exec` callback)
+<a href=#38 id=38 data-nosnippet>38</a>/// inherits the value with the rest of its memory.
+<a href=#39 id=39 data-nosnippet>39</a></span><span class="kw">static </span>DIAGNOSTICS_MUST_NOT_WAIT: AtomicBool = AtomicBool::new(<span class="bool-val">false</span>);
+<a href=#40 id=40 data-nosnippet>40</a>
+<a href=#41 id=41 data-nosnippet>41</a><span class="doccomment">/// From now on, in this process and every process it forks, a diagnostic that
+<a href=#42 id=42 data-nosnippet>42</a>/// asks [`diagnostics_must_not_wait`] is written once with
+<a href=#43 id=43 data-nosnippet>43</a>/// [`write_without_waiting`] and omitted when stderr cannot take it at once,
+<a href=#44 id=44 data-nosnippet>44</a>/// and [`crate::util::RetryingStderr`] never waits inside `write(2)`.
+<a href=#45 id=45 data-nosnippet>45</a>/// Only `hermit`'s `main` calls this, when `--max-log-bytes` is given.
+<a href=#46 id=46 data-nosnippet>46</a></span><span class="kw">pub fn </span>forbid_waiting_diagnostics() {
+<a href=#47 id=47 data-nosnippet>47</a>    DIAGNOSTICS_MUST_NOT_WAIT.store(<span class="bool-val">true</span>, Ordering::Relaxed);
+<a href=#48 id=48 data-nosnippet>48</a>}
+<a href=#49 id=49 data-nosnippet>49</a>
+<a href=#50 id=50 data-nosnippet>50</a><span class="doccomment">/// Whether [`forbid_waiting_diagnostics`] was called. A single atomic load, so
+<a href=#51 id=51 data-nosnippet>51</a>/// it is safe after `fork` and in a signal handler.
+<a href=#52 id=52 data-nosnippet>52</a></span><span class="kw">pub fn </span>diagnostics_must_not_wait() -&gt; bool {
+<a href=#53 id=53 data-nosnippet>53</a>    DIAGNOSTICS_MUST_NOT_WAIT.load(Ordering::Relaxed)
+<a href=#54 id=54 data-nosnippet>54</a>}
+<a href=#55 id=55 data-nosnippet>55</a>
+<a href=#56 id=56 data-nosnippet>56</a><span class="doccomment">/// Put `bytes` on `fd` once, without waiting for the other end and without
+<a href=#57 id=57 data-nosnippet>57</a>/// letting the attempt raise a signal. A diagnostic that cannot be delivered
+<a href=#58 id=58 data-nosnippet>58</a>/// that way is omitted: the exit status still says why the run ended.
+<a href=#59 id=59 data-nosnippet>59</a>///
+<a href=#60 id=60 data-nosnippet>60</a>/// THE DESCRIPTOR ITSELF IS NEVER MADE NON-BLOCKING. An inherited descriptor's
+<a href=#61 id=61 data-nosnippet>61</a>/// open file description is shared with the parent, the guest or a terminal,
+<a href=#62 id=62 data-nosnippet>62</a>/// and `fcntl(O_NONBLOCK)` on it would leak into all of them. Each kind of file
+<a href=#63 id=63 data-nosnippet>63</a>/// instead gets a primitive that is non-blocking on its own:
+<a href=#64 id=64 data-nosnippet>64</a>///
+<a href=#65 id=65 data-nosnippet>65</a>/// - a regular file: `pwritev2(RWF_NOWAIT)` at offset -1, so the file position
+<a href=#66 id=66 data-nosnippet>66</a>///   and `O_APPEND` are honoured. `EAGAIN` or `EOPNOTSUPP` omit the line.
+<a href=#67 id=67 data-nosnippet>67</a>///   Buffered `RWF_NOWAIT` writes fail with `EAGAIN` on btrfs and with
+<a href=#68 id=68 data-nosnippet>68</a>///   `EOPNOTSUPP` on tmpfs, so a log file there does not get the line.
+<a href=#69 id=69 data-nosnippet>69</a>/// - a socket: `send(MSG_DONTWAIT | MSG_NOSIGNAL)`.
+<a href=#70 id=70 data-nosnippet>70</a>/// - a pipe, FIFO or terminal: a NEW open file description for the same
+<a href=#71 id=71 data-nosnippet>71</a>///   object, opened through `/proc/self/fd/&lt;fd&gt;` with `O_NONBLOCK`, and one
+<a href=#72 id=72 data-nosnippet>72</a>///   write of at most `PIPE_BUF` bytes, which a pipe either takes whole or
+<a href=#73 id=73 data-nosnippet>73</a>///   refuses with `EAGAIN`. Opening a pipe that has no reader fails with
+<a href=#74 id=74 data-nosnippet>74</a>///   `ENXIO` rather than raising `SIGPIPE`.
+<a href=#75 id=75 data-nosnippet>75</a>/// - anything else, including a descriptor whose type cannot be learned:
+<a href=#76 id=76 data-nosnippet>76</a>///   omitted.
+<a href=#77 id=77 data-nosnippet>77</a>///
+<a href=#78 id=78 data-nosnippet>78</a>/// The file type comes from `file_type` in this module.
+<a href=#79 id=79 data-nosnippet>79</a>///
+<a href=#80 id=80 data-nosnippet>80</a>/// No signal escapes; see [`suppressing_diagnostic_signals`].
+<a href=#81 id=81 data-nosnippet>81</a>///
+<a href=#82 id=82 data-nosnippet>82</a>/// What this cannot avoid are short kernel locks that sleep uninterruptibly,
+<a href=#83 id=83 data-nosnippet>83</a>/// which no handled signal or timer could break either: the file-position lock
+<a href=#84 id=84 data-nosnippet>84</a>/// of an open file description another process is writing through at that
+<a href=#85 id=85 data-nosnippet>85</a>/// moment, a terminal's termios and output locks, a socket's lock. None of
+<a href=#86 id=86 data-nosnippet>86</a>/// them waits for a reader to drain anything.
+<a href=#87 id=87 data-nosnippet>87</a></span><span class="kw">pub fn </span>write_without_waiting(fd: RawFd, bytes: <span class="kw-2">&amp;</span>[u8]) {
+<a href=#88 id=88 data-nosnippet>88</a>    <span class="kw">let </span>bytes = <span class="kw-2">&amp;</span>bytes[..bytes.len().min(libc::PIPE_BUF)];
+<a href=#89 id=89 data-nosnippet>89</a>    suppressing_diagnostic_signals(|| {
+<a href=#90 id=90 data-nosnippet>90</a>        <span class="kw">let </span><span class="prelude-val">Ok</span>(file_type) = file_type(fd) <span class="kw">else </span>{
+<a href=#91 id=91 data-nosnippet>91</a>            <span class="kw">return </span><span class="number">0</span>;
+<a href=#92 id=92 data-nosnippet>92</a>        };
+<a href=#93 id=93 data-nosnippet>93</a>        <span class="kw">let </span>written = <span class="kw">match </span>file_type {
+<a href=#94 id=94 data-nosnippet>94</a>            libc::S_IFREG =&gt; {
+<a href=#95 id=95 data-nosnippet>95</a>                <span class="kw">let </span>iov = libc::iovec {
+<a href=#96 id=96 data-nosnippet>96</a>                    iov_base: bytes.as_ptr() <span class="kw">as </span><span class="kw-2">*mut </span>libc::c_void,
+<a href=#97 id=97 data-nosnippet>97</a>                    iov_len: bytes.len(),
+<a href=#98 id=98 data-nosnippet>98</a>                };
+<a href=#99 id=99 data-nosnippet>99</a>                <span class="comment">// SAFETY: one valid iovec over `bytes`; offset -1 is the
+<a href=#100 id=100 data-nosnippet>100</a>                // current position.
+<a href=#101 id=101 data-nosnippet>101</a>                </span><span class="kw">unsafe </span>{ libc::pwritev2(fd, <span class="kw-2">&amp;</span>iov, <span class="number">1</span>, -<span class="number">1</span>, libc::RWF_NOWAIT) }
+<a href=#102 id=102 data-nosnippet>102</a>            }
+<a href=#103 id=103 data-nosnippet>103</a>            <span class="comment">// SAFETY: `bytes` is valid for its length.
+<a href=#104 id=104 data-nosnippet>104</a>            </span>libc::S_IFSOCK =&gt; <span class="kw">unsafe </span>{
+<a href=#105 id=105 data-nosnippet>105</a>                libc::send(
+<a href=#106 id=106 data-nosnippet>106</a>                    fd,
+<a href=#107 id=107 data-nosnippet>107</a>                    bytes.as_ptr().cast(),
+<a href=#108 id=108 data-nosnippet>108</a>                    bytes.len(),
+<a href=#109 id=109 data-nosnippet>109</a>                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+<a href=#110 id=110 data-nosnippet>110</a>                )
+<a href=#111 id=111 data-nosnippet>111</a>            },
+<a href=#112 id=112 data-nosnippet>112</a>            libc::S_IFIFO =&gt; <span class="kw">return </span>write_through_new_description(fd, bytes),
+<a href=#113 id=113 data-nosnippet>113</a>            <span class="comment">// SAFETY: isatty only inspects `fd`.
+<a href=#114 id=114 data-nosnippet>114</a>            </span>libc::S_IFCHR <span class="kw">if unsafe </span>{ libc::isatty(fd) } == <span class="number">1 </span>=&gt; {
+<a href=#115 id=115 data-nosnippet>115</a>                <span class="kw">return </span>write_through_new_description(fd, bytes);
+<a href=#116 id=116 data-nosnippet>116</a>            }
+<a href=#117 id=117 data-nosnippet>117</a>            <span class="kw">_ </span>=&gt; <span class="kw">return </span><span class="number">0</span>,
+<a href=#118 id=118 data-nosnippet>118</a>        };
+<a href=#119 id=119 data-nosnippet>119</a>        <span class="kw">if </span>written &lt; <span class="number">0 </span>{ last_errno() } <span class="kw">else </span>{ <span class="number">0 </span>}
+<a href=#120 id=120 data-nosnippet>120</a>    });
+<a href=#121 id=121 data-nosnippet>121</a>}
+<a href=#122 id=122 data-nosnippet>122</a>
+<a href=#123 id=123 data-nosnippet>123</a><span class="doccomment">/// One write of `bytes` to `fd` that cannot wait for a reader to drain the
+<a href=#124 id=124 data-nosnippet>124</a>/// file, for a writer that then waits itself, within its own bound, when it
+<a href=#125 id=125 data-nosnippet>125</a>/// is told the file is full ([`crate::util::RetryingStderr`] while
+<a href=#126 id=126 data-nosnippet>126</a>/// [`diagnostics_must_not_wait`]). Returns the bytes written, which may be
+<a href=#127 id=127 data-nosnippet>127</a>/// fewer than `bytes.len()`, or the error; `WouldBlock` means full.
+<a href=#128 id=128 data-nosnippet>128</a>///
+<a href=#129 id=129 data-nosnippet>129</a>/// THE DESCRIPTOR ITSELF IS NEVER MADE NON-BLOCKING, as in
+<a href=#130 id=130 data-nosnippet>130</a>/// [`write_without_waiting`]:
+<a href=#131 id=131 data-nosnippet>131</a>///
+<a href=#132 id=132 data-nosnippet>132</a>/// - a pipe, a FIFO or any character device, a terminal or `/dev/null`: one
+<a href=#133 id=133 data-nosnippet>133</a>///   write through a new `O_NONBLOCK` open file description for the same
+<a href=#134 id=134 data-nosnippet>134</a>///   object (see [`write_without_waiting`]). Opening a pipe that has no reader
+<a href=#135 id=135 data-nosnippet>135</a>///   fails with `ENXIO`, reported here as `EPIPE`, what a write to it would
+<a href=#136 id=136 data-nosnippet>136</a>///   have returned. If the new description cannot be opened, nothing is
+<a href=#137 id=137 data-nosnippet>137</a>///   written and the error is returned.
+<a href=#138 id=138 data-nosnippet>138</a>///
+<a href=#139 id=139 data-nosnippet>139</a>///   ⚠️ NO CHARACTER DEVICE GETS A PLAIN WRITE, not even one the terminal
+<a href=#140 id=140 data-nosnippet>140</a>///   query says is not a terminal. Nothing the process asks can tell a
+<a href=#141 id=141 data-nosnippet>141</a>///   terminal from `/dev/null` in a way a seccomp policy cannot forge: a
+<a href=#142 id=142 data-nosnippet>142</a>///   policy that answers the query with `ENOTTY` makes a terminal look like
+<a href=#143 id=143 data-nosnippet>143</a>///   `/dev/null`, and a plain write to a full terminal waits for a reader
+<a href=#144 id=144 data-nosnippet>144</a>///   forever.
+<a href=#145 id=145 data-nosnippet>145</a>/// - a socket: `send(MSG_DONTWAIT | MSG_NOSIGNAL)`.
+<a href=#146 id=146 data-nosnippet>146</a>/// - anything else, a regular file included: a plain `write(2)`. Nothing
+<a href=#147 id=147 data-nosnippet>147</a>///   reads a regular file, so the write cannot wait for a reader to drain it;
+<a href=#148 id=148 data-nosnippet>148</a>///   and `RWF_NOWAIT` would refuse buffered writes on btrfs and tmpfs, which
+<a href=#149 id=149 data-nosnippet>149</a>///   would lose every line of a log written there. A regular file on a
+<a href=#150 id=150 data-nosnippet>150</a>///   network or FUSE file system whose server has stopped answering can
+<a href=#151 id=151 data-nosnippet>151</a>///   still hold this write.
+<a href=#152 id=152 data-nosnippet>152</a>/// - a descriptor whose type cannot be learned (see `file_type` in this
+<a href=#153 id=153 data-nosnippet>153</a>///   module): nothing is written, and the error is returned, so the caller
+<a href=#154 id=154 data-nosnippet>154</a>///   gives up on the bytes.
+<a href=#155 id=155 data-nosnippet>155</a>///
+<a href=#156 id=156 data-nosnippet>156</a>/// No `SIGPIPE`, `SIGXFSZ` or `SIGTTOU` escapes; see
+<a href=#157 id=157 data-nosnippet>157</a>/// [`suppressing_diagnostic_signals`].
+<a href=#158 id=158 data-nosnippet>158</a></span><span class="kw">pub fn </span>write_without_waiting_for_a_reader(fd: RawFd, bytes: <span class="kw-2">&amp;</span>[u8]) -&gt; io::Result&lt;usize&gt; {
+<a href=#159 id=159 data-nosnippet>159</a>    <span class="comment">// Replaced by the closure; left only if the signal mask could not be set,
+<a href=#160 id=160 data-nosnippet>160</a>    // in which case nothing was written.
+<a href=#161 id=161 data-nosnippet>161</a>    </span><span class="kw">let </span><span class="kw-2">mut </span>result = <span class="prelude-val">Err</span>(io::Error::other(
+<a href=#162 id=162 data-nosnippet>162</a>        <span class="string">"the signal mask for a diagnostic write could not be set"</span>,
+<a href=#163 id=163 data-nosnippet>163</a>    ));
+<a href=#164 id=164 data-nosnippet>164</a>    suppressing_diagnostic_signals(|| {
+<a href=#165 id=165 data-nosnippet>165</a>        <span class="kw">let </span>file_type = <span class="kw">match </span>file_type(fd) {
+<a href=#166 id=166 data-nosnippet>166</a>            <span class="prelude-val">Ok</span>(file_type) =&gt; file_type,
+<a href=#167 id=167 data-nosnippet>167</a>            <span class="prelude-val">Err</span>(errno) =&gt; {
+<a href=#168 id=168 data-nosnippet>168</a>                <span class="comment">// ⚠️ FAIL CLOSED. Without the file type there is no way to
+<a href=#169 id=169 data-nosnippet>169</a>                // tell a pipe from a regular file, and a plain write to a full
+<a href=#170 id=170 data-nosnippet>170</a>                // pipe waits forever. The line is not written; the caller
+<a href=#171 id=171 data-nosnippet>171</a>                // gives up on it.
+<a href=#172 id=172 data-nosnippet>172</a>                </span>result = <span class="prelude-val">Err</span>(io::Error::from_raw_os_error(errno));
+<a href=#173 id=173 data-nosnippet>173</a>                <span class="kw">return </span><span class="number">0</span>;
+<a href=#174 id=174 data-nosnippet>174</a>            }
+<a href=#175 id=175 data-nosnippet>175</a>        };
+<a href=#176 id=176 data-nosnippet>176</a>        <span class="kw">let </span>written = <span class="kw">match </span>file_type {
+<a href=#177 id=177 data-nosnippet>177</a>            <span class="comment">// SAFETY: `bytes` is valid for its length.
+<a href=#178 id=178 data-nosnippet>178</a>            </span>libc::S_IFSOCK =&gt; <span class="kw">unsafe </span>{
+<a href=#179 id=179 data-nosnippet>179</a>                libc::send(
+<a href=#180 id=180 data-nosnippet>180</a>                    fd,
+<a href=#181 id=181 data-nosnippet>181</a>                    bytes.as_ptr().cast(),
+<a href=#182 id=182 data-nosnippet>182</a>                    bytes.len(),
+<a href=#183 id=183 data-nosnippet>183</a>                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+<a href=#184 id=184 data-nosnippet>184</a>                )
+<a href=#185 id=185 data-nosnippet>185</a>            },
+<a href=#186 id=186 data-nosnippet>186</a>            libc::S_IFIFO | libc::S_IFCHR =&gt; {
+<a href=#187 id=187 data-nosnippet>187</a>                <span class="kw">let </span>path = proc_self_fd_path(fd);
+<a href=#188 id=188 data-nosnippet>188</a>                <span class="comment">// SAFETY: `path` is NUL-terminated.
+<a href=#189 id=189 data-nosnippet>189</a>                </span><span class="kw">let </span>reopened = <span class="kw">unsafe </span>{
+<a href=#190 id=190 data-nosnippet>190</a>                    libc::open(
+<a href=#191 id=191 data-nosnippet>191</a>                        path.as_ptr().cast(),
+<a href=#192 id=192 data-nosnippet>192</a>                        libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY,
+<a href=#193 id=193 data-nosnippet>193</a>                    )
+<a href=#194 id=194 data-nosnippet>194</a>                };
+<a href=#195 id=195 data-nosnippet>195</a>                <span class="kw">if </span>reopened &lt; <span class="number">0 </span>{
+<a href=#196 id=196 data-nosnippet>196</a>                    <span class="kw">let </span>errno = <span class="kw">match </span>last_errno() {
+<a href=#197 id=197 data-nosnippet>197</a>                        libc::ENXIO =&gt; libc::EPIPE,
+<a href=#198 id=198 data-nosnippet>198</a>                        errno =&gt; errno,
+<a href=#199 id=199 data-nosnippet>199</a>                    };
+<a href=#200 id=200 data-nosnippet>200</a>                    result = <span class="prelude-val">Err</span>(io::Error::from_raw_os_error(errno));
+<a href=#201 id=201 data-nosnippet>201</a>                    <span class="comment">// Nothing was written, so no signal was generated.
+<a href=#202 id=202 data-nosnippet>202</a>                    </span><span class="kw">return </span><span class="number">0</span>;
+<a href=#203 id=203 data-nosnippet>203</a>                }
+<a href=#204 id=204 data-nosnippet>204</a>                <span class="comment">// SAFETY: `bytes` is valid for its length; `reopened` is ours.
+<a href=#205 id=205 data-nosnippet>205</a>                </span><span class="kw">let </span>written = <span class="kw">unsafe </span>{ libc::write(reopened, bytes.as_ptr().cast(), bytes.len()) };
+<a href=#206 id=206 data-nosnippet>206</a>                <span class="kw">let </span>errno = last_errno();
+<a href=#207 id=207 data-nosnippet>207</a>                <span class="comment">// SAFETY: closes only the descriptor opened above.
+<a href=#208 id=208 data-nosnippet>208</a>                </span><span class="kw">unsafe </span>{ libc::close(reopened) };
+<a href=#209 id=209 data-nosnippet>209</a>                <span class="kw">if </span>written &lt; <span class="number">0 </span>{
+<a href=#210 id=210 data-nosnippet>210</a>                    result = <span class="prelude-val">Err</span>(io::Error::from_raw_os_error(errno));
+<a href=#211 id=211 data-nosnippet>211</a>                    <span class="kw">return </span>errno;
+<a href=#212 id=212 data-nosnippet>212</a>                }
+<a href=#213 id=213 data-nosnippet>213</a>                written
+<a href=#214 id=214 data-nosnippet>214</a>            }
+<a href=#215 id=215 data-nosnippet>215</a>            <span class="comment">// SAFETY: `bytes` is valid for its length.
+<a href=#216 id=216 data-nosnippet>216</a>            </span><span class="kw">_ </span>=&gt; <span class="kw">unsafe </span>{ libc::write(fd, bytes.as_ptr().cast(), bytes.len()) },
+<a href=#217 id=217 data-nosnippet>217</a>        };
+<a href=#218 id=218 data-nosnippet>218</a>        <span class="kw">if </span>written &lt; <span class="number">0 </span>{
+<a href=#219 id=219 data-nosnippet>219</a>            <span class="kw">let </span>error = io::Error::last_os_error();
+<a href=#220 id=220 data-nosnippet>220</a>            <span class="kw">let </span>errno = error.raw_os_error().unwrap_or(<span class="number">0</span>);
+<a href=#221 id=221 data-nosnippet>221</a>            result = <span class="prelude-val">Err</span>(error);
+<a href=#222 id=222 data-nosnippet>222</a>            errno
+<a href=#223 id=223 data-nosnippet>223</a>        } <span class="kw">else </span>{
+<a href=#224 id=224 data-nosnippet>224</a>            result = <span class="prelude-val">Ok</span>(written <span class="kw">as </span>usize);
+<a href=#225 id=225 data-nosnippet>225</a>            <span class="number">0
+<a href=#226 id=226 data-nosnippet>226</a>        </span>}
+<a href=#227 id=227 data-nosnippet>227</a>    });
+<a href=#228 id=228 data-nosnippet>228</a>    result
+<a href=#229 id=229 data-nosnippet>229</a>}
+<a href=#230 id=230 data-nosnippet>230</a>
+<a href=#231 id=231 data-nosnippet>231</a><span class="doccomment">/// The type of the file behind `fd`, its nonzero `S_IFMT` bits, or the errno
+<a href=#232 id=232 data-nosnippet>232</a>/// that kept it from being learned.
+<a href=#233 id=233 data-nosnippet>233</a>///
+<a href=#234 id=234 data-nosnippet>234</a>/// `statx(AT_STATX_DONT_SYNC)` first: it answers from cached attributes
+<a href=#235 id=235 data-nosnippet>235</a>/// instead of asking a network or FUSE file system. When `statx` fails (a
+<a href=#236 id=236 data-nosnippet>236</a>/// seccomp policy that denies it, as the Rust standard library also allows
+<a href=#237 id=237 data-nosnippet>237</a>/// for) or names no type, two questions that the open file answers from
+<a href=#238 id=238 data-nosnippet>238</a>/// memory: `fcntl(F_GETPIPE_SZ)`, which only a pipe or a FIFO answers, and
+<a href=#239 id=239 data-nosnippet>239</a>/// `getsockopt(SO_TYPE)`, which only a socket answers. Any other file then
+<a href=#240 id=240 data-nosnippet>240</a>/// has no type here, and the writers fail closed. The error is `statx`'s, or
+<a href=#241 id=241 data-nosnippet>241</a>/// `EIO` when `statx` returned 0 without a type.
+<a href=#242 id=242 data-nosnippet>242</a>///
+<a href=#243 id=243 data-nosnippet>243</a>/// ⚠️ NO `fstat`. It asks a network or FUSE file system for attributes once
+<a href=#244 id=244 data-nosnippet>244</a>/// its cached ones have expired, and waits for the server's answer; a server
+<a href=#245 id=245 data-nosnippet>245</a>/// that has stopped answering, behind a FIFO or a regular file on stderr,
+<a href=#246 id=246 data-nosnippet>246</a>/// would then hold the crossing writer before `_exit(123)`, and the stderr
+<a href=#247 id=247 data-nosnippet>247</a>/// log sink before the cap is crossed.
+<a href=#248 id=248 data-nosnippet>248</a>///
+<a href=#249 id=249 data-nosnippet>249</a>/// ⚠️ A CALL THAT RETURNS 0 BUT NAMES NO TYPE HAS FAILED. A seccomp policy
+<a href=#250 id=250 data-nosnippet>250</a>/// that answers with errno 0 makes the call return 0 and fill in nothing, and
+<a href=#251 id=251 data-nosnippet>251</a>/// a zeroed type would read as "anything else", which
+<a href=#252 id=252 data-nosnippet>252</a>/// [`write_without_waiting_for_a_reader`] writes to plainly. For the same
+<a href=#253 id=253 data-nosnippet>253</a>/// reason a pipe size of 0 and a socket type of 0 are not answers: no pipe
+<a href=#254 id=254 data-nosnippet>254</a>/// holds 0 bytes, and no socket type is 0.
+<a href=#255 id=255 data-nosnippet>255</a></span><span class="kw">fn </span>file_type(fd: RawFd) -&gt; <span class="prelude-ty">Result</span>&lt;libc::mode_t, i32&gt; {
+<a href=#256 id=256 data-nosnippet>256</a>    <span class="comment">// SAFETY: statx writes only into the zeroed struct it is given; an empty
+<a href=#257 id=257 data-nosnippet>257</a>    // path with AT_EMPTY_PATH names `fd` itself.
+<a href=#258 id=258 data-nosnippet>258</a>    </span><span class="kw">let </span><span class="kw-2">mut </span>stat: libc::statx = <span class="kw">unsafe </span>{ mem::zeroed() };
+<a href=#259 id=259 data-nosnippet>259</a>    <span class="kw">let </span>inspected = <span class="kw">unsafe </span>{
+<a href=#260 id=260 data-nosnippet>260</a>        libc::statx(
+<a href=#261 id=261 data-nosnippet>261</a>            fd,
+<a href=#262 id=262 data-nosnippet>262</a>            <span class="string">c""</span>.as_ptr(),
+<a href=#263 id=263 data-nosnippet>263</a>            libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC,
+<a href=#264 id=264 data-nosnippet>264</a>            libc::STATX_TYPE,
+<a href=#265 id=265 data-nosnippet>265</a>            <span class="kw-2">&amp;mut </span>stat,
+<a href=#266 id=266 data-nosnippet>266</a>        )
+<a href=#267 id=267 data-nosnippet>267</a>    } == <span class="number">0</span>;
+<a href=#268 id=268 data-nosnippet>268</a>    <span class="kw">let </span>statx_errno = <span class="kw">if </span>inspected { libc::EIO } <span class="kw">else </span>{ last_errno() };
+<a href=#269 id=269 data-nosnippet>269</a>    <span class="kw">let </span>file_type = libc::mode_t::from(stat.stx_mode) &amp; libc::S_IFMT;
+<a href=#270 id=270 data-nosnippet>270</a>    <span class="kw">if </span>inspected &amp;&amp; stat.stx_mask &amp; libc::STATX_TYPE != <span class="number">0 </span>&amp;&amp; file_type != <span class="number">0 </span>{
+<a href=#271 id=271 data-nosnippet>271</a>        <span class="kw">return </span><span class="prelude-val">Ok</span>(file_type);
+<a href=#272 id=272 data-nosnippet>272</a>    }
+<a href=#273 id=273 data-nosnippet>273</a>    <span class="comment">// SAFETY: F_GETPIPE_SZ only reads the pipe behind `fd`.
+<a href=#274 id=274 data-nosnippet>274</a>    </span><span class="kw">if unsafe </span>{ libc::fcntl(fd, libc::F_GETPIPE_SZ) } &gt; <span class="number">0 </span>{
+<a href=#275 id=275 data-nosnippet>275</a>        <span class="kw">return </span><span class="prelude-val">Ok</span>(libc::S_IFIFO);
+<a href=#276 id=276 data-nosnippet>276</a>    }
+<a href=#277 id=277 data-nosnippet>277</a>    <span class="kw">let </span><span class="kw-2">mut </span>socket_type: libc::c_int = <span class="number">0</span>;
+<a href=#278 id=278 data-nosnippet>278</a>    <span class="kw">let </span><span class="kw-2">mut </span>length = mem::size_of::&lt;libc::c_int&gt;() <span class="kw">as </span>libc::socklen_t;
+<a href=#279 id=279 data-nosnippet>279</a>    <span class="comment">// SAFETY: getsockopt writes at most `length` bytes into `socket_type`.
+<a href=#280 id=280 data-nosnippet>280</a>    </span><span class="kw">let </span>answered = <span class="kw">unsafe </span>{
+<a href=#281 id=281 data-nosnippet>281</a>        libc::getsockopt(
+<a href=#282 id=282 data-nosnippet>282</a>            fd,
+<a href=#283 id=283 data-nosnippet>283</a>            libc::SOL_SOCKET,
+<a href=#284 id=284 data-nosnippet>284</a>            libc::SO_TYPE,
+<a href=#285 id=285 data-nosnippet>285</a>            (<span class="kw-2">&amp;</span><span class="kw">raw </span><span class="kw-2">mut </span>socket_type).cast(),
+<a href=#286 id=286 data-nosnippet>286</a>            <span class="kw-2">&amp;mut </span>length,
+<a href=#287 id=287 data-nosnippet>287</a>        )
+<a href=#288 id=288 data-nosnippet>288</a>    } == <span class="number">0</span>;
+<a href=#289 id=289 data-nosnippet>289</a>    <span class="kw">if </span>answered &amp;&amp; socket_type != <span class="number">0 </span>{
+<a href=#290 id=290 data-nosnippet>290</a>        <span class="kw">return </span><span class="prelude-val">Ok</span>(libc::S_IFSOCK);
+<a href=#291 id=291 data-nosnippet>291</a>    }
+<a href=#292 id=292 data-nosnippet>292</a>    <span class="prelude-val">Err</span>(statx_errno)
+<a href=#293 id=293 data-nosnippet>293</a>}
+<a href=#294 id=294 data-nosnippet>294</a>
+<a href=#295 id=295 data-nosnippet>295</a><span class="doccomment">/// The calling thread's `errno`, 0 when there is none.
+<a href=#296 id=296 data-nosnippet>296</a></span><span class="kw">pub fn </span>last_errno() -&gt; i32 {
+<a href=#297 id=297 data-nosnippet>297</a>    io::Error::last_os_error().raw_os_error().unwrap_or(<span class="number">0</span>)
+<a href=#298 id=298 data-nosnippet>298</a>}
+<a href=#299 id=299 data-nosnippet>299</a>
+<a href=#300 id=300 data-nosnippet>300</a><span class="doccomment">/// Write `bytes` through a new, non-blocking open file description for the
+<a href=#301 id=301 data-nosnippet>301</a>/// pipe, FIFO or terminal behind `fd`. Returns the write's errno, 0 for none.
+<a href=#302 id=302 data-nosnippet>302</a>/// `O_NOCTTY`: a session leader (the container init) must not acquire the
+<a href=#303 id=303 data-nosnippet>303</a>/// terminal as its controlling terminal by writing a diagnostic to it.
+<a href=#304 id=304 data-nosnippet>304</a></span><span class="kw">fn </span>write_through_new_description(fd: RawFd, bytes: <span class="kw-2">&amp;</span>[u8]) -&gt; i32 {
+<a href=#305 id=305 data-nosnippet>305</a>    <span class="kw">let </span>path = proc_self_fd_path(fd);
+<a href=#306 id=306 data-nosnippet>306</a>    <span class="comment">// SAFETY: `path` is NUL-terminated.
+<a href=#307 id=307 data-nosnippet>307</a>    </span><span class="kw">let </span>reopened = <span class="kw">unsafe </span>{
+<a href=#308 id=308 data-nosnippet>308</a>        libc::open(
+<a href=#309 id=309 data-nosnippet>309</a>            path.as_ptr().cast(),
+<a href=#310 id=310 data-nosnippet>310</a>            libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY,
+<a href=#311 id=311 data-nosnippet>311</a>        )
+<a href=#312 id=312 data-nosnippet>312</a>    };
+<a href=#313 id=313 data-nosnippet>313</a>    <span class="kw">if </span>reopened &lt; <span class="number">0 </span>{
+<a href=#314 id=314 data-nosnippet>314</a>        <span class="comment">// ENXIO is a pipe with no reader: nothing written, nothing raised.
+<a href=#315 id=315 data-nosnippet>315</a>        </span><span class="kw">return </span><span class="number">0</span>;
+<a href=#316 id=316 data-nosnippet>316</a>    }
+<a href=#317 id=317 data-nosnippet>317</a>    <span class="comment">// SAFETY: `bytes` is valid for its length; `reopened` is ours.
+<a href=#318 id=318 data-nosnippet>318</a>    </span><span class="kw">let </span>written = <span class="kw">unsafe </span>{ libc::write(reopened, bytes.as_ptr().cast(), bytes.len()) };
+<a href=#319 id=319 data-nosnippet>319</a>    <span class="kw">let </span>errno = <span class="kw">if </span>written &lt; <span class="number">0 </span>{ last_errno() } <span class="kw">else </span>{ <span class="number">0 </span>};
+<a href=#320 id=320 data-nosnippet>320</a>    <span class="comment">// SAFETY: closes only the descriptor opened above.
+<a href=#321 id=321 data-nosnippet>321</a>    </span><span class="kw">unsafe </span>{ libc::close(reopened) };
+<a href=#322 id=322 data-nosnippet>322</a>    errno
+<a href=#323 id=323 data-nosnippet>323</a>}
+<a href=#324 id=324 data-nosnippet>324</a>
+<a href=#325 id=325 data-nosnippet>325</a><span class="doccomment">/// `/proc/self/fd/&lt;fd&gt;` as a NUL-terminated path, built without allocating:
+<a href=#326 id=326 data-nosnippet>326</a>/// the crossing writer may run with arbitrary locks held.
+<a href=#327 id=327 data-nosnippet>327</a></span><span class="kw">pub fn </span>proc_self_fd_path(fd: RawFd) -&gt; [u8; <span class="number">32</span>] {
+<a href=#328 id=328 data-nosnippet>328</a>    <span class="kw">const </span>PREFIX: <span class="kw-2">&amp;</span>[u8] = <span class="string">b"/proc/self/fd/"</span>;
+<a href=#329 id=329 data-nosnippet>329</a>    <span class="kw">let </span><span class="kw-2">mut </span>path = [<span class="number">0u8</span>; <span class="number">32</span>];
+<a href=#330 id=330 data-nosnippet>330</a>    path[..PREFIX.len()].copy_from_slice(PREFIX);
+<a href=#331 id=331 data-nosnippet>331</a>    <span class="kw">let </span><span class="kw-2">mut </span>digits = [<span class="number">0u8</span>; <span class="number">10</span>];
+<a href=#332 id=332 data-nosnippet>332</a>    <span class="kw">let </span><span class="kw-2">mut </span>count = <span class="number">0</span>;
+<a href=#333 id=333 data-nosnippet>333</a>    <span class="kw">let </span><span class="kw-2">mut </span>rest = fd.unsigned_abs();
+<a href=#334 id=334 data-nosnippet>334</a>    <span class="kw">loop </span>{
+<a href=#335 id=335 data-nosnippet>335</a>        digits[count] = <span class="string">b'0' </span>+ (rest % <span class="number">10</span>) <span class="kw">as </span>u8;
+<a href=#336 id=336 data-nosnippet>336</a>        count += <span class="number">1</span>;
+<a href=#337 id=337 data-nosnippet>337</a>        rest /= <span class="number">10</span>;
+<a href=#338 id=338 data-nosnippet>338</a>        <span class="kw">if </span>rest == <span class="number">0 </span>{
+<a href=#339 id=339 data-nosnippet>339</a>            <span class="kw">break</span>;
+<a href=#340 id=340 data-nosnippet>340</a>        }
+<a href=#341 id=341 data-nosnippet>341</a>    }
+<a href=#342 id=342 data-nosnippet>342</a>    <span class="kw">for </span>(slot, digit) <span class="kw">in </span>path[PREFIX.len()..]
+<a href=#343 id=343 data-nosnippet>343</a>        .iter_mut()
+<a href=#344 id=344 data-nosnippet>344</a>        .zip(digits[..count].iter().rev())
+<a href=#345 id=345 data-nosnippet>345</a>    {
+<a href=#346 id=346 data-nosnippet>346</a>        <span class="kw-2">*</span>slot = <span class="kw-2">*</span>digit;
+<a href=#347 id=347 data-nosnippet>347</a>    }
+<a href=#348 id=348 data-nosnippet>348</a>    path
+<a href=#349 id=349 data-nosnippet>349</a>}
+<a href=#350 id=350 data-nosnippet>350</a>
+<a href=#351 id=351 data-nosnippet>351</a><span class="doccomment">/// Run one diagnostic write (`write` returns its errno, 0 for none) so that no
+<a href=#352 id=352 data-nosnippet>352</a>/// signal it generates escapes.
+<a href=#353 id=353 data-nosnippet>353</a>///
+<a href=#354 id=354 data-nosnippet>354</a>/// Reverie's container setup restores `SIGPIPE`'s default disposition and
+<a href=#355 id=355 data-nosnippet>355</a>/// clears the signal mask in the process that runs the tracer. Under
+<a href=#356 id=356 data-nosnippet>356</a>/// `--no-namespace` that was an ordinary process, and round 2 of the review of
+<a href=#357 id=357 data-nosnippet>357</a>/// &lt;https://github.com/rrnewton/hermit/pull/3686&gt; found a `SIGPIPE` from its
+<a href=#358 id=358 data-nosnippet>358</a>/// crossing line killing it before `_exit(123)`, reported as an internal
+<a href=#359 id=359 data-nosnippet>359</a>/// failure (125); the cap is refused there now. In hermit's PID namespace the
+<a href=#360 id=360 data-nosnippet>360</a>/// tracer runs in the container init, PID 1 of the namespace, and the kernel
+<a href=#361 id=361 data-nosnippet>361</a>/// discards a signal at its default disposition that the init raises in
+<a href=#362 id=362 data-nosnippet>362</a>/// itself, so there the guard is a defence rather than the fix: it keeps any
+<a href=#363 id=363 data-nosnippet>363</a>/// process in which this writer runs with `SIGPIPE` at its default from dying
+<a href=#364 id=364 data-nosnippet>364</a>/// before the exit.
+<a href=#365 id=365 data-nosnippet>365</a>/// As in `proc_mount`'s warning writer, `SIGPIPE` and `SIGXFSZ` (a file-size
+<a href=#366 id=366 data-nosnippet>366</a>/// limit) are blocked for the attempt, and a signal is consumed only when this
+<a href=#367 id=367 data-nosnippet>367</a>/// write failed with the matching error and the signal was not already pending
+<a href=#368 id=368 data-nosnippet>368</a>/// before it. `SIGTTOU` is blocked too: a terminal with `TOSTOP` treats a
+<a href=#369 id=369 data-nosnippet>369</a>/// blocked `SIGTTOU` as ignored and accepts the write, instead of stopping a
+<a href=#370 id=370 data-nosnippet>370</a>/// background process. The original mask is restored afterwards.
+<a href=#371 id=371 data-nosnippet>371</a></span><span class="kw">pub fn </span>suppressing_diagnostic_signals(write: <span class="kw">impl </span>FnOnce() -&gt; i32) {
+<a href=#372 id=372 data-nosnippet>372</a>    <span class="comment">// SAFETY: sigset operations on local, initialized sets; pthread_sigmask and
+<a href=#373 id=373 data-nosnippet>373</a>    // sigtimedwait affect only the calling thread.
+<a href=#374 id=374 data-nosnippet>374</a>    </span><span class="kw">unsafe </span>{
+<a href=#375 id=375 data-nosnippet>375</a>        <span class="kw">let </span><span class="kw-2">mut </span>blocked: libc::sigset_t = mem::zeroed();
+<a href=#376 id=376 data-nosnippet>376</a>        libc::sigemptyset(<span class="kw-2">&amp;mut </span>blocked);
+<a href=#377 id=377 data-nosnippet>377</a>        <span class="kw">for </span>signal <span class="kw">in </span>[libc::SIGPIPE, libc::SIGXFSZ, libc::SIGTTOU] {
+<a href=#378 id=378 data-nosnippet>378</a>            libc::sigaddset(<span class="kw-2">&amp;mut </span>blocked, signal);
+<a href=#379 id=379 data-nosnippet>379</a>        }
+<a href=#380 id=380 data-nosnippet>380</a>        <span class="kw">let </span><span class="kw-2">mut </span>original: libc::sigset_t = mem::zeroed();
+<a href=#381 id=381 data-nosnippet>381</a>        <span class="kw">if </span>libc::pthread_sigmask(libc::SIG_BLOCK, <span class="kw-2">&amp;</span>blocked, <span class="kw-2">&amp;mut </span>original) != <span class="number">0 </span>{
+<a href=#382 id=382 data-nosnippet>382</a>            <span class="kw">return</span>;
+<a href=#383 id=383 data-nosnippet>383</a>        }
+<a href=#384 id=384 data-nosnippet>384</a>        <span class="kw">let </span><span class="kw-2">mut </span>pending_before: libc::sigset_t = mem::zeroed();
+<a href=#385 id=385 data-nosnippet>385</a>        libc::sigemptyset(<span class="kw-2">&amp;mut </span>pending_before);
+<a href=#386 id=386 data-nosnippet>386</a>        libc::sigpending(<span class="kw-2">&amp;mut </span>pending_before);
+<a href=#387 id=387 data-nosnippet>387</a>        <span class="kw">let </span>errno = write();
+<a href=#388 id=388 data-nosnippet>388</a>        <span class="kw">let </span>generated = <span class="kw">match </span>errno {
+<a href=#389 id=389 data-nosnippet>389</a>            libc::EPIPE =&gt; <span class="prelude-val">Some</span>(libc::SIGPIPE),
+<a href=#390 id=390 data-nosnippet>390</a>            libc::EFBIG =&gt; <span class="prelude-val">Some</span>(libc::SIGXFSZ),
+<a href=#391 id=391 data-nosnippet>391</a>            <span class="kw">_ </span>=&gt; <span class="prelude-val">None</span>,
+<a href=#392 id=392 data-nosnippet>392</a>        };
+<a href=#393 id=393 data-nosnippet>393</a>        <span class="kw">if let </span><span class="prelude-val">Some</span>(signal) = generated
+<a href=#394 id=394 data-nosnippet>394</a>            &amp;&amp; libc::sigismember(<span class="kw-2">&amp;</span>pending_before, signal) == <span class="number">0
+<a href=#395 id=395 data-nosnippet>395</a>        </span>{
+<a href=#396 id=396 data-nosnippet>396</a>            <span class="kw">let </span><span class="kw-2">mut </span>consume: libc::sigset_t = mem::zeroed();
+<a href=#397 id=397 data-nosnippet>397</a>            libc::sigemptyset(<span class="kw-2">&amp;mut </span>consume);
+<a href=#398 id=398 data-nosnippet>398</a>            libc::sigaddset(<span class="kw-2">&amp;mut </span>consume, signal);
+<a href=#399 id=399 data-nosnippet>399</a>            <span class="kw">let </span>now = libc::timespec {
+<a href=#400 id=400 data-nosnippet>400</a>                tv_sec: <span class="number">0</span>,
+<a href=#401 id=401 data-nosnippet>401</a>                tv_nsec: <span class="number">0</span>,
+<a href=#402 id=402 data-nosnippet>402</a>            };
+<a href=#403 id=403 data-nosnippet>403</a>            <span class="kw">while </span>libc::sigtimedwait(<span class="kw-2">&amp;</span>consume, std::ptr::null_mut(), <span class="kw-2">&amp;</span>now) &lt; <span class="number">0
+<a href=#404 id=404 data-nosnippet>404</a>                </span>&amp;&amp; last_errno() == libc::EINTR
+<a href=#405 id=405 data-nosnippet>405</a>            {}
+<a href=#406 id=406 data-nosnippet>406</a>        }
+<a href=#407 id=407 data-nosnippet>407</a>        libc::pthread_sigmask(libc::SIG_SETMASK, <span class="kw-2">&amp;</span>original, std::ptr::null_mut());
+<a href=#408 id=408 data-nosnippet>408</a>    }
+<a href=#409 id=409 data-nosnippet>409</a>}
+</code></pre></div></section></main></body></html>

@@ -1,0 +1,42 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Descriptors that would make a guest the server another guest’s exit waits for, refused while process exits complete asynchronously."><title>detcore::exit_dependencies - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="detcore" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module exit_dependencies</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../detcore/index.html">detcore</a><span class="version">0.4.1</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module exit_<wbr>dependencies</a></h2><h3><a href="#constants">Module Items</a></h3><ul class="block"><li><a href="#constants" title="Constants">Constants</a></li><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate detcore</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">detcore</a></div><h1>Module <span>exit_<wbr>dependencies</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/detcore/exit_dependencies.rs.html#9-450">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Descriptors that would make a guest the server another guest’s exit waits
+for, refused while process exits complete asynchronously.</p>
+<p>With <code>BackendCapabilities::process_exits_complete_asynchronously</code>, Detcore
+selects no turn between a process’s exit grant and its physical exit. A native exit that needs another guest to act therefore
+never completes. Coord rulings A and D.1 (dev-hermit
+ai_docs/transient/liteinst-inguest-exit-control-design-20261006.md) refuse,
+by name, the two descriptors that make a guest such a server:</p>
+<ul>
+<li>a FUSE or CUSE device (<code>/dev/fuse</code> or <code>/dev/cuse</code>): the exiting guest’s
+close of a file that guest serves sends a synchronous flush to it.
+Recognised by the character device’s number (misc major 10, minors 229
+and 203), never by path. A plain file on a FUSE filesystem is not
+refused: when no guest holds the device, the server is outside the guest
+set.</li>
+<li>a seccomp user-notification listener: an exit-time system call the
+listener’s filter traps waits for the listener’s reply. Recognised by the
+descriptor’s anon inode, <code>anon_inode:seccomp notify</code>, never by a name.
+Creating one (<code>SECCOMP_FILTER_FLAG_NEW_LISTENER</code>) is already refused,
+because guests cannot install filters; an inherited filter with no
+guest-held listener stays allowed.</li>
+</ul>
+<p>A descriptor is checked where it arrives: from an open, through
+<code>SCM_RIGHTS</code> (<code>recvmsg</code>, <code>recvmmsg</code>) or through <code>pidfd_getfd</code>
+(<code>Detcore::refuse_exit_dependencies</code>). The in-guest runtime checks the
+descriptors a process starts with (<a href="fn.descriptor_exit_dependency.html" title="fn detcore::exit_dependencies::descriptor_exit_dependency"><code>descriptor_exit_dependency</code></a> on
+<code>/proc/self/fd</code>). userfaultfd is not refused (ruling D.2): the reference
+backend supports it, and a stuck exit is caught by the backend’s watchdog.</p>
+<p>Detcore’s refusal names the capability and the descriptor, never a backend.
+The backend layer, which knows which backend runs and what to try instead,
+adds that through <a href="fn.set_backend_advice.html" title="fn detcore::exit_dependencies::set_backend_advice"><code>set_backend_advice</code></a>.</p>
+</div></details><h2 id="constants" class="section-header">Constants<a href="#constants" class="anchor">§</a></h2><dl class="item-table"><dt><a class="constant" href="constant.SECCOMP_NOTIFY_LINK.html" title="constant detcore::exit_dependencies::SECCOMP_NOTIFY_LINK">SECCOMP_<wbr>NOTIFY_<wbr>LINK</a></dt><dd>What <code>readlink</code> reports for a seccomp user-notification listener.</dd></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.descriptor_exit_dependency.html" title="fn detcore::exit_dependencies::descriptor_exit_dependency">descriptor_<wbr>exit_<wbr>dependency</a></dt><dd>What the descriptor at <code>fd_link</code>, a <code>/proc/&lt;pid&gt;/fd/&lt;n&gt;</code> entry, would make
+its holder serve, or <code>None</code>. A descriptor that cannot be read is not
+refused.</dd><dt><a class="fn" href="fn.device_exit_dependency.html" title="fn detcore::exit_dependencies::device_exit_dependency">device_<wbr>exit_<wbr>dependency</a></dt><dd>What a character device numbered <code>rdev</code> would make its holder serve, or
+<code>None</code>.</dd><dt><a class="fn" href="fn.held_exit_dependency.html" title="fn detcore::exit_dependencies::held_exit_dependency">held_<wbr>exit_<wbr>dependency</a></dt><dd>The first descriptor listed in <code>fd_directory</code> (a <code>/proc/&lt;pid&gt;/fd</code>
+directory) that would make its holder serve another guest’s exit: its name
+in the directory and what it is. The in-guest runtime checks
+<code>/proc/self/fd</code> with it before installing Detcore. A directory that cannot
+be listed is an error, never a pass. Listed with
+<a href="../util/fn.find_in_directory.html" title="fn detcore::util::find_in_directory"><code>crate::util::find_in_directory</code></a>: this runs inside the guest, where
+<code>std::fs::read_dir</code> would leave the listing in the guest’s heap.</dd><dt><a class="fn" href="fn.set_backend_advice.html" title="fn detcore::exit_dependencies::set_backend_advice">set_<wbr>backend_<wbr>advice</a></dt><dd>Sets the sentence a refusal ends with: which backend refused, and what to
+run instead. The backend layer calls it once, before Detcore runs; a later
+call is ignored.</dd></dl></section></div></main></body></html>

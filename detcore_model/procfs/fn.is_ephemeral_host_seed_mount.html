@@ -1,0 +1,33 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="True for one ephemeral host FUSE seed mount row in `/proc/&#60;pid&#62;/mountinfo` grammar: filesystem type `fuse.squashfuse_ll` and a mount point whose last path component is a host seed name, `&#60;hex&#62;-seed-&#60;seed&#62;-ns-&#60;digits&#62;`, where `&#60;seed&#62;` is a non-empty run of ASCII letters, digits, `_` and `-`."><title>is_ephemeral_host_seed_mount in detcore_model::procfs - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="detcore_model" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">is_ephemeral_host_seed_mount</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../detcore_model/index.html">detcore_<wbr>model</a><span class="version">0.4.1</span></h2></div><div class="sidebar-elems"><div id="rustdoc-modnav"><h2><a href="index.html">In detcore_<wbr>model::<wbr>procfs</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">detcore_model</a>::<wbr><a href="index.html">procfs</a></div><h1>Function <span class="fn">is_<wbr>ephemeral_<wbr>host_<wbr>seed_<wbr>mount</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/detcore_model/procfs.rs.html#62-74">Source</a> </span></div><pre class="rust item-decl"><code>pub fn is_ephemeral_host_seed_mount(line: &amp;[<a class="primitive" href="https://doc.rust-lang.org/nightly/std/primitive.u8.html">u8</a>]) -&gt; <a class="primitive" href="https://doc.rust-lang.org/nightly/std/primitive.bool.html">bool</a></code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>True for one ephemeral host FUSE seed mount row in <code>/proc/&lt;pid&gt;/mountinfo</code>
+grammar: filesystem type <code>fuse.squashfuse_ll</code> and a mount point whose last
+path component is a host seed name, <code>&lt;hex&gt;-seed-&lt;seed&gt;-ns-&lt;digits&gt;</code>, where
+<code>&lt;seed&gt;</code> is a non-empty run of ASCII letters, digits, <code>_</code> and <code>-</code>.</p>
+<p>The host’s squashfuse infrastructure creates these mounts, normally at
+<code>/mnt/xarfuse/uid-&lt;uid&gt;/&lt;seed name&gt;</code>, either one per host process (seed
+<code>nspid&lt;digits&gt;_cgpid&lt;digits&gt;</code>) or one per named host tool (for example
+seed <code>chef</code>, <code>fb-pcie-error-log</code> or <code>devserver-cleanup_hg_cache</code>). Those
+rows are other processes’ runtime state imported into the guest namespace
+by shared mount propagation: they are not created by Hermit, by the guest
+session, or by any ancestor the guest can name, and they appear, disappear
+and are remounted under new mount IDs asynchronously as unrelated host
+processes and tool runs start and stop (named-tool seeds were observed
+living four to five seconds, and the <code>chef</code> seed was remounted under a new
+mount ID). Passing their membership through made <code>/proc/&lt;pid&gt;/mountinfo</code>
+(and the length of every read of it) a host-timing observation: in the
+<code>procfs-sanitized-paths</code> divergence, one seed row changed the tail <code>read</code>
+length between two strict runs.</p>
+<p>This is a chosen determinism fidelity trade. Seed rows are real mounts in
+the guest namespace (imported by shared propagation and traversable), and
+Linux omits no real mount from mountinfo. Hermit nevertheless excludes the
+class, long-lived named seeds included, because its membership is owned by
+unrelated host processes and changes asynchronously, the same scope choice
+<code>DETERMINISM_ARGUMENT.md</code> makes for other changing host inputs. The class is
+decided by the seed name, not by the directory it is shown under, so other
+SquashFUSE mounts (for example a long-lived <code>/mnt/xarfuse/stable-release</code>)
+stay visible, and a guest whose root makes the displayed path
+<code>/xarfuse/uid-&lt;uid&gt;/&lt;seed&gt;</code> still excludes the same rows the launch-time
+capture excluded. Other host mount churn, such as logind’s
+<code>/run/user/&lt;uid&gt;</code> tmpfs mounts, is not in this class and stays visible.</p>
+<p>Only mountinfo rows are classified. <code>/proc/&lt;pid&gt;/mounts</code> is passed through
+unchanged: <a href="https://github.com/rrnewton/hermit/issues/3719">https://github.com/rrnewton/hermit/issues/3719</a>.</p>
+</div></details></section></div></main></body></html>

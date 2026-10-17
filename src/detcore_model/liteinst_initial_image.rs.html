@@ -1,0 +1,378 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `detcore-model/src/liteinst_initial_image.rs`."><title>liteinst_initial_image.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="detcore_model" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../../static.files/src-script-813739b1.js"></script><script defer src="../../src-files.js"></script><script defer src="../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1><div class="sub-heading">detcore_model/</div>liteinst_initial_image.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-3"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="comment">/*
+<a href=#2 id=2 data-nosnippet>2</a> * Copyright (c) Meta Platforms, Inc. and affiliates.
+<a href=#3 id=3 data-nosnippet>3</a> * All rights reserved.
+<a href=#4 id=4 data-nosnippet>4</a> * This source code is licensed under the BSD-style license found in LICENSE.
+<a href=#5 id=5 data-nosnippet>5</a> */
+<a href=#6 id=6 data-nosnippet>6</a>
+<a href=#7 id=7 data-nosnippet>7</a></span><span class="doccomment">//! Bounded InitialImage launch packet shared by the host and private runtime.
+<a href=#8 id=8 data-nosnippet>8</a>//!
+<a href=#9 id=9 data-nosnippet>9</a>//! Packet bytes, nonce and file seals are not authorization. The coordinator
+<a href=#10 id=10 data-nosnippet>10</a>//! separately redeems a one-use launch instance against its actual process watch.
+<a href=#11 id=11 data-nosnippet>11</a>//! Decoding validates the complete byte shape without allocating. Only the host
+<a href=#12 id=12 data-nosnippet>12</a>//! encodes packets; the private initializer consumes borrowed fields.
+<a href=#13 id=13 data-nosnippet>13</a>
+<a href=#14 id=14 data-nosnippet>14</a></span><span class="kw">use </span>std::fmt;
+<a href=#15 id=15 data-nosnippet>15</a>
+<a href=#16 id=16 data-nosnippet>16</a><span class="kw">use </span><span class="kw">crate</span>::config::Config;
+<a href=#17 id=17 data-nosnippet>17</a>
+<a href=#18 id=18 data-nosnippet>18</a><span class="doccomment">/// Maximum complete packet size, including its fixed header.
+<a href=#19 id=19 data-nosnippet>19</a></span><span class="kw">pub const </span>MAX_PACKET_LEN: usize = <span class="number">4096</span>;
+<a href=#20 id=20 data-nosnippet>20</a><span class="doccomment">/// Magic naming this explicit InitialImage protocol.
+<a href=#21 id=21 data-nosnippet>21</a></span><span class="kw">pub const </span>MAGIC: [u8; <span class="number">8</span>] = <span class="kw-2">*</span><span class="string">b"HLIINIT1"</span>;
+<a href=#22 id=22 data-nosnippet>22</a><span class="doccomment">/// Only this wire version is accepted.
+<a href=#23 id=23 data-nosnippet>23</a></span><span class="kw">pub const </span>VERSION: u16 = <span class="number">1</span>;
+<a href=#24 id=24 data-nosnippet>24</a><span class="doccomment">/// Bytes before the three variable length fields.
+<a href=#25 id=25 data-nosnippet>25</a></span><span class="kw">pub const </span>HEADER_LEN: usize = <span class="number">98</span>;
+<a href=#26 id=26 data-nosnippet>26</a>
+<a href=#27 id=27 data-nosnippet>27</a><span class="doccomment">/// Borrowed fields of one complete, bounded launch packet.
+<a href=#28 id=28 data-nosnippet>28</a></span><span class="attr">#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+<a href=#29 id=29 data-nosnippet>29</a></span><span class="kw">pub struct </span>Packet&lt;<span class="lifetime">'a</span>&gt; {
+<a href=#30 id=30 data-nosnippet>30</a>    <span class="doccomment">/// Coordinator-held one-use challenge to redeem; not authority by itself.
+<a href=#31 id=31 data-nosnippet>31</a>    </span><span class="kw">pub </span>nonce: <span class="kw-2">&amp;</span><span class="lifetime">'a </span>[u8; <span class="number">32</span>],
+<a href=#32 id=32 data-nosnippet>32</a>    <span class="doccomment">/// Independently supplied SHA-256 of the exact wire Config bytes.
+<a href=#33 id=33 data-nosnippet>33</a>    </span><span class="kw">pub </span>config_digest: <span class="kw-2">&amp;</span><span class="lifetime">'a </span>[u8; <span class="number">32</span>],
+<a href=#34 id=34 data-nosnippet>34</a>    <span class="doccomment">/// Sixteen ASCII hex characters naming the actual Config/RPC schema.
+<a href=#35 id=35 data-nosnippet>35</a>    </span><span class="kw">pub </span>schema_fingerprint: <span class="kw-2">&amp;</span><span class="lifetime">'a </span>[u8; <span class="number">16</span>],
+<a href=#36 id=36 data-nosnippet>36</a>    <span class="doccomment">/// Nonempty raw Unix coordinator path bytes (UTF-8 is not required).
+<a href=#37 id=37 data-nosnippet>37</a>    </span><span class="kw">pub </span>coordinator: <span class="kw-2">&amp;</span><span class="lifetime">'a </span>[u8],
+<a href=#38 id=38 data-nosnippet>38</a>    <span class="doccomment">/// Nonempty UTF-8 inherited DETLOG fd and physical socket identity.
+<a href=#39 id=39 data-nosnippet>39</a>    </span><span class="kw">pub </span>detlog_identity: <span class="kw-2">&amp;</span><span class="lifetime">'a </span>str,
+<a href=#40 id=40 data-nosnippet>40</a>    <span class="doccomment">/// Nonempty UTF-8 encoded genuine DETLOG forwarding policy.
+<a href=#41 id=41 data-nosnippet>41</a>    </span><span class="kw">pub </span>forward_policy: <span class="kw-2">&amp;</span><span class="lifetime">'a </span>str,
+<a href=#42 id=42 data-nosnippet>42</a>}
+<a href=#43 id=43 data-nosnippet>43</a>
+<a href=#44 id=44 data-nosnippet>44</a><span class="doccomment">/// A packet shape refusal, with no heap-backed error payload.
+<a href=#45 id=45 data-nosnippet>45</a></span><span class="attr">#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+<a href=#46 id=46 data-nosnippet>46</a></span><span class="kw">pub enum </span>PacketError {
+<a href=#47 id=47 data-nosnippet>47</a>    <span class="doccomment">/// Complete size is outside the bound or differs from the advertised size.
+<a href=#48 id=48 data-nosnippet>48</a>    </span>Size,
+<a href=#49 id=49 data-nosnippet>49</a>    <span class="doccomment">/// Magic does not name this protocol.
+<a href=#50 id=50 data-nosnippet>50</a>    </span>Magic,
+<a href=#51 id=51 data-nosnippet>51</a>    <span class="doccomment">/// Unsupported version.
+<a href=#52 id=52 data-nosnippet>52</a>    </span>Version,
+<a href=#53 id=53 data-nosnippet>53</a>    <span class="doccomment">/// Field lengths do not consume the complete packet exactly.
+<a href=#54 id=54 data-nosnippet>54</a>    </span>Length,
+<a href=#55 id=55 data-nosnippet>55</a>    <span class="doccomment">/// A mandatory text/path field is empty.
+<a href=#56 id=56 data-nosnippet>56</a>    </span>Empty,
+<a href=#57 id=57 data-nosnippet>57</a>    <span class="doccomment">/// A text/path field contains a NUL byte.
+<a href=#58 id=58 data-nosnippet>58</a>    </span>Nul,
+<a href=#59 id=59 data-nosnippet>59</a>    <span class="doccomment">/// DETLOG identity or policy is not UTF-8.
+<a href=#60 id=60 data-nosnippet>60</a>    </span>Utf8,
+<a href=#61 id=61 data-nosnippet>61</a>    <span class="doccomment">/// Schema fingerprint is not exactly sixteen ASCII hex characters.
+<a href=#62 id=62 data-nosnippet>62</a>    </span>Fingerprint,
+<a href=#63 id=63 data-nosnippet>63</a>}
+<a href=#64 id=64 data-nosnippet>64</a><span class="kw">impl </span>fmt::Display <span class="kw">for </span>PacketError {
+<a href=#65 id=65 data-nosnippet>65</a>    <span class="kw">fn </span>fmt(<span class="kw-2">&amp;</span><span class="self">self</span>, f: <span class="kw-2">&amp;mut </span>fmt::Formatter&lt;<span class="lifetime">'_</span>&gt;) -&gt; fmt::Result {
+<a href=#66 id=66 data-nosnippet>66</a>        f.write_str(<span class="kw">match </span><span class="self">self </span>{
+<a href=#67 id=67 data-nosnippet>67</a>            <span class="self">Self</span>::Size =&gt; <span class="string">"InitialImage packet size mismatch"</span>,
+<a href=#68 id=68 data-nosnippet>68</a>            <span class="self">Self</span>::Magic =&gt; <span class="string">"InitialImage packet magic mismatch"</span>,
+<a href=#69 id=69 data-nosnippet>69</a>            <span class="self">Self</span>::Version =&gt; <span class="string">"InitialImage packet version mismatch"</span>,
+<a href=#70 id=70 data-nosnippet>70</a>            <span class="self">Self</span>::Length =&gt; <span class="string">"InitialImage packet field length mismatch"</span>,
+<a href=#71 id=71 data-nosnippet>71</a>            <span class="self">Self</span>::Empty =&gt; <span class="string">"InitialImage packet mandatory field is empty"</span>,
+<a href=#72 id=72 data-nosnippet>72</a>            <span class="self">Self</span>::Nul =&gt; <span class="string">"InitialImage packet field contains NUL"</span>,
+<a href=#73 id=73 data-nosnippet>73</a>            <span class="self">Self</span>::Utf8 =&gt; <span class="string">"InitialImage packet DETLOG field is not UTF-8"</span>,
+<a href=#74 id=74 data-nosnippet>74</a>            <span class="self">Self</span>::Fingerprint =&gt; <span class="string">"InitialImage packet schema fingerprint is not ASCII hex"</span>,
+<a href=#75 id=75 data-nosnippet>75</a>        })
+<a href=#76 id=76 data-nosnippet>76</a>    }
+<a href=#77 id=77 data-nosnippet>77</a>}
+<a href=#78 id=78 data-nosnippet>78</a><span class="kw">impl </span>std::error::Error <span class="kw">for </span>PacketError {}
+<a href=#79 id=79 data-nosnippet>79</a>
+<a href=#80 id=80 data-nosnippet>80</a><span class="doccomment">/// Decode and validate all fields and exact full consumption before allocation.
+<a href=#81 id=81 data-nosnippet>81</a></span><span class="kw">pub fn </span>decode(bytes: <span class="kw-2">&amp;</span>[u8]) -&gt; <span class="prelude-ty">Result</span>&lt;Packet&lt;<span class="lifetime">'_</span>&gt;, PacketError&gt; {
+<a href=#82 id=82 data-nosnippet>82</a>    <span class="kw">if </span>!(HEADER_LEN..=MAX_PACKET_LEN).contains(<span class="kw-2">&amp;</span>bytes.len()) {
+<a href=#83 id=83 data-nosnippet>83</a>        <span class="kw">return </span><span class="prelude-val">Err</span>(PacketError::Size);
+<a href=#84 id=84 data-nosnippet>84</a>    }
+<a href=#85 id=85 data-nosnippet>85</a>    <span class="kw">if </span>bytes[..<span class="number">8</span>] != MAGIC {
+<a href=#86 id=86 data-nosnippet>86</a>        <span class="kw">return </span><span class="prelude-val">Err</span>(PacketError::Magic);
+<a href=#87 id=87 data-nosnippet>87</a>    }
+<a href=#88 id=88 data-nosnippet>88</a>    <span class="kw">if </span>u16::from_be_bytes([bytes[<span class="number">8</span>], bytes[<span class="number">9</span>]]) != VERSION {
+<a href=#89 id=89 data-nosnippet>89</a>        <span class="kw">return </span><span class="prelude-val">Err</span>(PacketError::Version);
+<a href=#90 id=90 data-nosnippet>90</a>    }
+<a href=#91 id=91 data-nosnippet>91</a>    <span class="kw">if </span>usize::from(u16::from_be_bytes([bytes[<span class="number">10</span>], bytes[<span class="number">11</span>]])) != bytes.len() {
+<a href=#92 id=92 data-nosnippet>92</a>        <span class="kw">return </span><span class="prelude-val">Err</span>(PacketError::Size);
+<a href=#93 id=93 data-nosnippet>93</a>    }
+<a href=#94 id=94 data-nosnippet>94</a>    <span class="kw">let </span>lengths = [<span class="number">92</span>, <span class="number">94</span>, <span class="number">96</span>].map(|i| usize::from(u16::from_be_bytes([bytes[i], bytes[i + <span class="number">1</span>]])));
+<a href=#95 id=95 data-nosnippet>95</a>    <span class="kw">let </span>path_end = HEADER_LEN + lengths[<span class="number">0</span>];
+<a href=#96 id=96 data-nosnippet>96</a>    <span class="kw">let </span>identity_end = path_end + lengths[<span class="number">1</span>];
+<a href=#97 id=97 data-nosnippet>97</a>    <span class="kw">let </span>policy_end = identity_end + lengths[<span class="number">2</span>];
+<a href=#98 id=98 data-nosnippet>98</a>    <span class="kw">if </span>policy_end != bytes.len() {
+<a href=#99 id=99 data-nosnippet>99</a>        <span class="kw">return </span><span class="prelude-val">Err</span>(PacketError::Length);
+<a href=#100 id=100 data-nosnippet>100</a>    }
+<a href=#101 id=101 data-nosnippet>101</a>    <span class="comment">// Positive lengths and the exact end prove all three bounds before slicing.
+<a href=#102 id=102 data-nosnippet>102</a>    </span><span class="kw">let </span>coordinator = <span class="kw-2">&amp;</span>bytes[HEADER_LEN..path_end];
+<a href=#103 id=103 data-nosnippet>103</a>    <span class="kw">let </span>identity = <span class="kw-2">&amp;</span>bytes[path_end..identity_end];
+<a href=#104 id=104 data-nosnippet>104</a>    <span class="kw">let </span>policy = <span class="kw-2">&amp;</span>bytes[identity_end..policy_end];
+<a href=#105 id=105 data-nosnippet>105</a>    check_text(coordinator)<span class="question-mark">?</span>;
+<a href=#106 id=106 data-nosnippet>106</a>    check_text(identity)<span class="question-mark">?</span>;
+<a href=#107 id=107 data-nosnippet>107</a>    check_text(policy)<span class="question-mark">?</span>;
+<a href=#108 id=108 data-nosnippet>108</a>    <span class="kw">let </span>packet = Packet {
+<a href=#109 id=109 data-nosnippet>109</a>        nonce: bytes[<span class="number">12</span>..<span class="number">44</span>].try_into().map_err(|<span class="kw">_</span>| PacketError::Length)<span class="question-mark">?</span>,
+<a href=#110 id=110 data-nosnippet>110</a>        config_digest: bytes[<span class="number">44</span>..<span class="number">76</span>].try_into().map_err(|<span class="kw">_</span>| PacketError::Length)<span class="question-mark">?</span>,
+<a href=#111 id=111 data-nosnippet>111</a>        schema_fingerprint: bytes[<span class="number">76</span>..<span class="number">92</span>]
+<a href=#112 id=112 data-nosnippet>112</a>            .try_into()
+<a href=#113 id=113 data-nosnippet>113</a>            .map_err(|<span class="kw">_</span>| PacketError::Fingerprint)<span class="question-mark">?</span>,
+<a href=#114 id=114 data-nosnippet>114</a>        coordinator,
+<a href=#115 id=115 data-nosnippet>115</a>        detlog_identity: std::str::from_utf8(identity).map_err(|<span class="kw">_</span>| PacketError::Utf8)<span class="question-mark">?</span>,
+<a href=#116 id=116 data-nosnippet>116</a>        forward_policy: std::str::from_utf8(policy).map_err(|<span class="kw">_</span>| PacketError::Utf8)<span class="question-mark">?</span>,
+<a href=#117 id=117 data-nosnippet>117</a>    };
+<a href=#118 id=118 data-nosnippet>118</a>    check_fingerprint(packet.schema_fingerprint)<span class="question-mark">?</span>;
+<a href=#119 id=119 data-nosnippet>119</a>    <span class="prelude-val">Ok</span>(packet)
+<a href=#120 id=120 data-nosnippet>120</a>}
+<a href=#121 id=121 data-nosnippet>121</a>
+<a href=#122 id=122 data-nosnippet>122</a><span class="doccomment">/// Host-side encoding with the same shape checks as the borrowed decoder.
+<a href=#123 id=123 data-nosnippet>123</a></span><span class="kw">pub fn </span>encode(packet: Packet&lt;<span class="lifetime">'_</span>&gt;) -&gt; <span class="prelude-ty">Result</span>&lt;Vec&lt;u8&gt;, PacketError&gt; {
+<a href=#124 id=124 data-nosnippet>124</a>    <span class="kw">let </span>fields = [
+<a href=#125 id=125 data-nosnippet>125</a>        packet.coordinator,
+<a href=#126 id=126 data-nosnippet>126</a>        packet.detlog_identity.as_bytes(),
+<a href=#127 id=127 data-nosnippet>127</a>        packet.forward_policy.as_bytes(),
+<a href=#128 id=128 data-nosnippet>128</a>    ];
+<a href=#129 id=129 data-nosnippet>129</a>    <span class="kw">for </span>field <span class="kw">in </span>fields {
+<a href=#130 id=130 data-nosnippet>130</a>        <span class="kw">if </span>field.len() &gt; MAX_PACKET_LEN {
+<a href=#131 id=131 data-nosnippet>131</a>            <span class="kw">return </span><span class="prelude-val">Err</span>(PacketError::Size);
+<a href=#132 id=132 data-nosnippet>132</a>        }
+<a href=#133 id=133 data-nosnippet>133</a>        check_text(field)<span class="question-mark">?</span>;
+<a href=#134 id=134 data-nosnippet>134</a>    }
+<a href=#135 id=135 data-nosnippet>135</a>    check_fingerprint(packet.schema_fingerprint)<span class="question-mark">?</span>;
+<a href=#136 id=136 data-nosnippet>136</a>    <span class="kw">let </span>total = HEADER_LEN
+<a href=#137 id=137 data-nosnippet>137</a>        .checked_add(fields.iter().map(|field| field.len()).sum::&lt;usize&gt;())
+<a href=#138 id=138 data-nosnippet>138</a>        .filter(|total| <span class="kw-2">*</span>total &lt;= MAX_PACKET_LEN)
+<a href=#139 id=139 data-nosnippet>139</a>        .ok_or(PacketError::Size)<span class="question-mark">?</span>;
+<a href=#140 id=140 data-nosnippet>140</a>    <span class="kw">let </span><span class="kw-2">mut </span>bytes = Vec::with_capacity(total);
+<a href=#141 id=141 data-nosnippet>141</a>    bytes.extend_from_slice(<span class="kw-2">&amp;</span>MAGIC);
+<a href=#142 id=142 data-nosnippet>142</a>    bytes.extend_from_slice(<span class="kw-2">&amp;</span>VERSION.to_be_bytes());
+<a href=#143 id=143 data-nosnippet>143</a>    bytes.extend_from_slice(<span class="kw-2">&amp;</span>(total <span class="kw">as </span>u16).to_be_bytes());
+<a href=#144 id=144 data-nosnippet>144</a>    bytes.extend_from_slice(packet.nonce);
+<a href=#145 id=145 data-nosnippet>145</a>    bytes.extend_from_slice(packet.config_digest);
+<a href=#146 id=146 data-nosnippet>146</a>    bytes.extend_from_slice(packet.schema_fingerprint);
+<a href=#147 id=147 data-nosnippet>147</a>    <span class="kw">for </span>field <span class="kw">in </span>fields {
+<a href=#148 id=148 data-nosnippet>148</a>        bytes.extend_from_slice(<span class="kw-2">&amp;</span>(field.len() <span class="kw">as </span>u16).to_be_bytes());
+<a href=#149 id=149 data-nosnippet>149</a>    }
+<a href=#150 id=150 data-nosnippet>150</a>    <span class="kw">for </span>field <span class="kw">in </span>fields {
+<a href=#151 id=151 data-nosnippet>151</a>        bytes.extend_from_slice(field);
+<a href=#152 id=152 data-nosnippet>152</a>    }
+<a href=#153 id=153 data-nosnippet>153</a>    <span class="prelude-val">Ok</span>(bytes)
+<a href=#154 id=154 data-nosnippet>154</a>}
+<a href=#155 id=155 data-nosnippet>155</a>
+<a href=#156 id=156 data-nosnippet>156</a><span class="kw">fn </span>check_text(bytes: <span class="kw-2">&amp;</span>[u8]) -&gt; <span class="prelude-ty">Result</span>&lt;(), PacketError&gt; {
+<a href=#157 id=157 data-nosnippet>157</a>    <span class="kw">if </span>bytes.is_empty() {
+<a href=#158 id=158 data-nosnippet>158</a>        <span class="kw">return </span><span class="prelude-val">Err</span>(PacketError::Empty);
+<a href=#159 id=159 data-nosnippet>159</a>    }
+<a href=#160 id=160 data-nosnippet>160</a>    <span class="kw">if </span>bytes.contains(<span class="kw-2">&amp;</span><span class="number">0</span>) {
+<a href=#161 id=161 data-nosnippet>161</a>        <span class="kw">return </span><span class="prelude-val">Err</span>(PacketError::Nul);
+<a href=#162 id=162 data-nosnippet>162</a>    }
+<a href=#163 id=163 data-nosnippet>163</a>    <span class="prelude-val">Ok</span>(())
+<a href=#164 id=164 data-nosnippet>164</a>}
+<a href=#165 id=165 data-nosnippet>165</a><span class="kw">fn </span>check_fingerprint(bytes: <span class="kw-2">&amp;</span>[u8; <span class="number">16</span>]) -&gt; <span class="prelude-ty">Result</span>&lt;(), PacketError&gt; {
+<a href=#166 id=166 data-nosnippet>166</a>    <span class="kw">if </span>bytes.iter().all(u8::is_ascii_hexdigit) {
+<a href=#167 id=167 data-nosnippet>167</a>        <span class="prelude-val">Ok</span>(())
+<a href=#168 id=168 data-nosnippet>168</a>    } <span class="kw">else </span>{
+<a href=#169 id=169 data-nosnippet>169</a>        <span class="prelude-val">Err</span>(PacketError::Fingerprint)
+<a href=#170 id=170 data-nosnippet>170</a>    }
+<a href=#171 id=171 data-nosnippet>171</a>}
+<a href=#172 id=172 data-nosnippet>172</a>
+<a href=#173 id=173 data-nosnippet>173</a><span class="doccomment">/// Refuse unsupported InitialImage configuration without changing it.
+<a href=#174 id=174 data-nosnippet>174</a>///
+<a href=#175 id=175 data-nosnippet>175</a>/// This first slice excludes PMU/RCB time, maximum/target timeslices, imprecise
+<a href=#176 id=176 data-nosnippet>176</a>/// timers, chaos and slowdown, preemption recording/replay and stack traces,
+<a href=#177 id=177 data-nosnippet>177</a>/// schedule replay, and record/replay execution modes. `record_host_inputs`
+<a href=#178 id=178 data-nosnippet>178</a>/// remains supported for genuine strict verification. No startup-accounting,
+<a href=#179 id=179 data-nosnippet>179</a>/// successor exec, fork or thread capability is implied by this predicate.
+<a href=#180 id=180 data-nosnippet>180</a></span><span class="kw">pub fn </span>config_violation(config: <span class="kw-2">&amp;</span>Config) -&gt; <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span><span class="lifetime">'static </span>str&gt; {
+<a href=#181 id=181 data-nosnippet>181</a>    <span class="kw">if </span>config.use_rcb_time() || config.max_timeslice.is_some() || config.target_timeslice.is_some()
+<a href=#182 id=182 data-nosnippet>182</a>    {
+<a href=#183 id=183 data-nosnippet>183</a>        <span class="kw">return </span><span class="prelude-val">Some</span>(<span class="string">"InitialImage does not support RCB time or preemption timeslices"</span>);
+<a href=#184 id=184 data-nosnippet>184</a>    }
+<a href=#185 id=185 data-nosnippet>185</a>    <span class="kw">if </span>config.imprecise_timers
+<a href=#186 id=186 data-nosnippet>186</a>        || config.chaos
+<a href=#187 id=187 data-nosnippet>187</a>        || config.chaos_target_races
+<a href=#188 id=188 data-nosnippet>188</a>        || config.chaos_per_thread_slowdown
+<a href=#189 id=189 data-nosnippet>189</a>    {
+<a href=#190 id=190 data-nosnippet>190</a>        <span class="kw">return </span><span class="prelude-val">Some</span>(<span class="string">"InitialImage does not support chaos or imprecise timers"</span>);
+<a href=#191 id=191 data-nosnippet>191</a>    }
+<a href=#192 id=192 data-nosnippet>192</a>    <span class="kw">if </span>config.record_preemptions
+<a href=#193 id=193 data-nosnippet>193</a>        || config.record_preemptions_to.is_some()
+<a href=#194 id=194 data-nosnippet>194</a>        || config.replay_preemptions_from.is_some()
+<a href=#195 id=195 data-nosnippet>195</a>        || config.replay_schedule_from.is_some()
+<a href=#196 id=196 data-nosnippet>196</a>        || config.preemption_stacktrace
+<a href=#197 id=197 data-nosnippet>197</a>        || config.preemption_stacktrace_log_file.is_some()
+<a href=#198 id=198 data-nosnippet>198</a>        || !config.stacktrace_event.is_empty()
+<a href=#199 id=199 data-nosnippet>199</a>        || config.stacktrace_signal.is_some()
+<a href=#200 id=200 data-nosnippet>200</a>    {
+<a href=#201 id=201 data-nosnippet>201</a>        <span class="kw">return </span><span class="prelude-val">Some</span>(
+<a href=#202 id=202 data-nosnippet>202</a>            <span class="string">"InitialImage does not support preemption/schedule recording, replay or stack traces"</span>,
+<a href=#203 id=203 data-nosnippet>203</a>        );
+<a href=#204 id=204 data-nosnippet>204</a>    }
+<a href=#205 id=205 data-nosnippet>205</a>    <span class="kw">if </span>config.recordreplay_modes || config.replaying || config.replay_data.is_some() {
+<a href=#206 id=206 data-nosnippet>206</a>        <span class="kw">return </span><span class="prelude-val">Some</span>(<span class="string">"InitialImage does not support record/replay execution"</span>);
+<a href=#207 id=207 data-nosnippet>207</a>    }
+<a href=#208 id=208 data-nosnippet>208</a>    <span class="prelude-val">None
+<a href=#209 id=209 data-nosnippet>209</a></span>}
+<a href=#210 id=210 data-nosnippet>210</a>
+<a href=#211 id=211 data-nosnippet>211</a><span class="attr">#[cfg(test)]
+<a href=#212 id=212 data-nosnippet>212</a></span><span class="kw">mod </span>tests {
+<a href=#213 id=213 data-nosnippet>213</a>    <span class="kw">use super</span>::<span class="kw-2">*</span>;
+<a href=#214 id=214 data-nosnippet>214</a>
+<a href=#215 id=215 data-nosnippet>215</a>    <span class="kw">fn </span>packet&lt;<span class="lifetime">'a</span>&gt;() -&gt; Packet&lt;<span class="lifetime">'a</span>&gt; {
+<a href=#216 id=216 data-nosnippet>216</a>        Packet {
+<a href=#217 id=217 data-nosnippet>217</a>            nonce: <span class="kw-2">&amp;</span>[<span class="number">1</span>; <span class="number">32</span>],
+<a href=#218 id=218 data-nosnippet>218</a>            config_digest: <span class="kw-2">&amp;</span>[<span class="number">2</span>; <span class="number">32</span>],
+<a href=#219 id=219 data-nosnippet>219</a>            schema_fingerprint: <span class="string">b"0123456789abcdef"</span>,
+<a href=#220 id=220 data-nosnippet>220</a>            coordinator: <span class="string">b"/tmp/coordinator-\xff.sock"</span>,
+<a href=#221 id=221 data-nosnippet>221</a>            detlog_identity: <span class="string">"19:7:1234"</span>,
+<a href=#222 id=222 data-nosnippet>222</a>            forward_policy: <span class="string">"INFO"</span>,
+<a href=#223 id=223 data-nosnippet>223</a>        }
+<a href=#224 id=224 data-nosnippet>224</a>    }
+<a href=#225 id=225 data-nosnippet>225</a>
+<a href=#226 id=226 data-nosnippet>226</a>    <span class="attr">#[test]
+<a href=#227 id=227 data-nosnippet>227</a>    </span><span class="kw">fn </span>exact_wire_shape_and_borrowed_roundtrip_accept_raw_path() {
+<a href=#228 id=228 data-nosnippet>228</a>        <span class="kw">let </span>packet = packet();
+<a href=#229 id=229 data-nosnippet>229</a>        <span class="kw">let </span>encoded = encode(packet).unwrap();
+<a href=#230 id=230 data-nosnippet>230</a>        <span class="macro">assert_eq!</span>(
+<a href=#231 id=231 data-nosnippet>231</a>            <span class="kw-2">&amp;</span>encoded[..<span class="number">12</span>],
+<a href=#232 id=232 data-nosnippet>232</a>            <span class="kw-2">&amp;</span>[<span class="string">b'H'</span>, <span class="string">b'L'</span>, <span class="string">b'I'</span>, <span class="string">b'I'</span>, <span class="string">b'N'</span>, <span class="string">b'I'</span>, <span class="string">b'T'</span>, <span class="string">b'1'</span>, <span class="number">0</span>, <span class="number">1</span>, <span class="number">0</span>, <span class="number">134</span>]
+<a href=#233 id=233 data-nosnippet>233</a>        );
+<a href=#234 id=234 data-nosnippet>234</a>        <span class="macro">assert_eq!</span>(HEADER_LEN, <span class="number">98</span>);
+<a href=#235 id=235 data-nosnippet>235</a>        <span class="kw">let </span>decoded = decode(<span class="kw-2">&amp;</span>encoded).unwrap();
+<a href=#236 id=236 data-nosnippet>236</a>        <span class="macro">assert_eq!</span>(decoded, packet);
+<a href=#237 id=237 data-nosnippet>237</a>        <span class="macro">assert_eq!</span>(decoded.coordinator.as_ptr(), encoded[HEADER_LEN..].as_ptr());
+<a href=#238 id=238 data-nosnippet>238</a>        <span class="macro">assert_eq!</span>(decoded.nonce.as_ptr(), encoded[<span class="number">12</span>..].as_ptr());
+<a href=#239 id=239 data-nosnippet>239</a>    }
+<a href=#240 id=240 data-nosnippet>240</a>
+<a href=#241 id=241 data-nosnippet>241</a>    <span class="attr">#[test]
+<a href=#242 id=242 data-nosnippet>242</a>    </span><span class="kw">fn </span>malformed_shapes_and_every_truncated_prefix_refuse() {
+<a href=#243 id=243 data-nosnippet>243</a>        <span class="kw">let </span>valid = encode(packet()).unwrap();
+<a href=#244 id=244 data-nosnippet>244</a>        <span class="kw">for </span>length <span class="kw">in </span><span class="number">0</span>..valid.len() {
+<a href=#245 id=245 data-nosnippet>245</a>            <span class="macro">assert!</span>(decode(<span class="kw-2">&amp;</span>valid[..length]).is_err(), <span class="string">"prefix {length}"</span>);
+<a href=#246 id=246 data-nosnippet>246</a>        }
+<a href=#247 id=247 data-nosnippet>247</a>        <span class="kw">for </span>(index, byte, expected) <span class="kw">in </span>[
+<a href=#248 id=248 data-nosnippet>248</a>            (<span class="number">0</span>, <span class="number">0</span>, PacketError::Magic),
+<a href=#249 id=249 data-nosnippet>249</a>            (<span class="number">9</span>, <span class="number">2</span>, PacketError::Version),
+<a href=#250 id=250 data-nosnippet>250</a>            (<span class="number">11</span>, <span class="number">0</span>, PacketError::Size),
+<a href=#251 id=251 data-nosnippet>251</a>            (<span class="number">76</span>, <span class="string">b'g'</span>, PacketError::Fingerprint),
+<a href=#252 id=252 data-nosnippet>252</a>            (<span class="number">93</span>, <span class="number">0</span>, PacketError::Length),
+<a href=#253 id=253 data-nosnippet>253</a>            (<span class="number">98</span>, <span class="number">0</span>, PacketError::Nul),
+<a href=#254 id=254 data-nosnippet>254</a>        ] {
+<a href=#255 id=255 data-nosnippet>255</a>            <span class="kw">let </span><span class="kw-2">mut </span>bytes = valid.clone();
+<a href=#256 id=256 data-nosnippet>256</a>            bytes[index] = byte;
+<a href=#257 id=257 data-nosnippet>257</a>            <span class="macro">assert_eq!</span>(decode(<span class="kw-2">&amp;</span>bytes), <span class="prelude-val">Err</span>(expected), <span class="string">"offset {index}"</span>);
+<a href=#258 id=258 data-nosnippet>258</a>        }
+<a href=#259 id=259 data-nosnippet>259</a>        <span class="kw">for </span>field <span class="kw">in </span><span class="number">0</span>..<span class="number">3 </span>{
+<a href=#260 id=260 data-nosnippet>260</a>            <span class="kw">let </span><span class="kw-2">mut </span>bytes = valid.clone();
+<a href=#261 id=261 data-nosnippet>261</a>            <span class="kw">let </span>index = <span class="number">92 </span>+ field * <span class="number">2</span>;
+<a href=#262 id=262 data-nosnippet>262</a>            <span class="kw">let </span>length = u16::from_be_bytes([bytes[index], bytes[index + <span class="number">1</span>]]) <span class="kw">as </span>usize;
+<a href=#263 id=263 data-nosnippet>263</a>            <span class="kw">let </span>start = <span class="number">98
+<a href=#264 id=264 data-nosnippet>264</a>                </span>+ [
+<a href=#265 id=265 data-nosnippet>265</a>                    packet().coordinator.len(),
+<a href=#266 id=266 data-nosnippet>266</a>                    packet().detlog_identity.len(),
+<a href=#267 id=267 data-nosnippet>267</a>                    packet().forward_policy.len(),
+<a href=#268 id=268 data-nosnippet>268</a>                ][..field]
+<a href=#269 id=269 data-nosnippet>269</a>                    .iter()
+<a href=#270 id=270 data-nosnippet>270</a>                    .sum::&lt;usize&gt;();
+<a href=#271 id=271 data-nosnippet>271</a>            bytes.drain(start..start + length);
+<a href=#272 id=272 data-nosnippet>272</a>            bytes[index..index + <span class="number">2</span>].copy_from_slice(<span class="kw-2">&amp;</span><span class="number">0_u16</span>.to_be_bytes());
+<a href=#273 id=273 data-nosnippet>273</a>            <span class="kw">let </span>total = bytes.len() <span class="kw">as </span>u16;
+<a href=#274 id=274 data-nosnippet>274</a>            bytes[<span class="number">10</span>..<span class="number">12</span>].copy_from_slice(<span class="kw-2">&amp;</span>total.to_be_bytes());
+<a href=#275 id=275 data-nosnippet>275</a>            <span class="macro">assert_eq!</span>(
+<a href=#276 id=276 data-nosnippet>276</a>                decode(<span class="kw-2">&amp;</span>bytes),
+<a href=#277 id=277 data-nosnippet>277</a>                <span class="prelude-val">Err</span>(PacketError::Empty),
+<a href=#278 id=278 data-nosnippet>278</a>                <span class="string">"empty field {field}"
+<a href=#279 id=279 data-nosnippet>279</a>            </span>);
+<a href=#280 id=280 data-nosnippet>280</a>        }
+<a href=#281 id=281 data-nosnippet>281</a>        <span class="kw">let </span><span class="kw-2">mut </span>trailing = valid.clone();
+<a href=#282 id=282 data-nosnippet>282</a>        trailing.push(<span class="number">1</span>);
+<a href=#283 id=283 data-nosnippet>283</a>        <span class="macro">assert_eq!</span>(decode(<span class="kw-2">&amp;</span>trailing), <span class="prelude-val">Err</span>(PacketError::Size));
+<a href=#284 id=284 data-nosnippet>284</a>        <span class="kw">let </span>total = trailing.len() <span class="kw">as </span>u16;
+<a href=#285 id=285 data-nosnippet>285</a>        trailing[<span class="number">10</span>..<span class="number">12</span>].copy_from_slice(<span class="kw-2">&amp;</span>total.to_be_bytes());
+<a href=#286 id=286 data-nosnippet>286</a>        <span class="macro">assert_eq!</span>(decode(<span class="kw-2">&amp;</span>trailing), <span class="prelude-val">Err</span>(PacketError::Length));
+<a href=#287 id=287 data-nosnippet>287</a>        <span class="kw">let </span>identity_start = <span class="number">98 </span>+ packet().coordinator.len();
+<a href=#288 id=288 data-nosnippet>288</a>        <span class="kw">for </span>(byte, error) <span class="kw">in </span>[(<span class="number">0</span>, PacketError::Nul), (<span class="number">0xff</span>, PacketError::Utf8)] {
+<a href=#289 id=289 data-nosnippet>289</a>            <span class="kw">let </span><span class="kw-2">mut </span>bytes = valid.clone();
+<a href=#290 id=290 data-nosnippet>290</a>            bytes[identity_start] = byte;
+<a href=#291 id=291 data-nosnippet>291</a>            <span class="macro">assert_eq!</span>(decode(<span class="kw-2">&amp;</span>bytes), <span class="prelude-val">Err</span>(error));
+<a href=#292 id=292 data-nosnippet>292</a>        }
+<a href=#293 id=293 data-nosnippet>293</a>        <span class="kw">let </span>policy_start = identity_start + packet().detlog_identity.len();
+<a href=#294 id=294 data-nosnippet>294</a>        <span class="kw">let </span><span class="kw-2">mut </span>bytes = valid;
+<a href=#295 id=295 data-nosnippet>295</a>        bytes[policy_start] = <span class="number">0xff</span>;
+<a href=#296 id=296 data-nosnippet>296</a>        <span class="macro">assert_eq!</span>(decode(<span class="kw-2">&amp;</span>bytes), <span class="prelude-val">Err</span>(PacketError::Utf8));
+<a href=#297 id=297 data-nosnippet>297</a>    }
+<a href=#298 id=298 data-nosnippet>298</a>
+<a href=#299 id=299 data-nosnippet>299</a>    <span class="attr">#[test]
+<a href=#300 id=300 data-nosnippet>300</a>    </span><span class="kw">fn </span>packet_bound_and_host_validation_have_no_fallback() {
+<a href=#301 id=301 data-nosnippet>301</a>        <span class="kw">let </span><span class="kw-2">mut </span>packet = packet();
+<a href=#302 id=302 data-nosnippet>302</a>        <span class="kw">let </span>path = <span class="macro">vec!</span>[
+<a href=#303 id=303 data-nosnippet>303</a>            <span class="string">b'x'</span>;
+<a href=#304 id=304 data-nosnippet>304</a>            MAX_PACKET_LEN
+<a href=#305 id=305 data-nosnippet>305</a>                - HEADER_LEN
+<a href=#306 id=306 data-nosnippet>306</a>                - packet.detlog_identity.len()
+<a href=#307 id=307 data-nosnippet>307</a>                - packet.forward_policy.len()
+<a href=#308 id=308 data-nosnippet>308</a>        ];
+<a href=#309 id=309 data-nosnippet>309</a>        packet.coordinator = <span class="kw-2">&amp;</span>path;
+<a href=#310 id=310 data-nosnippet>310</a>        <span class="kw">let </span>bytes = encode(packet).unwrap();
+<a href=#311 id=311 data-nosnippet>311</a>        <span class="macro">assert_eq!</span>(bytes.len(), <span class="number">4096</span>);
+<a href=#312 id=312 data-nosnippet>312</a>        <span class="macro">assert!</span>(decode(<span class="kw-2">&amp;</span>bytes).is_ok());
+<a href=#313 id=313 data-nosnippet>313</a>        <span class="kw">let </span>oversized = <span class="macro">vec!</span>[<span class="string">b'x'</span>; path.len() + <span class="number">1</span>];
+<a href=#314 id=314 data-nosnippet>314</a>        packet.coordinator = <span class="kw-2">&amp;</span>oversized;
+<a href=#315 id=315 data-nosnippet>315</a>        <span class="macro">assert_eq!</span>(encode(packet), <span class="prelude-val">Err</span>(PacketError::Size));
+<a href=#316 id=316 data-nosnippet>316</a>        packet.coordinator = <span class="string">b""</span>;
+<a href=#317 id=317 data-nosnippet>317</a>        <span class="macro">assert_eq!</span>(encode(packet), <span class="prelude-val">Err</span>(PacketError::Empty));
+<a href=#318 id=318 data-nosnippet>318</a>        packet.coordinator = <span class="string">b"x\0"</span>;
+<a href=#319 id=319 data-nosnippet>319</a>        <span class="macro">assert_eq!</span>(encode(packet), <span class="prelude-val">Err</span>(PacketError::Nul));
+<a href=#320 id=320 data-nosnippet>320</a>        packet.coordinator = <span class="string">b"x"</span>;
+<a href=#321 id=321 data-nosnippet>321</a>        packet.detlog_identity = <span class="string">""</span>;
+<a href=#322 id=322 data-nosnippet>322</a>        <span class="macro">assert_eq!</span>(encode(packet), <span class="prelude-val">Err</span>(PacketError::Empty));
+<a href=#323 id=323 data-nosnippet>323</a>        packet.detlog_identity = <span class="string">"1"</span>;
+<a href=#324 id=324 data-nosnippet>324</a>        packet.forward_policy = <span class="string">"\0"</span>;
+<a href=#325 id=325 data-nosnippet>325</a>        <span class="macro">assert_eq!</span>(encode(packet), <span class="prelude-val">Err</span>(PacketError::Nul));
+<a href=#326 id=326 data-nosnippet>326</a>        <span class="macro">assert_eq!</span>(decode(<span class="kw-2">&amp;</span><span class="macro">vec!</span>[<span class="number">1</span>; <span class="number">4097</span>]), <span class="prelude-val">Err</span>(PacketError::Size));
+<a href=#327 id=327 data-nosnippet>327</a>    }
+<a href=#328 id=328 data-nosnippet>328</a>
+<a href=#329 id=329 data-nosnippet>329</a>    <span class="kw">fn </span>bounded_config() -&gt; Config {
+<a href=#330 id=330 data-nosnippet>330</a>        Config {
+<a href=#331 id=331 data-nosnippet>331</a>            max_timeslice: <span class="prelude-val">None</span>,
+<a href=#332 id=332 data-nosnippet>332</a>            target_timeslice: <span class="prelude-val">None</span>,
+<a href=#333 id=333 data-nosnippet>333</a>            no_rcb_time: <span class="bool-val">true</span>,
+<a href=#334 id=334 data-nosnippet>334</a>            ..Config::default()
+<a href=#335 id=335 data-nosnippet>335</a>        }
+<a href=#336 id=336 data-nosnippet>336</a>    }
+<a href=#337 id=337 data-nosnippet>337</a>    <span class="attr">#[test]
+<a href=#338 id=338 data-nosnippet>338</a>    </span><span class="kw">fn </span>actual_config_options_refuse_without_mutation_and_verify_capture_remains() {
+<a href=#339 id=339 data-nosnippet>339</a>        <span class="kw">let </span><span class="kw-2">mut </span>allowed = bounded_config();
+<a href=#340 id=340 data-nosnippet>340</a>        allowed.record_host_inputs = <span class="bool-val">true</span>;
+<a href=#341 id=341 data-nosnippet>341</a>        <span class="macro">assert_eq!</span>(config_violation(<span class="kw-2">&amp;</span>allowed), <span class="prelude-val">None</span>);
+<a href=#342 id=342 data-nosnippet>342</a>        <span class="kw">let </span><span class="kw-2">mut </span>rcb = bounded_config();
+<a href=#343 id=343 data-nosnippet>343</a>        rcb.no_rcb_time = <span class="bool-val">false</span>;
+<a href=#344 id=344 data-nosnippet>344</a>        rcb.max_timeslice = <span class="prelude-val">Some</span>(std::num::NonZeroU64::new(<span class="number">1</span>).unwrap());
+<a href=#345 id=345 data-nosnippet>345</a>        <span class="macro">assert!</span>(rcb.use_rcb_time());
+<a href=#346 id=346 data-nosnippet>346</a>        <span class="macro">assert!</span>(config_violation(<span class="kw-2">&amp;</span>rcb).is_some());
+<a href=#347 id=347 data-nosnippet>347</a>        <span class="kw">let </span>mutations: <span class="kw-2">&amp;</span>[<span class="kw">fn</span>(<span class="kw-2">&amp;mut </span>Config)] = <span class="kw-2">&amp;</span>[
+<a href=#348 id=348 data-nosnippet>348</a>            |c| c.max_timeslice = <span class="prelude-val">Some</span>(std::num::NonZeroU64::new(<span class="number">1</span>).unwrap()),
+<a href=#349 id=349 data-nosnippet>349</a>            |c| c.target_timeslice = <span class="prelude-val">Some</span>(std::num::NonZeroU64::new(<span class="number">1</span>).unwrap()),
+<a href=#350 id=350 data-nosnippet>350</a>            |c| c.imprecise_timers = <span class="bool-val">true</span>,
+<a href=#351 id=351 data-nosnippet>351</a>            |c| c.chaos = <span class="bool-val">true</span>,
+<a href=#352 id=352 data-nosnippet>352</a>            |c| c.chaos_target_races = <span class="bool-val">true</span>,
+<a href=#353 id=353 data-nosnippet>353</a>            |c| c.chaos_per_thread_slowdown = <span class="bool-val">true</span>,
+<a href=#354 id=354 data-nosnippet>354</a>            |c| c.record_preemptions = <span class="bool-val">true</span>,
+<a href=#355 id=355 data-nosnippet>355</a>            |c| c.record_preemptions_to = <span class="prelude-val">Some</span>(<span class="string">"trace"</span>.into()),
+<a href=#356 id=356 data-nosnippet>356</a>            |c| c.replay_preemptions_from = <span class="prelude-val">Some</span>(<span class="string">"trace"</span>.into()),
+<a href=#357 id=357 data-nosnippet>357</a>            |c| c.replay_schedule_from = <span class="prelude-val">Some</span>(<span class="string">"trace"</span>.into()),
+<a href=#358 id=358 data-nosnippet>358</a>            |c| c.preemption_stacktrace = <span class="bool-val">true</span>,
+<a href=#359 id=359 data-nosnippet>359</a>            |c| c.preemption_stacktrace_log_file = <span class="prelude-val">Some</span>(<span class="string">"trace"</span>.into()),
+<a href=#360 id=360 data-nosnippet>360</a>            |c| c.stacktrace_event.push((<span class="number">1</span>, <span class="prelude-val">None</span>)),
+<a href=#361 id=361 data-nosnippet>361</a>            |c| c.stacktrace_signal = <span class="prelude-val">Some</span>(<span class="kw">crate</span>::schedule::SigWrapper(libc::SIGINT)),
+<a href=#362 id=362 data-nosnippet>362</a>            |c| c.recordreplay_modes = <span class="bool-val">true</span>,
+<a href=#363 id=363 data-nosnippet>363</a>            |c| c.replaying = <span class="bool-val">true</span>,
+<a href=#364 id=364 data-nosnippet>364</a>            |c| c.replay_data = <span class="prelude-val">Some</span>(<span class="string">"record"</span>.into()),
+<a href=#365 id=365 data-nosnippet>365</a>        ];
+<a href=#366 id=366 data-nosnippet>366</a>        <span class="kw">for </span>(index, mutate) <span class="kw">in </span>mutations.iter().enumerate() {
+<a href=#367 id=367 data-nosnippet>367</a>            <span class="kw">let </span><span class="kw-2">mut </span>config = bounded_config();
+<a href=#368 id=368 data-nosnippet>368</a>            mutate(<span class="kw-2">&amp;mut </span>config);
+<a href=#369 id=369 data-nosnippet>369</a>            <span class="kw">let </span>before = bincode::serde::encode_to_vec(<span class="kw-2">&amp;</span>config, bincode::config::legacy()).unwrap();
+<a href=#370 id=370 data-nosnippet>370</a>            <span class="macro">assert!</span>(config_violation(<span class="kw-2">&amp;</span>config).is_some(), <span class="string">"case {index}"</span>);
+<a href=#371 id=371 data-nosnippet>371</a>            <span class="macro">assert_eq!</span>(
+<a href=#372 id=372 data-nosnippet>372</a>                bincode::serde::encode_to_vec(<span class="kw-2">&amp;</span>config, bincode::config::legacy()).unwrap(),
+<a href=#373 id=373 data-nosnippet>373</a>                before
+<a href=#374 id=374 data-nosnippet>374</a>            );
+<a href=#375 id=375 data-nosnippet>375</a>        }
+<a href=#376 id=376 data-nosnippet>376</a>    }
+<a href=#377 id=377 data-nosnippet>377</a>}
+</code></pre></div></section></main></body></html>
