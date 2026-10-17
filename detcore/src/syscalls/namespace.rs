@@ -1302,15 +1302,38 @@ impl<T: RecordOrReplay> Detcore<T> {
         let inside = |path: &Path| -> Option<PathBuf> {
             Some(Path::new("/").join(path.strip_prefix(&root).ok()?))
         };
-        // The caller's pid as its procfs numbers it: Detcore's, or in a
-        // nested PID namespace the namespace's, read from its own
-        // `thread-self` (the tool shares the guest's process where it
-        // resolves these, under a launcher).
-        let pid = if guest.thread_state().nested_pid_namespace {
-            if !self.cfg.backend.tool_shares_guest_descriptor_table {
-                // A tracer's own `thread-self` is not the guest's.
-                return None;
+        // A tracer's own `self` and `thread-self` are not the guest's: name
+        // the guest's procfs directory instead, and the guest's pid as the
+        // tracer's procfs numbers it.
+        let tracer = !self.cfg.backend.tool_shares_guest_descriptor_table;
+        let spelled = if tracer {
+            let (pid, tid) = (guest.pid().as_raw(), guest.tid().as_raw());
+            let mut parts = spelled.components();
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some(Component::RootDir), Some(proc), Some(own)) if proc.as_os_str() == "proc" => {
+                    let own = match own.as_os_str().to_str() {
+                        Some("self") => PathBuf::from(format!("/proc/{pid}")),
+                        Some("thread-self") => PathBuf::from(format!("/proc/{pid}/task/{tid}")),
+                        _ => spelled.to_path_buf(),
+                    };
+                    if own.as_path() == spelled {
+                        own
+                    } else {
+                        own.join(parts.as_path())
+                    }
+                }
+                _ => spelled.to_path_buf(),
             }
+        } else {
+            spelled.to_path_buf()
+        };
+        let spelled = spelled.as_path();
+        // The caller's pid as its procfs numbers it: a tracer's view of it,
+        // Detcore's, or in a nested PID namespace the namespace's, read from
+        // its own `thread-self` (the tool shares the guest's process there).
+        let pid = if tracer {
+            guest.pid().as_raw()
+        } else if guest.thread_state().nested_pid_namespace {
             let own = std::fs::canonicalize(root.join("proc/thread-self")).ok()?;
             let own = inside(&own)?;
             let mut parts = own.components().skip(2);
@@ -1540,6 +1563,88 @@ impl<T: RecordOrReplay> Detcore<T> {
             .map_err(|_| Errno::EFAULT)?;
         restore_link_tail(guest, buffer, written, kernel_len, saved)?;
         Ok(written as i64)
+    }
+
+    /// Detcore's program-break model for the image the calling thread's
+    /// exec ran ([`crate::memory::BrkModel`]): Linux's start for the image's
+    /// layout (`crate::exec_record::ElfLayout`, read from the exec record's
+    /// file) at its load bias, which for a position-independent image is read
+    /// from the guest's mappings (the file's mapping at offset 0). The
+    /// in-memory program headers (`AT_PHDR`) would give the same bias, but a
+    /// backend whose kernel exec'd a launcher reports the launcher's auxv.
+    /// `None` without a record, where the file or its mapping cannot be read,
+    /// or where the bias cannot be found (a position-independent image Hermit
+    /// staged under another name for SaBRe).
+    fn brk_model_for_image<G: Guest<Self>>(&self, guest: &G) -> Option<crate::memory::BrkModel> {
+        let exe = guest.thread_state().exe.clone()?;
+        let root = self.guest_root(guest)?;
+        let file = root.join(exe.exe.strip_prefix("/").ok()?);
+        let layout = crate::exec_record::ElfLayout::read(&file)?;
+        let bias = if layout.position_independent {
+            let maps =
+                std::fs::read_to_string(self.guest_task_directory(guest)?.join("maps")).ok()?;
+            let mapped = std::fs::canonicalize(&file).ok()?;
+            crate::exec_record::load_bias(&maps, &mapped, exe.identity().1, layout.first_page)?
+        } else {
+            0
+        };
+        let start = layout.start_brk(bias)?;
+        Some(crate::memory::BrkModel {
+            start,
+            current: start,
+            data_span: layout.data_span,
+        })
+    }
+
+    /// Adopt the program-break model for the image an exec just ran
+    /// (`Self::brk_model_for_image`) as the address space's. Where the kernel
+    /// exec'd the guest (no launcher declared), the kernel's own `start_brk`
+    /// (`/proc/<pid>/stat` field 47) is the check: a model that differs is a
+    /// Detcore defect, reported as an error and dropped.
+    pub(crate) fn adopt_brk_model<G: Guest<Self>>(&self, guest: &G) {
+        let mut model = self.brk_model_for_image(guest);
+        let kernel = self
+            .declared_launcher()
+            .is_none()
+            .then(|| self.kernel_start_brk(guest))
+            .flatten();
+        tracing::debug!(
+            "[detcore, dtid {}] program break model {:?}, kernel start_brk {:?}",
+            guest.thread_state().dettid,
+            model.map(|model| model.start),
+            kernel,
+        );
+        if let (Some(computed), Some(kernel)) = (model, kernel)
+            && kernel != computed.start
+        {
+            tracing::error!(
+                "[detcore, dtid {}] program break model {:#x} differs from the kernel's start_brk {:#x}; dropped",
+                guest.thread_state().dettid,
+                computed.start,
+                kernel,
+            );
+            model = None;
+        }
+        guest
+            .thread_state()
+            .memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .brk_model = model;
+    }
+
+    /// The kernel's `start_brk` for the calling thread's process, field 47 of
+    /// its `/proc/<pid>/stat`, read where the tool reaches its procfs.
+    fn kernel_start_brk<G: Guest<Self>>(&self, guest: &G) -> Option<u64> {
+        let stat = std::fs::read_to_string(self.guest_task_directory(guest)?.join("stat")).ok()?;
+        // Fields after the command, which may hold spaces and parentheses,
+        // start with field 3.
+        let after_command = &stat[stat.rfind(')')? + 1..];
+        after_command
+            .split_ascii_whitespace()
+            .nth(47 - 3)?
+            .parse()
+            .ok()
     }
 
     /// Detcore's pid for the calling thread's process.

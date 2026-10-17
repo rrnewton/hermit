@@ -61,6 +61,27 @@ pub(crate) struct MemoryMetadata {
     /// The guest's most recently observed program break.
     #[serde(default)]
     brk_current: Option<u64>,
+    /// Detcore's model of this address space's program break, from the image
+    /// its exec ran ([`BrkModel`]); `None` where the image's layout could not
+    /// be read.
+    #[serde(default)]
+    pub(crate) brk_model: Option<BrkModel>,
+}
+
+/// Detcore's model of a process's program break: where Linux starts it for
+/// the image the process exec'd (`crate::exec_record::ElfLayout::start_brk`)
+/// and where it stands now. Detcore keeps it on every backend and checks the
+/// start against the kernel's wherever the kernel exec'd the guest; it answers
+/// `brk(2)` from it only where the kernel exec'd a launcher in the guest's
+/// place, whose break the kernel's is (`Detcore::handle_brk`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct BrkModel {
+    /// `mm->start_brk`.
+    pub(crate) start: u64,
+    /// `mm->brk`, as `brk(2)` last set it (not page-aligned).
+    pub(crate) current: u64,
+    /// `mm->end_data - mm->start_data` (`crate::exec_record::ElfLayout`).
+    pub(crate) data_span: u64,
 }
 
 impl MemoryMetadata {
@@ -75,6 +96,7 @@ impl MemoryMetadata {
             && self.shared_mappings.is_empty()
             && self.brk_start.is_none()
             && self.brk_current.is_none()
+            && self.brk_model.is_none()
     }
 
     /// Record a program break reported by a `brk(2)` return.

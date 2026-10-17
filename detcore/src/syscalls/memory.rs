@@ -230,6 +230,147 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 }
 
+/// The page size `brk(2)` rounds the break to.
+const BRK_PAGE: u64 = 4096;
+
+fn brk_page_align(address: u64) -> Option<u64> {
+    Some(address.checked_add(BRK_PAGE - 1)? & !(BRK_PAGE - 1))
+}
+
+impl<T: RecordOrReplay> Detcore<T> {
+    /// `brk(addr)` in a run whose kernel exec'd a launcher in the guest's place
+    /// ([`crate::LaunchImage::launcher`]), where the kernel's program break is
+    /// the launcher's: answered from Detcore's model of the guest's break
+    /// ([`crate::memory::BrkModel`]), as Linux's `brk` (mm/mmap.c) answers
+    /// from `mm->brk`. A request below the start, one past `RLIMIT_DATA`, or
+    /// growth that would come within a page of an existing mapping leaves the
+    /// break where it is; the call returns the break in effect afterwards,
+    /// never an error. Growth maps anonymous zero pages
+    /// (`MAP_FIXED_NOREPLACE`, so an existing mapping is never replaced) and
+    /// shrinking unmaps them. A run without a model for the image (Detcore
+    /// could not read its layout) is refused by name.
+    pub(crate) async fn handle_brk<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Syscall,
+    ) -> Result<i64, Error> {
+        let requested = syscalls::SyscallInfo::into_parts(call).1.arg0 as u64;
+        let model = guest
+            .thread_state()
+            .memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .brk_model;
+        let Some(model) = model else {
+            let reason = "unsupported: brk for an image whose layout Detcore could not read, \
+                          where the kernel's program break is the launcher's"
+                .to_owned();
+            return self
+                .refuse_launched_exe_because(guest, syscalls::Sysno::brk, reason)
+                .await;
+        };
+        let granted = self.granted_brk(guest, &model, requested).await;
+        guest
+            .thread_state()
+            .memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .brk_model = Some(crate::memory::BrkModel {
+            current: granted,
+            ..model
+        });
+        Ok(granted as i64)
+    }
+
+    /// The break `brk(requested)` leaves in effect, from `model`, mapping or
+    /// unmapping the pages between the old and the new break.
+    async fn granted_brk<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        model: &crate::memory::BrkModel,
+        requested: u64,
+    ) -> u64 {
+        let current = model.current;
+        if requested < model.start {
+            return current;
+        }
+        let limit = guest
+            .thread_state()
+            .resource_limits
+            .lock()
+            .unwrap()
+            .get(libc::RLIMIT_DATA)
+            .map_or(libc::RLIM64_INFINITY, |limit| limit.current);
+        let used = (requested - model.start).saturating_add(model.data_span);
+        if limit != libc::RLIM64_INFINITY && used > limit {
+            return current;
+        }
+        let (Some(new_end), Some(old_end)) = (brk_page_align(requested), brk_page_align(current))
+        else {
+            return current;
+        };
+        if new_end == old_end {
+            return requested;
+        }
+        if requested <= current {
+            let unmapped = guest
+                .inject_with_retry(syscalls::Syscall::Munmap(
+                    syscalls::Munmap::new()
+                        .with_addr(syscalls::Addr::from_raw(new_end as usize))
+                        .with_len((old_end - new_end) as usize),
+                ))
+                .await;
+            return if unmapped.is_ok() { requested } else { current };
+        }
+        // Linux grows the break only where no mapping starts within a page of
+        // the new end: map that page too, so that `MAP_FIXED_NOREPLACE`
+        // refuses an overlap with it as well, then give it back.
+        let Some(length) = (new_end - old_end).checked_add(BRK_PAGE) else {
+            return current;
+        };
+        let mapped = guest
+            .inject_with_retry(syscalls::Syscall::Mmap(
+                syscalls::Mmap::new()
+                    .with_addr(syscalls::Addr::from_raw(old_end as usize))
+                    .with_len(length as usize)
+                    .with_prot(syscalls::ProtFlags::PROT_READ | syscalls::ProtFlags::PROT_WRITE)
+                    .with_flags(
+                        syscalls::MapFlags::MAP_PRIVATE
+                            | syscalls::MapFlags::MAP_ANONYMOUS
+                            | syscalls::MapFlags::MAP_FIXED_NOREPLACE,
+                    )
+                    .with_fd(-1)
+                    .with_offset(0),
+            ))
+            .await;
+        match mapped {
+            Ok(address) if address as u64 == old_end => {
+                let guard = guest
+                    .inject_with_retry(syscalls::Syscall::Munmap(
+                        syscalls::Munmap::new()
+                            .with_addr(syscalls::Addr::from_raw(new_end as usize))
+                            .with_len(BRK_PAGE as usize),
+                    ))
+                    .await;
+                if guard.is_ok() { requested } else { current }
+            }
+            // A kernel without MAP_FIXED_NOREPLACE treats the address as a
+            // hint and may map elsewhere: give that mapping back.
+            Ok(address) => {
+                let _ = guest
+                    .inject_with_retry(syscalls::Syscall::Munmap(
+                        syscalls::Munmap::new()
+                            .with_addr(syscalls::Addr::from_raw(address as usize))
+                            .with_len(length as usize),
+                    ))
+                    .await;
+                current
+            }
+            Err(_) => current,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

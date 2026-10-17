@@ -3046,6 +3046,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
 
         tool_global::mark_past_first_execve(guest).await;
+        // The new image's program-break model, once its exec record is in place.
+        self.adopt_brk_model(guest);
         // Linux discards every queued POSIX timer signal at exec
         // (`flush_itimer_signals`), and Hermit's are ordinary signals it sent:
         // take them back before the new image runs
@@ -4420,6 +4422,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // Linux and the backend own the pass-through call. Detcore also
             // mirrors its successful registration into the scheduler because
             // the scheduler supplies the logical CHILD_CLEARTID wake.
+            // Where the kernel exec'd a launcher in the guest's place, the
+            // kernel's program break is the launcher's: Detcore answers brk
+            // from its model of the guest's (`Detcore::handle_brk`).
+            SyscallClassification::PassThrough
+                if call.number() == Sysno::brk && self.declared_launcher().is_some() =>
+            {
+                self.handle_brk(guest, call).await
+            }
             SyscallClassification::PassThrough if call.number() == Sysno::set_tid_address => {
                 match call {
                     Syscall::SetTidAddress(s) => self.handle_set_tid_address(guest, s).await,
