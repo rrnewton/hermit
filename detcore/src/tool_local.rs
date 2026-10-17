@@ -3579,6 +3579,12 @@ pub struct ThreadState<T> {
     pub(crate) published_dispositions:
         Arc<Mutex<crate::syscalls::signal_shadow::PublishedDispositions>>,
 
+    /// The mask this thread last had the scheduler take from Detcore's copy
+    /// (A5 step 2b, `signal_shadow::publish_mask`); `None` when it holds
+    /// none for this thread.
+    #[serde(default)]
+    pub(crate) published_mask: Option<u64>,
+
     /// The SIGALRM blocked bit this thread last published to the scheduler's
     /// ledger (signal phase 1). A handler's return changes the virtual mask
     /// without a syscall; the next syscall's entry compares the runtime's
@@ -4362,6 +4368,7 @@ impl<T> ThreadState<T> {
             sigalrm_handled: false,
             signal_shadow: None,
             signal_shadow_lost: false,
+            published_mask: None,
             published_dispositions: Arc::default(),
             sigalrm_blocked_published: false,
             handler_restore_rt_reported: 0,

@@ -2927,6 +2927,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     // The threads of a process share the record of what the
                     // scheduler holds for it; a new process has nothing
                     // published.
+                    // A new thread has published no mask.
+                    published_mask: None,
                     published_dispositions: if clone_flags.contains(CloneFlags::CLONE_THREAD) {
                         Arc::clone(&pts.1.published_dispositions)
                     } else {

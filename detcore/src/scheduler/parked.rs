@@ -840,7 +840,7 @@ impl Scheduler {
             }
             let mask = match self.saved_guest_sigmasks.get(&thread) {
                 Some(mask) => *mask,
-                None => match self.thread_signal_mask(thread) {
+                None => match self.thread_signal_mask_for(thread, signo) {
                     Some(mask) => mask,
                     None => return RealTimeFate::Deliverable,
                 },
