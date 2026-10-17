@@ -4814,6 +4814,24 @@ mod tests {
         COPIED_PANIC_ON_UNSUPPORTED.store(saved, Ordering::Release);
     }
 
+    #[test]
+    fn copied_child_refuses_priority_queries_only_in_strict_mode() {
+        let _guard = COPIED_CHILD_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved = COPIED_PANIC_ON_UNSUPPORTED.load(Ordering::Acquire);
+        assert!(detcore::is_determinized_syscall(Sysno::getpriority));
+        for (strict, expected) in [(true, 1), (false, 0)] {
+            COPIED_PANIC_ON_UNSUPPORTED.store(strict, Ordering::Release);
+            assert_eq!(
+                copied_child_action(Sysno::getpriority.id() as i64),
+                expected,
+                "getpriority in a copied child, strict={strict}"
+            );
+        }
+        COPIED_PANIC_ON_UNSUPPORTED.store(saved, Ordering::Release);
+    }
+
     /// Fails when a `Determinized` syscall gains a silent native escape in a
     /// strict copied child. See `ACKNOWLEDGED_STRICT_COPIED_CHILD_ESCAPES`.
     #[test]
