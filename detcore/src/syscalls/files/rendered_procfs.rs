@@ -1665,7 +1665,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 if path.as_os_str().is_empty() {
                     return Ok(None);
                 }
-                let observed = Self::observed_path(guest, dirfd, &path)?;
+                let observed = self.procfs_spelling_at(guest, dirfd, &path).await?;
                 match self.rendered_procfs_at(guest, &observed).await? {
                     // A link's own metadata is not its target's: `lstat` of
                     // `/proc/self/fd/N` describes the link, which the kernel has.
@@ -2476,7 +2476,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // file's name or a descriptor number.
             let files = self.rendered_files(guest);
             let lexical = if could_name_rendered(&text, files) {
-                let observed = Self::observed_path(guest, dirfd, &text)?;
+                let observed = self.procfs_spelling_at(guest, dirfd, &text).await?;
                 match self.rendered_procfs_at(guest, &observed).await? {
                     // A call that does not follow a descriptor link acts on
                     // the link itself, which the kernel has.
