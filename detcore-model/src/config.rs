@@ -2005,10 +2005,10 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
             "backend_supports_parked_write_signal_interruption",
             backend.supports_parked_write_signal_interruption,
         ),
-        (
-            "backend_virtualizes_capability_prctls",
-            backend.virtualizes_capability_prctls,
-        ),
+        // No backend virtualizes the capability prctls any more; they reach
+        // the kernel on every backend. Always false; see
+        // `from_legacy_backend_json`.
+        ("backend_virtualizes_capability_prctls", false),
         (
             "backend_defers_vfork_child_registration",
             backend.defers_vfork_child_registration,
@@ -2059,6 +2059,11 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// says `true` fails the parse rather than being read as a policy no backend
 /// has.
 ///
+/// `backend_virtualizes_capability_prctls` supplies no capability either: it
+/// said the backend answered the capability-set prctls itself, and every
+/// backend now passes them to the kernel. It is written as false, so DBT's
+/// configuration keeps its bytes, and `true` fails the parse.
+///
 /// `kvm_shared_dequeue_timers` supplies no capability. It was read into a
 /// `Config` field that chose the controlled signal path, and that choice is
 /// now made from the capabilities, [`Config::sequentialize_threads`] and the
@@ -2103,6 +2108,12 @@ pub fn from_legacy_backend_json(json: &str) -> serde_json::Result<Config> {
         return Err(<serde_json::Error as serde::de::Error>::custom(
             "cpuid_virtualized_by_backend is true, but no backend installs a CPUID \
              policy of its own; the key must be false or absent",
+        ));
+    }
+    if legacy.backend_virtualizes_capability_prctls {
+        return Err(<serde_json::Error as serde::de::Error>::custom(
+            "backend_virtualizes_capability_prctls is true, but no backend answers the \
+             capability prctls itself; the key must be false or absent",
         ));
     }
     let controlled = legacy.backend_is_kvm && config.sequentialize_threads;
@@ -2272,7 +2283,6 @@ impl LegacyBackendKeys {
         backend.supports_parked_write_signal_interruption =
             self.backend_supports_parked_write_signal_interruption;
         backend.defers_vfork_child_registration = self.backend_defers_vfork_child_registration;
-        backend.virtualizes_capability_prctls = self.backend_virtualizes_capability_prctls;
         backend.supports_madvise = self.backend_supports_madvise;
         // A legacy encoding predates this key: every backend that supports
         // madvise supports MADV_DONTNEED, and KVM implements it alone.
@@ -2841,7 +2851,6 @@ mod tests {
         assert!(config.backend.runs_exit_robust_list);
         assert!(!config.backend.requires_thread_directed_process_signals);
         assert!(config.backend.supports_parked_write_signal_interruption);
-        assert!(!config.backend.virtualizes_capability_prctls);
         assert!(!config.backend.defers_vfork_child_registration);
         assert!(!config.sequentialize_threads);
         assert!(
@@ -3285,7 +3294,14 @@ mod tests {
                     expected.supports_parked_write_signal_interruption = false
                 }
                 "backend_virtualizes_capability_prctls" => {
-                    expected.virtualizes_capability_prctls = true
+                    // No backend answers the capability prctls itself, so
+                    // `true` fails the parse.
+                    let mut flipped = ptrace.clone();
+                    flipped.insert(key.to_owned(), serde_json::Value::Bool(!ptrace_value));
+                    let error = from_legacy_backend_json(&serde_json::to_string(&flipped).unwrap())
+                        .unwrap_err();
+                    assert!(error.to_string().contains(key), "{error}");
+                    continue;
                 }
                 "backend_defers_vfork_child_registration" => {
                     expected.defers_vfork_child_registration = true

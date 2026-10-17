@@ -1602,6 +1602,48 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/capability-set-prctls",
+          "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/capability-set-prctls",
+          "mode": "verify",
+          "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/capability-set-prctls",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/capability-set-prctls",
+          "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/capability-set-prctls",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/capability-set-prctls",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/child-subreaper-refusal",
           "mode": "verify",
           "backend": "dbt"
@@ -26216,6 +26258,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/capability-set-prctls",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/child-subreaper-support",
           "mode": "verify",
           "backend": "ptrace"
@@ -31586,6 +31635,27 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/cachestat-refusal",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/capability-set-prctls",
+          "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/capability-set-prctls",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/capability-set-prctls",
           "mode": "verify",
           "backend": "sabre"
         },
@@ -48436,6 +48506,48 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/cachestat-refusal",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/capability-set-prctls",
+          "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/capability-set-prctls",
+          "mode": "verify",
+          "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/capability-set-prctls",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/capability-set-prctls",
+          "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/capability-set-prctls",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/capability-set-prctls",
           "mode": "verify",
           "backend": "sabre"
         },

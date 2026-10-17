@@ -1783,7 +1783,14 @@ fi
 # for the root Cargo.toml, Cargo.lock and rust-toolchain.toml, so all seven
 # SDK inputs, inventory 961, the calibrated budget, job width and limits are
 # unchanged.
-expected_pin=4021030b81acd342affafaab923b096636670df4
+# CARRY TO bce37465c03a15101b8115531d49888222607007 (2026-10-16): from
+# 4021030b81acd342affafaab923b096636670df4. The interval is one commit, bce37465, which removes the
+# virtualizes_capability_prctls field from reverie-core's BackendCapabilities
+# (reverie/src/capabilities.rs only). git diff is empty under reverie-dbt/, and
+# the root Cargo.toml, Cargo.lock and rust-toolchain.toml are unchanged. All
+# seven SDK inputs, inventory 961, calibrated budget, job width and limits are
+# unchanged.
+expected_pin=bce37465c03a15101b8115531d49888222607007
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

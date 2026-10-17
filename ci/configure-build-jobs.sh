@@ -1860,8 +1860,15 @@ fi
 # for the root Cargo.toml, Cargo.lock and rust-toolchain.toml, so all seven
 # SDK inputs, inventory 961, the calibrated budget, job width and limits are
 # unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 4021030b81acd342affafaab923b096636670df4 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 4021030b81acd342affafaab923b096636670df4 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO bce37465c03a15101b8115531d49888222607007 (2026-10-16): from
+# 4021030b81acd342affafaab923b096636670df4. The interval is one commit, bce37465, which removes the
+# virtualizes_capability_prctls field from reverie-core's BackendCapabilities
+# (reverie/src/capabilities.rs only). git diff is empty under reverie-dbt/, and
+# the root Cargo.toml, Cargo.lock and rust-toolchain.toml are unchanged. All
+# seven SDK inputs, inventory 961, calibrated budget, job width and limits are
+# unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != bce37465c03a15101b8115531d49888222607007 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie bce37465c03a15101b8115531d49888222607007 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
