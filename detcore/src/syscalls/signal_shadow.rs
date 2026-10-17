@@ -805,6 +805,58 @@ where
     }
 }
 
+/// The guest's dispositions as Detcore's copy holds them, in the kernel's bit
+/// layout: the signals it ignores and the signals it catches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CopiedDispositions {
+    /// Signals whose action is `SIG_IGN`.
+    pub(crate) ignored: KernelSigset,
+    /// Signals with a handler.
+    pub(crate) caught: KernelSigset,
+}
+
+/// This thread's dispositions from Detcore's copy, for a decision that needs
+/// only them (A5 step 2a). `None` where the copy cannot answer: none is kept,
+/// the actions it shares are unknown, or an unreported signal is noted
+/// anywhere (a handler may have changed the actions unseen). The caller then
+/// reads the kernel's `/proc` view as before. Where the copy answers, it holds
+/// what the kernel holds: it is checked against the kernel after each
+/// recorded call and gives itself up on any mismatch.
+///
+/// The SIGTRAP and preemption-signal bits are not modelled exactly (the
+/// backend changes their kernel state unseen), so a decision about one of
+/// those signals uses [`copied_dispositions_for`].
+pub(crate) fn copied_dispositions<G, T>(guest: &G) -> Option<CopiedDispositions>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if any_notes() {
+        return None;
+    }
+    let shadow = guest.thread_state().signal_shadow.as_ref()?;
+    let actions = shadow.dispositions.lock().unwrap();
+    let dispositions = actions.as_ref()?;
+    Some(CopiedDispositions {
+        ignored: dispositions.ignored(),
+        caught: dispositions.caught(),
+    })
+}
+
+/// [`copied_dispositions`] for a decision about `signal` alone: also `None`
+/// for SIGTRAP and Reverie's preemption signal, whose kernel state the
+/// backend changes without the copy seeing it.
+pub(crate) fn copied_dispositions_for<G, T>(guest: &G, signal: i32) -> Option<CopiedDispositions>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if (trap() | reserved()) & sigbit(signal) != 0 {
+        return None;
+    }
+    copied_dispositions(guest)
+}
+
 /// Whether this tool asks the backend to report every guest `rt_sigreturn`
 /// (`Tool::observes_sigreturns`): where the copy is kept (serialized
 /// threads), the backend can report them, no gdbserver is attached (the
@@ -1740,6 +1792,62 @@ mod tests {
             .signal_shadow
             .as_ref()
             .map_or(0, |shadow| shadow.thread.activations.len())
+    }
+
+    #[test]
+    fn copied_dispositions_answer_only_where_the_copy_can() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let mut guest = seeded(&kernel, 0);
+        let handler = KernelSigaction {
+            handler: 0x4000,
+            flags: (libc::SA_SIGINFO | 0x0400_0000) as u64,
+            restorer: 0x7000,
+            mask: 0,
+        };
+        let ignore = KernelSigaction {
+            handler: libc::SIG_IGN as u64,
+            flags: 0x0400_0000,
+            restorer: 0x7000,
+            mask: 0,
+        };
+        kernel.set(0, 0, USR1);
+        record_rt_sigaction(&mut guest, libc::SIGUSR1, Some(handler), None, &Ok(0));
+        kernel.set(0, USR2, USR1);
+        record_rt_sigaction(&mut guest, libc::SIGUSR2, Some(ignore), None, &Ok(0));
+        let expected = Some(CopiedDispositions {
+            ignored: USR2,
+            caught: USR1,
+        });
+        assert_eq!(
+            copied_dispositions(&guest),
+            expected,
+            "what the kernel holds"
+        );
+        assert_eq!(copied_dispositions_for(&guest, libc::SIGUSR1), expected);
+        // The backend changes these signals' kernel state unseen.
+        assert_eq!(copied_dispositions_for(&guest, libc::SIGTRAP), None);
+        assert_eq!(
+            copied_dispositions_for(&guest, reverie::PERF_EVENT_SIGNAL as i32),
+            None
+        );
+        // An unreported signal noted anywhere: a handler may have changed the
+        // actions unseen.
+        note_unreported(1, i32::MAX - 1, libc::SIGUSR1);
+        assert_eq!(copied_dispositions(&guest), None);
+        with_notes(|notes| notes.clear());
+        assert_eq!(copied_dispositions(&guest), expected);
+        // Shared actions another thread lost are unknown.
+        guest
+            .thread
+            .signal_shadow
+            .as_ref()
+            .unwrap()
+            .forget_dispositions();
+        assert_eq!(copied_dispositions(&guest), None);
+        // No copy at all.
+        guest.thread.signal_shadow = None;
+        assert_eq!(copied_dispositions(&guest), None);
     }
 
     #[test]
