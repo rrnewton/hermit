@@ -2453,7 +2453,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_break_check_compares_only_where_linuxs_rule_gives_the_kernels_start): 1982, listed.
     // And +5 from 9d6182b5: 1982.
     // And the ten in-flight-dequeue units of https://github.com/rrnewton/hermit/pull/4499: 1992, listed.
-    ("test.detcore_unit", 1992),
+    // And A5 step 2's six sigreturn-report signal_shadow tests: 1998, listed.
+    ("test.detcore_unit", 1998),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4252,7 +4253,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same five program-break model and check tests: 1982, listed.
     // And +5 from 9d6182b5: 1982.
     // And the same ten in-flight-dequeue units: 1992.
-    ("test.detcore_unit_on_host", 1992),
+    // And the same six sigreturn-report tests: 1998.
+    ("test.detcore_unit_on_host", 1998),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
