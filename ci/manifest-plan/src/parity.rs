@@ -5905,7 +5905,10 @@ mod tests {
         // sysv-shm-enosys and perf-event-open-enosys and system-utils/echo-stdout,
         // and merged c-programs/get-robust-list-self into robust-list, one row
         // per candidate backend each, 5 x 5: 2980.
-        assert_eq!(parsed.cells.len(), 2980);
+        // The same audit deleted 13 compat rows (sync, gcc, python3, zstd,
+        // zstd-roundtrip, tar, tar-roundtrip, gzip, bzip2, xz, echo, true,
+        // printf), 13 x 5: 2915.
+        assert_eq!(parsed.cells.len(), 2915);
         assert_eq!(parsed.schema, PARITY_CELLS_SCHEMA);
         // The repository's limit for a text file is 2 MiB. This bound was
         // 1 MiB until fold 5 of https://github.com/rrnewton/hermit/issues/3448

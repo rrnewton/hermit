@@ -1321,7 +1321,9 @@ mod tests {
                 }
             }
         }
-        assert_eq!((gated, refused), (214, UNSELECTED_REPLAY.len()));
+        // 214 until the 2026-10-17 test audit deleted 13 rows, each with a
+        // gated replay cell: 201.
+        assert_eq!((gated, refused), (201, UNSELECTED_REPLAY.len()));
     }
 
     /// The replay cells the 2026-10-09 survey saw fail, each with its issue.
