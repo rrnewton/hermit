@@ -1831,7 +1831,12 @@ fi
 # src/lib.rs (two imports gated on prototype-runtime); no file is added
 # (inventory 961), and build.rs, vendor/, native/, the root Cargo.toml,
 # Cargo.lock and rust-toolchain.toml are unchanged, so the budget carries.
-expected_pin=bc301d042d8f871326c2b7d6168919aa99f0fa2d
+# CARRY TO bf13e06eff3b9c9927c624eee051f4229659277a (2026-10-17): from
+# bc301d042d8f871326c2b7d6168919aa99f0fa2d through A5 step 2's sigreturn report (Tool::observes_sigreturns,
+# Tool::handle_sigreturn, BackendCapabilities::reports_sigreturns; reverie-core
+# and reverie-ptrace only). reverie-dbt tree, root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml are unchanged, so the budget carries unchanged.
+expected_pin=bf13e06eff3b9c9927c624eee051f4229659277a
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

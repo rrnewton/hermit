@@ -1908,8 +1908,13 @@ fi
 # src/lib.rs (two imports gated on prototype-runtime); no file is added
 # (inventory 961), and build.rs, vendor/, native/, the root Cargo.toml,
 # Cargo.lock and rust-toolchain.toml are unchanged, so the budget carries.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != bc301d042d8f871326c2b7d6168919aa99f0fa2d ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie bc301d042d8f871326c2b7d6168919aa99f0fa2d (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO bf13e06eff3b9c9927c624eee051f4229659277a (2026-10-17): from
+# bc301d042d8f871326c2b7d6168919aa99f0fa2d through A5 step 2's sigreturn report (Tool::observes_sigreturns,
+# Tool::handle_sigreturn, BackendCapabilities::reports_sigreturns; reverie-core
+# and reverie-ptrace only). reverie-dbt tree, root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml are unchanged, so the budget carries unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != bf13e06eff3b9c9927c624eee051f4229659277a ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie bf13e06eff3b9c9927c624eee051f4229659277a (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
