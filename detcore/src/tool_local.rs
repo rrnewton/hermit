@@ -3571,6 +3571,14 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub(crate) signal_shadow_lost: bool,
 
+    /// The dispositions the scheduler holds for this thread's process, as its
+    /// threads last published them (A5 step 2b,
+    /// `signal_shadow::publish_dispositions`); `None` when it holds none.
+    /// Shared by the threads of a process, which publish one entry.
+    #[serde(default)]
+    pub(crate) published_dispositions:
+        Arc<Mutex<Option<crate::syscalls::signal_shadow::CopiedDispositions>>>,
+
     /// The SIGALRM blocked bit this thread last published to the scheduler's
     /// ledger (signal phase 1). A handler's return changes the virtual mask
     /// without a syscall; the next syscall's entry compares the runtime's
@@ -4354,6 +4362,7 @@ impl<T> ThreadState<T> {
             sigalrm_handled: false,
             signal_shadow: None,
             signal_shadow_lost: false,
+            published_dispositions: Arc::default(),
             sigalrm_blocked_published: false,
             handler_restore_rt_reported: 0,
             signal_register_projection: None,

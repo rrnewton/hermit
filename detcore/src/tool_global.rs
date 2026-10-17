@@ -2267,6 +2267,20 @@ impl GlobalState {
                 .discarded_signal_control(dtid, control);
             return (None, R::DiscardedSignal(answer));
         }
+        // A thread's copied signal dispositions
+        // (`syscalls::signal_shadow::publish_dispositions`): like the control
+        // messages above, it carries no logical time and its answer carries
+        // none back. It replaces what the scheduler holds for the sender's
+        // process, which the sender's own operations changed while it held
+        // the turn.
+        if let GlobalRequest::PublishSignalDispositions(dispositions) = request {
+            let taken = self
+                .sched
+                .lock()
+                .unwrap()
+                .publish_signal_dispositions(dtid, dispositions);
+            return (None, R::PublishSignalDispositions(taken));
+        }
         if let GlobalRequest::SignalDequeued {
             detpid,
             identity,
@@ -2510,6 +2524,9 @@ impl GlobalState {
             }
             GlobalRequest::RecordDeterminismLoss(_) => {
                 unreachable!("determinism loss answered before clock accounting")
+            }
+            GlobalRequest::PublishSignalDispositions(_) => {
+                unreachable!("published dispositions answered before clock accounting")
             }
             GlobalRequest::ParkedRequest(rs, pid, capability) => {
                 let (response, _) = self
@@ -5608,6 +5625,11 @@ pub enum GlobalRequest {
     /// Change or read the state Detcore keeps on a rendered per-process
     /// `/proc` file's inode (`InodePool::rendered_file_state`). Appended last.
     RenderedFileState(u64, crate::procfs::listing::RenderedFileChange),
+    /// The sender's process's signal dispositions as Detcore's copy holds
+    /// them, or `None` to withdraw them
+    /// (`Scheduler::publish_signal_dispositions`). Answered before any clock
+    /// or scheduler accounting. Appended last.
+    PublishSignalDispositions(Option<crate::syscalls::signal_shadow::CopiedDispositions>),
 }
 
 /// Responses from the global object
@@ -5791,6 +5813,9 @@ pub enum GlobalResponse {
     ProcfsTask(crate::procfs::listing::ProcfsTaskAnswer),
     /// Appended last.
     RenderedFileState(crate::procfs::listing::RenderedFileState),
+    /// Whether the scheduler took the dispositions (it ignores a thread it
+    /// has not registered). Appended last.
+    PublishSignalDispositions(bool),
 }
 
 /// `request`, carrying the number of records this guest thread produced for
@@ -6181,6 +6206,32 @@ where
     assert_eq!(response, GlobalResponse::SetChildTidAddress(()));
 }
 
+/// Whether the scheduler took `dispositions` as the calling thread's
+/// process's (`Scheduler::publish_signal_dispositions`; `None` withdraws
+/// them). Like the zero-time control messages it carries no logical time and
+/// its answer carries none back. It is sent from `send_and_update_time`, not
+/// through it, so it neither consumes a grant's deadline nor counts forwarded
+/// records.
+pub(crate) async fn publish_signal_dispositions<G, T>(
+    guest: &mut G,
+    dispositions: Option<crate::syscalls::signal_shadow::CopiedDispositions>,
+) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let state = guest.thread_state();
+    let message = (
+        state.thread_logical_time.clone(),
+        state.mm_id,
+        GlobalRequest::PublishSignalDispositions(dispositions),
+    );
+    matches!(
+        guest.send_rpc(message).await.1,
+        GlobalResponse::PublishSignalDispositions(true)
+    )
+}
+
 pub async fn send_and_update_time<G, T>(
     guest: &mut G,
     request: GlobalRequest,
@@ -6199,6 +6250,9 @@ where
         guest.thread_state().dettid,
         "replacement image must reconnect before ordinary RPCs"
     );
+    // Any request may let another thread run, which may then decide from
+    // this thread's process's dispositions.
+    crate::syscalls::signal_shadow::publish_dispositions(guest).await;
     let mytime = guest.thread_state().thread_logical_time.clone();
     let mm = guest.thread_state().mm_id;
     let mut resp = guest.send_rpc((mytime, mm, counted_request(request))).await;

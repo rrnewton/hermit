@@ -14,7 +14,9 @@
 //! committed, uses only values Detcore already holds for that operation, and
 //! issues no injection and no scheduler request: recording changes nothing the
 //! guest or the schedule can observe, and adds no log line at INFO or above
-//! while the copy matches (one TRACE line per check, for counting).
+//! while the copy matches (one TRACE line per check, for counting). The
+//! scheduler learns the copy's dispositions separately, from
+//! [`publish_dispositions`], a message that carries no logical time.
 //!
 //! Where the backend's kernel signal state is the guest's own
 //! ([`kernel_state_is_the_guests`]), the
@@ -30,6 +32,8 @@ use reverie::Pid;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::MemoryAccess;
+use serde::Deserialize;
+use serde::Serialize;
 use tracing::debug;
 use tracing::trace;
 use tracing::warn;
@@ -849,8 +853,8 @@ where
 
 /// The guest's dispositions as Detcore's copy holds them, in the kernel's bit
 /// layout: the signals it ignores and the signals it catches.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CopiedDispositions {
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CopiedDispositions {
     /// Signals whose action is `SIG_IGN`.
     pub(crate) ignored: KernelSigset,
     /// Signals with a handler.
@@ -877,7 +881,14 @@ where
     if any_notes() {
         return None;
     }
-    let shadow = guest.thread_state().signal_shadow.as_ref()?;
+    table_dispositions(guest.thread_state())
+}
+
+/// The dispositions `thread`'s copy holds for the actions it shares, whether
+/// or not an unreported signal is noted: `None` without a copy, or with the
+/// shared actions unknown.
+fn table_dispositions<T>(thread: &crate::tool_local::ThreadState<T>) -> Option<CopiedDispositions> {
+    let shadow = thread.signal_shadow.as_ref()?;
     let actions = shadow.dispositions.lock().unwrap();
     let dispositions = actions.as_ref()?;
     Some(CopiedDispositions {
@@ -894,10 +905,107 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    if (forced() | reserved()) & sigbit(signal) != 0 {
+    if !models(signal) {
         return None;
     }
     copied_dispositions(guest)
+}
+
+/// Whether the copy holds `signal`'s state exactly: it is neither a signal
+/// Linux force-delivers ([`forced`]) nor Reverie's preemption signal
+/// ([`reserved`]), whose kernel state changes without the copy seeing it.
+fn models(signal: i32) -> bool {
+    (forced() | reserved()) & sigbit(signal) == 0
+}
+
+/// What this thread has to publish to the scheduler as its process's
+/// dispositions ([`publish_dispositions`]): the copy's, or `None` to withdraw
+/// what it published, because it has no copy or the shared actions became
+/// unknown. Nothing (the outer `None`) when the scheduler already holds that
+/// for the process, and where no copy is kept.
+fn dispositions_due<G, T>(guest: &G) -> Option<Option<CopiedDispositions>>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if !kernel_state_is_the_guests(guest) {
+        return None;
+    }
+    let current = table_dispositions(guest.thread_state());
+    let published = *guest.thread_state().published_dispositions.lock().unwrap();
+    (current != published).then_some(current)
+}
+
+/// Publishes this thread's copied dispositions to the scheduler as its
+/// process's (A5 step 2b), where they differ from what the scheduler holds
+/// for it (`ThreadState::published_dispositions`), so that a decision about another thread reads them in
+/// place of the kernel's `/proc` view (`Scheduler::published_dispositions_for`).
+///
+/// Called before each of the thread's requests that can let another thread
+/// run (`tool_global::send_and_update_time`). Every change to the actions is
+/// recorded in this thread's own operations, while it holds the turn, so the
+/// scheduler holds the new actions before any other thread can read them. A
+/// thread the scheduler has not registered yet is refused, and publishes at
+/// its next request.
+///
+/// Every thread sharing the actions holds them behind one reference, so a
+/// thread publishes them as they are now, whoever changed them. The
+/// scheduler keys them by process, which is right because the actions of a
+/// process are never shared with another one: [`before_clone`] makes them
+/// unknown first.
+pub(crate) async fn publish_dispositions<G, T>(guest: &mut G)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let Some(current) = dispositions_due(guest) else {
+        return;
+    };
+    let taken = crate::tool_global::publish_signal_dispositions(guest, current).await;
+    trace!(
+        "[dtid {}] signal-state copy: published its process's dispositions {:?} (taken: {})",
+        guest.thread_state().dettid,
+        current,
+        taken
+    );
+    if taken {
+        *guest.thread_state().published_dispositions.lock().unwrap() = current;
+    }
+}
+
+/// Whether dispositions a process published ([`publish_dispositions`])
+/// decide about `signal` now: the copy holds it exactly ([`models`]), and no
+/// unreported signal is noted, whose handler may have changed the actions
+/// unseen (`SA_RESETHAND`) until its thread consumes the note at its next
+/// syscall and gives its copy up.
+pub(crate) fn published_dispositions_decide(signal: i32) -> bool {
+    models(signal) && !any_notes()
+}
+
+/// Before this thread runs a clone with `flags`: a child that shares the
+/// actions from another process (`CLONE_SIGHAND` without `CLONE_THREAD`)
+/// could change them where the scheduler, which keeps the published
+/// dispositions per process, would not see it for this one. The actions
+/// become unknown to every thread sharing them, and are withdrawn before the
+/// child exists. Such a child gets no copy (`SignalShadow::for_clone`).
+pub(crate) async fn before_clone<G, T>(guest: &mut G, flags: u64)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let shares_actions = flags & libc::CLONE_SIGHAND as u64 != 0;
+    let new_process = flags & libc::CLONE_THREAD as u64 == 0;
+    if shares_actions
+        && new_process
+        && let Some(shadow) = guest.thread_state().signal_shadow.as_ref()
+    {
+        debug!(
+            "[dtid {}] signal-state copy: the actions become unknown, a clone shares them with a new process",
+            guest.thread_state().dettid
+        );
+        shadow.forget_dispositions();
+    }
+    publish_dispositions(guest).await;
 }
 
 /// Whether this tool asks the backend to report every guest `rt_sigreturn`
@@ -2123,6 +2231,122 @@ mod tests {
         // No copy at all.
         guest.thread.signal_shadow = None;
         assert_eq!(copied_dispositions(&guest), None);
+    }
+
+    /// A5 step 2b: a thread has its process's dispositions to publish
+    /// whenever the scheduler holds anything else for the process, and
+    /// withdraws them once the copy is given up. Recording sends nothing
+    /// (this guest fails any RPC): publication waits for the thread's next
+    /// request.
+    #[test]
+    fn a_publication_is_due_whenever_the_scheduler_holds_other_dispositions() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let mut guest = seeded(&kernel, 0);
+        let published = |guest: &ShadowGuest, dispositions| {
+            *guest.thread.published_dispositions.lock().unwrap() = dispositions;
+        };
+        let nothing = CopiedDispositions {
+            ignored: 0,
+            caught: 0,
+        };
+        assert_eq!(dispositions_due(&guest), Some(Some(nothing)), "seeded");
+        published(&guest, Some(nothing));
+        assert_eq!(dispositions_due(&guest), None, "the scheduler holds them");
+        let ignore = KernelSigaction {
+            handler: libc::SIG_IGN as u64,
+            flags: 0x0400_0000,
+            restorer: 0x7000,
+            mask: 0,
+        };
+        kernel.set(0, USR1, 0);
+        record_rt_sigaction(&mut guest, libc::SIGUSR1, Some(ignore), None, &Ok(0));
+        let ignoring = CopiedDispositions {
+            ignored: USR1,
+            caught: 0,
+        };
+        assert_eq!(dispositions_due(&guest), Some(Some(ignoring)));
+        published(&guest, Some(ignoring));
+        // A noted unreported signal does not stop the publication: the
+        // scheduler consults the notes itself.
+        note_unreported(1, i32::MAX - 1, libc::SIGUSR1);
+        assert_eq!(dispositions_due(&guest), None);
+        with_notes(|notes| notes.clear());
+        give_up(&mut guest, "a test");
+        assert_eq!(dispositions_due(&guest), Some(None), "withdrawn");
+        published(&guest, None);
+        assert_eq!(dispositions_due(&guest), None);
+    }
+
+    /// Where no copy is kept nothing is published, even with the switch on.
+    #[test]
+    fn nothing_is_published_where_no_copy_is_kept() {
+        let config = Config {
+            sequentialize_threads: true,
+            backend: reverie::BackendCapabilities::KVM,
+            ..Config::default()
+        };
+        let thread = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let guest = ShadowGuest { config, thread };
+        *guest.thread.published_dispositions.lock().unwrap() = Some(CopiedDispositions {
+            ignored: USR1,
+            caught: 0,
+        });
+        assert_eq!(dispositions_due(&guest), None);
+    }
+
+    /// Published dispositions decide only about a signal the copy holds
+    /// exactly, and only while no unreported signal is noted.
+    #[test]
+    fn published_dispositions_decide_where_the_copy_does() {
+        assert!(published_dispositions_decide(libc::SIGUSR1));
+        assert!(published_dispositions_decide(libc::SIGCHLD));
+        for signal in [
+            libc::SIGTRAP,
+            libc::SIGSEGV,
+            libc::SIGBUS,
+            libc::SIGILL,
+            libc::SIGFPE,
+            libc::SIGSYS,
+            reverie::PERF_EVENT_SIGNAL as i32,
+        ] {
+            assert!(!published_dispositions_decide(signal), "{signal}");
+        }
+        note_unreported(1, i32::MAX - 1, libc::SIGUSR1);
+        assert!(!published_dispositions_decide(libc::SIGUSR1));
+        with_notes(|notes| notes.clear());
+    }
+
+    /// A clone that shares the actions with a new process makes them unknown
+    /// before it runs, so its child gets no copy and the scheduler, which
+    /// keys the published dispositions by process, holds none for them. A
+    /// thread shares them within its process and changes nothing.
+    #[test]
+    fn a_clone_sharing_the_actions_with_a_new_process_makes_them_unknown() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let sighand = (libc::CLONE_VM | libc::CLONE_SIGHAND) as u64;
+        let nothing = CopiedDispositions {
+            ignored: 0,
+            caught: 0,
+        };
+
+        let mut guest = seeded(&kernel, 0);
+        *guest.thread.published_dispositions.lock().unwrap() = Some(nothing);
+        let thread = sighand | libc::CLONE_THREAD as u64;
+        futures::executor::block_on(before_clone(&mut guest, thread));
+        assert_eq!(copied_dispositions(&guest), Some(nothing), "a thread");
+
+        // Withdrawing what the scheduler holds is an RPC, which this guest
+        // fails, so it starts with nothing published.
+        let mut guest = seeded(&kernel, 0);
+        futures::executor::block_on(before_clone(&mut guest, sighand));
+        assert_eq!(copied_dispositions(&guest), None);
+        let shadow = guest.thread.signal_shadow.as_ref().unwrap();
+        assert!(
+            shadow.for_clone(sighand).is_none(),
+            "the child gets no copy"
+        );
     }
 
     #[test]

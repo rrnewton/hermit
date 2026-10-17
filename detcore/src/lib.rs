@@ -2867,6 +2867,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     // again; a child denied a copy for a quiet reason is
                     // seeded at its exec.
                     signal_shadow_lost: pts.1.signal_shadow_lost,
+                    // The threads of a process share the record of what the
+                    // scheduler holds for it; a new process has nothing
+                    // published.
+                    published_dispositions: if clone_flags.contains(CloneFlags::CLONE_THREAD) {
+                        Arc::clone(&pts.1.published_dispositions)
+                    } else {
+                        Arc::default()
+                    },
                     sigalrm_blocked_published: pts.1.sigalrm_blocked_published,
                     handler_restore_rt_reported: pts.1.handler_restore_rt_reported,
                     signal_register_projection: None,
