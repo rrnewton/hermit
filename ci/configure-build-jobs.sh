@@ -1922,8 +1922,14 @@ fi
 # outside the measured SDK region and requires fresh runtime validation.
 # Preserve existing carries, budget values, parallel width and limits.
 # The paired strict copied-child named refusal remains required.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 01e05bef246244466710d07d6e85442f64303f48 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 01e05bef246244466710d07d6e85442f64303f48 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO ec16b632ac835513477d19b06fc42eebad503440 (2026-10-17): from
+# 01e05bef246244466710d07d6e85442f64303f48, one commit changing only
+# reverie-ptrace/src/timer.rs (the staged timer's default latency budget,
+# 600 -> 2,000 ns). Nothing under reverie-dbt/ changes, and build.rs, vendor/,
+# native/, the root Cargo.toml, Cargo.lock and rust-toolchain.toml are
+# unchanged, so the budget carries.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != ec16b632ac835513477d19b06fc42eebad503440 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie ec16b632ac835513477d19b06fc42eebad503440 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

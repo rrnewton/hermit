@@ -1845,7 +1845,13 @@ fi
 # outside the measured SDK region and requires fresh runtime validation.
 # Preserve existing carries, budget values, parallel width and limits.
 # The paired strict copied-child named refusal remains required.
-expected_pin=01e05bef246244466710d07d6e85442f64303f48
+# CARRY TO ec16b632ac835513477d19b06fc42eebad503440 (2026-10-17): from
+# 01e05bef246244466710d07d6e85442f64303f48, one commit changing only
+# reverie-ptrace/src/timer.rs (the staged timer's default latency budget,
+# 600 -> 2,000 ns). Nothing under reverie-dbt/ changes, and build.rs, vendor/,
+# native/, the root Cargo.toml, Cargo.lock and rust-toolchain.toml are
+# unchanged, so the budget carries.
+expected_pin=ec16b632ac835513477d19b06fc42eebad503440
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
