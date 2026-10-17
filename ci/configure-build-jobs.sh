@@ -1977,8 +1977,24 @@ fi
 # rust-toolchain.toml are byte-identical to 25f8b656. Inventory 961,
 # calibrated job width and CPU/wall limits carry unchanged. Fresh runtime
 # and native artifact qualification remain separate from this budget carry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != e53cc6f4a20318730eacfb10804acf5fee80e077 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie e53cc6f4a20318730eacfb10804acf5fee80e077 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO a0071f59586039e6cc6cd2e9aff04a21267bbf1e (2026-10-17): from
+# e53cc6f4a20318730eacfb10804acf5fee80e077: Reverie main 0b583715 (two
+# reverie-sabre commits, nothing under reverie-dbt) plus b891b1e2
+# (DbtRunner::tool_answers_brk) and a0071f59 (Auxv::at_execfn, in
+# reverie/src only). b891b1e2 edits two
+# vendored DynamoRIO sources, vendor/dynamorio/core/lib/globals_shared.h (+4
+# lines) and core/unix/loader.c (+12 lines), and adds reverie-dbt unit tests,
+# a live test and its C fixture. build.rs, native/, third-party, the root
+# Cargo.toml, Cargo.lock and rust-toolchain.toml are unchanged. Cold DynamoRIO
+# builds, back to back, 16 jobs, load about 300 of 316 CPUs (host in
+# docs/TESTING_ENVIRONMENTS.md, "Named measurement hosts"):
+# unpatched 13.06s (208.95 job-seconds), patched 13.32s (213.16 job-seconds;
+# measured at the first version of the patch, which differed only in a
+# loader.c comment),
+# against the 572 job-second ceiling. Calibrated job width and CPU/wall limits
+# carry unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a0071f59586039e6cc6cd2e9aff04a21267bbf1e ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a0071f59586039e6cc6cd2e9aff04a21267bbf1e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
